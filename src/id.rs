@@ -14,6 +14,7 @@
 //! truncation is upstream-faithful: the decodable timestamp is
 //! `millis mod 2^36`, roughly a 69-year cycle.)
 
+use std::fmt::Write as _;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -33,21 +34,23 @@ const CHARS: &[u8; 62] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq
 /// loops: contention here is negligible and correctness is trivial to verify.
 static STATE: Mutex<(u64, u64)> = Mutex::new((0, 0));
 
-fn now_millis() -> u64 {
+/// Milliseconds since the Unix epoch (0 on clock skew before the epoch).
+/// Shared by ID generation and API handlers.
+pub(crate) fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
+        .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
 
 /// Encode the 12-char hex time portion: low 48 bits of
 /// `timestamp * 0x1000 + counter` as 6 big-endian bytes.
 fn encode_time(timestamp: u64, counter: u64) -> String {
+    // TIME_MASK caps the value at 48 bits, so `{value:012x}` is exactly the
+    // 6-byte big-endian hex upstream produces per byte.
     let value = timestamp.wrapping_mul(0x1000).wrapping_add(counter) & TIME_MASK;
     let mut hex = String::with_capacity(TIME_HEX_CHARS);
-    for index in 0..6 {
-        hex.push_str(&format!("{:02x}", (value >> (40 - 8 * index)) & 0xff));
-    }
+    write!(hex, "{value:012x}").expect("writing to a String never fails");
     hex
 }
 
@@ -83,7 +86,7 @@ fn ascending_body(timestamp: u64) -> String {
 /// Generate an ascending ID with the given prefix, e.g. `id("ses")` ->
 /// `"ses_019a2b..."`.
 pub fn id(prefix: &str) -> String {
-    format!("{prefix}_{}", ascending_body(now_millis()))
+    format!("{prefix}_{}", ascending_body(now_millis() as u64))
 }
 
 #[cfg(test)]
@@ -118,7 +121,7 @@ mod tests {
         let cases = [
             (0_u64, 0_u64),
             (1, 1),
-            (now_millis(), 1),
+            (now_millis() as u64, 1),
             (0xff_ffff_ffff, 0xfff), // truncation boundary: 2^36 ms
             (0x1_0000_0000_0abc, 123),
         ];

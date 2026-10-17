@@ -10,8 +10,9 @@ use std::path::Path;
 use anyhow::Result;
 use tokio_rusqlite::Connection;
 
-/// Embedded upstream-compatible schema (opencode v2). Idempotent: every
-/// statement uses `IF NOT EXISTS`.
+/// Embedded upstream-compatible schema (opencode v2), migration version 1.
+/// Idempotent within itself: every statement uses `IF NOT EXISTS` (so it is
+/// safe to apply onto a DB the upstream Bun server already created).
 const MIGRATION_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS event_sequence (
   aggregate_id text PRIMARY KEY,
@@ -116,6 +117,11 @@ CREATE INDEX IF NOT EXISTS session_pending_session_delivery_seq_idx ON session_p
 CREATE UNIQUE INDEX IF NOT EXISTS session_pending_session_compaction_idx ON session_pending (session_id) WHERE type = 'compaction';
 "#;
 
+/// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
+/// far the database has been migrated; each migration runs in a transaction
+/// that bumps `user_version` to its own version number.
+const MIGRATIONS: &[(u32, &str)] = &[(1, MIGRATION_V1)];
+
 /// All indexes the migration creates, verbatim from upstream
 /// (`packages/core/src/database/schema.gen.ts`). Kept next to the schema so
 /// the test stays in sync with what we actually create.
@@ -192,11 +198,23 @@ impl Db {
         Ok(db)
     }
 
-    /// Apply the embedded schema. Idempotent.
+    /// Apply pending migrations in version order. Each migration runs in a
+    /// transaction and bumps `PRAGMA user_version`, so re-running is a no-op
+    /// once the database is current.
     pub async fn migrate(&self) -> Result<()> {
         self.conn
             .call(|c| -> rusqlite::Result<()> {
-                c.execute_batch(MIGRATION_V1)?;
+                let current: u32 = c.pragma_query_value(None, "user_version", |row| row.get(0))?;
+                for &(version, sql) in MIGRATIONS {
+                    if version <= current {
+                        continue;
+                    }
+                    let tx = c.transaction()?;
+                    tx.execute_batch(sql)?;
+                    tx.pragma_update(None, "user_version", version)?;
+                    tx.commit()?;
+                    tracing::info!(version, "applied db migration");
+                }
                 Ok(())
             })
             .await?;
@@ -206,6 +224,17 @@ impl Db {
     /// Access the underlying connection for queries.
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Current `PRAGMA user_version` (migration level).
+    #[cfg(test)]
+    async fn user_version(&self) -> u32 {
+        self.conn
+            .call(|c| -> rusqlite::Result<u32> {
+                c.pragma_query_value(None, "user_version", |row| row.get(0))
+            })
+            .await
+            .unwrap()
     }
 
     /// Check whether a table exists (used for graceful degradation when
@@ -241,11 +270,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_is_idempotent() {
+    async fn migration_tracks_user_version_and_is_idempotent() {
         let db = Db::open_in_memory().await.unwrap();
-        // Running the migration a second time must not error.
+        assert_eq!(db.user_version().await, 1);
+        // Re-running must be a no-op: version stays, no error.
         db.migrate().await.unwrap();
         db.migrate().await.unwrap();
+        assert_eq!(db.user_version().await, 1);
     }
 
     #[tokio::test]

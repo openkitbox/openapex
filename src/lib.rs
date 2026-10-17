@@ -10,20 +10,21 @@ pub mod id;
 
 use anyhow::Result;
 use salvo::prelude::*;
-use std::time::Instant;
 
 use crate::api::AppState;
 use crate::config::Config;
 use crate::db::Db;
 
-/// Build application state: open the DB and run migrations.
+/// Build application state: open the DB, run migrations, and canonicalize
+/// the working directory once (falls back to the raw path on error).
 pub async fn build_state(config: Config) -> Result<AppState> {
     let db = Db::open(&config.db_path).await?;
+    let cwd = std::env::current_dir()?;
+    let directory = cwd.canonicalize().unwrap_or(cwd);
     Ok(AppState {
         config,
         db,
-        started: Instant::now(),
-        directory: std::env::current_dir()?,
+        directory,
     })
 }
 

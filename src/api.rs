@@ -6,21 +6,36 @@
 //! `agent.list` / `model.list` -> `{ location, data }` envelopes.
 
 use std::path::PathBuf;
-use std::time::Instant;
 
+use salvo::http::StatusCode;
 use salvo::prelude::*;
 use serde::Serialize;
 
 use crate::config::Config;
 use crate::db::Db;
+use crate::id::now_millis;
 
 /// Shared application state, injected via `salvo::affix_state`.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Config,
     pub db: Db,
-    pub started: Instant,
+    /// Working directory, canonicalized once at startup.
     pub directory: PathBuf,
+}
+
+/// Fetch the injected app state; on failure logs the error and renders a
+/// 500, returning `None` so the handler can bail out without panicking
+/// (project rule: no expect/unwrap in request paths).
+fn state<'a>(depot: &'a Depot, res: &mut Response) -> Option<&'a AppState> {
+    match depot.get_typed::<AppState>() {
+        Ok(state) => Some(state),
+        Err(_) => {
+            tracing::error!("app state missing from depot");
+            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -50,7 +65,9 @@ struct ServerCapabilities {
 
 #[handler] // operation_id: server.info
 async fn server_info(depot: &mut Depot, res: &mut Response) {
-    let state = depot.get_typed::<AppState>().expect("app state injected");
+    let Some(state) = state(depot, res) else {
+        return;
+    };
     res.render(Json(ServerInfo {
         version: env!("CARGO_PKG_VERSION"),
         pid: std::process::id(),
@@ -84,19 +101,15 @@ struct LocationProject {
 
 #[handler] // operation_id: location.get
 async fn location_get(depot: &mut Depot, res: &mut Response) {
-    let state = depot.get_typed::<AppState>().expect("app state injected");
+    let Some(state) = state(depot, res) else {
+        return;
+    };
     let directory = state.directory.to_string_lossy().into_owned();
-    let canonical = state
-        .directory
-        .canonicalize()
-        .unwrap_or_else(|_| state.directory.clone())
-        .to_string_lossy()
-        .into_owned();
     res.render(Json(LocationInfo {
         project: LocationProject {
             id: "default".to_owned(),
             directory: directory.clone(),
-            canonical,
+            canonical: directory.clone(),
         },
         directory,
     }));
@@ -125,15 +138,11 @@ struct ProjectTime {
 }
 
 fn synthetic_project(directory: &std::path::Path) -> Project {
-    let canonical = directory
-        .canonicalize()
-        .unwrap_or_else(|_| directory.to_path_buf())
-        .to_string_lossy()
-        .into_owned();
+    // `state.directory` is already canonicalized at startup.
     let now = now_millis();
     Project {
         id: "default".to_owned(),
-        canonical,
+        canonical: directory.to_string_lossy().into_owned(),
         time: ProjectTime {
             created: now,
             updated: now,
@@ -145,7 +154,9 @@ fn synthetic_project(directory: &std::path::Path) -> Project {
 
 #[handler] // operation_id: project.list
 async fn project_list(depot: &mut Depot, res: &mut Response) {
-    let state = depot.get_typed::<AppState>().expect("app state injected");
+    let Some(state) = state(depot, res) else {
+        return;
+    };
 
     let projects = if state.db.table_exists("project").await.unwrap_or(false) {
         // Shared upstream DB: map its `project` table rows onto the protocol
@@ -263,7 +274,9 @@ struct ModelLimit {
 
 #[handler] // operation_id: model.list
 async fn model_list(depot: &mut Depot, res: &mut Response) {
-    let state = depot.get_typed::<AppState>().expect("app state injected");
+    let Some(state) = state(depot, res) else {
+        return;
+    };
     let data = state
         .config
         .models
@@ -332,7 +345,9 @@ struct AgentRequest {
 
 #[handler] // operation_id: agent.list
 async fn agent_list(depot: &mut Depot, res: &mut Response) {
-    let state = depot.get_typed::<AppState>().expect("app state injected");
+    let Some(state) = state(depot, res) else {
+        return;
+    };
     let build = AgentInfo {
         id: "build".to_owned(),
         name: "build".to_owned(),
@@ -363,11 +378,4 @@ pub fn build_router(state: AppState) -> Router {
             .push(Router::with_path("model").get(model_list))
             .push(Router::with_path("agent").get(agent_list)),
     )
-}
-
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }

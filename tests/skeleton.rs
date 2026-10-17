@@ -2,12 +2,11 @@
 //! read endpoints over HTTP.
 
 use std::net::TcpListener as StdTcpListener;
-use std::time::Instant;
 
 use ox::api::AppState;
 use ox::config::Config;
-use ox::db::Db;
 use salvo::prelude::*;
+use tempfile::TempDir;
 use tokio::task::JoinHandle;
 
 /// Pick an ephemeral port by binding then releasing a std listener.
@@ -19,23 +18,19 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Spawn the server in the background against a temp DB; returns (base_url, handle).
-async fn spawn_server() -> (String, JoinHandle<()>) {
+/// Spawn the server in the background against a temp DB.
+/// Returns (base_url, handle, tempdir) — the tempdir guard must outlive the
+/// server so the DB files are cleaned up on drop.
+async fn spawn_server() -> (String, JoinHandle<()>, TempDir) {
     let port = free_port();
-    let dir = std::env::temp_dir().join(format!("ox-itest-{}", std::process::id()));
-    let db_path = dir.join(format!("ox-{port}.db"));
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ox.db");
     let config = Config {
         db_path,
         listen: format!("127.0.0.1:{port}"),
         ..Config::default()
     };
-    let db = Db::open(&config.db_path).await.unwrap();
-    let state = AppState {
-        config: config.clone(),
-        db,
-        started: Instant::now(),
-        directory: std::env::current_dir().unwrap(),
-    };
+    let state = ox::build_state(config.clone()).await.unwrap();
     let router = ox::build_router(state);
     let listen: String = config.listen.clone();
     let handle = tokio::spawn(async move {
@@ -43,21 +38,24 @@ async fn spawn_server() -> (String, JoinHandle<()>) {
         Server::new(acceptor).serve(router).await;
     });
 
-    // Wait until the port accepts connections.
+    // Poll until the port accepts connections; fail loudly if it never does.
     let client = reqwest::Client::new();
     let base = format!("http://127.0.0.1:{port}");
+    let mut ready = false;
     for _ in 0..50 {
         if client.get(format!("{base}/api/info")).send().await.is_ok() {
+            ready = true;
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    (base, handle)
+    assert!(ready, "server at {base} never became ready");
+    (base, handle, dir)
 }
 
 #[tokio::test]
 async fn info_location_project_endpoints_respond() {
-    let (base, handle) = spawn_server().await;
+    let (base, handle, _dir) = spawn_server().await;
     let client = reqwest::Client::new();
 
     // GET /api/info → 200 JSON with a `version` field.
@@ -148,9 +146,11 @@ async fn info_location_project_endpoints_respond() {
 async fn project_list_reads_upstream_project_table() {
     // Simulate a shared upstream DB: create the `project` table per
     // upstream's drizzle schema and insert one row.
+    use ox::db::Db;
+
     let port = free_port();
-    let dir = std::env::temp_dir().join(format!("ox-itest-{}", std::process::id()));
-    let db_path = dir.join(format!("ox-shared-{port}.db"));
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ox-shared.db");
     let config = Config {
         db_path,
         listen: format!("127.0.0.1:{port}"),
@@ -186,7 +186,6 @@ async fn project_list_reads_upstream_project_table() {
     let state = AppState {
         config: config.clone(),
         db,
-        started: Instant::now(),
         directory: std::env::current_dir().unwrap(),
     };
     let router = ox::build_router(state);
@@ -206,7 +205,8 @@ async fn project_list_reads_upstream_project_table() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let projects = projects.expect("project.list responded");
+    let projects =
+        projects.expect("server never became ready: /api/project gave no response after 50 polls");
     let arr = projects.as_array().unwrap();
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["id"], "prj_abc");
