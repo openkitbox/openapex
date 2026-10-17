@@ -454,7 +454,6 @@ fn event_session_created() {
         json!({
             "sessionID": "ses_01",
             "projectID": "prj_01",
-            "project": { "id": "prj_01", "canonical": "/repo" },
             "location": { "directory": "/repo" },
             "slug": "brave-fox",
             "title": "hello world",

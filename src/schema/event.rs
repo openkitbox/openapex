@@ -120,13 +120,6 @@ pub enum InterruptReason {
 /// message schema).
 pub use crate::schema::message::CompactionReason;
 
-/// Upstream `Project.Ref` (`packages/schema/src/project-id.ts`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct ProjectRef {
-    pub id: String,
-    pub canonical: String,
-}
-
 /// Upstream `Step.Failed` `finish` literal (currently only content-filter).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum StepFailedFinish {
@@ -156,7 +149,6 @@ pub enum SessionEventData {
         session_id: String,
         #[serde(rename = "projectID")]
         project_id: String,
-        project: ProjectRef,
         location: LocationRef,
         #[serde(skip_serializing_if = "Option::is_none")]
         subpath: Option<String>,
