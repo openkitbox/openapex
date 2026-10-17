@@ -6,7 +6,9 @@
 pub mod api;
 pub mod config;
 pub mod db;
+pub mod event_bus;
 pub mod id;
+pub mod projector;
 pub mod schema;
 
 use anyhow::Result;

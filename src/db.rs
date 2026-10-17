@@ -182,8 +182,7 @@ impl Db {
         Ok(db)
     }
 
-    /// Open an in-memory database (for tests).
-    #[cfg(test)]
+    /// Open an in-memory database (for tests and ephemeral runs).
     pub async fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory().await?;
         conn.call(|c| -> rusqlite::Result<()> {

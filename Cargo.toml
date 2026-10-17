@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+dashmap = "6.2.1"
 dirs = "7.0.0"
 rand = "0.9"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
