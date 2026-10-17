@@ -33,6 +33,9 @@ CREATE TABLE IF NOT EXISTS kv (
   time_created integer NOT NULL,
   time_updated integer NOT NULL
 );
+-- Indexes verified against upstream packages/core/src/database/schema.gen.ts.
+CREATE UNIQUE INDEX IF NOT EXISTS event_aggregate_seq_idx ON event (aggregate_id, seq);
+CREATE INDEX IF NOT EXISTS event_aggregate_type_seq_idx ON event (aggregate_id, type, seq);
 CREATE TABLE IF NOT EXISTS session_v2 (
   id text PRIMARY KEY,
   project_id text NOT NULL,
@@ -72,6 +75,9 @@ CREATE TABLE IF NOT EXISTS session_v2 (
   resume_attempts integer NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS session_v2_project_idx ON session_v2 (project_id);
+CREATE INDEX IF NOT EXISTS session_v2_workspace_idx ON session_v2 (workspace_id);
+CREATE INDEX IF NOT EXISTS session_v2_parent_idx ON session_v2 (parent_id);
+CREATE INDEX IF NOT EXISTS session_v2_time_suspended_idx ON session_v2 (time_suspended) WHERE time_suspended IS NOT NULL;
 CREATE TABLE IF NOT EXISTS session_message (
   id text PRIMARY KEY,
   session_id text NOT NULL REFERENCES session_v2(id) ON DELETE CASCADE,
@@ -82,6 +88,9 @@ CREATE TABLE IF NOT EXISTS session_message (
   data text NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS session_message_session_seq_idx ON session_message (session_id, seq);
+CREATE INDEX IF NOT EXISTS session_message_session_type_seq_idx ON session_message (session_id, type, seq);
+CREATE INDEX IF NOT EXISTS session_message_session_time_created_id_idx ON session_message (session_id, time_created, id);
+CREATE INDEX IF NOT EXISTS session_message_time_created_idx ON session_message (time_created);
 CREATE TABLE IF NOT EXISTS session_inbox (
   id text PRIMARY KEY,
   session_id text NOT NULL REFERENCES session_v2(id) ON DELETE CASCADE,
@@ -92,6 +101,7 @@ CREATE TABLE IF NOT EXISTS session_inbox (
   time_created integer NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS session_inbox_session_enqueued_seq_idx ON session_inbox (session_id, enqueued_seq);
+CREATE INDEX IF NOT EXISTS session_inbox_session_delivery_seq_idx ON session_inbox (session_id, delivery, enqueued_seq);
 CREATE TABLE IF NOT EXISTS session_pending (
   id text PRIMARY KEY,
   session_id text NOT NULL REFERENCES session_v2(id) ON DELETE CASCADE,
@@ -102,7 +112,31 @@ CREATE TABLE IF NOT EXISTS session_pending (
   time_created integer NOT NULL
 );
 CREATE UNIQUE INDEX IF NOT EXISTS session_pending_session_admitted_seq_idx ON session_pending (session_id, admitted_seq);
+CREATE INDEX IF NOT EXISTS session_pending_session_delivery_seq_idx ON session_pending (session_id, delivery, admitted_seq);
+CREATE UNIQUE INDEX IF NOT EXISTS session_pending_session_compaction_idx ON session_pending (session_id) WHERE type = 'compaction';
 "#;
+
+/// All indexes the migration creates, verbatim from upstream
+/// (`packages/core/src/database/schema.gen.ts`). Kept next to the schema so
+/// the test stays in sync with what we actually create.
+#[cfg(test)]
+const EXPECTED_INDEXES: &[&str] = &[
+    "event_aggregate_seq_idx",
+    "event_aggregate_type_seq_idx",
+    "session_v2_project_idx",
+    "session_v2_workspace_idx",
+    "session_v2_parent_idx",
+    "session_v2_time_suspended_idx",
+    "session_message_session_seq_idx",
+    "session_message_session_type_seq_idx",
+    "session_message_session_time_created_id_idx",
+    "session_message_time_created_idx",
+    "session_inbox_session_enqueued_seq_idx",
+    "session_inbox_session_delivery_seq_idx",
+    "session_pending_session_admitted_seq_idx",
+    "session_pending_session_delivery_seq_idx",
+    "session_pending_session_compaction_idx",
+];
 
 /// Tables created by the embedded migration, in creation order.
 #[cfg(test)]
@@ -217,30 +251,52 @@ mod tests {
     #[tokio::test]
     async fn indexes_exist() {
         let db = Db::open_in_memory().await.unwrap();
-        let names = db
+        // (name, is_unique) per index, via sqlite_master + pragma_index_list.
+        let indexes = db
             .conn()
-            .call(|c| -> rusqlite::Result<Vec<String>> {
-                let mut stmt = c
-                    .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'")?;
-                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            .call(|c| -> rusqlite::Result<Vec<(String, bool)>> {
+                let mut stmt = c.prepare(
+                    "SELECT name, tbl_name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'",
+                )?;
+                let rows: Vec<(String, String)> = stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
                 let mut out = Vec::new();
-                for row in rows {
-                    out.push(row?);
+                for (name, table) in rows {
+                    let mut s = c.prepare(&format!(
+                        "SELECT \"unique\" FROM pragma_index_list('{table}') WHERE name = '{name}'"
+                    ))?;
+                    let unique: bool = s.query_row([], |row| row.get(0))?;
+                    out.push((name, unique));
                 }
                 Ok(out)
             })
             .await
             .unwrap();
-        for expected in [
-            "session_v2_project_idx",
+
+        let names: Vec<&str> = indexes.iter().map(|(n, _)| n.as_str()).collect();
+        for expected in EXPECTED_INDEXES {
+            assert!(names.contains(expected), "missing index {expected}");
+        }
+        assert_eq!(
+            names.len(),
+            EXPECTED_INDEXES.len(),
+            "unexpected extra indexes: {names:?}"
+        );
+
+        // Unique indexes enforce shared-DB invariants, not just performance.
+        for unique in [
+            "event_aggregate_seq_idx",
             "session_message_session_seq_idx",
             "session_inbox_session_enqueued_seq_idx",
             "session_pending_session_admitted_seq_idx",
+            "session_pending_session_compaction_idx",
         ] {
-            assert!(
-                names.contains(&expected.to_owned()),
-                "missing index {expected}"
-            );
+            let (_, is_unique) = indexes
+                .iter()
+                .find(|(n, _)| n == unique)
+                .unwrap_or_else(|| panic!("missing index {unique}"));
+            assert!(is_unique, "index {unique} must be UNIQUE");
         }
     }
 }
