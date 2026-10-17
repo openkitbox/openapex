@@ -13,8 +13,8 @@ use crate::id;
 use crate::schema::event::{EventEnvelope, SessionEventData, StepFailedFinish};
 use crate::schema::message::{
     AssistantContent, AssistantMessage, AssistantRetry, AssistantSnapshot, AssistantTime,
-    Compaction, CompactionCompleted, CompactionMessage, IdleOutcome, Message, TimeCreated,
-    ToolState, ToolTime,
+    Compaction, CompactionCompleted, CompactionMessage, IdleOutcome, LocationSwitch, Message,
+    TimeCreated, ToolState, ToolTime,
 };
 use crate::schema::support::{FinishReason, Record};
 
@@ -40,18 +40,24 @@ fn decode_assistant(id: &str, data: &str) -> Result<AssistantMessage> {
     }
 }
 
-/// Load the latest assistant message for a session (`ORDER BY id DESC LIMIT 1`).
-fn load_latest_assistant(tx: &Connection, session_id: &str) -> Result<Option<AssistantMessage>> {
+/// Load the current assistant message for a session. Port of upstream
+/// `getCurrentAssistant`: select the latest assistant row by `seq DESC`, then
+/// keep it only if it has no `time.completed` (the filter happens on the
+/// decoded message, not in SQL — a completed latest row yields `None`, not an
+/// older incomplete row).
+fn load_current_assistant(tx: &Connection, session_id: &str) -> Result<Option<AssistantMessage>> {
     let row = tx
         .query_row(
             "SELECT id, data FROM session_message \
-             WHERE type = 'assistant' AND session_id = ?1 ORDER BY id DESC LIMIT 1",
+             WHERE type = 'assistant' AND session_id = ?1 ORDER BY seq DESC LIMIT 1",
             rusqlite::params![session_id],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
         )
         .optional()?;
-    row.map(|(id, data)| decode_assistant(&id, &data))
-        .transpose()
+    let decoded = row
+        .map(|(id, data)| decode_assistant(&id, &data))
+        .transpose()?;
+    Ok(decoded.filter(|msg| msg.time.completed.is_none()))
 }
 
 /// Load an assistant message by id.
@@ -120,6 +126,35 @@ fn load_latest_compaction(tx: &Connection, session_id: &str) -> Result<Option<Co
         .transpose()
 }
 
+/// Read the current session's location for the `previous` field of a
+/// `location-switched` message. Port of upstream `getLocation`.
+fn load_location(tx: &Connection, session_id: &str) -> Result<Option<LocationSwitch>> {
+    let row = tx
+        .query_row(
+            "SELECT directory, workspace_id, project_id, path FROM session_v2 WHERE id = ?1",
+            rusqlite::params![session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(row.map(
+        |(directory, workspace_id, project_id, subpath)| LocationSwitch {
+            location: crate::schema::support::LocationRef {
+                directory,
+                workspace_id,
+            },
+            project_id,
+            subpath,
+        },
+    ))
+}
+
 /// Persist a compaction message row (UPDATE existing id, else INSERT).
 fn store_compaction(
     tx: &Connection,
@@ -142,7 +177,7 @@ fn store_compaction(
 /// Clear the `retry` block on the current (latest) assistant message.
 /// Upstream `clearCurrentRetry`.
 fn clear_current_retry(tx: &Connection, session_id: &str, seq: i64) -> Result<()> {
-    if let Some(mut current) = load_latest_assistant(tx, session_id)?
+    if let Some(mut current) = load_current_assistant(tx, session_id)?
         && current.retry.is_some()
     {
         current.retry = None;
@@ -184,6 +219,27 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
     let mut usage_recorded = false;
 
     match &env.data {
+        E::SessionMoved {
+            session_id,
+            payload,
+        } => {
+            // Append a `location-switched` message recording the new location,
+            // with `previous` read from the current session_v2 row.
+            let previous = load_location(tx, session_id)?;
+            let msg = Message::LocationSwitched {
+                id: id::from_event(&env.id),
+                metadata: env.metadata.clone(),
+                time: TimeCreated { created },
+                location: LocationSwitch {
+                    location: payload.location.clone(),
+                    project_id: Some(payload.project_id.clone()),
+                    subpath: payload.subpath.clone(),
+                },
+                previous,
+            };
+            insert_message(tx, session_id, seq, &msg)?;
+        }
+
         E::SessionSynthetic {
             session_id,
             text,
@@ -191,7 +247,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
             metadata,
         } => {
             let msg = Message::Synthetic {
-                id: id::id("msg"),
+                id: id::from_event(&env.id),
                 metadata: metadata.clone(),
                 time: TimeCreated { created },
                 text: text.clone(),
@@ -265,7 +321,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                 }
                 store_assistant(tx, session_id, seq, assistant_message_id, &msg)?;
             } else {
-                if let Some(mut current) = load_latest_assistant(tx, session_id)? {
+                if let Some(mut current) = load_current_assistant(tx, session_id)? {
                     current.retry = None;
                     current.time.completed = Some(created);
                     store_assistant(tx, session_id, seq, &current.id, &current)?;
@@ -611,7 +667,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
             ..
         } => {
             let msg = Message::Compaction(CompactionMessage {
-                id: id::id("msg"),
+                id: id::from_event(&env.id),
                 metadata: None,
                 time: TimeCreated { created },
                 compaction: Compaction::Running {
@@ -656,7 +712,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                 store_compaction(tx, session_id, seq, c)?;
             } else {
                 let msg = CompactionMessage {
-                    id: id::id("msg"),
+                    id: id::from_event(&env.id),
                     metadata: None,
                     time: TimeCreated { created },
                     compaction: completed,
@@ -695,7 +751,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                 store_compaction(tx, session_id, seq, c)?;
             } else {
                 let msg = CompactionMessage {
-                    id: id::id("msg"),
+                    id: id::from_event(&env.id),
                     metadata: None,
                     time: TimeCreated { created },
                     compaction: failed,
@@ -711,7 +767,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
         E::ExecutionSucceeded { session_id } => {
             clear_current_retry(tx, session_id, seq)?;
             let msg = Message::Idle {
-                id: id::id("msg"),
+                id: id::from_event(&env.id),
                 metadata: None,
                 time: TimeCreated { created },
                 outcome: IdleOutcome::Succeeded,
@@ -723,7 +779,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
         E::ExecutionFailed { session_id, error } => {
             clear_current_retry(tx, session_id, seq)?;
             let msg = Message::Idle {
-                id: id::id("msg"),
+                id: id::from_event(&env.id),
                 metadata: None,
                 time: TimeCreated { created },
                 outcome: IdleOutcome::Failed,
@@ -740,7 +796,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
             } else {
                 clear_current_retry(tx, session_id, seq)?;
                 let msg = Message::Idle {
-                    id: id::id("msg"),
+                    id: id::from_event(&env.id),
                     metadata: None,
                     time: TimeCreated { created },
                     outcome: IdleOutcome::Interrupted,

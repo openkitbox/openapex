@@ -89,6 +89,20 @@ pub fn id(prefix: &str) -> String {
     format!("{prefix}_{}", ascending_body(now_millis() as u64))
 }
 
+/// Derive a deterministic message ID from a durable event ID by swapping the
+/// `evt_` prefix for `msg_` (upstream `SessionMessage.ID.fromEvent`).
+///
+/// Projected messages derive their ID from the committing event so that
+/// replaying the same event reproduces the same message row (replay
+/// idempotency). Non-`evt_` inputs are passed through with the prefix swapped
+/// only when present; otherwise the body is reused verbatim.
+pub fn from_event(event_id: &str) -> String {
+    match event_id.strip_prefix("evt_") {
+        Some(body) => format!("msg_{body}"),
+        None => format!("msg_{event_id}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

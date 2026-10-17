@@ -473,3 +473,292 @@ async fn ephemeral_events_broadcast_not_persisted() {
         .unwrap();
     assert_eq!(n, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Spec-review regressions
+// ---------------------------------------------------------------------------
+
+/// `getCurrentAssistant` semantics: the latest assistant row is selected by
+/// `seq DESC`, then discarded if it has `time.completed`. A completed
+/// assistant must therefore never be reset/closed by a later `step.started`.
+#[tokio::test]
+async fn completed_assistant_is_not_current() {
+    let bus = bus().await;
+    create(&bus, "s1").await;
+
+    bus.publish(SessionEventData::StepStarted {
+        session_id: "s1".to_string(),
+        assistant_message_id: "am1".to_string(),
+        agent: "build".to_string(),
+        model: model(),
+        snapshot: None,
+        started: 100,
+    })
+    .await
+    .unwrap();
+    bus.publish(SessionEventData::StepEnded {
+        session_id: "s1".to_string(),
+        assistant_message_id: "am1".to_string(),
+        finish: ox::schema::support::FinishReason::Stop,
+        raw_finish: None,
+        provider_state: None,
+        cost: ox::schema::support::Finite::Float(0.0),
+        tokens: TokenUsage {
+            input: 0,
+            output: 0,
+            reasoning: 0,
+            cache: TokenCache { read: 0, write: 0 },
+        },
+        snapshot: None,
+        files: None,
+    })
+    .await
+    .unwrap();
+
+    let conn = bus.db_conn().clone();
+    let before: String = conn
+        .clone()
+        .call(move |c| {
+            c.query_row(
+                "SELECT data FROM session_message WHERE id = 'am1'",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .unwrap();
+
+    // A second step starts while am1 is complete. The "close current
+    // incomplete assistant" path must not touch it (getCurrentAssistant ->
+    // None), so am1 is not mutated.
+    bus.publish(SessionEventData::StepStarted {
+        session_id: "s1".to_string(),
+        assistant_message_id: "am2".to_string(),
+        agent: "build".to_string(),
+        model: model(),
+        snapshot: None,
+        started: 200,
+    })
+    .await
+    .unwrap();
+
+    let after: String = conn
+        .call(move |c| {
+            c.query_row(
+                "SELECT data FROM session_message WHERE id = 'am1'",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(before, after, "completed assistant must not be mutated");
+
+    // The new assistant exists and the completed one still carries its finish.
+    let (count, finish): (i64, Option<String>) = bus
+        .db_conn()
+        .clone()
+        .call(move |c| {
+            let count = c.query_row(
+                "SELECT count(*) FROM session_message WHERE session_id = 's1' AND type = 'assistant'",
+                [],
+                |r| r.get(0),
+            )?;
+            let finish = c.query_row(
+                "SELECT json_extract(data, '$.finish') FROM session_message WHERE id = 'am1'",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )?;
+            Ok::<(i64, Option<String>), rusqlite::Error>((count, finish))
+        })
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+    assert_eq!(finish.as_deref(), Some("stop"));
+}
+
+/// Projected message ids derive deterministically from the event id by
+/// swapping the `evt_` prefix for `msg_` (upstream `ID.fromEvent`). Two
+/// distinct events therefore yield two rows whose ids are exactly the
+/// prefix-swapped event ids — no random ids inside projection.
+#[tokio::test]
+async fn projected_message_ids_derive_from_event_id() {
+    let bus = bus().await;
+    create(&bus, "s1").await;
+
+    let first = bus
+        .publish(SessionEventData::ExecutionSucceeded {
+            session_id: "s1".to_string(),
+        })
+        .await
+        .unwrap();
+    let second = bus
+        .publish(SessionEventData::ExecutionSucceeded {
+            session_id: "s1".to_string(),
+        })
+        .await
+        .unwrap();
+
+    assert!(first.id.starts_with("evt_"));
+    let conn = bus.db_conn().clone();
+    let ids: Vec<String> = conn
+        .call(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT id FROM session_message WHERE session_id = 's1' \
+                 AND type = 'idle' ORDER BY seq ASC",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ids,
+        vec![
+            ox::id::from_event(&first.id),
+            ox::id::from_event(&second.id)
+        ]
+    );
+    assert!(ids.iter().all(|id| id.starts_with("msg_")));
+    // Determinism: the derivation is a pure prefix swap.
+    assert_eq!(
+        ox::id::from_event(&first.id),
+        format!("msg_{}", &first.id[4..])
+    );
+}
+
+/// `session.moved` updates the session row's location and appends a
+/// `location-switched` message carrying the previous location.
+#[tokio::test]
+async fn session_moved_projects_location_and_message() {
+    let bus = bus().await;
+    create(&bus, "s1").await;
+
+    let moved = bus
+        .publish(SessionEventData::SessionMoved {
+            session_id: "s1".to_string(),
+            payload: ox::schema::inbox::MovePayload {
+                location: LocationRef {
+                    directory: "/tmp/moved".to_string(),
+                    workspace_id: Some("ws1".to_string()),
+                },
+                project_id: "proj2".to_string(),
+                subpath: Some("packages/app".to_string()),
+            },
+        })
+        .await
+        .unwrap();
+    let moved_id = ox::id::from_event(&moved.id);
+
+    let created = moved.created;
+    let conn = bus.db_conn().clone();
+    let (directory, path, project_id, workspace_id, time_updated): (
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        i64,
+    ) = conn
+        .clone()
+        .call(move |c| {
+            c.query_row(
+                "SELECT directory, path, project_id, workspace_id, time_updated \
+                 FROM session_v2 WHERE id = 's1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(directory, "/tmp/moved");
+    assert_eq!(path.as_deref(), Some("packages/app"));
+    assert_eq!(project_id, "proj2");
+    assert_eq!(workspace_id.as_deref(), Some("ws1"));
+    assert_eq!(time_updated, created);
+
+    let data: String = conn
+        .call(move |c| {
+            c.query_row(
+                "SELECT data FROM session_message WHERE id = ?1 AND type = 'location-switched'",
+                rusqlite::params![moved_id],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(value["location"]["directory"], "/tmp/moved");
+    assert_eq!(value["projectID"], "proj2");
+    assert_eq!(value["previous"]["location"]["directory"], "/tmp/ox");
+}
+
+/// The ephemeral `session.usage.updated` is broadcast only after the
+/// committing transaction: the totals it carries are read back from the
+/// committed row on a separate connection.
+#[tokio::test]
+async fn usage_updated_broadcast_after_commit() {
+    let bus = bus().await;
+    create(&bus, "s1").await;
+    let mut rx = bus.subscribe();
+
+    bus.publish(SessionEventData::SessionUsageRecorded {
+        session_id: "s1".to_string(),
+        source: ox::schema::event::UsageSource::Title,
+        cost: ox::schema::support::Finite::Float(0.25),
+        tokens: TokenUsage {
+            input: 3,
+            output: 4,
+            reasoning: 1,
+            cache: TokenCache { read: 2, write: 0 },
+        },
+    })
+    .await
+    .unwrap();
+
+    let mut seen_recorded = false;
+    let mut usage = None;
+    while let Ok(ev) = rx.try_recv() {
+        if ev.kind == "session.usage.recorded" {
+            seen_recorded = true;
+        }
+        if ev.kind == "session.usage.updated" {
+            usage = Some(ev);
+        }
+    }
+    assert!(seen_recorded, "durable usage.recorded was broadcast");
+    let usage = usage.expect("ephemeral usage.updated was broadcast after commit");
+    assert!(usage.durable.is_none());
+    let typed = usage.parse_typed();
+    match typed.data {
+        SessionEventData::SessionUsageUpdated {
+            session_id,
+            cost,
+            tokens,
+        } => {
+            assert_eq!(session_id, "s1");
+            assert_eq!(cost, ox::schema::support::Finite::Float(0.25));
+            assert_eq!(tokens.input, 3);
+            assert_eq!(tokens.output, 4);
+            assert_eq!(tokens.reasoning, 1);
+            assert_eq!(tokens.cache.read, 2);
+        }
+        other => panic!("unexpected payload: {other:?}"),
+    }
+
+    // Ephemeral events are not persisted.
+    let n: i64 = bus
+        .db_conn()
+        .clone()
+        .call(move |c| {
+            c.query_row(
+                "SELECT count(*) FROM event WHERE aggregate_id = 's1' \
+                 AND type LIKE 'session.usage.updated%'",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .await
+        .unwrap();
+    assert_eq!(n, 0);
+}

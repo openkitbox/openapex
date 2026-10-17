@@ -191,8 +191,32 @@ pub fn project(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result
         E::SessionForked { .. } => {
             // TODO(task 4): fork projection copies messages up to the boundary.
         }
-        E::SessionMoved { .. }
-        | E::SessionUsageUpdated { .. }
+        E::SessionMoved {
+            session_id,
+            payload,
+        } => {
+            // Upstream: run the message-updater (appends `location-switched`),
+            // then update the session row's directory/path/project/workspace.
+            message_updater::run(tx, env)?;
+            tx.execute(
+                "UPDATE session_v2 SET
+                   directory = ?2,
+                   path = ?3,
+                   project_id = ?4,
+                   workspace_id = ?5,
+                   time_updated = ?6
+                 WHERE id = ?1",
+                rusqlite::params![
+                    session_id,
+                    payload.location.directory,
+                    payload.subpath,
+                    payload.project_id,
+                    payload.location.workspace_id,
+                    env.created,
+                ],
+            )?;
+        }
+        E::SessionUsageUpdated { .. }
         | E::TextDelta { .. }
         | E::ReasoningDelta { .. }
         | E::ToolInputDelta { .. }
