@@ -70,7 +70,17 @@ async fn info_location_project_endpoints_respond() {
         .await
         .unwrap();
     assert!(info.get("version").and_then(|v| v.as_str()).is_some());
-    assert!(info.get("uptimeMs").and_then(|v| v.as_u64()).is_some());
+    // Upstream ServerInfo is `additionalProperties: false`: exactly these keys.
+    let keys: Vec<&str> = info
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(|k| k.as_str())
+        .collect();
+    for key in ["version", "pid", "urls", "paths", "capabilities"] {
+        assert!(keys.contains(&key), "missing key {key}");
+    }
+    assert_eq!(keys.len(), 5, "unexpected extra keys: {keys:?}");
     assert!(info.get("pid").and_then(|v| v.as_u64()).is_some());
 
     // GET /api/location → 200 JSON with directory + project.

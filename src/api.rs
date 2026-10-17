@@ -35,8 +35,6 @@ struct ServerInfo {
     urls: Vec<String>,
     paths: ServerPaths,
     capabilities: ServerCapabilities,
-    #[serde(rename = "uptimeMs")]
-    uptime_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -63,7 +61,6 @@ async fn server_info(depot: &mut Depot, res: &mut Response) {
         capabilities: ServerCapabilities {
             persistent_pty: false,
         },
-        uptime_ms: state.started.elapsed().as_millis() as u64,
     }));
 }
 
