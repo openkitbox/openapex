@@ -7,6 +7,7 @@ pub mod api;
 pub mod config;
 pub mod db;
 pub mod id;
+pub mod schema;
 
 use anyhow::Result;
 use salvo::prelude::*;
