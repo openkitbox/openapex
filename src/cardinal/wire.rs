@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// A streaming chat completion request.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ChatRequest {
     /// Model identifier as cardinal exposes it (`model.list`).
     pub model: String,
@@ -26,7 +26,9 @@ pub struct ChatRequest {
     /// Tools the model may call; omitted from the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolDef>,
-    /// Tool selection policy; defaults to [`ToolChoice::Auto`].
+    /// Tool selection policy; defaults to [`ToolChoice::Auto`]. Serialized
+    /// only alongside a non-empty `tools` array — `tool_choice` without
+    /// tools is meaningless on the wire.
     #[serde(default)]
     pub tool_choice: ToolChoice,
     /// Sampling temperature; omitted when unset.
@@ -56,6 +58,30 @@ impl ChatRequest {
             stream: StreamEnabled,
             stream_options: IncludeUsage,
         }
+    }
+}
+
+impl Serialize for ChatRequest {
+    /// Canonical OpenAI field order; `tools`/`tool_choice` appear only when
+    /// tools are offered, and the optional sampling fields only when set.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut state = serializer.serialize_struct("ChatRequest", 8)?;
+        state.serialize_field("model", &self.model)?;
+        state.serialize_field("messages", &self.messages)?;
+        if !self.tools.is_empty() {
+            state.serialize_field("tools", &self.tools)?;
+            state.serialize_field("tool_choice", &self.tool_choice)?;
+        }
+        if let Some(temperature) = &self.temperature {
+            state.serialize_field("temperature", temperature)?;
+        }
+        if let Some(max_tokens) = &self.max_tokens {
+            state.serialize_field("max_tokens", max_tokens)?;
+        }
+        state.serialize_field("stream", &self.stream)?;
+        state.serialize_field("stream_options", &self.stream_options)?;
+        state.end()
     }
 }
 
@@ -274,10 +300,10 @@ mod tests {
             json!({
                 "model": "glm-4.7",
                 "messages": [{"role": "user", "content": "hi"}],
-                "tool_choice": "auto",
                 "stream": true,
                 "stream_options": {"include_usage": true},
-            })
+            }),
+            "no tools → no tools/tool_choice on the wire"
         );
     }
 

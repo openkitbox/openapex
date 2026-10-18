@@ -8,8 +8,11 @@
 //!   empty), then `Done` for `data: [DONE]`;
 //! - maps a non-2xx response to [`CardinalError::Http`] with a body snippet;
 //! - maps an in-band chunk `error` object to [`CardinalError::Upstream`];
-//! - reports a connection closed *before* `[DONE]` as
-//!   [`CardinalError::EarlyClose`] (the turn is incomplete).
+//! - reports a connection closed before any terminal signal as
+//!   [`CardinalError::EarlyClose`] (the turn is incomplete). A seen
+//!   `finish_reason` *is* a terminal for cardinal's verdict even when
+//!   `[DONE]` never arrives, so an EOF after `Finish` ends the stream
+//!   cleanly with a synthetic `Done` — assembled content is kept.
 //!
 //! # Cancellation
 //!
@@ -97,6 +100,7 @@ impl CardinalClient {
             pending: VecDeque::new(),
             eof: false,
             finished: false,
+            saw_finish: false,
             cancel: None,
         })
     }
@@ -113,6 +117,7 @@ pub struct ChatStream {
     pending: VecDeque<StreamEvent>,
     eof: bool,
     finished: bool,
+    saw_finish: bool,
     cancel: Option<CancellationToken>,
 }
 
@@ -148,8 +153,10 @@ impl Stream for ChatStream {
         let this = self.get_mut();
         loop {
             if let Some(event) = this.pending.pop_front() {
-                if matches!(event, StreamEvent::Done) {
-                    this.finished = true;
+                match event {
+                    StreamEvent::Done => this.finished = true,
+                    StreamEvent::Finish { .. } => this.saw_finish = true,
+                    _ => {}
                 }
                 return Poll::Ready(Some(Ok(event)));
             }
@@ -157,9 +164,16 @@ impl Stream for ChatStream {
                 return Poll::Ready(None);
             }
             if this.eof {
-                // Bytes ran out without [DONE]: flush the verdict as an error
-                // so the runner never treats a truncated stream as a turn.
                 this.finished = true;
+                if this.saw_finish {
+                    // Cardinal's verdict counts any seen finish_reason as a
+                    // terminal even without `[DONE]` — end cleanly so the
+                    // assembled content survives.
+                    return Poll::Ready(Some(Ok(StreamEvent::Done)));
+                }
+                // Bytes ran out without any terminal signal: flush the
+                // verdict as an error so the runner never treats a truncated
+                // stream as a turn.
                 return Poll::Ready(Some(Err(CardinalError::EarlyClose)));
             }
             if let Some(token) = &this.cancel

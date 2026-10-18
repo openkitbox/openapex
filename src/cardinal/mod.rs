@@ -52,8 +52,11 @@ pub enum CardinalError {
     /// failures in-band once the stream has started).
     #[error("cardinal stream error: {0}")]
     Upstream(String),
-    /// The connection closed before `data: [DONE]` arrived — the response is
-    /// incomplete and must not be treated as a successful turn.
+    /// The connection closed before any terminal signal — no `finish_reason`
+    /// and no `data: [DONE]` — so the response is incomplete and must not be
+    /// treated as a successful turn. A seen `finish_reason` counts as a
+    /// terminal even without `[DONE]` (cardinal's verdict) and ends the
+    /// stream cleanly instead.
     #[error("cardinal stream closed before [DONE]")]
     EarlyClose,
     /// A `data:` payload was not valid JSON (fatal, like cardinal's

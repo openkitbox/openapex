@@ -174,7 +174,10 @@ async fn streams_chat_assembles_and_sends_canonical_request() {
     assert_eq!(body["model"], "glm-4.7");
     assert_eq!(body["stream"], true);
     assert_eq!(body["stream_options"]["include_usage"], true);
-    assert_eq!(body["tool_choice"], "auto");
+    assert!(
+        body.get("tool_choice").is_none(),
+        "tool_choice is omitted when no tools are offered"
+    );
 
     server.await.unwrap();
 }
@@ -224,6 +227,36 @@ async fn connection_closed_before_done_is_an_error() {
         "unexpected error: {error}"
     );
     assert!(stream.next_event().await.is_none());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn eof_after_finish_reason_ends_cleanly_without_done() {
+    // Cardinal's verdict: a seen finish_reason is a terminal even when
+    // [DONE] never arrives. Text + Finish + usage-only chunk, then the
+    // socket closes — the assembled message must survive with done=true.
+    let head = sse_head("200 OK");
+    let writes = vec![Write::now(format!(
+        "{head}{}{}{}",
+        event(r#"{"choices":[{"delta":{"content":"done text"},"finish_reason":null}]}"#),
+        event(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#),
+        event(r#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2}}"#)
+    ))];
+    let (addr, _captured, server) = spawn_mock(writes).await;
+
+    let client = CardinalClient::new(format!("http://{addr}"), None).unwrap();
+    let message = client
+        .stream_chat(&test_request())
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert_eq!(message.text, "done text");
+    assert_eq!(message.finish_reason.as_deref(), Some("stop"));
+    assert_eq!(message.usage.map(|usage| usage.completion_tokens), Some(2));
+    assert!(message.done, "synthetic Done must close the assembly");
+    assert!(message.tool_calls.is_empty());
     server.await.unwrap();
 }
 
