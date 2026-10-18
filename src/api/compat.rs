@@ -2,14 +2,17 @@
 //! empty or trivially-derived data. Shapes follow upstream's protocol
 //! (`packages/protocol/openapi.json`); semantics are the ox MVP subset —
 //! no plugins, commands, MCP, skills, forms, or integrations exist, and
-//! config is not yet modeled.
+//! config is not yet modeled. Unlike upstream, these endpoints answer 200
+//! with empty data for unknown locations instead of 404
+//! `LocationNotFoundError` — an ox server owns its directory model, so
+//! keep that divergence here rather than "fixing" endpoints piecemeal.
 
 use salvo::prelude::*;
 use serde_json::json;
 
 /// The request's project directory (upstream `location.ts:73-75`):
 /// `location[directory]` query, then the percent-encoded
-/// /// `x-opencode-directory` header; `None` lets the caller fall back to the
+/// `x-opencode-directory` header; `None` lets the caller fall back to the
 /// server's own directory.
 pub(crate) fn request_directory(req: &Request) -> Option<String> {
     if let Some(directory) = req.query::<String>("location[directory]") {
@@ -19,6 +22,25 @@ pub(crate) fn request_directory(req: &Request) -> Option<String> {
         .get("x-opencode-directory")
         .and_then(|value| value.to_str().ok())
         .map(percent_decode)
+}
+
+/// The request's project directory, canonicalized when it exists on disk,
+/// falling back to the server's directory. Every catalog envelope echoes
+/// this one resolved value so responses stay consistent.
+pub(crate) fn directory_of(req: &Request) -> String {
+    request_directory(req)
+        .map(|raw| {
+            let path = std::path::PathBuf::from(&raw);
+            path.canonicalize().unwrap_or(path).display().to_string()
+        })
+        .unwrap_or_else(fallback_directory)
+}
+
+fn fallback_directory() -> String {
+    std::env::current_dir()
+        .unwrap_or_default()
+        .display()
+        .to_string()
 }
 
 /// `decodeURIComponent` semantics with upstream's raw fallback: `%XX` byte
@@ -68,17 +90,12 @@ pub(crate) async fn config_get(res: &mut Response) {
 }
 
 /// Empty catalog lists: command / mcp / provider / reference / skill /
-/// shell / form / plugin / integration.
+/// shell / pending-forms / plugin / integration.
 macro_rules! empty_catalog {
     ($name:ident, $operation:literal) => {
         #[handler] // operation_id: $operation
         pub(crate) async fn $name(req: &mut Request, res: &mut Response) {
-            let directory = request_directory(req).unwrap_or_else(|| {
-                std::env::current_dir()
-                    .unwrap_or_default()
-                    .display()
-                    .to_string()
-            });
+            let directory = directory_of(req);
             res.render(Json(envelope(&directory, json!([]))));
         }
     };
@@ -90,7 +107,7 @@ empty_catalog!(provider_list, "provider.list");
 empty_catalog!(reference_list, "reference.list");
 empty_catalog!(skill_list, "skill.list");
 empty_catalog!(shell_list, "shell.list");
-empty_catalog!(form_list, "form.list");
+empty_catalog!(pending_form_list, "form.list");
 empty_catalog!(plugin_list, "plugin.list");
 empty_catalog!(integration_list, "integration.list");
 
@@ -98,12 +115,7 @@ empty_catalog!(integration_list, "integration.list");
 /// client, so the catalog is empty.
 #[handler] // operation_id: mcp.resource.catalog
 pub(crate) async fn mcp_resource_catalog(req: &mut Request, res: &mut Response) {
-    let directory = request_directory(req).unwrap_or_else(|| {
-        std::env::current_dir()
-            .unwrap_or_default()
-            .display()
-            .to_string()
-    });
+    let directory = directory_of(req);
     res.render(Json(envelope(
         &directory,
         json!({ "resources": [], "templates": [] }),
@@ -114,20 +126,19 @@ pub(crate) async fn mcp_resource_catalog(req: &mut Request, res: &mut Response) 
 /// a plain `git` invocation; not-a-repo degrades to empty branch names.
 #[handler] // operation_id: vcs.get
 pub(crate) async fn vcs_get(req: &mut Request, res: &mut Response) {
-    let directory = request_directory(req).unwrap_or_else(|| {
-        std::env::current_dir()
-            .unwrap_or_default()
-            .display()
-            .to_string()
-    });
-    let current = tokio::process::Command::new("git")
+    let directory = directory_of(req);
+    let command = tokio::process::Command::new("git")
         .args(["-C", &directory, "rev-parse", "--abbrev-ref", "HEAD"])
-        .output()
-        .await
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-        .unwrap_or_default();
+        .kill_on_drop(true)
+        .output();
+    // A wedged git helper must not park the endpoint; an empty branch is
+    // the documented degradation.
+    let current = match tokio::time::timeout(std::time::Duration::from_secs(2), command).await {
+        Ok(Ok(output)) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+        _ => String::new(),
+    };
     res.render(Json(envelope(
         &directory,
         json!({ "branch": { "current": current, "default": "" } }),
@@ -144,9 +155,15 @@ const FS_SKIP: &[&str] = &[
     "build",
     ".next",
     ".cache",
+    ".venv",
+    "__pycache__",
+    ".svn",
 ];
 
-/// Collect relative file/dir paths under `root` (bounded walk).
+/// Collect relative file/dir paths under `root`, sorted for deterministic
+/// output. Bounded walk: stops at `limit` entries, so very large trees may
+/// be truncated silently (the picker is a suggestion surface, not a listing
+/// contract).
 fn walk(root: &std::path::Path, limit: usize) -> Vec<(String, &'static str)> {
     let mut found = Vec::new();
     let mut frontier = vec![std::path::PathBuf::from("")];
@@ -173,38 +190,29 @@ fn walk(root: &std::path::Path, limit: usize) -> Vec<(String, &'static str)> {
                 found.push((path, "file"));
             }
             if found.len() >= limit {
+                found.sort();
                 return found;
             }
         }
     }
+    found.sort();
     found
 }
 
-fn location_directory(req: &Request) -> String {
-    request_directory(req)
-        .map(|raw| {
-            let path = std::path::PathBuf::from(&raw);
-            path.canonicalize().unwrap_or(path).display().to_string()
-        })
-        .unwrap_or_else(|| {
-            std::env::current_dir()
-                .unwrap_or_default()
-                .display()
-                .to_string()
-        })
-}
-
 /// `GET /api/fs/list?location[directory]=X[&path=Y]` — upstream `fs.list`:
-/// relative entries under the directory.
+/// relative entries under the directory. `path` is absolute or relative to
+/// the requested location (`Path::join` replaces the base for absolute
+/// paths), never relative to the server process.
 #[handler] // operation_id: fs.list
 pub(crate) async fn fs_list(req: &mut Request, res: &mut Response) {
-    let directory = location_directory(req);
-    let root = req
-        .query::<String>("path")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(&directory));
+    let directory = directory_of(req);
+    let root =
+        std::path::Path::new(&directory).join(req.query::<String>("path").unwrap_or_default());
     let limit = req.query::<usize>("limit").unwrap_or(200).min(2_000);
-    let entries = walk(&root, limit)
+    // The walk is plain filesystem I/O; keep it off the async workers.
+    let entries = tokio::task::spawn_blocking(move || walk(&root, limit))
+        .await
+        .unwrap_or_default()
         .into_iter()
         .map(|(path, kind)| json!({ "path": path, "type": kind }))
         .collect::<Vec<_>>();
@@ -212,10 +220,11 @@ pub(crate) async fn fs_list(req: &mut Request, res: &mut Response) {
 }
 
 /// `GET /api/fs/find?location[directory]=X&query=Q[&limit=N]` — upstream
-/// `fs.find`: substring match over the walked paths (the @-file picker).
+/// `fs.find`: case-insensitive substring match over the walked paths (the
+/// @-file picker).
 #[handler] // operation_id: fs.find
 pub(crate) async fn fs_find(req: &mut Request, res: &mut Response) {
-    let directory = location_directory(req);
+    let directory = directory_of(req);
     let Some(query) = req.query::<String>("query") else {
         res.status_code(StatusCode::BAD_REQUEST);
         res.render(Json(json!({
@@ -227,7 +236,10 @@ pub(crate) async fn fs_find(req: &mut Request, res: &mut Response) {
     let kind = req.query::<String>("type");
     let limit = req.query::<usize>("limit").unwrap_or(20).min(500);
     let needle = query.to_lowercase();
-    let entries = walk(std::path::Path::new(&directory), 5_000)
+    let root = std::path::PathBuf::from(&directory);
+    let entries = tokio::task::spawn_blocking(move || walk(&root, 5_000))
+        .await
+        .unwrap_or_default()
         .into_iter()
         .filter(|(path, entry_kind)| {
             path.to_lowercase().contains(&needle)
@@ -252,11 +264,59 @@ pub(crate) fn mount(api: Router) -> Router {
             .push(Router::with_path("reference").get(reference_list))
             .push(Router::with_path("skill").get(skill_list))
             .push(Router::with_path("shell").get(shell_list))
-            .push(Router::with_path("form").get(form_list))
+            .push(Router::with_path("form").get(pending_form_list))
             .push(Router::with_path("plugin").get(plugin_list))
             .push(Router::with_path("integration").get(integration_list))
             .push(Router::with_path("fs/list").get(fs_list))
             .push(Router::with_path("fs/find").get(fs_find))
             .push(Router::with_path("experimental/migration/v1").get(migration_status)),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_decode_table() {
+        let cases = [
+            ("%2Ftmp%2Fx", "/tmp/x"),
+            ("%2f", "/"),        // lowercase hex
+            ("%25", "%"),        // escaped percent
+            ("%E4%B8%AD", "中"), // multibyte UTF-8
+            ("plain", "plain"),  // nothing to decode
+            ("%zz", "%zz"),      // invalid hex → raw
+            ("%2", "%2"),        // truncated → raw
+            ("a%2Fb%2Fc", "a/b/c"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(percent_decode(input), expected, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn walk_skips_noise_and_sorts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("b.txt"), "").unwrap();
+        std::fs::write(dir.path().join("a.txt"), "").unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "").unwrap();
+        let found = walk(dir.path(), 100);
+        let paths = found.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec!["a.txt", "b.txt", "src", "src/lib.rs"],
+            "skip target/, sorted"
+        );
+    }
+
+    #[test]
+    fn walk_respects_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..5 {
+            std::fs::write(dir.path().join(format!("f{i}.txt")), "").unwrap();
+        }
+        assert_eq!(walk(dir.path(), 3).len(), 3);
+    }
 }

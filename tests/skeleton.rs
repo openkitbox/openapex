@@ -246,3 +246,174 @@ async fn unmatched_route_answers_json_not_html() {
     assert_eq!(status, 404);
     assert!(body.contains("NotFoundError"), "body: {body}");
 }
+
+#[tokio::test]
+async fn fs_list_and_find_resolve_paths_against_location() {
+    let (base, handle, _dir) = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    // Build a tree under the system temp dir (the location the requests name).
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src/lib.rs"), "").unwrap();
+    std::fs::write(root.path().join("top.txt"), "").unwrap();
+    let location = format!(
+        "location%5Bdirectory%5D={}",
+        urlencoding_encode(root.path().to_str().unwrap())
+    );
+
+    // Default: relative to the location root.
+    let body: serde_json::Value = client
+        .get(format!("{base}/api/fs/list?{location}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let paths = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(paths.contains(&"top.txt"), "{paths:?}");
+    assert!(paths.contains(&"src/lib.rs"), "{paths:?}");
+
+    // Relative `path` joins the location, not the server process cwd.
+    let body: serde_json::Value = client
+        .get(format!("{base}/api/fs/list?{location}&path=src"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let paths = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, vec!["lib.rs"], "{paths:?}");
+
+    // find matches by substring with the location envelope. The envelope
+    // echoes the CANONICALIZED location (macOS /var → /private/var).
+    let canonical = std::fs::canonicalize(root.path()).unwrap();
+    let body: serde_json::Value = client
+        .get(format!("{base}/api/fs/find?{location}&query=lib"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["data"][0]["path"], "src/lib.rs", "find body: {body}");
+    assert_eq!(body["location"]["directory"], canonical.to_str().unwrap());
+    handle.abort();
+}
+
+/// Minimal percent-encoder for test query values (enough for paths).
+fn urlencoding_encode(raw: &str) -> String {
+    let mut out = String::new();
+    for byte in raw.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn location_get_echoes_requested_directory() {
+    let (base, handle, _dir) = spawn_server().await;
+    let client = reqwest::Client::new();
+    let body: serde_json::Value = client
+        .get(format!(
+            "{base}/api/location?location%5Bdirectory%5D=%2Ftmp%2Fsomewhere"
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["directory"], "/tmp/somewhere", "{body:?}");
+    assert_eq!(body["project"]["canonical"], "/tmp/somewhere");
+    handle.abort();
+}
+
+#[tokio::test]
+async fn catalog_envelope_shape_is_pinned() {
+    let (base, handle, _dir) = spawn_server().await;
+    let client = reqwest::Client::new();
+    for path in ["/api/command", "/api/mcp", "/api/plugin", "/api/form"] {
+        let body: serde_json::Value = client
+            .get(format!("{base}{path}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            body["location"]["directory"].is_string(),
+            "{path}: {body:?}"
+        );
+        assert_eq!(body["data"], serde_json::json!([]), "{path}: {body:?}");
+    }
+    let config: serde_json::Value = client
+        .get(format!("{base}/api/config"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(config, serde_json::json!([]));
+    let migration: serde_json::Value = client
+        .get(format!("{base}/api/experimental/migration/v1"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(migration, serde_json::json!({"status": "completed"}));
+    handle.abort();
+}
+
+#[tokio::test]
+async fn wait_idle_404s_unknown_session_and_204s_when_idle() {
+    let (base, handle, _dir) = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{base}/api/experimental/session/ses_unknown/wait"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+
+    // A real session with no dispatched work is idle: 204, no body.
+    let created: serde_json::Value = client
+        .post(format!("{base}/api/session"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let session_id = created["data"]["id"].as_str().unwrap();
+    let response = client
+        .post(format!("{base}/api/experimental/session/{session_id}/wait"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    handle.abort();
+}

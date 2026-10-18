@@ -2066,11 +2066,11 @@ pub(crate) async fn permission_list(req: &mut Request, depot: &mut Depot, res: &
         invalid_request(res, "Missing sessionID");
         return;
     };
-    if !matches!(load_session(&app.db, &session_id).await, Ok(Some(_))) {
-        session_not_found(res, &session_id);
-        return;
+    match load_session(&app.db, &session_id).await {
+        Ok(Some(_)) => res.render(Json(json!({ "data": [] }))),
+        Ok(None) => session_not_found(res, &session_id),
+        Err(error) => unknown_error(res, &error),
     }
-    res.render(Json(json!({ "data": [] })));
 }
 
 /// `GET /api/session/{sessionID}/form` — upstream `session.form.list`.
@@ -2084,11 +2084,11 @@ pub(crate) async fn form_list(req: &mut Request, depot: &mut Depot, res: &mut Re
         invalid_request(res, "Missing sessionID");
         return;
     };
-    if !matches!(load_session(&app.db, &session_id).await, Ok(Some(_))) {
-        session_not_found(res, &session_id);
-        return;
+    match load_session(&app.db, &session_id).await {
+        Ok(Some(_)) => res.render(Json(json!({ "data": [] }))),
+        Ok(None) => session_not_found(res, &session_id),
+        Err(error) => unknown_error(res, &error),
     }
-    res.render(Json(json!({ "data": [] })));
 }
 
 /// `POST /api/experimental/session/{sessionID}/wait` — upstream
@@ -2103,9 +2103,16 @@ pub(crate) async fn wait_idle(req: &mut Request, depot: &mut Depot, res: &mut Re
         invalid_request(res, "Missing sessionID");
         return;
     };
-    if !matches!(load_session(&app.db, &session_id).await, Ok(Some(_))) {
-        session_not_found(res, &session_id);
-        return;
+    match load_session(&app.db, &session_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            session_not_found(res, &session_id);
+            return;
+        }
+        Err(error) => {
+            unknown_error(res, &error);
+            return;
+        }
     }
     while app.runner.is_active(&session_id) {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;

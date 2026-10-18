@@ -187,6 +187,10 @@ struct SessionHandle {
     parked: Arc<tokio::sync::Mutex<Option<mpsc::Receiver<ActorMsg>>>>,
     /// Cancellation of the busy period in flight, if any.
     cancel: Arc<Mutex<Option<CancellationToken>>>,
+    /// `true` from `dispatch` until the actor installs the busy period's
+    /// cancellation token — covers the gap between enqueue and the actor's
+    /// first poll so `is_active` never reports idle for scheduled work.
+    scheduled: Arc<Mutex<bool>>,
 }
 
 /// Lock a std mutex, recovering from poisoning (a panic in one actor must
@@ -221,12 +225,14 @@ impl Runner {
         }
     }
 
-    /// Whether a busy period is currently in flight (process-local view).
+    /// Whether work is scheduled or a busy period is currently in flight
+    /// (process-local view). `scheduled` bridges the gap between dispatch
+    /// and the actor's first poll installing the cancellation token.
     pub fn is_active(&self, session_id: &str) -> bool {
         self.inner
             .sessions
             .get(session_id)
-            .is_some_and(|handle| lock(&handle.cancel).is_some())
+            .is_some_and(|handle| *lock(&handle.scheduled) || lock(&handle.cancel).is_some())
     }
 
     /// Wake the session's actor for a drain: spawn one if parked, otherwise
@@ -234,15 +240,22 @@ impl Runner {
     /// coalesces enqueues into one busy period.
     pub async fn dispatch(&self, session_id: &str, inbox_id: &str) -> Result<()> {
         let handle = self.handle(session_id);
+        // Mark scheduled BEFORE the send: once the message is in the mailbox
+        // the actor may install the busy period at any point, and `is_active`
+        // must hold continuously from here until the terminal settles.
+        *lock(&handle.scheduled) = true;
         // Send BEFORE taking the parked receiver: a task parking concurrently
         // re-checks the channel under the slot lock, so a message that beat
         // the send is picked up by exactly one side.
-        let _ = handle
+        let sent = handle
             .tx
             .send(ActorMsg::Enqueue {
                 inbox_id: inbox_id.to_owned(),
             })
             .await;
+        if sent.is_err() {
+            *lock(&handle.scheduled) = false;
+        }
         self.spawn_if_parked(session_id, handle).await;
         Ok(())
     }
@@ -282,6 +295,7 @@ impl Runner {
                     tx,
                     parked: Arc::new(tokio::sync::Mutex::new(Some(rx))),
                     cancel: Arc::new(Mutex::new(None)),
+                    scheduled: Arc::new(Mutex::new(false)),
                 }
             })
             .clone()
@@ -460,6 +474,7 @@ impl ActorTask {
                 }
             }
             *lock(&self.handle.cancel) = None;
+            *lock(&self.handle.scheduled) = false;
             // Loop: absorb anything that arrived while the terminal settled.
         }
     }
@@ -491,12 +506,26 @@ impl ActorTask {
                 }
             })
             .await
+            .inspect_err(|error| {
+                tracing::warn!(
+                    session = %self.session_id,
+                    error = %error,
+                    "session directory lookup failed; falling back to server directory"
+                )
+            })
             .ok()
             .flatten();
-        raw.map(std::path::PathBuf::from)
-            .filter(|path| path.is_dir())
-            .map(|path| path.canonicalize().unwrap_or(path))
-            .unwrap_or_else(|| self.inner.directory.clone())
+        match raw.map(std::path::PathBuf::from) {
+            Some(path) if path.is_dir() => path.canonicalize().unwrap_or(path),
+            other => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    directory = ?other,
+                    "session directory missing or gone; falling back to server directory"
+                );
+                self.inner.directory.clone()
+            }
+        }
     }
 
     async fn terminal_interrupted(&self) {
