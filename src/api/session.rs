@@ -1961,10 +1961,18 @@ pub(crate) async fn inbox_update(req: &mut Request, depot: &mut Depot, res: &mut
         .await
     {
         // Upstream `pendingMutation`: any lifecycle conflict on a pending
-        // row surfaces as 409 (including an unknown inbox id).
+        // row surfaces as 409 (including an unknown inbox id). The wire
+        // message is `Pending input cannot change to ${delivery}: ${inboxID}`
+        // with the literal delivery string (session.ts:47-53 + :535).
         conflict_error(
             res,
-            &format!("Pending input cannot change to {delivery:?}"),
+            &format!(
+                "Pending input cannot change to {}: {inbox_id}",
+                match delivery {
+                    crate::schema::inbox::Delivery::Steer => "steer",
+                    crate::schema::inbox::Delivery::Queue => "queue",
+                }
+            ),
             &inbox_id,
         );
         tracing::debug!(session = %session_id, inbox = %inbox_id, error = %error, "inbox update rejected");

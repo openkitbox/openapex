@@ -563,12 +563,13 @@ fn to_session_error(error: &CardinalError) -> SessionError {
 /// Build the OpenAI message list: the system prompt, then the session
 /// transcript in `seq` order.
 ///
-/// Mapping (upstream `SessionModelRequest.baseTranscript`):
-/// - `user`     → `{role: "user", content: joined text parts}` (file
-///   attachments degrade to inline markers; upstream inlines resolved file
-///   content during prompt preparation, which lands in 6b).
-/// - `synthetic`/`system`/`skill` → user-role text (system/skill content is
-///   plain transcript input for the model).
+/// Mapping (upstream `to-llm-message.ts`):
+/// - `user`     → `{role: "user", content: joined text parts}`, dropped
+///   entirely when the assembled content is empty (to-llm-message.ts:274);
+///   file attachments degrade to inline markers (upstream inlines resolved
+///   file content during prompt preparation, which lands in 6b).
+/// - `synthetic`/`skill` → user-role text.
+/// - `system`   → `{role: "system", content}` (to-llm-message.ts:291).
 /// - `assistant` → `{role: "assistant", content: text parts joined,
 ///   tool_calls: from its tool content}`; reasoning content is dropped.
 /// - tool results (`{role: "tool", tool_call_id, content}`) ride in 6b with
@@ -581,12 +582,21 @@ pub(crate) fn build_chat_messages(system: &str, messages: &[Message]) -> Vec<Cha
     }];
     for message in messages {
         match message {
-            Message::User { prompt, .. } => out.push(ChatMessage::User {
-                content: user_prompt_text(prompt),
-            }),
-            Message::Synthetic { text, .. }
-            | Message::System { text, .. }
-            | Message::Skill { text, .. } => out.push(ChatMessage::User {
+            Message::User { prompt, .. } => {
+                let content = user_prompt_text(prompt);
+                if content.is_empty() {
+                    // Upstream: a user message with no assembled content is
+                    // omitted from the transcript.
+                    continue;
+                }
+                out.push(ChatMessage::User { content });
+            }
+            Message::Synthetic { text, .. } | Message::Skill { text, .. } => {
+                out.push(ChatMessage::User {
+                    content: text.clone(),
+                })
+            }
+            Message::System { text, .. } => out.push(ChatMessage::System {
                 content: text.clone(),
             }),
             Message::Assistant(assistant) => {
@@ -656,4 +666,137 @@ async fn load_history(db: &crate::db::Db, session_id: &str) -> Result<Vec<Messag
             Ok(Message::from_row_data(&id, &kind, value)?)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cardinal::wire::Usage;
+    use crate::schema::message::{
+        AssistantContent, AssistantMessage, AssistantTime, Message, TimeCreated,
+    };
+    use crate::schema::support::{ModelRef, Prompt};
+
+    // Gap: upstream usage.ts maps `input` to the NON-cached prompt tokens —
+    // input + cache.read must reconstruct prompt_tokens exactly once.
+    #[test]
+    fn map_tokens_input_excludes_cached_prompt_tokens() {
+        let tokens = map_tokens(Some(Usage {
+            prompt_tokens: 100,
+            completion_tokens: 10,
+            cached_tokens: Some(40),
+            reasoning_tokens: Some(5),
+        }));
+        assert_eq!(tokens.input, 60, "input = prompt_tokens − cached");
+        assert_eq!(tokens.output, 10);
+        assert_eq!(tokens.reasoning, 5);
+        assert_eq!(tokens.cache.read, 40);
+        assert_eq!(
+            tokens.cache.write, 0,
+            "OpenAI-compatible streams never report cache writes"
+        );
+        assert_eq!(tokens.input + tokens.cache.read, 100);
+
+        // Absent usage and absent cache fields settle sanely.
+        let none = map_tokens(None);
+        assert_eq!(
+            (none.input, none.output, none.cache.read, none.cache.write),
+            (0, 0, 0, 0)
+        );
+        let uncached = map_tokens(Some(Usage {
+            prompt_tokens: 7,
+            completion_tokens: 3,
+            cached_tokens: None,
+            reasoning_tokens: None,
+        }));
+        assert_eq!(uncached.input, 7);
+        assert_eq!(uncached.cache.read, 0);
+    }
+
+    fn user_row(id: &str, text: &str) -> Message {
+        Message::User {
+            id: id.to_owned(),
+            metadata: None,
+            time: TimeCreated { created: 1 },
+            prompt: Prompt {
+                text: text.to_owned(),
+                files: None,
+                agents: None,
+                skills: None,
+            },
+        }
+    }
+
+    #[test]
+    fn system_rows_map_to_system_role_and_empty_users_are_dropped() {
+        let assistant = Message::Assistant(Box::new(AssistantMessage {
+            id: "msg_a".to_owned(),
+            metadata: None,
+            time: AssistantTime {
+                created: 2,
+                streamed: None,
+                completed: Some(3),
+            },
+            agent: "build".to_owned(),
+            model: ModelRef {
+                id: "m".to_owned(),
+                provider_id: "p".to_owned(),
+                variant: None,
+            },
+            content: vec![AssistantContent::Text {
+                text: "hi".to_owned(),
+                state: None,
+            }],
+            snapshot: None,
+            finish: None,
+            tokens: None,
+            error: None,
+            cost: None,
+            raw_finish: None,
+            provider_state: None,
+            retry: None,
+        }));
+        let messages = vec![
+            user_row("msg_u1", "question"),
+            user_row("msg_u2", ""), // empty assembled content → dropped
+            Message::System {
+                id: "msg_s".to_owned(),
+                metadata: None,
+                time: TimeCreated { created: 4 },
+                text: "server notice".to_owned(),
+                description: None,
+            },
+            assistant,
+        ];
+        let chat = build_chat_messages("sys", &messages);
+        let system_roles: Vec<&str> = chat
+            .iter()
+            .filter_map(|m| match m {
+                ChatMessage::System { .. } => Some("system"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            system_roles,
+            vec!["system", "system"],
+            "prompt + system row"
+        );
+
+        let user_texts: Vec<&str> = chat
+            .iter()
+            .filter_map(|m| match m {
+                ChatMessage::User { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            user_texts,
+            vec!["question"],
+            "empty user dropped, text kept"
+        );
+
+        assert!(chat.iter().any(
+            |m| matches!(m, ChatMessage::Assistant { content: Some(text), .. } if text == "hi")
+        ));
+    }
 }

@@ -109,8 +109,8 @@ impl Chat for MockChat {
                 Script::Events(mut events) => {
                     events.push(StreamEvent::Done);
                     Ok(Box::pin(EventsStream {
-                        events: events.into_iter().collect(),
-                        hang: None,
+                        events: events.into_iter().map(Step::Event).collect(),
+                        gate: None,
                     }) as BoxChatStream)
                 }
                 Script::TextThenHang(delta, gate) => {
@@ -120,8 +120,15 @@ impl Chat for MockChat {
                         let _ = tx.send(());
                     });
                     Ok(Box::pin(EventsStream {
-                        events: VecDeque::from(vec![StreamEvent::TextDelta(delta.to_owned())]),
-                        hang: Some(rx),
+                        events: VecDeque::from(vec![
+                            Step::Event(StreamEvent::TextDelta(delta.to_owned())),
+                            Step::Wait,
+                            Step::Event(StreamEvent::Finish {
+                                reason: "stop".to_owned(),
+                            }),
+                            Step::Event(StreamEvent::Done),
+                        ]),
+                        gate: Some(rx),
                     }) as BoxChatStream)
                 }
             }
@@ -129,11 +136,20 @@ impl Chat for MockChat {
     }
 }
 
-/// A stream yielding scripted events, then (optionally) holding open until
-/// its gate fires — the interrupt target.
+/// A stream yielding scripted events; a `Wait` marker holds the stream open
+/// until its gate fires, then continues with the remaining events (the
+/// interrupt path drops the stream at the hold point instead).
 struct EventsStream {
-    events: VecDeque<StreamEvent>,
-    hang: Option<oneshot::Receiver<()>>,
+    events: VecDeque<Step>,
+    gate: Option<oneshot::Receiver<()>>,
+}
+
+/// One scripted stream step.
+enum Step {
+    /// Yield this event.
+    Event(StreamEvent),
+    /// Hold until the gate fires (never yields by itself).
+    Wait,
 }
 
 impl Stream for EventsStream {
@@ -141,15 +157,27 @@ impl Stream for EventsStream {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if let Some(event) = this.events.pop_front() {
-            return Poll::Ready(Some(Ok(event)));
-        }
-        match this.hang.as_mut() {
-            Some(done) => match Pin::new(done).poll(cx) {
-                Poll::Pending => Poll::Pending,
-                Poll::Ready(_) => Poll::Ready(None),
-            },
-            None => Poll::Ready(None),
+        loop {
+            match this.events.front() {
+                Some(Step::Event(event)) => {
+                    let event = event.clone();
+                    this.events.pop_front();
+                    return Poll::Ready(Some(Ok(event)));
+                }
+                Some(Step::Wait) => {
+                    let Some(gate) = this.gate.as_mut() else {
+                        return Poll::Ready(None);
+                    };
+                    match Pin::new(gate).poll(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        // Gate fired: drop the marker and continue the script.
+                        Poll::Ready(_) => {
+                            this.events.pop_front();
+                        }
+                    }
+                }
+                None => return Poll::Ready(None),
+            }
         }
     }
 }
@@ -292,7 +320,8 @@ impl Harness {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        panic!("timed out waiting for {what}");
+        let messages = self.messages(session_id).await;
+        panic!("timed out waiting for {what}; messages: {messages:?}");
     }
 
     /// Recorded durable + ephemeral event kinds so far.
@@ -664,7 +693,7 @@ async fn inbox_endpoints_list_patch_and_cancel() {
         })
         .await;
 
-    // Patching an unknown row → 409 (upstream pendingMutation conflict).
+    // Patching an unknown row → 409 with the exact upstream wire string.
     let response = harness
         .client
         .patch(format!("{}/inbox_missing", harness.base.clone() + &inbox))
@@ -673,6 +702,12 @@ async fn inbox_endpoints_list_patch_and_cancel() {
         .await
         .expect("patch");
     assert_eq!(response.status(), 409);
+    let conflict: Value = response.json().await.expect("json");
+    assert_eq!(
+        conflict["message"],
+        "Pending input cannot change to queue: inbox_missing"
+    );
+    assert_eq!(conflict["resource"], "inbox_missing");
 
     // Cancel a still-pending item: 204 + inbox.cancelled, row disappears;
     // cancelling again stays 204 (upstream swallows the conflict).
@@ -755,6 +790,108 @@ async fn compaction_item_fails_not_implemented() {
         })
         .await;
     assert!(kinds.contains(&"session.execution.succeeded".to_owned()));
+}
+
+// ---------------------------------------------------------------------------
+// Queue chaining: a queued head re-opens the entry boundary in the same
+// busy period (llm.ts:109-112) — no dispatch doorbell required
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn queued_items_chain_across_turns_in_one_busy_period() {
+    use ox::schema::inbox::{Delivery, Item, UserPayload};
+
+    let gate = Arc::new(Notify::new());
+    let harness = Harness::spawn(vec![
+        Script::TextThenHang("one", gate.clone()),
+        MockChat::text("two"),
+    ])
+    .await;
+    let session_id = harness.create_session().await;
+
+    // Turn 1 starts and blocks mid-stream.
+    let response = harness
+        .post(
+            &format!("/api/session/{session_id}/prompt"),
+            json!({ "text": "first", "delivery": "queue" }),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    harness
+        .wait_for(&session_id, "assistant started", |messages| {
+            messages
+                .iter()
+                .any(|m| m["type"] == "assistant" && m["time"]["completed"].is_null())
+        })
+        .await;
+
+    // A second queued row lands while turn 1 is in flight — published
+    // straight onto the bus, so no dispatch message follows: only the
+    // drain's own re-opened entry boundary can pick it up.
+    harness
+        .bus
+        .publish(ox::schema::event::SessionEventData::InboxEnqueued {
+            session_id: session_id.clone(),
+            inbox_id: "msg_second".to_owned(),
+            item: Item::User {
+                payload: UserPayload {
+                    prompt: ox::schema::support::Prompt {
+                        text: "second".to_owned(),
+                        files: None,
+                        agents: None,
+                        skills: None,
+                    },
+                    metadata: None,
+                },
+                delivery: Delivery::Queue,
+            },
+        })
+        .await
+        .expect("enqueued");
+
+    // Turn 1 finishes; the drain must chain straight into turn 2.
+    gate.notify_waiters();
+    harness
+        .wait_for(&session_id, "second assistant", |messages| {
+            messages.iter().filter(|m| m["type"] == "assistant").count() == 2
+        })
+        .await;
+
+    // Two turns in ONE busy period: one started/succeeded pair, both
+    // prompts delivered, inbox empty.
+    harness.wait_event("session.execution.succeeded").await;
+    let kinds = harness.event_kinds().await;
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| **k == "session.execution.started")
+            .count(),
+        1,
+        "one busy period"
+    );
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| **k == "session.execution.succeeded")
+            .count(),
+        1,
+        "one terminal"
+    );
+    assert_eq!(harness.chat.requests().len(), 2, "two model calls");
+    let sid = session_id.clone();
+    let pending: i64 = harness
+        .db
+        .conn()
+        .call(move |c| {
+            c.query_row(
+                "SELECT count(*) FROM session_inbox WHERE session_id = ?1",
+                [sid],
+                |row| row.get(0),
+            )
+        })
+        .await
+        .expect("query");
+    assert_eq!(pending, 0, "no stranded inbox rows");
 }
 
 // ---------------------------------------------------------------------------

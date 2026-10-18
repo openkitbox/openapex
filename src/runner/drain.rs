@@ -8,7 +8,9 @@
 //! - Boundary scan (`advanceToStep`): pick the next promotable item — steer
 //!   items first (a compaction control at the head of the steers is unshifted
 //!   ahead of earlier steers), else the oldest queue item at an *input*
-//!   boundary. A queued item on a steer-scoped drain ends the drain.
+//!   boundary. A non-steer pending head re-opens the entry boundary
+//!   (llm.ts:109-112), so queued items chain across turns inside one busy
+//!   period. A queued item on a steer-scoped drain ends the drain.
 //! - Controls: a compaction publishes `inbox.delivered` +
 //!   `compaction.started` (then runs the summary — 6a stubs it as failed); a
 //!   move publishes `inbox.delivered` and would re-root the session (6a
@@ -111,7 +113,8 @@ pub(crate) async fn drain(
     }
 
     // 6a: turns never continue (steps never request tools), so `continuing`
-    // is always false and every boundary after a turn is an input boundary.
+    // is always false and every scan runs at input scope; a queued head
+    // re-opens the entry boundary to chain the next turn.
     // TODO(task 6b): track `continuing` + step numbers for tool-call turns.
     let mut entering = true;
     let mut continuing = false;
@@ -128,12 +131,21 @@ pub(crate) async fn drain(
             Err(error) => return DrainOutcome::Failed(unknown_error(error.to_string())),
         };
 
-        // Upstream guard: a quiet inbox ends the drain; so does a queued item
-        // when this drain itself is steer-scoped (it belongs to the next turn).
         let Some(next) = next else {
             return DrainOutcome::Complete;
         };
-        if !input_scope && next.item.delivery() == Delivery::Queue {
+
+        // llm.ts:109-112: a non-steer pending head re-opens the entry
+        // boundary, so queued items chain across turns within one busy
+        // period — no mailbox doorbell is needed to pick up the next turn.
+        if !continuing && next.item.delivery() != Delivery::Steer {
+            entering = true;
+        }
+
+        // Upstream guard: a quiet inbox ends the drain; so does a queued item
+        // when this drain itself is steer-scoped (it belongs to the next
+        // turn entry, not this pass).
+        if !continuing && scope == Promotable::Steer && next.item.delivery() == Delivery::Queue {
             return DrainOutcome::Complete;
         }
 
@@ -169,13 +181,17 @@ pub(crate) async fn drain(
                     Err(error) => return DrainOutcome::Failed(unknown_error(error.to_string())),
                 };
                 if promoted == 0 {
-                    // Nothing delivered (steer-scoped drain, steers raced away):
-                    // upstream would run a forced step; 6a has no force paths.
+                    // Nothing delivered: at a re-opened entry boundary the
+                    // scanned row raced away between scan and promote
+                    // (cancelled). Upstream would run a forced step; 6a has
+                    // no force paths, so the drain ends.
                     return DrainOutcome::Complete;
                 }
                 match run_turn(ctx, token).await {
                     Ok(TurnOutcome::Ended) => {
-                        // Next boundary scans for the following queued turn.
+                        // The next scan re-opens the entry boundary when the
+                        // head is a queued item (llm.ts:109-112), chaining
+                        // turns inside this busy period.
                         entering = false;
                         continuing = false;
                     }
