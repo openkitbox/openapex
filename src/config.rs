@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-const DEFAULT_CARDINAL_URL: &str = "http://127.0.0.1:4000";
+const DEFAULT_CARDINAL_URL: &str = "http://127.0.0.1:10202";
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
 
 /// Environment variable overrides.
@@ -44,10 +44,12 @@ pub struct ModelEntry {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    /// Base URL of the cardinal LLM gateway.
+    /// Base URL of the cardinal LLM gateway (cardinal's `listen`, e.g.
+    /// `http://127.0.0.1:10202`).
     #[serde(default = "default_cardinal_url")]
     pub cardinal_url: String,
-    /// API key for the cardinal gateway, if it requires one.
+    /// API key for the cardinal gateway (its `gateway_key`). Required unless
+    /// cardinal runs with auth disabled.
     #[serde(default)]
     pub cardinal_key: Option<String>,
     /// Path to the SQLite database file.

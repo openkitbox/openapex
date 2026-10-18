@@ -4,6 +4,7 @@
 //! drive it over HTTP against an ephemeral port.
 
 pub mod api;
+pub mod cardinal;
 pub mod config;
 pub mod db;
 pub mod event_bus;
