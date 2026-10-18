@@ -340,8 +340,8 @@ async fn load_children(db: &Db, parent_id: &str) -> Result<Vec<String>> {
 
 /// The project a session belongs to: the shared `project` table row whose
 /// `worktree` is the directory, else the synthetic `default` project rooted at
-/// `fallback_root`.
-async fn resolve_project(db: &Db, directory: &str, fallback_root: &str) -> (String, String) {
+/// the directory itself (ox has no worktree discovery).
+pub(crate) async fn resolve_project(db: &Db, directory: &str) -> (String, String) {
     if db.table_exists("project").await.unwrap_or(false) {
         let wanted = directory.to_owned();
         let found = db
@@ -359,7 +359,7 @@ async fn resolve_project(db: &Db, directory: &str, fallback_root: &str) -> (Stri
             return (id, directory.to_owned());
         }
     }
-    ("default".to_owned(), fallback_root.to_owned())
+    ("default".to_owned(), directory.to_owned())
 }
 
 /// `subpath` for a location inside a project directory: the relative remainder,
@@ -727,7 +727,11 @@ pub(crate) async fn create(req: &mut Request, depot: &mut Depot, res: &mut Respo
         }
     }
 
-    let root = app.directory.to_string_lossy().into_owned();
+    // Upstream resolves the create directory from the request itself when the
+    // body carries none (`location.ts:73-75`): `location[directory]` query,
+    // then the percent-encoded `x-opencode-directory` header, then the
+    // server's directory.
+    let request_directory = super::compat::request_directory(req);
 
     // Location, metadata and permissions are inherited from the parent the way
     // upstream inherits them in `Session.create`.
@@ -773,8 +777,9 @@ pub(crate) async fn create(req: &mut Request, depot: &mut Depot, res: &mut Respo
                     .location
                     .as_ref()
                     .map(|l| l.directory.clone())
-                    .unwrap_or_else(|| root.clone());
-                let (_, project_directory) = resolve_project(&app.db, &directory, &root).await;
+                    .or(request_directory)
+                    .unwrap_or_else(|| app.directory.to_string_lossy().into_owned());
+                let (_, project_directory) = resolve_project(&app.db, &directory).await;
                 (
                     LocationRef {
                         directory: directory.clone(),
@@ -789,7 +794,7 @@ pub(crate) async fn create(req: &mut Request, depot: &mut Depot, res: &mut Respo
             }
         };
 
-    let (project_id, _) = resolve_project(&app.db, &location.directory, &root).await;
+    let (project_id, _) = resolve_project(&app.db, &location.directory).await;
 
     let event = SessionEventData::SessionCreated {
         session_id: session_id.clone(),

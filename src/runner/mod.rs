@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Result, bail};
 use dashmap::DashMap;
+use rusqlite::OptionalExtension;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -374,10 +375,13 @@ impl ActorTask {
             };
 
             // Busy period: consecutive drains until the inbox is quiet. Every
-            // coalesced drain shares one terminal publication.
+            // coalesced drain shares one terminal publication. The project
+            // directory is the SESSION's directory (the client's project),
+            // not the server process cwd — tools and the system prompt must
+            // operate where the session lives.
             let ctx = drain::DrainCtx {
                 session_id: self.session_id.clone(),
-                directory: self.inner.directory.clone(),
+                directory: self.session_directory().await,
                 config: self.inner.config.clone(),
                 db: self.inner.db.clone(),
                 bus: self.inner.bus.clone(),
@@ -464,6 +468,35 @@ impl ActorTask {
         // The actor is done for good; drop the registry entry so a later
         // dispatch builds a fresh handle instead of messaging a dead mailbox.
         self.inner.sessions.remove(&self.session_id);
+    }
+
+    /// The session's project directory: the `directory` recorded on the
+    /// session row (the client's project), canonicalized; falls back to the
+    /// server's directory when the row predates the column or the path is
+    /// gone.
+    async fn session_directory(&self) -> std::path::PathBuf {
+        let raw: Option<String> = self
+            .inner
+            .db
+            .conn()
+            .call({
+                let session_id = self.session_id.clone();
+                move |c| {
+                    c.query_row(
+                        "SELECT directory FROM session_v2 WHERE id = ?1",
+                        rusqlite::params![session_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                }
+            })
+            .await
+            .ok()
+            .flatten();
+        raw.map(std::path::PathBuf::from)
+            .filter(|path| path.is_dir())
+            .map(|path| path.canonicalize().unwrap_or(path))
+            .unwrap_or_else(|| self.inner.directory.clone())
     }
 
     async fn terminal_interrupted(&self) {

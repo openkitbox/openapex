@@ -17,6 +17,7 @@ use crate::event_bus::EventBus;
 use crate::id::now_millis;
 use crate::runner::Runner;
 
+pub mod compat;
 pub mod event;
 pub mod session;
 
@@ -109,15 +110,28 @@ struct LocationProject {
 }
 
 #[handler] // operation_id: location.get
-async fn location_get(depot: &mut Depot, res: &mut Response) {
+async fn location_get(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let Some(state) = state(depot, res) else {
         return;
     };
-    let directory = state.directory.to_string_lossy().into_owned();
+    // Upstream `location.get` echoes the REQUESTED directory (deepObject
+    // `location[directory]` query), resolving its project; the client anchors
+    // the session's project on this response.
+    let requested = req
+        .query::<String>("location[directory]")
+        .map(|raw| {
+            std::path::PathBuf::from(&raw)
+                .canonicalize()
+                .unwrap_or(std::path::PathBuf::from(&raw))
+        })
+        .unwrap_or_else(|| state.directory.clone());
+    let directory = requested.to_string_lossy().into_owned();
+    let (project_id, project_directory) =
+        crate::api::session::resolve_project(&state.db, &directory).await;
     res.render(Json(LocationInfo {
         project: LocationProject {
-            id: "default".to_owned(),
-            directory: directory.clone(),
+            id: project_id,
+            directory: project_directory,
             canonical: directory.clone(),
         },
         directory,
@@ -389,6 +403,7 @@ pub fn build_router(state: AppState) -> Router {
                 .push(Router::with_path("model").get(model_list))
                 .push(Router::with_path("agent").get(agent_list))
                 .push(Router::with_path("event").get(event::subscribe))
+                .push(compat::mount(Router::new()))
                 .push(
                     Router::with_path("experimental/session/{sessionID}/wait")
                         .post(session::wait_idle),
