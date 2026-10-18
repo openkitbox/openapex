@@ -13,13 +13,18 @@ use serde::Serialize;
 
 use crate::config::Config;
 use crate::db::Db;
+use crate::event_bus::EventBus;
 use crate::id::now_millis;
+
+pub mod session;
 
 /// Shared application state, injected via `salvo::affix_state`.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Config,
     pub db: Db,
+    /// In-process event bus; every session mutation is published through it.
+    pub bus: EventBus,
     /// Working directory, canonicalized once at startup.
     pub directory: PathBuf,
 }
@@ -376,6 +381,29 @@ pub fn build_router(state: AppState) -> Router {
             .push(Router::with_path("location").get(location_get))
             .push(Router::with_path("project").get(project_list))
             .push(Router::with_path("model").get(model_list))
-            .push(Router::with_path("agent").get(agent_list)),
+            .push(Router::with_path("agent").get(agent_list))
+            .push(
+                Router::with_path("session")
+                    .get(session::list)
+                    .post(session::create)
+                    .push(Router::with_path("active").get(session::active))
+                    .push(
+                        Router::with_path("{sessionID}")
+                            .get(session::get)
+                            .patch(session::update)
+                            .delete(session::remove)
+                            .push(Router::with_path("fork").post(session::fork))
+                            .push(Router::with_path("view").post(session::view))
+                            .push(Router::with_path("agent").post(session::switch_agent))
+                            .push(Router::with_path("model").post(session::switch_model))
+                            .push(
+                                Router::with_path("message")
+                                    .get(session::message_list)
+                                    .push(
+                                        Router::with_path("{messageID}").get(session::message_get),
+                                    ),
+                            ),
+                    ),
+            ),
     )
 }

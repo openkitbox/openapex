@@ -185,6 +185,7 @@ async fn project_list_reads_upstream_project_table() {
 
     let state = AppState {
         config: config.clone(),
+        bus: ox::event_bus::EventBus::new(db.clone()),
         db,
         directory: std::env::current_dir().unwrap(),
     };

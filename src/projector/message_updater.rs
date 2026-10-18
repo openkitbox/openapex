@@ -16,7 +16,7 @@ use crate::schema::message::{
     Compaction, CompactionCompleted, CompactionMessage, IdleOutcome, LocationSwitch, Message,
     TimeCreated, ToolState, ToolTime,
 };
-use crate::schema::support::{FinishReason, Record};
+use crate::schema::support::{FinishReason, ModelRef, Record};
 
 use super::{apply_usage, insert_message, touch};
 
@@ -155,6 +155,33 @@ fn load_location(tx: &Connection, session_id: &str) -> Result<Option<LocationSwi
     ))
 }
 
+/// Read the session row's current `agent` (upstream `getAgent`).
+/// `None` covers both a missing row and a NULL column.
+fn load_session_agent(tx: &Connection, session_id: &str) -> Result<Option<String>> {
+    let raw: Option<Option<String>> = tx
+        .query_row(
+            "SELECT agent FROM session_v2 WHERE id = ?1",
+            rusqlite::params![session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    Ok(raw.flatten())
+}
+
+/// Read the session row's current `model` JSON (upstream `getModel`).
+fn load_session_model(tx: &Connection, session_id: &str) -> Result<Option<ModelRef>> {
+    let raw: Option<Option<String>> = tx
+        .query_row(
+            "SELECT model FROM session_v2 WHERE id = ?1",
+            rusqlite::params![session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?;
+    raw.flatten()
+        .map(|s| Ok(serde_json::from_str(&s)?))
+        .transpose()
+}
+
 /// Persist a compaction message row (UPDATE existing id, else INSERT).
 fn store_compaction(
     tx: &Connection,
@@ -235,6 +262,46 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                     project_id: Some(payload.project_id.clone()),
                     subpath: payload.subpath.clone(),
                 },
+                previous,
+            };
+            insert_message(tx, session_id, seq, &msg)?;
+        }
+
+        E::SessionAgentSelected {
+            session_id,
+            agent,
+            previous,
+        } => {
+            // Append an `agent-switched` message; `previous` falls back to the
+            // session row (read before the projector updates it below).
+            let previous = match previous {
+                Some(agent) => Some(agent.clone()),
+                None => load_session_agent(tx, session_id)?,
+            };
+            let msg = Message::AgentSwitched {
+                id: id::from_event(&env.id),
+                metadata: env.metadata.clone(),
+                time: TimeCreated { created },
+                agent: agent.clone(),
+                previous,
+            };
+            insert_message(tx, session_id, seq, &msg)?;
+        }
+
+        E::SessionModelSelected {
+            session_id,
+            model,
+            previous,
+        } => {
+            let previous = match previous {
+                Some(model) => Some(model.clone()),
+                None => load_session_model(tx, session_id)?,
+            };
+            let msg = Message::ModelSwitched {
+                id: id::from_event(&env.id),
+                metadata: env.metadata.clone(),
+                time: TimeCreated { created },
+                model: model.clone(),
                 previous,
             };
             insert_message(tx, session_id, seq, &msg)?;

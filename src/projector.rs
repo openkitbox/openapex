@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use crate::schema::event::{EventEnvelope, InterruptReason, SessionEventData};
 use crate::schema::inbox::{Delivery, Item};
 use crate::schema::message::{IdleOutcome, Message, TimeCreated};
-use crate::schema::support::{Finite, MoneyUsd, TokenUsage};
+use crate::schema::support::{Finite, ForkBoundary, MoneyUsd, TokenUsage};
 
 /// Secondary effects to run after the durable transaction commits.
 pub enum PostCommit {
@@ -157,6 +157,60 @@ pub fn project(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result
             });
         }
 
+        // Session-selection / metadata events: append the projected message
+        // first (it needs the pre-update row for `previous`), then update the
+        // session columns.
+        E::SessionAgentSelected {
+            session_id, agent, ..
+        } => {
+            message_updater::run(tx, env)?;
+            tx.execute(
+                "UPDATE session_v2 SET agent = ?2, time_updated = ?3 WHERE id = ?1",
+                rusqlite::params![session_id, agent, env.created],
+            )?;
+        }
+        E::SessionModelSelected {
+            session_id, model, ..
+        } => {
+            message_updater::run(tx, env)?;
+            tx.execute(
+                "UPDATE session_v2 SET model = ?2, time_updated = ?3 WHERE id = ?1",
+                rusqlite::params![session_id, to_json(model)?, env.created],
+            )?;
+        }
+        E::SessionMetadataUpdated {
+            session_id,
+            metadata,
+        } => {
+            tx.execute(
+                "UPDATE session_v2 SET metadata = ?2, time_updated = ?3 WHERE id = ?1",
+                rusqlite::params![session_id, to_json(metadata)?, env.created],
+            )?;
+        }
+        E::SessionPermissions {
+            session_id,
+            permissions,
+        } => {
+            tx.execute(
+                "UPDATE session_v2 SET permission = ?2, time_updated = ?3 WHERE id = ?1",
+                rusqlite::params![session_id, to_json(permissions)?, env.created],
+            )?;
+        }
+        E::SessionViewed { session_id, idle } => {
+            // Monotone watermark: a duplicate or stale view never regresses,
+            // and a terminal event committing after the viewer's observation
+            // keeps the newer idle transition unread. `time_updated` is left
+            // unchanged (self-assignment).
+            tx.execute(
+                "UPDATE session_v2 SET
+                   time_viewed = max(?2, coalesce(time_viewed, ?2)),
+                   time_updated = time_updated
+                 WHERE id = ?1",
+                rusqlite::params![session_id, idle],
+            )?;
+        }
+        E::SessionForked { .. } => project_fork(tx, env)?,
+
         // Message-updater events.
         E::SessionSynthetic { .. }
         | E::SessionRetryScheduled { .. }
@@ -187,10 +241,6 @@ pub fn project(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result
             }
         }
 
-        // Not-yet-projected or ephemeral-only events.
-        E::SessionForked { .. } => {
-            // TODO(task 4): fork projection copies messages up to the boundary.
-        }
         E::SessionMoved {
             session_id,
             payload,
@@ -498,6 +548,230 @@ pub(crate) fn insert_message(
             message.time_created(),
             data,
         ],
+    )?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Fork projection (packages/core/src/session/projector.ts projectFork)
+// ---------------------------------------------------------------------------
+
+/// Columns copied verbatim from the parent row (`model`, `metadata`,
+/// `permission` are TEXT blobs of JSON, so no re-encoding is needed).
+type ParentRow = (
+    String,         // project_id
+    Option<String>, // workspace_id
+    String,         // directory
+    Option<String>, // path
+    Option<String>, // title
+    Option<String>, // agent
+    Option<String>, // model
+    Option<String>, // metadata
+    Option<String>, // permission
+    String,         // version
+);
+
+/// `forkTitle`: append ` (fork #N)` to the parent's title, incrementing an
+/// existing counter. `None` stays `None` (no title to fork).
+fn fork_title(title: Option<&str>) -> Option<String> {
+    let value = title?;
+    if let Some(open) = value.rfind(" (fork #")
+        && value.ends_with(')')
+    {
+        let head = &value[..open];
+        let digits = &value[open + " (fork #".len()..value.len() - 1];
+        if !digits.is_empty()
+            && digits.chars().all(|c| c.is_ascii_digit())
+            && let Ok(n) = digits.parse::<u64>()
+        {
+            return Some(format!("{head} (fork #{})", n + 1));
+        }
+    }
+    Some(format!("{value} (fork #1)"))
+}
+
+/// projectFork: insert the forked session row, copy the parent's settled
+/// history up to the boundary, and reserve the child's durable sequence.
+fn project_fork(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<()> {
+    let SessionEventData::SessionForked {
+        session_id,
+        parent_id,
+        boundary,
+        ..
+    } = &env.data
+    else {
+        bail!("project_fork called with {}", env.kind);
+    };
+
+    let parent: Option<ParentRow> = tx
+        .query_row(
+            "SELECT project_id, workspace_id, directory, path, title, agent,
+                    model, metadata, permission, version
+             FROM session_v2 WHERE id = ?1",
+            rusqlite::params![parent_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            },
+        )
+        .optional()?;
+    let (
+        project_id,
+        workspace_id,
+        directory,
+        path,
+        title,
+        agent,
+        model,
+        metadata,
+        permission,
+        version,
+    ) = parent.ok_or_else(|| anyhow!("Fork parent session not found: {parent_id}"))?;
+
+    let boundary_message_id = match boundary {
+        ForkBoundary::Before { message_id } | ForkBoundary::Through { message_id } => message_id,
+    };
+    let boundary_seq: Option<i64> = tx
+        .query_row(
+            "SELECT seq FROM session_message WHERE session_id = ?1 AND id = ?2",
+            rusqlite::params![parent_id, boundary_message_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let boundary_seq = boundary_seq
+        .ok_or_else(|| anyhow!("Fork boundary message not found: {boundary_message_id}"))?;
+
+    // Last message seq included in the copy ("before" is exclusive).
+    let copied_seq: Option<i64> = tx
+        .query_row(
+            if matches!(boundary, ForkBoundary::Before { .. }) {
+                "SELECT seq FROM session_message WHERE session_id = ?1 AND seq < ?2
+                 ORDER BY seq DESC LIMIT 1"
+            } else {
+                "SELECT seq FROM session_message WHERE session_id = ?1 AND seq <= ?2
+                 ORDER BY seq DESC LIMIT 1"
+            },
+            rusqlite::params![parent_id, boundary_seq],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    // Forked row: new slug, cost/tokens zeroed (column defaults), location and
+    // settings inherited from the parent. Upstream `.onConflictDoNothing()`
+    // maps to `INSERT OR IGNORE`; a pre-existing row is a defect.
+    let n = tx.execute(
+        "INSERT OR IGNORE INTO session_v2
+         (id, project_id, workspace_id, parent_id, fork_session_id, fork_boundary,
+          slug, directory, path, title, agent, model, metadata, permission, version,
+          time_created, time_updated)
+         VALUES (?1,?2,?3,NULL,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)",
+        rusqlite::params![
+            session_id,
+            project_id,
+            workspace_id,
+            parent_id,
+            to_json(boundary)?,
+            crate::slug::create(),
+            directory,
+            path,
+            fork_title(title.as_deref()),
+            agent,
+            model,
+            metadata,
+            permission,
+            version,
+            env.created,
+        ],
+    )?;
+    if n == 0 {
+        bail!("SessionAlreadyProjected: `{session_id}` already exists");
+    }
+
+    // TODO(instructions): `instructionEntries` / `instructions` snapshots need
+    // the instruction tables, which are out of scope for this task.
+
+    let Some(copied_seq) = copied_seq else {
+        return Ok(());
+    };
+
+    // Copy settled history: rows up to `copied_seq`, skipping active
+    // projections (running assistant/shell/compaction stay on the parent).
+    const FORK_BATCH_SIZE: usize = 500;
+    let msg_prefix = crate::id::from_event(&env.id);
+    let mut cursor: i64 = -1;
+    loop {
+        let mut stmt = tx.prepare(
+            "SELECT id, type, seq, time_created, time_updated, data
+             FROM session_message
+             WHERE session_id = ?1 AND seq > ?2 AND seq <= ?3
+               AND (type != 'assistant'
+                    OR json_extract(data, '$.time.completed') IS NOT NULL)
+               AND (type != 'shell'
+                    OR json_extract(data, '$.status') != 'running')
+               AND (type != 'compaction'
+                    OR json_extract(data, '$.status') != 'running')
+             ORDER BY seq ASC
+             LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(
+            rusqlite::params![parent_id, cursor, copied_seq, FORK_BATCH_SIZE as i64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            },
+        )?;
+        let mut batch = Vec::new();
+        for row in rows {
+            batch.push(row?);
+        }
+        if batch.is_empty() {
+            break;
+        }
+        cursor = batch
+            .last()
+            .map(|(_, _, seq, _, _, _)| *seq)
+            .ok_or_else(|| anyhow!("fork copy: empty batch"))?;
+        drop(stmt);
+        for (_old_id, kind, seq, time_created, time_updated, data) in &batch {
+            tx.execute(
+                "INSERT INTO session_message
+                 (id, session_id, type, seq, time_created, time_updated, data)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                rusqlite::params![
+                    format!("{msg_prefix}_{seq}"),
+                    session_id,
+                    kind,
+                    seq,
+                    time_created,
+                    time_updated,
+                    data,
+                ],
+            )?;
+        }
+    }
+
+    // reserveSequence: the forked event already sits at seq 0 (allocated by
+    // the durable commit); never regress it.
+    tx.execute(
+        "INSERT INTO event_sequence (aggregate_id, seq) VALUES (?1, ?2)
+         ON CONFLICT(aggregate_id) DO UPDATE SET seq = max(seq, excluded.seq)",
+        rusqlite::params![session_id, copied_seq],
     )?;
     Ok(())
 }

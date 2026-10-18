@@ -10,6 +10,7 @@ pub mod event_bus;
 pub mod id;
 pub mod projector;
 pub mod schema;
+pub mod slug;
 
 use anyhow::Result;
 use salvo::prelude::*;
@@ -17,6 +18,7 @@ use salvo::prelude::*;
 use crate::api::AppState;
 use crate::config::Config;
 use crate::db::Db;
+use crate::event_bus::EventBus;
 
 /// Build application state: open the DB, run migrations, and canonicalize
 /// the working directory once (falls back to the raw path on error).
@@ -24,9 +26,11 @@ pub async fn build_state(config: Config) -> Result<AppState> {
     let db = Db::open(&config.db_path).await?;
     let cwd = std::env::current_dir()?;
     let directory = cwd.canonicalize().unwrap_or(cwd);
+    let bus = EventBus::new(db.clone());
     Ok(AppState {
         config,
         db,
+        bus,
         directory,
     })
 }

@@ -62,14 +62,16 @@ fn now_millis() -> i64 {
 }
 
 /// An event bus with per-aggregate durable sequencing and broadcast.
+#[derive(Clone)]
 pub struct EventBus {
     db: Db,
     tx: broadcast::Sender<EventEnvelope>,
     /// Per-aggregate serialization for durable commit.
     locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     /// Monotonic counter so `id::id("evt")` is strictly ascending within a
-    /// process even when multiple events share the same millisecond.
-    counter: AtomicU64,
+    /// process even when multiple events share the same millisecond. Shared
+    /// across clones so every publisher draws from one sequence.
+    counter: Arc<AtomicU64>,
 }
 
 impl EventBus {
@@ -79,7 +81,7 @@ impl EventBus {
             db,
             tx,
             locks: DashMap::new(),
-            counter: AtomicU64::new(0),
+            counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -318,6 +320,30 @@ impl EventBus {
         Ok(result)
     }
 
+    /// Purge an aggregate's durable log: the `event_sequence` watermark and
+    /// all `event` rows (upstream `Bus.remove`, called by `session.remove`).
+    pub async fn remove(&self, aggregate_id: &str) -> Result<()> {
+        let agg = aggregate_id.to_string();
+        let db = self.db.conn().clone();
+        db.call(move |conn| -> rusqlite::Result<()> {
+            let tx = conn.transaction()?;
+            tx.execute(
+                "DELETE FROM event_sequence WHERE aggregate_id = ?1",
+                rusqlite::params![agg],
+            )?;
+            tx.execute(
+                "DELETE FROM event WHERE aggregate_id = ?1",
+                rusqlite::params![agg],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+        .context("remove aggregate event log")?;
+        self.locks.remove(aggregate_id);
+        Ok(())
+    }
+
     /// Access the underlying connection (tests / read-only helpers).
     pub fn db_conn(&self) -> &tokio_rusqlite::Connection {
         self.db.conn()
@@ -354,6 +380,11 @@ pub(crate) fn session_id_of(data: &SessionEventData) -> Option<&str> {
         | E::SessionRenamed { session_id, .. }
         | E::SessionDeleted { session_id }
         | E::SessionForked { session_id, .. }
+        | E::SessionAgentSelected { session_id, .. }
+        | E::SessionModelSelected { session_id, .. }
+        | E::SessionMetadataUpdated { session_id, .. }
+        | E::SessionPermissions { session_id, .. }
+        | E::SessionViewed { session_id, .. }
         | E::SessionUsageRecorded { session_id, .. }
         | E::SessionUsageUpdated { session_id, .. }
         | E::SessionSynthetic { session_id, .. }

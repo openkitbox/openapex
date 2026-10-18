@@ -1,0 +1,1136 @@
+//! Integration tests for the session lifecycle endpoints (Task 4).
+//!
+//! Each test boots the real router on an ephemeral port (same pattern as
+//! `tests/skeleton.rs`) and drives it over HTTP. Tests that need to seed
+//! history publish durable events directly on the same in-process event bus
+//! the server uses, so the projections and the API stay consistent.
+
+use std::net::TcpListener as StdTcpListener;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use ox::config::Config;
+use ox::db::Db;
+use ox::event_bus::EventBus;
+use ox::schema::event::SessionEventData;
+use ox::schema::inbox::{Delivery, Item, UserPayload};
+use ox::schema::support::{FinishReason, Finite, ModelRef, Prompt, TokenCache, TokenUsage};
+use rusqlite::OptionalExtension;
+use rusqlite::types::Value as SqlValue;
+use salvo::prelude::*;
+use serde_json::{Value, json};
+use tempfile::TempDir;
+use tokio::task::JoinHandle;
+
+// ---------------------------------------------------------------------------
+// Harness
+// ---------------------------------------------------------------------------
+
+fn free_port() -> u16 {
+    StdTcpListener::bind("127.0.0.1:0")
+        .expect("bind ephemeral port")
+        .local_addr()
+        .expect("local addr")
+        .port()
+}
+
+struct Harness {
+    base: String,
+    client: reqwest::Client,
+    db: Db,
+    bus: EventBus,
+    handle: JoinHandle<()>,
+    _dir: TempDir,
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+impl Harness {
+    async fn spawn() -> Self {
+        let port = free_port();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("ox.db");
+        let config = Config {
+            db_path,
+            listen: format!("127.0.0.1:{port}"),
+            ..Config::default()
+        };
+        let state = ox::build_state(config.clone()).await.expect("build state");
+        let db = state.db.clone();
+        let bus = state.bus.clone();
+        let router = ox::build_router(state);
+        let listen: String = config.listen.clone();
+        let handle = tokio::spawn(async move {
+            let acceptor = TcpListener::new(listen).bind().await;
+            Server::new(acceptor).serve(router).await;
+        });
+
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{port}");
+        let mut ready = false;
+        for _ in 0..50 {
+            if client.get(format!("{base}/api/info")).send().await.is_ok() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(ready, "server at {base} never became ready");
+
+        Self {
+            base,
+            client,
+            db,
+            bus,
+            handle,
+            _dir: dir,
+        }
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base)
+    }
+
+    async fn get(&self, path: &str) -> reqwest::Response {
+        self.client
+            .get(self.url(path))
+            .send()
+            .await
+            .expect("GET request")
+    }
+
+    async fn post(&self, path: &str, body: Value) -> reqwest::Response {
+        self.client
+            .post(self.url(path))
+            .json(&body)
+            .send()
+            .await
+            .expect("POST request")
+    }
+
+    async fn patch(&self, path: &str, body: Value) -> reqwest::Response {
+        self.client
+            .patch(self.url(path))
+            .json(&body)
+            .send()
+            .await
+            .expect("PATCH request")
+    }
+
+    async fn delete(&self, path: &str) -> reqwest::Response {
+        self.client
+            .delete(self.url(path))
+            .send()
+            .await
+            .expect("DELETE request")
+    }
+
+    /// Create a session over HTTP and return its id.
+    async fn create(&self, body: Value) -> String {
+        let resp = self.post("/api/session", body).await;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "session.create");
+        let body: Value = resp.json().await.expect("create json");
+        body["data"]["id"]
+            .as_str()
+            .expect("created session id")
+            .to_owned()
+    }
+
+    /// `session.get` and unwrap the `data` envelope.
+    async fn session_info(&self, session_id: &str) -> Value {
+        let resp = self.get(&format!("/api/session/{session_id}")).await;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "session.get");
+        let body: Value = resp.json().await.expect("get json");
+        body["data"].clone()
+    }
+
+    /// Publish a durable event on the server's bus.
+    async fn publish(&self, event: SessionEventData) {
+        self.bus.publish(event).await.expect("publish event");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Direct database helpers
+// ---------------------------------------------------------------------------
+
+async fn query_one<T, F>(db: &Db, sql: &str, params: Vec<SqlValue>, f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T> + Send + 'static,
+{
+    let sql = sql.to_owned();
+    db.conn()
+        .call(move |c| {
+            c.query_row(sql.as_str(), rusqlite::params_from_iter(params.iter()), f)
+                .optional()
+        })
+        .await
+        .expect("query_one")
+}
+
+async fn query_all<T, F>(db: &Db, sql: &str, params: Vec<SqlValue>, f: F) -> Vec<T>
+where
+    T: Send + 'static,
+    F: Fn(&rusqlite::Row<'_>) -> rusqlite::Result<T> + Send + 'static,
+{
+    let sql = sql.to_owned();
+    db.conn()
+        .call(move |c| -> rusqlite::Result<Vec<T>> {
+            let mut stmt = c.prepare(sql.as_str())?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(params.iter()), f)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await
+        .expect("query_all")
+}
+
+async fn count_rows(db: &Db, sql: &str, params: Vec<SqlValue>) -> i64 {
+    query_one(db, sql, params, |row| row.get(0))
+        .await
+        .expect("count")
+}
+
+/// `SELECT <column> FROM session_v2 WHERE id = ?` as text.
+async fn session_text(db: &Db, session_id: &str, column: &str) -> Option<String> {
+    let sql = format!("SELECT {column} FROM session_v2 WHERE id = ?1");
+    query_one(
+        db,
+        &sql,
+        vec![SqlValue::Text(session_id.to_owned())],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .await
+    .flatten()
+}
+
+// ---------------------------------------------------------------------------
+// History seeding (bus-level, mirrors what the prompt/step endpoints will do)
+// ---------------------------------------------------------------------------
+
+/// Admit and deliver a user message through the inbox, exactly as
+/// `session.prompt` will. Returns the message id.
+async fn push_user_message(bus: &EventBus, session_id: &str, text: &str) -> String {
+    let message_id = ox::id::id("msg");
+    bus.publish(SessionEventData::InboxEnqueued {
+        session_id: session_id.to_owned(),
+        inbox_id: message_id.clone(),
+        item: Item::User {
+            payload: UserPayload {
+                prompt: Prompt {
+                    text: text.to_owned(),
+                    files: None,
+                    agents: None,
+                    skills: None,
+                },
+                metadata: None,
+            },
+            delivery: Delivery::Queue,
+        },
+    })
+    .await
+    .expect("enqueue user message");
+    bus.publish(SessionEventData::InboxDelivered {
+        session_id: session_id.to_owned(),
+        inbox_id: message_id.clone(),
+    })
+    .await
+    .expect("deliver user message");
+    message_id
+}
+
+/// Start (and optionally settle) an assistant message. Returns its id.
+async fn push_assistant_message(bus: &EventBus, session_id: &str, settle: bool) -> String {
+    let message_id = ox::id::id("msg");
+    let started = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    bus.publish(SessionEventData::StepStarted {
+        session_id: session_id.to_owned(),
+        assistant_message_id: message_id.clone(),
+        agent: "build".to_owned(),
+        model: ModelRef {
+            id: "model".to_owned(),
+            provider_id: "provider".to_owned(),
+            variant: None,
+        },
+        snapshot: None,
+        started,
+    })
+    .await
+    .expect("step started");
+    if settle {
+        bus.publish(SessionEventData::StepEnded {
+            session_id: session_id.to_owned(),
+            assistant_message_id: message_id.clone(),
+            finish: FinishReason::Stop,
+            raw_finish: None,
+            provider_state: None,
+            cost: Finite::Int(0),
+            tokens: TokenUsage {
+                input: 3,
+                output: 4,
+                reasoning: 0,
+                cache: TokenCache { read: 0, write: 0 },
+            },
+            snapshot: None,
+            files: None,
+        })
+        .await
+        .expect("step ended");
+    }
+    message_id
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_get_list_update_delete_round_trip() {
+    let h = Harness::spawn().await;
+
+    let session_id = h.create(json!({ "title": "hello" })).await;
+    assert!(session_id.starts_with("ses_"), "id {session_id}");
+
+    // session.create returns the full Session.Info (`additionalProperties:
+    // false`: exactly these keys for a titled session).
+    let info = h.session_info(&session_id).await;
+    let mut keys: Vec<&str> = info
+        .as_object()
+        .expect("info object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "cost",
+            "id",
+            "location",
+            "projectID",
+            "time",
+            "title",
+            "tokens"
+        ],
+        "Session.Info key set"
+    );
+    assert_eq!(info["id"], json!(session_id));
+    assert_eq!(info["title"], json!("hello"));
+    assert_eq!(info["projectID"], json!("default"));
+    assert_eq!(info["cost"], json!(0));
+    assert_eq!(
+        info["tokens"],
+        json!({
+            "input": 0, "output": 0, "reasoning": 0,
+            "cache": {"read": 0, "write": 0},
+        })
+    );
+    assert!(info["time"]["created"].as_i64().is_some());
+    assert!(info["time"]["updated"].as_i64().is_some());
+    assert!(info["time"].get("idle").is_none());
+    assert_eq!(info["location"].as_object().expect("location").len(), 1);
+
+    // DB row exists with the generated id.
+    let n = count_rows(
+        &h.db,
+        "SELECT count(*) FROM session_v2 WHERE id = ?1",
+        vec![SqlValue::Text(session_id.clone())],
+    )
+    .await;
+    assert_eq!(n, 1);
+
+    // session.list → SessionsResponse envelope with our session + cursors.
+    let listed: Value = h.get("/api/session").await.json().await.expect("list json");
+    let data = listed["data"].as_array().expect("data array");
+    assert!(
+        data.iter().any(|s| s["id"] == json!(session_id)),
+        "list must contain the created session"
+    );
+    assert!(listed["cursor"].is_object());
+    assert!(listed["cursor"]["previous"].is_string());
+    assert!(listed["cursor"]["next"].is_string());
+
+    // session.update → 204, and the title sticks.
+    let resp = h
+        .patch(
+            &format!("/api/session/{session_id}"),
+            json!({"title": "renamed"}),
+        )
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(h.session_info(&session_id).await["title"], json!("renamed"));
+
+    // Metadata and permissions round-trip through their events.
+    let resp = h
+        .patch(
+            &format!("/api/session/{session_id}"),
+            json!({"metadata": {"origin": "test"}}),
+        )
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        h.session_info(&session_id).await["metadata"],
+        json!({"origin": "test"})
+    );
+
+    let resp = h
+        .patch(
+            &format!("/api/session/{session_id}"),
+            json!({"permissions": [{"action": "read", "resource": "/tmp", "effect": "allow"}]}),
+        )
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        h.session_info(&session_id).await["permissions"],
+        json!([{"action": "read", "resource": "/tmp", "effect": "allow"}])
+    );
+
+    // session.remove → 204, then 404 and a purged event log.
+    let events_before = count_rows(
+        &h.db,
+        "SELECT count(*) FROM event WHERE aggregate_id = ?1",
+        vec![SqlValue::Text(session_id.clone())],
+    )
+    .await;
+    assert!(events_before > 0);
+
+    let resp = h.delete(&format!("/api/session/{session_id}")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let resp = h.get(&format!("/api/session/{session_id}")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let err: Value = resp.json().await.expect("error json");
+    assert_eq!(err["_tag"], json!("SessionNotFoundError"));
+    assert_eq!(err["sessionID"], json!(session_id));
+
+    assert_eq!(
+        count_rows(
+            &h.db,
+            "SELECT count(*) FROM session_v2 WHERE id = ?1",
+            vec![SqlValue::Text(session_id.clone())],
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count_rows(
+            &h.db,
+            "SELECT count(*) FROM event WHERE aggregate_id = ?1",
+            vec![SqlValue::Text(session_id.clone())],
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count_rows(
+            &h.db,
+            "SELECT count(*) FROM event_sequence WHERE aggregate_id = ?1",
+            vec![SqlValue::Text(session_id.clone())],
+        )
+        .await,
+        0
+    );
+
+    // The session is gone from the list too.
+    let listed: Value = h.get("/api/session").await.json().await.expect("list json");
+    assert!(
+        !listed["data"]
+            .as_array()
+            .expect("data")
+            .iter()
+            .any(|s| s["id"] == json!(session_id))
+    );
+}
+
+#[tokio::test]
+async fn list_orders_newest_first_and_filters_by_parent() {
+    let h = Harness::spawn().await;
+
+    let first = h.create(json!({"title": "first"})).await;
+    let second = h.create(json!({"title": "second"})).await;
+
+    let listed: Value = h
+        .get("/api/session?order=asc")
+        .await
+        .json()
+        .await
+        .expect("json");
+    let ids: Vec<&str> = listed["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .filter_map(|s| s["id"].as_str())
+        .collect();
+    let first_pos = ids
+        .iter()
+        .position(|id| *id == first)
+        .expect("first listed");
+    let second_pos = ids
+        .iter()
+        .position(|id| *id == second)
+        .expect("second listed");
+    assert!(first_pos < second_pos, "asc order: {ids:?}");
+
+    let listed: Value = h
+        .get("/api/session?order=desc")
+        .await
+        .json()
+        .await
+        .expect("json");
+    let ids: Vec<&str> = listed["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .filter_map(|s| s["id"].as_str())
+        .collect();
+    let first_pos = ids
+        .iter()
+        .position(|id| *id == first)
+        .expect("first listed");
+    let second_pos = ids
+        .iter()
+        .position(|id| *id == second)
+        .expect("second listed");
+    assert!(second_pos < first_pos, "desc order: {ids:?}");
+
+    // `parentID=null` selects the roots. Forks carry `parent_id = NULL`
+    // upstream, so the forked child is a root too.
+    let child = {
+        push_user_message(&h.bus, &second, "fork me").await;
+        let resp = h
+            .post(&format!("/api/session/{second}/fork"), json!({}))
+            .await;
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: Value = resp.json().await.expect("fork json");
+        body["data"]["id"].as_str().expect("child id").to_owned()
+    };
+
+    let roots: Value = h
+        .get("/api/session?parentID=null")
+        .await
+        .json()
+        .await
+        .expect("json");
+    let root_ids: Vec<&str> = roots["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .filter_map(|s| s["id"].as_str())
+        .collect();
+    assert!(root_ids.contains(&second.as_str()));
+    assert!(root_ids.contains(&child.as_str()));
+
+    // Nothing is actually a `parent_id` child of `second` (forks are siblings).
+    let children: Value = h
+        .get(&format!("/api/session?parentID={second}"))
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(children["data"].as_array().expect("data").len(), 0);
+
+    // Search filters on the title.
+    let searched: Value = h
+        .get("/api/session?search=first")
+        .await
+        .json()
+        .await
+        .expect("json");
+    let search_ids: Vec<&str> = searched["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .filter_map(|s| s["id"].as_str())
+        .collect();
+    assert_eq!(search_ids, vec![first.as_str()]);
+}
+
+#[tokio::test]
+async fn switch_agent_and_model_mutate_session_and_append_messages() {
+    let h = Harness::spawn().await;
+    let session_id = h.create(json!({"title": "switch"})).await;
+
+    // switchAgent → 204, session_v2.agent updated, agent-switched message.
+    let resp = h
+        .post(
+            &format!("/api/session/{session_id}/agent"),
+            json!({"agent": "plan"}),
+        )
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        session_text(&h.db, &session_id, "agent").await.as_deref(),
+        Some("plan")
+    );
+
+    let switched: Vec<(String, String)> = query_all(
+        &h.db,
+        "SELECT type, data FROM session_message WHERE session_id = ?1 AND type = 'agent-switched'",
+        vec![SqlValue::Text(session_id.clone())],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .await;
+    assert_eq!(switched.len(), 1);
+    let data: Value = serde_json::from_str(&switched[0].1).expect("agent data");
+    assert_eq!(data["agent"], json!("plan"));
+    assert_eq!(data["previous"], Value::Null);
+
+    // A second switch records the previous agent from the session row.
+    let resp = h
+        .post(
+            &format!("/api/session/{session_id}/agent"),
+            json!({"agent": "build"}),
+        )
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        session_text(&h.db, &session_id, "agent").await.as_deref(),
+        Some("build")
+    );
+    let switched: Vec<String> = query_all(
+        &h.db,
+        "SELECT data FROM session_message WHERE session_id = ?1 AND type = 'agent-switched' ORDER BY seq",
+        vec![SqlValue::Text(session_id.clone())],
+        |row| row.get(0),
+    )
+    .await;
+    assert_eq!(switched.len(), 2);
+    let latest: Value = serde_json::from_str(&switched[1]).expect("agent data");
+    assert_eq!(latest["previous"], json!("plan"));
+
+    // switchModel → 204, session_v2.model updated, model-switched message.
+    let resp = h
+        .post(
+            &format!("/api/session/{session_id}/model"),
+            json!({"model": {"id": "gpt", "providerID": "openai"}}),
+        )
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    let stored = session_text(&h.db, &session_id, "model")
+        .await
+        .expect("model");
+    assert_eq!(
+        serde_json::from_str::<Value>(&stored).expect("model json"),
+        json!({"id": "gpt", "providerID": "openai"})
+    );
+
+    // Session.Info normalises the missing variant to "default".
+    let info = h.session_info(&session_id).await;
+    assert_eq!(
+        info["model"],
+        json!({"id": "gpt", "providerID": "openai", "variant": "default"})
+    );
+
+    // Switching to the same model is a no-op (no extra message).
+    let resp = h
+        .post(
+            &format!("/api/session/{session_id}/model"),
+            json!({"model": {"id": "gpt", "providerID": "openai"}}),
+        )
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    let model_switched = count_rows(
+        &h.db,
+        "SELECT count(*) FROM session_message WHERE session_id = ?1 AND type = 'model-switched'",
+        vec![SqlValue::Text(session_id.clone())],
+    )
+    .await;
+    assert_eq!(model_switched, 1);
+
+    // Missing body fields are a 400.
+    let resp = h
+        .post(&format!("/api/session/{session_id}/agent"), json!({}))
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let resp = h
+        .post(&format!("/api/session/{session_id}/model"), json!({}))
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Unknown session → 404.
+    let resp = h
+        .post("/api/session/ses_missing/agent", json!({"agent": "plan"}))
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn view_advances_the_viewed_watermark_once() {
+    let h = Harness::spawn().await;
+    let session_id = h.create(json!({"title": "view"})).await;
+
+    // Before any execution terminates there is no idle watermark: view is a
+    // no-op, exactly like upstream.
+    let resp = h
+        .post(
+            &format!("/api/session/{session_id}/view"),
+            json!({"idle": 1}),
+        )
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    assert!(
+        session_text(&h.db, &session_id, "time_viewed")
+            .await
+            .is_none()
+    );
+
+    // Terminating an execution stamps `time_idle`.
+    h.publish(SessionEventData::ExecutionSucceeded {
+        session_id: session_id.clone(),
+    })
+    .await;
+    let idle: i64 = query_one(
+        &h.db,
+        "SELECT time_idle FROM session_v2 WHERE id = ?1",
+        vec![SqlValue::Text(session_id.clone())],
+        |row| row.get(0),
+    )
+    .await
+    .expect("time_idle");
+
+    let resp = h
+        .post(
+            &format!("/api/session/{session_id}/view"),
+            json!({"idle": idle}),
+        )
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    let viewed: i64 = query_one(
+        &h.db,
+        "SELECT time_viewed FROM session_v2 WHERE id = ?1",
+        vec![SqlValue::Text(session_id.clone())],
+        |row| row.get(0),
+    )
+    .await
+    .expect("time_viewed");
+    assert_eq!(viewed, idle);
+
+    // Session.Info exposes the watermark.
+    let info = h.session_info(&session_id).await;
+    assert_eq!(info["time"]["idle"], json!(idle));
+    assert_eq!(info["time"]["viewed"], json!(idle));
+
+    // Re-viewing the same watermark (or a newer idle) publishes nothing.
+    for candidate in [idle, idle + 1_000] {
+        let resp = h
+            .post(
+                &format!("/api/session/{session_id}/view"),
+                json!({"idle": candidate}),
+            )
+            .await;
+        assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    }
+    let viewed_after: i64 = query_one(
+        &h.db,
+        "SELECT time_viewed FROM session_v2 WHERE id = ?1",
+        vec![SqlValue::Text(session_id.clone())],
+        |row| row.get(0),
+    )
+    .await
+    .expect("time_viewed");
+    assert_eq!(viewed_after, idle);
+
+    // `idle` is required.
+    let resp = h
+        .post(&format!("/api/session/{session_id}/view"), json!({}))
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let resp = h
+        .post("/api/session/ses_missing/view", json!({"idle": 1}))
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // session.active reports the (always empty) in-process execution set.
+    let active: Value = h
+        .get("/api/session/active")
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(active, json!({"data": {}}));
+}
+
+#[tokio::test]
+async fn fork_copies_settled_history_and_reserves_sequence() {
+    let h = Harness::spawn().await;
+    let parent = h.create(json!({"title": "parent"})).await;
+
+    let user_one = push_user_message(&h.bus, &parent, "first question").await;
+    let assistant = push_assistant_message(&h.bus, &parent, true).await;
+    let user_two = push_user_message(&h.bus, &parent, "second question").await;
+
+    let parent_messages: Vec<(String, i64)> = query_all(
+        &h.db,
+        "SELECT id, seq FROM session_message WHERE session_id = ?1 ORDER BY seq",
+        vec![SqlValue::Text(parent.clone())],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .await;
+    assert_eq!(
+        parent_messages.len(),
+        3,
+        "seeded history: {parent_messages:?}"
+    );
+    assert_eq!(parent_messages[0].0, user_one);
+    assert_eq!(parent_messages[1].0, assistant);
+    assert_eq!(parent_messages[2].0, user_two);
+
+    // Fork `before` the last user message: everything up to (not including) it.
+    let resp = h
+        .post(
+            &format!("/api/session/{parent}/fork"),
+            json!({"before": user_two}),
+        )
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "session.fork");
+    let body: Value = resp.json().await.expect("fork json");
+    let child = body["data"]["id"].as_str().expect("child id").to_owned();
+    assert!(child.starts_with("ses_"));
+    assert_ne!(child, parent);
+
+    // Child Session.Info: fork link, boundary, forked title, zeroed usage.
+    // Upstream projectFork sets `parent_id = null` (forks are siblings, linked
+    // only through `fork_session_id`), so `parentID` is absent from the Info.
+    let info = &body["data"];
+    assert!(info.get("parentID").is_none(), "parentID: {info}");
+    assert_eq!(info["fork"]["sessionID"], json!(parent));
+    assert_eq!(
+        info["fork"]["boundary"],
+        json!({"type": "before", "messageID": user_two})
+    );
+    assert_eq!(info["title"], json!("parent (fork #1)"));
+    assert_eq!(info["cost"], json!(0));
+    assert_eq!(info["tokens"]["input"], json!(0));
+
+    let parent_row: Vec<(String, String, Option<String>)> = query_all(
+        &h.db,
+        "SELECT project_id, directory, path FROM session_v2 WHERE id = ?1",
+        vec![SqlValue::Text(parent.clone())],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .await;
+    let (project_id, directory, path) = parent_row.into_iter().next().expect("parent row");
+    type ChildRow = (
+        String,
+        String,
+        Option<String>,
+        String,
+        String,
+        Option<String>,
+    );
+    let child_row: Vec<ChildRow> = query_all(
+        &h.db,
+        "SELECT project_id, directory, path, fork_session_id, fork_boundary, parent_id
+         FROM session_v2 WHERE id = ?1",
+        vec![SqlValue::Text(child.clone())],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        },
+    )
+    .await;
+    let (child_project, child_directory, child_path, fork_session_id, fork_boundary, parent_id) =
+        child_row.into_iter().next().expect("child row");
+    assert_eq!(child_project, project_id);
+    assert_eq!(child_directory, directory);
+    assert_eq!(child_path, path);
+    assert_eq!(fork_session_id, parent);
+    assert_eq!(
+        serde_json::from_str::<Value>(&fork_boundary).expect("boundary json"),
+        json!({"type": "before", "messageID": user_two})
+    );
+    assert!(parent_id.is_none(), "fork rows have no parent_id");
+
+    // Copied rows: same seqs as the parent's first two, ids derived from the
+    // forking event (`${SessionMessage.ID.fromEvent(event.id)}_${seq}` —
+    // upstream only requires the `msg_` prefix, and ox event ids carry a
+    // `_{counter}` suffix).
+    let copied: Vec<(String, i64, String)> = query_all(
+        &h.db,
+        "SELECT id, seq, type FROM session_message WHERE session_id = ?1 ORDER BY seq",
+        vec![SqlValue::Text(child.clone())],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )
+    .await;
+    assert_eq!(
+        copied.iter().map(|(_, seq, _)| *seq).collect::<Vec<_>>(),
+        vec![parent_messages[0].1, parent_messages[1].1]
+    );
+    assert_eq!(copied[0].2, "user");
+    assert_eq!(copied[1].2, "assistant");
+    let prefix = copied[0]
+        .0
+        .strip_suffix(&format!("_{}", copied[0].1))
+        .expect("derived id suffix");
+    assert!(prefix.starts_with("msg_"), "{prefix}");
+    for (id, seq, _) in &copied {
+        assert_eq!(id, &format!("{prefix}_{seq}"));
+    }
+    let distinct_prefixes: std::collections::HashSet<&str> = copied
+        .iter()
+        .filter_map(|(id, seq, _)| id.strip_suffix(&format!("_{seq}")))
+        .collect();
+    assert_eq!(
+        distinct_prefixes.len(),
+        1,
+        "all copies derive from one event: {copied:?}"
+    );
+
+    // The child's durable sequence is reserved past the copied history.
+    let reserved: i64 = query_one(
+        &h.db,
+        "SELECT seq FROM event_sequence WHERE aggregate_id = ?1",
+        vec![SqlValue::Text(child.clone())],
+        |row| row.get(0),
+    )
+    .await
+    .expect("reserved sequence");
+    assert_eq!(
+        reserved,
+        copied
+            .iter()
+            .map(|(_, seq, _)| *seq)
+            .max()
+            .expect("max seq")
+    );
+    assert!(reserved >= 1);
+
+    // Fork `through` the newest message copies the whole history.
+    let resp = h
+        .post(&format!("/api/session/{parent}/fork"), json!({}))
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.expect("fork json");
+    let whole = body["data"]["id"].as_str().expect("child id").to_owned();
+    assert_eq!(
+        body["data"]["fork"]["boundary"],
+        json!({"type": "through", "messageID": user_two})
+    );
+    // Upstream forkTitle matches `^(.+) \(fork #(\d+)\)$` on the *parent's*
+    // title — the parent is untitled-as-fork, so both forks read "(fork #1)".
+    assert_eq!(body["data"]["title"], json!("parent (fork #1)"));
+    let copied_count = count_rows(
+        &h.db,
+        "SELECT count(*) FROM session_message WHERE session_id = ?1",
+        vec![SqlValue::Text(whole.clone())],
+    )
+    .await;
+    assert_eq!(copied_count, 3);
+
+    // Forking a fork increments the title counter.
+    let resp = h
+        .post(&format!("/api/session/{child}/fork"), json!({}))
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.expect("fork json");
+    assert_eq!(body["data"]["title"], json!("parent (fork #2)"));
+
+    // Unknown boundaries and empty sessions are client errors.
+    let resp = h
+        .post(
+            &format!("/api/session/{parent}/fork"),
+            json!({"before": "msg_nope"}),
+        )
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let err: Value = resp.json().await.expect("error json");
+    assert_eq!(err["_tag"], json!("MessageNotFoundError"));
+
+    let empty = h.create(json!({"title": "empty"})).await;
+    let resp = h
+        .post(&format!("/api/session/{empty}/fork"), json!({}))
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let err: Value = resp.json().await.expect("error json");
+    assert_eq!(err["_tag"], json!("InvalidRequestError"));
+    assert_eq!(err["kind"], json!("empty_session"));
+
+    let resp = h.post("/api/session/ses_missing/fork", json!({})).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // Forks are siblings of the parent (parent_id is NULL upstream), so they
+    // survive `session.remove` cascades, which walk `parent_id` links only.
+    let resp = h.delete(&format!("/api/session/{parent}")).await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        count_rows(
+            &h.db,
+            "SELECT count(*) FROM session_v2 WHERE id = ?1",
+            vec![SqlValue::Text(parent.clone())],
+        )
+        .await,
+        0
+    );
+    for kept in [&child, &whole] {
+        assert_eq!(
+            count_rows(
+                &h.db,
+                "SELECT count(*) FROM session_v2 WHERE id = ?1",
+                vec![SqlValue::Text(kept.clone())],
+            )
+            .await,
+            1,
+            "fork {kept} must survive the parent's removal"
+        );
+    }
+}
+
+#[tokio::test]
+async fn message_list_and_get_return_protocol_shapes_in_seq_order() {
+    let h = Harness::spawn().await;
+    let session_id = h.create(json!({"title": "messages"})).await;
+
+    let user_one = push_user_message(&h.bus, &session_id, "hello").await;
+    let assistant = push_assistant_message(&h.bus, &session_id, true).await;
+    let user_two = push_user_message(&h.bus, &session_id, "again").await;
+
+    // Default order is newest first.
+    let page: Value = h
+        .get(&format!("/api/session/{session_id}/message"))
+        .await
+        .json()
+        .await
+        .expect("json");
+    let ids: Vec<&str> = page["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![user_two.as_str(), assistant.as_str(), user_one.as_str()]
+    );
+    assert!(page["cursor"]["previous"].is_string());
+    assert!(page["cursor"]["next"].is_string());
+
+    // Ascending order matches the durable seq order.
+    let page: Value = h
+        .get(&format!("/api/session/{session_id}/message?order=asc"))
+        .await
+        .json()
+        .await
+        .expect("json");
+    let ids: Vec<&str> = page["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec![user_one.as_str(), assistant.as_str(), user_two.as_str()]
+    );
+
+    // The user message carries the flattened prompt fields.
+    let first = &page["data"][0];
+    assert_eq!(first["type"], json!("user"));
+    assert_eq!(first["id"], json!(user_one));
+    assert_eq!(first["text"], json!("hello"));
+    assert!(first["time"]["created"].as_i64().is_some());
+    assert!(first.get("metadata").is_none());
+
+    // The settled assistant message carries finish + usage.
+    let second = &page["data"][1];
+    assert_eq!(second["type"], json!("assistant"));
+    assert_eq!(second["id"], json!(assistant));
+    assert_eq!(second["finish"], json!("stop"));
+    assert_eq!(second["tokens"]["input"], json!(3));
+    assert_eq!(second["content"], json!([]));
+
+    // Type filter.
+    let page: Value = h
+        .get(&format!("/api/session/{session_id}/message?type=user"))
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        page["data"].as_array().expect("data").len(),
+        2,
+        "only the two user messages"
+    );
+
+    // Pagination: limit 2, then follow the `next` cursor.
+    let page: Value = h
+        .get(&format!("/api/session/{session_id}/message?limit=2"))
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(page["data"].as_array().expect("data").len(), 2);
+    let next = page["cursor"]["next"]
+        .as_str()
+        .expect("next cursor")
+        .to_owned();
+    let page: Value = h
+        .get(&format!("/api/session/{session_id}/message?cursor={next}"))
+        .await
+        .json()
+        .await
+        .expect("json");
+    let ids: Vec<&str> = page["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert_eq!(ids, vec![user_one.as_str()]);
+
+    // session.message.get
+    let resp = h
+        .get(&format!("/api/session/{session_id}/message/{assistant}"))
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["data"]["type"], json!("assistant"));
+    assert_eq!(body["data"]["id"], json!(assistant));
+
+    let resp = h
+        .get(&format!("/api/session/{session_id}/message/msg_nope"))
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let err: Value = resp.json().await.expect("json");
+    assert_eq!(err["_tag"], json!("MessageNotFoundError"));
+
+    let resp = h.get("/api/session/ses_missing/message").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // An invalid cursor is a 400, not a 500.
+    let resp = h
+        .get(&format!(
+            "/api/session/{session_id}/message?cursor=not-a-cursor"
+        ))
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // `create` is idempotent for a supplied id.
+    let supplied = ox::id::id("ses");
+    let resp = h
+        .post("/api/session", json!({"id": supplied, "title": "supplied"}))
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["data"]["id"], json!(supplied));
+    assert_eq!(body["data"]["title"], json!("supplied"));
+    assert_eq!(
+        h.create(json!({"id": supplied, "title": "ignored"})).await,
+        supplied
+    );
+    assert_eq!(h.session_info(&supplied).await["title"], json!("supplied"));
+}

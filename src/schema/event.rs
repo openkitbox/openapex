@@ -242,6 +242,41 @@ pub enum SessionEventData {
         #[serde(flatten)]
         payload: MovePayload,
     },
+    #[serde(rename = "session.agent.selected")]
+    SessionAgentSelected {
+        #[serde(rename = "sessionID")]
+        session_id: String,
+        agent: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous: Option<String>,
+    },
+    #[serde(rename = "session.model.selected")]
+    SessionModelSelected {
+        #[serde(rename = "sessionID")]
+        session_id: String,
+        model: ModelRef,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        previous: Option<ModelRef>,
+    },
+    #[serde(rename = "session.metadata.updated")]
+    SessionMetadataUpdated {
+        #[serde(rename = "sessionID")]
+        session_id: String,
+        metadata: SessionMetadata,
+    },
+    #[serde(rename = "session.permissions")]
+    SessionPermissions {
+        #[serde(rename = "sessionID")]
+        session_id: String,
+        permissions: Vec<Rule>,
+    },
+    #[serde(rename = "session.viewed")]
+    SessionViewed {
+        #[serde(rename = "sessionID")]
+        session_id: String,
+        /// Epoch-millisecond idle watermark the viewer observed.
+        idle: i64,
+    },
 
     // -- Execution ------------------------------------------------------------
     #[serde(rename = "session.execution.started")]
@@ -600,6 +635,11 @@ impl SessionEventData {
                 "session.message.content.updated"
             }
             SessionEventData::SessionMoved { .. } => "session.moved",
+            SessionEventData::SessionAgentSelected { .. } => "session.agent.selected",
+            SessionEventData::SessionModelSelected { .. } => "session.model.selected",
+            SessionEventData::SessionMetadataUpdated { .. } => "session.metadata.updated",
+            SessionEventData::SessionPermissions { .. } => "session.permissions",
+            SessionEventData::SessionViewed { .. } => "session.viewed",
             SessionEventData::ExecutionStarted { .. } => "session.execution.started",
             SessionEventData::ExecutionSucceeded { .. } => "session.execution.succeeded",
             SessionEventData::ExecutionFailed { .. } => "session.execution.failed",
