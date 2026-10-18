@@ -390,6 +390,10 @@ pub fn build_router(state: AppState) -> Router {
                 .push(Router::with_path("agent").get(agent_list))
                 .push(Router::with_path("event").get(event::subscribe))
                 .push(
+                    Router::with_path("experimental/session/{sessionID}/wait")
+                        .post(session::wait_idle),
+                )
+                .push(
                     Router::with_path("session")
                         .get(session::list)
                         .post(session::create)
@@ -419,7 +423,9 @@ pub fn build_router(state: AppState) -> Router {
                                             .delete(session::inbox_cancel),
                                     ),
                                 )
-                                .push(Router::with_path("interrupt").post(session::interrupt)),
+                                .push(Router::with_path("interrupt").post(session::interrupt))
+                                .push(Router::with_path("permission").get(session::permission_list))
+                                .push(Router::with_path("form").get(session::form_list)),
                         ),
                 ),
         )

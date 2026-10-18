@@ -2044,3 +2044,66 @@ pub(crate) async fn interrupt(req: &mut Request, depot: &mut Depot, res: &mut Re
     let interrupted = app.runner.interrupt(&session_id);
     res.render(Json(json!({ "interrupted": interrupted })));
 }
+
+// ---------------------------------------------------------------------------
+// Permission / form listings + experimental wait (client compatibility)
+// ---------------------------------------------------------------------------
+
+/// `GET /api/session/{sessionID}/permission` — upstream `session.permission.list`.
+/// ox executes tools without an approval flow, so no permission request is
+/// ever pending and the list is always empty.
+#[handler]
+pub(crate) async fn permission_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(app) = state(depot, res) else {
+        return;
+    };
+    let Some(session_id) = req.param::<String>("sessionID") else {
+        invalid_request(res, "Missing sessionID");
+        return;
+    };
+    if !matches!(load_session(&app.db, &session_id).await, Ok(Some(_))) {
+        session_not_found(res, &session_id);
+        return;
+    }
+    res.render(Json(json!({ "data": [] })));
+}
+
+/// `GET /api/session/{sessionID}/form` — upstream `session.form.list`.
+/// ox has no form channel; the list is always empty.
+#[handler]
+pub(crate) async fn form_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(app) = state(depot, res) else {
+        return;
+    };
+    let Some(session_id) = req.param::<String>("sessionID") else {
+        invalid_request(res, "Missing sessionID");
+        return;
+    };
+    if !matches!(load_session(&app.db, &session_id).await, Ok(Some(_))) {
+        session_not_found(res, &session_id);
+        return;
+    }
+    res.render(Json(json!({ "data": [] })));
+}
+
+/// `POST /api/experimental/session/{sessionID}/wait` — upstream
+/// `experimental.session.wait`: long-poll until the session's agent loop is
+/// idle, then answer 204. Unknown sessions answer 404.
+#[handler]
+pub(crate) async fn wait_idle(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(app) = state(depot, res) else {
+        return;
+    };
+    let Some(session_id) = req.param::<String>("sessionID") else {
+        invalid_request(res, "Missing sessionID");
+        return;
+    };
+    if !matches!(load_session(&app.db, &session_id).await, Ok(Some(_))) {
+        session_not_found(res, &session_id);
+        return;
+    }
+    while app.runner.is_active(&session_id) {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    res.status_code(StatusCode::NO_CONTENT);
+}
