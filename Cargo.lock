@@ -1339,6 +1339,7 @@ dependencies = [
  "dirs",
  "futures-core",
  "rand 0.9.5",
+ "regex",
  "reqwest",
  "rusqlite",
  "salvo",

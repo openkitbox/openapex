@@ -775,3 +775,150 @@ fn project_fork(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Resul
     )?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Db;
+    use crate::schema::event::DurableEnvelope;
+    use crate::schema::event::SessionEventData;
+    use crate::schema::support::ModelRef;
+    use rusqlite::Connection;
+
+    fn model() -> ModelRef {
+        ModelRef {
+            id: "m".to_owned(),
+            provider_id: "p".to_owned(),
+            variant: None,
+        }
+    }
+
+    fn envelope(seq: i64, data: SessionEventData) -> EventEnvelope<SessionEventData> {
+        EventEnvelope {
+            id: format!("evt_{seq}"),
+            created: seq * 10,
+            kind: "session.test".to_owned(),
+            data,
+            durable: Some(DurableEnvelope {
+                aggregate_id: "ses_close".to_owned(),
+                seq,
+                version: 1,
+            }),
+            location: None,
+            metadata: None,
+        }
+    }
+
+    fn assistant_row(tx: &Connection, id: &str) -> (i64, Option<i64>, Option<i64>) {
+        tx.query_row(
+            "SELECT seq, time_created, json_extract(data, '$.time.completed')
+             FROM session_message WHERE id = ?1",
+            [id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("assistant row")
+    }
+
+    /// `StepStarted` with an incomplete current assistant closes that row in
+    /// place: the closed row keeps its original `seq` (history position and
+    /// the UNIQUE(session_id, seq) index) while the event's seq belongs to
+    /// the fresh assistant appended after it.
+    #[tokio::test]
+    async fn step_started_closes_stale_assistant_in_place() {
+        let db = Db::open_in_memory().await.expect("db");
+        db.conn()
+            .call(|conn| -> rusqlite::Result<()> {
+                conn.execute(
+                    "INSERT INTO session_v2 (id, project_id, slug, directory, version, time_created, time_updated)
+                     VALUES ('ses_close', 'p', 's', '/tmp', 'v', 0, 0)",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .expect("session row");
+
+        // Turn 1: a step starts (assistant msg_a) and never completes —
+        // the crash / failed-step scenario.
+        let first = envelope(
+            1,
+            SessionEventData::StepStarted {
+                session_id: "ses_close".to_owned(),
+                assistant_message_id: "msg_a".to_owned(),
+                agent: "build".to_owned(),
+                model: model(),
+                snapshot: None,
+                started: 100,
+            },
+        );
+        db.conn()
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                project(&tx, &first).expect("first step started");
+                tx.commit()
+            })
+            .await
+            .expect("turn 1");
+
+        // Turn 2: another step starts — msg_a must close in place.
+        let second = envelope(
+            2,
+            SessionEventData::StepStarted {
+                session_id: "ses_close".to_owned(),
+                assistant_message_id: "msg_b".to_owned(),
+                agent: "build".to_owned(),
+                model: model(),
+                snapshot: None,
+                started: 200,
+            },
+        );
+        db.conn()
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                project(&tx, &second).expect("second step started");
+                tx.commit()
+            })
+            .await
+            .expect("turn 2");
+
+        let (seq_a, created_a, completed_a) = db
+            .conn()
+            .call(|conn| Ok(assistant_row(conn, "msg_a")) as rusqlite::Result<_>)
+            .await
+            .expect("row a");
+        let (seq_b, _, _) = db
+            .conn()
+            .call(|conn| Ok(assistant_row(conn, "msg_b")) as rusqlite::Result<_>)
+            .await
+            .expect("row b");
+        assert_eq!(seq_a, 1_i64, "the closed row keeps its original seq");
+        assert_eq!(
+            created_a,
+            Some(100_i64),
+            "the closed row keeps its creation"
+        );
+        // Completed carries the closing event's created time, not the new
+        // step's `started`.
+        assert_eq!(
+            completed_a,
+            Some(20_i64),
+            "the closed row is marked completed"
+        );
+        assert_eq!(seq_b, 2_i64, "the fresh assistant owns the event's seq");
+        // History order is unchanged: the closed assistant still sorts first.
+        let order = db
+            .conn()
+            .call(|conn| -> rusqlite::Result<Vec<String>> {
+                Ok(conn
+                    .prepare("SELECT id FROM session_message WHERE session_id = 'ses_close' ORDER BY seq")
+                    .expect("stmt")
+                    .query_map([], |row| row.get::<_, String>(0))
+                    .expect("rows")
+                    .collect::<rusqlite::Result<Vec<String>>>()
+                    .expect("collect"))
+            })
+            .await
+            .expect("order");
+        assert_eq!(order, vec!["msg_a".to_owned(), "msg_b".to_owned()]);
+    }
+}

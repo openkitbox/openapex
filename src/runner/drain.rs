@@ -225,8 +225,10 @@ enum TurnOutcome {
 /// (upstream `drain` step loop). A step that finished with tool calls
 /// continues into the next step after its tools settled; a step rejected as
 /// context overflow compacts once (reason `auto`) and retries; a
-/// length-truncated step continues via a synthetic user prompt and gives up
-/// after three consecutive truncations (upstream `Outcome.OutputLimit`).
+/// length-truncated step continues via the tool-call boundary when the
+/// truncated response carried tool calls (`needsContinuation`), else via a
+/// synthetic user prompt, giving up after three consecutive truncations
+/// (upstream `Outcome.OutputLimit`).
 async fn run_turn(ctx: &DrainCtx, token: &CancellationToken) -> Result<TurnOutcome> {
     let (agent, model) = match resolve_selection(&ctx.db, &ctx.session_id, &ctx.config).await {
         Ok(selection) => selection,
@@ -243,63 +245,66 @@ async fn run_turn(ctx: &DrainCtx, token: &CancellationToken) -> Result<TurnOutco
             model: &model,
         };
         match super::step::run(ctx, token, &params).await? {
-            super::step::StepOutcome::Completed { finish } => {
-                if finish != FinishReason::ToolCalls && finish != FinishReason::Length {
+            super::step::StepOutcome::Completed {
+                finish,
+                needs_continuation,
+            } => {
+                if finish == FinishReason::ToolCalls {
+                    // The step settled its tool parts (success/failed rows);
+                    // steer items that arrived mid-turn join before the
+                    // continuation step (upstream step boundary: steer-only).
+                    deliver_pending_steers(ctx).await?;
+                    continue;
+                }
+                if finish != FinishReason::Length {
                     return Ok(TurnOutcome::Ended);
                 }
-                if finish == FinishReason::Length {
-                    // Upstream Outcome.OutputLimit (llm.ts): the truncated
-                    // response stays in context; a synthetic user prompt
-                    // continues the turn. After two continuations that still
-                    // end `length`, the turn gives up.
-                    if output_limit_exhausted(&ctx.db, &ctx.session_id).await? {
-                        let error = SessionError {
-                            kind: "output-limit".to_owned(),
-                            message:
-                                "Response still truncated after two output token limit continuations"
-                                    .to_owned(),
-                            status: None,
-                            response: None,
-                        };
-                        ctx.bus
-                            .publish(SessionEventData::StepFailed {
-                                session_id: ctx.session_id.clone(),
-                                assistant_message_id: params.assistant_message_id.clone(),
-                                error: error.clone(),
-                                finish: None,
-                                raw_finish: None,
-                                provider_state: None,
-                                cost: None,
-                                tokens: None,
-                                snapshot: None,
-                                files: None,
-                            })
-                            .await?;
-                        return Ok(TurnOutcome::Failed(error));
-                    }
-                    ctx.bus
-                        .publish(SessionEventData::SessionSynthetic {
-                            session_id: ctx.session_id.clone(),
-                            text: CONTINUE_AFTER_OUTPUT_LIMIT.to_owned(),
-                            description: None,
-                            metadata: None,
-                        })
-                        .await?;
+                // Upstream Outcome.OutputLimit (llm.ts): a tool-call length
+                // truncation continues without a prompt (`needsContinuation`).
+                if needs_continuation {
+                    deliver_pending_steers(ctx).await?;
+                    continue;
                 }
-                // The step settled its tool parts (success/failed rows);
-                // steer items that arrived mid-turn join before the
-                // continuation step (upstream step boundary: steer-only).
-                deliver_pending_steers(ctx).await?;
+                // A text truncation continues via a synthetic user prompt;
+                // after two continuations that still end `length`, the turn
+                // gives up.
+                if output_limit_exhausted(&ctx.db, &ctx.session_id).await? {
+                    // Upstream raises StepFailedError with only
+                    // execution.failed as the terminal: the last assistant
+                    // keeps `finish: "length"`, no step.failed event.
+                    return Ok(TurnOutcome::Failed(SessionError {
+                        kind: "output-limit".to_owned(),
+                        message:
+                            "Response still truncated after two output token limit continuations"
+                                .to_owned(),
+                        status: None,
+                        response: None,
+                    }));
+                }
+                ctx.bus
+                    .publish(SessionEventData::SessionSynthetic {
+                        session_id: ctx.session_id.clone(),
+                        text: CONTINUE_AFTER_OUTPUT_LIMIT.to_owned(),
+                        description: None,
+                        metadata: None,
+                    })
+                    .await?;
             }
             super::step::StepOutcome::Overflow { error } => {
                 if compacted {
+                    // Upstream llm.ts: `recoverOverflow` is one-shot, so a
+                    // retry that still overflows raises StepFailedError — a
+                    // fresh failed assistant row forwarding the provider
+                    // error, then execution.failed as the terminal.
+                    super::step::fail_step(ctx, &params, error.clone(), None, false).await?;
                     return Ok(TurnOutcome::Failed(error));
                 }
                 compacted = true;
                 // Upstream Outcome.Compacted: compact, then retry the step
                 // against the post-compaction context. A failed compaction
                 // settles its row and fails the turn with the original
-                // overflow error.
+                // overflow error (llm.ts:221 — compaction failures carry
+                // only compaction.failed + execution.failed, no step.failed).
                 if let Err(compact_error) =
                     compaction::compact(ctx, CompactionReason::Auto, None).await
                 {

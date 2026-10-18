@@ -133,6 +133,17 @@ impl MockChat {
         ])
     }
 
+    /// A template-filled compaction summary reply (the mock cannot know the
+    /// template, so the reply carries one real heading verbatim).
+    fn summary(text: &'static str) -> Script {
+        Script::Events(vec![
+            StreamEvent::TextDelta(format!("## Objective\n- {text}")),
+            StreamEvent::Finish {
+                reason: "stop".to_owned(),
+            },
+        ])
+    }
+
     fn requests(&self) -> Vec<ChatRequest> {
         self.requests.lock().expect("requests lock").clone()
     }
@@ -801,7 +812,7 @@ async fn transport_failures_retry_then_fail_the_step() {
         .iter()
         .find(|m| m["type"] == "assistant")
         .expect("assistant row");
-    assert_eq!(assistant["error"]["type"], "unknown");
+    assert_eq!(assistant["error"]["type"], "provider.transport");
     assert!(
         assistant["error"]["message"]
             .as_str()
@@ -1023,6 +1034,7 @@ async fn tool_failure_continues_with_error_result() {
         .iter()
         .find(|(k, _)| k == "session.tool.failed")
         .expect("failure event");
+    assert_eq!(failure.1["error"]["type"], "tool.execution");
     assert_eq!(failure.1["error"]["message"], "boom");
 
     // The model saw the error result and the turn still continued.
@@ -1165,7 +1177,7 @@ async fn interrupt_aborts_in_flight_tool() {
 async fn overflow_compacts_and_retries_once() {
     let harness = Harness::spawn(vec![
         Script::Overflow,
-        MockChat::text("S2 summary"),
+        MockChat::summary("S2 summary"),
         MockChat::text("resumed"),
     ])
     .await;
@@ -1222,7 +1234,12 @@ async fn overflow_compacts_and_retries_once() {
         .find(|m| m["type"] == "compaction")
         .expect("compaction row");
     assert_eq!(compaction["status"], "completed");
-    assert_eq!(compaction["summary"], "S2 summary");
+    assert!(
+        compaction["summary"]
+            .as_str()
+            .is_some_and(|text| text.contains("S2 summary")),
+        "summary carries the model's text"
+    );
 }
 
 #[tokio::test]
@@ -1230,7 +1247,11 @@ async fn compaction_item_summarizes_and_checkpoints_context() {
     use ox::schema::event::SessionEventData;
     use ox::schema::inbox::{CompactionPayload, Delivery, Item};
 
-    let harness = Harness::spawn(vec![MockChat::text("S2 summary"), MockChat::text("after")]).await;
+    let harness = Harness::spawn(vec![
+        MockChat::summary("S2 summary"),
+        MockChat::text("after"),
+    ])
+    .await;
     let session_id = harness.create_session().await;
 
     harness
@@ -1268,7 +1289,13 @@ async fn compaction_item_summarizes_and_checkpoints_context() {
         .iter()
         .find(|(k, _)| k == "session.compaction.ended")
         .expect("compaction ended");
-    assert_eq!(ended.1["text"], "S2 summary");
+    assert!(
+        ended.1["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("S2 summary")),
+        "summary carries the model's text: {:?}",
+        ended.1["text"]
+    );
     assert!(
         log.iter().any(|(k, _)| k == "session.compaction.delta"),
         "the summary streamed as deltas"
@@ -1300,7 +1327,11 @@ async fn compaction_item_summarizes_and_checkpoints_context() {
     // The compaction row is durable.
     let messages = harness.messages(&session_id).await;
     assert!(messages.iter().any(|m| {
-        m["type"] == "compaction" && m["status"] == "completed" && m["summary"] == "S2 summary"
+        m["type"] == "compaction"
+            && m["status"] == "completed"
+            && m["summary"]
+                .as_str()
+                .is_some_and(|text| text.contains("S2 summary"))
     }));
 }
 
@@ -1433,19 +1464,24 @@ async fn length_truncation_continues_then_exhausts() {
         ox::cardinal::wire::ChatMessage::User { content } if content.contains("hit the output token limit")
     )));
 
-    // The last assistant settled failed with the output-limit error; the
-    // earlier truncated ones keep finish=length.
+    // Upstream raises StepFailedError from OutputLimit exhaustion with only
+    // execution.failed as the terminal: every truncated assistant keeps
+    // `finish: "length"` with no error, and no step.failed is published.
+    let log = harness.event_log().await;
+    assert!(
+        !log.iter().any(|(k, _)| k == "session.step.failed"),
+        "exhaustion surfaces only as execution.failed"
+    );
     let messages = harness.messages(&session_id).await;
     let assistants: Vec<&Value> = messages
         .iter()
         .filter(|m| m["type"] == "assistant")
         .collect();
     assert_eq!(assistants.len(), 3);
-    for assistant in &assistants[..2] {
+    for assistant in &assistants {
         assert_eq!(assistant["finish"], "length");
         assert!(assistant["error"].is_null());
     }
-    assert_eq!(assistants[2]["error"]["type"], "output-limit");
 }
 
 #[tokio::test]
@@ -1467,6 +1503,374 @@ async fn no_tools_session_omits_tools_key() {
     let wire = serde_json::to_value(&requests[0]).expect("wire");
     assert!(wire.get("tools").is_none(), "no tools key on the wire");
     assert!(wire.get("tool_choice").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Length truncation with tool calls: continues without a synthetic prompt
+// (upstream `Outcome.OutputLimit` + `needsContinuation`)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn length_with_tool_calls_continues_without_prompt() {
+    let (echo, executed) = EchoTool::tool(false, Duration::ZERO, None);
+    let mut truncated = MockChat::tool_events("call_1", "test_echo", r#"{"q":"hi"}"#);
+    truncated.pop(); // finish=tool_calls → finish=length
+    let harness = Harness::spawn_with(
+        vec![
+            Script::Events({
+                truncated.push(StreamEvent::Finish {
+                    reason: "length".to_owned(),
+                });
+                truncated
+            }),
+            MockChat::text("after"),
+        ],
+        registry_with(echo),
+    )
+    .await;
+    let session_id = harness.create_session().await;
+    let response = harness
+        .post(
+            &format!("/api/session/{session_id}/prompt"),
+            json!({ "text": "truncated but tooled" }),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    harness.wait_event("session.execution.succeeded").await;
+
+    assert!(
+        executed.load(Ordering::SeqCst),
+        "the truncated step's tool ran"
+    );
+    // No synthetic continuation prompt: the tool calls own the boundary.
+    let log = harness.event_log().await;
+    assert!(
+        !log.iter().any(|(k, _)| k == "session.synthetic"),
+        "needsContinuation skips the synthetic prompt"
+    );
+    let requests = harness.chat.requests();
+    assert_eq!(requests.len(), 2, "truncated step + continuation step");
+    let messages = harness.messages(&session_id).await;
+    let assistant = messages
+        .iter()
+        .find(|m| m["type"] == "assistant")
+        .expect("assistant row");
+    assert_eq!(assistant["finish"], "length");
+    assert_eq!(assistant["content"][0]["state"]["status"], "completed");
+}
+
+// ---------------------------------------------------------------------------
+// Overflow give-up: a retry that still overflows publishes step.failed
+// (fresh failed row forwarding the provider error) then execution.failed
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn overflow_give_up_fails_step_forwarding_provider_error() {
+    let harness = Harness::spawn(vec![
+        Script::Overflow,
+        MockChat::summary("S2 summary"),
+        Script::Overflow,
+    ])
+    .await;
+    let session_id = harness.create_session().await;
+    let response = harness
+        .post(
+            &format!("/api/session/{session_id}/prompt"),
+            json!({ "text": "still too long" }),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    harness.wait_event("session.execution.failed").await;
+
+    harness.wait_event("session.step.failed").await;
+    let log = harness.event_log().await;
+    let failed = log
+        .iter()
+        .find(|(k, _)| k == "session.step.failed")
+        .expect("step failed");
+    assert_eq!(failed.1["error"]["type"], "provider.invalid-request");
+    assert!(
+        failed.1["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("maximum context length")),
+        "the provider error is forwarded: {:?}",
+        failed.1["error"]["message"]
+    );
+    // One compaction ran, then the give-up.
+    assert_eq!(
+        log.iter()
+            .filter(|(k, _)| k == "session.compaction.started")
+            .count(),
+        1
+    );
+
+    let messages = harness.messages(&session_id).await;
+    let assistant = messages
+        .iter()
+        .find(|m| m["type"] == "assistant")
+        .expect("assistant row");
+    assert_eq!(assistant["finish"], "error");
+    assert_eq!(assistant["error"]["type"], "provider.invalid-request");
+    assert!(
+        assistant["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("maximum context length"))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Compaction nudge: an off-template summary reply gets exactly one re-ask
+// (upstream NUDGE), then either succeeds or fails compaction
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn compaction_nudges_off_template_reply_once() {
+    use ox::schema::event::SessionEventData;
+    use ox::schema::inbox::{CompactionPayload, Delivery, Item};
+
+    let harness = Harness::spawn(vec![
+        MockChat::text("I will not follow templates."),
+        MockChat::summary("proper summary"),
+        MockChat::text("after"),
+    ])
+    .await;
+    let session_id = harness.create_session().await;
+    harness
+        .bus
+        .publish(SessionEventData::InboxEnqueued {
+            session_id: session_id.clone(),
+            inbox_id: "msg_compaction_nudge".to_owned(),
+            item: Item::Compaction {
+                payload: CompactionPayload {},
+                delivery: Delivery::Steer,
+            },
+        })
+        .await
+        .expect("enqueued");
+    let response = harness
+        .post(
+            &format!("/api/session/{session_id}/prompt"),
+            json!({ "text": "wake" }),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    harness.wait_event("session.compaction.ended").await;
+    harness.wait_event("session.execution.succeeded").await;
+
+    let requests = harness.chat.requests();
+    assert_eq!(requests.len(), 3, "off-template ask + nudge + wake turn");
+    // The nudge appended the reminder after the summary prompt.
+    let nudged = &requests[1];
+    let users: Vec<&String> = nudged
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            ox::cardinal::wire::ChatMessage::User { content } => Some(content),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(users.len(), 2, "summary instruction + nudge");
+    assert!(
+        users[0].contains("You MUST summarize"),
+        "the summary instruction precedes the nudge"
+    );
+    assert!(
+        users[1].contains("did not fill in the required summary template"),
+        "the nudge re-asks the template"
+    );
+
+    // The second reply satisfied the template and became the checkpoint.
+    let messages = harness.messages(&session_id).await;
+    assert!(messages.iter().any(|m| {
+        m["type"] == "compaction"
+            && m["status"] == "completed"
+            && m["summary"]
+                .as_str()
+                .is_some_and(|text| text.contains("proper summary"))
+    }));
+    assert!(!log_contains(&harness, "session.compaction.failed").await);
+}
+
+/// Whether the harness log recorded `kind` so far.
+async fn log_contains(harness: &Harness, kind: &str) -> bool {
+    harness.event_log().await.iter().any(|(k, _)| k == kind)
+}
+
+// ---------------------------------------------------------------------------
+// Malformed JSON tool input: fails the call with the input excerpt, the
+// turn continues (upstream `INPUT_FAILURES.malformed` + `inputFailure`)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn malformed_json_input_fails_with_excerpt() {
+    let (echo, executed) = EchoTool::tool(false, Duration::ZERO, None);
+    let harness = Harness::spawn_with(
+        vec![
+            MockChat::tool_turn("call_1", "test_echo", r#"{"q": "#),
+            MockChat::text("retrying"),
+        ],
+        registry_with(echo),
+    )
+    .await;
+    let session_id = harness.create_session().await;
+    let response = harness
+        .post(
+            &format!("/api/session/{session_id}/prompt"),
+            json!({ "text": "break the args" }),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    harness.wait_event("session.execution.succeeded").await;
+
+    let failure = harness
+        .event_log()
+        .await
+        .into_iter()
+        .find(|(k, _)| k == "session.tool.failed")
+        .expect("malformed failure");
+    assert_eq!(failure.1["error"]["type"], "tool.input-json");
+    let message = failure.1["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("could not be parsed as JSON"),
+        "upstream malformed wording: {message}"
+    );
+    assert!(
+        message.contains("Input excerpt (first 6 of 6 characters):\n{\"q\": "),
+        "the input excerpt is appended: {message}"
+    );
+    assert!(!executed.load(Ordering::SeqCst), "the call never executed");
+
+    // The failure is model-visible and the turn continued.
+    let requests = harness.chat.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1].messages.iter().any(|m| matches!(
+        m,
+        ox::cardinal::wire::ChatMessage::Tool { content, .. } if content.contains("could not be parsed as JSON")
+    )));
+    let messages = harness.messages(&session_id).await;
+    let part = messages
+        .iter()
+        .find(|m| m["type"] == "assistant")
+        .expect("assistant row")["content"]
+        .as_array()
+        .expect("parts")
+        .iter()
+        .find(|p| p["type"] == "tool")
+        .expect("tool part")
+        .clone();
+    assert_eq!(part["state"]["status"], "error");
+    assert_eq!(part["state"]["error"]["type"], "tool.input-json");
+}
+
+// ---------------------------------------------------------------------------
+// Stream ends with no (or an unrecognized) finish: open tool input settles
+// tool.input-incomplete with the excerpt, the step fails with
+// provider.invalid-output (upstream `unknownFinish` + `failIncompleteTools`)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn incomplete_input_and_unknown_finish_fail_the_step() {
+    let (echo, executed) = EchoTool::tool(false, Duration::ZERO, None);
+    let harness = Harness::spawn_with(
+        vec![Script::Events(vec![StreamEvent::ToolCallDelta {
+            index: 0,
+            id: Some("call_1".to_owned()),
+            name: Some("test_echo".to_owned()),
+            arguments: "{\"q\": \"par".to_owned(),
+        }])],
+        registry_with(echo),
+    )
+    .await;
+    let session_id = harness.create_session().await;
+    let response = harness
+        .post(
+            &format!("/api/session/{session_id}/prompt"),
+            json!({ "text": "cut off" }),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    harness.wait_event("session.execution.failed").await;
+
+    let failure = harness
+        .event_log()
+        .await
+        .into_iter()
+        .find(|(k, _)| k == "session.tool.failed")
+        .expect("incomplete failure");
+    assert_eq!(failure.1["error"]["type"], "tool.input-incomplete");
+    let message = failure.1["error"]["message"].as_str().expect("message");
+    assert!(
+        message.contains("arguments were not completed"),
+        "upstream incomplete wording: {message}"
+    );
+    assert!(
+        message.contains("Input excerpt (first 10 of 10 characters):\n{\"q\": \"par"),
+        "the input excerpt is appended: {message}"
+    );
+    assert!(!executed.load(Ordering::SeqCst), "the call never executed");
+
+    let log = harness.event_log().await;
+    let failed = log
+        .iter()
+        .find(|(k, _)| k == "session.step.failed")
+        .expect("step failed");
+    assert_eq!(failed.1["error"]["type"], "provider.invalid-output");
+    assert_eq!(
+        failed.1["error"]["message"],
+        "The provider response ended with an unknown finish reason."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Unknown tool name: the call settles tool.unknown without executing
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn unknown_tool_fails_with_tool_unknown() {
+    let (echo, _executed) = EchoTool::tool(false, Duration::ZERO, None);
+    let harness = Harness::spawn_with(
+        vec![
+            MockChat::tool_turn("call_1", "no_such_tool", r#"{}"#),
+            MockChat::text("noted"),
+        ],
+        registry_with(echo),
+    )
+    .await;
+    let session_id = harness.create_session().await;
+    let response = harness
+        .post(
+            &format!("/api/session/{session_id}/prompt"),
+            json!({ "text": "call a ghost" }),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    harness.wait_event("session.execution.succeeded").await;
+
+    let failure = harness
+        .event_log()
+        .await
+        .into_iter()
+        .find(|(k, _)| k == "session.tool.failed")
+        .expect("unknown tool failure");
+    assert_eq!(failure.1["error"]["type"], "tool.unknown");
+    assert_eq!(
+        failure.1["error"]["message"],
+        "Tool is not available for this request: no_such_tool"
+    );
+
+    let messages = harness.messages(&session_id).await;
+    let part = messages
+        .iter()
+        .find(|m| m["type"] == "assistant")
+        .expect("assistant row")["content"]
+        .as_array()
+        .expect("parts")
+        .iter()
+        .find(|p| p["type"] == "tool")
+        .expect("tool part")
+        .clone();
+    assert_eq!(part["state"]["status"], "error");
+    assert_eq!(part["state"]["error"]["type"], "tool.unknown");
 }
 
 // ---------------------------------------------------------------------------

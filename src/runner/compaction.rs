@@ -80,6 +80,72 @@ pub(crate) fn summarization_request(model: &str, transcript: &[ChatMessage]) -> 
     ChatRequest::new(model.to_owned(), messages)
 }
 
+/// Upstream `NUDGE` (compaction.ts): the one re-ask sent when the reply
+/// skips the summary template.
+const NUDGE: &str = "The previous response did not fill in the required summary template. Do not call tools. Return the summary as text using the exact section headings from the template.";
+
+/// Upstream `filled`: the reply mentions at least one template heading on a
+/// line of its own. The headings come from the template embedded in the
+/// summary prompt (every `##`/`###` line).
+fn filled(summary: &str) -> bool {
+    let headings: Vec<&str> = SUMMARY_PROMPT
+        .lines()
+        .filter(|line| line.starts_with("##"))
+        .collect();
+    summary.lines().any(|line| headings.contains(&line.trim()))
+}
+
+/// Stream one summarization request to completion, publishing
+/// `compaction.delta` per fragment (upstream `stream`).
+async fn stream_summary(
+    ctx: &DrainCtx,
+    request: &ChatRequest,
+) -> std::result::Result<String, SessionError> {
+    let failure = |kind: &str, message: String| SessionError {
+        kind: kind.to_owned(),
+        message,
+        status: None,
+        response: None,
+    };
+    let mut stream = match ctx.chat.stream_chat(request).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            return Err(failure(
+                "compaction.failed",
+                format!("compaction request failed: {error}"),
+            ));
+        }
+    };
+    let mut summary = String::new();
+    loop {
+        let next = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await;
+        match next {
+            Some(Ok(StreamEvent::TextDelta(delta))) => {
+                summary.push_str(&delta);
+                if let Err(error) = ctx
+                    .bus
+                    .publish(SessionEventData::CompactionDelta {
+                        session_id: ctx.session_id.clone(),
+                        text: delta,
+                    })
+                    .await
+                {
+                    return Err(failure("unknown", error.to_string()));
+                }
+            }
+            Some(Ok(_)) => {}
+            Some(Err(error)) => {
+                return Err(failure(
+                    "compaction.failed",
+                    format!("compaction stream failed: {error}"),
+                ));
+            }
+            None => break,
+        }
+    }
+    Ok(summary)
+}
+
 /// Run one compaction to completion: publish `started`, stream the
 /// summarization request, publish `ended` (or `failed`). Returns the
 /// summary on success; the failure error after publishing
@@ -118,51 +184,31 @@ pub(crate) async fn compact(
             Ok(rows) => rows,
             Err(error) => return Err(failure("unknown", error.to_string())),
         };
-        let request = summarization_request(
+        let mut request = summarization_request(
             &format!("{}/{}", model.provider_id, model.id),
             &super::step::build_chat_messages("", &rows),
         );
-        let mut stream = match ctx.chat.stream_chat(&request).await {
-            Ok(stream) => stream,
-            Err(error) => {
+        let mut summary = stream_summary(ctx, &request).await?;
+        // Upstream `send` (compaction.ts): a reply that ignores the summary
+        // template gets one nudge before it counts as a failure. (Upstream's
+        // budget shrink ladder is out of scope — the request is never
+        // refitted smaller here.)
+        if !filled(&summary) {
+            request.messages.push(ChatMessage::User {
+                content: NUDGE.to_owned(),
+            });
+            summary = stream_summary(ctx, &request).await?;
+            if !filled(&summary) {
                 return Err(failure(
                     "compaction.failed",
-                    format!("compaction request failed: {error}"),
+                    if summary.trim().is_empty() {
+                        "Compaction produced no summary"
+                    } else {
+                        "Compaction summary did not match the required template"
+                    }
+                    .to_owned(),
                 ));
             }
-        };
-        let mut summary = String::new();
-        loop {
-            let next = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await;
-            match next {
-                Some(Ok(StreamEvent::TextDelta(delta))) => {
-                    summary.push_str(&delta);
-                    if let Err(error) = ctx
-                        .bus
-                        .publish(SessionEventData::CompactionDelta {
-                            session_id: ctx.session_id.clone(),
-                            text: delta,
-                        })
-                        .await
-                    {
-                        return Err(failure("unknown", error.to_string()));
-                    }
-                }
-                Some(Ok(_)) => {}
-                Some(Err(error)) => {
-                    return Err(failure(
-                        "compaction.failed",
-                        format!("compaction stream failed: {error}"),
-                    ));
-                }
-                None => break,
-            }
-        }
-        if summary.trim().is_empty() {
-            return Err(failure(
-                "compaction.failed",
-                "Compaction produced no summary".to_owned(),
-            ));
         }
         Ok(summary)
     }
@@ -201,17 +247,6 @@ pub(crate) async fn compact(
             Err(error)
         }
     }
-}
-
-/// Whether a provider rejection body/`status` is a context-length overflow
-/// (upstream `isContextOverflowFailure`, via the signatures cardinal passes
-/// through). Matched case-insensitively on the body.
-pub(crate) fn is_context_overflow(status: u16, body: &str) -> bool {
-    if status != 400 {
-        return false;
-    }
-    let body = body.to_ascii_lowercase();
-    body.contains("context") || body.contains("token")
 }
 
 #[cfg(test)]
@@ -264,16 +299,14 @@ mod tests {
     }
 
     #[test]
-    fn overflow_signature_matches_400_bodies_only() {
-        assert!(is_context_overflow(
-            400,
+    fn overflow_detection_is_scoped_in_provider_error() {
+        // The signature port lives in `provider_error`; compaction only
+        // consumes its verdict through the step's `StepOutcome::Overflow`.
+        assert!(super::super::provider_error::is_context_overflow(
             "This model's maximum context length is 4097 tokens"
         ));
-        assert!(is_context_overflow(
-            400,
-            "Request too large: TOO MANY TOKENS"
+        assert!(!super::super::provider_error::is_context_overflow(
+            "invalid api key"
         ));
-        assert!(!is_context_overflow(429, "maximum context length exceeded"));
-        assert!(!is_context_overflow(400, "invalid api key"));
     }
 }
