@@ -617,9 +617,11 @@ async fn switch_agent_and_model_mutate_session_and_append_messages() {
     let stored = session_text(&h.db, &session_id, "model")
         .await
         .expect("model");
+    // The published event carries the normalized variant, so the projected
+    // row stores it concretely (upstream `session.get` renders the same).
     assert_eq!(
         serde_json::from_str::<Value>(&stored).expect("model json"),
-        json!({"id": "gpt", "providerID": "openai"})
+        json!({"id": "gpt", "providerID": "openai", "variant": "default"})
     );
 
     // Session.Info normalises the missing variant to "default".
@@ -1133,4 +1135,166 @@ async fn message_list_and_get_return_protocol_shapes_in_seq_order() {
         supplied
     );
     assert_eq!(h.session_info(&supplied).await["title"], json!("supplied"));
+}
+
+#[tokio::test]
+async fn list_previous_page_comes_out_in_requested_order() {
+    let h = Harness::spawn().await;
+
+    // Four sessions created in order, so time_updated ascends with creation.
+    let mut created: Vec<String> = Vec::new();
+    for title in ["one", "two", "three", "four"] {
+        created.push(h.create(json!({ "title": title })).await);
+    }
+    let [one, two, three, four]: [String; 4] = created.try_into().expect("four sessions");
+
+    fn page_ids(body: &Value) -> Vec<&str> {
+        body["data"]
+            .as_array()
+            .expect("data")
+            .iter()
+            .filter_map(|s| s["id"].as_str())
+            .collect()
+    }
+
+    // Page 1 (newest first): [four, three].
+    let page1: Value = h
+        .get("/api/session?limit=2")
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(page_ids(&page1), vec![four.as_str(), three.as_str()]);
+    let next = page1["cursor"]["next"].as_str().expect("next").to_owned();
+
+    // Page 2: [two, one], still in the requested descending order.
+    let page2: Value = h
+        .get(&format!("/api/session?cursor={next}"))
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(page_ids(&page2), vec![two.as_str(), one.as_str()]);
+    let previous = page2["cursor"]["previous"]
+        .as_str()
+        .expect("previous")
+        .to_owned();
+
+    // The previous page must come out newest-first too (the store fetches it
+    // ascending and reverses; upstream store.ts `rows.toReversed()`).
+    let back: Value = h
+        .get(&format!("/api/session?cursor={previous}"))
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(
+        page_ids(&back),
+        vec![four.as_str(), three.as_str()],
+        "previous page in requested (descending) order"
+    );
+
+    // A request-level `order` alongside a cursor is ignored, not rejected.
+    let resp = h
+        .get(&format!("/api/session?cursor={next}&order=asc"))
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // An invalid cursor renders the upstream `InvalidCursorError` tag.
+    let resp = h.get("/api/session?cursor=not-a-cursor").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let err: Value = resp.json().await.expect("json");
+    assert_eq!(err["_tag"], json!("InvalidCursorError"));
+    assert!(err["message"].is_string());
+}
+
+#[tokio::test]
+async fn message_cursors_embed_concrete_order() {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+
+    let h = Harness::spawn().await;
+    let session_id = h.create(json!({"title": "cursor order"})).await;
+    let one = push_user_message(&h.bus, &session_id, "one").await;
+    let two = push_user_message(&h.bus, &session_id, "two").await;
+
+    let decoded_cursor = |raw: &str| -> Value {
+        let bytes = B64.decode(raw).expect("base64url cursor");
+        serde_json::from_slice(&bytes).expect("cursor json")
+    };
+
+    // Default page embeds the effective `order: "desc"` in both cursors.
+    let page: Value = h
+        .get(&format!("/api/session/{session_id}/message?limit=1"))
+        .await
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(page["data"].as_array().expect("data").len(), 1);
+    for key in ["previous", "next"] {
+        let cursor = decoded_cursor(page["cursor"][key].as_str().expect(key));
+        assert_eq!(cursor["order"], json!("desc"), "{key} cursor: {cursor}");
+        assert_eq!(cursor["direction"], json!(key));
+    }
+
+    // An explicit `order=asc` is embedded concretely and survives following
+    // the cursor without repeating the query param.
+    let page: Value = h
+        .get(&format!(
+            "/api/session/{session_id}/message?order=asc&limit=1"
+        ))
+        .await
+        .json()
+        .await
+        .expect("json");
+    let next = page["cursor"]["next"].as_str().expect("next").to_owned();
+    assert_eq!(decoded_cursor(&next)["order"], json!("asc"));
+    let page: Value = h
+        .get(&format!("/api/session/{session_id}/message?cursor={next}"))
+        .await
+        .json()
+        .await
+        .expect("json");
+    let ids: Vec<&str> = page["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert_eq!(ids, vec![two.as_str()], "ascending continuation");
+
+    // cursor + order stays a 400 here, tagged `InvalidCursorError` upstream.
+    let resp = h
+        .get(&format!(
+            "/api/session/{session_id}/message?cursor={next}&order=asc"
+        ))
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let err: Value = resp.json().await.expect("json");
+    assert_eq!(err["_tag"], json!("InvalidCursorError"));
+
+    // A legacy cursor without an embedded order still walks, defaulting desc:
+    // next from the newest message yields the remaining older one.
+    let legacy = B64.encode(
+        json!({"id": two, "direction": "next"})
+            .to_string()
+            .into_bytes(),
+    );
+    let page: Value = h
+        .get(&format!(
+            "/api/session/{session_id}/message?cursor={legacy}"
+        ))
+        .await
+        .json()
+        .await
+        .expect("json");
+    let ids: Vec<&str> = page["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert_eq!(ids, vec![one.as_str()], "orderless cursor defaults to desc");
+    let next = page["cursor"]["next"].as_str().expect("next").to_owned();
+    assert_eq!(decoded_cursor(&next)["order"], json!("desc"));
 }

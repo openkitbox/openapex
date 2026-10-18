@@ -82,6 +82,15 @@ fn invalid_request_kind(res: &mut Response, message: &str, kind: &str) {
     })));
 }
 
+/// 400 `InvalidCursorError` (protocol/src/errors.ts).
+fn invalid_cursor(res: &mut Response, message: &str) {
+    res.status_code(StatusCode::BAD_REQUEST);
+    res.render(Json(json!({
+        "_tag": "InvalidCursorError",
+        "message": message,
+    })));
+}
+
 /// 500 `UnknownError` — never leaks internal detail on the wire.
 fn unknown_error(res: &mut Response, error: &anyhow::Error) {
     tracing::error!(error = %error, "session handler failed");
@@ -561,17 +570,14 @@ pub(crate) async fn list(req: &mut Request, depot: &mut Depot, res: &mut Respons
     };
 
     let raw_cursor: Option<String> = req.query("cursor");
-    let raw_order: Option<String> = req.query("order");
-    if raw_cursor.is_some() && raw_order.is_some() {
-        invalid_request(res, "Cursor cannot be combined with order");
-        return;
-    }
+    // A cursor carries the whole query including its order, so a request-level
+    // `order` alongside a cursor is simply ignored (upstream `session.list`).
 
     let decoded: Option<SessionsCursor> = match raw_cursor.as_deref() {
         Some(raw) => match decode_cursor(raw) {
             Some(cursor) => Some(cursor),
             None => {
-                invalid_request(res, "Invalid cursor");
+                invalid_cursor(res, "Invalid cursor");
                 return;
             }
         },
@@ -623,6 +629,12 @@ pub(crate) async fn list(req: &mut Request, depot: &mut Depot, res: &mut Respons
             return;
         }
     };
+    // The fetch walks opposite to the requested order for `previous`; reverse
+    // so the page comes out in the requested order (upstream store.ts).
+    let mut rows = rows;
+    if direction == Direction::Previous {
+        rows.reverse();
+    }
 
     let data: Vec<Value> = rows.iter().map(SessionRow::info).collect();
     let previous = rows.first().map(|row| {
@@ -1288,6 +1300,20 @@ pub(crate) async fn switch_model(req: &mut Request, depot: &mut Depot, res: &mut
         return;
     }
 
+    // Normalize the variant the way `session.get` renders it
+    // (`variant ?? "default"`, session/info.ts) so the event, the projected
+    // row, and the `model-switched` message all carry a concrete variant.
+    let mut model = model;
+    if model.variant.is_none() {
+        model.variant = Some("default".to_owned());
+    }
+    let previous = previous.map(|mut current| {
+        if current.variant.is_none() {
+            current.variant = Some("default".to_owned());
+        }
+        current
+    });
+
     if let Err(error) = app
         .bus
         .publish(SessionEventData::SessionModelSelected {
@@ -1443,7 +1469,7 @@ pub(crate) async fn message_list(req: &mut Request, depot: &mut Depot, res: &mut
     let raw_cursor: Option<String> = req.query("cursor");
     let raw_order: Option<String> = req.query("order");
     if raw_cursor.is_some() && raw_order.is_some() {
-        invalid_request(res, "Cursor cannot be combined with order");
+        invalid_cursor(res, "Cursor cannot be combined with order");
         return;
     }
 
@@ -1451,17 +1477,19 @@ pub(crate) async fn message_list(req: &mut Request, depot: &mut Depot, res: &mut
         Some(raw) => match decode_cursor(raw) {
             Some(cursor) => Some(cursor),
             None => {
-                invalid_request(res, "Invalid cursor");
+                invalid_cursor(res, "Invalid cursor");
                 return;
             }
         },
         None => None,
     };
 
-    let order = match &decoded {
-        Some(cursor) => cursor.order.clone(),
+    // The effective order is always concrete: a cursor's embedded order wins,
+    // then the request's, defaulting to newest-first.
+    let order: Option<String> = match &decoded {
+        Some(cursor) => Some(cursor.order.clone().unwrap_or_else(|| "desc".to_owned())),
         None => match resolve_order(raw_order) {
-            Ok(order) => order,
+            Ok(order) => Some(order.unwrap_or_else(|| "desc".to_owned())),
             Err(message) => {
                 invalid_request(res, &message);
                 return;
