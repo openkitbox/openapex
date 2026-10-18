@@ -1,10 +1,10 @@
 //! The drain loop, ported from `packages/core/src/session/runner/llm.ts`.
 //!
-//! Upstream shape (kept here so 6b can slot in without re-deriving):
+//! Upstream shape (kept here so later tasks slot in without re-deriving):
 //!
-//! - **settleStaleCompactions** runs before anything else: compaction rows
-//!   left `running` by a process death are published as
-//!   `session.compaction.failed` newest-first.
+//! - **settleStaleCompactions** and **settleStaleToolCalls** run before
+//!   anything else: compaction rows / tool parts left `running` by a process
+//!   death are published as failed, newest-first.
 //! - Boundary scan (`advanceToStep`): pick the next promotable item — steer
 //!   items first (a compaction control at the head of the steers is unshifted
 //!   ahead of earlier steers), else the oldest queue item at an *input*
@@ -12,17 +12,18 @@
 //!   (llm.ts:109-112), so queued items chain across turns inside one busy
 //!   period. A queued item on a steer-scoped drain ends the drain.
 //! - Controls: a compaction publishes `inbox.delivered` +
-//!   `compaction.started` (then runs the summary — 6a stubs it as failed); a
-//!   move publishes `inbox.delivered` and would re-root the session (6a
-//!   fails the execution).
+//!   `compaction.started`, then the summarization request runs and the row
+//!   settles via `compaction.ended`/`compaction.failed`; a move publishes
+//!   `inbox.delivered` and would re-root the session (ox fails the
+//!   execution).
 //! - Input: `SessionInbox.promote` delivers every steer item in order, then
 //!   exactly one queue item at input boundaries; a turn runs consecutive
-//!   steps until a step returns no tool calls (`needsContinuation`).
+//!   steps until a step finishes without tool calls (`needsContinuation`).
+//!   Between steps, steer items that arrived mid-turn are delivered (a
+//!   compaction control at the steer head owns that boundary and runs
+//!   first). A 400 context-overflow before any output compacts (reason
+//!   `auto`) and retries the step once.
 //! - Quiet inbox → the drain completes and the actor publishes the terminal.
-//!
-//! 6a deviations (each marked inline): compaction/move bodies are stubbed,
-//! turns never continue (no tool execution yet), and upstream's
-//! `force`/`continuation` re-entry paths don't exist yet.
 
 use std::sync::Arc;
 
@@ -37,10 +38,11 @@ use crate::event_bus::EventBus;
 use crate::id;
 use crate::schema::event::SessionEventData;
 use crate::schema::inbox::{Delivery, Item};
-use crate::schema::message::CompactionReason;
-use crate::schema::support::SessionError;
+use crate::schema::message::{CompactionReason, Message};
+use crate::schema::support::{FinishReason, SessionError};
 
 use super::ToolRegistry;
+use super::compaction;
 use super::unknown_error;
 
 /// Which delivery classes a drain pass may promote. Upstream `Promotable`:
@@ -105,17 +107,16 @@ pub(crate) async fn drain(
     token: &CancellationToken,
     scope: Promotable,
 ) -> DrainOutcome {
-    // A process death skips compaction finalizers; settle orphans first
-    // (upstream settleStaleCompactions). Failures only warn: a broken
-    // settle must not wedge the turn.
+    // A process death skips compaction/tool finalizers; settle orphans
+    // first (upstream settleStaleCompactions + settleStaleToolCalls).
+    // Failures only warn: a broken settle must not wedge the turn.
     if let Err(error) = settle_stale_compactions(&ctx.bus, &ctx.db, &ctx.session_id).await {
         tracing::warn!(session = %ctx.session_id, error = %error, "settleStaleCompactions failed");
     }
+    if let Err(error) = settle_stale_tool_calls(&ctx.bus, &ctx.db, &ctx.session_id).await {
+        tracing::warn!(session = %ctx.session_id, error = %error, "settleStaleToolCalls failed");
+    }
 
-    // 6a: turns never continue (steps never request tools), so `continuing`
-    // is always false and every scan runs at input scope; a queued head
-    // re-opens the entry boundary to chain the next turn.
-    // TODO(task 6b): track `continuing` + step numbers for tool-call turns.
     let mut entering = true;
     let mut continuing = false;
 
@@ -151,10 +152,18 @@ pub(crate) async fn drain(
 
         match &next.item {
             Item::Compaction { .. } => {
-                if let Err(error) = settle_compaction_stub(ctx, &next.id).await {
+                // Upstream: deliver the control, run the summarization
+                // compaction (reason "manual", the inbox row as input), then
+                // loop back with force=false. A failed compaction settles
+                // its row and does NOT fail the execution.
+                if let Err(error) = deliver(ctx, &next.id).await {
                     return DrainOutcome::Failed(unknown_error(error.to_string()));
                 }
-                // Upstream loops back with force=false after a compaction.
+                if let Err(error) =
+                    compaction::compact(ctx, CompactionReason::Manual, Some(next.id.clone())).await
+                {
+                    tracing::warn!(session = %ctx.session_id, error = %error.message, "compaction failed");
+                }
                 entering = true;
                 continuing = false;
             }
@@ -183,7 +192,7 @@ pub(crate) async fn drain(
                 if promoted == 0 {
                     // Nothing delivered: at a re-opened entry boundary the
                     // scanned row raced away between scan and promote
-                    // (cancelled). Upstream would run a forced step; 6a has
+                    // (cancelled). Upstream would run a forced step; ox has
                     // no force paths, so the drain ends.
                     return DrainOutcome::Complete;
                 }
@@ -212,45 +221,160 @@ enum TurnOutcome {
     Failed(SessionError),
 }
 
-/// One turn: consecutive steps sharing the session's model selection. 6a
-/// runs exactly one step (steps never return tool calls); the loop shape is
-/// where 6b hangs tool execution and continuation.
+/// One turn: consecutive steps sharing the session's model selection
+/// (upstream `drain` step loop). A step that finished with tool calls
+/// continues into the next step after its tools settled; a step rejected as
+/// context overflow compacts once (reason `auto`) and retries; a
+/// length-truncated step continues via a synthetic user prompt and gives up
+/// after three consecutive truncations (upstream `Outcome.OutputLimit`).
 async fn run_turn(ctx: &DrainCtx, token: &CancellationToken) -> Result<TurnOutcome> {
-    // TODO(task 6b): consecutive steps per turn — execute `tool_calls` and
-    // loop (upstream needsContinuation), with retry/compaction recovery and
-    // step numbering feeding max-steps prompts.
     let (agent, model) = match resolve_selection(&ctx.db, &ctx.session_id, &ctx.config).await {
         Ok(selection) => selection,
         Err(error) => return Ok(TurnOutcome::Failed(unknown_error(error.to_string()))),
     };
-    let params = super::step::StepParams {
-        assistant_message_id: id::id("msg"),
-        agent: &agent,
-        model: &model,
-    };
-    match super::step::run(ctx, token, &params).await? {
-        super::step::StepOutcome::Completed { finish, tool_calls } => {
-            if !tool_calls.is_empty() {
-                // 6a never executes tools; a scripted transport returning
-                // tool calls still ends the turn cleanly (6b hangs here).
-                tracing::warn!(
-                    session = %ctx.session_id,
-                    finish = ?finish,
-                    count = tool_calls.len(),
-                    "tool calls are not executed in task 6a; ending the turn"
-                );
-            }
-            Ok(TurnOutcome::Ended)
+    let mut compacted = false;
+    loop {
+        if token.is_cancelled() {
+            return Ok(TurnOutcome::Interrupted);
         }
-        super::step::StepOutcome::Interrupted => Ok(TurnOutcome::Interrupted),
-        super::step::StepOutcome::Failed(error) => Ok(TurnOutcome::Failed(error)),
+        let params = super::step::StepParams {
+            assistant_message_id: id::id("msg"),
+            agent: &agent,
+            model: &model,
+        };
+        match super::step::run(ctx, token, &params).await? {
+            super::step::StepOutcome::Completed { finish } => {
+                if finish != FinishReason::ToolCalls && finish != FinishReason::Length {
+                    return Ok(TurnOutcome::Ended);
+                }
+                if finish == FinishReason::Length {
+                    // Upstream Outcome.OutputLimit (llm.ts): the truncated
+                    // response stays in context; a synthetic user prompt
+                    // continues the turn. After two continuations that still
+                    // end `length`, the turn gives up.
+                    if output_limit_exhausted(&ctx.db, &ctx.session_id).await? {
+                        let error = SessionError {
+                            kind: "output-limit".to_owned(),
+                            message:
+                                "Response still truncated after two output token limit continuations"
+                                    .to_owned(),
+                            status: None,
+                            response: None,
+                        };
+                        ctx.bus
+                            .publish(SessionEventData::StepFailed {
+                                session_id: ctx.session_id.clone(),
+                                assistant_message_id: params.assistant_message_id.clone(),
+                                error: error.clone(),
+                                finish: None,
+                                raw_finish: None,
+                                provider_state: None,
+                                cost: None,
+                                tokens: None,
+                                snapshot: None,
+                                files: None,
+                            })
+                            .await?;
+                        return Ok(TurnOutcome::Failed(error));
+                    }
+                    ctx.bus
+                        .publish(SessionEventData::SessionSynthetic {
+                            session_id: ctx.session_id.clone(),
+                            text: CONTINUE_AFTER_OUTPUT_LIMIT.to_owned(),
+                            description: None,
+                            metadata: None,
+                        })
+                        .await?;
+                }
+                // The step settled its tool parts (success/failed rows);
+                // steer items that arrived mid-turn join before the
+                // continuation step (upstream step boundary: steer-only).
+                deliver_pending_steers(ctx).await?;
+            }
+            super::step::StepOutcome::Overflow { error } => {
+                if compacted {
+                    return Ok(TurnOutcome::Failed(error));
+                }
+                compacted = true;
+                // Upstream Outcome.Compacted: compact, then retry the step
+                // against the post-compaction context. A failed compaction
+                // settles its row and fails the turn with the original
+                // overflow error.
+                if let Err(compact_error) =
+                    compaction::compact(ctx, CompactionReason::Auto, None).await
+                {
+                    tracing::warn!(
+                        session = %ctx.session_id,
+                        error = %compact_error.message,
+                        "overflow compaction failed"
+                    );
+                    return Ok(TurnOutcome::Failed(error));
+                }
+            }
+            super::step::StepOutcome::Interrupted => return Ok(TurnOutcome::Interrupted),
+            super::step::StepOutcome::Failed(error) => return Ok(TurnOutcome::Failed(error)),
+        }
     }
+}
+
+/// Upstream `CONTINUE_AFTER_OUTPUT_LIMIT` (llm.ts).
+const CONTINUE_AFTER_OUTPUT_LIMIT: &str = "Your last response hit the output token limit (stop reason: length). Do not apologize, recap, or repeat yourself. Break the remaining work into smaller pieces.";
+/// Upstream exhausts the length-continuation streak on the third truncated
+/// response (two continuations).
+const OUTPUT_LIMIT_STRIKES: usize = 3;
+
+/// Whether the last `OUTPUT_LIMIT_STRIKES` user/assistant rows are all
+/// length-truncated assistants (upstream llm.ts OutputLimit exhaustion
+/// check; compaction/other rows break the streak).
+async fn output_limit_exhausted(db: &Db, session_id: &str) -> Result<bool> {
+    let rows = super::step::load_history(db, session_id).await?;
+    let recent: Vec<&Message> = rows
+        .iter()
+        .filter(|message| matches!(message, Message::User { .. } | Message::Assistant(_)))
+        .rev()
+        .take(OUTPUT_LIMIT_STRIKES)
+        .collect();
+    Ok(recent.len() == OUTPUT_LIMIT_STRIKES
+        && recent.iter().all(|message| {
+            matches!(
+                message,
+                Message::Assistant(assistant)
+                    if assistant.finish == Some(FinishReason::Length)
+            )
+        }))
+}
+
+/// Deliver the steers pending at a step boundary, steer-scope only: queued
+/// items wait for the next turn entry. A compaction control at the steer
+/// head owns the boundary — it runs before the continuation step; a move
+/// still bounds it (handled at drain level after the turn).
+async fn deliver_pending_steers(ctx: &DrainCtx) -> Result<()> {
+    let steers: Vec<InboxRow> = list_rows(&ctx.db, &ctx.session_id)
+        .await?
+        .into_iter()
+        .filter(|row| row.item.delivery() == Delivery::Steer)
+        .collect();
+    let steers = reorder_steers(steers);
+    let Some(head) = steers.first() else {
+        return Ok(());
+    };
+    if matches!(head.item, Item::Compaction { .. }) {
+        let inbox_id = head.id.clone();
+        deliver(ctx, &inbox_id).await?;
+        if let Err(error) = compaction::compact(ctx, CompactionReason::Manual, Some(inbox_id)).await
+        {
+            tracing::warn!(session = %ctx.session_id, error = %error.message, "mid-turn compaction failed");
+        }
+        return Ok(());
+    }
+    deliver_up_to_control(ctx, steers).await?;
+    Ok(())
 }
 
 /// Resolve the session's agent + model (`context.resolveModel`): the
 /// projected selection when set, else the config's first model, else the
 /// cardinal default id.
-async fn resolve_selection(
+pub(crate) async fn resolve_selection(
     db: &Db,
     session_id: &str,
     config: &Config,
@@ -434,36 +558,71 @@ async fn deliver(ctx: &DrainCtx, inbox_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Compaction control, 6a stub: deliver the item, publish
-/// `compaction.started`, then fail the compaction — the summary flow
-/// (context selection, preview, summary stream) is task 6b.
-// TODO(task 6b): replace the failure with the real compaction pipeline
-// (`SessionCompaction.compact`, reason "manual").
-async fn settle_compaction_stub(ctx: &DrainCtx, inbox_id: &str) -> Result<()> {
-    deliver(ctx, inbox_id).await?;
-    ctx.bus
-        .publish(SessionEventData::CompactionStarted {
-            session_id: ctx.session_id.clone(),
-            reason: CompactionReason::Manual,
-            recent: String::new(),
-            input_id: Some(inbox_id.to_owned()),
-        })
-        .await?;
-    ctx.bus
-        .publish(SessionEventData::CompactionFailed {
-            session_id: ctx.session_id.clone(),
-            reason: CompactionReason::Manual,
-            error: SessionError {
-                kind: "compaction.failed".to_owned(),
-                message: "compaction is not implemented in task 6a".to_owned(),
-                status: None,
-                response: None,
-            },
-            input_id: Some(inbox_id.to_owned()),
-            cost: None,
-            tokens: None,
-        })
-        .await?;
+/// `settleStaleToolCalls` (upstream runner/llm.ts): assistant tool parts
+/// left `running`/`streaming` by a process death are published as failed
+/// (`session.tool.failed`, upstream error "aborted") newest-message-first,
+/// so no tool part stays unsettled across restarts.
+async fn settle_stale_tool_calls(bus: &EventBus, db: &Db, session_id: &str) -> Result<()> {
+    // Assistant rows with an unsettled tool part, newest first. The JSON
+    // match mirrors the projector's stored shapes: `running` keeps
+    // `{status, input, metadata}`, `streaming` keeps `{status, input}`.
+    let rows: Vec<(String, String)> = {
+        let sid = session_id.to_owned();
+        db.conn()
+            .call(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT id, data FROM session_message
+                 WHERE session_id = ?1 AND type = 'assistant'
+                   AND (json_extract(data, '$.error') IS NULL)
+                   AND EXISTS (
+                     SELECT 1 FROM json_each(session_message.data, '$.content')
+                     WHERE json_extract(value, '$.type') = 'tool'
+                       AND json_extract(value, '$.state.status') IN ('running', 'streaming')
+                   )
+                 ORDER BY seq DESC",
+                )?;
+                let mapped = stmt.query_map(rusqlite::params![sid], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await?
+    };
+    for (message_id, data) in rows {
+        let message: Value = serde_json::from_str(&data)?;
+        let Some(content) = message.get("content").and_then(Value::as_array) else {
+            continue;
+        };
+        for part in content {
+            let is_tool = part.get("type").and_then(Value::as_str) == Some("tool");
+            let status = part
+                .get("state")
+                .and_then(|state| state.get("status"))
+                .and_then(Value::as_str);
+            if !is_tool || !matches!(status, Some("running") | Some("streaming")) {
+                continue;
+            }
+            let Some(id) = part.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            bus.publish(SessionEventData::ToolFailed {
+                session_id: session_id.to_owned(),
+                assistant_message_id: message_id.clone(),
+                id: id.to_owned(),
+                error: SessionError {
+                    kind: "aborted".to_owned(),
+                    message: "Tool execution interrupted".to_owned(),
+                    status: None,
+                    response: None,
+                },
+                content: None,
+                metadata: None,
+                executed: false,
+                result_state: None,
+            })
+            .await?;
+        }
+    }
     Ok(())
 }
 

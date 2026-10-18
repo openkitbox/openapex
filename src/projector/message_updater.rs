@@ -30,6 +30,25 @@ pub struct Output {
 // Assistant row load/store helpers
 // ---------------------------------------------------------------------------
 
+/// Rewrite an assistant row's `data` without moving its `seq`: used when one
+/// event must settle a row other than the one the event's seq is about
+/// (closing a stale assistant while appending the fresh one).
+fn close_assistant_in_place(
+    tx: &Connection,
+    session_id: &str,
+    msg: &AssistantMessage,
+) -> Result<()> {
+    let data = Message::Assistant(Box::new(msg.clone()))
+        .to_row_data()
+        .to_string();
+    tx.execute(
+        "UPDATE session_message SET data = ?3, time_updated = ?4
+         WHERE id = ?1 AND session_id = ?2",
+        rusqlite::params![msg.id, session_id, data, msg.time.created],
+    )?;
+    Ok(())
+}
+
 /// Decode an assistant `data` JSON row into an `AssistantMessage`.
 fn decode_assistant(id: &str, data: &str) -> Result<AssistantMessage> {
     let value: Value = serde_json::from_str(data)?;
@@ -391,7 +410,13 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                 if let Some(mut current) = load_current_assistant(tx, session_id)? {
                     current.retry = None;
                     current.time.completed = Some(created);
-                    store_assistant(tx, session_id, seq, &current.id, &current)?;
+                    // Close the stale assistant in place: the row keeps its
+                    // original history position, and the event's `seq` stays
+                    // owned by the fresh assistant appended below (a second
+                    // write at the event seq would collide with the
+                    // UNIQUE(session_id, seq) index — and reorder the closed
+                    // row after this turn's rows).
+                    close_assistant_in_place(tx, session_id, &current)?;
                 }
                 let msg = AssistantMessage {
                     id: assistant_message_id.clone(),

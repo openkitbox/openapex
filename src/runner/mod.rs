@@ -20,10 +20,11 @@
 //!   into the gap.
 //!
 //! The [`Tool`] trait + [`ToolRegistry`] here are the seam task 7 fills with
-//! real tools; the registry ships empty and steps in 6a never execute tools.
+//! real tools; the registry ships empty until task 7 fills it.
 
 pub use crate::cardinal::chat::Chat;
 
+pub(crate) mod compaction;
 pub mod drain;
 pub mod step;
 
@@ -81,7 +82,7 @@ pub struct ToolContext {
     pub cancellation: CancellationToken,
 }
 
-/// A tool's terminal output (task 7 streams progress; 6a settles once).
+/// A tool's terminal output (task 7 streams progress; 6b settles once).
 pub struct ToolOutput {
     /// Content for the model (JSON text or structured value).
     pub content: Value,
@@ -131,7 +132,7 @@ impl ToolRegistry {
         self.tools.get(name).cloned()
     }
 
-    /// Whether no tools are registered (6a ships empty).
+    /// Whether no tools are registered (ox ships empty until task 7).
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
     }

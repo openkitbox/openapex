@@ -1,6 +1,4 @@
-//! One streaming step, ported from `packages/core/src/session/runner/step.ts`
-//! (text-only for task 6a; the tool/continuation branches are structured for
-//! 6b).
+//! One streaming step, ported from `packages/core/src/session/runner/step.ts`.
 //!
 //! Event choreography (matching upstream):
 //!
@@ -11,45 +9,69 @@
 //! - Text/reasoning deltas stream as ephemeral events between
 //!   `*.started`/`*.ended` pairs, each block with its own zero-based
 //!   ordinal.
-//! - On a clean finish: `session.step.streamed` then `session.step.ended`
-//!   with upstream's token shape (`input` = prompt minus cached, `output` =
-//!   completion, `reasoning`, `cache.read` = cached, `cache.write` = 0).
+//! - Tool calls accumulate per stream index from
+//!   `StreamEvent::ToolCallDelta` fragments: `session.tool.input.started`
+//!   fires once the call is identified (id + name known), `*.input.delta`
+//!   per fragment (ephemeral), `*.input.ended` when the arguments complete.
+//!   Cardinal completes a call's arguments at `finish_reason`, so the
+//!   settlement — `session.tool.called` plus the spawned execution — runs
+//!   at `Finish` while the stream may still be open (upstream: tool
+//!   execution is concurrent with the stream, llm.ts + step.ts).
+//! - Each execution settles its tool part durably: `session.tool.success`
+//!   or `session.tool.failed` (status `completed` / `error`). An
+//!   interrupted in-flight execution settles as failed/`aborted`.
+//! - On a clean finish: `session.step.streamed`, tool settlement, then
+//!   `session.step.ended` with upstream's token shape (`input` = prompt
+//!   minus cached, `output` = completion, `reasoning`, `cache.read` =
+//!   cached, `cache.write` = 0).
 //! - An interruption after the step started settles the step with
-//!   `session.step.failed` carrying the upstream `aborted` error.
+//!   `session.step.failed` carrying the upstream `aborted` error, after
+//!   failing unsettled tool parts.
 //! - Transport errors before any output retry with backoff (upstream's
-//!   SessionRunnerRetry publishes `session.retry.scheduled`); 6a caps at 3
-//!   attempts. 6b replaces the flat cap with upstream's retry policy
-//!   (recoverable overflow/continuation handling).
+//!   SessionRunnerRetry publishes `session.retry.scheduled`); capped at 3
+//!   attempts. A 400 context-length overflow before any output surfaces as
+//!   [`StepOutcome::Overflow`] so the drain can compact and retry once
+//!   (upstream `Outcome.Compacted`).
 //!
 //! The context assembly lives in one named function
-//! ([`build_chat_messages`]) so 6b and the e2e suite can trust the mapping.
+//! ([`build_chat_messages`]) so the e2e suite can trust the mapping.
 
 use std::collections::BTreeMap;
 use std::future::poll_fn;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use serde_json::{Value, json};
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::cardinal::CardinalError;
 use crate::cardinal::chat::BoxChatStream;
-use crate::cardinal::stream::{AssembledToolCall, StreamEvent};
+use crate::cardinal::stream::StreamEvent;
 use crate::cardinal::wire::{
     ChatMessage, ChatRequest, FunctionCall, FunctionType, ToolCall, Usage,
 };
 use crate::id;
 use crate::prompt;
 use crate::schema::event::SessionEventData;
-use crate::schema::message::{AssistantContent, Message};
+use crate::schema::message::{
+    AssistantContent, Compaction, CompactionCompleted, CompactionMessage, Message, ToolState,
+};
 use crate::schema::support::{
-    FinishReason, ModelRef, Prompt, SessionError, TokenCache, TokenUsage,
+    Content, FinishReason, ModelRef, Prompt, Record, SessionError, TokenCache, TokenUsage,
 };
 
+use super::ToolContext;
+use super::compaction;
+use super::compaction::is_context_overflow;
 use super::drain::DrainCtx;
 
 /// Upstream `STEP_INTERRUPTED` (runner/step.ts).
 const STEP_INTERRUPTED: &str = "Step interrupted";
-/// Transport attempts before the step fails (upstream policy arrives in 6b).
+/// Upstream `TOOLS_INTERRUPTED` (runner/step.ts).
+const TOOLS_INTERRUPTED: &str = "Tool execution interrupted";
+/// Transport attempts before the step fails (upstream policy arrives later).
 const MAX_ATTEMPTS: usize = 3;
 /// Backoff base; attempt N sleeps `base * N`.
 const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(250);
@@ -57,12 +79,12 @@ const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(250);
 /// Terminal states of one step, consumed by the drain loop.
 #[derive(Debug)]
 pub(crate) enum StepOutcome {
-    /// The stream finished. `tool_calls` would continue the turn (6b
-    /// executes them; 6a turns always end here).
-    Completed {
-        finish: FinishReason,
-        tool_calls: Vec<ToolCall>,
-    },
+    /// The stream finished. `FinishReason::ToolCalls` continues the turn
+    /// (the tool parts are already settled in the assistant row).
+    Completed { finish: FinishReason },
+    /// The provider rejected the request as context overflow before any
+    /// output; the drain compacts and retries the step once.
+    Overflow { error: SessionError },
     /// The cancellation token fired. The assistant row is settled
     /// (`step.failed` / `aborted`) when the step had started.
     Interrupted,
@@ -114,6 +136,13 @@ pub(crate) async fn run(
         let stream = match ctx.chat.stream_chat(&request).await {
             Ok(stream) => stream,
             Err(error) => {
+                // Context overflow before any output → the drain compacts
+                // and retries the step once (upstream Outcome.Compacted).
+                if !started && is_overflow_error(&error) {
+                    return Ok(StepOutcome::Overflow {
+                        error: to_session_error(&error),
+                    });
+                }
                 // Connect failure: nothing was published for this attempt.
                 if attempt < MAX_ATTEMPTS {
                     schedule_retry(ctx, params, &mut started, attempt, &error).await?;
@@ -128,6 +157,11 @@ pub(crate) async fn run(
         match consume(ctx, token, params, dispatch, &mut started, stream).await? {
             Attempt::Done(outcome) => return Ok(outcome),
             Attempt::Transport { error, published } => {
+                if !started && is_overflow_error(&error) {
+                    return Ok(StepOutcome::Overflow {
+                        error: to_session_error(&error),
+                    });
+                }
                 if !published && attempt < MAX_ATTEMPTS {
                     schedule_retry(ctx, params, &mut started, attempt, &error).await?;
                     if !sleep_backoff(token, attempt).await {
@@ -138,6 +172,17 @@ pub(crate) async fn run(
                 return fail_step(ctx, params, to_session_error(&error), None, started).await;
             }
         }
+    }
+}
+
+/// Whether a cardinal error is a context-length overflow rejection (upstream
+/// `isContextOverflowFailure`): an HTTP 400 (or an in-band upstream failure
+/// forwarded as a stream error) whose body carries the overflow signature.
+fn is_overflow_error(error: &CardinalError) -> bool {
+    match error {
+        CardinalError::Http { status, body } => is_context_overflow(*status, body),
+        CardinalError::Upstream(body) => is_context_overflow(400, body),
+        _ => false,
     }
 }
 
@@ -248,6 +293,22 @@ async fn fail_step(
     Ok(outcome)
 }
 
+/// One accumulating tool call from `ToolCallDelta` fragments.
+#[derive(Debug, Default)]
+struct ToolAccum {
+    /// Call id (first fragment that carries one).
+    id: String,
+    /// Function name (first fragment that carries one).
+    name: String,
+    /// Concatenated argument JSON.
+    arguments: String,
+    /// `tool.input.started` has gone out (id + name known).
+    input_started: bool,
+    /// The call settled: input ended and `tool.called` (or a failure)
+    /// published. Guards idempotent settlement.
+    called: bool,
+}
+
 /// Consume one stream attempt, publishing streaming events as they arrive
 /// and settling the step when the stream terminates cleanly. `started` is
 /// updated when `step.started` goes out (persisted across retry attempts).
@@ -267,9 +328,13 @@ async fn consume(
     let mut next_reasoning_ordinal: i64 = 0;
     let mut finish: Option<(FinishReason, String)> = None;
     let mut usage: Option<Usage> = None;
-    // Tool-call fragments by stream index (6b executes these; 6a only
-    // assembles them for the outcome).
-    let mut tool_acc: BTreeMap<u32, AssembledToolCall> = BTreeMap::new();
+    // Tool-call fragments by stream index.
+    let mut tool_acc: BTreeMap<u32, ToolAccum> = BTreeMap::new();
+    // In-flight tool executions paired with their call ids. Each task
+    // publishes its own settlement; the step joins them before `step.ended`
+    // (upstream: tools run while the stream continues, and the step waits
+    // for all spawned tools).
+    let mut tool_tasks: Vec<(String, JoinHandle<()>)> = Vec::new();
 
     loop {
         enum Next {
@@ -293,6 +358,12 @@ async fn consume(
                     &reasoning,
                 )
                 .await?;
+                // Settle open tool inputs and in-flight executions as
+                // aborted (upstream `interruptTools` + `failUnsettledTools`)
+                // BEFORE `step.failed`.
+                fail_unsettled_tools(ctx, params, &mut tool_acc, aborted_error(TOOLS_INTERRUPTED))
+                    .await?;
+                join_tool_tasks(ctx, params, &mut tool_tasks, token).await?;
                 return Ok(Attempt::Done(
                     settle_interrupted(ctx, params, *started, Some(map_tokens(usage))).await?,
                 ));
@@ -310,6 +381,12 @@ async fn consume(
                     &reasoning,
                 )
                 .await?;
+                // A failure before `Finish` leaves no spawned executions
+                // (settlement happens at `Finish`); open inputs settle as
+                // interrupted so no tool part stays streaming.
+                fail_unsettled_tools(ctx, params, &mut tool_acc, aborted_error(TOOLS_INTERRUPTED))
+                    .await?;
+                join_tool_tasks(ctx, params, &mut tool_tasks, token).await?;
                 let published = *started;
                 return Ok(Attempt::Transport { error, published });
             }
@@ -381,19 +458,55 @@ async fn consume(
                         publish_started(ctx, params, dispatch).await?;
                         *started = true;
                     }
-                    // TODO(task 6b): publish tool.input.started/delta/ended and
-                    // session.tool.called as the fragments arrive.
-                    let call = tool_acc.entry(index).or_default();
-                    if let Some(id) = id {
-                        call.id = id;
+                    let entry = tool_acc.entry(index).or_default();
+                    if entry.id.is_empty()
+                        && let Some(seen) = id
+                    {
+                        entry.id = seen;
                     }
-                    if let Some(name) = name {
-                        call.name = name;
+                    if entry.name.is_empty()
+                        && let Some(seen) = name
+                    {
+                        entry.name = seen;
                     }
-                    call.arguments.push_str(&arguments);
+                    // `tool.input.started` fires once the call is identified
+                    // (id + name known), like upstream `startToolInput`.
+                    if !entry.input_started && !entry.id.is_empty() && !entry.name.is_empty() {
+                        entry.input_started = true;
+                        ctx.bus
+                            .publish(SessionEventData::ToolInputStarted {
+                                session_id: ctx.session_id.clone(),
+                                assistant_message_id: params.assistant_message_id.clone(),
+                                id: entry.id.clone(),
+                                name: entry.name.clone(),
+                            })
+                            .await?;
+                    }
+                    if !arguments.is_empty() {
+                        entry.arguments.push_str(&arguments);
+                        if entry.input_started {
+                            // Ephemeral; the durable state keeps the final
+                            // input from `tool.input.ended`.
+                            ctx.bus
+                                .publish(SessionEventData::ToolInputDelta {
+                                    session_id: ctx.session_id.clone(),
+                                    assistant_message_id: params.assistant_message_id.clone(),
+                                    id: entry.id.clone(),
+                                    delta: arguments,
+                                })
+                                .await?;
+                        }
+                    }
                 }
                 StreamEvent::Finish { reason } => {
                     finish = Some((map_finish(&reason), reason));
+                    // Cardinal completes a tool call's arguments at the
+                    // finish chunk, so the calls settle — input ended,
+                    // `tool.called`, execution spawned — while the stream is
+                    // still open (usage / `[DONE]` may follow). Upstream
+                    // starts tool executions as tool-calls arrive,
+                    // concurrent with reading the stream.
+                    settle_tool_calls(ctx, params, &mut tool_acc, &mut tool_tasks, token).await?;
                 }
                 StreamEvent::Usage(seen) => usage = Some(seen),
                 StreamEvent::Done => break,
@@ -419,7 +532,11 @@ async fn consume(
         });
     }
     let Some((mapped_finish, raw_finish)) = finish else {
-        // Upstream treats a missing finish reason as invalid provider output.
+        // Upstream treats a missing finish reason as invalid provider
+        // output; any open tool input settles as incomplete first
+        // (upstream `failIncompleteTools`).
+        fail_unsettled_tools(ctx, params, &mut tool_acc, incomplete_input_error()).await?;
+        join_tool_tasks(ctx, params, &mut tool_tasks, token).await?;
         let outcome = fail_step(
             ctx,
             params,
@@ -436,12 +553,27 @@ async fn consume(
         return Ok(Attempt::Done(outcome));
     };
 
+    // Anything still unsettled without a `Finish`-driven settlement (a
+    // stream that ended before its finish chunk carried no calls) is
+    // idempotently settled here.
+    settle_tool_calls(ctx, params, &mut tool_acc, &mut tool_tasks, token).await?;
+
     ctx.bus
         .publish(SessionEventData::StepStreamed {
             session_id: ctx.session_id.clone(),
             assistant_message_id: params.assistant_message_id.clone(),
         })
         .await?;
+    // Wait for every spawned execution; an interrupt while waiting aborts
+    // the remainder and settles their parts aborted.
+    join_tool_tasks(ctx, params, &mut tool_tasks, token).await?;
+    // An interrupt that landed during the join settles the step
+    // interrupted (upstream: failAssistant, no step.ended).
+    if token.is_cancelled() {
+        return Ok(Attempt::Done(
+            settle_interrupted(ctx, params, *started, Some(map_tokens(usage))).await?,
+        ));
+    }
     ctx.bus
         .publish(SessionEventData::StepEnded {
             session_id: ctx.session_id.clone(),
@@ -457,8 +589,278 @@ async fn consume(
         .await?;
     Ok(Attempt::Done(StepOutcome::Completed {
         finish: mapped_finish,
-        tool_calls: assemble_tool_calls(tool_acc),
     }))
+}
+
+/// Upstream `TOOLS_INTERRUPTED` as an `aborted` session error.
+fn aborted_error(message: &str) -> SessionError {
+    SessionError {
+        kind: "aborted".to_owned(),
+        message: message.to_owned(),
+        status: None,
+        response: None,
+    }
+}
+
+/// Upstream `INPUT_FAILURES.incomplete`.
+fn incomplete_input_error() -> SessionError {
+    SessionError {
+        kind: "tool.input-incomplete".to_owned(),
+        message:
+            "Tool call arguments were not completed and were not executed. Reissue the call with complete arguments."
+                .to_owned(),
+        status: None,
+        response: None,
+    }
+}
+
+/// Settle every complete-but-uncalled accumulator, in index order: end its
+/// input, publish `tool.called` with the parsed arguments, and spawn the
+/// execution. Malformed arguments fail the call instead (upstream
+/// `INPUT_FAILURES.malformed`). Idempotent via `ToolAccum::called`.
+async fn settle_tool_calls(
+    ctx: &DrainCtx,
+    params: &StepParams<'_>,
+    accs: &mut BTreeMap<u32, ToolAccum>,
+    tasks: &mut Vec<(String, JoinHandle<()>)>,
+    token: &CancellationToken,
+) -> Result<()> {
+    for acc in accs.values_mut() {
+        if !acc.input_started || acc.called || acc.id.is_empty() || acc.name.is_empty() {
+            continue;
+        }
+        acc.called = true;
+        ctx.bus
+            .publish(SessionEventData::ToolInputEnded {
+                session_id: ctx.session_id.clone(),
+                assistant_message_id: params.assistant_message_id.clone(),
+                id: acc.id.clone(),
+                text: acc.arguments.clone(),
+            })
+            .await?;
+        let trimmed = acc.arguments.trim();
+        // `Record` = a JSON object; scalars/arrays/null fail the parse and
+        // the call (upstream `INPUT_FAILURES.malformed`).
+        let input_record: Record = if trimmed.is_empty() {
+            Record::new()
+        } else {
+            match serde_json::from_str(trimmed) {
+                Ok(input) => input,
+                Err(_) => {
+                    ctx.bus
+                        .publish(SessionEventData::ToolFailed {
+                            session_id: ctx.session_id.clone(),
+                            assistant_message_id: params.assistant_message_id.clone(),
+                            id: acc.id.clone(),
+                            error: SessionError {
+                                kind: "tool.input-json".to_owned(),
+                                message: "The tool input could not be parsed as JSON, so the call was not executed. Reissue the call with valid JSON arguments."
+                                    .to_owned(),
+                                status: None,
+                                response: None,
+                            },
+                            content: None,
+                            metadata: None,
+                            executed: false,
+                            result_state: None,
+                        })
+                        .await?;
+                    continue;
+                }
+            }
+        };
+        let input_value = Value::Object(input_record.clone().into_iter().collect());
+        ctx.bus
+            .publish(SessionEventData::ToolCalled {
+                session_id: ctx.session_id.clone(),
+                assistant_message_id: params.assistant_message_id.clone(),
+                id: acc.id.clone(),
+                input: input_record,
+                executed: false,
+                state: None,
+            })
+            .await?;
+        match ctx.tools.get(&acc.name) {
+            Some(tool) => tasks.push((
+                acc.id.clone(),
+                spawn_tool_task(ctx, token, params, acc.id.clone(), tool, input_value),
+            )),
+            None => {
+                ctx.bus
+                    .publish(SessionEventData::ToolFailed {
+                        session_id: ctx.session_id.clone(),
+                        assistant_message_id: params.assistant_message_id.clone(),
+                        id: acc.id.clone(),
+                        error: SessionError {
+                            kind: "unknown".to_owned(),
+                            message: format!("Unknown tool: {}", acc.name),
+                            status: None,
+                            response: None,
+                        },
+                        content: None,
+                        metadata: None,
+                        executed: false,
+                        result_state: None,
+                    })
+                    .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Spawn one tool execution; the task publishes `tool.success` or
+/// `tool.failed` itself and the step only joins the handle (upstream runs
+/// each execution in its own fiber).
+fn spawn_tool_task(
+    ctx: &DrainCtx,
+    token: &CancellationToken,
+    params: &StepParams<'_>,
+    call_id: String,
+    tool: Arc<dyn super::Tool>,
+    input: Value,
+) -> JoinHandle<()> {
+    let bus = ctx.bus.clone();
+    let session_id = ctx.session_id.clone();
+    let message_id = params.assistant_message_id.clone();
+    let directory = ctx.directory.clone();
+    // A child token: interrupting the busy period cancels the tool at its
+    // next await point.
+    let cancellation = token.child_token();
+    tokio::spawn(async move {
+        let output = tool
+            .execute(
+                ToolContext {
+                    session_id: session_id.clone(),
+                    directory,
+                    call_id: call_id.clone(),
+                    cancellation,
+                },
+                input,
+            )
+            .await;
+        let event = match output.error {
+            None => SessionEventData::ToolSuccess {
+                session_id,
+                assistant_message_id: message_id,
+                id: call_id,
+                content: vec![Content::Text {
+                    text: tool_output_text(output.content),
+                }],
+                metadata: None,
+                executed: false,
+                result_state: None,
+            },
+            Some(message) => SessionEventData::ToolFailed {
+                session_id,
+                assistant_message_id: message_id,
+                id: call_id,
+                error: SessionError {
+                    kind: "unknown".to_owned(),
+                    message,
+                    status: None,
+                    response: None,
+                },
+                content: None,
+                metadata: None,
+                executed: false,
+                result_state: None,
+            },
+        };
+        if let Err(error) = bus.publish(event).await {
+            tracing::error!(error = %error, "tool settlement failed to publish");
+        }
+    })
+}
+
+/// A tool output's model-facing text: strings verbatim, anything else as
+/// compact JSON.
+fn tool_output_text(value: Value) -> String {
+    match value {
+        Value::String(text) => text,
+        other => other.to_string(),
+    }
+}
+
+/// Fail every input-started-but-uncalled accumulator with `error`
+/// (upstream `failUnsettledTools`): the projector settles the streaming
+/// tool part into the error state.
+async fn fail_unsettled_tools(
+    ctx: &DrainCtx,
+    params: &StepParams<'_>,
+    accs: &mut BTreeMap<u32, ToolAccum>,
+    error: SessionError,
+) -> Result<()> {
+    for acc in accs.values_mut() {
+        if !acc.input_started || acc.called {
+            continue;
+        }
+        acc.called = true;
+        ctx.bus
+            .publish(SessionEventData::ToolFailed {
+                session_id: ctx.session_id.clone(),
+                assistant_message_id: params.assistant_message_id.clone(),
+                id: acc.id.clone(),
+                error: error.clone(),
+                content: None,
+                metadata: None,
+                executed: false,
+                result_state: None,
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+/// Wait for every spawned execution. An interrupt while waiting aborts the
+/// remaining tasks; a task cancelled before it settled gets its tool part
+/// settled `aborted` here (a task that finished first already published its
+/// own settlement, and the projector ignores a failure for a settled part).
+async fn join_tool_tasks(
+    ctx: &DrainCtx,
+    params: &StepParams<'_>,
+    tasks: &mut [(String, JoinHandle<()>)],
+    token: &CancellationToken,
+) -> Result<()> {
+    let mut interrupted = false;
+    for (call_id, task) in tasks.iter_mut() {
+        if interrupted {
+            task.abort();
+        }
+        let result = if interrupted {
+            (&mut *task).await
+        } else {
+            let outcome = tokio::select! {
+                result = &mut *task => Ok(result),
+                () = token.cancelled() => Err(()),
+            };
+            match outcome {
+                Ok(result) => result,
+                Err(()) => {
+                    // Interrupted mid-wait: abort the execution and settle
+                    // its part aborted below.
+                    interrupted = true;
+                    task.abort();
+                    (&mut *task).await
+                }
+            }
+        };
+        if result.is_err() {
+            ctx.bus
+                .publish(SessionEventData::ToolFailed {
+                    session_id: ctx.session_id.clone(),
+                    assistant_message_id: params.assistant_message_id.clone(),
+                    id: call_id.clone(),
+                    error: aborted_error(TOOLS_INTERRUPTED),
+                    content: None,
+                    metadata: None,
+                    executed: false,
+                    result_state: None,
+                })
+                .await?;
+        }
+    }
+    Ok(())
 }
 
 /// Publish `text.ended`/`reasoning.ended` for any open blocks. Idempotent:
@@ -494,20 +896,6 @@ async fn flush_blocks(
             .await?;
     }
     Ok(())
-}
-
-/// Reconstruct wire tool calls from streamed fragments, in index order.
-fn assemble_tool_calls(acc: BTreeMap<u32, AssembledToolCall>) -> Vec<ToolCall> {
-    acc.into_values()
-        .map(|call| ToolCall {
-            id: call.id,
-            kind: FunctionType::Function,
-            function: FunctionCall {
-                name: call.name,
-                arguments: call.arguments,
-            },
-        })
-        .collect()
 }
 
 /// Upstream token shape (`SessionUsage.tokens`): input excludes cached
@@ -557,7 +945,7 @@ fn to_session_error(error: &CardinalError) -> SessionError {
 }
 
 // ---------------------------------------------------------------------------
-// Context assembly (one named mapping; 6b/e2e trust this function)
+// Context assembly (one named mapping; the e2e suite trusts this function)
 // ---------------------------------------------------------------------------
 
 /// Build the OpenAI message list: the system prompt, then the session
@@ -571,16 +959,32 @@ fn to_session_error(error: &CardinalError) -> SessionError {
 /// - `synthetic`/`skill` → user-role text.
 /// - `system`   → `{role: "system", content}` (to-llm-message.ts:291).
 /// - `assistant` → `{role: "assistant", content: text parts joined,
-///   tool_calls: from its tool content}`; reasoning content is dropped.
-/// - tool results (`{role: "tool", tool_call_id, content}`) ride in 6b with
-///   tool execution.
-/// - compaction rows collapse into the context summary (6b); idle/shell/
-///   switch markers never reach the model.
+///   tool_calls: the row's tool parts}`; reasoning content is dropped.
+/// - A settled assistant tool part (`completed`/`error`, `executed: false`)
+///   additionally becomes `{role: "tool", tool_call_id, content}` — joined
+///   JSON content for completed calls, `{error: …}` for failed ones
+///   (upstream `toolResult`).
+/// - `compaction` (completed) → the checkpoint user message carrying the
+///   summary (and `recent` when present); incomplete compactions are
+///   skipped, and history selection starts at the latest completed row
+///   anyway (upstream `SessionHistory` boundary).
+/// - idle/shell/switch markers never reach the model.
 pub(crate) fn build_chat_messages(system: &str, messages: &[Message]) -> Vec<ChatMessage> {
+    // Upstream `messageEntries`: history starts at the latest completed
+    // compaction row, so the checkpoint replaces everything before it.
+    let boundary = messages.iter().rposition(|message| {
+        matches!(
+            message,
+            Message::Compaction(CompactionMessage {
+                compaction: Compaction::Completed(_),
+                ..
+            })
+        )
+    });
     let mut out = vec![ChatMessage::System {
         content: system.to_owned(),
     }];
-    for message in messages {
+    for message in messages.iter().skip(boundary.unwrap_or(0)) {
         match message {
             Message::User { prompt, .. } => {
                 let content = user_prompt_text(prompt);
@@ -600,23 +1004,72 @@ pub(crate) fn build_chat_messages(system: &str, messages: &[Message]) -> Vec<Cha
                 content: text.clone(),
             }),
             Message::Assistant(assistant) => {
-                let mut parts: Vec<&str> = Vec::new();
+                let mut parts: Vec<String> = Vec::new();
+                let mut tool_calls: Vec<ToolCall> = Vec::new();
+                let mut tool_results: Vec<ChatMessage> = Vec::new();
                 for content in &assistant.content {
-                    if let AssistantContent::Text { text, .. } = content {
-                        parts.push(text);
+                    match content {
+                        AssistantContent::Text { text, .. } => parts.push(text.clone()),
+                        // Reasoning is dropped (upstream's provider-bound
+                        // state replay has no ox wire counterpart yet).
+                        AssistantContent::Reasoning { .. } => {}
+                        AssistantContent::Tool {
+                            id,
+                            name,
+                            executed,
+                            state,
+                            ..
+                        } => {
+                            tool_calls.push(ToolCall {
+                                id: id.clone(),
+                                kind: FunctionType::Function,
+                                function: FunctionCall {
+                                    name: name.clone(),
+                                    arguments: serde_json::to_string(&tool_input(state))
+                                        .unwrap_or_else(|_| "{}".to_owned()),
+                                },
+                            });
+                            // Host-executed parts echo their result;
+                            // provider-executed ones don't (upstream
+                            // `executed !== true`).
+                            if *executed != Some(true)
+                                && let Some(result) = tool_result_message(id, state)
+                            {
+                                tool_results.push(result);
+                            }
+                        }
                     }
-                    // Reasoning is dropped; tool content mapping is 6b.
                 }
-                if parts.is_empty() {
+                if parts.is_empty() && tool_calls.is_empty() {
                     continue;
                 }
                 out.push(ChatMessage::Assistant {
-                    content: Some(parts.join("")),
-                    tool_calls: None,
+                    content: if parts.is_empty() {
+                        None
+                    } else {
+                        Some(parts.join(""))
+                    },
+                    tool_calls: if tool_calls.is_empty() {
+                        None
+                    } else {
+                        Some(tool_calls)
+                    },
+                });
+                out.extend(tool_results);
+            }
+            Message::Compaction(CompactionMessage {
+                compaction: Compaction::Completed(completed),
+                ..
+            }) => {
+                let CompactionCompleted {
+                    summary, recent, ..
+                } = &**completed;
+                out.push(ChatMessage::User {
+                    content: compaction::checkpoint_message(summary, recent),
                 });
             }
-            Message::Compaction(_)
-            | Message::Idle { .. }
+            Message::Compaction(_) => {}
+            Message::Idle { .. }
             | Message::Shell { .. }
             | Message::AgentSwitched { .. }
             | Message::ModelSwitched { .. }
@@ -624,6 +1077,46 @@ pub(crate) fn build_chat_messages(system: &str, messages: &[Message]) -> Vec<Cha
         }
     }
     out
+}
+
+/// A tool part's call input for the wire: parsed from the streaming state's
+/// string, verbatim from the settled states (upstream `toolInput`).
+fn tool_input(state: &ToolState) -> Record {
+    match state {
+        ToolState::Streaming { input } => serde_json::from_str(input).unwrap_or_default(),
+        ToolState::Running { input, .. }
+        | ToolState::Completed { input, .. }
+        | ToolState::Error { input, .. } => input.clone(),
+    }
+}
+
+/// The `{role: "tool"}` result message for a settled tool part
+/// (upstream `toolResult`): joined text content for completed calls,
+/// `{error: …}` for failed ones. A `streaming`/`running` part yields
+/// `None` — its own row's result lands in the next request.
+fn tool_result_message(id: &str, state: &ToolState) -> Option<ChatMessage> {
+    let content = match state {
+        ToolState::Completed { content, .. } => {
+            let text = content
+                .iter()
+                .map(|content| match content {
+                    Content::Text { text } => text.clone(),
+                    Content::File { uri, mime, name } => format!(
+                        "[file {} ({mime}) {uri}]",
+                        name.clone().unwrap_or_else(|| "file".to_owned())
+                    ),
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            serde_json::to_string(&json!({ "output": text })).ok()?
+        }
+        ToolState::Error { error, .. } => serde_json::to_string(&json!({ "error": error })).ok()?,
+        ToolState::Streaming { .. } | ToolState::Running { .. } => return None,
+    };
+    Some(ChatMessage::Tool {
+        tool_call_id: id.to_owned(),
+        content,
+    })
 }
 
 /// A user prompt's wire text: the typed text plus attachment markers.
@@ -641,7 +1134,7 @@ fn user_prompt_text(prompt: &Prompt) -> String {
 }
 
 /// The session transcript in `seq` order, decoded from `session_message`.
-async fn load_history(db: &crate::db::Db, session_id: &str) -> Result<Vec<Message>> {
+pub(crate) async fn load_history(db: &crate::db::Db, session_id: &str) -> Result<Vec<Message>> {
     let session_id = session_id.to_owned();
     let rows: Vec<(String, String, String)> = db
         .conn()
