@@ -185,7 +185,8 @@ pub(crate) async fn compact(
             Err(error) => return Err(failure("unknown", error.to_string())),
         };
         let mut request = summarization_request(
-            &format!("{}/{}", model.provider_id, model.id),
+            // Same cardinal routing rule as step.rs: bare model id.
+            &model.id,
             &super::step::build_chat_messages("", &rows),
         );
         let mut summary = stream_summary(ctx, &request).await?;
@@ -275,7 +276,7 @@ mod tests {
                 content: "hello".to_owned(),
             },
         ];
-        let request = summarization_request("p/m", &transcript);
+        let request = summarization_request("p", &transcript);
         assert!(request.tools.is_empty(), "compaction never sends tools");
         let wire = serde_json::to_value(&request).expect("serialize");
         assert!(wire.get("tools").is_none(), "tools key omitted");
@@ -283,7 +284,7 @@ mod tests {
             wire.get("tool_choice").is_none(),
             "tool_choice omitted without tools"
         );
-        assert_eq!(request.model, "p/m");
+        assert_eq!(request.model, "p");
         assert!(
             matches!(&request.messages[0], ChatMessage::System { content } if content == COMPACTION_SYSTEM),
             "summarization system prompt first"

@@ -198,7 +198,10 @@ pub(crate) async fn run(
         let rows = load_history(&ctx.db, &ctx.session_id).await?;
         let system = prompt::build(&ctx.directory);
         let mut request = ChatRequest::new(
-            format!("{}/{}", params.model.provider_id, params.model.id),
+            // cardinal routes on the bare model id; the providerID/modelID
+            // qualified form is upstream's provider-adapter vocabulary and
+            // cardinal answers "no route for model cardinal/<id>" to it.
+            params.model.id.clone(),
             build_chat_messages(&system, &rows),
         );
         request.tools = ctx.tools.definitions();
