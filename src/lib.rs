@@ -14,6 +14,7 @@ pub mod prompt;
 pub mod runner;
 pub mod schema;
 pub mod slug;
+pub mod tool;
 
 use std::sync::Arc;
 
@@ -35,7 +36,7 @@ pub async fn build_state(config: Config) -> Result<AppState> {
     build_state_with(
         config,
         Arc::new(cardinal),
-        Arc::new(runner::ToolRegistry::new()),
+        Arc::new(runner::ToolRegistry::with_builtins()),
     )
     .await
 }

@@ -84,6 +84,7 @@ pub struct ToolContext {
 }
 
 /// A tool's terminal output (task 7 streams progress; 6b settles once).
+#[derive(Debug)]
 pub struct ToolOutput {
     /// Content for the model (JSON text or structured value).
     pub content: Value,
@@ -131,6 +132,17 @@ impl ToolRegistry {
     /// Look a tool up by name.
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
         self.tools.get(name).cloned()
+    }
+
+    /// Bulk-register pre-built tools. Names must be unique; a duplicate is a
+    /// programming error caught by debug builds (built-ins have fixed names).
+    pub(crate) fn register_all(&mut self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) {
+        for tool in tools {
+            let name = tool.name().to_owned();
+            if self.tools.insert(name, tool.clone()).is_some() {
+                debug_assert!(false, "duplicate tool name `{}`", tool.name());
+            }
+        }
     }
 
     /// Whether no tools are registered (ox ships empty until task 7).
