@@ -37,25 +37,13 @@ pub struct ShellTool {
 impl ShellTool {
     /// Resolve the login shell like upstream `ShellSelect`: `$SHELL` when it
     /// exists and is not a denied shell (fish, nushell), else the platform
-    /// fallback (`/bin/zsh` on macOS, `/bin/bash`, `/bin/sh`).
+    /// fallback (`/bin/zsh` on macOS, `/bin/bash`, `/bin/sh`). Denied shells
+    /// never enter the candidate list (upstream `compatible`).
     pub fn new() -> Self {
-        let mut shell = None;
-        if let Some(candidate) = std::env::var_os("SHELL") {
-            let candidate = PathBuf::from(candidate);
-            let denied = candidate
-                .file_name()
-                .map(|name| DENIED_SHELLS.contains(&name.to_string_lossy().to_lowercase().as_str()))
-                .unwrap_or(true);
-            if !denied && candidate.is_file() {
-                shell = Some(candidate);
-            }
-        }
-        let shell = shell.unwrap_or_else(|| {
-            shell_candidates()
-                .into_iter()
-                .find(|candidate| candidate.is_file())
-                .unwrap_or_else(|| PathBuf::from("/bin/sh"))
-        });
+        let shell = shell_candidates()
+            .into_iter()
+            .find(|candidate| candidate.is_file())
+            .unwrap_or_else(|| PathBuf::from("/bin/sh"));
         Self::with_shell(shell)
     }
 
@@ -75,6 +63,18 @@ impl ShellTool {
 /// Upstream `ShellSelect.META` deny list.
 const DENIED_SHELLS: [&str; 2] = ["fish", "nu"];
 
+/// Upstream `ShellSelect.compatible`: denied by basename.
+fn denied(shell: &Path) -> bool {
+    shell
+        .file_name()
+        .map(|name| DENIED_SHELLS.contains(&name.to_string_lossy().to_lowercase().as_str()))
+        .unwrap_or(true)
+}
+
+/// Serializes tests that mutate `SHELL` against tests that resolve it.
+#[cfg(test)]
+pub(crate) static SHELL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl Default for ShellTool {
     fn default() -> Self {
         Self::new()
@@ -92,6 +92,9 @@ fn shell_candidates() -> Vec<PathBuf> {
     candidates.push(PathBuf::from("/bin/bash"));
     candidates.push(PathBuf::from("/bin/sh"));
     candidates
+        .into_iter()
+        .filter(|candidate| !denied(candidate))
+        .collect()
 }
 
 /// How the process ended.
@@ -295,7 +298,7 @@ async fn run(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> ToolOutput {
         Err(_) => return wrap("capture failed".to_owned()),
     };
     let raw_text = String::from_utf8_lossy(&raw);
-    let (text, truncated, total_lines) = truncate_output(&raw_text);
+    let (text, truncated, total_lines, shown_lines) = truncate_output(&raw_text);
     let notice = match outcome {
         Outcome::TimedOut => Some("Timed out before completion".to_owned()),
         Outcome::Completed(status) => exit_notice(&status),
@@ -305,6 +308,7 @@ async fn run(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> ToolOutput {
         text,
         truncated,
         total_lines,
+        shown_lines,
         timeout_ms,
         notice,
         &output_file,
@@ -355,8 +359,10 @@ fn capture_file(call_id: &str) -> std::io::Result<PathBuf> {
 
 /// Upstream capture truncation (shell.ts `result`): the last `MAX_BYTES` of
 /// the file, then the last `MAX_LINES` lines. Returns the visible text, the
-/// truncation flag, and the total line count.
-fn truncate_output(raw: &str) -> (String, bool, usize) {
+/// truncation flag, the total line count (newlines across the WHOLE file,
+/// +1 when the captured page doesn't end with a newline), and the number of
+/// shown lines (page-relative, capped at `MAX_LINES`).
+fn truncate_output(raw: &str) -> (String, bool, usize, usize) {
     let bytes = raw.as_bytes();
     let page = if bytes.len() > MAX_BYTES {
         let mut start = bytes.len() - MAX_BYTES;
@@ -373,13 +379,16 @@ fn truncate_output(raw: &str) -> (String, bool, usize) {
         lines.pop();
     }
     let truncated = truncated_bytes || lines.len() > MAX_LINES;
-    let total = lines.len();
+    // Upstream: the store tracks cumulative newlines; `total` is file-wide,
+    // not page-relative.
+    let total = raw.matches('\n').count() + if page.ends_with('\n') { 0 } else { 1 };
+    let shown = lines.len().min(MAX_LINES);
     let text = if lines.len() > MAX_LINES {
         lines[lines.len() - MAX_LINES..].join("\n")
     } else {
         page.to_owned()
     };
-    (text, truncated, total)
+    (text, truncated, total, shown)
 }
 
 /// Upstream capture + `resultMessages`: the visible text (with truncation
@@ -388,6 +397,7 @@ fn assemble_output(
     text: String,
     truncated: bool,
     total_lines: usize,
+    shown_lines: usize,
     timeout_ms: u64,
     notice: Option<String>,
     output_file: &Path,
@@ -398,10 +408,9 @@ fn assemble_output(
         text
     };
     if truncated {
-        let shown = MAX_LINES.min(total_lines);
         output.push_str(&format!(
             "\n\n[showing lines {}-{} of {total_lines}; full output saved to {}]",
-            total_lines - shown + 1,
+            total_lines - shown_lines + 1,
             total_lines,
             output_file.display()
         ));
@@ -551,5 +560,54 @@ mod tests {
             output.error.as_deref(),
             Some("Unable to execute command: echo hi")
         );
+    }
+
+    #[tokio::test]
+    async fn truncation_total_counts_whole_file() {
+        let directory = tempdir().unwrap();
+        // ~400 KiB capture: the 50 KiB page window holds only the tail, so a
+        // page-relative total would be far below 4000. No trailing newline.
+        let output = shell(
+            directory.path(),
+            json!({"command": "i=1; while [ $i -le 3999 ]; do printf 'line %04d %090d\\n' $i $i; i=$((i+1)); done; printf 'line 4000 %090d' 4000"}),
+        )
+        .await;
+        let text = output.content.as_str().unwrap();
+        // `total` is the file-wide line count (a page-relative count would
+        // say `of ~506`); `shown` stays page-relative (upstream
+        // `shown = min(lines.length, maxLines)` on the maxBytes window).
+        assert!(
+            text.contains(" of 4000; full output saved to "),
+            "unexpected: {}",
+            text.chars().rev().take(200).collect::<String>()
+        );
+        assert!(!text.contains(" of 506;"));
+    }
+
+    #[test]
+    fn denied_shell_env_falls_back_to_zsh_or_bash() {
+        let lock = SHELL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let directory = tempdir().unwrap();
+        let fish = directory.path().join("fish");
+        std::fs::write(&fish, "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&fish, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let original = std::env::var_os("SHELL");
+        // SAFETY: serialized against other SHELL readers by SHELL_ENV_LOCK.
+        unsafe { std::env::set_var("SHELL", &fish) };
+        let tool = ShellTool::new();
+        match &original {
+            Some(value) => unsafe { std::env::set_var("SHELL", value) },
+            None => unsafe { std::env::remove_var("SHELL") },
+        }
+        let picked = tool.shell.to_string_lossy().to_lowercase();
+        assert!(
+            picked.ends_with("/zsh") || picked.ends_with("/bash") || picked.ends_with("/sh"),
+            "picked: {picked}"
+        );
+        assert!(!picked.contains("fish"), "picked: {picked}");
+        drop(lock);
     }
 }

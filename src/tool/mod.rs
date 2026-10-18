@@ -215,6 +215,24 @@ pub(crate) fn optional_positive_int(
     }
 }
 
+/// An optional JSON number (absent or `null` → `None`); anything else is an
+/// invalid-arguments error.
+pub(crate) fn optional_number(
+    tool: &str,
+    input: &Value,
+    key: &str,
+) -> Result<Option<f64>, ToolOutput> {
+    match input.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(value)) => Ok(value.as_f64()),
+        Some(other) => Err(invalid_arguments(
+            tool,
+            &[(key, format!("Expected a number, got {other}"))],
+            input,
+        )),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Path helpers
 // ---------------------------------------------------------------------------
@@ -369,6 +387,10 @@ mod tests {
 
     #[test]
     fn with_builtins_registers_all_tools_with_schemas() {
+        // ShellTool::new() reads $SHELL; serialize against env-mutating tests.
+        let lock = crate::tool::shell::SHELL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let registry = ToolRegistry::with_builtins();
         let mut names: Vec<String> = registry
             .definitions()
@@ -416,5 +438,6 @@ mod tests {
             edit.function.parameters["required"],
             json!(["path", "oldString", "newString"])
         );
+        drop(lock);
     }
 }
