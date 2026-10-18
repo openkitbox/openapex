@@ -1642,3 +1642,397 @@ pub(crate) async fn message_get(req: &mut Request, depot: &mut Depot, res: &mut 
         Err(error) => unknown_error(res, &anyhow::Error::from(error)),
     }
 }
+
+// ---------------------------------------------------------------------------
+// session.prompt — POST /api/session/{sessionID}/prompt
+// ---------------------------------------------------------------------------
+
+/// Request body of `session.prompt` (OpenAPI `PromptInput`): the prompt
+/// fields plus admission controls. `delivery` defaults to `steer` upstream.
+#[derive(Default, Deserialize)]
+struct PromptBody {
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    files: Option<Vec<crate::schema::support::FileAttachment>>,
+    #[serde(default)]
+    agents: Option<Vec<crate::schema::support::AgentAttachment>>,
+    #[serde(default)]
+    skills: Option<Vec<crate::schema::support::SkillAttachment>>,
+    #[serde(default)]
+    metadata: Option<crate::schema::support::Record>,
+    #[serde(default)]
+    delivery: Option<crate::schema::inbox::Delivery>,
+    #[serde(default)]
+    resume: Option<bool>,
+}
+
+/// 409 `ConflictError` (protocol/src/errors.ts).
+fn conflict_error(res: &mut Response, message: &str, resource: &str) {
+    res.status_code(StatusCode::CONFLICT);
+    res.render(Json(json!({
+        "_tag": "ConflictError",
+        "message": message,
+        "resource": resource,
+    })));
+}
+
+#[handler] // operation_id: session.prompt
+pub(crate) async fn prompt(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(app) = state(depot, res) else {
+        return;
+    };
+    let Some(session_id) = req.param::<String>("sessionID") else {
+        invalid_request(res, "Missing sessionID");
+        return;
+    };
+    let Some(body) = parse_body::<PromptBody>(req, res).await else {
+        return;
+    };
+    let Some(text) = body.text else {
+        invalid_request(res, "Missing text");
+        return;
+    };
+    if !matches!(load_session(&app.db, &session_id).await, Ok(Some(_))) {
+        session_not_found(res, &session_id);
+        return;
+    }
+
+    let message_id = body.id.clone().unwrap_or_else(|| id::id("msg"));
+    let delivery = body
+        .delivery
+        .unwrap_or(crate::schema::inbox::Delivery::Steer);
+    let payload = crate::schema::inbox::UserPayload {
+        prompt: crate::schema::support::Prompt {
+            text,
+            files: body.files,
+            agents: body.agents,
+            skills: body.skills,
+        },
+        metadata: body.metadata,
+    };
+    // Upstream `admission.reconcile`: re-prompting with the same id and
+    // delivery is idempotent; a delivery mismatch is a prompt conflict.
+    match load_inbox_row(&app.db, &session_id, &message_id).await {
+        Ok(Some(existing)) => {
+            if existing.delivery != delivery {
+                conflict_error(
+                    res,
+                    &format!(
+                        "Prompt message ID conflicts with an existing durable record: {message_id}"
+                    ),
+                    &message_id,
+                );
+                return;
+            }
+            let info = existing.info;
+            if body.resume != Some(false)
+                && let Err(error) = app.runner.dispatch(&session_id, &message_id).await
+            {
+                unknown_error(res, &error);
+                return;
+            }
+            res.render(Json(json!({ "data": info })));
+            return;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            unknown_error(res, &error);
+            return;
+        }
+    }
+
+    let item = crate::schema::inbox::Item::User {
+        payload: payload.clone(),
+        delivery,
+    };
+    if let Err(error) = app
+        .bus
+        .publish(SessionEventData::InboxEnqueued {
+            session_id: session_id.clone(),
+            inbox_id: message_id.clone(),
+            item: item.clone(),
+        })
+        .await
+    {
+        unknown_error(res, &error);
+        return;
+    }
+    // Upstream wakes the session unless `resume` is explicitly false.
+    if body.resume != Some(false)
+        && let Err(error) = app.runner.dispatch(&session_id, &message_id).await
+    {
+        unknown_error(res, &error);
+        return;
+    }
+    res.render(Json(json!({
+        "data": crate::schema::inbox::Info::User {
+            id: message_id,
+            session_id,
+            time: crate::schema::inbox::EnqueuedTime {
+                created: id::now_millis(),
+            },
+            payload,
+            delivery,
+        },
+    })));
+}
+
+/// A pending `session_inbox` row decoded into its wire [`Info`] shape.
+struct InboxRowInfo {
+    delivery: crate::schema::inbox::Delivery,
+    info: crate::schema::inbox::Info,
+}
+
+/// `session_inbox` columns of a single-row lookup.
+type InboxTuple = (String, String, String, i64, String);
+
+/// Load one inbox row by id.
+async fn load_inbox_row(db: &Db, session_id: &str, inbox_id: &str) -> Result<Option<InboxRowInfo>> {
+    let session_id = session_id.to_owned();
+    let row: Option<InboxTuple> = {
+        let inbox_id = inbox_id.to_owned();
+        db.conn()
+            .call(move |c| -> rusqlite::Result<Option<InboxTuple>> {
+                use rusqlite::OptionalExtension;
+                c.query_row(
+                    "SELECT type, payload, delivery, time_created, session_id
+                 FROM session_inbox WHERE id = ?1 AND session_id = ?2",
+                    rusqlite::params![inbox_id, session_id],
+                    |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get::<_, i64>(3)?,
+                            r.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .optional()
+            })
+            .await?
+    };
+    row.map(|(kind, payload, delivery, created, session_id)| {
+        decode_inbox_info(&session_id, inbox_id, &kind, &payload, &delivery, created).map(|info| {
+            InboxRowInfo {
+                delivery: info_delivery(&info),
+                info,
+            }
+        })
+    })
+    .transpose()
+}
+
+/// Decode `session_inbox` columns into the [`Info`] wire enum.
+fn decode_inbox_info(
+    session_id: &str,
+    inbox_id: &str,
+    kind: &str,
+    payload: &str,
+    delivery: &str,
+    created: i64,
+) -> Result<crate::schema::inbox::Info> {
+    let payload: Value = serde_json::from_str(payload)?;
+    serde_json::from_value(json!({
+        "type": kind,
+        "id": inbox_id,
+        "sessionID": session_id,
+        "time": { "created": created },
+        "payload": payload,
+        "delivery": delivery,
+    }))
+    .map_err(|error| anyhow::Error::from(error).context("decoding inbox row"))
+}
+
+/// The delivery policy of a decoded [`Info`].
+fn info_delivery(info: &crate::schema::inbox::Info) -> crate::schema::inbox::Delivery {
+    match info {
+        crate::schema::inbox::Info::User { delivery, .. }
+        | crate::schema::inbox::Info::Synthetic { delivery, .. }
+        | crate::schema::inbox::Info::Compaction { delivery, .. }
+        | crate::schema::inbox::Info::Move { delivery, .. } => *delivery,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// session.inbox.list — GET /api/session/{sessionID}/inbox
+// ---------------------------------------------------------------------------
+
+#[handler] // operation_id: session.inbox.list
+pub(crate) async fn inbox_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(app) = state(depot, res) else {
+        return;
+    };
+    let Some(session_id) = req.param::<String>("sessionID") else {
+        invalid_request(res, "Missing sessionID");
+        return;
+    };
+    if !matches!(load_session(&app.db, &session_id).await, Ok(Some(_))) {
+        session_not_found(res, &session_id);
+        return;
+    }
+    let rows: Vec<(String, String, String, String, i64, String)> = match app
+        .db
+        .conn()
+        .call(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT id, type, payload, delivery, time_created, session_id
+                 FROM session_inbox WHERE session_id = ?1
+                 ORDER BY enqueued_seq ASC",
+            )?;
+            let mapped = stmt.query_map(rusqlite::params![session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            unknown_error(res, &anyhow::Error::from(error));
+            return;
+        }
+    };
+    let mut data = Vec::with_capacity(rows.len());
+    for (inbox_id, kind, payload, delivery, created, session_id) in rows {
+        match decode_inbox_info(&session_id, &inbox_id, &kind, &payload, &delivery, created) {
+            Ok(info) => data.push(info),
+            Err(error) => {
+                unknown_error(res, &error);
+                return;
+            }
+        }
+    }
+    res.render(Json(json!({ "data": data })));
+}
+
+// ---------------------------------------------------------------------------
+// session.inbox.update — PATCH /api/session/{sessionID}/inbox/{inboxID}
+// ---------------------------------------------------------------------------
+
+#[derive(Default, Deserialize)]
+struct InboxUpdateBody {
+    #[serde(default)]
+    delivery: Option<crate::schema::inbox::Delivery>,
+}
+
+#[handler] // operation_id: session.inbox.update
+pub(crate) async fn inbox_update(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(app) = state(depot, res) else {
+        return;
+    };
+    let Some(session_id) = req.param::<String>("sessionID") else {
+        invalid_request(res, "Missing sessionID");
+        return;
+    };
+    let Some(inbox_id) = req.param::<String>("inboxID") else {
+        invalid_request(res, "Missing inboxID");
+        return;
+    };
+    let Some(body) = parse_body::<InboxUpdateBody>(req, res).await else {
+        return;
+    };
+    let Some(delivery) = body.delivery else {
+        invalid_request(res, "Missing delivery");
+        return;
+    };
+    if !matches!(load_session(&app.db, &session_id).await, Ok(Some(_))) {
+        session_not_found(res, &session_id);
+        return;
+    }
+
+    if let Err(error) = app
+        .bus
+        .publish(SessionEventData::InboxDeliveryChanged {
+            session_id: session_id.clone(),
+            inbox_id: inbox_id.clone(),
+            delivery,
+        })
+        .await
+    {
+        // Upstream `pendingMutation`: any lifecycle conflict on a pending
+        // row surfaces as 409 (including an unknown inbox id).
+        conflict_error(
+            res,
+            &format!("Pending input cannot change to {delivery:?}"),
+            &inbox_id,
+        );
+        tracing::debug!(session = %session_id, inbox = %inbox_id, error = %error, "inbox update rejected");
+        return;
+    }
+    // Upstream `steerInbox` wakes the session; `queueInbox` does not.
+    if delivery == crate::schema::inbox::Delivery::Steer
+        && let Err(error) = app.runner.dispatch(&session_id, &inbox_id).await
+    {
+        unknown_error(res, &error);
+        return;
+    }
+    no_content(res);
+}
+
+// ---------------------------------------------------------------------------
+// session.inbox.cancel — DELETE /api/session/{sessionID}/inbox/{inboxID}
+// ---------------------------------------------------------------------------
+
+#[handler] // operation_id: session.inbox.cancel
+pub(crate) async fn inbox_cancel(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(app) = state(depot, res) else {
+        return;
+    };
+    let Some(session_id) = req.param::<String>("sessionID") else {
+        invalid_request(res, "Missing sessionID");
+        return;
+    };
+    let Some(inbox_id) = req.param::<String>("inboxID") else {
+        invalid_request(res, "Missing inboxID");
+        return;
+    };
+    if !matches!(load_session(&app.db, &session_id).await, Ok(Some(_))) {
+        session_not_found(res, &session_id);
+        return;
+    }
+
+    // Upstream swallows inbox lifecycle conflicts here: cancelling an
+    // already-delivered/absent item is still a 204.
+    if let Err(error) = app
+        .bus
+        .publish(SessionEventData::InboxCancelled {
+            session_id: session_id.clone(),
+            inbox_id: inbox_id.clone(),
+        })
+        .await
+    {
+        tracing::debug!(session = %session_id, inbox = %inbox_id, error = %error, "inbox cancel was a no-op");
+    }
+    no_content(res);
+}
+
+// ---------------------------------------------------------------------------
+// session.interrupt — POST /api/session/{sessionID}/interrupt
+// ---------------------------------------------------------------------------
+
+#[handler] // operation_id: session.interrupt
+pub(crate) async fn interrupt(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(app) = state(depot, res) else {
+        return;
+    };
+    let Some(session_id) = req.param::<String>("sessionID") else {
+        invalid_request(res, "Missing sessionID");
+        return;
+    };
+    // `resume` (query) drives upstream's auto-resume; ox has no resume flow
+    // yet, so it is accepted and ignored.
+    let _resume = req.query::<bool>("resume");
+    let interrupted = app.runner.interrupt(&session_id);
+    res.render(Json(json!({ "interrupted": interrupted })));
+}

@@ -183,11 +183,26 @@ async fn project_list_reads_upstream_project_table() {
         .await
         .unwrap();
 
+    let bus = ox::event_bus::EventBus::new(db.clone());
+    let cardinal = ox::cardinal::client::CardinalClient::new(
+        config.cardinal_url.clone(),
+        config.cardinal_key.clone(),
+    )
+    .unwrap();
+    let runner = ox::runner::Runner::new(
+        config.clone(),
+        std::env::current_dir().unwrap(),
+        db.clone(),
+        bus.clone(),
+        std::sync::Arc::new(cardinal),
+        std::sync::Arc::new(ox::runner::ToolRegistry::new()),
+    );
     let state = AppState {
         config: config.clone(),
-        bus: ox::event_bus::EventBus::new(db.clone()),
+        bus,
         db,
         directory: std::env::current_dir().unwrap(),
+        runner,
     };
     let router = ox::build_router(state);
     let listen: String = config.listen.clone();

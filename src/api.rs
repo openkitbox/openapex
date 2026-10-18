@@ -15,6 +15,7 @@ use crate::config::Config;
 use crate::db::Db;
 use crate::event_bus::EventBus;
 use crate::id::now_millis;
+use crate::runner::Runner;
 
 pub mod session;
 
@@ -27,6 +28,8 @@ pub struct AppState {
     pub bus: EventBus,
     /// Working directory, canonicalized once at startup.
     pub directory: PathBuf,
+    /// Per-session execution actor registry (task 6).
+    pub runner: Runner,
 }
 
 /// Fetch the injected app state; on failure logs the error and renders a
@@ -402,7 +405,16 @@ pub fn build_router(state: AppState) -> Router {
                                     .push(
                                         Router::with_path("{messageID}").get(session::message_get),
                                     ),
-                            ),
+                            )
+                            .push(Router::with_path("prompt").post(session::prompt))
+                            .push(
+                                Router::with_path("inbox").get(session::inbox_list).push(
+                                    Router::with_path("{inboxID}")
+                                        .patch(session::inbox_update)
+                                        .delete(session::inbox_cancel),
+                                ),
+                            )
+                            .push(Router::with_path("interrupt").post(session::interrupt)),
                     ),
             ),
     )

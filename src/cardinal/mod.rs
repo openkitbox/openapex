@@ -26,6 +26,7 @@
 //! `data:` payload that is not valid JSON is fatal (matching cardinal's own
 //! verdict on a misbehaving upstream).
 
+pub mod chat;
 pub mod client;
 pub mod stream;
 pub mod wire;

@@ -1,0 +1,717 @@
+//! The drain loop, ported from `packages/core/src/session/runner/llm.ts`.
+//!
+//! Upstream shape (kept here so 6b can slot in without re-deriving):
+//!
+//! - **settleStaleCompactions** runs before anything else: compaction rows
+//!   left `running` by a process death are published as
+//!   `session.compaction.failed` newest-first.
+//! - Boundary scan (`advanceToStep`): pick the next promotable item — steer
+//!   items first (a compaction control at the head of the steers is unshifted
+//!   ahead of earlier steers), else the oldest queue item at an *input*
+//!   boundary. A queued item on a steer-scoped drain ends the drain.
+//! - Controls: a compaction publishes `inbox.delivered` +
+//!   `compaction.started` (then runs the summary — 6a stubs it as failed); a
+//!   move publishes `inbox.delivered` and would re-root the session (6a
+//!   fails the execution).
+//! - Input: `SessionInbox.promote` delivers every steer item in order, then
+//!   exactly one queue item at input boundaries; a turn runs consecutive
+//!   steps until a step returns no tool calls (`needsContinuation`).
+//! - Quiet inbox → the drain completes and the actor publishes the terminal.
+//!
+//! 6a deviations (each marked inline): compaction/move bodies are stubbed,
+//! turns never continue (no tool execution yet), and upstream's
+//! `force`/`continuation` re-entry paths don't exist yet.
+
+use std::sync::Arc;
+
+use anyhow::Result;
+use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
+
+use crate::cardinal::chat::Chat;
+use crate::config::Config;
+use crate::db::Db;
+use crate::event_bus::EventBus;
+use crate::id;
+use crate::schema::event::SessionEventData;
+use crate::schema::inbox::{Delivery, Item};
+use crate::schema::message::CompactionReason;
+use crate::schema::support::SessionError;
+
+use super::ToolRegistry;
+use super::unknown_error;
+
+/// Which delivery classes a drain pass may promote. Upstream `Promotable`:
+/// `"input"` (steer + queue) or `"steer"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Promotable {
+    /// Any delivery (turn entry).
+    Input,
+    /// Steer-delivered items only (mid-turn boundaries, interrupt resume).
+    Steer,
+}
+
+/// Terminal states of one drain pass, consumed by the actor.
+#[derive(Debug)]
+pub(crate) enum DrainOutcome {
+    /// No promotable input remains; the actor may publish the terminal.
+    Complete,
+    /// The cancellation token fired; the actor publishes `interrupted`.
+    Interrupted,
+    /// The drain failed terminally; the actor publishes `failed`.
+    Failed(SessionError),
+}
+
+/// A pending inbox row (decoded `session_inbox` entry).
+#[derive(Debug, Clone)]
+pub(crate) struct InboxRow {
+    pub id: String,
+    pub item: Item,
+}
+
+impl InboxRow {
+    fn is_control(&self) -> bool {
+        matches!(self.item, Item::Compaction { .. } | Item::Move { .. })
+    }
+
+    /// Decode a `session_inbox` row into its [`Item`].
+    fn from_columns(id: String, kind: &str, payload: Value, delivery: &str) -> Result<Self> {
+        let adapter = json!({ "type": kind, "payload": payload, "delivery": delivery });
+        Ok(InboxRow {
+            id,
+            item: serde_json::from_value(adapter)?,
+        })
+    }
+}
+
+/// Everything one busy period's drains and steps share.
+pub(crate) struct DrainCtx {
+    pub session_id: String,
+    pub directory: std::path::PathBuf,
+    pub config: Config,
+    pub db: Db,
+    pub bus: EventBus,
+    pub chat: Arc<dyn Chat>,
+    pub tools: Arc<ToolRegistry>,
+}
+
+/// Run drains until the inbox is quiet, a control interrupts, or a turn
+/// fails. One call covers every queued turn (upstream's `drain` only returns
+/// on `Complete`/`Moved`/`Reloaded`).
+pub(crate) async fn drain(
+    ctx: &DrainCtx,
+    token: &CancellationToken,
+    scope: Promotable,
+) -> DrainOutcome {
+    // A process death skips compaction finalizers; settle orphans first
+    // (upstream settleStaleCompactions). Failures only warn: a broken
+    // settle must not wedge the turn.
+    if let Err(error) = settle_stale_compactions(&ctx.bus, &ctx.db, &ctx.session_id).await {
+        tracing::warn!(session = %ctx.session_id, error = %error, "settleStaleCompactions failed");
+    }
+
+    // 6a: turns never continue (steps never request tools), so `continuing`
+    // is always false and every boundary after a turn is an input boundary.
+    // TODO(task 6b): track `continuing` + step numbers for tool-call turns.
+    let mut entering = true;
+    let mut continuing = false;
+
+    loop {
+        if token.is_cancelled() {
+            return DrainOutcome::Interrupted;
+        }
+
+        // Pending scope: input at turn boundaries, steer-only mid-turn.
+        let input_scope = entering || !continuing;
+        let next = match next_promotable(&ctx.db, &ctx.session_id, input_scope).await {
+            Ok(next) => next,
+            Err(error) => return DrainOutcome::Failed(unknown_error(error.to_string())),
+        };
+
+        // Upstream guard: a quiet inbox ends the drain; so does a queued item
+        // when this drain itself is steer-scoped (it belongs to the next turn).
+        let Some(next) = next else {
+            return DrainOutcome::Complete;
+        };
+        if !input_scope && next.item.delivery() == Delivery::Queue {
+            return DrainOutcome::Complete;
+        }
+
+        match &next.item {
+            Item::Compaction { .. } => {
+                if let Err(error) = settle_compaction_stub(ctx, &next.id).await {
+                    return DrainOutcome::Failed(unknown_error(error.to_string()));
+                }
+                // Upstream loops back with force=false after a compaction.
+                entering = true;
+                continuing = false;
+            }
+            Item::Move { .. } => {
+                if let Err(error) = deliver(ctx, &next.id).await {
+                    return DrainOutcome::Failed(unknown_error(error.to_string()));
+                }
+                // Upstream returns Moved and re-roots the session (task 9+).
+                return DrainOutcome::Failed(SessionError {
+                    kind: "unknown".to_owned(),
+                    message: "session.move is not supported by ox".to_owned(),
+                    status: None,
+                    response: None,
+                });
+            }
+            Item::User { .. } | Item::Synthetic { .. } => {
+                let promotable = if entering && !continuing {
+                    scope
+                } else {
+                    Promotable::Steer
+                };
+                let promoted = match promote(ctx, promotable).await {
+                    Ok(count) => count,
+                    Err(error) => return DrainOutcome::Failed(unknown_error(error.to_string())),
+                };
+                if promoted == 0 {
+                    // Nothing delivered (steer-scoped drain, steers raced away):
+                    // upstream would run a forced step; 6a has no force paths.
+                    return DrainOutcome::Complete;
+                }
+                match run_turn(ctx, token).await {
+                    Ok(TurnOutcome::Ended) => {
+                        // Next boundary scans for the following queued turn.
+                        entering = false;
+                        continuing = false;
+                    }
+                    Ok(TurnOutcome::Interrupted) => return DrainOutcome::Interrupted,
+                    Ok(TurnOutcome::Failed(error)) => return DrainOutcome::Failed(error),
+                    Err(error) => return DrainOutcome::Failed(unknown_error(error.to_string())),
+                }
+            }
+        }
+    }
+}
+
+/// How one turn ended (consumed by the drain loop).
+enum TurnOutcome {
+    /// Every step settled and no tool calls remain open.
+    Ended,
+    Interrupted,
+    Failed(SessionError),
+}
+
+/// One turn: consecutive steps sharing the session's model selection. 6a
+/// runs exactly one step (steps never return tool calls); the loop shape is
+/// where 6b hangs tool execution and continuation.
+async fn run_turn(ctx: &DrainCtx, token: &CancellationToken) -> Result<TurnOutcome> {
+    // TODO(task 6b): consecutive steps per turn — execute `tool_calls` and
+    // loop (upstream needsContinuation), with retry/compaction recovery and
+    // step numbering feeding max-steps prompts.
+    let (agent, model) = match resolve_selection(&ctx.db, &ctx.session_id, &ctx.config).await {
+        Ok(selection) => selection,
+        Err(error) => return Ok(TurnOutcome::Failed(unknown_error(error.to_string()))),
+    };
+    let params = super::step::StepParams {
+        assistant_message_id: id::id("msg"),
+        agent: &agent,
+        model: &model,
+    };
+    match super::step::run(ctx, token, &params).await? {
+        super::step::StepOutcome::Completed { finish, tool_calls } => {
+            if !tool_calls.is_empty() {
+                // 6a never executes tools; a scripted transport returning
+                // tool calls still ends the turn cleanly (6b hangs here).
+                tracing::warn!(
+                    session = %ctx.session_id,
+                    finish = ?finish,
+                    count = tool_calls.len(),
+                    "tool calls are not executed in task 6a; ending the turn"
+                );
+            }
+            Ok(TurnOutcome::Ended)
+        }
+        super::step::StepOutcome::Interrupted => Ok(TurnOutcome::Interrupted),
+        super::step::StepOutcome::Failed(error) => Ok(TurnOutcome::Failed(error)),
+    }
+}
+
+/// Resolve the session's agent + model (`context.resolveModel`): the
+/// projected selection when set, else the config's first model, else the
+/// cardinal default id.
+async fn resolve_selection(
+    db: &Db,
+    session_id: &str,
+    config: &Config,
+) -> Result<(String, crate::schema::support::ModelRef)> {
+    let row: Option<(Option<String>, Option<String>)> = {
+        let session_id = session_id.to_owned();
+        db.conn()
+            .call(
+                move |c| -> rusqlite::Result<Option<(Option<String>, Option<String>)>> {
+                    use rusqlite::OptionalExtension;
+                    c.query_row(
+                        "SELECT agent, model FROM session_v2 WHERE id = ?1",
+                        rusqlite::params![session_id],
+                        |r| {
+                            Ok((
+                                r.get::<_, Option<String>>(0)?,
+                                r.get::<_, Option<String>>(1)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                },
+            )
+            .await?
+    };
+    let Some((agent, model)) = row else {
+        anyhow::bail!("session `{session_id}` is not projected");
+    };
+    let model = match model.and_then(|raw| serde_json::from_str(&raw).ok()) {
+        Some(model) => model,
+        None => {
+            let configured = config.models.first();
+            crate::schema::support::ModelRef {
+                id: configured
+                    .map(|m| m.id.clone())
+                    .unwrap_or_else(|| "default".to_owned()),
+                provider_id: configured
+                    .map(|m| m.provider.clone())
+                    .unwrap_or_else(|| "opencode".to_owned()),
+                variant: None,
+            }
+        }
+    };
+    Ok((agent.unwrap_or_else(|| "build".to_owned()), model))
+}
+
+// ---------------------------------------------------------------------------
+// Inbox scanning + promotion (packages/core/src/session/inbox.ts)
+// ---------------------------------------------------------------------------
+
+/// `SessionInbox.list`: every pending row in arrival order.
+async fn list_rows(db: &Db, session_id: &str) -> Result<Vec<InboxRow>> {
+    let session_id = session_id.to_owned();
+    let raw: Vec<(String, String, String, String, String)> = db
+        .conn()
+        .call(move |c| {
+            let mut stmt = c.prepare(
+                "SELECT id, session_id, type, payload, delivery
+                 FROM session_inbox WHERE session_id = ?1
+                 ORDER BY enqueued_seq ASC",
+            )?;
+            let mapped = stmt.query_map(rusqlite::params![session_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            mapped.collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .await?;
+    raw.into_iter()
+        .map(|(id, _session_id, kind, payload, delivery)| {
+            InboxRow::from_columns(id, &kind, serde_json::from_str(&payload)?, &delivery)
+        })
+        .collect()
+}
+
+/// `pendingSteers`: steer rows in arrival order with the first compaction
+/// control unshifted ahead (a move never moves — it bounds the boundary).
+fn reorder_steers(rows: Vec<InboxRow>) -> Vec<InboxRow> {
+    let control = rows
+        .iter()
+        .position(|row| matches!(row.item, Item::Compaction { .. } | Item::Move { .. }));
+    let mut rows = rows;
+    if let Some(at) = control
+        && at > 0
+        && matches!(rows[at].item, Item::Compaction { .. })
+    {
+        let control_row = rows.remove(at);
+        rows.insert(0, control_row);
+    }
+    rows
+}
+
+/// `nextPromotable`: the head steer (compaction-unshifted), else the oldest
+/// queue item when the scope allows input.
+async fn next_promotable(db: &Db, session_id: &str, input_scope: bool) -> Result<Option<InboxRow>> {
+    let steers: Vec<InboxRow> = list_rows(db, session_id)
+        .await?
+        .into_iter()
+        .filter(|row| row.item.delivery() == Delivery::Steer)
+        .collect();
+    let steers = reorder_steers(steers);
+    if let Some(head) = steers.into_iter().next() {
+        return Ok(Some(head));
+    }
+    if !input_scope {
+        return Ok(None);
+    }
+    Ok(list_rows(db, session_id)
+        .await?
+        .into_iter()
+        .find(|row| row.item.delivery() == Delivery::Queue))
+}
+
+/// Deliver items at one boundary (task contract + upstream inbox.ts):
+/// - steer scope: the pending steers in arrival order, up to the first
+///   control (a compaction unshifts ahead of earlier steers; a move bounds).
+/// - input scope: steers first, then exactly one queue item, then steers
+///   that arrived while delivering. A control at the steer head owns the
+///   boundary — nothing is delivered and the drain rescans.
+///
+/// Returns the delivered count; `Ok(0)` when nothing was deliverable.
+async fn promote(ctx: &DrainCtx, scope: Promotable) -> Result<usize> {
+    let steers: Vec<InboxRow> = list_rows(&ctx.db, &ctx.session_id)
+        .await?
+        .into_iter()
+        .filter(|row| row.item.delivery() == Delivery::Steer)
+        .collect();
+    let steers = reorder_steers(steers);
+    if steers.first().is_some_and(InboxRow::is_control) {
+        return Ok(0);
+    }
+    if scope == Promotable::Steer {
+        return deliver_up_to_control(ctx, steers).await;
+    }
+    // Input boundary: the steer batch, then one queued item, then new steers.
+    let mut count = deliver_up_to_control(ctx, steers).await?;
+    let queued = list_rows(&ctx.db, &ctx.session_id)
+        .await?
+        .into_iter()
+        .find(|row| row.item.delivery() == Delivery::Queue);
+    if let Some(queued) = queued.filter(|row| !row.is_control()) {
+        deliver(ctx, &queued.id).await?;
+        count += 1;
+        let arrived: Vec<InboxRow> = list_rows(&ctx.db, &ctx.session_id)
+            .await?
+            .into_iter()
+            .filter(|row| row.item.delivery() == Delivery::Steer)
+            .collect();
+        count += deliver_up_to_control(ctx, reorder_steers(arrived)).await?;
+    }
+    Ok(count)
+}
+
+/// Publish `inbox.delivered` for each row up to the first control.
+async fn deliver_up_to_control(ctx: &DrainCtx, rows: Vec<InboxRow>) -> Result<usize> {
+    let mut count = 0;
+    for row in rows {
+        if row.is_control() {
+            break;
+        }
+        deliver(ctx, &row.id).await?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Deliver one item: `session.inbox.delivered`; the projector deletes the
+/// row (and promotes user/synthetic items to messages).
+async fn deliver(ctx: &DrainCtx, inbox_id: &str) -> Result<()> {
+    ctx.bus
+        .publish(SessionEventData::InboxDelivered {
+            session_id: ctx.session_id.clone(),
+            inbox_id: inbox_id.to_owned(),
+        })
+        .await?;
+    Ok(())
+}
+
+/// Compaction control, 6a stub: deliver the item, publish
+/// `compaction.started`, then fail the compaction — the summary flow
+/// (context selection, preview, summary stream) is task 6b.
+// TODO(task 6b): replace the failure with the real compaction pipeline
+// (`SessionCompaction.compact`, reason "manual").
+async fn settle_compaction_stub(ctx: &DrainCtx, inbox_id: &str) -> Result<()> {
+    deliver(ctx, inbox_id).await?;
+    ctx.bus
+        .publish(SessionEventData::CompactionStarted {
+            session_id: ctx.session_id.clone(),
+            reason: CompactionReason::Manual,
+            recent: String::new(),
+            input_id: Some(inbox_id.to_owned()),
+        })
+        .await?;
+    ctx.bus
+        .publish(SessionEventData::CompactionFailed {
+            session_id: ctx.session_id.clone(),
+            reason: CompactionReason::Manual,
+            error: SessionError {
+                kind: "compaction.failed".to_owned(),
+                message: "compaction is not implemented in task 6a".to_owned(),
+                status: None,
+                response: None,
+            },
+            input_id: Some(inbox_id.to_owned()),
+            cost: None,
+            tokens: None,
+        })
+        .await?;
+    Ok(())
+}
+
+/// `settleStaleCompactions`: publish `compaction.failed` for compaction rows
+/// left running by a process death, newest first.
+async fn settle_stale_compactions(bus: &EventBus, db: &Db, session_id: &str) -> Result<()> {
+    let rows: Vec<(String, String)> = {
+        let sid = session_id.to_owned();
+        db.conn()
+            .call(move |c| {
+                let mut stmt = c.prepare(
+                    "SELECT id, data FROM session_message
+                 WHERE session_id = ?1 AND type = 'compaction'
+                   AND json_extract(data, '$.status') = 'running'
+                 ORDER BY seq DESC",
+                )?;
+                let mapped = stmt.query_map(rusqlite::params![sid], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?;
+                mapped.collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await?
+    };
+    for (message_id, data) in rows {
+        let reason = serde_json::from_str::<Value>(&data)?
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(|raw| match raw {
+                "auto" => CompactionReason::Auto,
+                _ => CompactionReason::Manual,
+            })
+            .unwrap_or(CompactionReason::Manual);
+        bus.publish(SessionEventData::CompactionFailed {
+            session_id: session_id.to_owned(),
+            reason,
+            error: SessionError {
+                kind: "compaction.interrupted".to_owned(),
+                message: "Compaction was interrupted".to_owned(),
+                status: None,
+                response: None,
+            },
+            input_id: Some(message_id),
+            cost: None,
+            tokens: None,
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Boundary-semantics tests for promotion (upstream inbox.ts). These run
+    //! in-crate because the drain's scanning helpers are `pub(crate)`; the
+    //! HTTP-level behavior is covered by `tests/runner.rs`.
+
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::config::Config;
+    use crate::schema::event::SessionEventData;
+    use crate::schema::inbox::{CompactionPayload, Delivery, Item, UserPayload};
+    use crate::schema::support::Prompt;
+
+    struct Ctx {
+        db: Db,
+        bus: EventBus,
+        session_id: String,
+        _dir: tempfile::TempDir,
+    }
+
+    async fn ctx() -> Ctx {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            db_path: dir.path().join("ox.db"),
+            ..Config::default()
+        };
+        let db = Db::open(&config.db_path).await.expect("db");
+        let bus = EventBus::new(db.clone());
+        // The inbox projector FKs into the session table; create one row.
+        bus.publish(SessionEventData::SessionCreated {
+            session_id: "ses_test".to_owned(),
+            project_id: "prj_test".to_owned(),
+            location: crate::schema::support::LocationRef {
+                directory: dir.path().display().to_string(),
+                workspace_id: None,
+            },
+            subpath: None,
+            parent_id: None,
+            slug: "test".to_owned(),
+            title: None,
+            agent: None,
+            model: None,
+            metadata: None,
+            permissions: None,
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        })
+        .await
+        .expect("session created");
+        Ctx {
+            db,
+            bus,
+            session_id: "ses_test".to_owned(),
+            _dir: dir,
+        }
+    }
+
+    impl Ctx {
+        async fn enqueue(&self, id: &str, item: Item) {
+            self.bus
+                .publish(SessionEventData::InboxEnqueued {
+                    session_id: self.session_id.clone(),
+                    inbox_id: id.to_owned(),
+                    item,
+                })
+                .await
+                .expect("enqueued");
+        }
+
+        async fn pending(&self) -> Vec<(String, String)> {
+            self.db
+                .conn()
+                .call(|c| -> rusqlite::Result<Vec<(String, String)>> {
+                    let mut stmt = c.prepare(
+                        "SELECT id, delivery FROM session_inbox ORDER BY enqueued_seq ASC",
+                    )?;
+                    let mapped = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+                    mapped.collect()
+                })
+                .await
+                .expect("pending")
+        }
+
+        fn drain_ctx(&self) -> DrainCtx {
+            DrainCtx {
+                session_id: self.session_id.clone(),
+                directory: self._dir.path().to_path_buf(),
+                config: Config::default(),
+                db: self.db.clone(),
+                bus: self.bus.clone(),
+                chat: Arc::new(NoopChat),
+                tools: Arc::new(crate::runner::ToolRegistry::new()),
+            }
+        }
+    }
+
+    /// Chat stub for promotion-only tests (no step ever runs).
+    struct NoopChat;
+
+    impl crate::cardinal::chat::Chat for NoopChat {
+        fn stream_chat<'a>(
+            &'a self,
+            _request: &'a crate::cardinal::wire::ChatRequest,
+        ) -> crate::cardinal::chat::ChatFuture<'a> {
+            Box::pin(async { Err(crate::cardinal::CardinalError::EarlyClose) })
+        }
+    }
+
+    fn user(text: &str, delivery: Delivery) -> Item {
+        Item::User {
+            payload: UserPayload {
+                prompt: Prompt {
+                    text: text.to_owned(),
+                    files: None,
+                    agents: None,
+                    skills: None,
+                },
+                metadata: None,
+            },
+            delivery,
+        }
+    }
+
+    fn compaction(delivery: Delivery) -> Item {
+        Item::Compaction {
+            payload: CompactionPayload {},
+            delivery,
+        }
+    }
+
+    #[tokio::test]
+    async fn steer_scope_promotes_only_steers() {
+        let ctx = ctx().await;
+        ctx.enqueue("i1", user("a", Delivery::Steer)).await;
+        ctx.enqueue("i2", user("b", Delivery::Queue)).await;
+        ctx.enqueue("i3", user("c", Delivery::Steer)).await;
+
+        let count = promote(&ctx.drain_ctx(), Promotable::Steer)
+            .await
+            .expect("promote");
+        assert_eq!(count, 2, "both steers, not the queued item");
+        let pending = ctx.pending().await;
+        assert_eq!(
+            pending,
+            vec![("i2".to_owned(), "queue".to_owned())],
+            "queued item untouched by a steer boundary"
+        );
+
+        // The input boundary takes the queued item plus new steers.
+        ctx.enqueue("i4", user("d", Delivery::Steer)).await;
+        let count = promote(&ctx.drain_ctx(), Promotable::Input)
+            .await
+            .expect("promote");
+        assert_eq!(count, 2, "one queued item + steers that arrived");
+        assert!(ctx.pending().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn entry_boundary_counts_one_queue_and_interleaved_steers() {
+        let ctx = ctx().await;
+        ctx.enqueue("q1", user("q", Delivery::Queue)).await;
+        ctx.enqueue("s1", user("s", Delivery::Steer)).await;
+        let count = promote(&ctx.drain_ctx(), Promotable::Input)
+            .await
+            .expect("promote");
+        assert_eq!(count, 2, "exactly one queue item + steers present");
+    }
+
+    #[tokio::test]
+    async fn steer_compaction_unshifts_ahead_of_earlier_steers() {
+        let first = ctx().await;
+        first.enqueue("s1", user("a", Delivery::Steer)).await;
+        first.enqueue("cp", compaction(Delivery::Steer)).await;
+        first.enqueue("s2", user("b", Delivery::Steer)).await;
+
+        let next = next_promotable(&first.db, &first.session_id, true)
+            .await
+            .expect("scan")
+            .expect("next");
+        assert_eq!(next.id, "cp", "compaction moves to the steer head");
+
+        // The move control never unshifts: it only bounds the boundary.
+        let second = ctx().await;
+        second.enqueue("s1", user("a", Delivery::Steer)).await;
+        second.enqueue("mv", user("m", Delivery::Steer)).await;
+        let next = next_promotable(&second.db, &second.session_id, true)
+            .await
+            .expect("scan")
+            .expect("next");
+        assert_eq!(next.id, "s1", "a move does not reorder steers");
+    }
+
+    #[tokio::test]
+    async fn compact_queued_head_is_not_promoted_by_promote() {
+        let ctx = ctx().await;
+        ctx.enqueue("cp", compaction(Delivery::Queue)).await;
+        // The drain handles queued controls via next_promotable, not promote;
+        // promote() must not deliver a queued control.
+        let count = promote(&ctx.drain_ctx(), Promotable::Input)
+            .await
+            .expect("promote");
+        assert_eq!(count, 0, "queued compaction is not a promote target");
+        assert_eq!(ctx.pending().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reorder_steers_returns_arrival_order_without_controls() {
+        let ctx = ctx().await;
+        ctx.enqueue("s1", user("a", Delivery::Steer)).await;
+        ctx.enqueue("s2", user("b", Delivery::Steer)).await;
+        let next = next_promotable(&ctx.db, &ctx.session_id, true)
+            .await
+            .expect("scan")
+            .expect("next");
+        assert_eq!(next.id, "s1", "oldest steer first");
+    }
+}
