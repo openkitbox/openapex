@@ -379,45 +379,62 @@ async fn agent_list(depot: &mut Depot, res: &mut Response) {
 
 /// Build the salvo router with all `/api` endpoints mounted.
 pub fn build_router(state: AppState) -> Router {
-    Router::new().hoop(affix_state::inject(state)).push(
-        Router::with_path("api")
-            .push(Router::with_path("info").get(server_info))
-            .push(Router::with_path("location").get(location_get))
-            .push(Router::with_path("project").get(project_list))
-            .push(Router::with_path("model").get(model_list))
-            .push(Router::with_path("agent").get(agent_list))
-            .push(Router::with_path("event").get(event::subscribe))
-            .push(
-                Router::with_path("session")
-                    .get(session::list)
-                    .post(session::create)
-                    .push(Router::with_path("active").get(session::active))
-                    .push(
-                        Router::with_path("{sessionID}")
-                            .get(session::get)
-                            .patch(session::update)
-                            .delete(session::remove)
-                            .push(Router::with_path("fork").post(session::fork))
-                            .push(Router::with_path("view").post(session::view))
-                            .push(Router::with_path("agent").post(session::switch_agent))
-                            .push(Router::with_path("model").post(session::switch_model))
-                            .push(
-                                Router::with_path("message")
-                                    .get(session::message_list)
-                                    .push(
-                                        Router::with_path("{messageID}").get(session::message_get),
+    Router::new()
+        .hoop(affix_state::inject(state))
+        .push(
+            Router::with_path("api")
+                .push(Router::with_path("info").get(server_info))
+                .push(Router::with_path("location").get(location_get))
+                .push(Router::with_path("project").get(project_list))
+                .push(Router::with_path("model").get(model_list))
+                .push(Router::with_path("agent").get(agent_list))
+                .push(Router::with_path("event").get(event::subscribe))
+                .push(
+                    Router::with_path("session")
+                        .get(session::list)
+                        .post(session::create)
+                        .push(Router::with_path("active").get(session::active))
+                        .push(
+                            Router::with_path("{sessionID}")
+                                .get(session::get)
+                                .patch(session::update)
+                                .delete(session::remove)
+                                .push(Router::with_path("fork").post(session::fork))
+                                .push(Router::with_path("view").post(session::view))
+                                .push(Router::with_path("agent").post(session::switch_agent))
+                                .push(Router::with_path("model").post(session::switch_model))
+                                .push(
+                                    Router::with_path("message")
+                                        .get(session::message_list)
+                                        .push(
+                                            Router::with_path("{messageID}")
+                                                .get(session::message_get),
+                                        ),
+                                )
+                                .push(Router::with_path("prompt").post(session::prompt))
+                                .push(
+                                    Router::with_path("inbox").get(session::inbox_list).push(
+                                        Router::with_path("{inboxID}")
+                                            .patch(session::inbox_update)
+                                            .delete(session::inbox_cancel),
                                     ),
-                            )
-                            .push(Router::with_path("prompt").post(session::prompt))
-                            .push(
-                                Router::with_path("inbox").get(session::inbox_list).push(
-                                    Router::with_path("{inboxID}")
-                                        .patch(session::inbox_update)
-                                        .delete(session::inbox_cancel),
-                                ),
-                            )
-                            .push(Router::with_path("interrupt").post(session::interrupt)),
-                    ),
-            ),
-    )
+                                )
+                                .push(Router::with_path("interrupt").post(session::interrupt)),
+                        ),
+                ),
+        )
+        .push(Router::with_path("{**rest}").goal(unmatched))
+}
+
+/// Fallback for unmatched routes: upstream's Effect HttpApi always answers
+/// JSON, never salvo's default HTML 404 page. Log the miss (compat triage)
+/// and answer a structured error.
+#[handler]
+async fn unmatched(req: &mut Request, res: &mut Response) {
+    tracing::warn!(method = %req.method(), path = %req.uri().path(), "unmatched route");
+    res.status_code(StatusCode::NOT_FOUND);
+    res.render(Json(serde_json::json!({
+        "_tag": "NotFoundError",
+        "message": format!("No route for {} {}", req.method(), req.uri().path()),
+    })));
 }

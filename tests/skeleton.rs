@@ -233,3 +233,16 @@ async fn project_list_reads_upstream_project_table() {
 
     handle.abort();
 }
+
+#[tokio::test]
+async fn unmatched_route_answers_json_not_html() {
+    let (base, handle, _dir) = spawn_server().await;
+    let response = reqwest::get(format!("{base}/api/nonexistent"))
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    handle.abort();
+    assert_eq!(status, 404);
+    assert!(body.contains("NotFoundError"), "body: {body}");
+}
