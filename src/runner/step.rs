@@ -32,6 +32,16 @@
 //!   attempts. A 400 context-length overflow before any output surfaces as
 //!   [`StepOutcome::Overflow`] so the drain can compact and retry once
 //!   (upstream `Outcome.Compacted`).
+//! - A mid-stream failure after published output never transparently
+//!   retries: only an *interrupted stream* continues (upstream
+//!   `Outcome.Continue`) — a transport read failure, or a stream that ends
+//!   without a recognized finish reason. The partial assistant settles
+//!   `session.step.failed` with the stream error (upstream `failAssistant`:
+//!   no `step.ended`, finish `error`, open tool inputs fail with the same
+//!   error), the retry announcement follows, and the continuation prompt
+//!   (llm.ts `CONTINUE_AFTER_INCOMPLETE_STREAM`) is published as a
+//!   synthetic user message before the attempt re-runs against a fresh
+//!   assistant row.
 //!
 //! The context assembly lives in one named function
 //! ([`build_chat_messages`]) so the e2e suite can trust the mapping.
@@ -75,6 +85,10 @@ const TOOLS_INTERRUPTED: &str = "Tool execution interrupted";
 const MAX_ATTEMPTS: usize = 3;
 /// Backoff base; attempt N sleeps `base * N`.
 const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(250);
+/// Upstream `CONTINUE_AFTER_INCOMPLETE_STREAM` (runner/llm.ts): the
+/// continuation prompt published after an interrupted stream so the model
+/// resumes where it left off.
+const CONTINUE_AFTER_INCOMPLETE_STREAM: &str = "The previous response was interrupted. Continue from where you left off without repeating completed content.";
 
 /// Terminal states of one step, consumed by the drain loop.
 #[derive(Debug)]
@@ -110,48 +124,106 @@ pub(crate) struct StepParams<'a> {
 enum Attempt {
     /// Terminal step outcome.
     Done(StepOutcome),
-    /// Transport failed; `published` says whether provider output/events
-    /// already went out (retry is only safe before any output).
-    Transport {
-        error: CardinalError,
+    /// The attempt failed; `published` says whether provider output/events
+    /// already went out. A published failure retries only as an upstream
+    /// continuation (`Outcome.Continue`), never transparently.
+    Failed {
+        failure: AttemptFailure,
         published: bool,
+        tokens: Option<TokenUsage>,
     },
+}
+
+/// Why an attempt died (upstream error classes on the retry/continue path).
+enum AttemptFailure {
+    /// A transport-grade failure: connect error, mid-stream read failure
+    /// (`EarlyClose`), malformed SSE framing, or a connection error.
+    Transport(CardinalError),
+    /// The stream ended without a recognized finish reason (upstream
+    /// `unknownFinish` → `InvalidProviderOutput` classified
+    /// `incomplete-stream`).
+    IncompleteStream,
+}
+
+impl AttemptFailure {
+    /// Upstream `isInterruptedStream` (step.ts): interrupted streams
+    /// continue via a continuation prompt; content errors (HTTP rejections,
+    /// in-band provider failures) fail the step.
+    fn is_interrupted_stream(&self) -> bool {
+        match self {
+            AttemptFailure::Transport(
+                CardinalError::EarlyClose | CardinalError::Sse(_) | CardinalError::Transport(_),
+            ) => true,
+            AttemptFailure::Transport(CardinalError::Http { .. } | CardinalError::Upstream(_)) => {
+                false
+            }
+            AttemptFailure::IncompleteStream => true,
+        }
+    }
+
+    /// Upstream gates `Outcome.Compacted` on `!outputStarted`: overflow
+    /// recovery is a pre-output concern.
+    fn is_overflow(&self) -> bool {
+        match self {
+            AttemptFailure::Transport(error) => super::provider_error::is_overflow_error(error),
+            AttemptFailure::IncompleteStream => false,
+        }
+    }
+
+    /// The session error the row settles with (upstream `toSessionError`).
+    fn session_error(&self) -> SessionError {
+        match self {
+            AttemptFailure::Transport(error) => to_session_error(error),
+            AttemptFailure::IncompleteStream => invalid_output_error(),
+        }
+    }
 }
 
 /// Run one step end-to-end (context assembly → stream → durable settlement).
 pub(crate) async fn run(
     ctx: &DrainCtx,
     token: &CancellationToken,
-    params: &StepParams<'_>,
+    params: &mut StepParams<'_>,
 ) -> Result<StepOutcome> {
-    let rows = load_history(&ctx.db, &ctx.session_id).await?;
-    let system = prompt::build(&ctx.directory);
-    let mut request = ChatRequest::new(
-        format!("{}/{}", params.model.provider_id, params.model.id),
-        build_chat_messages(&system, &rows),
-    );
-    request.tools = ctx.tools.definitions();
-
     // Request dispatch time, published with step.started (before any output).
-    let dispatch = id::now_millis();
+    let mut dispatch = id::now_millis();
     let mut started = false;
 
     let mut attempt: usize = 0;
     loop {
         attempt += 1;
+        // The transcript is rebuilt per attempt (upstream refreshes context
+        // on retry and continuation): a continuation attempt must observe
+        // the settled partial row plus the continuation prompt.
+        let rows = load_history(&ctx.db, &ctx.session_id).await?;
+        let system = prompt::build(&ctx.directory);
+        let mut request = ChatRequest::new(
+            format!("{}/{}", params.model.provider_id, params.model.id),
+            build_chat_messages(&system, &rows),
+        );
+        request.tools = ctx.tools.definitions();
+
         let stream = match ctx.chat.stream_chat(&request).await {
             Ok(stream) => stream,
             Err(error) => {
-                // Context overflow before any output → the drain compacts
-                // and retries the step once (upstream Outcome.Compacted).
-                if !started && super::provider_error::is_overflow_error(&error) {
+                // Context overflow → the drain compacts and retries the step
+                // once (upstream Outcome.Compacted); connect errors never
+                // carry published output.
+                if super::provider_error::is_overflow_error(&error) {
                     return Ok(StepOutcome::Overflow {
                         error: to_session_error(&error),
                     });
                 }
                 // Connect failure: nothing was published for this attempt.
                 if attempt < MAX_ATTEMPTS {
-                    schedule_retry(ctx, params, &mut started, attempt, &error).await?;
+                    schedule_retry(
+                        ctx,
+                        params,
+                        &mut started,
+                        attempt,
+                        &to_session_error(&error),
+                    )
+                    .await?;
                     if !sleep_backoff(token, attempt).await {
                         return settle_interrupted(ctx, params, started, None).await;
                     }
@@ -162,20 +234,58 @@ pub(crate) async fn run(
         };
         match consume(ctx, token, params, dispatch, &mut started, stream).await? {
             Attempt::Done(outcome) => return Ok(outcome),
-            Attempt::Transport { error, published } => {
-                if !started && super::provider_error::is_overflow_error(&error) {
+            Attempt::Failed {
+                failure,
+                published,
+                tokens,
+            } => {
+                // Overflow recovery is a pre-output concern (upstream gates
+                // Outcome.Compacted on `!outputStarted`).
+                if !published && failure.is_overflow() {
                     return Ok(StepOutcome::Overflow {
-                        error: to_session_error(&error),
+                        error: failure.session_error(),
                     });
                 }
-                if !published && attempt < MAX_ATTEMPTS {
+                let error = failure.session_error();
+                // Upstream retry policy (step.ts): transparent retry before
+                // any output; after it, only an interrupted stream continues
+                // (Outcome.Continue).
+                if attempt < MAX_ATTEMPTS && (failure.is_interrupted_stream() || !published) {
+                    if published {
+                        // The partial assistant settles `step.failed` with
+                        // the stream error first (upstream failAssistant —
+                        // no step.ended, finish `error`).
+                        fail_step(ctx, params, error.clone(), tokens, started).await?;
+                    }
                     schedule_retry(ctx, params, &mut started, attempt, &error).await?;
                     if !sleep_backoff(token, attempt).await {
+                        if published {
+                            // The row already settled; the interrupt only
+                            // ends the turn (upstream: retry.wait aborts
+                            // without further step events).
+                            return Ok(StepOutcome::Interrupted);
+                        }
                         return settle_interrupted(ctx, params, started, None).await;
+                    }
+                    if published {
+                        // The continuation prompt lands as a synthetic user
+                        // message; the next attempt runs against a fresh
+                        // assistant row (upstream runStep Continue branch).
+                        ctx.bus
+                            .publish(SessionEventData::SessionSynthetic {
+                                session_id: ctx.session_id.clone(),
+                                text: CONTINUE_AFTER_INCOMPLETE_STREAM.to_owned(),
+                                description: None,
+                                metadata: None,
+                            })
+                            .await?;
+                        params.assistant_message_id = id::id("msg");
+                        started = false;
+                        dispatch = id::now_millis();
                     }
                     continue;
                 }
-                return fail_step(ctx, params, to_session_error(&error), None, started).await;
+                return fail_step(ctx, params, error, tokens, started).await;
             }
         }
     }
@@ -224,7 +334,7 @@ async fn schedule_retry(
     params: &StepParams<'_>,
     started: &mut bool,
     attempt: usize,
-    error: &CardinalError,
+    error: &SessionError,
 ) -> Result<()> {
     if !*started {
         publish_started(ctx, params, id::now_millis()).await?;
@@ -237,7 +347,7 @@ async fn schedule_retry(
             assistant_message_id: params.assistant_message_id.clone(),
             attempt: attempt as i64,
             at: id::now_millis() + delay.as_millis() as i64,
-            error: to_session_error(error),
+            error: error.clone(),
         })
         .await?;
     Ok(())
@@ -258,12 +368,11 @@ async fn publish_started(ctx: &DrainCtx, params: &StepParams<'_>, dispatch: i64)
     Ok(())
 }
 
-/// Settle the assistant row as failed (`session.step.failed`) and surface
-/// [`StepOutcome::Failed`]. Starts the row first when nothing was published.
-/// Settle the step as failed: start the assistant row when the failure hit
-/// before it, then publish `session.step.failed` (the projector writes the
-/// error onto the row). Shared with the drain's overflow give-up (upstream
-/// raises `StepFailedError` from the same two places).
+/// Settle the assistant row as failed: start the row when the failure hit
+/// before `step.started`, then publish `session.step.failed` (the projector
+/// writes the error onto the row and closes it with finish `error`).
+/// Shared with the drain's overflow give-up and the continuation settle
+/// (upstream raises `StepFailedError` / runs `failAssistant` there).
 pub(crate) async fn fail_step(
     ctx: &DrainCtx,
     params: &StepParams<'_>,
@@ -360,13 +469,8 @@ async fn consume(
                 // Settle open tool inputs and in-flight executions as
                 // aborted (upstream `interruptTools` + `failUnsettledTools`)
                 // BEFORE `step.failed`.
-                fail_unsettled_tools(
-                    ctx,
-                    params,
-                    &mut tool_acc,
-                    UnsettledFailure::Shared(aborted_error(TOOLS_INTERRUPTED)),
-                )
-                .await?;
+                fail_unsettled_tools(ctx, params, &mut tool_acc, aborted_error(TOOLS_INTERRUPTED))
+                    .await?;
                 join_tool_tasks(ctx, params, &mut tool_tasks, token).await?;
                 return Ok(Attempt::Done(
                     settle_interrupted(ctx, params, *started, Some(map_tokens(usage))).await?,
@@ -385,19 +489,28 @@ async fn consume(
                     &reasoning,
                 )
                 .await?;
-                // A failure before `Finish` leaves no spawned executions
-                // (settlement happens at `Finish`); open inputs settle as
-                // interrupted so no tool part stays streaming.
-                fail_unsettled_tools(
-                    ctx,
-                    params,
-                    &mut tool_acc,
-                    UnsettledFailure::Shared(aborted_error(TOOLS_INTERRUPTED)),
-                )
-                .await?;
+                // Upstream `publisher.streamed()`: an attempt that produced
+                // output marks the row streamed even when the stream then
+                // dies before `Finish`.
+                if *started {
+                    ctx.bus
+                        .publish(SessionEventData::StepStreamed {
+                            session_id: ctx.session_id.clone(),
+                            assistant_message_id: params.assistant_message_id.clone(),
+                        })
+                        .await?;
+                }
+                // Upstream `failAssistant`: settlement only happens at
+                // `Finish`, so open inputs fail with the stream error itself
+                // (failTools `uncalled`) and no tool part stays streaming.
+                fail_unsettled_tools(ctx, params, &mut tool_acc, to_session_error(&error)).await?;
                 join_tool_tasks(ctx, params, &mut tool_tasks, token).await?;
                 let published = *started;
-                return Ok(Attempt::Transport { error, published });
+                return Ok(Attempt::Failed {
+                    failure: AttemptFailure::Transport(error),
+                    published,
+                    tokens: None,
+                });
             }
             Next::Event(Some(Ok(event))) => match event {
                 StreamEvent::TextDelta(delta) => {
@@ -546,39 +659,27 @@ async fn consume(
     if !*started {
         // The stream produced nothing at all: a transport-grade failure so
         // the retry loop runs (the final attempt settles as step.failed).
-        return Ok(Attempt::Transport {
-            error: CardinalError::EarlyClose,
+        return Ok(Attempt::Failed {
+            failure: AttemptFailure::Transport(CardinalError::EarlyClose),
             published: false,
+            tokens: None,
         });
     }
-    // Upstream treats a missing or unrecognized finish reason as invalid
-    // provider output (`unknownFinish`); any open tool input settles as
-    // incomplete first (upstream `failIncompleteTools`).
     let Some((mapped_finish, raw_finish)) =
         finish.filter(|(mapped, _)| *mapped != FinishReason::Unknown)
     else {
-        fail_unsettled_tools(
-            ctx,
-            params,
-            &mut tool_acc,
-            UnsettledFailure::Input(InputFailureReason::Incomplete, false),
-        )
-        .await?;
+        // Upstream `unknownFinish`: a stream that ends without a recognized
+        // finish reason is invalid provider output — an interrupted stream
+        // that continues via the upstream prompt after published output
+        // (run's Outcome.Continue gate). Open inputs fail with the same
+        // error (failAssistant), and the attempt keeps its usage.
+        fail_unsettled_tools(ctx, params, &mut tool_acc, invalid_output_error()).await?;
         join_tool_tasks(ctx, params, &mut tool_tasks, token).await?;
-        let outcome = fail_step(
-            ctx,
-            params,
-            SessionError {
-                kind: "provider.invalid-output".to_owned(),
-                message: "The provider response ended with an unknown finish reason.".to_owned(),
-                status: None,
-                response: None,
-            },
-            Some(map_tokens(usage)),
-            true,
-        )
-        .await?;
-        return Ok(Attempt::Done(outcome));
+        return Ok(Attempt::Failed {
+            failure: AttemptFailure::IncompleteStream,
+            published: true,
+            tokens: Some(map_tokens(usage)),
+        });
     };
 
     // Anything still unsettled without a `Finish`-driven settlement (a
@@ -646,7 +747,7 @@ const INPUT_EXCERPT_LIMIT: usize = 2048;
 
 /// Upstream `INPUT_FAILURES` (publish-llm-event.ts): the model-facing
 /// failure for a tool call that never executed.
-fn input_failure(reason: InputFailureReason, arguments: &str, length_finish: bool) -> SessionError {
+fn input_failure(arguments: &str, length_finish: bool) -> SessionError {
     // Upstream `failToolInput`: a step that settled on the output token
     // limit reports every input failure as the length cut-off.
     let (kind, message) = if length_finish {
@@ -655,16 +756,10 @@ fn input_failure(reason: InputFailureReason, arguments: &str, length_finish: boo
             "The tool call was not executed because the output token limit (stop reason: length) was reached before you could complete the arguments. Break large payloads into smaller tool calls and reissue the call with complete arguments.",
         )
     } else {
-        match reason {
-            InputFailureReason::Malformed => (
-                "tool.input-json",
-                "The tool input could not be parsed as JSON, so the call was not executed. Reissue the call with valid JSON arguments.",
-            ),
-            InputFailureReason::Incomplete => (
-                "tool.input-incomplete",
-                "Tool call arguments were not completed and were not executed. Reissue the call with complete arguments.",
-            ),
-        }
+        (
+            "tool.input-json",
+            "The tool input could not be parsed as JSON, so the call was not executed. Reissue the call with valid JSON arguments.",
+        )
     };
     SessionError {
         kind: kind.to_owned(),
@@ -674,16 +769,6 @@ fn input_failure(reason: InputFailureReason, arguments: &str, length_finish: boo
         status: None,
         response: None,
     }
-}
-
-/// Which upstream `INPUT_FAILURES` entry a call failed with.
-#[derive(Clone, Copy)]
-enum InputFailureReason {
-    /// Arguments were not valid JSON (upstream `malformed`).
-    Malformed,
-    /// The stream ended before the arguments completed (upstream
-    /// `incomplete`).
-    Incomplete,
 }
 
 /// Upstream `inputFailure` + `inputExcerpt`: append the first
@@ -739,8 +824,7 @@ async fn settle_tool_calls(
             match serde_json::from_str(trimmed) {
                 Ok(input) => input,
                 Err(_) => {
-                    let error =
-                        input_failure(InputFailureReason::Malformed, &acc.arguments, length_finish);
+                    let error = input_failure(&acc.arguments, length_finish);
                     ctx.bus
                         .publish(SessionEventData::ToolFailed {
                             session_id: ctx.session_id.clone(),
@@ -874,41 +958,38 @@ fn tool_output_text(value: Value) -> String {
     }
 }
 
-/// The failure handed to input-started-but-uncalled calls. Upstream has two
-/// paths: `failUnsettledTools` carries one shared error (e.g.
-/// `TOOLS_INTERRUPTED`), while `failIncompleteTools` and the malformed flush
-/// use the per-call `INPUT_FAILURES` entry with the input excerpt.
-enum UnsettledFailure {
-    Shared(SessionError),
-    Input(InputFailureReason, bool),
+/// Upstream `unknownFinish` (step.ts): the session error for a stream that
+/// ended without a recognized finish reason (`InvalidProviderOutput`
+/// classified `incomplete-stream`).
+fn invalid_output_error() -> SessionError {
+    SessionError {
+        kind: "provider.invalid-output".to_owned(),
+        message: "The provider response ended with an unknown finish reason.".to_owned(),
+        status: None,
+        response: None,
+    }
 }
 
-/// Fail every input-started-but-uncalled accumulator (upstream
-/// `failUnsettledTools` / `failIncompleteTools`): the projector settles the
-/// streaming tool part into the error state.
+/// Fail every input-started-but-uncalled accumulator with one shared error
+/// (upstream `failAssistant`'s failTools `uncalled` sweep): the projector
+/// settles the streaming tool part into the error state.
 async fn fail_unsettled_tools(
     ctx: &DrainCtx,
     params: &StepParams<'_>,
     accs: &mut BTreeMap<u32, ToolAccum>,
-    failure: UnsettledFailure,
+    error: SessionError,
 ) -> Result<()> {
     for acc in accs.values_mut() {
         if !acc.input_started || acc.called {
             continue;
         }
         acc.called = true;
-        let error = match &failure {
-            UnsettledFailure::Shared(error) => error.clone(),
-            UnsettledFailure::Input(reason, length_finish) => {
-                input_failure(*reason, &acc.arguments, *length_finish)
-            }
-        };
         ctx.bus
             .publish(SessionEventData::ToolFailed {
                 session_id: ctx.session_id.clone(),
                 assistant_message_id: params.assistant_message_id.clone(),
                 id: acc.id.clone(),
-                error,
+                error: error.clone(),
                 content: None,
                 metadata: None,
                 executed: false,

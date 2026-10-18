@@ -53,6 +53,9 @@ enum Script {
     Fail,
     /// A 400 context-length overflow rejection at connect time.
     Overflow,
+    /// Emit the head events, then the stream dies mid-flight (transport
+    /// read failure after published output — the interrupted-stream class).
+    Die(Vec<StreamEvent>),
 }
 
 /// A [`Chat`] implementation handing out scripts in order and recording
@@ -144,6 +147,31 @@ impl MockChat {
         ])
     }
 
+    /// Text streamed, then the stream dies mid-flight (no finish, no
+    /// `[DONE]`): the canonical interrupted stream after published output.
+    fn dies_after_text(delta: &'static str) -> Script {
+        Script::Die(vec![StreamEvent::TextDelta(delta.to_owned())])
+    }
+
+    /// A tool call whose arguments never completed: input started, one
+    /// argument fragment, then the stream dies mid-flight.
+    fn dies_after_partial_tool(id: &str, name: &str, partial: &str) -> Script {
+        Script::Die(vec![
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some(id.to_owned()),
+                name: Some(name.to_owned()),
+                arguments: String::new(),
+            },
+            StreamEvent::ToolCallDelta {
+                index: 0,
+                id: None,
+                name: None,
+                arguments: partial.to_owned(),
+            },
+        ])
+    }
+
     fn requests(&self) -> Vec<ChatRequest> {
         self.requests.lock().expect("requests lock").clone()
     }
@@ -168,6 +196,14 @@ impl Chat for MockChat {
                     status: 400,
                     body: "This model's maximum context length is 4097 tokens".to_owned(),
                 }),
+                Script::Die(events) => {
+                    let mut steps: VecDeque<Step> = events.into_iter().map(Step::Event).collect();
+                    steps.push_back(Step::Fail(CardinalError::EarlyClose));
+                    Ok(Box::pin(EventsStream {
+                        events: steps,
+                        gate: None,
+                    }) as BoxChatStream)
+                }
                 Script::Events(mut events) => {
                     events.push(StreamEvent::Done);
                     Ok(Box::pin(EventsStream {
@@ -227,6 +263,8 @@ enum Step {
     Event(StreamEvent),
     /// Hold until the gate fires (never yields by itself).
     Wait,
+    /// Kill the stream with a transport error (the read-failure shape).
+    Fail(CardinalError),
 }
 
 impl Stream for EventsStream {
@@ -252,6 +290,12 @@ impl Stream for EventsStream {
                             this.events.pop_front();
                         }
                     }
+                }
+                Some(Step::Fail(_)) => {
+                    if let Some(Step::Fail(error)) = this.events.pop_front() {
+                        return Poll::Ready(Some(Err(error)));
+                    }
+                    unreachable!("Fail marker matched");
                 }
                 None => return Poll::Ready(None),
             }
@@ -818,6 +862,347 @@ async fn transport_failures_retry_then_fail_the_step() {
             .as_str()
             .expect("message")
             .contains("closed before [DONE]")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Interrupted-stream continuation (upstream Outcome.Continue)
+// ---------------------------------------------------------------------------
+
+/// Upstream `CONTINUE_AFTER_INCOMPLETE_STREAM` (runner/llm.ts), verbatim.
+const CONTINUE_PROMPT: &str = "The previous response was interrupted. Continue from where you left off without repeating completed content.";
+
+#[tokio::test]
+async fn mid_stream_failure_continues_with_upstream_prompt() {
+    let harness = Harness::spawn(vec![
+        MockChat::dies_after_text("par"),
+        MockChat::text("tial answer"),
+    ])
+    .await;
+    let session_id = harness.create_session().await;
+    let response = harness
+        .post(
+            &format!("/api/session/{session_id}/prompt"),
+            json!({ "text": "interrupted stream" }),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    harness.wait_event("session.execution.succeeded").await;
+
+    // The continuation re-ran the attempt against a fresh assistant row.
+    let requests = harness.chat.requests();
+    assert_eq!(requests.len(), 2, "partial attempt + continuation attempt");
+
+    // The continuation prompt rides as a synthetic user message, verbatim.
+    let synthetic = harness
+        .event_log()
+        .await
+        .into_iter()
+        .find(|(k, _)| k == "session.synthetic")
+        .map(|(_, data)| data)
+        .expect("continuation prompt published");
+    assert_eq!(synthetic["text"], CONTINUE_PROMPT);
+
+    // The continuation attempt observes the original prompt, the partial
+    // assistant text, and the continuation prompt.
+    let user_texts: Vec<&str> = requests[1]
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            ox::cardinal::wire::ChatMessage::User { content } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(user_texts, vec!["interrupted stream", CONTINUE_PROMPT]);
+    let assistant_texts: Vec<&str> = requests[1]
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            ox::cardinal::wire::ChatMessage::Assistant { content, .. } => content.as_deref(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(assistant_texts, vec!["par"], "partial text replayed");
+
+    // Rows: user, partial assistant (failed), synthetic, completed assistant
+    // (plus the actor's idle marker at the end of the busy period).
+    let messages = harness.messages(&session_id).await;
+    let kinds: Vec<&str> = messages.iter().filter_map(|m| m["type"].as_str()).collect();
+    assert_eq!(&kinds[..4], ["user", "assistant", "synthetic", "assistant"]);
+
+    // The partial assistant settles `step.failed` with the stream error
+    // (finish `error`, no `step.ended` for it — upstream failAssistant).
+    let partial = &messages[1];
+    assert_eq!(partial["error"]["type"], "provider.transport");
+    assert_eq!(partial["finish"], "error");
+    assert_eq!(partial["content"][0]["text"], "par", "partial text flushed");
+    let final_row = &messages[3];
+    assert!(final_row["error"].is_null(), "fresh row settled cleanly");
+    assert_eq!(final_row["content"][0]["text"], "tial answer");
+    assert_eq!(final_row["finish"], "stop");
+
+    let log = harness.event_log().await;
+    let step_failed = log
+        .iter()
+        .find(|(k, _)| k == "session.step.failed")
+        .map(|(_, data)| data)
+        .expect("partial step failed");
+    assert_eq!(step_failed["assistantMessageID"], partial["id"]);
+    assert_eq!(step_failed["error"]["type"], "provider.transport");
+    let step_ended = log
+        .iter()
+        .find(|(k, _)| k == "session.step.ended")
+        .map(|(_, data)| data)
+        .expect("continuation step ended");
+    assert_eq!(step_ended["assistantMessageID"], final_row["id"]);
+    assert_eq!(
+        log.iter()
+            .filter(|(k, _)| k == "session.step.failed")
+            .count(),
+        1,
+        "only the partial row failed"
+    );
+    let retry = log
+        .iter()
+        .find(|(k, _)| k == "session.retry.scheduled")
+        .map(|(_, data)| data)
+        .expect("retry announced");
+    assert_eq!(retry["attempt"], 1);
+    assert_eq!(retry["error"]["type"], "provider.transport");
+}
+
+#[tokio::test]
+async fn mid_stream_failure_settles_partial_tool_with_stream_error() {
+    let (echo, _executed) = EchoTool::tool(false, Duration::ZERO, None);
+    let harness = Harness::spawn_with(
+        vec![
+            MockChat::dies_after_partial_tool("call_1", "test_echo", r#"{"q":"par"#),
+            MockChat::tool_turn("call_2", "test_echo", r#"{"q":"ok"}"#),
+            MockChat::text("done"),
+        ],
+        registry_with(echo),
+    )
+    .await;
+    let session_id = harness.create_session().await;
+    let response = harness
+        .post(
+            &format!("/api/session/{session_id}/prompt"),
+            json!({ "text": "die mid tool" }),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    harness.wait_event("session.execution.succeeded").await;
+
+    // Upstream failAssistant: the call unsettled at the stream's death
+    // fails with the stream error itself — not the input-failure text —
+    // and never executes.
+    let failure = harness
+        .event_log()
+        .await
+        .into_iter()
+        .find(|(k, _)| k == "session.tool.failed")
+        .map(|(_, data)| data)
+        .expect("partial tool settled");
+    assert_eq!(failure["id"], "call_1");
+    assert_eq!(failure["error"]["type"], "provider.transport");
+
+    // The continuation attempt re-issues the call: the failed call and its
+    // error result replay before the continuation prompt.
+    let requests = harness.chat.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "partial attempt + tool continuation + text step"
+    );
+    let roles: Vec<&str> = requests[1]
+        .messages
+        .iter()
+        .map(|m| match m {
+            ox::cardinal::wire::ChatMessage::System { .. } => "system",
+            ox::cardinal::wire::ChatMessage::User { .. } => "user",
+            ox::cardinal::wire::ChatMessage::Assistant { .. } => "assistant",
+            ox::cardinal::wire::ChatMessage::Tool { .. } => "tool",
+        })
+        .collect();
+    assert_eq!(
+        roles,
+        vec!["system", "user", "assistant", "tool", "user"],
+        "failed call + error result replay, then the continuation prompt"
+    );
+    let replayed = requests[1]
+        .messages
+        .iter()
+        .find_map(|m| match m {
+            ox::cardinal::wire::ChatMessage::Tool {
+                tool_call_id,
+                content,
+            } => Some((tool_call_id.clone(), content.clone())),
+            _ => None,
+        })
+        .expect("failed call's result replayed");
+    assert_eq!(replayed.0, "call_1");
+    assert!(
+        replayed.1.contains("provider.transport"),
+        "the error result carries the stream error: {}",
+        replayed.1
+    );
+
+    // Rows: user, partial row (tool part in error), synthetic prompt,
+    // completed tool step, text step.
+    let messages = harness.messages(&session_id).await;
+    let kinds: Vec<&str> = messages.iter().filter_map(|m| m["type"].as_str()).collect();
+    assert_eq!(
+        &kinds[..5],
+        ["user", "assistant", "synthetic", "assistant", "assistant"]
+    );
+
+    let partial = &messages[1];
+    let part = &partial["content"][0];
+    assert_eq!(part["type"], "tool");
+    assert_eq!(part["id"], "call_1");
+    assert_eq!(part["state"]["status"], "error");
+    assert_eq!(part["state"]["error"]["type"], "provider.transport");
+    assert_eq!(partial["error"]["type"], "provider.transport");
+
+    let retried = &messages[3];
+    let part = retried["content"]
+        .as_array()
+        .expect("parts")
+        .iter()
+        .find(|p| p["type"] == "tool")
+        .expect("reissued tool part");
+    assert_eq!(part["id"], "call_2");
+    assert_eq!(part["state"]["status"], "completed");
+    assert_eq!(retried["finish"], "tool-calls");
+}
+
+#[tokio::test]
+async fn continuation_exhaustion_fails_the_step() {
+    let harness = Harness::spawn(vec![
+        MockChat::dies_after_text("a"),
+        MockChat::dies_after_text("b"),
+        MockChat::dies_after_text("c"),
+    ])
+    .await;
+    let session_id = harness.create_session().await;
+    let response = harness
+        .post(
+            &format!("/api/session/{session_id}/prompt"),
+            json!({ "text": "never finishes" }),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    harness.wait_event("session.execution.failed").await;
+
+    let requests = harness.chat.requests();
+    assert_eq!(requests.len(), 3, "three attempts, two continuations");
+    let log = harness.event_log().await;
+    assert_eq!(
+        log.iter().filter(|(k, _)| k == "session.synthetic").count(),
+        2,
+        "a continuation prompt per retry"
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|(k, _)| k == "session.retry.scheduled")
+            .count(),
+        2
+    );
+
+    // Every attempt's partial row settles failed with the stream error.
+    let messages = harness.messages(&session_id).await;
+    let assistants: Vec<&Value> = messages
+        .iter()
+        .filter(|m| m["type"] == "assistant")
+        .collect();
+    assert_eq!(assistants.len(), 3, "one row per attempt");
+    for (attempt, row) in assistants.iter().enumerate() {
+        assert_eq!(row["error"]["type"], "provider.transport", "row {attempt}");
+        assert!(
+            row["time"]["completed"].is_number(),
+            "row {attempt} settled"
+        );
+    }
+    assert_eq!(assistants[0]["content"][0]["text"], "a");
+    assert_eq!(assistants[1]["content"][0]["text"], "b");
+    assert_eq!(assistants[2]["content"][0]["text"], "c");
+
+    let failed: Vec<&Value> = log
+        .iter()
+        .filter(|(k, _)| k == "session.step.failed")
+        .map(|(_, data)| data)
+        .collect();
+    assert_eq!(failed.len(), 3, "one step.failed per attempt");
+    assert_eq!(failed[2]["assistantMessageID"], assistants[2]["id"]);
+    let execution = log
+        .iter()
+        .find(|(k, _)| k == "session.execution.failed")
+        .map(|(_, data)| data)
+        .expect("execution failed");
+    assert_eq!(execution["error"]["type"], "provider.transport");
+}
+
+#[tokio::test]
+async fn failing_continuation_retries_then_fails() {
+    let harness = Harness::spawn(vec![
+        MockChat::dies_after_text("par"),
+        Script::Fail,
+        Script::Fail,
+    ])
+    .await;
+    let session_id = harness.create_session().await;
+    let response = harness
+        .post(
+            &format!("/api/session/{session_id}/prompt"),
+            json!({ "text": "continuation dies too" }),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    harness.wait_event("session.execution.failed").await;
+
+    let requests = harness.chat.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "partial attempt + continuation + exhausted retry"
+    );
+    let log = harness.event_log().await;
+    assert_eq!(
+        log.iter().filter(|(k, _)| k == "session.synthetic").count(),
+        1,
+        "one continuation prompt"
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|(k, _)| k == "session.retry.scheduled")
+            .count(),
+        2
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|(k, _)| k == "session.step.failed")
+            .count(),
+        2,
+        "the partial row and the exhausted retry row"
+    );
+
+    let messages = harness.messages(&session_id).await;
+    let assistants: Vec<&Value> = messages
+        .iter()
+        .filter(|m| m["type"] == "assistant")
+        .collect();
+    assert_eq!(assistants.len(), 2);
+    assert_eq!(assistants[0]["content"][0]["text"], "par");
+    assert_eq!(assistants[0]["error"]["type"], "provider.transport");
+    assert!(
+        assistants[1]["error"].is_object(),
+        "the connect-failed row settles failed"
+    );
+    assert!(
+        assistants[1]["content"]
+            .as_array()
+            .is_none_or(Vec::is_empty),
+        "no content on the connect-failed row"
     );
 }
 
@@ -1769,15 +2154,18 @@ async fn malformed_json_input_fails_with_excerpt() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn incomplete_input_and_unknown_finish_fail_the_step() {
+async fn stream_without_finish_continues_after_output() {
     let (echo, executed) = EchoTool::tool(false, Duration::ZERO, None);
     let harness = Harness::spawn_with(
-        vec![Script::Events(vec![StreamEvent::ToolCallDelta {
-            index: 0,
-            id: Some("call_1".to_owned()),
-            name: Some("test_echo".to_owned()),
-            arguments: "{\"q\": \"par".to_owned(),
-        }])],
+        vec![
+            Script::Events(vec![StreamEvent::ToolCallDelta {
+                index: 0,
+                id: Some("call_1".to_owned()),
+                name: Some("test_echo".to_owned()),
+                arguments: "{\"q\": \"par".to_owned(),
+            }]),
+            MockChat::text("recovered"),
+        ],
         registry_with(echo),
     )
     .await;
@@ -1789,36 +2177,40 @@ async fn incomplete_input_and_unknown_finish_fail_the_step() {
         )
         .await;
     assert_eq!(response.status(), 200);
-    harness.wait_event("session.execution.failed").await;
+    harness.wait_event("session.execution.succeeded").await;
 
+    // Upstream `unknownFinish`: a stream that ends without a finish reason
+    // is invalid provider output; the unsettled call fails with that error
+    // itself (failAssistant — not the input-failure text) and the step
+    // continues via the upstream prompt.
     let failure = harness
         .event_log()
         .await
         .into_iter()
         .find(|(k, _)| k == "session.tool.failed")
-        .expect("incomplete failure");
-    assert_eq!(failure.1["error"]["type"], "tool.input-incomplete");
-    let message = failure.1["error"]["message"].as_str().expect("message");
-    assert!(
-        message.contains("arguments were not completed"),
-        "upstream incomplete wording: {message}"
-    );
-    assert!(
-        message.contains("Input excerpt (first 10 of 10 characters):\n{\"q\": \"par"),
-        "the input excerpt is appended: {message}"
+        .map(|(_, data)| data)
+        .expect("unsettled tool failure");
+    assert_eq!(failure["error"]["type"], "provider.invalid-output");
+    assert_eq!(
+        failure["error"]["message"],
+        "The provider response ended with an unknown finish reason."
     );
     assert!(!executed.load(Ordering::SeqCst), "the call never executed");
 
-    let log = harness.event_log().await;
-    let failed = log
-        .iter()
-        .find(|(k, _)| k == "session.step.failed")
-        .expect("step failed");
-    assert_eq!(failed.1["error"]["type"], "provider.invalid-output");
-    assert_eq!(
-        failed.1["error"]["message"],
-        "The provider response ended with an unknown finish reason."
-    );
+    let synthetic = harness
+        .event_log()
+        .await
+        .into_iter()
+        .find(|(k, _)| k == "session.synthetic")
+        .map(|(_, data)| data)
+        .expect("continuation prompt published");
+    assert_eq!(synthetic["text"], CONTINUE_PROMPT);
+
+    let messages = harness.messages(&session_id).await;
+    let kinds: Vec<&str> = messages.iter().filter_map(|m| m["type"].as_str()).collect();
+    assert_eq!(&kinds[..4], ["user", "assistant", "synthetic", "assistant"]);
+    assert_eq!(messages[1]["error"]["type"], "provider.invalid-output");
+    assert_eq!(messages[3]["content"][0]["text"], "recovered");
 }
 
 // ---------------------------------------------------------------------------

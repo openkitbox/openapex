@@ -22,7 +22,9 @@
 //!   Between steps, steer items that arrived mid-turn are delivered (a
 //!   compaction control at the steer head owns that boundary and runs
 //!   first). A 400 context-overflow before any output compacts (reason
-//!   `auto`) and retries the step once.
+//!   `auto`) and retries the step once; a mid-stream interrupted stream
+//!   settles its partial row and continues via a synthetic prompt
+//!   (upstream `Outcome.Continue`).
 //! - Quiet inbox → the drain completes and the actor publishes the terminal.
 
 use std::sync::Arc;
@@ -239,12 +241,12 @@ async fn run_turn(ctx: &DrainCtx, token: &CancellationToken) -> Result<TurnOutco
         if token.is_cancelled() {
             return Ok(TurnOutcome::Interrupted);
         }
-        let params = super::step::StepParams {
+        let mut params = super::step::StepParams {
             assistant_message_id: id::id("msg"),
             agent: &agent,
             model: &model,
         };
-        match super::step::run(ctx, token, &params).await? {
+        match super::step::run(ctx, token, &mut params).await? {
             super::step::StepOutcome::Completed {
                 finish,
                 needs_continuation,
