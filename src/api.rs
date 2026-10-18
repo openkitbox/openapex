@@ -17,6 +17,7 @@ use crate::event_bus::EventBus;
 use crate::id::now_millis;
 use crate::runner::Runner;
 
+pub mod event;
 pub mod session;
 
 /// Shared application state, injected via `salvo::affix_state`.
@@ -385,6 +386,7 @@ pub fn build_router(state: AppState) -> Router {
             .push(Router::with_path("project").get(project_list))
             .push(Router::with_path("model").get(model_list))
             .push(Router::with_path("agent").get(agent_list))
+            .push(Router::with_path("event").get(event::subscribe))
             .push(
                 Router::with_path("session")
                     .get(session::list)

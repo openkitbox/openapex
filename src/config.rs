@@ -61,6 +61,16 @@ pub struct Config {
     /// Statically configured models exposed by `model.list`.
     #[serde(default = "default_models")]
     pub models: Vec<ModelEntry>,
+    /// Heartbeat interval for the `event.subscribe` SSE stream, in
+    /// milliseconds. Upstream hardcodes 15 seconds
+    /// (`Stream.tick("15 seconds")`); the default matches. Exposed for
+    /// tests and tuning.
+    #[serde(default = "default_event_heartbeat_ms")]
+    pub event_heartbeat_ms: u64,
+}
+
+fn default_event_heartbeat_ms() -> u64 {
+    15_000
 }
 
 impl Default for Config {
@@ -71,6 +81,7 @@ impl Default for Config {
             db_path: default_db_path(),
             listen: default_listen(),
             models: default_models(),
+            event_heartbeat_ms: default_event_heartbeat_ms(),
         }
     }
 }
@@ -133,6 +144,7 @@ mod tests {
         assert_eq!(cfg.cardinal_url, DEFAULT_CARDINAL_URL);
         assert_eq!(cfg.listen, DEFAULT_LISTEN);
         assert!(cfg.cardinal_key.is_none());
+        assert_eq!(cfg.event_heartbeat_ms, 15_000);
         assert!(cfg.db_path.ends_with("ox.db"));
         assert!(cfg.models.is_empty());
     }
