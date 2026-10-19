@@ -1,1 +1,320 @@
-//! Compartment records, coverage ends and pressure thresholds.
+//! Compartment records: what the historian has folded out of the live
+//! transcript, plus the coverage end the request assembly uses as its floor.
+//!
+//! One row per compartment in `mc_compartments` (columns fixed by the plan:
+//! `id, session_id, coverage_end, importance, tiers JSON, facts JSON,
+//! events JSON, created_at`). `tiers` carries the row fields the decay
+//! renderer consumes; `facts`/`events` are historian-side payloads the render
+//! path deliberately ignores (the reference never renders session facts into
+//! the history block).
+//!
+//! Chronological order is insertion order (`created_at`, tie-broken by `id`):
+//! the historian only ever appends, and `coverage_end` is text in the schema
+//! so it must not be used for ordering.
+
+use anyhow::{Context as _, Result};
+use serde::{Deserialize, Serialize};
+
+use crate::db::Db;
+use crate::mctx::decay_render::DecayRenderCompartment;
+
+/// The paraphrase tiers and heading fields of one compartment — the `tiers`
+/// JSON column. `p1..p4` are the paraphrase ladder; `p1` absent or empty
+/// marks a flat-content (`legacy`) row.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tiers {
+    /// Heading title (untrusted: historian-authored).
+    #[serde(default)]
+    pub title: String,
+    /// First covered message ordinal.
+    #[serde(default)]
+    pub start_message: i64,
+    /// Last covered message ordinal.
+    #[serde(default)]
+    pub end_message: i64,
+    /// Start date (YYYY-MM-DD) of the covered span.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_date: Option<String>,
+    /// End date (YYYY-MM-DD) of the covered span.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_date: Option<String>,
+    /// Paraphrase tier P1 (most verbose).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p1: Option<String>,
+    /// Paraphrase tier P2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p2: Option<String>,
+    /// Paraphrase tier P3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p3: Option<String>,
+    /// Paraphrase tier P4 (most compressed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub p4: Option<String>,
+}
+
+/// One stored compartment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Compartment {
+    /// Row id (`mc_`-style opaque id).
+    pub id: String,
+    /// Owning session.
+    pub session_id: String,
+    /// Last message ordinal this compartment covers, as text in the column.
+    pub coverage_end: String,
+    /// 1..100 importance (decay rate).
+    pub importance: f64,
+    /// Heading + paraphrase tiers.
+    pub tiers: Tiers,
+    /// Historian-side facts payload (not rendered).
+    pub facts: serde_json::Value,
+    /// Historian-side events payload (not rendered).
+    pub events: serde_json::Value,
+    /// Insertion time (ms); chronological order.
+    pub created_at: i64,
+}
+
+impl Compartment {
+    /// The coverage end as a number, or `None` when the column is malformed.
+    pub fn end_ordinal(&self) -> Option<i64> {
+        self.coverage_end.trim().parse::<i64>().ok()
+    }
+
+    /// Projection into the decay renderer's input shape.
+    pub fn render_input(&self) -> DecayRenderCompartment {
+        DecayRenderCompartment {
+            start_message: self.tiers.start_message,
+            end_message: self.tiers.end_message,
+            title: self.tiers.title.clone(),
+            content: String::new(),
+            start_date: self.tiers.start_date.clone(),
+            end_date: self.tiers.end_date.clone(),
+            p1: self.tiers.p1.clone(),
+            p2: self.tiers.p2.clone(),
+            p3: self.tiers.p3.clone(),
+            p4: self.tiers.p4.clone(),
+            importance: Some(self.importance.round().clamp(1.0, 100.0) as i32),
+            legacy: None,
+        }
+    }
+}
+
+const COLUMNS: &str = "id, session_id, coverage_end, importance, tiers, facts, events, created_at";
+
+fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Compartment> {
+    let tiers: String = row.get(4)?;
+    let facts: String = row.get(5)?;
+    let events: String = row.get(6)?;
+    Ok(Compartment {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        coverage_end: row.get(2)?,
+        importance: row.get(3)?,
+        tiers: serde_json::from_str(&tiers).unwrap_or_else(|error| {
+            tracing::warn!(error = %error, "malformed mc_compartments.tiers; treating as empty");
+            Tiers::default()
+        }),
+        facts: serde_json::from_str(&facts).unwrap_or(serde_json::Value::Null),
+        events: serde_json::from_str(&events).unwrap_or(serde_json::Value::Null),
+        created_at: row.get(7)?,
+    })
+}
+
+/// Load every compartment of a session, chronologically (oldest first).
+pub async fn load(db: &Db, session_id: &str) -> Result<Vec<Compartment>> {
+    let session = session_id.to_owned();
+    let rows = db
+        .conn()
+        .call(move |c| -> rusqlite::Result<Vec<Compartment>> {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {COLUMNS} FROM mc_compartments
+                 WHERE session_id = ?1
+                 ORDER BY created_at, id"
+            ))?;
+            let rows = stmt.query_map([&session], from_row)?;
+            rows.collect()
+        })
+        .await
+        .with_context(|| format!("load mc_compartments for session {session_id}"))?;
+    Ok(rows)
+}
+
+/// The highest covered ordinal across `compartments` (the request-assembly
+/// floor), or `None` when nothing is covered.
+pub fn coverage_end(compartments: &[Compartment]) -> Option<i64> {
+    compartments
+        .iter()
+        .filter_map(Compartment::end_ordinal)
+        .max()
+}
+
+/// A compartment about to be stored.
+#[derive(Debug, Clone)]
+pub struct NewCompartment<'a> {
+    /// Row id (`mc_`-style opaque id).
+    pub id: &'a str,
+    /// Owning session.
+    pub session_id: &'a str,
+    /// 1..100 importance (decay rate).
+    pub importance: f64,
+    /// Heading + paraphrase tiers.
+    pub tiers: &'a Tiers,
+    /// Historian-side facts payload.
+    pub facts: &'a serde_json::Value,
+    /// Historian-side events payload.
+    pub events: &'a serde_json::Value,
+}
+
+/// Append one compartment.
+pub async fn insert(db: &Db, compartment: &NewCompartment<'_>) -> Result<()> {
+    let id = compartment.id.to_owned();
+    let session = compartment.session_id.to_owned();
+    let coverage_end = compartment.tiers.end_message.to_string();
+    let importance = compartment.importance;
+    let tiers_json =
+        serde_json::to_string(compartment.tiers).context("serialize compartment tiers")?;
+    let facts_json =
+        serde_json::to_string(compartment.facts).context("serialize compartment facts")?;
+    let events_json =
+        serde_json::to_string(compartment.events).context("serialize compartment events")?;
+    let now = crate::id::now_millis();
+    db.conn()
+        .call(move |c| -> rusqlite::Result<usize> {
+            c.execute(
+                &format!("INSERT INTO mc_compartments ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),
+                rusqlite::params![
+                    id,
+                    session,
+                    coverage_end,
+                    importance,
+                    tiers_json,
+                    facts_json,
+                    events_json,
+                    now
+                ],
+            )
+        })
+        .await
+        .with_context(|| {
+            format!(
+                "insert mc_compartments row for session {}",
+                compartment.session_id
+            )
+        })?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    async fn db() -> Db {
+        let db = Db::open_in_memory().await.unwrap();
+        db.migrate().await.unwrap();
+        db
+    }
+
+    fn tiers(start: i64, end: i64, title: &str) -> Tiers {
+        Tiers {
+            title: title.to_string(),
+            start_message: start,
+            end_message: end,
+            p1: Some(format!("{title} body")),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_and_load_round_trip_in_chronological_order() {
+        let db = db().await;
+        let first = tiers(1, 4, "First");
+        let second = tiers(5, 9, "Second");
+        let other = tiers(1, 2, "Other");
+        let empty = json!({});
+        let none = json!([]);
+        for (id, session, importance, tiers) in [
+            ("mc_1", "ses_a", 80.0, &first),
+            ("mc_2", "ses_a", 40.0, &second),
+            ("mc_3", "ses_b", 50.0, &other),
+        ] {
+            insert(
+                &db,
+                &NewCompartment {
+                    id,
+                    session_id: session,
+                    importance,
+                    tiers,
+                    facts: &empty,
+                    events: &none,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let rows = load(&db, "ses_a").await.unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|c| c.tiers.title.as_str())
+                .collect::<Vec<_>>(),
+            ["First", "Second"]
+        );
+        assert_eq!(rows[0].importance, 80.0);
+        assert_eq!(rows[1].coverage_end, "9");
+        assert_eq!(coverage_end(&rows), Some(9));
+        assert_eq!(coverage_end(&[]), None);
+    }
+
+    #[tokio::test]
+    async fn malformed_tiers_degrade_to_empty_not_an_error() {
+        let db = db().await;
+        db.conn()
+            .call(|c| -> rusqlite::Result<usize> {
+                c.execute(
+                    "INSERT INTO mc_compartments
+                         (id, session_id, coverage_end, importance, tiers, facts, events, created_at)
+                     VALUES ('mc_bad', 'ses_a', '3', 50.0, '{not json', 'null', 'null', 1)",
+                    [],
+                )
+            })
+            .await
+            .unwrap();
+        let rows = load(&db, "ses_a").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tiers, Tiers::default());
+        // The coverage column still parses, so the floor still advances.
+        assert_eq!(coverage_end(&rows), Some(3));
+    }
+
+    #[test]
+    fn projection_carries_heading_and_tiers() {
+        let compartment = Compartment {
+            id: "mc_1".into(),
+            session_id: "ses_a".into(),
+            coverage_end: "9".into(),
+            importance: 91.6,
+            tiers: Tiers {
+                title: "T".into(),
+                start_message: 1,
+                end_message: 9,
+                start_date: Some("2026-06-08".into()),
+                end_date: Some("2026-06-09".into()),
+                p1: Some("verbose".into()),
+                p2: Some("dense".into()),
+                p3: None,
+                p4: None,
+            },
+            facts: json!({}),
+            events: json!([]),
+            created_at: 1,
+        };
+        let input = compartment.render_input();
+        assert_eq!(input.title, "T");
+        assert_eq!((input.start_message, input.end_message), (1, 9));
+        assert_eq!(input.start_date.as_deref(), Some("2026-06-08"));
+        assert_eq!(input.p1.as_deref(), Some("verbose"));
+        assert_eq!(input.p2.as_deref(), Some("dense"));
+        assert_eq!(input.importance, Some(92), "importance rounds and clamps");
+        assert_eq!(input.legacy, None);
+    }
+}

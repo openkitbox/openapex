@@ -61,8 +61,19 @@ pub mod memory;
 /// Compartment records, coverage ends and pressure thresholds.
 pub mod compartments;
 
+/// The deterministic tier-decay curve (age/importance/budget → tier).
+pub mod decay;
+
+/// Decay rendering: turns chronological compartments into the markdown
+/// history body that fills `m[0]`/`m[1]`.
+pub mod decay_render;
+
 /// Decay rendering and `m[0]`/`m[1]` synthetic-message composition.
 pub mod render;
+
+/// The per-session transform pass: plan → classify → step the cache kernel →
+/// CAS write-back (the `m[0]`/`m[1]` head producer).
+pub mod pass;
 
 /// Historian: triggering, chunking, prompt, cardinal execution, validation
 /// and publication of compartments.

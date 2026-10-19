@@ -195,14 +195,18 @@ pub(crate) async fn run(
         // The transcript is rebuilt per attempt (upstream refreshes context
         // on retry and continuation): a continuation attempt must observe
         // the settled partial row plus the continuation prompt.
-        let rows = load_history(&ctx.db, &ctx.session_id).await?;
-        let system = prompt::build(&ctx.directory, &mctx_tail(ctx).await);
+        // The magic-context head replaces everything it covers: the pass mints
+        // the frozen bytes and reports the ordinal floor, so the transcript
+        // starts after the covered range.
+        let (head, floor) = mctx_head(ctx).await;
+        let rows = load_history_after(&ctx.db, &ctx.session_id, floor).await?;
+        let system = prompt::build(&ctx.directory);
         let mut request = ChatRequest::new(
             // cardinal routes on the bare model id; the providerID/modelID
             // qualified form is upstream's provider-adapter vocabulary and
             // cardinal answers "no route for model cardinal/<id>" to it.
             params.model.id.clone(),
-            build_chat_messages(&system, &rows),
+            build_chat_messages(&system, head.as_deref(), &rows),
         );
         request.tools = ctx.tools.definitions();
 
@@ -1163,26 +1167,57 @@ fn to_session_error(error: &CardinalError) -> SessionError {
 // Context assembly (one named mapping; the e2e suite trusts this function)
 // ---------------------------------------------------------------------------
 
-/// The magic-context prompt tail for one step: the project-memory pinboard
-/// when `[magic_context]` is enabled, else an empty string (the prompt then
-/// stays byte-identical to the integration-off one). A failed render warns
-/// and degrades to empty — a broken pinboard must never fail the turn.
-async fn mctx_tail(ctx: &DrainCtx) -> String {
+/// The magic-context head for one step: the frozen `m[0]`/`m[1]` bytes plus
+/// the transcript floor they cover, or `(None, 0)` when the integration is off
+/// or the pass failed (the prompt then stays byte-identical to the
+/// integration-off one — a broken head must never fail the turn).
+async fn mctx_head(ctx: &DrainCtx) -> (Option<String>, i64) {
     if !ctx.config.magic_context.enabled {
-        return String::new();
+        return (None, 0);
     }
-    let project = ctx.directory.to_string_lossy();
-    match crate::mctx::render::render_memory_pinboard(&ctx.db, &project).await {
-        Ok(tail) => tail,
+    let last_seq = match latest_seq(&ctx.db, &ctx.session_id).await {
+        Ok(seq) => seq,
+        Err(error) => {
+            tracing::warn!(session = %ctx.session_id, error = %error, "mctx pass failed; continuing without a head");
+            return (None, 0);
+        }
+    };
+    let project = ctx.directory.to_string_lossy().into_owned();
+    let request = crate::mctx::pass::PassRequest {
+        db: &ctx.db,
+        session_id: &ctx.session_id,
+        project: &project,
+        last_seq,
+        forced: false,
+        run_started: false,
+    };
+    match crate::mctx::pass::run(request).await {
+        Ok(result) => (result.head, result.floor),
         Err(error) => {
             tracing::warn!(
                 session = %ctx.session_id,
                 error = %error,
-                "pinboard render failed; continuing without the memory tail"
+                "mctx pass failed; continuing without a head"
             );
-            String::new()
+            (None, 0)
         }
     }
+}
+
+/// The highest transcript ordinal in a session.
+async fn latest_seq(db: &crate::db::Db, session_id: &str) -> Result<i64> {
+    let session = session_id.to_owned();
+    let seq = db
+        .conn()
+        .call(move |c| -> rusqlite::Result<i64> {
+            c.query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM session_message WHERE session_id = ?1",
+                [&session],
+                |row| row.get(0),
+            )
+        })
+        .await?;
+    Ok(seq)
 }
 
 /// Build the OpenAI message list: the system prompt, then the session
@@ -1206,7 +1241,11 @@ async fn mctx_tail(ctx: &DrainCtx) -> String {
 ///   skipped, and history selection starts at the latest completed row
 ///   anyway (upstream `SessionHistory` boundary).
 /// - idle/shell/switch markers never reach the model.
-pub(crate) fn build_chat_messages(system: &str, messages: &[Message]) -> Vec<ChatMessage> {
+pub(crate) fn build_chat_messages(
+    system: &str,
+    head: Option<&str>,
+    messages: &[Message],
+) -> Vec<ChatMessage> {
     // Upstream `messageEntries`: history starts at the latest completed
     // compaction row, so the checkpoint replaces everything before it.
     let boundary = messages.iter().rposition(|message| {
@@ -1221,6 +1260,13 @@ pub(crate) fn build_chat_messages(system: &str, messages: &[Message]) -> Vec<Cha
     let mut out = vec![ChatMessage::System {
         content: system.to_owned(),
     }];
+    if let Some(head) = head {
+        // The head is synthetic: it stands in for the covered history, so it
+        // leads the transcript as a user message.
+        out.push(ChatMessage::User {
+            content: head.to_owned(),
+        });
+    }
     for message in messages.iter().skip(boundary.unwrap_or(0)) {
         match message {
             Message::User { prompt, .. } => {
@@ -1372,15 +1418,26 @@ fn user_prompt_text(prompt: &Prompt) -> String {
 
 /// The session transcript in `seq` order, decoded from `session_message`.
 pub(crate) async fn load_history(db: &crate::db::Db, session_id: &str) -> Result<Vec<Message>> {
+    load_history_after(db, session_id, i64::MIN).await
+}
+
+/// Load a session transcript above `floor`: rows with a greater ordinal. The
+/// magic-context head stands in for everything at or below the floor it
+/// reports, so the request carries only the live tail.
+pub(crate) async fn load_history_after(
+    db: &crate::db::Db,
+    session_id: &str,
+    floor: i64,
+) -> Result<Vec<Message>> {
     let session_id = session_id.to_owned();
     let rows: Vec<(String, String, String)> = db
         .conn()
         .call(move |c| {
             let mut stmt = c.prepare(
                 "SELECT id, type, data FROM session_message
-                 WHERE session_id = ?1 ORDER BY seq ASC",
+                 WHERE session_id = ?1 AND seq > ?2 ORDER BY seq ASC",
             )?;
-            let mapped = stmt.query_map(rusqlite::params![session_id], |row| {
+            let mapped = stmt.query_map(rusqlite::params![session_id, floor], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -1498,7 +1555,7 @@ mod tests {
             },
             assistant,
         ];
-        let chat = build_chat_messages("sys", &messages);
+        let chat = build_chat_messages("sys", None, &messages);
         let system_roles: Vec<&str> = chat
             .iter()
             .filter_map(|m| match m {

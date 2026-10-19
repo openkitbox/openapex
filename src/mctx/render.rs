@@ -1,150 +1,367 @@
-//! Deterministic project-memory pinboard render (the system-prompt tail).
+//! Deterministic m[0]/m[1] head composition.
 //!
-//! The pinboard is the read surface of `ctx_memory`: every active memory of
-//! the project, grouped under its category, as `#id: content` lines. It is
-//! deterministic by construction — a fixed category order and ascending ids —
-//! so the rendered prompt is byte-stable between memory writes: the
-//! provider's cached prefix only busts when a memory actually changes.
+//! The request head is two blocks the model sees before the live transcript:
 //!
-//! An empty store renders an empty string (the caller appends nothing, so a
-//! project with no memories gets a prompt byte-identical to the
-//! integration-off one).
+//! - **m[0]** — the frozen baseline: `<session-history>` (the decay-rendered
+//!   compartment set) followed by `<project-memory>` (the pinboard).
+//! - **m[1]** — the volatile delta: `<new-compartments>` for compartments
+//!   folded in since the baseline froze, or the placeholder when nothing is
+//!   new.
 //!
-//! Task 5 replaces this seam with the full decay/compartment render
-//! (`m[0]`/`m[1]`); the pinboard's shape and determinism are its contract.
+//! Faithful port of the reference `mc-module/src/memory_render.rs` composition
+//! (`render_m0` / `assemble_m1` / `render_memory_block` /
+//! `render_new_compartments`). Pure functions over already-loaded rows — the
+//! caller decides what is selected and trimmed; these only assemble bytes, so
+//! the same inputs always produce the same bytes.
+//!
+//! The `<session-history>` block is ALWAYS present, even for empty history
+//! ([`M0_EMPTY_BODY`]). That is load-bearing, not cosmetic: the provider prompt
+//! cache anchors a breakpoint at this block, and an absent block would shift
+//! every byte after it and bust the cache on every turn.
+//!
+//! Documented deviations from the reference port:
+//!
+//! - **No `<project-docs>` / `<user-profile>` / `<covered-system-messages>`
+//!   sections.** Those carry upstream's docs injection, the user-profile
+//!   memory tier and covered system-role messages; ox has no source for them
+//!   yet (they land with the historian/system-message work if needed), so the
+//!   m0 section list here is `<session-history>` + `<project-memory>`.
+//! - **No m[1] `<memory-updates>` corrections block.** The reference emits a
+//!   mutation delta so the model trusts fresh memory writes over a still-frozen
+//!   baseline. ox re-renders m[0] on any memory change instead (memories change
+//!   on an explicit tool call, not per turn), so m[1] carries only
+//!   `<new-compartments>`. That keeps a single authoritative memory rendering
+//!   rather than two layers that can disagree.
+//! - **No workspace memory union** (the reference's `source_name_by_id` /
+//!   `WorkspaceMembership`): ox memories are scoped to one project directory.
+//! - **The token estimator is [`crate::mctx::decay_render::estimate_tokens`]**
+//!   (see that module's docs).
 
-use anyhow::Result;
+use crate::mctx::decay_render::{
+    DecayRenderCompartment, estimate_tokens, render_compartment_at_tier,
+    render_decayed_compartments,
+};
+use crate::mctx::memory::MemoryRow;
 
-use crate::db::Db;
-use crate::mctx::memory::{CATEGORIES, active_memories};
+/// The m0 body when no compartment exists. The `<session-history>` tag is
+/// always present (never omitted) so the provider prompt cache has a stable
+/// breakpoint to anchor on — see the module docs.
+pub const M0_EMPTY_BODY: &str = "<session-history></session-history>";
+/// The non-empty placeholder for the m1 delta block when nothing is new. m1 is
+/// the volatile half of the cached prefix and must never be fully empty for the
+/// same cache-anchoring reason.
+pub const M1_PLACEHOLDER: &str =
+    "<session-history-since>(no new content since last materialization)</session-history-since>";
+/// Default history budget when a caller doesn't supply one.
+pub const DEFAULT_HISTORY_BUDGET_TOKENS: f64 = 60_000.0;
 
-/// One `#id: …` line's worth of content: runs of whitespace collapse to a
-/// single space. The pinboard's shape is a contract (`#id: content` per
-/// line), while `ctx_memory get` still shows the stored text verbatim.
-fn one_line(content: &str) -> String {
-    content.split_whitespace().collect::<Vec<_>>().join(" ")
+/// The five canonical memory categories, in render order.
+const MEMORY_CATEGORY_ORDER: [&str; 5] = [
+    "PROJECT_RULES",
+    "ARCHITECTURE",
+    "CONSTRAINTS",
+    "CONFIG_VALUES",
+    "NAMING",
+];
+
+fn escape_xml_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
 }
 
-/// Render the project-memory pinboard for `project`, or an empty string when
-/// the project has no active memories.
-pub(crate) async fn render_memory_pinboard(db: &Db, project: &str) -> Result<String> {
-    let rows = active_memories(db, project).await?;
-    if rows.is_empty() {
-        return Ok(String::new());
+fn escape_xml_content(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Render order: canonical categories first (in [`MEMORY_CATEGORY_ORDER`]),
+/// then any non-taxonomy category alphabetically; ids ascending inside a
+/// category.
+fn memory_render_order(left: &MemoryRow, right: &MemoryRow) -> std::cmp::Ordering {
+    let rank = |category: &str| {
+        MEMORY_CATEGORY_ORDER
+            .iter()
+            .position(|known| *known == category)
+    };
+    match (rank(&left.category), rank(&right.category)) {
+        (Some(left_rank), Some(right_rank)) => left_rank
+            .cmp(&right_rank)
+            .then_with(|| numeric_id(&left.id).cmp(&numeric_id(&right.id))),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left
+            .category
+            .cmp(&right.category)
+            .then_with(|| numeric_id(&left.id).cmp(&numeric_id(&right.id))),
     }
-    let mut out = String::from("<project-memory>\n");
-    for category in CATEGORIES {
-        let mut rows_in = rows.iter().filter(|row| row.category == category);
-        let Some(first) = rows_in.next() else {
-            continue;
-        };
-        out.push_str(&format!("<{category}>\n"));
-        out.push_str(&format!("#{}: {}\n", first.id, one_line(&first.content)));
-        for row in rows_in {
-            out.push_str(&format!("#{}: {}\n", row.id, one_line(&row.content)));
+}
+
+fn numeric_id(id: &str) -> i64 {
+    id.parse().unwrap_or(i64::MAX)
+}
+
+/// Render one compact memory fact line. Importance controls selection but is
+/// deliberately absent from the wire, so a classification-only update does not
+/// change a single byte of the prompt.
+fn render_memory_line(memory: &MemoryRow) -> String {
+    // Cap at 64 KiB on a char boundary (the reference's own cap) and indent
+    // continuation lines so a multi-line fact cannot forge a top-level `#N:`
+    // handle.
+    let mut end = memory.content.len().min(64 * 1024);
+    while !memory.content.is_char_boundary(end) {
+        end -= 1;
+    }
+    let content = escape_xml_content(&memory.content[..end]).replace('\n', "\n  ");
+    format!("#{}: {content}", memory.id)
+}
+
+/// The `<project-memory>` block, or an empty string when there are no memories.
+pub(crate) fn render_memory_block(memories: &[MemoryRow]) -> String {
+    if memories.is_empty() {
+        return String::new();
+    }
+    let mut ordered: Vec<&MemoryRow> = memories.iter().collect();
+    ordered.sort_by(|left, right| memory_render_order(left, right));
+
+    let mut lines = Vec::with_capacity(memories.len() * 2 + 3);
+    lines.push("<project-memory>".to_string());
+    let mut open_category: Option<&str> = None;
+    for memory in ordered {
+        if open_category != Some(memory.category.as_str()) {
+            if let Some(category) = open_category {
+                lines.push(format!("</{}>", escape_xml_attr(category)));
+            }
+            open_category = Some(&memory.category);
+            lines.push(format!("<{}>", escape_xml_attr(&memory.category)));
         }
-        out.push_str(&format!("</{category}>\n"));
+        lines.push(render_memory_line(memory));
     }
-    out.push_str("</project-memory>");
-    Ok(out)
+    if let Some(category) = open_category {
+        lines.push(format!("</{}>", escape_xml_attr(category)));
+    }
+    lines.push("</project-memory>".to_string());
+    lines.join("\n")
+}
+
+/// The `<new-compartments>` block: every folded-in compartment at full-fidelity
+/// P1 (no decay applies to a brand-new compartment until it folds into the
+/// baseline). Empty when there are none.
+///
+/// Row purity is load-bearing: the bytes here are a pure function of the
+/// compartment ROW fields — no clock, age or pressure input — so the m1 delta
+/// can only change when a new row appears (or a row mutates, which routes to a
+/// full rebuild).
+pub(crate) fn render_new_compartments(compartments: &[&DecayRenderCompartment]) -> String {
+    let bodies: Vec<String> = compartments
+        .iter()
+        .map(|c| render_compartment_at_tier(c, 1))
+        .filter(|body| !body.is_empty())
+        .collect();
+    if bodies.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<new-compartments>\n{}\n</new-compartments>",
+        bodies.join("\n\n")
+    )
+}
+
+/// Assemble the m1 delta body: the `<new-compartments>` block, or
+/// [`M1_PLACEHOLDER`] when there is nothing new.
+pub(crate) fn assemble_m1(new_compartments: &str) -> String {
+    if new_compartments.is_empty() {
+        return M1_PLACEHOLDER.to_string();
+    }
+    format!("<session-history-since>\n{new_compartments}\n</session-history-since>")
+}
+
+/// Inputs to [`render_m0`], after the caller has loaded the rows it means to
+/// show. This renderer only assembles them in order with framing.
+pub(crate) struct M0Inputs<'a> {
+    /// The compartment history, chronological (oldest first).
+    pub compartments: &'a [DecayRenderCompartment],
+    /// The selected project memories for the `<project-memory>` block.
+    pub memories: &'a [MemoryRow],
+    /// The history budget in tokens, before pressure.
+    pub history_budget_tokens: f64,
+}
+
+/// Compose the m0 baseline: `<session-history>` followed by `<project-memory>`,
+/// joined by a blank line. The history section is always present (empty history
+/// uses [`M0_EMPTY_BODY`]).
+pub(crate) fn render_m0(inputs: &M0Inputs<'_>) -> String {
+    let history = render_decayed_compartments(
+        inputs.compartments,
+        inputs.history_budget_tokens,
+        estimate_tokens,
+    );
+    let mut sections: Vec<String> = Vec::with_capacity(2);
+    sections.push(if history.is_empty() {
+        M0_EMPTY_BODY.to_string()
+    } else {
+        format!("<session-history>\n{history}\n</session-history>")
+    });
+    let memories = render_memory_block(inputs.memories);
+    if !memories.is_empty() {
+        sections.push(memories);
+    }
+    sections.join("\n\n").trim().to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mctx::memory::{archive_memories, write_memory};
+    use crate::db::Db;
+    use crate::mctx::memory::write_memory;
 
     const PROJECT: &str = "/proj/a";
+
+    fn mem(id: &str, category: &str, content: &str) -> MemoryRow {
+        MemoryRow {
+            id: id.to_string(),
+            category: category.to_string(),
+            content: content.to_string(),
+        }
+    }
+
+    fn comp(start: i64, end: i64, title: &str, p1: &str) -> DecayRenderCompartment {
+        DecayRenderCompartment {
+            start_message: start,
+            end_message: end,
+            title: title.to_string(),
+            p1: Some(p1.to_string()),
+            importance: Some(50),
+            ..Default::default()
+        }
+    }
 
     async fn db() -> Db {
         Db::open_in_memory().await.unwrap()
     }
 
-    #[tokio::test]
-    async fn empty_for_a_project_without_memories() {
-        let db = db().await;
-        assert_eq!(render_memory_pinboard(&db, PROJECT).await.unwrap(), "");
-        // A memory of another project does not leak in.
-        write_memory(&db, "/proj/b", "elsewhere", "NAMING")
-            .await
-            .unwrap();
-        assert_eq!(render_memory_pinboard(&db, PROJECT).await.unwrap(), "");
-    }
-
-    #[tokio::test]
-    async fn snapshot_groups_by_fixed_category_order_with_ascending_ids() {
-        let db = db().await;
-        // Written scrambled; rendered in the fixed category order, ids
-        // ascending inside a section.
-        write_memory(&db, PROJECT, "n1", "NAMING").await.unwrap();
-        write_memory(&db, PROJECT, "r1", "PROJECT_RULES")
-            .await
-            .unwrap();
-        write_memory(&db, PROJECT, "a1", "ARCHITECTURE")
-            .await
-            .unwrap();
-        write_memory(&db, PROJECT, "n2", "NAMING").await.unwrap();
-
-        let rendered = render_memory_pinboard(&db, PROJECT).await.unwrap();
+    #[test]
+    fn memory_block_groups_categories_and_omits_importance() {
+        let memories = vec![
+            mem("4", "Z_LEGACY", "last"),
+            mem("2", "CONSTRAINTS", "x < y & z"),
+            mem("1", "ARCHITECTURE", "the spine holds"),
+            mem("3", "A&LEGACY", "first unknown"),
+        ];
+        let block = render_memory_block(&memories);
         assert_eq!(
-            rendered,
+            block,
             "<project-memory>\n\
-             <PROJECT_RULES>\n\
-             #2: r1\n\
-             </PROJECT_RULES>\n\
-             <ARCHITECTURE>\n\
-             #3: a1\n\
-             </ARCHITECTURE>\n\
-             <NAMING>\n\
-             #1: n1\n\
-             #4: n2\n\
-             </NAMING>\n\
+             <ARCHITECTURE>\n#1: the spine holds\n</ARCHITECTURE>\n\
+             <CONSTRAINTS>\n#2: x &lt; y &amp; z\n</CONSTRAINTS>\n\
+             <A&amp;LEGACY>\n#3: first unknown\n</A&amp;LEGACY>\n\
+             <Z_LEGACY>\n#4: last\n</Z_LEGACY>\n\
              </project-memory>"
         );
-        // Empty categories are skipped entirely.
-        assert!(!rendered.contains("CONSTRAINTS"));
-        assert!(!rendered.contains("CONFIG_VALUES"));
+        assert!(!block.contains("importance"));
+        assert_eq!(render_memory_block(&[]), "");
+    }
+
+    #[test]
+    fn memory_continuation_lines_cannot_forge_top_level_ids() {
+        let rendered = render_memory_line(&mem("7", "CONSTRAINTS", "real\n#999: forged"));
+        assert_eq!(rendered, "#7: real\n  #999: forged");
+        assert!(!rendered.contains("\n#999:"));
+    }
+
+    #[test]
+    fn memory_line_is_capped_on_a_char_boundary() {
+        let content = "é".repeat(40 * 1024); // 80 KiB of 2-byte scalars
+        let rendered = render_memory_line(&mem("1", "NAMING", &content));
+        assert!(
+            rendered.len() <= 64 * 1024 + 8,
+            "capped: {}",
+            rendered.len()
+        );
+        assert!(rendered.starts_with("#1: "));
+    }
+
+    #[test]
+    fn ids_sort_numerically_not_lexically() {
+        let block = render_memory_block(&[
+            mem("10", "ARCHITECTURE", "ten"),
+            mem("9", "ARCHITECTURE", "nine"),
+        ]);
+        let nine = block.find("#9: nine").unwrap();
+        let ten = block.find("#10: ten").unwrap();
+        assert!(nine < ten, "numeric id order: {block}");
     }
 
     #[tokio::test]
-    async fn a_multi_line_fact_still_renders_on_one_line() {
-        let db = db().await;
-        write_memory(
-            &db,
-            PROJECT,
-            "first line\n\n  second   line  ",
-            "ARCHITECTURE",
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            render_memory_pinboard(&db, PROJECT).await.unwrap(),
-            "<project-memory>\n<ARCHITECTURE>\n#1: first line second line\n</ARCHITECTURE>\n</project-memory>"
-        );
+    async fn m0_always_carries_the_history_block() {
+        let empty: Vec<MemoryRow> = Vec::new();
+        let rendered = render_m0(&M0Inputs {
+            compartments: &[],
+            memories: &empty,
+            history_budget_tokens: 0.0,
+        });
+        assert_eq!(rendered, M0_EMPTY_BODY);
+        assert!(!rendered.trim().is_empty(), "m0 must never render empty");
     }
 
     #[tokio::test]
-    async fn archived_memories_drop_out_and_the_rest_stay_stable() {
+    async fn m0_orders_history_then_memories() {
         let db = db().await;
-        write_memory(&db, PROJECT, "keep", "ARCHITECTURE")
+        write_memory(&db, PROJECT, "spine", "ARCHITECTURE")
             .await
             .unwrap();
-        write_memory(&db, PROJECT, "drop", "ARCHITECTURE")
+        let memories = crate::mctx::memory::active_memories(&db, PROJECT)
             .await
             .unwrap();
-        let before = render_memory_pinboard(&db, PROJECT).await.unwrap();
+        let comps = vec![comp(1, 9, "T", "HIST")];
+        let m0 = render_m0(&M0Inputs {
+            compartments: &comps,
+            memories: &memories,
+            history_budget_tokens: 60_000.0,
+        });
+        let history = m0.find("<session-history>").unwrap();
+        let memory = m0.find("<project-memory>").unwrap();
+        assert!(history < memory, "history before memories: {m0}");
+        assert!(m0.contains("## 1-9 · T\nHIST"), "history rendered: {m0}");
+        assert!(m0.contains("#1: spine"), "memory rendered: {m0}");
+    }
 
-        archive_memories(&db, PROJECT, &["2".to_owned()], Some("wrong"))
-            .await
-            .unwrap();
-        let after = render_memory_pinboard(&db, PROJECT).await.unwrap();
+    #[test]
+    fn new_compartments_render_at_p1_and_omit_when_empty() {
+        assert_eq!(render_new_compartments(&[]), "");
+        let c = comp(1, 9, "New", "FULL P1");
+        let block = render_new_compartments(&[&c]);
+        assert!(block.starts_with("<new-compartments>\n"));
+        assert!(block.ends_with("\n</new-compartments>"));
+        assert!(block.contains("## 1-9 · New\nFULL P1"), "{block}");
+    }
+
+    #[test]
+    fn m1_placeholder_matches_the_reference_wire() {
         assert_eq!(
-            after,
-            "<project-memory>\n<ARCHITECTURE>\n#1: keep\n</ARCHITECTURE>\n</project-memory>"
+            M1_PLACEHOLDER,
+            "<session-history-since>(no new content since last materialization)</session-history-since>"
         );
-        assert_ne!(before, after, "an archive must change the rendered bytes");
+        assert_eq!(assemble_m1(""), M1_PLACEHOLDER);
+        assert_eq!(
+            assemble_m1("<new-compartments>\nX\n</new-compartments>"),
+            "<session-history-since>\n<new-compartments>\nX\n</new-compartments>\n</session-history-since>"
+        );
+    }
 
-        // Deterministic: two reads of the same state are byte-equal.
-        assert_eq!(after, render_memory_pinboard(&db, PROJECT).await.unwrap());
+    #[test]
+    fn composition_is_deterministic() {
+        let memories = vec![mem("2", "NAMING", "n"), mem("1", "ARCHITECTURE", "a")];
+        let comps = vec![comp(1, 4, "A", "a"), comp(5, 9, "B", "b")];
+        let render = || {
+            render_m0(&M0Inputs {
+                compartments: &comps,
+                memories: &memories,
+                history_budget_tokens: 500.0,
+            })
+        };
+        assert_eq!(render(), render());
     }
 }

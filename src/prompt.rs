@@ -10,11 +10,7 @@ use std::path::Path;
 /// Build the system prompt for a step: an environment block (working
 /// directory, platform, today's UTC date) plus `AGENTS.md` contents read
 /// from `directory` when present (read fresh each step — small files only).
-///
-/// `mctx_tail` is the magic-context prompt tail (the project-memory
-/// pinboard, rendered by [`crate::mctx::render`]); an empty tail appends
-/// nothing. The caller renders it only when `magic_context.enabled`.
-pub fn build(directory: &Path, mctx_tail: &str) -> String {
+pub fn build(directory: &Path) -> String {
     let mut prompt = format!(
         "You are a coding agent running in ox, an opencode-compatible server.\n\n\
          <env>\n\
@@ -31,11 +27,6 @@ pub fn build(directory: &Path, mctx_tail: &str) -> String {
         prompt.push_str(agents.trim_end());
         prompt.push_str("\n</project_instructions>");
         // No AGENTS.md (or unreadable): the env block alone is the prompt.
-    }
-    let tail = mctx_tail.trim_end();
-    if !tail.is_empty() {
-        prompt.push_str("\n\n");
-        prompt.push_str(tail);
     }
     prompt
 }
@@ -76,25 +67,17 @@ mod tests {
     #[test]
     fn build_includes_env_block() {
         let dir = std::env::temp_dir();
-        let prompt = build(&dir, "");
+        let prompt = build(&dir);
         assert!(prompt.contains("Working directory: "));
         assert!(prompt.contains("Today's date: "));
     }
 
     #[test]
-    fn build_appends_a_nonempty_mctx_tail_and_nothing_else() {
+    fn build_does_not_carry_the_memory_pinboard() {
+        // The pinboard lives in the magic-context head (m[0]), not in the
+        // system prompt: the system prompt must stay byte-identical whether
+        // the integration is on or off.
         let dir = std::env::temp_dir();
-        let without = build(&dir, "");
-        let with = build(
-            &dir,
-            "<project-memory>\n<ARCHITECTURE>\n#m: fact\n</ARCHITECTURE>\n</project-memory>\n",
-        );
-        assert!(!without.contains("<project-memory>"));
-        assert!(
-            with.ends_with(
-                "<project-memory>\n<ARCHITECTURE>\n#m: fact\n</ARCHITECTURE>\n</project-memory>"
-            ),
-            "the tail is the last block, trailing whitespace trimmed"
-        );
+        assert!(!build(&dir).contains("<project-memory>"));
     }
 }

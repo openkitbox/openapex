@@ -2468,9 +2468,21 @@ fn recorded_system(harness: &Harness) -> String {
         .expect("a system message")
 }
 
-/// Drive one text turn in `directory` and return the system message the
-/// model saw.
-async fn system_for_a_turn(harness: &Harness, directory: &str) -> String {
+/// The magic-context head message (the first user message) of the first
+/// recorded request, when the request carries one.
+fn recorded_head(harness: &Harness) -> Option<String> {
+    harness.chat.requests().iter().find_map(|request| {
+        let mut messages = request.messages.iter();
+        assert!(matches!(messages.next(), Some(ChatMessage::System { .. })));
+        match messages.next() {
+            Some(ChatMessage::User { content }) => Some(content.clone()),
+            _ => None,
+        }
+    })
+}
+
+/// Drive one text turn in `directory` and return the messages the model saw.
+async fn messages_for_a_turn(harness: &Harness, directory: &str) {
     let session_id = harness.create_session_in(directory).await;
     let response = harness
         .client
@@ -2488,7 +2500,6 @@ async fn system_for_a_turn(harness: &Harness, directory: &str) -> String {
                 .any(|m| m["type"] == "assistant" && m["time"]["completed"].is_number())
         })
         .await;
-    recorded_system(harness)
 }
 
 #[tokio::test]
@@ -2505,13 +2516,20 @@ async fn memory_pinboard_reaches_the_system_prompt_when_enabled() {
         .to_string();
     seed_memory(&harness.db, &project).await;
 
-    let system = system_for_a_turn(&harness, &project).await;
-    assert!(system.contains("<project-memory>"), "got: {system}");
+    messages_for_a_turn(&harness, &project).await;
+    let head = recorded_head(&harness).expect("a magic-context head");
+    assert!(head.contains("<project-memory>"), "got: {head}");
     assert!(
-        system.contains("<ARCHITECTURE>\n#7: The pinboard fact"),
-        "got: {system}"
+        head.contains("<ARCHITECTURE>\n#7: The pinboard fact"),
+        "got: {head}"
     );
-    assert!(system.ends_with("</project-memory>"), "the tail is last");
+    assert!(
+        head.contains("</project-memory>"),
+        "the pinboard closes m[0]"
+    );
+    // The head is not the system prompt: the system prompt stays
+    // integration-independent.
+    assert!(!recorded_system(&harness).contains("<project-memory>"));
 }
 
 #[tokio::test]
@@ -2526,7 +2544,12 @@ async fn memory_pinboard_is_absent_when_disabled() {
         .to_string();
     seed_memory(&harness.db, &project).await;
 
-    let system = system_for_a_turn(&harness, &project).await;
+    messages_for_a_turn(&harness, &project).await;
+    let system = recorded_system(&harness);
     assert!(!system.contains("<project-memory>"), "got: {system}");
-    assert!(!system.contains("The pinboard fact"), "got: {system}");
+    // No head either: the request opens straight on the system prompt and the
+    // user's own text.
+    let head = recorded_head(&harness).expect("the user prompt");
+    assert!(!head.contains("<project-memory>"), "got: {head}");
+    assert!(!head.contains("The pinboard fact"), "got: {head}");
 }

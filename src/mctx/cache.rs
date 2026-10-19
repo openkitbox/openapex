@@ -65,6 +65,13 @@ pub struct Signals {
     /// A run/episode boundary was crossed (lineage units reproduce
     /// byte-identical, episode units reset). Reserved for later tasks.
     pub run_started: bool,
+    /// The rendered baseline (`m0`) bytes differ from the frozen ones — a
+    /// memory write, or any other input the baseline is a function of. The
+    /// caller compares bytes because the baseline's inputs are open-ended.
+    pub head_changed: bool,
+    /// Only the delta (`m1`) differs from the frozen bytes: new coverage
+    /// arrived and the frozen baseline is still valid.
+    pub delta_changed: bool,
 }
 
 /// Sentinel fed to the kernel as `boundary_present` when the boundary is
@@ -85,11 +92,13 @@ const BOUNDARY_ABSENT: &str = "\u{0}absent";
 /// | 1 | no durable state (first-ever pass)                    | **Hard**   | mint the baseline |
 /// | 2 | boundary loss pending — the `signals.reconcile_pending` mirror OR the durable `state.reconcile_pending` flag | **Hard** | rematerialize against the live array |
 /// | 3 | `signals.forced` (explicit refresh/compaction)        | **Hard**   | the request demands a bust |
-/// | 4 | otherwise                                             | **SoftPlus** | defer: replay frozen bytes verbatim |
+/// | 4 | `signals.head_changed` (the m0 bytes differ)          | **Hard**   | a baseline input changed (memory write, budget) |
+/// | 5 | `signals.delta_changed` (only the m1 bytes differ)    | **Soft**   | new coverage rides the delta; the baseline stands |
+/// | 6 | otherwise                                             | **SoftPlus** | defer: replay frozen bytes verbatim |
 ///
-/// `Soft` is deliberately NOT produced by this MVP classifier — the
-/// compartment/coverage-extension classifier arrives with the render tasks
-/// (m[0]/m[1] + decay); until then every non-Hard pass defers.
+/// Rules 4 and 5 are byte comparisons made by the caller ([`crate::mctx::pass`])
+/// against the frozen units: the baseline's inputs are open-ended, so "did the
+/// head change" is answered by the bytes rather than by enumerating causes.
 pub fn classify(state: Option<&CoreState>, signals: &Signals) -> Action {
     // 1. First-ever pass: nothing frozen yet, mint a baseline.
     let Some(state) = state else {
@@ -104,7 +113,15 @@ pub fn classify(state: Option<&CoreState>, signals: &Signals) -> Action {
     if signals.forced {
         return Action::Hard;
     }
-    // 4. Default: defer.
+    // 4. The baseline itself changed.
+    if signals.head_changed {
+        return Action::Hard;
+    }
+    // 5. Only the delta changed.
+    if signals.delta_changed {
+        return Action::Soft;
+    }
+    // 6. Default: defer.
     Action::SoftPlus
 }
 
