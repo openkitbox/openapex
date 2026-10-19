@@ -180,6 +180,7 @@ impl Config {
             config.default_model = Some(model);
         }
 
+        config.magic_context = config.magic_context.validated();
         Ok(config)
     }
 }

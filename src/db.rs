@@ -210,6 +210,18 @@ ALTER TABLE mc_memory ADD COLUMN status text NOT NULL DEFAULT 'active';
 ALTER TABLE mc_memory ADD COLUMN archive_reason text;
 "#;
 
+/// magic-context historian run lifecycle columns (Task 6a). `mc_historian_run`
+/// gains the settle half the historian's durable "host" needs: `updated_at`
+/// stamps the terminal transition (a run's duration is `updated_at -
+/// created_at`, which no other column records) and `error` keeps the failure
+/// text when a run settles `failed` (or is aborted at startup). Purely additive
+/// (`ALTER TABLE ADD COLUMN`), so it applies onto any V4-stamped database; V4
+/// itself stays byte-identical because it is already stamped.
+const MIGRATION_V5: &str = r#"
+ALTER TABLE mc_historian_run ADD COLUMN updated_at integer NOT NULL DEFAULT 0;
+ALTER TABLE mc_historian_run ADD COLUMN error text;
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
@@ -218,6 +230,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (2, MIGRATION_V2),
     (3, MIGRATION_V3),
     (4, MIGRATION_V4),
+    (5, MIGRATION_V5),
 ];
 
 /// All indexes the migration creates: V1's verbatim from upstream
@@ -382,11 +395,11 @@ mod tests {
     #[tokio::test]
     async fn migration_tracks_user_version_and_is_idempotent() {
         let db = Db::open_in_memory().await.unwrap();
-        assert_eq!(db.user_version().await, 4);
+        assert_eq!(db.user_version().await, 5);
         // Re-running must be a no-op: version stays, no error.
         db.migrate().await.unwrap();
         db.migrate().await.unwrap();
-        assert_eq!(db.user_version().await, 4);
+        assert_eq!(db.user_version().await, 5);
     }
 
     #[tokio::test]
@@ -433,7 +446,7 @@ mod tests {
             conn.pragma_update(None, "user_version", 1).unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await, 4);
+        assert_eq!(db.user_version().await, 5);
         for table in [
             "mc_frozen_state",
             "mc_compartments",
@@ -460,7 +473,7 @@ mod tests {
             conn.pragma_update(None, "user_version", 2).unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await, 4);
+        assert_eq!(db.user_version().await, 5);
         for table in ["mc_tag", "mc_drop"] {
             assert!(
                 db.table_exists(table).await.unwrap(),
@@ -520,7 +533,7 @@ mod tests {
             .unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await, 4);
+        assert_eq!(db.user_version().await, 5);
         // The pre-existing row reads back with the 'active' default and no
         // archive reason — the additive columns converge both DB histories.
         let (status, reason): (String, Option<String>) = db
@@ -556,6 +569,44 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_v5_upgrades_an_existing_v4_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade5.db");
+        // Build a v4 database by hand: apply V1..V4 and stamp version 4.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(MIGRATION_V2).unwrap();
+            conn.execute_batch(MIGRATION_V3).unwrap();
+            conn.execute_batch(MIGRATION_V4).unwrap();
+            conn.pragma_update(None, "user_version", 4).unwrap();
+            // A pre-V5 historian run row: no settle columns yet.
+            conn.execute(
+                "INSERT INTO mc_historian_run (id, session_id, state, chunk_ref, attempt, created_at)
+                 VALUES ('hr_old', 'ses_1', 'running', '0..3', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).await.unwrap();
+        assert_eq!(db.user_version().await, 5);
+        // The pre-existing row reads back with the additive defaults.
+        let (updated_at, error): (i64, Option<String>) = db
+            .conn()
+            .call(|c| {
+                c.query_row(
+                    "SELECT updated_at, error FROM mc_historian_run WHERE id = 'hr_old'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(updated_at, 0);
+        assert_eq!(error, None);
     }
 
     #[tokio::test]

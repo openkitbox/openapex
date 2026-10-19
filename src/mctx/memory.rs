@@ -94,8 +94,12 @@ const NOTE_PAGE: usize = 25;
 // ---------------------------------------------------------------------------
 
 /// One active memory as the pinboard render reads it.
+///
+/// Public so the historian's `<project-memory>` renderer
+/// ([`crate::mctx::historian::render_historian_memory_block`]) can take it:
+/// that renderer is deliberately a different shape from the pinboard's.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct MemoryRow {
+pub struct MemoryRow {
     /// `#N` handle body.
     pub id: String,
     /// One of [`CATEGORIES`].

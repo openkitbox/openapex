@@ -28,6 +28,39 @@ pub struct MctxConfig {
     pub hard_threshold: f32,
 }
 
+impl MctxConfig {
+    /// The config with its threshold invariant enforced: both bands are
+    /// fractions in `(0, 1]` and `soft_threshold < hard_threshold`. A violated
+    /// invariant falls back to the default pair with a warning — a misconfigured
+    /// pair would otherwise silently collapse the bands (equal bands make
+    /// [`crate::mctx::historian::Trigger::Speculative`] unreachable; an inverted
+    /// pair makes the proactive band dead) and change when the historian runs
+    /// without any error surfacing.
+    pub fn validated(mut self) -> Self {
+        let bad = |name: &str, value: f32| {
+            tracing::warn!(
+                setting = name,
+                value,
+                "invalid [magic_context] threshold (expected a fraction in (0, 1], \
+                 soft < hard); using the default pair"
+            );
+        };
+        let in_range = |value: f32| value.is_finite() && value > 0.0 && value <= 1.0;
+        if !in_range(self.soft_threshold) {
+            bad("soft_threshold", self.soft_threshold);
+        } else if !in_range(self.hard_threshold) {
+            bad("hard_threshold", self.hard_threshold);
+        } else if self.soft_threshold >= self.hard_threshold {
+            bad("soft_threshold", self.soft_threshold);
+        } else {
+            return self;
+        }
+        self.soft_threshold = default_soft_threshold();
+        self.hard_threshold = default_hard_threshold();
+        self
+    }
+}
+
 fn default_soft_threshold() -> f32 {
     0.70
 }
@@ -91,6 +124,33 @@ pub mod tools;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validated_thresholds_keep_a_sane_pair() {
+        let ok = MctxConfig {
+            soft_threshold: 0.6,
+            hard_threshold: 0.9,
+            ..MctxConfig::default()
+        };
+        assert_eq!(ok.validated().soft_threshold, 0.6);
+
+        // Out of range, inverted, and equal pairs all fall back to the default
+        // pair: any of them would change when a historian run starts without
+        // surfacing an error.
+        for (soft, hard) in [(0.0_f32, 0.9_f32), (1.5, 2.0), (0.9, 0.7), (0.8, 0.8)] {
+            let cfg = MctxConfig {
+                soft_threshold: soft,
+                hard_threshold: hard,
+                ..MctxConfig::default()
+            }
+            .validated();
+            assert_eq!(
+                (cfg.soft_threshold, cfg.hard_threshold),
+                (default_soft_threshold(), default_hard_threshold()),
+                "soft={soft} hard={hard}"
+            );
+        }
+    }
 
     #[test]
     fn defaults() {

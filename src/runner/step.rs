@@ -1373,7 +1373,7 @@ pub(crate) fn build_chat_messages(
 
 /// A tool part's call input for the wire: parsed from the streaming state's
 /// string, verbatim from the settled states (upstream `toolInput`).
-fn tool_input(state: &ToolState) -> Record {
+pub(crate) fn tool_input(state: &ToolState) -> Record {
     match state {
         ToolState::Streaming { input } => serde_json::from_str(input).unwrap_or_default(),
         ToolState::Running { input, .. }
@@ -1414,7 +1414,7 @@ fn tool_result_message(id: &str, state: &ToolState) -> Option<ChatMessage> {
 /// A user prompt's wire text: the typed text plus attachment markers.
 /// (Upstream `SessionPrompt.prepare` inlines resolved file content; 6a
 /// stores attachments verbatim and marks them instead.)
-fn user_prompt_text(prompt: &Prompt) -> String {
+pub(crate) fn user_prompt_text(prompt: &Prompt) -> String {
     let mut text = prompt.text.clone();
     if let Some(files) = &prompt.files {
         for file in files {
@@ -1474,12 +1474,27 @@ async fn rows_after(
     session_id: &str,
     floor: i64,
 ) -> Result<Vec<serde_json::Value>> {
+    Ok(rows_after_with_seq(db, session_id, floor)
+        .await?
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect())
+}
+
+/// As [`rows_after`], but each row is paired with its `seq` ordinal. The
+/// historian addresses coverage by ordinal (`seq`), which the decoded message
+/// JSON does not carry, so it reads the tail through this variant.
+pub(crate) async fn rows_after_with_seq(
+    db: &crate::db::Db,
+    session_id: &str,
+    floor: i64,
+) -> Result<Vec<(i64, serde_json::Value)>> {
     let session_id = session_id.to_owned();
-    let rows: Vec<(String, String, String)> = db
+    let rows: Vec<(String, String, String, i64)> = db
         .conn()
         .call(move |c| {
             let mut stmt = c.prepare(
-                "SELECT id, type, data FROM session_message
+                "SELECT id, type, data, seq FROM session_message
                  WHERE session_id = ?1 AND seq > ?2 ORDER BY seq ASC",
             )?;
             let mapped = stmt.query_map(rusqlite::params![session_id, floor], |row| {
@@ -1487,24 +1502,25 @@ async fn rows_after(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             })?;
             mapped.collect::<rusqlite::Result<Vec<_>>>()
         })
         .await?;
     rows.into_iter()
-        .map(|(id, kind, data)| {
+        .map(|(id, kind, data, seq)| {
             let mut value: serde_json::Value = serde_json::from_str(&data)?;
             if let serde_json::Value::Object(map) = &mut value {
                 map.insert("id".to_owned(), serde_json::Value::String(id));
                 map.insert("type".to_owned(), serde_json::Value::String(kind));
             }
-            Ok(value)
+            Ok((seq, value))
         })
         .collect()
 }
 
-fn decode_row(value: &serde_json::Value) -> Result<Message> {
+pub(crate) fn decode_row(value: &serde_json::Value) -> Result<Message> {
     let id = value
         .get("id")
         .and_then(serde_json::Value::as_str)
