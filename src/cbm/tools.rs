@@ -57,12 +57,6 @@ pub(crate) fn all(cbm: Arc<Cbm>) -> [Arc<dyn Tool>; 5] {
     ]
 }
 
-// T2 lands the tool surface before T3's `register_cbm` consumes `all`; this
-// reference keeps the module live under `-D warnings`. T3 deletes it.
-const _: () = {
-    let _ = all;
-};
-
 /// A JSON-Schema string fragment restricted to `values`.
 fn enum_param(values: &[&str], description: &str) -> Value {
     json!({ "type": "string", "enum": values, "description": description })

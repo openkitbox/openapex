@@ -88,6 +88,27 @@ impl ToolRegistry {
     }
 }
 
+/// The CBM code-graph tools (`index_repository`, `search_graph`,
+/// `trace_path`, `get_code_snippet`, `get_architecture`), registered ON TOP
+/// of `with_builtins` at app-wiring time.
+impl ToolRegistry {
+    /// Register the five code-graph tools. Deliberately separate from
+    /// [`ToolRegistry::with_builtins`]:
+    ///
+    /// 1. The `codebase-memory-mcp` binary is optional, so the tools are
+    ///    registered only when it is discovered — at the composition root —
+    ///    keeping the advertised toolset unchanged on machines without it.
+    /// 2. The names are BARE names borrowed from the binary's own CLI
+    ///    contract so its error hints match verbatim; the borrow enters the
+    ///    registry here, in the module that owns the registration.
+    ///
+    /// Called exactly once from `run` when `crate::cbm::Cbm::discover`
+    /// finds the binary.
+    pub fn register_cbm(&mut self, cbm: crate::cbm::Cbm) {
+        self.register_all(crate::cbm::tools::all(Arc::new(cbm)));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared model-facing error/output helpers
 // ---------------------------------------------------------------------------
@@ -470,6 +491,83 @@ mod tests {
             edit.function.parameters["required"],
             json!(["path", "oldString", "newString"])
         );
+        drop(lock);
+    }
+
+    #[test]
+    fn register_cbm_adds_exactly_the_five_cbm_tools() {
+        // ShellTool::new() reads $SHELL; serialize against env-mutating tests.
+        let lock = crate::tool::shell::SHELL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut registry = ToolRegistry::with_builtins();
+        let before: std::collections::BTreeSet<String> = registry
+            .definitions()
+            .iter()
+            .map(|def| def.function.name.clone())
+            .collect();
+        registry.register_cbm(crate::cbm::Cbm::new(PathBuf::from(
+            "/nonexistent/codebase-memory-mcp",
+        )));
+        let after = registry.definitions();
+        let names: std::collections::BTreeSet<String> =
+            after.iter().map(|def| def.function.name.clone()).collect();
+        let added: Vec<String> = names.difference(&before).cloned().collect();
+        assert_eq!(
+            added,
+            vec![
+                "get_architecture".to_owned(),
+                "get_code_snippet".to_owned(),
+                "index_repository".to_owned(),
+                "search_graph".to_owned(),
+                "trace_path".to_owned(),
+            ]
+        );
+        assert_eq!(
+            names.len(),
+            before.len() + 5,
+            "CBM registration displaced an existing tool"
+        );
+        for definition in after
+            .iter()
+            .filter(|def| !before.contains(&def.function.name))
+        {
+            let name = &definition.function.name;
+            assert!(
+                !definition.function.description.is_empty(),
+                "{name} has no description"
+            );
+            let parameters = &definition.function.parameters;
+            assert_eq!(parameters["type"], json!("object"), "{name}");
+            assert!(parameters["properties"].is_object(), "{name}");
+            let expected_required = match name.as_str() {
+                "trace_path" => Some(json!(["function_name"])),
+                "get_code_snippet" => Some(json!(["qualified_name"])),
+                _ => None,
+            };
+            match expected_required {
+                Some(expected) => {
+                    assert_eq!(parameters["required"], expected, "{name}");
+                    // Mirror the sibling builtins test: a declared `required`
+                    // key is expected to be an array.
+                    for field in parameters["required"]
+                        .as_array()
+                        .expect("required must be an array")
+                    {
+                        assert!(
+                            parameters["properties"]
+                                .get(field.as_str().expect("required field name"))
+                                .is_some(),
+                            "required field {field} of {name} missing from properties"
+                        );
+                    }
+                }
+                None => assert!(
+                    parameters.get("required").is_none(),
+                    "{name} must not declare required fields"
+                ),
+            }
+        }
         drop(lock);
     }
 }

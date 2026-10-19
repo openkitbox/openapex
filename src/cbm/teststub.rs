@@ -61,9 +61,7 @@ pub(crate) fn stub(path: &Path, script: &str) -> Cbm {
     use std::os::unix::fs::PermissionsExt;
     std::fs::write(path, script).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-    Cbm {
-        binary: path.to_path_buf(),
-    }
+    Cbm::new(path.to_path_buf())
 }
 
 /// Write the `list_projects --format json` response the stub serves.

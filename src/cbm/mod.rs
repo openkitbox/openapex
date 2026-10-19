@@ -5,13 +5,12 @@
 //! arguments as a single JSON object on stdin (the binary reads stdin to EOF,
 //! so the writer must close it).
 //!
-//! The five tool names registered later (`index_repository`, `search_graph`,
+//! The five registered tool names (`index_repository`, `search_graph`,
 //! `trace_path`, `get_code_snippet`, `get_architecture`) are BARE names
 //! borrowed from the binary's own CLI contract so its error hints match
-//! verbatim; the borrow enters the registry only through `register_cbm`
-//! (added in T3).
+//! verbatim; the borrow enters the registry only through `register_cbm`.
 //!
-//! Scope: process plumbing only. The `Tool` impls live in `cbm::tools` (T2);
+//! Scope: process plumbing only. The `Tool` impls live in `cbm::tools`;
 //! this module knows nothing about the model-facing schemas. The binary is
 //! resolved through the shared [`crate::which`] helper, stderr is capped at
 //! 4 KiB while still being drained, and the only execution control is
@@ -60,12 +59,16 @@ pub struct Cbm {
 }
 
 impl Cbm {
+    /// A handle for `binary`. Used by [`Cbm::discover`] and by tests that
+    /// install a stub in place of the real binary.
+    pub(crate) fn new(binary: PathBuf) -> Self {
+        Self { binary }
+    }
+
     /// Probe `PATH` for the binary. `None` when it is absent, so callers can
     /// simply skip registering the CBM tools on machines without it.
     pub(crate) fn discover() -> Option<Self> {
-        Some(Self {
-            binary: which::find_on_path(BINARY_NAME)?,
-        })
+        Some(Self::new(which::find_on_path(BINARY_NAME)?))
     }
 
     /// Run one tool through `<binary> cli --quiet <tool>`.
@@ -378,14 +381,6 @@ fn cap_stderr(raw: &[u8]) -> String {
     text[..end].trim_end().to_owned()
 }
 
-// `cbm::tools` (T2) now uses `call` and `project_for`; only `discover` waits
-// for its consumer in `run` (T3). Until then the reference below keeps the
-// private API live under `-D warnings` without widening its visibility or
-// suppressing the lint. T3 deletes this scaffold.
-const _: () = {
-    let _ = Cbm::discover;
-};
-
 #[cfg(test)]
 mod tests {
     use super::teststub::{MAIN_STUB, SILENT_STUB, SLOW_STUB, STDERR_STUB, stub, write_projects};
@@ -503,9 +498,7 @@ mod tests {
     #[tokio::test]
     async fn call_reports_missing_binary() {
         let directory = tempdir().unwrap();
-        let cbm = Cbm {
-            binary: directory.path().join("missing-codebase-memory-mcp"),
-        };
+        let cbm = Cbm::new(directory.path().join("missing-codebase-memory-mcp"));
         let output = cbm
             .call(
                 "search_graph",

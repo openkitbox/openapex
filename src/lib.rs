@@ -32,17 +32,25 @@ use crate::db::Db;
 use crate::event_bus::EventBus;
 use crate::runner::Runner;
 
-/// Build application state: open the DB, run migrations, and canonicalize
-/// the working directory once (falls back to the raw path on error).
-pub async fn build_state(config: Config) -> Result<AppState> {
-    let cardinal = CardinalClient::new(config.cardinal_url.clone(), config.cardinal_key.clone())
+/// One client constructor shared by [`build_state`] and [`run`], so both map
+/// init failures identically.
+fn cardinal_chat(config: &Config) -> Result<Arc<dyn runner::Chat>> {
+    let cardinal = CardinalClient::from_config(config)
         .map_err(|error| anyhow::anyhow!("cardinal client init failed: {error}"))?;
-    build_state_with(
-        config,
-        Arc::new(cardinal),
-        runner::ToolRegistry::with_builtins(),
-    )
-    .await
+    Ok(Arc::new(cardinal))
+}
+
+/// Build application state: open the DB, run migrations, canonicalize the
+/// working directory once (falls back to the raw path on error), and register
+/// the eight built-in tools plus the magic-context tools when enabled (the
+/// default).
+///
+/// CBM discovery is deliberately not part of this builder: the optional
+/// `codebase-memory-mcp` binary is probed at the composition root ([`run`]),
+/// so tests get a deterministic toolset regardless of the host's `PATH`.
+pub async fn build_state(config: Config) -> Result<AppState> {
+    let chat = cardinal_chat(&config)?;
+    build_state_with(config, chat, runner::ToolRegistry::with_builtins()).await
 }
 
 /// [`build_state`] with an injected chat transport and tool registry —
@@ -50,6 +58,9 @@ pub async fn build_state(config: Config) -> Result<AppState> {
 /// passed unwrapped so the wiring can attach the Db-holding magic-context
 /// tools (`register_mctx`) after the DB opens; they are advertised only
 /// when `magic_context.enabled`.
+///
+/// Callers may pre-populate `tools` before handing it over (as [`run`] does
+/// with the CBM tools); this function only adds the magic-context tools.
 pub async fn build_state_with(
     config: Config,
     chat: std::sync::Arc<dyn runner::Chat>,
@@ -92,7 +103,17 @@ pub fn build_router(state: AppState) -> Router {
 /// Open the DB, build the router and serve on `config.listen`.
 pub async fn run(config: Config) -> Result<()> {
     let listen: String = config.listen.clone();
-    let state = build_state(config).await?;
+    let mut tools = runner::ToolRegistry::with_builtins();
+    match cbm::Cbm::discover() {
+        Some(cbm) => tools.register_cbm(cbm),
+        None => tracing::info!(
+            "codebase-memory-mcp not found on PATH; code-graph tools disabled: \
+             index_repository, search_graph, trace_path, get_code_snippet, \
+             get_architecture. Install it on the server's PATH to enable them"
+        ),
+    }
+    let chat = cardinal_chat(&config)?;
+    let state = build_state_with(config, chat, tools).await?;
     // Fetch the model list before serving, so the first client that asks
     // (`/api/model` at TUI startup) gets models instead of an empty list. A
     // failure only warns: the request path retries on its own TTL.
