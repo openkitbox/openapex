@@ -86,6 +86,17 @@ pub fn build_router(state: AppState) -> Router {
 pub async fn run(config: Config) -> Result<()> {
     let listen: String = config.listen.clone();
     let state = build_state(config).await?;
+    // Background memory consolidation. Idle unless `[magic_context]` enables
+    // it, and deliberately not part of `build_state_with`: tests must not
+    // acquire a background loop that writes to their database.
+    if state.config.magic_context.enabled && state.config.magic_context.dreamer_enabled {
+        Arc::new(mctx::dreamer::Dreamer::new(
+            state.db.clone(),
+            state.config.clone(),
+            state.runner.chat(),
+        ))
+        .spawn();
+    }
     let router = build_router(state);
     let acceptor = TcpListener::new(listen).bind().await;
     Server::new(acceptor).serve(router).await;

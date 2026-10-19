@@ -461,19 +461,26 @@ impl Dreamer {
         (self.config.magic_context.dreamer_interval_minutes.max(1) as i64).saturating_mul(60_000)
     }
 
-    /// Spawn the interval loop (Task 9 wires this into startup; nothing here
-    /// calls it). The first tick fires immediately, then every interval; a
-    /// failed tick is logged and the loop keeps its cadence — the same
-    /// isolation the reference's timer applies to its stages. The handle is
-    /// detached on drop, which is what a process-wide background loop wants.
+    /// Spawn the interval loop. The first tick fires immediately, then every
+    /// interval. The handle is detached on drop, which is what a process-wide
+    /// background loop wants.
+    ///
+    /// Each tick runs in its own task, so a panic is contained to that tick
+    /// (the join reports it) instead of ending the loop: memory consolidation
+    /// is background work, and a bug in one pass must not stop every later
+    /// pass for the life of the process.
     pub fn spawn(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
         let every = Duration::from_millis(self.interval_millis() as u64);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(every);
             loop {
                 ticker.tick().await;
-                if let Err(error) = self.tick(now_millis()).await {
-                    tracing::error!(error = %error, "dreamer tick failed");
+                let dreamer = Arc::clone(&self);
+                let joined = tokio::spawn(async move { dreamer.tick(now_millis()).await }).await;
+                match joined {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(error)) => tracing::error!(error = %error, "dreamer tick failed"),
+                    Err(join) => tracing::error!(error = %join, "dreamer tick panicked"),
                 }
             }
         })

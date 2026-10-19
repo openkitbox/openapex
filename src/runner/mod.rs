@@ -227,6 +227,12 @@ impl Runner {
     /// Whether work is scheduled or a busy period is currently in flight
     /// (process-local view). `scheduled` bridges the gap between dispatch
     /// and the actor's first poll installing the cancellation token.
+    /// The chat transport this runner issues completions through. Background
+    /// work that must not open a second transport (the dreamer) borrows it.
+    pub fn chat(&self) -> Arc<dyn Chat> {
+        Arc::clone(&self.inner.chat)
+    }
+
     pub fn is_active(&self, session_id: &str) -> bool {
         self.inner
             .sessions
