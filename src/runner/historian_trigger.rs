@@ -19,16 +19,16 @@ use crate::runner::step::rows_after_with_seq;
 // Historian trigger (step boundary)
 // ---------------------------------------------------------------------------
 
-/// Messages kept out of a historian run: the most recent turns stay verbatim
-/// in the request, because summarizing what the model is working on right now
-/// would lose exactly the detail it needs.
+/// Share of the history budget one run may cover.
 ///
-/// Deviates from the reference, which derives the fence from a token formula
-/// over the context limit, the usage percentage and a reserved headroom
-/// (`boundary.rs::derive_protected_tail_token_target`). ox has one fixed
-/// history budget, so a message count is the same protection without the
-/// formula's five constants.
-const PROTECTED_TAIL_MESSAGES: usize = 6;
+/// This is the fence: the chunk stops at this budget, so the newest part of the
+/// tail stays verbatim in the request (the model keeps what it is working on)
+/// and the run removes most of the pressure, which is what stops the next step
+/// from firing again. The reference derives the same split from a token formula
+/// over the context limit, usage and reserved headroom
+/// (`boundary.rs::derive_protected_tail_token_target`); ox has one fixed budget,
+/// so a fixed share of it is the same protection without five constants.
+const CHUNK_BUDGET_SHARE: f64 = 0.75;
 
 /// Fire the historian when the live tail has reached a pressure band.
 ///
@@ -87,22 +87,29 @@ async fn fire_historian(
         config.magic_context.soft_threshold,
         config.magic_context.hard_threshold,
     );
+    tracing::debug!(
+        session = %session_id,
+        tail_tokens = whole.token_estimate,
+        trigger = ?trigger,
+        messages = rows.len(),
+        bytes = whole.text.len(),
+        first_ordinal = rows.first().map(|(ordinal, _)| *ordinal),
+        last_ordinal = rows.last().map(|(ordinal, _)| *ordinal),
+        floor,
+        "historian pressure"
+    );
     if trigger == historian::Trigger::No {
         return Ok(());
     }
 
-    // The protected fence: the last few ordinals never enter a run.
-    let eligible_end = rows
-        .len()
-        .checked_sub(PROTECTED_TAIL_MESSAGES)
-        .map(|cut| rows[cut].0)
-        .unwrap_or(floor + 1);
-    let Some(chunk) = historian::chunk(
-        &rows,
-        floor + 1,
-        eligible_end,
-        DEFAULT_HISTORY_BUDGET_TOKENS as usize,
-    ) else {
+    // The newest row is never covered: it is the turn in flight. Everything
+    // older competes for the chunk budget, which stops the run at the fence.
+    let Some((last_ordinal, _)) = rows.last() else {
+        return Ok(());
+    };
+    let eligible_end = *last_ordinal;
+    let chunk_budget = (DEFAULT_HISTORY_BUDGET_TOKENS * CHUNK_BUDGET_SHARE) as usize;
+    let Some(chunk) = historian::chunk(&rows, floor + 1, eligible_end, chunk_budget) else {
         return Ok(());
     };
 
@@ -132,6 +139,14 @@ async fn fire_historian(
         attempt: 1,
         prompt,
     };
+    tracing::debug!(
+        session = %session_id,
+        chunk_start = chunk.start_ordinal,
+        chunk_end = chunk.end_ordinal,
+        chunk_tokens = chunk.token_estimate,
+        present = chunk.present_ordinals.len(),
+        "historian chunk"
+    );
     let outcome = historian::run(&run_ctx, &plan).await?;
     tracing::info!(
         session = %session_id,
@@ -250,7 +265,9 @@ mod tests {
         }
     }
 
-    /// A session row plus `count` user messages, `bulk_chars` of text in each.
+    /// A session row plus `count` messages, alternating user and assistant (a
+    /// block boundary per row, so the chunker's budget applies per message),
+    /// each carrying `bulk_chars` of text.
     async fn seed_session(db: &Db, count: i64, bulk_chars: usize) {
         let conn = db.acquire().await.unwrap();
         conn.execute(
@@ -263,18 +280,36 @@ mod tests {
         .unwrap();
         for seq in 1..=count {
             let text = "x".repeat(bulk_chars);
-            let data = serde_json::json!({
-                "id": format!("msg_{seq}"),
-                "type": "user",
-                "time": { "created": 0 },
-                "text": text,
-            })
-            .to_string();
+            // Alternating roles, so every row is its own chunk block and the
+            // budget applies per message.
+            let (kind, data) = if seq % 2 == 1 {
+                (
+                    "user",
+                    serde_json::json!({
+                        "id": format!("msg_{seq}"),
+                        "type": "user",
+                        "time": { "created": 0 },
+                        "text": text,
+                    }),
+                )
+            } else {
+                (
+                    "assistant",
+                    serde_json::json!({
+                        "id": format!("msg_{seq}"),
+                        "type": "assistant",
+                        "time": { "created": 0 },
+                        "agent": "build",
+                        "model": { "id": "m", "providerID": "p" },
+                        "content": [{ "type": "text", "text": text }],
+                    }),
+                )
+            };
             conn.execute(
                 "INSERT INTO session_message
                  (id, session_id, type, seq, time_created, time_updated, data)
-                 VALUES (?1, ?2, 'user', ?3, 0, 0, ?4)",
-                (format!("msg_{seq}"), SESSION, seq, data),
+                 VALUES (?1, ?2, ?3, ?4, 0, 0, ?5)",
+                (format!("msg_{seq}"), SESSION, kind, seq, data.to_string()),
             )
             .await
             .unwrap();
@@ -295,10 +330,44 @@ mod tests {
     #[tokio::test]
     async fn pressure_above_the_soft_band_fires_one_run() {
         let db = Db::open_in_memory().await.unwrap();
-        // 8 rows of 40k characters ≈ 80k estimated tokens: past the 70% band of
-        // the 60k budget, and enough rows that the fence (6) leaves two.
+        // 8 rows of 40k chars ≈ 10k tokens each: the tail is past the 70% band
+        // of the 60k budget, and the 45k chunk budget covers the first four.
         seed_session(&db, 8, 40_000).await;
         let config = config();
+        // The chunker decides the fence, so pin its arithmetic directly.
+        let rows = rows_after_with_seq(&db, SESSION, 0).await.unwrap();
+        let budget = (DEFAULT_HISTORY_BUDGET_TOKENS * CHUNK_BUDGET_SHARE) as usize;
+        let chunk = historian::chunk(&rows, 1, rows.last().unwrap().0, budget).expect("chunk");
+        assert_eq!(
+            (chunk.start_ordinal, chunk.end_ordinal),
+            (1, 4),
+            "the budget, not the row count, decides what a run covers"
+        );
+
+        let chat: Arc<dyn Chat> = Arc::new(TextChat::new(&valid_output(1, 4)));
+        fire_historian(&db, &config, &chat, SESSION, "/p", 0)
+            .await
+            .expect("a published run");
+
+        let compartments = compartments::load(&db, SESSION).await.unwrap();
+        assert_eq!(compartments.len(), 1, "one compartment published");
+        assert_eq!(
+            compartments[0].coverage_end, "4",
+            "the run covers what the chunker admitted and nothing newer"
+        );
+    }
+
+    /// A short tail under real pressure is still foldable: only the turn in
+    /// flight stays protected.
+    #[tokio::test]
+    async fn a_short_tail_under_pressure_still_folds_most_of_itself() {
+        let db = Db::open_in_memory().await.unwrap();
+        // Three rows, one of them huge: past the soft band, shorter than the
+        // six-message fence.
+        seed_session(&db, 3, 80_000).await;
+        let config = config();
+        // Three rows of 80k chars ≈ 20k tokens each: two fit the 45k budget,
+        // and the newest row is fenced off regardless.
         let chat: Arc<dyn Chat> = Arc::new(TextChat::new(&valid_output(1, 2)));
 
         fire_historian(&db, &config, &chat, SESSION, "/p", 0)
@@ -306,8 +375,11 @@ mod tests {
             .expect("a published run");
 
         let compartments = compartments::load(&db, SESSION).await.unwrap();
-        assert_eq!(compartments.len(), 1, "one compartment published");
-        assert_eq!(compartments[0].coverage_end, "2", "the fence held");
+        assert_eq!(compartments.len(), 1, "the tail was foldable");
+        assert_eq!(
+            compartments[0].coverage_end, "2",
+            "the newest row stays out of the run"
+        );
     }
 
     /// Below the soft band nothing runs and no completion is issued.
