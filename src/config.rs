@@ -256,12 +256,31 @@ name = "Claude Sonnet 4.5"
     #[test]
     fn magic_context_defaults_when_section_missing() {
         let cfg: Config = toml::from_str("listen = \"127.0.0.1:9999\"").unwrap();
-        assert!(!cfg.magic_context.enabled);
+        // On by default: a fresh install is the memory-integrated server, and
+        // `enabled = false` is the pass-through escape.
+        assert!(cfg.magic_context.enabled);
         assert!(cfg.magic_context.historian_model.is_none());
         assert_eq!(cfg.magic_context.soft_threshold, 0.70);
         assert_eq!(cfg.magic_context.hard_threshold, 0.85);
-        assert!(!cfg.magic_context.dreamer_enabled);
+        assert!(cfg.magic_context.dreamer_enabled);
         assert_eq!(cfg.magic_context.dreamer_interval_minutes, 15);
+    }
+
+    #[test]
+    fn magic_context_can_be_turned_off() {
+        let cfg: Config = toml::from_str(
+            "listen = \"127.0.0.1:9999\"
+             [magic_context]
+             enabled = false",
+        )
+        .unwrap();
+        assert!(!cfg.magic_context.enabled);
+        // The section leaves `dreamer_enabled` at its default; validation is
+        // what turns the orphaned dreamer off (it could never run).
+        assert!(
+            !cfg.magic_context.validated().dreamer_enabled,
+            "and the dreamer with it"
+        );
     }
 
     #[test]

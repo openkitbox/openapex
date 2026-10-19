@@ -11,9 +11,11 @@ use serde::Deserialize;
 /// missing key; the section itself is optional and defaults to disabled.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct MctxConfig {
-    /// Master switch. Defaults to `false`: the whole integration is inert
-    /// until explicitly enabled in the config file.
-    #[serde(default)]
+    /// Master switch. On by default: the integration is what ox is for, and a
+    /// silent default-off made a fresh install look like a plain chat server.
+    /// `enabled = false` turns the whole thing (pinboard, §N§ overlay, frozen
+    /// head, historian) back into a pass-through.
+    #[serde(default = "default_enabled")]
     pub enabled: bool,
     /// Model backing historian (and dreamer) sub-completions, as a
     /// qualified `provider/id` reference. When unset, ox's existing default
@@ -26,10 +28,10 @@ pub struct MctxConfig {
     /// Pressure fraction at which a historian pass is forced.
     #[serde(default = "default_hard_threshold")]
     pub hard_threshold: f32,
-    /// Whether the dreamer (the scheduled memory-maintenance loop) runs.
-    /// Defaults to `false`, like the master switch: the loop issues hidden
-    /// completions, so it is opted into explicitly.
-    #[serde(default)]
+    /// Whether the dreamer (the scheduled memory-maintenance loop) runs. On by
+    /// default with the module: it only issues a hidden completion when a
+    /// project actually holds memories whose cited files changed.
+    #[serde(default = "default_enabled")]
     pub dreamer_enabled: bool,
     /// Dreamer tick cadence in minutes. The reference's process-wide timer
     /// ticks every 15 minutes (`docs/architecture/dreamer.md`), the same
@@ -111,14 +113,19 @@ fn default_dreamer_interval_minutes() -> u64 {
 impl Default for MctxConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: default_enabled(),
             historian_model: None,
             soft_threshold: default_soft_threshold(),
             hard_threshold: default_hard_threshold(),
-            dreamer_enabled: false,
+            dreamer_enabled: default_enabled(),
             dreamer_interval_minutes: default_dreamer_interval_minutes(),
         }
     }
+}
+
+/// The module's default state: on.
+fn default_enabled() -> bool {
+    true
 }
 
 /// cache-core integration: classification predicates, render handoff,
@@ -241,9 +248,9 @@ mod tests {
             MctxConfig::default()
         );
         let cfg = MctxConfig::default();
-        assert!(!cfg.enabled);
+        assert!(cfg.enabled);
         assert!(cfg.historian_model.is_none());
-        assert!(!cfg.dreamer_enabled);
+        assert!(cfg.dreamer_enabled);
         assert_eq!(cfg.dreamer_interval_minutes, 15);
     }
 }
