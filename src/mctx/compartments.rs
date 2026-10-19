@@ -2,11 +2,17 @@
 //! transcript, plus the coverage end the request assembly uses as its floor.
 //!
 //! One row per compartment in `mc_compartments` (`id, session_id,
-//! coverage_end, importance, tiers JSON, created_at`). `tiers` carries every
-//! field the decay renderer consumes; the historian's `<facts>`/`<events>` side
-//! channels are NOT compartment fields (the reference's own compartment table
-//! has none) — they are emitted once per run and live on the producing
-//! `mc_historian_run` row.
+//! coverage_end, importance, tiers JSON, search_text, created_at`). `tiers`
+//! carries every field the decay renderer consumes; the historian's
+//! `<facts>`/`<events>` side channels are NOT compartment fields (the
+//! reference's own compartment table has none) — they are emitted once per
+//! run and live on the producing `mc_historian_run` row.
+//!
+//! `search_text` is the derived full-text column: the heading and paraphrase
+//! tiers joined by spaces, exactly as `MIGRATION_V7` backfills it (an FTS
+//! index is declared over a column, so the text has to be materialized).
+//! `tiers` stays the single source of truth — every insert derives the column
+//! from the in-memory [`Tiers`], and no reader renders from `search_text`.
 //!
 //! Chronological order is insertion order (`created_at`, tie-broken by `id`):
 //! the historian only ever appends, and `coverage_end` is text in the schema
@@ -96,7 +102,7 @@ impl Compartment {
 
 const COLUMNS: &str = "id, session_id, coverage_end, importance, tiers, created_at";
 
-fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Compartment> {
+fn from_row(row: &turso::Row) -> Result<Compartment> {
     let tiers: String = row.get(4)?;
     Ok(Compartment {
         id: row.get(0)?,
@@ -111,23 +117,41 @@ fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Compartment> {
     })
 }
 
+/// The derived search text: `trim(COALESCE(title,'') || ' ' || COALESCE(p1,'')
+/// || … )`, exactly the expression `MIGRATION_V7` backfills. Built from the
+/// in-memory tiers so the JSON stays the only source of truth; `trim_matches`
+/// matches SQLite's `trim`, which strips spaces only.
+fn search_text(tiers: &Tiers) -> String {
+    format!(
+        "{} {} {} {} {}",
+        tiers.title,
+        tiers.p1.as_deref().unwrap_or(""),
+        tiers.p2.as_deref().unwrap_or(""),
+        tiers.p3.as_deref().unwrap_or(""),
+        tiers.p4.as_deref().unwrap_or(""),
+    )
+    .trim_matches(' ')
+    .to_owned()
+}
+
 /// Load every compartment of a session, chronologically (oldest first).
 pub async fn load(db: &Db, session_id: &str) -> Result<Vec<Compartment>> {
-    let session = session_id.to_owned();
-    let rows = db
-        .conn()
-        .call(move |c| -> rusqlite::Result<Vec<Compartment>> {
-            let mut stmt = c.prepare(&format!(
-                "SELECT {COLUMNS} FROM mc_compartments
-                 WHERE session_id = ?1
-                 ORDER BY created_at, id"
-            ))?;
-            let rows = stmt.query_map([&session], from_row)?;
-            rows.collect()
-        })
+    let context = || format!("load mc_compartments for session {session_id}");
+    let conn = db.acquire().await?;
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {COLUMNS} FROM mc_compartments
+             WHERE session_id = ?1
+             ORDER BY created_at, id"
+        ))
         .await
-        .with_context(|| format!("load mc_compartments for session {session_id}"))?;
-    Ok(rows)
+        .with_context(context)?;
+    let mut rows = stmt.query([session_id]).await.with_context(context)?;
+    let mut compartments = Vec::new();
+    while let Some(row) = rows.next().await.with_context(context)? {
+        compartments.push(from_row(&row)?);
+    }
+    Ok(compartments)
 }
 
 /// The highest covered ordinal across `compartments` (the request-assembly
@@ -166,38 +190,48 @@ pub async fn insert_all(db: &Db, compartments: &[NewCompartment<'_>]) -> Result<
     if compartments.is_empty() {
         return Ok(());
     }
-    // Serialize before entering the connection closure: a `serde` failure is not
-    // a `rusqlite::Error`, and the closure must stay infallible-but-for-SQL.
+    // Serialize (and derive `search_text`) before opening the transaction: a
+    // `serde` failure must not leave a started transaction to roll back, and
+    // the bind values are then borrowed straight from these owners.
     let now = crate::id::now_millis();
-    let mut rows = Vec::with_capacity(compartments.len());
-    for compartment in compartments {
-        rows.push((
-            compartment.id.to_owned(),
-            compartment.session_id.to_owned(),
-            compartment.tiers.end_message.to_string(),
-            compartment.importance,
-            serde_json::to_string(compartment.tiers).context("serialize compartment tiers")?,
-            now,
-        ));
-    }
-    let session_id = compartments[0].session_id.to_owned();
-    let count = rows.len();
-    db.conn()
-        .call(move |c| -> rusqlite::Result<()> {
-            let tx = c.transaction()?;
-            {
-                let mut stmt = tx.prepare(&format!(
-                    "INSERT INTO mc_compartments ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
-                ))?;
-                for row in &rows {
-                    stmt.execute(rusqlite::params![
-                        &row.0, &row.1, &row.2, &row.3, &row.4, &row.5
-                    ])?;
-                }
-            }
-            tx.commit()
+    let tiers = compartments
+        .iter()
+        .map(|compartment| {
+            serde_json::to_string(compartment.tiers).context("serialize compartment tiers")
         })
-        .await
+        .collect::<Result<Vec<_>>>()?;
+    let session_id = compartments[0].session_id;
+    let count = compartments.len();
+    let written = async {
+        let tx = db.begin().await?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO mc_compartments
+                         (id, session_id, coverage_end, importance, tiers, search_text, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .await?;
+            for (compartment, tiers) in compartments.iter().zip(&tiers) {
+                let coverage_end = compartment.tiers.end_message.to_string();
+                let search_text = search_text(compartment.tiers);
+                stmt.execute((
+                    compartment.id,
+                    compartment.session_id,
+                    coverage_end.as_str(),
+                    compartment.importance,
+                    tiers.as_str(),
+                    search_text.as_str(),
+                    now,
+                ))
+                .await?;
+            }
+        }
+        tx.commit().await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    written
         .with_context(|| format!("insert {count} mc_compartments rows for session {session_id}"))?;
     Ok(())
 }
@@ -262,17 +296,15 @@ mod tests {
     #[tokio::test]
     async fn malformed_tiers_degrade_to_empty_not_an_error() {
         let db = db().await;
-        db.conn()
-            .call(|c| -> rusqlite::Result<usize> {
-                c.execute(
-                    "INSERT INTO mc_compartments
-                         (id, session_id, coverage_end, importance, tiers, created_at)
-                     VALUES ('mc_bad', 'ses_a', '3', 50.0, '{not json', 1)",
-                    [],
-                )
-            })
-            .await
-            .unwrap();
+        let conn = db.acquire().await.unwrap();
+        conn.execute(
+            "INSERT INTO mc_compartments
+                     (id, session_id, coverage_end, importance, tiers, created_at)
+                 VALUES ('mc_bad', 'ses_a', '3', 50.0, '{not json', 1)",
+            (),
+        )
+        .await
+        .unwrap();
         let rows = load(&db, "ses_a").await.unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tiers, Tiers::default());

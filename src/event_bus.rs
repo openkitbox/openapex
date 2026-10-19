@@ -131,68 +131,64 @@ impl EventBus {
         let env_id = self.next_evt_id();
         let version = durable_version(&kind) as i64;
         let data_value = data.clone().into_data();
-        let kind_for_tx = kind.clone();
-        let data_for_tx = data.clone();
-        let env_id_for_tx = env_id.clone();
-        let agg = aggregate_id.clone();
-        let db = self.db.conn().clone();
+        let type_str = format!("{kind}@v{version}");
 
-        let (seq, post_commit) = db
-            .call(move |conn| {
-                let tx = conn.transaction()?;
+        // One transaction, projector included: the event log and the read
+        // model it feeds must not be able to disagree.
+        let tx = self.db.begin().await?;
 
-                let latest: Option<i64> = tx
-                    .query_row(
-                        "SELECT seq FROM event_sequence WHERE aggregate_id = ?1",
-                        rusqlite::params![agg],
-                        |row| row.get(0),
-                    )
-                    .ok();
-                let seq = latest.map_or(0, |s| s + 1);
+        let latest = {
+            let mut stmt = tx
+                .prepare("SELECT seq FROM event_sequence WHERE aggregate_id = ?1")
+                .await?;
+            let mut rows = stmt.query([aggregate_id.as_str()]).await?;
+            match rows.next().await? {
+                Some(row) => Some(row.get::<i64>(0)?),
+                None => None,
+            }
+        };
+        let seq = latest.map_or(0, |s| s + 1);
 
-                let env = EventEnvelope {
-                    id: env_id_for_tx.clone(),
-                    created,
-                    kind: kind_for_tx.clone(),
-                    data: data_for_tx.clone(),
-                    durable: Some(DurableEnvelope {
-                        aggregate_id: agg.clone(),
-                        seq,
-                        version,
-                    }),
-                    location: None,
-                    metadata: None,
-                };
+        let env = EventEnvelope {
+            id: env_id.clone(),
+            created,
+            kind: kind.clone(),
+            data: data.clone(),
+            durable: Some(DurableEnvelope {
+                aggregate_id: aggregate_id.clone(),
+                seq,
+                version,
+            }),
+            location: None,
+            metadata: None,
+        };
 
-                // Run the projector in the same transaction. On error the
-                // transaction rolls back and the error propagates.
-                let post = project(&tx, &env).map_err(to_sql_err)?;
+        let post_commit = project(&tx, &env).await?;
 
-                tx.execute(
-                    "INSERT INTO event_sequence (aggregate_id, seq) VALUES (?1, ?2)
-                     ON CONFLICT(aggregate_id) DO UPDATE SET seq = max(seq, excluded.seq)",
-                    rusqlite::params![agg, seq],
-                )?;
+        tx.execute(
+            "INSERT INTO event_sequence (aggregate_id, seq) VALUES (?1, ?2)
+             ON CONFLICT(aggregate_id) DO UPDATE SET seq = max(seq, excluded.seq)",
+            (aggregate_id.as_str(), seq),
+        )
+        .await
+        .context("commit durable event")?;
 
-                let type_str = format!("{kind_for_tx}@v{version}");
-                tx.execute(
-                    "INSERT INTO event (id, aggregate_id, seq, created, type, data)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    rusqlite::params![
-                        env_id_for_tx,
-                        agg,
-                        seq,
-                        created,
-                        type_str,
-                        data_value.to_string(),
-                    ],
-                )?;
+        tx.execute(
+            "INSERT INTO event (id, aggregate_id, seq, created, type, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                env_id.as_str(),
+                aggregate_id.as_str(),
+                seq,
+                created,
+                type_str.as_str(),
+                data_value.to_string(),
+            ),
+        )
+        .await
+        .context("commit durable event")?;
 
-                tx.commit()?;
-                Ok::<(i64, Vec<PostCommit>), rusqlite::Error>((seq, post))
-            })
-            .await
-            .context("commit durable event")?;
+        tx.commit().await.context("commit durable event")?;
 
         let env = EventEnvelope {
             id: env_id,
@@ -237,35 +233,42 @@ impl EventBus {
         Ok(env)
     }
 
+    /// The database handle (read-only fixtures in tests).
+    pub fn db(&self) -> &Db {
+        &self.db
+    }
+
     /// Read the accumulated usage columns for a session (post-commit).
     async fn read_usage(&self, session_id: &str) -> Result<(Finite, TokenUsage)> {
-        let sid = session_id.to_string();
-        let db = self.db.conn().clone();
-        let out = db
-            .call(move |conn| {
-                conn.query_row(
-                    "SELECT cost, tokens_input, tokens_output, tokens_reasoning, \
-                     tokens_cache_read, tokens_cache_write FROM session_v2 WHERE id = ?1",
-                    rusqlite::params![sid],
-                    |row| {
-                        Ok((
-                            Finite::Float(row.get::<_, f64>(0)?),
-                            TokenUsage {
-                                input: row.get(1)?,
-                                output: row.get(2)?,
-                                reasoning: row.get(3)?,
-                                cache: crate::schema::support::TokenCache {
-                                    read: row.get(4)?,
-                                    write: row.get(5)?,
-                                },
-                            },
-                        ))
-                    },
-                )
-            })
+        let conn = self.db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT cost, tokens_input, tokens_output, tokens_reasoning, \
+                 tokens_cache_read, tokens_cache_write FROM session_v2 WHERE id = ?1",
+            )
             .await
             .context("read session usage")?;
-        Ok(out)
+        let mut rows = stmt
+            .query([session_id])
+            .await
+            .context("read session usage")?;
+        let row = rows
+            .next()
+            .await
+            .context("read session usage")?
+            .ok_or_else(|| anyhow!("session {session_id} has no row"))?;
+        Ok((
+            Finite::Float(row.get::<f64>(0)?),
+            TokenUsage {
+                input: row.get::<i64>(1)?,
+                output: row.get::<i64>(2)?,
+                reasoning: row.get::<i64>(3)?,
+                cache: crate::schema::support::TokenCache {
+                    read: row.get::<i64>(4)?,
+                    write: row.get::<i64>(5)?,
+                },
+            },
+        ))
     }
 
     /// Replay the durable event log for an aggregate, ordered by seq.
@@ -274,30 +277,30 @@ impl EventBus {
         aggregate_id: &str,
         after: i64,
     ) -> Result<Vec<EventEnvelope<Value>>> {
-        let agg = aggregate_id.to_string();
-        let db = self.db.conn().clone();
-        let rows = db
-            .call(move |conn| {
-                let mut stmt = conn.prepare(
-                    "SELECT id, aggregate_id, seq, created, type, data FROM event \
-                     WHERE aggregate_id = ?1 AND seq > ?2 ORDER BY seq ASC",
-                )?;
-                let out = stmt
-                    .query_map(rusqlite::params![agg, after], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, String>(4)?,
-                            row.get::<_, String>(5)?,
-                        ))
-                    })?
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                Ok::<Vec<_>, rusqlite::Error>(out)
-            })
+        let conn = self.db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, aggregate_id, seq, created, type, data FROM event \
+                 WHERE aggregate_id = ?1 AND seq > ?2 ORDER BY seq ASC",
+            )
             .await
             .context("read event log")?;
+        let mut rows = stmt
+            .query((aggregate_id, after))
+            .await
+            .context("read event log")?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.context("read event log")? {
+            out.push((
+                row.get::<String>(0)?,
+                row.get::<String>(1)?,
+                row.get::<i64>(2)?,
+                row.get::<i64>(3)?,
+                row.get::<String>(4)?,
+                row.get::<String>(5)?,
+            ));
+        }
+        let rows = out;
 
         let mut result = Vec::with_capacity(rows.len());
         for (id, aggregate_id, seq, created, type_str, data_str) in rows {
@@ -323,42 +326,25 @@ impl EventBus {
     /// Purge an aggregate's durable log: the `event_sequence` watermark and
     /// all `event` rows (upstream `Bus.remove`, called by `session.remove`).
     pub async fn remove(&self, aggregate_id: &str) -> Result<()> {
-        let agg = aggregate_id.to_string();
-        let db = self.db.conn().clone();
-        db.call(move |conn| -> rusqlite::Result<()> {
-            let tx = conn.transaction()?;
-            tx.execute(
-                "DELETE FROM event_sequence WHERE aggregate_id = ?1",
-                rusqlite::params![agg],
-            )?;
-            tx.execute(
-                "DELETE FROM event WHERE aggregate_id = ?1",
-                rusqlite::params![agg],
-            )?;
-            tx.commit()?;
-            Ok(())
-        })
+        let tx = self.db.begin().await?;
+        tx.execute(
+            "DELETE FROM event_sequence WHERE aggregate_id = ?1",
+            [aggregate_id],
+        )
         .await
         .context("remove aggregate event log")?;
+        tx.execute("DELETE FROM event WHERE aggregate_id = ?1", [aggregate_id])
+            .await
+            .context("remove aggregate event log")?;
+        tx.commit().await.context("remove aggregate event log")?;
         self.locks.remove(aggregate_id);
         Ok(())
-    }
-
-    /// Access the underlying connection (tests / read-only helpers).
-    pub fn db_conn(&self) -> &tokio_rusqlite::Connection {
-        self.db.conn()
     }
 
     fn next_evt_id(&self) -> String {
         let n = self.counter.fetch_add(1, Ordering::Relaxed);
         format!("{}_{n}", id::id("evt"))
     }
-}
-
-/// Map an anyhow projector error into a rusqlite error so the transaction
-/// rolls back and the failure propagates out of `db.conn().call`.
-fn to_sql_err(e: anyhow::Error) -> rusqlite::Error {
-    rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::other(e.to_string())))
 }
 
 /// Split `"{kind}@v{N}"` into `(kind, N)`. Absent suffix ⇒ v1.

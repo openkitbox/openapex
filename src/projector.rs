@@ -8,8 +8,8 @@
 pub mod message_updater;
 
 use anyhow::{Result, anyhow, bail};
-use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Value, json};
+use turso::Connection;
 
 use crate::schema::event::{EventEnvelope, InterruptReason, SessionEventData};
 use crate::schema::inbox::{Delivery, Item};
@@ -25,7 +25,10 @@ pub enum PostCommit {
 
 /// Dispatch a durable event to its projection. `tx` is the open transaction.
 /// Returns any post-commit effects to run after COMMIT.
-pub fn project(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Vec<PostCommit>> {
+pub async fn project(
+    tx: &Connection,
+    env: &EventEnvelope<SessionEventData>,
+) -> Result<Vec<PostCommit>> {
     use SessionEventData as E;
     let durable = env
         .durable
@@ -52,29 +55,31 @@ pub fn project(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result
             let meta_json = metadata.as_ref().map(to_json).transpose()?;
             let perm_json = permissions.as_ref().map(to_json).transpose()?;
             // Upstream `onConflictDoNothing`; a pre-existing row is a defect.
-            let n = tx.execute(
-                "INSERT OR IGNORE INTO session_v2
-                 (id, project_id, workspace_id, parent_id, slug, directory, path,
-                  title, agent, model, metadata, permission, version,
-                  time_created, time_updated)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14)",
-                rusqlite::params![
-                    session_id,
-                    project_id,
-                    location.workspace_id,
-                    parent_id,
-                    slug,
-                    location.directory,
-                    subpath,
-                    title,
-                    agent,
-                    model_json,
-                    meta_json,
-                    perm_json,
-                    version,
-                    env.created,
-                ],
-            )?;
+            let n = tx
+                .execute(
+                    "INSERT OR IGNORE INTO session_v2
+                     (id, project_id, workspace_id, parent_id, slug, directory, path,
+                      title, agent, model, metadata, permission, version,
+                      time_created, time_updated)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14)",
+                    (
+                        session_id.as_str(),
+                        project_id.as_str(),
+                        location.workspace_id.as_deref(),
+                        parent_id.as_deref(),
+                        slug.as_str(),
+                        location.directory.as_str(),
+                        subpath.as_deref(),
+                        title.as_deref(),
+                        agent.as_deref(),
+                        model_json.as_deref(),
+                        meta_json.as_deref(),
+                        perm_json.as_deref(),
+                        version.as_str(),
+                        env.created,
+                    ),
+                )
+                .await?;
             if n == 0 {
                 bail!("SessionAlreadyProjected: `{session_id}` already exists");
             }
@@ -83,33 +88,35 @@ pub fn project(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result
         E::SessionRenamed { session_id, title } => {
             tx.execute(
                 "UPDATE session_v2 SET title = ?2, time_updated = ?3 WHERE id = ?1",
-                rusqlite::params![session_id, title, env.created],
-            )?;
+                (session_id.as_str(), title.as_str(), env.created),
+            )
+            .await?;
         }
 
         E::SessionDeleted { session_id } => {
             tx.execute(
                 "DELETE FROM session_v2 WHERE id = ?1",
-                rusqlite::params![session_id],
-            )?;
+                [session_id.as_str()],
+            )
+            .await?;
         }
 
         E::ExecutionStarted { session_id } => {
-            touch(tx, session_id, env.created)?;
+            touch(tx, session_id, env.created).await?;
         }
         E::ExecutionSucceeded { session_id } => {
-            message_updater::run(tx, env)?;
-            project_idle(tx, session_id, env.created, IdleOutcome::Succeeded)?;
+            message_updater::run(tx, env).await?;
+            project_idle(tx, session_id, env.created, IdleOutcome::Succeeded).await?;
         }
         E::ExecutionFailed { session_id, .. } => {
-            message_updater::run(tx, env)?;
-            project_idle(tx, session_id, env.created, IdleOutcome::Failed)?;
+            message_updater::run(tx, env).await?;
+            project_idle(tx, session_id, env.created, IdleOutcome::Failed).await?;
         }
         E::ExecutionInterrupted { session_id, reason } => {
-            message_updater::run(tx, env)?;
+            message_updater::run(tx, env).await?;
             // Upstream: shutdown interrupts skip the idle-marker update.
             if *reason != InterruptReason::Shutdown {
-                project_idle(tx, session_id, env.created, IdleOutcome::Interrupted)?;
+                project_idle(tx, session_id, env.created, IdleOutcome::Interrupted).await?;
             }
         }
 
@@ -118,31 +125,31 @@ pub fn project(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result
             inbox_id,
             item,
         } => {
-            project_admitted(tx, session_id, inbox_id, item, durable.seq, env.created)?;
-            touch(tx, session_id, env.created)?;
+            project_admitted(tx, session_id, inbox_id, item, durable.seq, env.created).await?;
+            touch(tx, session_id, env.created).await?;
         }
         E::InboxDelivered {
             session_id,
             inbox_id,
         } => {
-            let item = project_delivered(tx, session_id, inbox_id)?;
+            let item = project_delivered(tx, session_id, inbox_id).await?;
             // Only user/synthetic promote to a message; compaction/move do not.
             if let Some(msg) = promote_to_message(&item, inbox_id, env.created) {
-                insert_message(tx, session_id, durable.seq, &msg)?;
+                insert_message(tx, session_id, durable.seq, &msg).await?;
             }
         }
         E::InboxCancelled {
             session_id,
             inbox_id,
         } => {
-            project_cancelled(tx, session_id, inbox_id)?;
+            project_cancelled(tx, session_id, inbox_id).await?;
         }
         E::InboxDeliveryChanged {
             session_id,
             inbox_id,
             delivery,
         } => {
-            project_delivery_changed(tx, session_id, inbox_id, delivery)?;
+            project_delivery_changed(tx, session_id, inbox_id, delivery).await?;
         }
 
         E::SessionUsageRecorded {
@@ -151,7 +158,7 @@ pub fn project(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result
             tokens,
             ..
         } => {
-            apply_usage(tx, session_id, *cost, tokens, None)?;
+            apply_usage(tx, session_id, *cost, tokens, None).await?;
             post.push(PostCommit::PublishUsage {
                 session_id: session_id.clone(),
             });
@@ -163,20 +170,22 @@ pub fn project(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result
         E::SessionAgentSelected {
             session_id, agent, ..
         } => {
-            message_updater::run(tx, env)?;
+            message_updater::run(tx, env).await?;
             tx.execute(
                 "UPDATE session_v2 SET agent = ?2, time_updated = ?3 WHERE id = ?1",
-                rusqlite::params![session_id, agent, env.created],
-            )?;
+                (session_id.as_str(), agent.as_str(), env.created),
+            )
+            .await?;
         }
         E::SessionModelSelected {
             session_id, model, ..
         } => {
-            message_updater::run(tx, env)?;
+            message_updater::run(tx, env).await?;
             tx.execute(
                 "UPDATE session_v2 SET model = ?2, time_updated = ?3 WHERE id = ?1",
-                rusqlite::params![session_id, to_json(model)?, env.created],
-            )?;
+                (session_id.as_str(), to_json(model)?.as_str(), env.created),
+            )
+            .await?;
         }
         E::SessionMetadataUpdated {
             session_id,
@@ -184,8 +193,13 @@ pub fn project(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result
         } => {
             tx.execute(
                 "UPDATE session_v2 SET metadata = ?2, time_updated = ?3 WHERE id = ?1",
-                rusqlite::params![session_id, to_json(metadata)?, env.created],
-            )?;
+                (
+                    session_id.as_str(),
+                    to_json(metadata)?.as_str(),
+                    env.created,
+                ),
+            )
+            .await?;
         }
         E::SessionPermissions {
             session_id,
@@ -193,8 +207,13 @@ pub fn project(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result
         } => {
             tx.execute(
                 "UPDATE session_v2 SET permission = ?2, time_updated = ?3 WHERE id = ?1",
-                rusqlite::params![session_id, to_json(permissions)?, env.created],
-            )?;
+                (
+                    session_id.as_str(),
+                    to_json(permissions)?.as_str(),
+                    env.created,
+                ),
+            )
+            .await?;
         }
         E::SessionViewed { session_id, idle } => {
             // Monotone watermark: a duplicate or stale view never regresses,
@@ -206,10 +225,11 @@ pub fn project(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result
                    time_viewed = max(?2, coalesce(time_viewed, ?2)),
                    time_updated = time_updated
                  WHERE id = ?1",
-                rusqlite::params![session_id, idle],
-            )?;
+                (session_id.as_str(), *idle),
+            )
+            .await?;
         }
-        E::SessionForked { .. } => project_fork(tx, env)?,
+        E::SessionForked { .. } => project_fork(tx, env).await?,
 
         // Message-updater events.
         E::SessionSynthetic { .. }
@@ -231,7 +251,7 @@ pub fn project(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result
         | E::CompactionStarted { .. }
         | E::CompactionEnded { .. }
         | E::CompactionFailed { .. } => {
-            let out = message_updater::run(tx, env)?;
+            let out = message_updater::run(tx, env).await?;
             if out.usage_recorded
                 && let Some(sid) = crate::event_bus::session_id_of(&env.data)
             {
@@ -247,7 +267,7 @@ pub fn project(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result
         } => {
             // Upstream: run the message-updater (appends `location-switched`),
             // then update the session row's directory/path/project/workspace.
-            message_updater::run(tx, env)?;
+            message_updater::run(tx, env).await?;
             tx.execute(
                 "UPDATE session_v2 SET
                    directory = ?2,
@@ -256,15 +276,16 @@ pub fn project(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result
                    workspace_id = ?5,
                    time_updated = ?6
                  WHERE id = ?1",
-                rusqlite::params![
-                    session_id,
-                    payload.location.directory,
-                    payload.subpath,
-                    payload.project_id,
-                    payload.location.workspace_id,
+                (
+                    session_id.as_str(),
+                    payload.location.directory.as_str(),
+                    payload.subpath.as_deref(),
+                    payload.project_id.as_str(),
+                    payload.location.workspace_id.as_deref(),
                     env.created,
-                ],
-            )?;
+                ),
+            )
+            .await?;
         }
         E::SessionUsageUpdated { .. }
         | E::TextDelta { .. }
@@ -290,17 +311,18 @@ fn to_json<T: serde::Serialize>(v: &T) -> Result<String> {
 }
 
 /// `time_updated = event.created`.
-pub(crate) fn touch(tx: &Connection, session_id: &str, created: i64) -> Result<()> {
+pub(crate) async fn touch(tx: &Connection, session_id: &str, created: i64) -> Result<()> {
     tx.execute(
         "UPDATE session_v2 SET time_updated = ?2 WHERE id = ?1",
-        rusqlite::params![session_id, created],
-    )?;
+        (session_id, created),
+    )
+    .await?;
     Ok(())
 }
 
 /// projectIdle: `time_idle = max(created, coalesce(time_idle + 1, created))`,
 /// set `idle_outcome`, leave `time_updated` unchanged (self-assignment).
-fn project_idle(
+async fn project_idle(
     tx: &Connection,
     session_id: &str,
     created: i64,
@@ -317,13 +339,14 @@ fn project_idle(
            idle_outcome = ?3,
            time_updated = time_updated
          WHERE id = ?1",
-        rusqlite::params![session_id, created, outcome_str],
-    )?;
+        (session_id, created, outcome_str),
+    )
+    .await?;
     Ok(())
 }
 
 /// Accumulate cost/tokens. `time_updated` is set only when `Some`.
-pub(crate) fn apply_usage(
+pub(crate) async fn apply_usage(
     tx: &Connection,
     session_id: &str,
     cost: MoneyUsd,
@@ -341,7 +364,7 @@ pub(crate) fn apply_usage(
                tokens_cache_write = tokens_cache_write + ?7,
                time_updated = ?8
              WHERE id = ?1",
-            rusqlite::params![
+            (
                 session_id,
                 finite_f64(cost),
                 tokens.input,
@@ -350,8 +373,9 @@ pub(crate) fn apply_usage(
                 tokens.cache.read,
                 tokens.cache.write,
                 t,
-            ],
-        )?;
+            ),
+        )
+        .await?;
     } else {
         tx.execute(
             "UPDATE session_v2 SET
@@ -362,7 +386,7 @@ pub(crate) fn apply_usage(
                tokens_cache_read = tokens_cache_read + ?6,
                tokens_cache_write = tokens_cache_write + ?7
              WHERE id = ?1",
-            rusqlite::params![
+            (
                 session_id,
                 finite_f64(cost),
                 tokens.input,
@@ -370,8 +394,9 @@ pub(crate) fn apply_usage(
                 tokens.reasoning,
                 tokens.cache.read,
                 tokens.cache.write,
-            ],
-        )?;
+            ),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -382,7 +407,7 @@ pub(crate) fn apply_usage(
 
 /// projectAdmitted: INSERT session_inbox. If a `session_message` already has
 /// the id → LifecycleConflict. INSERT OR IGNORE with 0 rows ⇒ Err.
-fn project_admitted(
+async fn project_admitted(
     tx: &Connection,
     session_id: &str,
     inbox_id: &str,
@@ -390,31 +415,30 @@ fn project_admitted(
     seq: i64,
     created: i64,
 ) -> Result<()> {
-    let exists: Option<String> = tx
-        .query_row(
-            "SELECT id FROM session_message WHERE id = ?1",
-            rusqlite::params![inbox_id],
-            |row| row.get(0),
-        )
-        .optional()?;
+    let mut stmt = tx
+        .prepare("SELECT id FROM session_message WHERE id = ?1")
+        .await?;
+    let exists = crate::db::optional(&mut stmt, [inbox_id]).await?;
     if exists.is_some() {
         bail!("LifecycleConflict: a session_message already exists for `{inbox_id}`");
     }
 
-    let n = tx.execute(
-        "INSERT OR IGNORE INTO session_inbox
-         (id, session_id, type, payload, delivery, enqueued_seq, time_created)
-         VALUES (?1,?2,?3,?4,?5,?6,?7)",
-        rusqlite::params![
-            inbox_id,
-            session_id,
-            item.kind(),
-            item.payload().to_string(),
-            delivery_str(item.delivery()),
-            seq,
-            created,
-        ],
-    )?;
+    let n = tx
+        .execute(
+            "INSERT OR IGNORE INTO session_inbox
+             (id, session_id, type, payload, delivery, enqueued_seq, time_created)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            (
+                inbox_id,
+                session_id,
+                item.kind(),
+                item.payload().to_string(),
+                delivery_str(item.delivery()),
+                seq,
+                created,
+            ),
+        )
+        .await?;
     if n == 0 {
         bail!("inbox item `{inbox_id}` already admitted");
     }
@@ -422,34 +446,36 @@ fn project_admitted(
 }
 
 /// projectDelivered: DELETE ... RETURNING; missing row ⇒ Err.
-fn project_delivered(tx: &Connection, session_id: &str, inbox_id: &str) -> Result<Item> {
-    let row = tx
-        .query_row(
+async fn project_delivered(tx: &Connection, session_id: &str, inbox_id: &str) -> Result<Item> {
+    // `RETURNING` only produces rows through `query`; a one-shot `execute`
+    // rejects them as `unexpected row during execution`.
+    let mut stmt = tx
+        .prepare(
             "DELETE FROM session_inbox WHERE id = ?1 AND session_id = ?2
              RETURNING type, payload, delivery",
-            rusqlite::params![inbox_id, session_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
         )
-        .optional()?;
-    let (kind, payload, delivery) = row
-        .ok_or_else(|| anyhow!("inbox.delivered: no row `{inbox_id}` in session `{session_id}`"))?;
+        .await?;
+    let Some(row) = crate::db::optional(&mut stmt, (inbox_id, session_id)).await? else {
+        return Err(anyhow!(
+            "inbox.delivered: no row `{inbox_id}` in session `{session_id}`"
+        ));
+    };
+    let kind = row.get::<String>(0)?;
+    let payload = row.get::<String>(1)?;
+    let delivery = row.get::<String>(2)?;
     let payload_value: Value = serde_json::from_str(&payload)?;
     decode_item(&kind, payload_value, &delivery)
 }
 
 /// projectCancelled: DELETE only if delivery IN ('queue','steer'); missing ⇒ Err.
-fn project_cancelled(tx: &Connection, session_id: &str, inbox_id: &str) -> Result<()> {
-    let n = tx.execute(
-        "DELETE FROM session_inbox WHERE id = ?1 AND session_id = ?2
-         AND delivery IN ('queue','steer')",
-        rusqlite::params![inbox_id, session_id],
-    )?;
+async fn project_cancelled(tx: &Connection, session_id: &str, inbox_id: &str) -> Result<()> {
+    let n = tx
+        .execute(
+            "DELETE FROM session_inbox WHERE id = ?1 AND session_id = ?2
+             AND delivery IN ('queue','steer')",
+            (inbox_id, session_id),
+        )
+        .await?;
     if n == 0 {
         bail!("inbox.cancelled: no cancellable row `{inbox_id}` in session `{session_id}`");
     }
@@ -458,7 +484,7 @@ fn project_cancelled(tx: &Connection, session_id: &str, inbox_id: &str) -> Resul
 
 /// projectDeliveryChanged: UPDATE delivery with a from-guard (from = opposite
 /// of to). 0 rows ⇒ Err.
-fn project_delivery_changed(
+async fn project_delivery_changed(
     tx: &Connection,
     session_id: &str,
     inbox_id: &str,
@@ -466,11 +492,13 @@ fn project_delivery_changed(
 ) -> Result<()> {
     let to_str = delivery_str(*to);
     let from_str = opposite_delivery(to_str);
-    let n = tx.execute(
-        "UPDATE session_inbox SET delivery = ?4
-         WHERE id = ?1 AND session_id = ?2 AND delivery = ?3",
-        rusqlite::params![inbox_id, session_id, from_str, to_str],
-    )?;
+    let n = tx
+        .execute(
+            "UPDATE session_inbox SET delivery = ?4
+             WHERE id = ?1 AND session_id = ?2 AND delivery = ?3",
+            (inbox_id, session_id, from_str, to_str),
+        )
+        .await?;
     if n == 0 {
         bail!("inbox.delivery.changed: no row `{inbox_id}` with delivery `{from_str}`");
     }
@@ -529,7 +557,7 @@ fn promote_to_message(item: &Item, inbox_id: &str, created: i64) -> Option<Messa
 }
 
 /// Insert a message row, mirroring upstream `insertMessage` (seq = event seq).
-pub(crate) fn insert_message(
+pub(crate) async fn insert_message(
     tx: &Connection,
     session_id: &str,
     seq: i64,
@@ -540,15 +568,16 @@ pub(crate) fn insert_message(
         "INSERT INTO session_message
          (id, session_id, type, seq, time_created, time_updated, data)
          VALUES (?1,?2,?3,?4,?5,?5,?6)",
-        rusqlite::params![
+        (
             message.id(),
             session_id,
             message.kind(),
             seq,
             message.time_created(),
             data,
-        ],
-    )?;
+        ),
+    )
+    .await?;
     Ok(())
 }
 
@@ -592,7 +621,7 @@ fn fork_title(title: Option<&str>) -> Option<String> {
 
 /// projectFork: insert the forked session row, copy the parent's settled
 /// history up to the boundary, and reserve the child's durable sequence.
-fn project_fork(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<()> {
+async fn project_fork(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<()> {
     let SessionEventData::SessionForked {
         session_id,
         parent_id,
@@ -603,28 +632,30 @@ fn project_fork(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Resul
         bail!("project_fork called with {}", env.kind);
     };
 
-    let parent: Option<ParentRow> = tx
-        .query_row(
+    let mut stmt = tx
+        .prepare(
             "SELECT project_id, workspace_id, directory, path, title, agent,
                     model, metadata, permission, version
              FROM session_v2 WHERE id = ?1",
-            rusqlite::params![parent_id],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                ))
-            },
         )
-        .optional()?;
+        .await?;
+    let parent: Option<ParentRow> = crate::db::optional(&mut stmt, [parent_id.as_str()])
+        .await?
+        .map(|row| {
+            Ok::<ParentRow, anyhow::Error>((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+            ))
+        })
+        .transpose()?;
     let (
         project_id,
         workspace_id,
@@ -641,58 +672,64 @@ fn project_fork(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Resul
     let boundary_message_id = match boundary {
         ForkBoundary::Before { message_id } | ForkBoundary::Through { message_id } => message_id,
     };
-    let boundary_seq: Option<i64> = tx
-        .query_row(
-            "SELECT seq FROM session_message WHERE session_id = ?1 AND id = ?2",
-            rusqlite::params![parent_id, boundary_message_id],
-            |row| row.get(0),
-        )
-        .optional()?;
+    let mut stmt = tx
+        .prepare("SELECT seq FROM session_message WHERE session_id = ?1 AND id = ?2")
+        .await?;
+    let boundary_seq: Option<i64> = crate::db::optional(
+        &mut stmt,
+        (parent_id.as_str(), boundary_message_id.as_str()),
+    )
+    .await?
+    .map(|row| row.get(0))
+    .transpose()?;
     let boundary_seq = boundary_seq
         .ok_or_else(|| anyhow!("Fork boundary message not found: {boundary_message_id}"))?;
 
     // Last message seq included in the copy ("before" is exclusive).
-    let copied_seq: Option<i64> = tx
-        .query_row(
-            if matches!(boundary, ForkBoundary::Before { .. }) {
-                "SELECT seq FROM session_message WHERE session_id = ?1 AND seq < ?2
-                 ORDER BY seq DESC LIMIT 1"
-            } else {
-                "SELECT seq FROM session_message WHERE session_id = ?1 AND seq <= ?2
-                 ORDER BY seq DESC LIMIT 1"
-            },
-            rusqlite::params![parent_id, boundary_seq],
-            |row| row.get(0),
-        )
-        .optional()?;
+    let mut stmt = tx
+        .prepare(if matches!(boundary, ForkBoundary::Before { .. }) {
+            "SELECT seq FROM session_message WHERE session_id = ?1 AND seq < ?2
+             ORDER BY seq DESC LIMIT 1"
+        } else {
+            "SELECT seq FROM session_message WHERE session_id = ?1 AND seq <= ?2
+             ORDER BY seq DESC LIMIT 1"
+        })
+        .await?;
+    let copied_seq: Option<i64> =
+        crate::db::optional(&mut stmt, (parent_id.as_str(), boundary_seq))
+            .await?
+            .map(|row| row.get(0))
+            .transpose()?;
 
     // Forked row: new slug, cost/tokens zeroed (column defaults), location and
     // settings inherited from the parent. Upstream `.onConflictDoNothing()`
     // maps to `INSERT OR IGNORE`; a pre-existing row is a defect.
-    let n = tx.execute(
-        "INSERT OR IGNORE INTO session_v2
-         (id, project_id, workspace_id, parent_id, fork_session_id, fork_boundary,
-          slug, directory, path, title, agent, model, metadata, permission, version,
-          time_created, time_updated)
-         VALUES (?1,?2,?3,NULL,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)",
-        rusqlite::params![
-            session_id,
-            project_id,
-            workspace_id,
-            parent_id,
-            to_json(boundary)?,
-            crate::slug::create(),
-            directory,
-            path,
-            fork_title(title.as_deref()),
-            agent,
-            model,
-            metadata,
-            permission,
-            version,
-            env.created,
-        ],
-    )?;
+    let n = tx
+        .execute(
+            "INSERT OR IGNORE INTO session_v2
+             (id, project_id, workspace_id, parent_id, fork_session_id, fork_boundary,
+              slug, directory, path, title, agent, model, metadata, permission, version,
+              time_created, time_updated)
+             VALUES (?1,?2,?3,NULL,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?15)",
+            (
+                session_id.as_str(),
+                project_id,
+                workspace_id,
+                parent_id.as_str(),
+                to_json(boundary)?,
+                crate::slug::create(),
+                directory,
+                path,
+                fork_title(title.as_deref()),
+                agent,
+                model,
+                metadata,
+                permission,
+                version,
+                env.created,
+            ),
+        )
+        .await?;
     if n == 0 {
         bail!("SessionAlreadyProjected: `{session_id}` already exists");
     }
@@ -710,35 +747,39 @@ fn project_fork(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Resul
     let msg_prefix = crate::id::from_event(&env.id);
     let mut cursor: i64 = -1;
     loop {
-        let mut stmt = tx.prepare(
-            "SELECT id, type, seq, time_created, time_updated, data
-             FROM session_message
-             WHERE session_id = ?1 AND seq > ?2 AND seq <= ?3
-               AND (type != 'assistant'
-                    OR json_extract(data, '$.time.completed') IS NOT NULL)
-               AND (type != 'shell'
-                    OR json_extract(data, '$.status') != 'running')
-               AND (type != 'compaction'
-                    OR json_extract(data, '$.status') != 'running')
-             ORDER BY seq ASC
-             LIMIT ?4",
-        )?;
-        let rows = stmt.query_map(
-            rusqlite::params![parent_id, cursor, copied_seq, FORK_BATCH_SIZE as i64],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            },
-        )?;
+        let mut stmt = tx
+            .prepare(
+                "SELECT id, type, seq, time_created, time_updated, data
+                 FROM session_message
+                 WHERE session_id = ?1 AND seq > ?2 AND seq <= ?3
+                   AND (type != 'assistant'
+                        OR json_extract(data, '$.time.completed') IS NOT NULL)
+                   AND (type != 'shell'
+                        OR json_extract(data, '$.status') != 'running')
+                   AND (type != 'compaction'
+                        OR json_extract(data, '$.status') != 'running')
+                 ORDER BY seq ASC
+                 LIMIT ?4",
+            )
+            .await?;
+        let mut rows = stmt
+            .query((
+                parent_id.as_str(),
+                cursor,
+                copied_seq,
+                FORK_BATCH_SIZE as i64,
+            ))
+            .await?;
         let mut batch = Vec::new();
-        for row in rows {
-            batch.push(row?);
+        while let Some(row) = rows.next().await? {
+            batch.push((
+                row.get::<String>(0)?,
+                row.get::<String>(1)?,
+                row.get::<i64>(2)?,
+                row.get::<i64>(3)?,
+                row.get::<i64>(4)?,
+                row.get::<String>(5)?,
+            ));
         }
         if batch.is_empty() {
             break;
@@ -747,22 +788,22 @@ fn project_fork(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Resul
             .last()
             .map(|(_, _, seq, _, _, _)| *seq)
             .ok_or_else(|| anyhow!("fork copy: empty batch"))?;
-        drop(stmt);
         for (_old_id, kind, seq, time_created, time_updated, data) in &batch {
             tx.execute(
                 "INSERT INTO session_message
                  (id, session_id, type, seq, time_created, time_updated, data)
                  VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                rusqlite::params![
+                (
                     format!("{msg_prefix}_{seq}"),
-                    session_id,
-                    kind,
-                    seq,
-                    time_created,
-                    time_updated,
-                    data,
-                ],
-            )?;
+                    session_id.as_str(),
+                    kind.as_str(),
+                    *seq,
+                    *time_created,
+                    *time_updated,
+                    data.as_str(),
+                ),
+            )
+            .await?;
         }
     }
 
@@ -771,8 +812,9 @@ fn project_fork(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Resul
     tx.execute(
         "INSERT INTO event_sequence (aggregate_id, seq) VALUES (?1, ?2)
          ON CONFLICT(aggregate_id) DO UPDATE SET seq = max(seq, excluded.seq)",
-        rusqlite::params![session_id, copied_seq],
-    )?;
+        (session_id.as_str(), copied_seq),
+    )
+    .await?;
     Ok(())
 }
 
@@ -783,7 +825,7 @@ mod tests {
     use crate::schema::event::DurableEnvelope;
     use crate::schema::event::SessionEventData;
     use crate::schema::support::ModelRef;
-    use rusqlite::Connection;
+    use turso::Connection;
 
     fn model() -> ModelRef {
         ModelRef {
@@ -809,14 +851,20 @@ mod tests {
         }
     }
 
-    fn assistant_row(tx: &Connection, id: &str) -> (i64, Option<i64>, Option<i64>) {
-        tx.query_row(
-            "SELECT seq, time_created, json_extract(data, '$.time.completed')
-             FROM session_message WHERE id = ?1",
-            [id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    async fn assistant_row(tx: &Connection, id: &str) -> (i64, Option<i64>, Option<i64>) {
+        let mut stmt = tx
+            .prepare(
+                "SELECT seq, time_created, json_extract(data, '$.time.completed')
+                 FROM session_message WHERE id = ?1",
+            )
+            .await
+            .expect("assistant row");
+        let row = stmt.query_row([id]).await.expect("assistant row");
+        (
+            row.get::<i64>(0).expect("seq"),
+            row.get::<Option<i64>>(1).expect("time_created"),
+            row.get::<Option<i64>>(2).expect("time_completed"),
         )
-        .expect("assistant row")
     }
 
     /// `StepStarted` with an incomplete current assistant closes that row in
@@ -826,17 +874,16 @@ mod tests {
     #[tokio::test]
     async fn step_started_closes_stale_assistant_in_place() {
         let db = Db::open_in_memory().await.expect("db");
-        db.conn()
-            .call(|conn| -> rusqlite::Result<()> {
-                conn.execute(
-                    "INSERT INTO session_v2 (id, project_id, slug, directory, version, time_created, time_updated)
-                     VALUES ('ses_close', 'p', 's', '/tmp', 'v', 0, 0)",
-                    [],
-                )?;
-                Ok(())
-            })
+        {
+            let conn = db.acquire().await.expect("conn");
+            conn.execute(
+                "INSERT INTO session_v2 (id, project_id, slug, directory, version, time_created, time_updated)
+                 VALUES ('ses_close', 'p', 's', '/tmp', 'v', 0, 0)",
+                (),
+            )
             .await
             .expect("session row");
+        }
 
         // Turn 1: a step starts (assistant msg_a) and never completes —
         // the crash / failed-step scenario.
@@ -851,14 +898,9 @@ mod tests {
                 started: 100,
             },
         );
-        db.conn()
-            .call(move |conn| {
-                let tx = conn.transaction()?;
-                project(&tx, &first).expect("first step started");
-                tx.commit()
-            })
-            .await
-            .expect("turn 1");
+        let tx = db.begin().await.expect("tx");
+        project(&tx, &first).await.expect("first step started");
+        tx.commit().await.expect("turn 1");
 
         // Turn 2: another step starts — msg_a must close in place.
         let second = envelope(
@@ -872,25 +914,13 @@ mod tests {
                 started: 200,
             },
         );
-        db.conn()
-            .call(move |conn| {
-                let tx = conn.transaction()?;
-                project(&tx, &second).expect("second step started");
-                tx.commit()
-            })
-            .await
-            .expect("turn 2");
+        let tx = db.begin().await.expect("tx");
+        project(&tx, &second).await.expect("second step started");
+        tx.commit().await.expect("turn 2");
 
-        let (seq_a, created_a, completed_a) = db
-            .conn()
-            .call(|conn| Ok(assistant_row(conn, "msg_a")) as rusqlite::Result<_>)
-            .await
-            .expect("row a");
-        let (seq_b, _, _) = db
-            .conn()
-            .call(|conn| Ok(assistant_row(conn, "msg_b")) as rusqlite::Result<_>)
-            .await
-            .expect("row b");
+        let conn = db.acquire().await.expect("conn");
+        let (seq_a, created_a, completed_a) = assistant_row(&conn, "msg_a").await;
+        let (seq_b, _, _) = assistant_row(&conn, "msg_b").await;
         assert_eq!(seq_a, 1_i64, "the closed row keeps its original seq");
         assert_eq!(
             created_a,
@@ -906,19 +936,15 @@ mod tests {
         );
         assert_eq!(seq_b, 2_i64, "the fresh assistant owns the event's seq");
         // History order is unchanged: the closed assistant still sorts first.
-        let order = db
-            .conn()
-            .call(|conn| -> rusqlite::Result<Vec<String>> {
-                Ok(conn
-                    .prepare("SELECT id FROM session_message WHERE session_id = 'ses_close' ORDER BY seq")
-                    .expect("stmt")
-                    .query_map([], |row| row.get::<_, String>(0))
-                    .expect("rows")
-                    .collect::<rusqlite::Result<Vec<String>>>()
-                    .expect("collect"))
-            })
+        let mut stmt = conn
+            .prepare("SELECT id FROM session_message WHERE session_id = 'ses_close' ORDER BY seq")
             .await
-            .expect("order");
+            .expect("stmt");
+        let mut rows = stmt.query(()).await.expect("rows");
+        let mut order = Vec::new();
+        while let Some(row) = rows.next().await.expect("collect") {
+            order.push(row.get::<String>(0).expect("id"));
+        }
         assert_eq!(order, vec!["msg_a".to_owned(), "msg_b".to_owned()]);
     }
 }

@@ -1556,17 +1556,14 @@ async fn settle_failed(db: &crate::db::Db, run_id: &str, error: &anyhow::Error) 
 /// Record the attempt a retry is about to make, so the row's `attempt` column
 /// always names the try that produced its terminal state.
 async fn update_run_attempt(db: &crate::db::Db, run_id: &str, attempt: i64) -> Result<()> {
-    let run_id = run_id.to_owned();
     let now = now_millis();
-    db.conn()
-        .call(move |c| {
-            c.execute(
-                "UPDATE mc_historian_run SET attempt = ?2, updated_at = ?3 WHERE id = ?1",
-                rusqlite::params![run_id, attempt, now],
-            )
-        })
-        .await
-        .with_context(|| format!("record mc_historian_run attempt {attempt}"))?;
+    let conn = db.acquire().await?;
+    conn.execute(
+        "UPDATE mc_historian_run SET attempt = ?2, updated_at = ?3 WHERE id = ?1",
+        (run_id, attempt, now),
+    )
+    .await
+    .with_context(|| format!("record mc_historian_run attempt {attempt}"))?;
     Ok(())
 }
 
@@ -1578,35 +1575,39 @@ async fn update_run_attempt(db: &crate::db::Db, run_id: &str, attempt: i64) -> R
 /// rows were settled.
 pub async fn settle_running_runs(db: &crate::db::Db) -> Result<usize> {
     let now = now_millis();
-    let settled = db
-        .conn()
-        .call(move |c| {
-            // The age is reported per run so an operator can see how long the
-            // killed process had a run in flight (`updated_at` is the terminal
-            // transition's stamp; nothing else records a run's duration).
-            let ages: Vec<i64> = {
-                let mut stmt =
-                    c.prepare("SELECT created_at FROM mc_historian_run WHERE state = 'running'")?;
-                let rows = stmt.query_map([], |row| row.get(0))?;
-                rows.collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            for created_at in &ages {
-                tracing::warn!(
-                    age_ms = now - created_at,
-                    "settled a stale running historian run as aborted: its process exited"
-                );
-            }
-            c.execute(
-                "UPDATE mc_historian_run
+    // The age is reported per run so an operator can see how long the
+    // killed process had a run in flight (`updated_at` is the terminal
+    // transition's stamp; nothing else records a run's duration).
+    let conn = db.acquire().await?;
+    let settled = async {
+        let mut stmt = conn
+            .prepare("SELECT created_at FROM mc_historian_run WHERE state = 'running'")
+            .await?;
+        let mut rows = stmt.query(()).await?;
+        let mut ages = Vec::new();
+        while let Some(row) = rows.next().await? {
+            ages.push(row.get::<i64>(0)?);
+        }
+        drop(rows);
+        drop(stmt);
+        for created_at in &ages {
+            tracing::warn!(
+                age_ms = now - created_at,
+                "settled a stale running historian run as aborted: its process exited"
+            );
+        }
+        conn.execute(
+            "UPDATE mc_historian_run
                  SET state = 'aborted', updated_at = ?1,
                      error = COALESCE(error, 'aborted at startup: the owning process exited')
                  WHERE state = 'running'",
-                rusqlite::params![now],
-            )
-        })
+            [now],
+        )
         .await
-        .context("settle stale running historian runs")?;
-    Ok(settled)
+    }
+    .await
+    .context("settle stale running historian runs")?;
+    Ok(settled as usize)
 }
 
 /// Claim a run row. The id is minted here, not by the database, so the same
@@ -1618,21 +1619,16 @@ async fn insert_run(
     attempt: i64,
 ) -> Result<String> {
     let run_id = id("hrun");
-    let row_id = run_id.clone();
-    let session_id = session_id.to_owned();
-    let chunk_ref = chunk_ref.to_owned();
     let now = now_millis();
-    db.conn()
-        .call(move |c| {
-            c.execute(
-                "INSERT INTO mc_historian_run
-                     (id, session_id, state, chunk_ref, attempt, created_at, updated_at)
-                 VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?5)",
-                rusqlite::params![row_id, session_id, chunk_ref, attempt, now],
-            )
-        })
-        .await
-        .with_context(|| format!("insert mc_historian_run row {run_id}"))?;
+    let conn = db.acquire().await?;
+    conn.execute(
+        "INSERT INTO mc_historian_run
+                 (id, session_id, state, chunk_ref, attempt, created_at, updated_at)
+             VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?5)",
+        (run_id.as_str(), session_id, chunk_ref, attempt, now),
+    )
+    .await
+    .with_context(|| format!("insert mc_historian_run row {run_id}"))?;
     Ok(run_id)
 }
 
@@ -1644,12 +1640,10 @@ async fn settle_run(
     error: Option<&str>,
     side_channels: Option<&SideChannels>,
 ) -> Result<()> {
-    let run_id = run_id.to_owned();
-    let error = error.map(str::to_owned);
     // The run row owns the side channels: the historian emits `<facts>` and
     // `<events>` once per run, for the memory-promotion pass that consumes them
-    // (a compartment has no such fields). Serialized here so the connection
-    // closure stays infallible-but-for-SQL.
+    // (a compartment has no such fields). Serialized before the write, so a
+    // serialization failure never leaves a half-settled row.
     let facts = match side_channels {
         Some(channels) => Some(
             serde_json::to_string(&channels.facts).context("serialize run facts side channel")?,
@@ -1663,17 +1657,22 @@ async fn settle_run(
         None => None,
     };
     let now = now_millis();
-    let settled = db
-        .conn()
-        .call(move |c| {
-            c.execute(
-                "UPDATE mc_historian_run
-                 SET state = ?2, updated_at = ?3, error = ?4,
-                     facts = COALESCE(?5, facts), events = COALESCE(?6, events)
-                 WHERE id = ?1",
-                rusqlite::params![run_id, state.as_str(), now, error, facts, events],
-            )
-        })
+    let conn = db.acquire().await?;
+    let settled = conn
+        .execute(
+            "UPDATE mc_historian_run
+             SET state = ?2, updated_at = ?3, error = ?4,
+                 facts = COALESCE(?5, facts), events = COALESCE(?6, events)
+             WHERE id = ?1",
+            (
+                run_id,
+                state.as_str(),
+                now,
+                error,
+                facts.as_deref(),
+                events.as_deref(),
+            ),
+        )
         .await
         .with_context(|| format!("settle mc_historian_run row as {}", state.as_str()))?;
     if settled == 0 {
@@ -1696,7 +1695,11 @@ pub struct SideChannels {
 /// The model the historian completion routes to. Cardinal routes on the BARE
 /// model id, so a qualified `provider/id` config reference is reduced to its id
 /// half; an unset reference falls back to ox's default model resolution.
-fn historian_model(config: &Config) -> Result<String> {
+///
+/// `pub(crate)` because the dreamer runs its hidden completions through the
+/// same resolution and the same transport ([`collect_completion`]): one route
+/// to the model, not two.
+pub(crate) fn historian_model(config: &Config) -> Result<String> {
     if let Some(qualified) = &config.magic_context.historian_model {
         let matched = qualified.split_once('/').and_then(|(provider, id)| {
             config
@@ -1727,7 +1730,14 @@ fn bare_model_id(qualified: &str) -> String {
 /// Drive the hidden completion and collect its text, the same way the runner
 /// collects a compaction summary. Non-text events (reasoning, usage, finish)
 /// are ignored: the historian's contract is the text.
-async fn collect_completion(chat: &Arc<dyn Chat>, request: &ChatRequest) -> Result<String> {
+///
+/// `pub(crate)`: shared with the dreamer, which drives the identical hidden
+/// sub-completion (the reference's dreamer and historian also share one
+/// provider-output path — `provider-output-failure.ts`).
+pub(crate) async fn collect_completion(
+    chat: &Arc<dyn Chat>,
+    request: &ChatRequest,
+) -> Result<String> {
     let mut stream = chat
         .stream_chat(request)
         .await
@@ -2186,17 +2196,18 @@ id = "k3-256k"
     }
 
     async fn run_columns(db: &Db, run_id: &str) -> (String, i64, Option<String>) {
-        let run_id = run_id.to_owned();
-        db.conn()
-            .call(move |c| {
-                c.query_row(
-                    "SELECT state, attempt, error FROM mc_historian_run WHERE id = ?1",
-                    rusqlite::params![run_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-            })
+        let conn = db.acquire().await.unwrap();
+        let mut stmt = conn
+            .prepare("SELECT state, attempt, error FROM mc_historian_run WHERE id = ?1")
             .await
-            .unwrap()
+            .unwrap();
+        let mut rows = stmt.query([run_id]).await.unwrap();
+        let row = rows.next().await.unwrap().expect("the run row");
+        (
+            row.get::<String>(0).unwrap(),
+            row.get::<i64>(1).unwrap(),
+            row.get::<Option<String>>(2).unwrap(),
+        )
     }
 
     /// The user half of a recorded request.
@@ -2252,20 +2263,19 @@ id = "k3-256k"
             }]
         );
         assert_eq!(outcome.side_channels.events.len(), 1);
-        let (facts, events): (Option<String>, Option<String>) = db
-            .conn()
-            .call({
-                let run_id = outcome.run_id.clone();
-                move |c| {
-                    c.query_row(
-                        "SELECT facts, events FROM mc_historian_run WHERE id = ?1",
-                        rusqlite::params![run_id],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                }
-            })
-            .await
-            .unwrap();
+        let (facts, events): (Option<String>, Option<String>) = {
+            let conn = db.acquire().await.unwrap();
+            let mut stmt = conn
+                .prepare("SELECT facts, events FROM mc_historian_run WHERE id = ?1")
+                .await
+                .unwrap();
+            let mut rows = stmt.query([outcome.run_id.as_str()]).await.unwrap();
+            let row = rows.next().await.unwrap().expect("the run row");
+            (
+                row.get::<Option<String>>(0).unwrap(),
+                row.get::<Option<String>>(1).unwrap(),
+            )
+        };
         let facts: Vec<historian_validate::FactCandidate> =
             serde_json::from_str(facts.as_deref().expect("facts stored")).unwrap();
         assert_eq!(facts.len(), 1);
@@ -2388,23 +2398,20 @@ id = "k3-256k"
         );
 
         assert_eq!(scripted.requests().len(), HISTORIAN_MAX_ATTEMPTS as usize);
-        let (state, attempt, message) = db
-            .conn()
-            .call(|c| {
-                c.query_row(
-                    "SELECT state, attempt, error FROM mc_historian_run",
-                    [],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, Option<String>>(2)?,
-                        ))
-                    },
-                )
-            })
-            .await
-            .unwrap();
+        let (state, attempt, message) = {
+            let conn = db.acquire().await.unwrap();
+            let mut stmt = conn
+                .prepare("SELECT state, attempt, error FROM mc_historian_run")
+                .await
+                .unwrap();
+            let mut rows = stmt.query(()).await.unwrap();
+            let row = rows.next().await.unwrap().expect("the run row");
+            (
+                row.get::<String>(0).unwrap(),
+                row.get::<i64>(1).unwrap(),
+                row.get::<Option<String>>(2).unwrap(),
+            )
+        };
         assert_eq!(state, RunState::Failed.as_str());
         assert_eq!(attempt, HISTORIAN_MAX_ATTEMPTS);
         assert!(message.is_some_and(|text| text.contains("left uncovered messages 2-3")));
@@ -2435,23 +2442,20 @@ id = "k3-256k"
         assert!(error.downcast_ref::<ValidationFailure>().is_none());
         assert_eq!(scripted.requests().len(), 1);
         // The row is failed, not left running, and it kept the attempt.
-        let (state, attempt, message) = db
-            .conn()
-            .call(|c| {
-                c.query_row(
-                    "SELECT state, attempt, error FROM mc_historian_run",
-                    [],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, i64>(1)?,
-                            row.get::<_, Option<String>>(2)?,
-                        ))
-                    },
-                )
-            })
-            .await
-            .unwrap();
+        let (state, attempt, message) = {
+            let conn = db.acquire().await.unwrap();
+            let mut stmt = conn
+                .prepare("SELECT state, attempt, error FROM mc_historian_run")
+                .await
+                .unwrap();
+            let mut rows = stmt.query(()).await.unwrap();
+            let row = rows.next().await.unwrap().expect("the run row");
+            (
+                row.get::<String>(0).unwrap(),
+                row.get::<i64>(1).unwrap(),
+                row.get::<Option<String>>(2).unwrap(),
+            )
+        };
         assert_eq!(state, RunState::Failed.as_str());
         assert_eq!(attempt, 1);
         assert!(message.is_some_and(|text| !text.is_empty()));
@@ -2475,15 +2479,20 @@ id = "k3-256k"
 
         assert!(error.to_string().contains("no model configured"));
         // Nothing was claimed: a run that cannot start leaves no row behind.
-        let rows: i64 = db
-            .conn()
-            .call(|c| {
-                c.query_row("SELECT count(*) FROM mc_historian_run", [], |row| {
-                    row.get(0)
-                })
-            })
-            .await
-            .unwrap();
+        let rows: i64 = {
+            let conn = db.acquire().await.unwrap();
+            let mut stmt = conn
+                .prepare("SELECT count(*) FROM mc_historian_run")
+                .await
+                .unwrap();
+            let mut rows = stmt.query(()).await.unwrap();
+            rows.next()
+                .await
+                .unwrap()
+                .expect("count row")
+                .get(0)
+                .unwrap()
+        };
         assert_eq!(rows, 0);
     }
 
@@ -2520,32 +2529,32 @@ historian_model = "anthropic/claude-sonnet-4-5"
     async fn recovery_settles_a_stale_running_row_as_aborted() {
         let db = Db::open_in_memory().await.unwrap();
         // Simulate a process killed mid-completion: a row left `running`.
-        db.conn()
-            .call(|c| {
-                c.execute(
-                    "INSERT INTO mc_historian_run
-                         (id, session_id, state, chunk_ref, attempt, created_at, updated_at)
-                     VALUES ('hrun_stale', 'ses_1', 'running', '1..5', 1, 0, 0)",
-                    [],
-                )
-            })
-            .await
-            .unwrap();
+        let conn = db.acquire().await.unwrap();
+        conn.execute(
+            "INSERT INTO mc_historian_run
+                     (id, session_id, state, chunk_ref, attempt, created_at, updated_at)
+                 VALUES ('hrun_stale', 'ses_1', 'running', '1..5', 1, 0, 0)",
+            (),
+        )
+        .await
+        .unwrap();
 
         let settled = settle_running_runs(&db).await.unwrap();
 
         assert_eq!(settled, 1);
-        let (state, error) = db
-            .conn()
-            .call(|c| {
-                c.query_row(
-                    "SELECT state, error FROM mc_historian_run WHERE id = 'hrun_stale'",
-                    [],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
-                )
-            })
-            .await
-            .unwrap();
+        let (state, error) = {
+            let conn = db.acquire().await.unwrap();
+            let mut stmt = conn
+                .prepare("SELECT state, error FROM mc_historian_run WHERE id = 'hrun_stale'")
+                .await
+                .unwrap();
+            let mut rows = stmt.query(()).await.unwrap();
+            let row = rows.next().await.unwrap().expect("the stale run row");
+            (
+                row.get::<String>(0).unwrap(),
+                row.get::<Option<String>>(1).unwrap(),
+            )
+        };
         assert_eq!(state, RunState::Aborted.as_str());
         assert!(error.is_some_and(|text| text.contains("aborted at startup")));
         // Recovery is idempotent: nothing is left to settle the second time.
@@ -2555,30 +2564,31 @@ historian_model = "anthropic/claude-sonnet-4-5"
     #[tokio::test]
     async fn recovery_leaves_settled_rows_alone() {
         let db = Db::open_in_memory().await.unwrap();
-        db.conn()
-            .call(|c| {
-                c.execute(
-                    "INSERT INTO mc_historian_run
-                         (id, session_id, state, chunk_ref, attempt, created_at, updated_at)
-                     VALUES ('hrun_done', 'ses_1', 'completed', '1..5', 1, 0, 0)",
-                    [],
-                )
-            })
-            .await
-            .unwrap();
+        let conn = db.acquire().await.unwrap();
+        conn.execute(
+            "INSERT INTO mc_historian_run
+                     (id, session_id, state, chunk_ref, attempt, created_at, updated_at)
+                 VALUES ('hrun_done', 'ses_1', 'completed', '1..5', 1, 0, 0)",
+            (),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(settle_running_runs(&db).await.unwrap(), 0);
-        let state: String = db
-            .conn()
-            .call(|c| {
-                c.query_row(
-                    "SELECT state FROM mc_historian_run WHERE id = 'hrun_done'",
-                    [],
-                    |row| row.get(0),
-                )
-            })
-            .await
-            .unwrap();
+        let state: String = {
+            let conn = db.acquire().await.unwrap();
+            let mut stmt = conn
+                .prepare("SELECT state FROM mc_historian_run WHERE id = 'hrun_done'")
+                .await
+                .unwrap();
+            let mut rows = stmt.query(()).await.unwrap();
+            rows.next()
+                .await
+                .unwrap()
+                .expect("the settled run row")
+                .get(0)
+                .unwrap()
+        };
         assert_eq!(state, RunState::Completed.as_str());
     }
 }

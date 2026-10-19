@@ -26,6 +26,17 @@ pub struct MctxConfig {
     /// Pressure fraction at which a historian pass is forced.
     #[serde(default = "default_hard_threshold")]
     pub hard_threshold: f32,
+    /// Whether the dreamer (the scheduled memory-maintenance loop) runs.
+    /// Defaults to `false`, like the master switch: the loop issues hidden
+    /// completions, so it is opted into explicitly.
+    #[serde(default)]
+    pub dreamer_enabled: bool,
+    /// Dreamer tick cadence in minutes. The reference's process-wide timer
+    /// ticks every 15 minutes (`docs/architecture/dreamer.md`), the same
+    /// default here; its per-task cron schedules are deliberately not ported
+    /// (see [`crate::mctx::dreamer`]), so this one interval drives every task.
+    #[serde(default = "default_dreamer_interval_minutes")]
+    pub dreamer_interval_minutes: u64,
 }
 
 impl MctxConfig {
@@ -46,6 +57,30 @@ impl MctxConfig {
             );
         };
         let in_range = |value: f32| value.is_finite() && value > 0.0 && value <= 1.0;
+        // The interval is enforced apart from the pair: a zero interval would
+        // make every task due on every tick, i.e. a hot loop of hidden
+        // completions at the tick loop's (immediate) cadence. One minute is
+        // the smallest sane cadence, so anything below it falls back too.
+        if self.dreamer_interval_minutes < 1 {
+            tracing::warn!(
+                setting = "dreamer_interval_minutes",
+                value = self.dreamer_interval_minutes,
+                "invalid [magic_context] dreamer interval (expected a positive number of \
+                 minutes); using the default"
+            );
+            self.dreamer_interval_minutes = default_dreamer_interval_minutes();
+        }
+        // The dreamer lives inside the module: requesting it while the module
+        // is off can never run it, so it is turned back off with a warning
+        // instead of staying a silently inert `true`.
+        if self.dreamer_enabled && !self.enabled {
+            tracing::warn!(
+                setting = "dreamer_enabled",
+                "enabled [magic_context] dreamer while the module is disabled; the dreamer \
+                 cannot run and stays off"
+            );
+            self.dreamer_enabled = false;
+        }
         if !in_range(self.soft_threshold) {
             bad("soft_threshold", self.soft_threshold);
         } else if !in_range(self.hard_threshold) {
@@ -69,6 +104,10 @@ fn default_hard_threshold() -> f32 {
     0.85
 }
 
+fn default_dreamer_interval_minutes() -> u64 {
+    15
+}
+
 impl Default for MctxConfig {
     fn default() -> Self {
         Self {
@@ -76,6 +115,8 @@ impl Default for MctxConfig {
             historian_model: None,
             soft_threshold: default_soft_threshold(),
             hard_threshold: default_hard_threshold(),
+            dreamer_enabled: false,
+            dreamer_interval_minutes: default_dreamer_interval_minutes(),
         }
     }
 }
@@ -157,6 +198,41 @@ mod tests {
     }
 
     #[test]
+    fn validated_rejects_a_zero_dreamer_interval_and_an_orphan_dreamer() {
+        // A zero interval would make every task due on every tick — a hot loop
+        // of hidden completions; anything below a minute is treated the same.
+        let cfg = MctxConfig {
+            dreamer_interval_minutes: 0,
+            ..MctxConfig::default()
+        }
+        .validated();
+        assert_eq!(cfg.dreamer_interval_minutes, 15);
+        let cfg = MctxConfig {
+            dreamer_interval_minutes: 1,
+            ..MctxConfig::default()
+        }
+        .validated();
+        assert_eq!(cfg.dreamer_interval_minutes, 1, "one minute is honoured");
+        let cfg = MctxConfig {
+            enabled: false,
+            dreamer_enabled: true,
+            ..MctxConfig::default()
+        }
+        .validated();
+        assert!(
+            !cfg.dreamer_enabled,
+            "a dreamer inside a disabled module can never run"
+        );
+        let cfg = MctxConfig {
+            enabled: true,
+            dreamer_enabled: true,
+            ..MctxConfig::default()
+        }
+        .validated();
+        assert!(cfg.dreamer_enabled, "an enabled module keeps its dreamer");
+    }
+
+    #[test]
     fn defaults() {
         // Serde field defaults and the Default impl must agree — they drift
         // independently (a changed default_* fn vs a forgotten impl arm).
@@ -167,5 +243,7 @@ mod tests {
         let cfg = MctxConfig::default();
         assert!(!cfg.enabled);
         assert!(cfg.historian_model.is_none());
+        assert!(!cfg.dreamer_enabled);
+        assert_eq!(cfg.dreamer_interval_minutes, 15);
     }
 }

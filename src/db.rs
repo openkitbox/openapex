@@ -1,14 +1,20 @@
-//! SQLite storage layer.
+//! Storage layer: turso (SQLite-compatible, pure Rust, native async).
 //!
-//! Wraps a `tokio_rusqlite::Connection` opened on the configured path and
-//! applies the upstream-compatible schema as an idempotent migration. The
-//! table/column names MUST match opencode v2's database exactly so that the
-//! ox server and the Bun server can read each other's DB files.
+//! [`Db`] owns the connection, its pragmas and the versioned schema; every
+//! domain module owns the SQL for its own tables (see the crate's mctx/api
+//! modules) and reaches the driver through [`Db::conn`]. There is no query
+//! wrapper layer: the driver's async API is the API.
+//!
+//! The upstream-compatible table/column names are kept verbatim so the schema
+//! stays recognisable against opencode v2's, but ox runs its own database file
+//! and does not read or write the Bun server's.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Result;
-use tokio_rusqlite::Connection;
+use tokio::sync::{Mutex, MutexGuard, OwnedSemaphorePermit, Semaphore};
+use turso::{Builder, Connection};
 
 /// Embedded upstream-compatible schema (opencode v2), migration version 1.
 /// Idempotent within itself: every statement uses `IF NOT EXISTS` (so it is
@@ -241,99 +247,69 @@ ALTER TABLE mc_historian_run ADD COLUMN facts text;
 ALTER TABLE mc_historian_run ADD COLUMN events text;
 "#;
 
-/// The unified retrieval index behind `ctx_search` (Task 7). One FTS5 table
-/// holds the searchable text of all three indexed corpora, tagged by `source`
-/// (`memory`/`note`/`compartment`) and addressed by `ref` (the source row's
-/// id). `source` and `ref` are UNINDEXED — they are filters and join keys,
-/// never search terms — so `body` is the only indexed column.
+/// The retrieval indexes behind `ctx_search` (Task 7), on turso.
 ///
-/// Maintenance is by **trigger**, not write-through in the store functions:
-/// `mctx::memory` and `mctx::compartments` already open their own
-/// transactions and know nothing about search, so triggers on the three
-/// source tables keep the index in step with every write path — including
-/// ones added later — without a call site having to remember. SQLite forbids
-/// `CREATE INDEX` on a virtual table, so the one-row-per-`(source, ref)`
-/// invariant is held by the trigger discipline itself: `INSERT` adds one row,
-/// `UPDATE` deletes the old `ref` then adds the new one, `DELETE` removes it.
+/// turso indexes a *column* with a Tantivy-backed FTS index
+/// (`CREATE INDEX … USING fts (cols)`), and the index follows every INSERT /
+/// UPDATE / DELETE by itself. That is why there is no virtual table, no
+/// trigger and no backfill-trigger maintenance here: the previous FTS5 design
+/// needed nine triggers to keep a shadow table in step, and this needs none.
 ///
-/// The three `INSERT ... SELECT` statements backfill rows that already exist
-/// when V7 runs (a database upgraded from a pre-V7 version); a fresh database
-/// finds them empty. They must mirror the `AFTER INSERT` trigger bodies — the
-/// same text expression per source — so both histories converge on the same
-/// index.
+/// Sources are separated by indexing each source table, which replaces FTS5's
+/// `UNINDEXED source` column. A compartment's searchable text is not a column
+/// (`tiers` is JSON), so this migration adds one derived column, filled by the
+/// single writer ([`crate::mctx::compartments`]) and backfilled here for rows
+/// that predate it.
 ///
-/// Each `AFTER INSERT` trigger deletes its `(source, ref)` rows BEFORE inserting
-/// its own. A plain `INSERT` would leave a duplicate behind under
-/// `INSERT OR REPLACE`/`REPLACE`: with `recursive_triggers` off (the default)
-/// the conflict's implicit delete does not fire `AFTER DELETE`, so the stale
-/// index row would survive. Deleting in the insert trigger makes one row per
-/// `(source, ref)` hold for every write style, which matters because SQLite
-/// cannot index a virtual table. `json_valid` guards the compartment tiers, which the store parses
-/// leniently ([`crate::mctx::compartments`] treats malformed JSON as empty);
-/// on this SQLite build `json_extract` of malformed text would raise, so the
-/// guard is load-bearing, not decorative.
+/// The backfill is an UPDATE, not an INSERT…SELECT: an upgraded database has
+/// compartment rows whose new column is the empty default. `json_valid` guards
+/// the malformed-JSON case, which raises in turso just as it does in SQLite.
 const MIGRATION_V7: &str = r#"
-CREATE VIRTUAL TABLE IF NOT EXISTS mc_search_fts USING fts5(body, source UNINDEXED, ref UNINDEXED);
-CREATE TRIGGER IF NOT EXISTS mc_memory_fts_ai AFTER INSERT ON mc_memory BEGIN
-  DELETE FROM mc_search_fts WHERE source = 'memory' AND ref = new.id;
-  INSERT INTO mc_search_fts(body, source, ref) VALUES (new.content, 'memory', new.id);
-END;
-CREATE TRIGGER IF NOT EXISTS mc_memory_fts_au AFTER UPDATE ON mc_memory BEGIN
-  DELETE FROM mc_search_fts WHERE source = 'memory' AND ref = old.id;
-  INSERT INTO mc_search_fts(body, source, ref) VALUES (new.content, 'memory', new.id);
-END;
-CREATE TRIGGER IF NOT EXISTS mc_memory_fts_ad AFTER DELETE ON mc_memory BEGIN
-  DELETE FROM mc_search_fts WHERE source = 'memory' AND ref = old.id;
-END;
-CREATE TRIGGER IF NOT EXISTS mc_note_fts_ai AFTER INSERT ON mc_note BEGIN
-  DELETE FROM mc_search_fts WHERE source = 'note' AND ref = new.id;
-  INSERT INTO mc_search_fts(body, source, ref)
-    VALUES (trim(new.title || ' ' || new.body || ' ' || COALESCE(new.surface_condition, '')), 'note', new.id);
-END;
-CREATE TRIGGER IF NOT EXISTS mc_note_fts_au AFTER UPDATE ON mc_note BEGIN
-  DELETE FROM mc_search_fts WHERE source = 'note' AND ref = old.id;
-  INSERT INTO mc_search_fts(body, source, ref)
-    VALUES (trim(new.title || ' ' || new.body || ' ' || COALESCE(new.surface_condition, '')), 'note', new.id);
-END;
-CREATE TRIGGER IF NOT EXISTS mc_note_fts_ad AFTER DELETE ON mc_note BEGIN
-  DELETE FROM mc_search_fts WHERE source = 'note' AND ref = old.id;
-END;
-CREATE TRIGGER IF NOT EXISTS mc_compartments_fts_ai AFTER INSERT ON mc_compartments BEGIN
-  DELETE FROM mc_search_fts WHERE source = 'compartment' AND ref = new.id;
-  INSERT INTO mc_search_fts(body, source, ref)
-    VALUES (CASE WHEN json_valid(new.tiers) THEN trim(
-              COALESCE(json_extract(new.tiers, '$.title'), '') || ' ' ||
-              COALESCE(json_extract(new.tiers, '$.p1'), '') || ' ' ||
-              COALESCE(json_extract(new.tiers, '$.p2'), '') || ' ' ||
-              COALESCE(json_extract(new.tiers, '$.p3'), '') || ' ' ||
-              COALESCE(json_extract(new.tiers, '$.p4'), '')) ELSE '' END,
-            'compartment', new.id);
-END;
-CREATE TRIGGER IF NOT EXISTS mc_compartments_fts_au AFTER UPDATE ON mc_compartments BEGIN
-  DELETE FROM mc_search_fts WHERE source = 'compartment' AND ref = old.id;
-  INSERT INTO mc_search_fts(body, source, ref)
-    VALUES (CASE WHEN json_valid(new.tiers) THEN trim(
-              COALESCE(json_extract(new.tiers, '$.title'), '') || ' ' ||
-              COALESCE(json_extract(new.tiers, '$.p1'), '') || ' ' ||
-              COALESCE(json_extract(new.tiers, '$.p2'), '') || ' ' ||
-              COALESCE(json_extract(new.tiers, '$.p3'), '') || ' ' ||
-              COALESCE(json_extract(new.tiers, '$.p4'), '')) ELSE '' END,
-            'compartment', new.id);
-END;
-CREATE TRIGGER IF NOT EXISTS mc_compartments_fts_ad AFTER DELETE ON mc_compartments BEGIN
-  DELETE FROM mc_search_fts WHERE source = 'compartment' AND ref = old.id;
-END;
-INSERT INTO mc_search_fts(body, source, ref) SELECT content, 'memory', id FROM mc_memory;
-INSERT INTO mc_search_fts(body, source, ref)
-  SELECT trim(title || ' ' || body || ' ' || COALESCE(surface_condition, '')), 'note', id FROM mc_note;
-INSERT INTO mc_search_fts(body, source, ref)
-  SELECT CASE WHEN json_valid(tiers) THEN trim(
-           COALESCE(json_extract(tiers, '$.title'), '') || ' ' ||
-           COALESCE(json_extract(tiers, '$.p1'), '') || ' ' ||
-           COALESCE(json_extract(tiers, '$.p2'), '') || ' ' ||
-           COALESCE(json_extract(tiers, '$.p3'), '') || ' ' ||
-           COALESCE(json_extract(tiers, '$.p4'), '')) ELSE '' END,
-         'compartment', id FROM mc_compartments;
+ALTER TABLE mc_compartments ADD COLUMN search_text text NOT NULL DEFAULT '';
+UPDATE mc_compartments SET search_text = CASE WHEN json_valid(tiers) THEN trim(
+         COALESCE(json_extract(tiers, '$.title'), '') || ' ' ||
+         COALESCE(json_extract(tiers, '$.p1'), '') || ' ' ||
+         COALESCE(json_extract(tiers, '$.p2'), '') || ' ' ||
+         COALESCE(json_extract(tiers, '$.p3'), '') || ' ' ||
+         COALESCE(json_extract(tiers, '$.p4'), '')) ELSE '' END;
+CREATE INDEX IF NOT EXISTS mc_memory_fts ON mc_memory USING fts (content);
+CREATE INDEX IF NOT EXISTS mc_note_fts ON mc_note USING fts (title, body, surface_condition);
+CREATE INDEX IF NOT EXISTS mc_compartments_fts ON mc_compartments USING fts (search_text);
+"#;
+
+/// The dreamer's per-`(project, task)` schedule state (Task 8). One row per
+/// project and task — the same grain as the reference's
+/// `task_schedule_state` (`storage-task-schedule.ts`) — holding everything the
+/// interval scheduler needs to decide whether a task is due and to report how
+/// its last run went:
+///
+/// - `last_run_at` is the START of the last *successful* run (the reference
+///   stamps it from the start so work that lands during a run is not skipped;
+///   see [`crate::mctx::dreamer`]). It is NULL until the first success, and a
+///   failed or skipped run never moves it.
+/// - `last_attempt_at` stamps every started run; together with
+///   `consecutive_failures` it is the (simplified) retry bound: past
+///   [`crate::mctx::dreamer::MAX_DREAM_FAILURES`] consecutive failures the row
+///   is treated as the next interval slot rather than retried on every tick.
+/// - `last_status`/`last_error` keep the terminal outcome and the failure
+///   class plus message, so a failing task is diagnosable from the DB alone.
+/// - `rotation_cursor` is the per-project category cursor for `curate`; it
+///   lives here because it must survive restarts (a process-local cursor would
+///   re-scan the same categories every boot).
+///
+/// The primary key is both the identity and the only index a lookup needs.
+const MIGRATION_V8: &str = r#"
+CREATE TABLE IF NOT EXISTS mc_dream_state (
+  project text NOT NULL,
+  task text NOT NULL,
+  last_run_at integer,
+  last_attempt_at integer NOT NULL DEFAULT 0,
+  last_status text,
+  last_error text,
+  consecutive_failures integer NOT NULL DEFAULT 0,
+  rotation_cursor integer NOT NULL DEFAULT 0,
+  PRIMARY KEY (project, task)
+);
 "#;
 
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
@@ -347,6 +323,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (5, MIGRATION_V5),
     (6, MIGRATION_V6),
     (7, MIGRATION_V7),
+    (8, MIGRATION_V8),
 ];
 
 /// All indexes the migration creates: V1's verbatim from upstream
@@ -375,6 +352,11 @@ const EXPECTED_INDEXES: &[&str] = &[
     "mc_note_session_idx",
     "mc_historian_run_session_idx",
     "mc_tag_session_message_idx",
+    // The FTS indexes (turso indexes an expression-free column list, and the
+    // index is a real `sqlite_master` index, not a shadow table).
+    "mc_memory_fts",
+    "mc_note_fts",
+    "mc_compartments_fts",
 ];
 
 /// Tables created by the embedded migration, in creation order.
@@ -394,22 +376,31 @@ const EXPECTED_TABLES: &[&str] = &[
     "mc_historian_run",
     "mc_tag",
     "mc_drop",
-    // FTS5 keeps its index in shadow tables that SQLite creates alongside the
-    // virtual table (one per FTS5 table, named after it: `<name>_config`,
-    // `_content`, `_data`, `_docsize`, `_idx`).
-    "mc_search_fts",
-    "mc_search_fts_config",
-    "mc_search_fts_content",
-    "mc_search_fts_data",
-    "mc_search_fts_docsize",
-    "mc_search_fts_idx",
+    "mc_dream_state",
 ];
 
-/// Async handle to the SQLite database.
+/// Async handle to the database.
 #[derive(Clone)]
 pub struct Db {
-    conn: Connection,
+    database: turso::Database,
+    /// Idle connections, ready to hand out. A pooled [`Connection`] serves one
+    /// operation at a time: turso refuses concurrent use of a connection
+    /// ("concurrent use forbidden" — a non-blocking check in its per-connection
+    /// guard), so a connection cannot be shared the way a mutex-guarded
+    /// `sqlite3*` can.
+    idle: Arc<Mutex<Vec<Connection>>>,
+    /// Caps live connections; each carries its own page cache.
+    permits: Arc<Semaphore>,
+    /// The ephemeral database file behind [`Db::open_in_memory`], deleted when
+    /// the handle goes away.
+    ephemeral: Option<Arc<EphemeralFile>>,
+    /// One writer at a time. ox's transactions are short, and serializing them
+    /// here keeps `BEGIN IMMEDIATE` from ever meeting a busy database.
+    write_gate: Arc<Mutex<()>>,
 }
+
+/// Most connections ox will hold open at once (idle ones are kept for reuse).
+const MAX_CONNECTIONS: usize = 8;
 
 impl Db {
     /// Open (creating if needed) the database at `path` and apply migrations.
@@ -418,92 +409,302 @@ impl Db {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path).await?;
-        conn.call(|c| -> rusqlite::Result<()> {
-            c.pragma_update(None, "journal_mode", "WAL")?;
-            c.pragma_update(None, "busy_timeout", 5000)?;
-            c.pragma_update(None, "foreign_keys", "ON")?;
-            Ok(())
-        })
-        .await?;
-        let db = Self { conn };
+        // turso takes the path as a `&str`; a lossy conversion would silently
+        // open a different file, so a non-UTF-8 path is an error.
+        let Some(path_str) = path.to_str() else {
+            anyhow::bail!("database path is not valid UTF-8: {}", path.display());
+        };
+        Self::open_path(path_str).await
+    }
+
+    /// Open a throwaway database (for tests and ephemeral runs).
+    ///
+    /// A file rather than `:memory:`: a turso in-memory database is one
+    /// database *per connection*, so a pool of connections would each see an
+    /// empty look-alike. The directory is removed when the handle drops.
+    pub async fn open_in_memory() -> Result<Self> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "ox-db-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir)?;
+        let ephemeral = Arc::new(EphemeralFile(dir.clone()));
+        let mut db = Self::open_path(dir.join("ox.db").to_str().unwrap_or_default()).await?;
+        db.ephemeral = Some(ephemeral);
+        Ok(db)
+    }
+
+    async fn open_path(path: &str) -> Result<Self> {
+        // `experimental_index_method` is required for `CREATE INDEX … USING
+        // fts`, which is how the search indexes are declared.
+        let database = Builder::new_local(path)
+            .experimental_index_method(true)
+            .build()
+            .await?;
+        let db = Self {
+            database,
+            idle: Arc::new(Mutex::new(Vec::new())),
+            permits: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
+            ephemeral: None,
+            write_gate: Arc::new(Mutex::new(())),
+        };
         db.migrate().await?;
         Ok(db)
     }
 
-    /// Open an in-memory database (for tests and ephemeral runs).
-    pub async fn open_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory().await?;
-        conn.call(|c| -> rusqlite::Result<()> {
-            c.pragma_update(None, "journal_mode", "WAL")?;
-            c.pragma_update(None, "busy_timeout", 5000)?;
-            c.pragma_update(None, "foreign_keys", "ON")?;
-            Ok(())
+    /// Borrow a connection for the duration of one operation.
+    ///
+    /// The guard derefs to [`Connection`] and returns the connection to the
+    /// pool on drop; holding it longer than a single operation is what makes
+    /// concurrent use impossible.
+    pub async fn acquire(&self) -> Result<Conn<'_>> {
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow::anyhow!("connection pool closed"))?;
+        let idle = {
+            let mut idle = self.idle.lock().await;
+            idle.pop()
+        };
+        let conn = match idle {
+            Some(conn) => conn,
+            None => self.connect().await?,
+        };
+        // A transaction left open by a writer that failed mid-way must not be
+        // handed to the next user: statements would run inside it and either
+        // commit with the next COMMIT or vanish with a later rollback.
+        if !conn.is_autocommit()? {
+            // `execute`, not `query`: turso answers a non-returning statement
+            // sent through `query` with success and does nothing.
+            conn.execute("ROLLBACK", ()).await?;
+        }
+        Ok(Conn {
+            db: self,
+            conn: Some(conn),
+            _permit: permit,
         })
-        .await?;
-        let db = Self { conn };
-        db.migrate().await?;
-        Ok(db)
+    }
+
+    /// One fresh connection with ox's pragmas. WAL is persistent in the file,
+    /// but the busy timeout and foreign keys are per connection, so every
+    /// connection sets them.
+    async fn connect(&self) -> Result<Connection> {
+        let conn = self.database.connect()?;
+        conn.pragma_update("journal_mode", "'wal'").await?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+        conn.pragma_update("foreign_keys", "ON").await?;
+        Ok(conn)
+    }
+
+    /// Begin a write transaction, waiting for any other writer.
+    pub async fn begin(&self) -> Result<WriteTx<'_>> {
+        let gate = self.write_gate.lock().await;
+        let conn = self.acquire().await?;
+        conn.execute("BEGIN IMMEDIATE", ()).await?;
+        Ok(WriteTx { conn, _gate: gate })
     }
 
     /// Apply pending migrations in version order. Each migration runs in a
-    /// transaction and bumps `PRAGMA user_version`, so re-running is a no-op
+    /// transaction that bumps `PRAGMA user_version`, so re-running is a no-op
     /// once the database is current.
     pub async fn migrate(&self) -> Result<()> {
-        self.conn
-            .call(|c| -> rusqlite::Result<()> {
-                let current: u32 = c.pragma_query_value(None, "user_version", |row| row.get(0))?;
-                for &(version, sql) in MIGRATIONS {
-                    if version <= current {
-                        continue;
-                    }
-                    let tx = c.transaction()?;
-                    tx.execute_batch(sql)?;
-                    tx.pragma_update(None, "user_version", version)?;
-                    tx.commit()?;
-                    tracing::info!(version, "applied db migration");
-                }
-                Ok(())
-            })
-            .await?;
+        let current = self.user_version().await?;
+        for &(version, sql) in MIGRATIONS {
+            if version <= current {
+                continue;
+            }
+            let tx = self.begin().await?;
+            tx.execute_batch(sql).await?;
+            tx.pragma_update("user_version", version).await?;
+            tx.commit().await?;
+            tracing::info!(version, "applied db migration");
+        }
         Ok(())
     }
 
-    /// Access the underlying connection for queries.
-    pub fn conn(&self) -> &Connection {
+    /// Current `PRAGMA user_version` (migration level).
+    async fn user_version(&self) -> Result<u32> {
+        let conn = self.acquire().await?;
+        let mut stmt = conn.prepare("PRAGMA user_version").await?;
+        let mut rows = stmt.query(()).await?;
+        match rows.next().await? {
+            Some(row) => Ok(row.get::<i64>(0)? as u32),
+            None => Ok(0),
+        }
+    }
+
+    /// Check whether a table exists.
+    pub async fn table_exists(&self, name: &'static str) -> Result<bool> {
+        let conn = self.acquire().await?;
+        let mut stmt = conn
+            .prepare("SELECT count(*) FROM sqlite_master WHERE type='table' AND name = ?1")
+            .await?;
+        let mut rows = stmt.query([name]).await?;
+        match rows.next().await? {
+            Some(row) => Ok(row.get::<i64>(0)? > 0),
+            None => Ok(false),
+        }
+    }
+}
+
+/// Removes a throwaway database's directory on drop.
+struct EphemeralFile(std::path::PathBuf);
+
+impl Drop for EphemeralFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A pooled connection, borrowed for one operation.
+pub struct Conn<'a> {
+    db: &'a Db,
+    conn: Option<Connection>,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl std::ops::Deref for Conn<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        self.conn.as_ref().expect("connection present until drop")
+    }
+}
+
+impl Drop for Conn<'_> {
+    fn drop(&mut self) {
+        let Some(conn) = self.conn.take() else {
+            return;
+        };
+        // A writer that failed mid-transaction leaves it open. Settle it before
+        // the connection is reused or released: an open write transaction holds
+        // the database's write lock, and the next writer would wait out its
+        // busy timeout. Rollback is async, so it runs on a task; without a
+        // runtime the connection is simply dropped, and closing it rolls back.
+        let open_transaction = matches!(conn.is_autocommit(), Ok(false));
+        if open_transaction && let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let idle = Arc::clone(&self.db.idle);
+            handle.spawn(async move {
+                let _ = conn.execute("ROLLBACK", ()).await;
+                let mut idle = idle.lock().await;
+                if idle.len() < MAX_CONNECTIONS {
+                    idle.push(conn);
+                }
+            });
+            return;
+        }
+        // `try_lock` is enough: an idle slot is an optimisation.
+        if let Ok(mut idle) = self.db.idle.try_lock()
+            && idle.len() < MAX_CONNECTIONS
+        {
+            idle.push(conn);
+        }
+    }
+}
+
+/// A write transaction: a pooled connection plus the write gate.
+///
+/// Held by one task for the transaction's whole life, so prepared statements
+/// inside it are the only place prepared *writes* may live — outside a
+/// transaction they would be sharing a connection that another task may borrow
+/// at any moment.
+pub struct WriteTx<'a> {
+    conn: Conn<'a>,
+    _gate: MutexGuard<'a, ()>,
+}
+
+impl WriteTx<'_> {
+    /// Commit and release the connection.
+    pub async fn commit(self) -> Result<()> {
+        self.conn.execute("COMMIT", ()).await?;
+        Ok(())
+    }
+
+    /// Roll back and release the connection.
+    pub async fn rollback(self) -> Result<()> {
+        self.conn.execute("ROLLBACK", ()).await?;
+        Ok(())
+    }
+}
+
+impl std::ops::Deref for WriteTx<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
         &self.conn
     }
+}
 
-    /// Current `PRAGMA user_version` (migration level).
-    #[cfg(test)]
-    async fn user_version(&self) -> u32 {
-        self.conn
-            .call(|c| -> rusqlite::Result<u32> {
-                c.pragma_query_value(None, "user_version", |row| row.get(0))
-            })
-            .await
-            .unwrap()
-    }
-
-    /// Check whether a table exists (used for graceful degradation when
-    /// sharing a DB file with the upstream server).
-    pub async fn table_exists(&self, name: &'static str) -> Result<bool> {
-        let exists = self
-            .conn
-            .call(move |c| -> rusqlite::Result<bool> {
-                let mut stmt =
-                    c.prepare("SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1")?;
-                let count: i64 = stmt.query_row([name], |row| row.get(0))?;
-                Ok(count > 0)
-            })
-            .await?;
-        Ok(exists)
+/// Read an optional row from a prepared statement.
+///
+/// turso reports "no rows" as an error variant rather than an empty stream, and
+/// 33 rusqlite call sites used `OptionalExtension::optional` for exactly this
+/// distinction. Keeping it in one place is what makes that distinction
+/// impossible to get wrong: a real error must not be read as an absent row.
+pub async fn optional(
+    stmt: &mut turso::Statement,
+    params: impl turso::IntoParams,
+) -> Result<Option<turso::Row>> {
+    match stmt.query_row(params).await {
+        Ok(row) => Ok(Some(row)),
+        Err(turso::Error::QueryReturnedNoRows) => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A bare connection with the same builder settings [`Db`] uses — the same
+    /// driver that will migrate the fixture, so a hand-built database is a
+    /// real upgrade fixture rather than a foreign one.
+    async fn raw(path: &Path) -> Connection {
+        let db = Builder::new_local(path.to_str().unwrap())
+            .experimental_index_method(true)
+            .build()
+            .await
+            .unwrap();
+        db.connect().unwrap()
+    }
+
+    /// Build a database as it exists after `version`, by hand.
+    async fn build_upto(path: &Path, version: u32) {
+        let conn = raw(path).await;
+        for &(v, sql) in MIGRATIONS {
+            if v <= version {
+                conn.execute_batch(sql).await.unwrap();
+            }
+        }
+        conn.pragma_update("user_version", version).await.unwrap();
+    }
+
+    async fn query_row(db: &Db, sql: &str) -> turso::Row {
+        let conn = db.acquire().await.unwrap();
+        let mut stmt = conn.prepare(sql).await.unwrap();
+        let mut rows = stmt.query(()).await.unwrap();
+        rows.next().await.unwrap().expect("expected one row")
+    }
+
+    async fn count(db: &Db, sql: &str) -> i64 {
+        query_row(db, sql).await.get::<i64>(0).unwrap()
+    }
+
+    async fn columns(db: &Db, table: &str) -> Vec<String> {
+        let conn = db.acquire().await.unwrap();
+        let mut stmt = conn
+            .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .await
+            .unwrap();
+        let mut rows = stmt.query(()).await.unwrap();
+        let mut names = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            names.push(row.get::<String>(0).unwrap());
+        }
+        names
+    }
 
     #[tokio::test]
     async fn fresh_db_has_all_tables() {
@@ -520,50 +721,76 @@ mod tests {
     #[tokio::test]
     async fn migration_tracks_user_version_and_is_idempotent() {
         let db = Db::open_in_memory().await.unwrap();
-        assert_eq!(db.user_version().await, 7);
+        assert_eq!(db.user_version().await.unwrap(), 8);
         // Re-running must be a no-op: version stays, no error.
         db.migrate().await.unwrap();
         db.migrate().await.unwrap();
-        assert_eq!(db.user_version().await, 7);
+        assert_eq!(db.user_version().await.unwrap(), 8);
+    }
+
+    /// The pragmas [`Db::connect`] sets are the ones the storage layer relies
+    /// on (WAL for concurrent readers, a busy timeout for writers, foreign keys
+    /// for the session cascades).
+    #[tokio::test]
+    async fn connect_sets_the_expected_pragmas() {
+        let db = Db::open_in_memory().await.unwrap();
+        assert_eq!(
+            query_row(&db, "PRAGMA journal_mode")
+                .await
+                .get::<String>(0)
+                .unwrap(),
+            "wal"
+        );
+        assert_eq!(
+            query_row(&db, "PRAGMA busy_timeout")
+                .await
+                .get::<i64>(0)
+                .unwrap(),
+            5000
+        );
+        assert_eq!(
+            query_row(&db, "PRAGMA foreign_keys")
+                .await
+                .get::<i64>(0)
+                .unwrap(),
+            1
+        );
     }
 
     #[tokio::test]
     async fn mc_migration_creates_tables_and_indexes() {
         let db = Db::open_in_memory().await.unwrap();
-        let names = db
-            .conn()
-            .call(|c| -> rusqlite::Result<Vec<String>> {
-                // Triggers are excluded here (V7 adds nine); the migration
-                // convergence test below compares every object type.
-                let mut stmt = c.prepare(
-                    "SELECT name FROM sqlite_master
-                      WHERE type IN ('table', 'index') AND name LIKE 'mc\\_%' ESCAPE '\\'
-                      ORDER BY name",
-                )?;
-                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-                rows.collect()
-            })
+        let conn = db.acquire().await.unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT name FROM sqlite_master
+                  WHERE type IN ('table', 'index') AND name LIKE 'mc%'
+                  ORDER BY name",
+            )
             .await
             .unwrap();
+        let mut rows = stmt.query(()).await.unwrap();
+        let mut names = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            names.push(row.get::<String>(0).unwrap());
+        }
         assert_eq!(
             names,
             vec![
                 "mc_compartments",
+                "mc_compartments_fts",
                 "mc_compartments_session_idx",
+                "mc_dream_state",
                 "mc_drop",
                 "mc_frozen_state",
                 "mc_historian_run",
                 "mc_historian_run_session_idx",
                 "mc_memory",
+                "mc_memory_fts",
                 "mc_memory_project_idx",
                 "mc_note",
+                "mc_note_fts",
                 "mc_note_session_idx",
-                "mc_search_fts",
-                "mc_search_fts_config",
-                "mc_search_fts_content",
-                "mc_search_fts_data",
-                "mc_search_fts_docsize",
-                "mc_search_fts_idx",
                 "mc_tag",
                 "mc_tag_session_message_idx",
             ]
@@ -574,14 +801,9 @@ mod tests {
     async fn migration_v2_upgrades_an_existing_v1_database() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("upgrade.db");
-        // Build a v1 database by hand: apply only MIGRATION_V1 and stamp it.
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(MIGRATION_V1).unwrap();
-            conn.pragma_update(None, "user_version", 1).unwrap();
-        }
+        build_upto(&path, 1).await;
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await, 7);
+        assert_eq!(db.user_version().await.unwrap(), 8);
         for table in [
             "mc_frozen_state",
             "mc_compartments",
@@ -600,313 +822,340 @@ mod tests {
     async fn migration_v3_upgrades_an_existing_v2_database() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("upgrade3.db");
-        // Build a v2 database by hand: apply V1+V2 and stamp version 2.
-        {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(MIGRATION_V1).unwrap();
-            conn.execute_batch(MIGRATION_V2).unwrap();
-            conn.pragma_update(None, "user_version", 2).unwrap();
-        }
+        build_upto(&path, 2).await;
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await, 7);
+        assert_eq!(db.user_version().await.unwrap(), 8);
         for table in ["mc_tag", "mc_drop"] {
             assert!(
                 db.table_exists(table).await.unwrap(),
                 "expected table {table} after upgrade"
             );
         }
-        // The mc_drop default state and the tag lookup index survive the
-        // upgrade path exactly as on a fresh database.
-        let indexes = db
-            .conn()
-            .call(|c| -> rusqlite::Result<i64> {
-                c.query_row(
-                    "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='mc_tag_session_message_idx'",
-                    [],
-                    |row| row.get(0),
-                )
-            })
+        assert_eq!(
+            count(
+                &db,
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='mc_tag_session_message_idx'"
+            )
+            .await,
+            1
+        );
+        let fresh = Db::open_in_memory().await.unwrap();
+        let fresh_conn = fresh.acquire().await.unwrap();
+        fresh_conn
+            .execute(
+                "INSERT INTO mc_drop (session_id, tag, reason, created_at) VALUES ('s', 7, 'r', 0)",
+                (),
+            )
             .await
             .unwrap();
-        assert_eq!(indexes, 1);
-        let db2 = Db::open_in_memory().await.unwrap();
-        db2.conn()
-            .call(|c| -> rusqlite::Result<()> {
-                c.execute(
-                    "INSERT INTO mc_drop (session_id, tag, reason, created_at) VALUES ('s', 7, 'r', 0)",
-                    [],
-                )?;
-                let state: String = c.query_row(
-                    "SELECT state FROM mc_drop WHERE session_id = 's' AND tag = 7",
-                    [],
-                    |row| row.get(0),
-                )?;
-                assert_eq!(state, "queued", "state column defaults to 'queued'");
-                Ok(())
-            })
+        assert_eq!(
+            query_row(
+                &fresh,
+                "SELECT state FROM mc_drop WHERE session_id = 's' AND tag = 7"
+            )
             .await
-            .unwrap();
+            .get::<String>(0)
+            .unwrap(),
+            "queued",
+            "state column defaults to 'queued'"
+        );
     }
 
     #[tokio::test]
     async fn migration_v4_upgrades_an_existing_v3_database() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("upgrade4.db");
-        // Build a v3 database by hand: apply V1..V3 and stamp version 3.
+        build_upto(&path, 3).await;
         {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(MIGRATION_V1).unwrap();
-            conn.execute_batch(MIGRATION_V2).unwrap();
-            conn.execute_batch(MIGRATION_V3).unwrap();
-            conn.pragma_update(None, "user_version", 3).unwrap();
-            // A pre-V4 row: no lifecycle columns yet.
+            let conn = raw(&path).await;
             conn.execute(
                 "INSERT INTO mc_memory (id, project, content, category, created_at, updated_at)
                  VALUES ('mem_old', '/p', 'pre-existing fact', 'ARCHITECTURE', 1, 1)",
-                [],
+                (),
             )
+            .await
             .unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await, 7);
+        assert_eq!(db.user_version().await.unwrap(), 8);
         // The pre-existing row reads back with the 'active' default and no
         // archive reason — the additive columns converge both DB histories.
-        let (status, reason): (String, Option<String>) = db
-            .conn()
-            .call(|c| {
-                c.query_row(
-                    "SELECT status, archive_reason FROM mc_memory WHERE id = 'mem_old'",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-            })
-            .await
-            .unwrap();
-        assert_eq!(status, "active");
-        assert_eq!(reason, None);
+        let row = query_row(
+            &db,
+            "SELECT status, archive_reason FROM mc_memory WHERE id = 'mem_old'",
+        )
+        .await;
+        assert_eq!(row.get::<String>(0).unwrap(), "active");
+        assert_eq!(row.get::<Option<String>>(1).unwrap(), None);
         // Explicit archived rows round-trip both new columns.
-        db.conn()
-            .call(|c| -> rusqlite::Result<()> {
-                c.execute(
-                    "INSERT INTO mc_memory (id, project, content, category, created_at,
-                        updated_at, status, archive_reason)
-                     VALUES ('mem_a', '/p', 'gone', 'NAMING', 2, 2, 'archived', 'merged')",
-                    [],
-                )?;
-                let (status, reason): (String, Option<String>) = c.query_row(
-                    "SELECT status, archive_reason FROM mc_memory WHERE id = 'mem_a'",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )?;
-                assert_eq!(status, "archived");
-                assert_eq!(reason.as_deref(), Some("merged"));
-                Ok(())
-            })
+        db.acquire()
+            .await
+            .unwrap()
+            .execute(
+                "INSERT INTO mc_memory (id, project, content, category, created_at,
+                    updated_at, status, archive_reason)
+                 VALUES ('mem_a', '/p', 'gone', 'NAMING', 2, 2, 'archived', 'merged')",
+                (),
+            )
             .await
             .unwrap();
+        let row = query_row(
+            &db,
+            "SELECT status, archive_reason FROM mc_memory WHERE id = 'mem_a'",
+        )
+        .await;
+        assert_eq!(row.get::<String>(0).unwrap(), "archived");
+        assert_eq!(
+            row.get::<Option<String>>(1).unwrap().as_deref(),
+            Some("merged")
+        );
     }
 
     #[tokio::test]
     async fn migration_v5_upgrades_an_existing_v4_database() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("upgrade5.db");
-        // Build a v4 database by hand: apply V1..V4 and stamp version 4.
+        build_upto(&path, 4).await;
         {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(MIGRATION_V1).unwrap();
-            conn.execute_batch(MIGRATION_V2).unwrap();
-            conn.execute_batch(MIGRATION_V3).unwrap();
-            conn.execute_batch(MIGRATION_V4).unwrap();
-            conn.pragma_update(None, "user_version", 4).unwrap();
-            // A pre-V5 historian run row: no settle columns yet.
+            let conn = raw(&path).await;
             conn.execute(
                 "INSERT INTO mc_historian_run (id, session_id, state, chunk_ref, attempt, created_at)
                  VALUES ('hr_old', 'ses_1', 'running', '0..3', 1, 1)",
-                [],
+                (),
             )
+            .await
             .unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await, 7);
-        // The pre-existing row reads back with the additive defaults.
-        let (updated_at, error): (i64, Option<String>) = db
-            .conn()
-            .call(|c| {
-                c.query_row(
-                    "SELECT updated_at, error FROM mc_historian_run WHERE id = 'hr_old'",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-            })
-            .await
-            .unwrap();
-        assert_eq!(updated_at, 0);
-        assert_eq!(error, None);
+        assert_eq!(db.user_version().await.unwrap(), 8);
+        let row = query_row(
+            &db,
+            "SELECT updated_at, error FROM mc_historian_run WHERE id = 'hr_old'",
+        )
+        .await;
+        assert_eq!(row.get::<i64>(0).unwrap(), 0);
+        assert_eq!(row.get::<Option<String>>(1).unwrap(), None);
     }
 
     #[tokio::test]
     async fn migration_v6_moves_the_side_channels_off_the_compartment_row() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("upgrade6.db");
-        // Build a v5 database by hand: apply V1..V5 and stamp version 5.
+        build_upto(&path, 5).await;
         {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(MIGRATION_V1).unwrap();
-            conn.execute_batch(MIGRATION_V2).unwrap();
-            conn.execute_batch(MIGRATION_V3).unwrap();
-            conn.execute_batch(MIGRATION_V4).unwrap();
-            conn.execute_batch(MIGRATION_V5).unwrap();
-            conn.pragma_update(None, "user_version", 5).unwrap();
+            let conn = raw(&path).await;
             // A pre-V6 compartment row carries the (neutral) placeholders.
             conn.execute(
                 "INSERT INTO mc_compartments
                      (id, session_id, coverage_end, importance, tiers, facts, events, created_at)
                  VALUES ('mc_old', 'ses_1', '4', 50.0, '{}', '{}', '[]', 1)",
-                [],
+                (),
             )
+            .await
             .unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await, 7);
-        let (compartments, runs): (Vec<String>, Vec<String>) = db
-            .conn()
-            .call(|c| -> rusqlite::Result<(Vec<String>, Vec<String>)> {
-                let mut stmt =
-                    c.prepare("SELECT name FROM pragma_table_info('mc_compartments')")?;
-                let compartments = stmt
-                    .query_map([], |row| row.get(0))?
-                    .collect::<rusqlite::Result<Vec<String>>>()?;
-                let mut stmt =
-                    c.prepare("SELECT name FROM pragma_table_info('mc_historian_run')")?;
-                let runs = stmt
-                    .query_map([], |row| row.get(0))?
-                    .collect::<rusqlite::Result<Vec<String>>>()?;
-                Ok((compartments, runs))
-            })
-            .await
-            .unwrap();
-        // The compartment row's side channels are gone; the run row owns them.
-        // The surviving row still loads (it only ever held placeholders).
+        assert_eq!(db.user_version().await.unwrap(), 8);
+        let compartments = columns(&db, "mc_compartments").await;
+        let runs = columns(&db, "mc_historian_run").await;
         assert!(!compartments.iter().any(|c| c == "facts"));
         assert!(!compartments.iter().any(|c| c == "events"));
         assert!(runs.iter().any(|c| c == "facts"));
         assert!(runs.iter().any(|c| c == "events"));
-        let compartments = crate::mctx::compartments::load(&db, "ses_1").await.unwrap();
-        assert_eq!(compartments.len(), 1);
-        assert_eq!(compartments[0].coverage_end, "4");
+        let loaded = crate::mctx::compartments::load(&db, "ses_1").await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].coverage_end, "4");
     }
 
     /// Every schema object a database owns, as `(type, name, sql)` ordered
-    /// deterministically. `sql` is NULL for FTS5's internal shadow tables.
+    /// deterministically.
     async fn schema_objects(db: &Db) -> Vec<(String, String, Option<String>)> {
-        db.conn()
-            .call(
-                |c| -> rusqlite::Result<Vec<(String, String, Option<String>)>> {
-                    let mut stmt = c.prepare(
-                        "SELECT type, name, sql FROM sqlite_master
-                      WHERE name NOT LIKE 'sqlite_%'
-                      ORDER BY type, name",
-                    )?;
-                    let rows =
-                        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
-                    rows.collect()
-                },
+        let conn = db.acquire().await.unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master
+                  WHERE name NOT LIKE 'sqlite_%'
+                  ORDER BY type, name",
             )
             .await
-            .unwrap()
+            .unwrap();
+        let mut rows = stmt.query(()).await.unwrap();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            out.push((
+                row.get::<String>(0).unwrap(),
+                row.get::<String>(1).unwrap(),
+                row.get::<Option<String>>(2).unwrap(),
+            ));
+        }
+        out
     }
 
     #[tokio::test]
     async fn migration_v7_converges_upgraded_and_fresh_databases() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("upgrade7.db");
-        // Build a v6 database by hand: apply V1..V6, stamp version 6, and
-        // leave a row behind so the V7 backfill has something to index.
+        build_upto(&path, 6).await;
         {
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.execute_batch(MIGRATION_V1).unwrap();
-            conn.execute_batch(MIGRATION_V2).unwrap();
-            conn.execute_batch(MIGRATION_V3).unwrap();
-            conn.execute_batch(MIGRATION_V4).unwrap();
-            conn.execute_batch(MIGRATION_V5).unwrap();
-            conn.execute_batch(MIGRATION_V6).unwrap();
-            conn.pragma_update(None, "user_version", 6).unwrap();
-            conn.execute(
+            let conn = raw(&path).await;
+            // Rows written before the search indexes exist, one per source.
+            for sql in [
                 "INSERT INTO mc_memory (id, project, content, category, created_at, updated_at)
                  VALUES ('1', '/p', 'legacy pre-existing fact', 'ARCHITECTURE', 1, 1)",
-                [],
-            )
-            .unwrap();
-            conn.execute(
                 "INSERT INTO mc_note (id, session_id, title, body, status, surface_condition, created_at, updated_at)
                  VALUES ('1', 'ses_1', 'legacy note', 'pre-existing note body', 'active', NULL, 1, 1)",
-                [],
-            )
-            .unwrap();
-            conn.execute(
                 "INSERT INTO mc_compartments (id, session_id, coverage_end, importance, tiers, created_at)
                  VALUES ('mc_1', 'ses_1', '4', 50.0, '{\"title\":\"Legacy\",\"p1\":\"pre-existing body\"}', 1)",
-                [],
-            )
-            .unwrap();
+            ] {
+                conn.execute(sql, ()).await.unwrap();
+            }
         }
         let upgraded = Db::open(&path).await.unwrap();
         let fresh = Db::open_in_memory().await.unwrap();
-        assert_eq!(upgraded.user_version().await, 7);
+        assert_eq!(upgraded.user_version().await.unwrap(), 8);
         // Both histories must create exactly the same objects, SQL included.
         assert_eq!(
             schema_objects(&upgraded).await,
             schema_objects(&fresh).await,
-            "upgraded and fresh V7 databases must converge"
+            "upgraded and fresh databases must converge"
         );
-        // And the backfill is real: every source's pre-V7 rows are searchable,
-        // through the same text expression the triggers use.
-        for (term, source) in [
-            ("\"legacy\"", "memory"),
-            ("\"note\"", "note"),
-            ("\"pre-existing\"", "compartment"),
+        // The backfill is real: each pre-V7 row is searchable through its own
+        // source index, and the derived compartment column carries the tiers.
+        for sql in [
+            "SELECT count(*) FROM mc_memory WHERE fts_match(content, '\"legacy\"')",
+            "SELECT count(*) FROM mc_note WHERE fts_match(title, body, '\"legacy\"')",
+            "SELECT count(*) FROM mc_compartments WHERE fts_match(search_text, '\"pre-existing\"')",
         ] {
-            let hits: i64 = upgraded
-                .conn()
-                .call(move |c| {
-                    c.query_row(
-                        "SELECT count(*) FROM mc_search_fts
-                          WHERE mc_search_fts MATCH ?1 AND source = ?2",
-                        rusqlite::params![term, source],
-                        |row| row.get(0),
-                    )
-                })
-                .await
-                .unwrap();
-            assert_eq!(hits, 1, "V7 backfills {source} rows that predate the index");
+            assert_eq!(count(&upgraded, sql).await, 1, "{sql}");
         }
+    }
+
+    /// The search indexes follow writes with no trigger and no second write
+    /// path: that is why the FTS5 shadow table and its nine triggers are gone.
+    #[tokio::test]
+    async fn search_indexes_follow_every_write() {
+        let db = Db::open_in_memory().await.unwrap();
+        db.acquire()
+            .await
+            .unwrap()
+            .execute(
+                "INSERT INTO mc_memory (id, project, content, category, created_at, updated_at)
+                 VALUES ('1', '/p', 'narwhal fact', 'CONSTRAINTS', 1, 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            count(
+                &db,
+                "SELECT count(*) FROM mc_memory WHERE fts_match(content, 'narwhal')"
+            )
+            .await,
+            1
+        );
+        db.acquire()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE mc_memory SET content = 'axolotl fact' WHERE id = '1'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            count(
+                &db,
+                "SELECT count(*) FROM mc_memory WHERE fts_match(content, 'narwhal')"
+            )
+            .await,
+            0,
+            "an updated row must leave the index"
+        );
+        assert_eq!(
+            count(
+                &db,
+                "SELECT count(*) FROM mc_memory WHERE fts_match(content, 'axolotl')"
+            )
+            .await,
+            1
+        );
+        db.acquire()
+            .await
+            .unwrap()
+            .execute("DELETE FROM mc_memory WHERE id = '1'", ())
+            .await
+            .unwrap();
+        assert_eq!(
+            count(
+                &db,
+                "SELECT count(*) FROM mc_memory WHERE fts_match(content, 'axolotl')"
+            )
+            .await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_v8_converges_upgraded_and_fresh_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade8.db");
+        build_upto(&path, 7).await;
+        let upgraded = Db::open(&path).await.unwrap();
+        let fresh = Db::open_in_memory().await.unwrap();
+        assert_eq!(upgraded.user_version().await.unwrap(), 8);
+        assert_eq!(
+            schema_objects(&upgraded).await,
+            schema_objects(&fresh).await,
+            "upgraded and fresh V8 databases must converge"
+        );
+        assert!(upgraded.table_exists("mc_dream_state").await.unwrap());
+        // The new table's defaults are what the scheduler relies on: a row
+        // inserted with only its key reads back as "never run, never failed".
+        let upgraded_conn = upgraded.acquire().await.unwrap();
+        upgraded_conn
+            .execute(
+                "INSERT INTO mc_dream_state (project, task) VALUES ('/p', 'verify')",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = query_row(
+            &upgraded,
+            "SELECT last_run_at, last_attempt_at, consecutive_failures, rotation_cursor
+               FROM mc_dream_state WHERE project = '/p' AND task = 'verify'",
+        )
+        .await;
+        assert_eq!(
+            (
+                row.get::<Option<i64>>(0).unwrap(),
+                row.get::<i64>(1).unwrap(),
+                row.get::<i64>(2).unwrap(),
+                row.get::<i64>(3).unwrap(),
+            ),
+            (None, 0, 0, 0)
+        );
     }
 
     #[tokio::test]
     async fn indexes_exist() {
         let db = Db::open_in_memory().await.unwrap();
-        // (name, is_unique) per index, via sqlite_master + pragma_index_list.
-        let indexes = db
-            .conn()
-            .call(|c| -> rusqlite::Result<Vec<(String, bool)>> {
-                let mut stmt = c.prepare(
-                    "SELECT name, tbl_name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'",
-                )?;
-                let rows: Vec<(String, String)> = stmt
-                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                let mut out = Vec::new();
-                for (name, table) in rows {
-                    let mut s = c.prepare(&format!(
-                        "SELECT \"unique\" FROM pragma_index_list('{table}') WHERE name = '{name}'"
-                    ))?;
-                    let unique: bool = s.query_row([], |row| row.get(0))?;
-                    out.push((name, unique));
-                }
-                Ok(out)
-            })
+        let conn = db.acquire().await.unwrap();
+        let mut stmt = conn
+            .prepare(
+                // turso materializes its FTS index behind internal
+                // `__turso_internal_fts_dir_*` entries; they are the driver's
+                // own bookkeeping, not schema ox declares.
+                "SELECT name, tbl_name FROM sqlite_master
+                  WHERE type='index' AND name NOT LIKE 'sqlite_%'
+                    AND name NOT LIKE '__turso_internal%'",
+            )
             .await
             .unwrap();
+        let mut rows = stmt.query(()).await.unwrap();
+        let mut indexes: Vec<(String, String)> = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            indexes.push((row.get::<String>(0).unwrap(), row.get::<String>(1).unwrap()));
+        }
 
         let names: Vec<&str> = indexes.iter().map(|(n, _)| n.as_str()).collect();
         for expected in EXPECTED_INDEXES {
@@ -918,7 +1167,7 @@ mod tests {
             "unexpected extra indexes: {names:?}"
         );
 
-        // Unique indexes enforce shared-DB invariants, not just performance.
+        // Unique indexes enforce invariants, not just performance.
         for unique in [
             "event_aggregate_seq_idx",
             "session_message_session_seq_idx",
@@ -926,11 +1175,24 @@ mod tests {
             "session_pending_session_admitted_seq_idx",
             "session_pending_session_compaction_idx",
         ] {
-            let (_, is_unique) = indexes
+            let (_, table) = indexes
                 .iter()
                 .find(|(n, _)| n == unique)
                 .unwrap_or_else(|| panic!("missing index {unique}"));
-            assert!(is_unique, "index {unique} must be UNIQUE");
+            let conn = db.acquire().await.unwrap();
+            let mut stmt = conn
+                .prepare(&format!(
+                    "SELECT \"unique\" FROM pragma_index_list('{table}') WHERE name = '{unique}'"
+                ))
+                .await
+                .unwrap();
+            let mut rows = stmt.query(()).await.unwrap();
+            let row = rows.next().await.unwrap().expect("index listed");
+            assert_eq!(
+                row.get::<i64>(0).unwrap(),
+                1,
+                "index {unique} must be UNIQUE"
+            );
         }
     }
 }

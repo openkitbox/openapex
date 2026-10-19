@@ -54,11 +54,10 @@ use std::future::Future;
 use std::pin::Pin;
 
 use anyhow::{Context as _, Result};
-use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
 
 use crate::cardinal::wire::ToolDef;
-use crate::db::Db;
+use crate::db::{Db, optional};
 use crate::id::now_millis;
 use crate::runner::{Tool, ToolContext, ToolOutput};
 use crate::tool::{object_param, ok_text};
@@ -129,30 +128,28 @@ pub(crate) async fn write_memory(
     category: &str,
 ) -> Result<String> {
     let context = format!("write memory for project {project}");
-    let project = project.to_owned();
-    let content = content.to_owned();
-    let category = category.to_owned();
     let now = now_millis();
-    db.conn()
-        .call(move |c| -> rusqlite::Result<String> {
-            let tx = c.transaction()?;
-            let next: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(CAST(id AS INTEGER)), 0) + 1 FROM mc_memory",
-                [],
-                |row| row.get(0),
-            )?;
-            let id = next.to_string();
-            tx.execute(
-                "INSERT INTO mc_memory
-                     (id, project, content, category, created_at, updated_at, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, 'active')",
-                rusqlite::params![id, project, content, category, now],
-            )?;
-            tx.commit()?;
-            Ok(id)
-        })
-        .await
-        .with_context(|| context)
+    let result: Result<String> = async {
+        let tx = db.begin().await?;
+        let next = {
+            let mut stmt = tx
+                .prepare("SELECT COALESCE(MAX(CAST(id AS INTEGER)), 0) + 1 FROM mc_memory")
+                .await?;
+            stmt.query_row(()).await?.get::<i64>(0)?
+        };
+        let id = next.to_string();
+        tx.execute(
+            "INSERT INTO mc_memory
+                 (id, project, content, category, created_at, updated_at, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, 'active')",
+            (id.as_str(), project, content, category, now),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+    .await;
+    result.with_context(|| context)
 }
 
 /// Rewrite one memory. `category` omitted keeps the stored one. `false` =
@@ -165,29 +162,31 @@ pub(crate) async fn update_memory(
     category: Option<&str>,
 ) -> Result<bool> {
     let context = format!("update memory #{id} for project {project}");
-    let project = project.to_owned();
-    let id = id.to_owned();
-    let content = content.to_owned();
-    let category = category.map(str::to_owned);
     let now = now_millis();
-    db.conn()
-        .call(move |c| -> rusqlite::Result<bool> {
-            let changed = match category {
-                Some(category) => c.execute(
+    let result: Result<bool> = async {
+        let conn = db.acquire().await?;
+        let changed = match category {
+            Some(category) => {
+                conn.execute(
                     "UPDATE mc_memory SET content = ?3, category = ?4, updated_at = ?5
-                     WHERE project = ?1 AND id = ?2",
-                    rusqlite::params![project, id, content, category, now],
-                )?,
-                None => c.execute(
+                         WHERE project = ?1 AND id = ?2",
+                    (project, id, content, category, now),
+                )
+                .await?
+            }
+            None => {
+                conn.execute(
                     "UPDATE mc_memory SET content = ?3, updated_at = ?4
-                     WHERE project = ?1 AND id = ?2",
-                    rusqlite::params![project, id, content, now],
-                )?,
-            };
-            Ok(changed > 0)
-        })
-        .await
-        .with_context(|| context)
+                         WHERE project = ?1 AND id = ?2",
+                    (project, id, content, now),
+                )
+                .await?
+            }
+        };
+        Ok(changed > 0)
+    }
+    .await;
+    result.with_context(|| context)
 }
 
 /// Archive the given memories (any status may be given; already-archived
@@ -199,38 +198,38 @@ pub(crate) async fn archive_memories(
     reason: Option<&str>,
 ) -> Result<Vec<String>> {
     let context = format!("archive memories for project {project}");
-    let project = project.to_owned();
-    let ids = ids.to_vec();
-    let reason = reason.map(str::to_owned);
     let now = now_millis();
-    db.conn()
-        .call(move |c| -> rusqlite::Result<Vec<String>> {
-            let tx = c.transaction()?;
-            let mut archived = Vec::new();
-            {
-                let mut stmt =
-                    tx.prepare("SELECT status FROM mc_memory WHERE project = ?1 AND id = ?2")?;
-                for id in &ids {
-                    let status: Option<String> = stmt
-                        .query_row(rusqlite::params![project, id], |row| row.get(0))
-                        .optional()?;
-                    if status.as_deref() == Some("active") && !archived.contains(id) {
-                        archived.push(id.clone());
-                    }
+    let result: Result<Vec<String>> = async {
+        let tx = db.begin().await?;
+        let mut archived = Vec::new();
+        {
+            let mut stmt = tx
+                .prepare("SELECT status FROM mc_memory WHERE project = ?1 AND id = ?2")
+                .await?;
+            for id in ids {
+                let status: Option<String> =
+                    match optional(&mut stmt, (project, id.as_str())).await? {
+                        Some(row) => Some(row.get(0)?),
+                        None => None,
+                    };
+                if status.as_deref() == Some("active") && !archived.contains(id) {
+                    archived.push(id.clone());
                 }
             }
-            for id in &archived {
-                tx.execute(
-                    "UPDATE mc_memory SET status = 'archived', archive_reason = ?3, updated_at = ?4
-                     WHERE project = ?1 AND id = ?2",
-                    rusqlite::params![project, id, reason, now],
-                )?;
-            }
-            tx.commit()?;
-            Ok(archived)
-        })
-        .await
-        .with_context(|| context)
+        }
+        for id in &archived {
+            tx.execute(
+                "UPDATE mc_memory SET status = 'archived', archive_reason = ?3, updated_at = ?4
+                 WHERE project = ?1 AND id = ?2",
+                (project, id.as_str(), reason, now),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(archived)
+    }
+    .await;
+    result.with_context(|| context)
 }
 
 /// The result of a merge: the surviving handle and every handle the merge
@@ -255,69 +254,76 @@ pub(crate) async fn merge_memories(
     category: Option<&str>,
 ) -> Result<Option<Merged>> {
     let context = format!("merge memories for project {project}");
-    let project = project.to_owned();
-    let ids = ids.to_vec();
-    let content = content.to_owned();
-    let category = category.map(str::to_owned);
     let now = now_millis();
-    db.conn()
-        .call(move |c| -> rusqlite::Result<Option<Merged>> {
-            let tx = c.transaction()?;
-            // Only ACTIVE rows are merge candidates: an archived row must
-            // neither survive (its content would be stranded outside the
-            // pinboard) nor lose (its own archive reason would be
-            // overwritten).
-            let mut live: Vec<String> = Vec::new();
-            {
-                let mut stmt =
-                    tx.prepare("SELECT status FROM mc_memory WHERE project = ?1 AND id = ?2")?;
-                for id in &ids {
-                    let status: Option<String> = stmt
-                        .query_row(rusqlite::params![project, id], |row| row.get(0))
-                        .optional()?;
-                    if status.as_deref() == Some("active") && !live.contains(id) {
-                        live.push(id.clone());
-                    }
+    let result: Result<Option<Merged>> = async {
+        let tx = db.begin().await?;
+        // Only ACTIVE rows are merge candidates: an archived row must
+        // neither survive (its content would be stranded outside the
+        // pinboard) nor lose (its own archive reason would be
+        // overwritten).
+        let mut live: Vec<String> = Vec::new();
+        {
+            let mut stmt = tx
+                .prepare("SELECT status FROM mc_memory WHERE project = ?1 AND id = ?2")
+                .await?;
+            for id in ids {
+                let status: Option<String> =
+                    match optional(&mut stmt, (project, id.as_str())).await? {
+                        Some(row) => Some(row.get(0)?),
+                        None => None,
+                    };
+                if status.as_deref() == Some("active") && !live.contains(id) {
+                    live.push(id.clone());
                 }
             }
-            // A merge needs at least two live rows; fewer is reported as
-            // "nothing merged" rather than silently rewriting one row.
-            if live.len() < 2 {
-                return Ok(None);
-            }
-            // The survivor is the lowest id (the oldest row).
-            live.sort_by_key(|id| id.parse::<i64>().unwrap_or(i64::MAX));
-            let Some((survivor, losers)) = live.split_first() else {
-                return Ok(None);
-            };
-            match category {
-                Some(category) => tx.execute(
+        }
+        // A merge needs at least two live rows; fewer is reported as
+        // "nothing merged" rather than silently rewriting one row.
+        if live.len() < 2 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        // The survivor is the lowest id (the oldest row).
+        live.sort_by_key(|id| id.parse::<i64>().unwrap_or(i64::MAX));
+        let Some((survivor, losers)) = live.split_first() else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        match category {
+            Some(category) => {
+                tx.execute(
                     "UPDATE mc_memory SET content = ?3, category = ?4, updated_at = ?5
                      WHERE project = ?1 AND id = ?2",
-                    rusqlite::params![project, survivor, content, category, now],
-                )?,
-                None => tx.execute(
+                    (project, survivor.as_str(), content, category, now),
+                )
+                .await?;
+            }
+            None => {
+                tx.execute(
                     "UPDATE mc_memory SET content = ?3, updated_at = ?4
                      WHERE project = ?1 AND id = ?2",
-                    rusqlite::params![project, survivor, content, now],
-                )?,
-            };
-            for id in losers {
-                tx.execute(
-                    "UPDATE mc_memory SET status = 'archived', archive_reason = 'merged',
-                         updated_at = ?3
-                     WHERE project = ?1 AND id = ?2",
-                    rusqlite::params![project, id, now],
-                )?;
+                    (project, survivor.as_str(), content, now),
+                )
+                .await?;
             }
-            tx.commit()?;
-            Ok(Some(Merged {
-                survivor: survivor.clone(),
-                sources: live,
-            }))
-        })
-        .await
-        .with_context(|| context)
+        }
+        for id in losers {
+            tx.execute(
+                "UPDATE mc_memory SET status = 'archived', archive_reason = 'merged',
+                     updated_at = ?3
+                 WHERE project = ?1 AND id = ?2",
+                (project, id.as_str(), now),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(Some(Merged {
+            survivor: survivor.clone(),
+            sources: live,
+        }))
+    }
+    .await;
+    result.with_context(|| context)
 }
 
 /// Fetch memories by id in every status, in the requested order (unknown
@@ -328,63 +334,173 @@ pub(crate) async fn get_memories(
     ids: &[String],
 ) -> Result<Vec<MemoryDetail>> {
     let context = format!("get memories for project {project}");
-    let project = project.to_owned();
-    let ids = ids.to_vec();
-    db.conn()
-        .call(move |c| -> rusqlite::Result<Vec<MemoryDetail>> {
-            let mut out = Vec::new();
-            let mut stmt = c.prepare(
+    let result: Result<Vec<MemoryDetail>> = async {
+        let conn = db.acquire().await?;
+        let mut out = Vec::new();
+        let mut stmt = conn
+            .prepare(
                 "SELECT id, category, content, status FROM mc_memory
                  WHERE project = ?1 AND id = ?2",
-            )?;
-            for id in &ids {
-                let row: Option<(String, String, String, String)> = stmt
-                    .query_row(rusqlite::params![project, id], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-                    })
-                    .optional()?;
-                if let Some((id, category, content, status)) = row {
-                    // The row's own handle: a repeated request id must not
-                    // print the same memory twice.
-                    if !out.iter().any(|row: &MemoryDetail| row.id == id) {
-                        out.push(MemoryDetail {
-                            id,
-                            category,
-                            content,
-                            status,
-                        });
-                    }
-                }
+            )
+            .await?;
+        for id in ids {
+            let Some(row) = optional(&mut stmt, (project, id.as_str())).await? else {
+                continue;
+            };
+            let id: String = row.get(0)?;
+            let category: String = row.get(1)?;
+            let content: String = row.get(2)?;
+            let status: String = row.get(3)?;
+            // The row's own handle: a repeated request id must not
+            // print the same memory twice.
+            if !out.iter().any(|row: &MemoryDetail| row.id == id) {
+                out.push(MemoryDetail {
+                    id,
+                    category,
+                    content,
+                    status,
+                });
             }
-            Ok(out)
-        })
-        .await
-        .with_context(|| context)
+        }
+        Ok(out)
+    }
+    .await;
+    result.with_context(|| context)
 }
 
 /// Every active memory of the project, ids ascending (the renderer applies
 /// category order).
 pub(crate) async fn active_memories(db: &Db, project: &str) -> Result<Vec<MemoryRow>> {
     let context = format!("read active memories for project {project}");
-    let project = project.to_owned();
-    db.conn()
-        .call(move |c| -> rusqlite::Result<Vec<MemoryRow>> {
-            let mut stmt = c.prepare(
+    let result: Result<Vec<MemoryRow>> = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
                 "SELECT id, category, content FROM mc_memory
                  WHERE project = ?1 AND status = 'active'
                  ORDER BY CAST(id AS INTEGER)",
-            )?;
-            let mapped = stmt.query_map([&project], |row| {
-                Ok(MemoryRow {
-                    id: row.get(0)?,
-                    category: row.get(1)?,
-                    content: row.get(2)?,
-                })
-            })?;
-            mapped.collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .await
-        .with_context(|| context)
+            )
+            .await?;
+        let mut rows = stmt.query([project]).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(MemoryRow {
+                id: row.get(0)?,
+                category: row.get(1)?,
+                content: row.get(2)?,
+            });
+        }
+        Ok(out)
+    }
+    .await;
+    result.with_context(|| context)
+}
+
+/// One active memory as the dreamer's gate reads it: the render's shape plus
+/// the `updated_at` watermark the verify task compares file mtimes against
+/// (the reference's `last_verified_at` stand-in — see
+/// [`crate::mctx::dreamer`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StoredMemory {
+    /// `#N` handle body.
+    pub id: String,
+    /// One of [`CATEGORIES`].
+    pub category: String,
+    /// The fact text.
+    pub content: String,
+    /// Last write to the row, in epoch milliseconds.
+    pub updated_at: i64,
+}
+
+/// [`active_memories`] with the `updated_at` watermark attached. Kept separate
+/// from the pinboard read: the renderer has no use for the timestamp, and the
+/// dreamer is the only caller that does.
+pub(crate) async fn active_memories_with_watermark(
+    db: &Db,
+    project: &str,
+) -> Result<Vec<StoredMemory>> {
+    let context = format!("read active memories with updated_at for project {project}");
+    let result: Result<Vec<StoredMemory>> = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, category, content, updated_at FROM mc_memory
+                 WHERE project = ?1 AND status = 'active'
+                 ORDER BY CAST(id AS INTEGER)",
+            )
+            .await?;
+        let mut rows = stmt.query([project]).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(StoredMemory {
+                id: row.get(0)?,
+                category: row.get(1)?,
+                content: row.get(2)?,
+                updated_at: row.get(3)?,
+            });
+        }
+        Ok(out)
+    }
+    .await;
+    result.with_context(|| context)
+}
+
+/// The projects that have at least one active memory, ascending. The dreamer
+/// enumerates work by project (its grain is `(project, task)`), and a project
+/// with no memories has nothing for any of its tasks to do — this is the
+/// reference's cheap idle-project pruning (`pruneIdleScheduleIdentities`),
+/// reduced to the one identity form ox has.
+pub(crate) async fn projects_with_active_memories(db: &Db) -> Result<Vec<String>> {
+    let result: Result<Vec<String>> = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT DISTINCT project FROM mc_memory WHERE status = 'active' ORDER BY project",
+            )
+            .await?;
+        let mut rows = stmt.query(()).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(row.get(0)?);
+        }
+        Ok(out)
+    }
+    .await;
+    result.context("enumerate projects with active memories")
+}
+
+/// Advance the "last checked against the code" watermark of the given active
+/// memories: `updated_at = now`, nothing else about the row.
+///
+/// The `verify` task uses this as the reference's per-memory `verified_at`
+/// (`recordMemoryVerifications`): a re-affirmed memory is newer than the files
+/// it cites, so it is not a candidate again until one of them changes. ox has
+/// no `verified_at` column, and `updated_at` is the row's only touch stamp —
+/// which is safe because no render reads it (the pinboard and the historian
+/// block render id, category and content only), so the prompt text and the
+/// prompt cache are unaffected. Returns the number of rows touched.
+pub(crate) async fn touch_memories(db: &Db, project: &str, ids: &[String]) -> Result<usize> {
+    let context = format!("touch memories for project {project}");
+    let now = now_millis();
+    let result: Result<usize> = async {
+        let tx = db.begin().await?;
+        let mut touched = 0;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "UPDATE mc_memory SET updated_at = ?3
+                      WHERE project = ?1 AND id = ?2 AND status = 'active'",
+                )
+                .await?;
+            for id in ids {
+                touched += stmt.execute((project, id.as_str(), now)).await? as usize;
+            }
+        }
+        tx.commit().await?;
+        Ok(touched)
+    }
+    .await;
+    result.with_context(|| context)
 }
 
 // ---------------------------------------------------------------------------
@@ -476,36 +592,43 @@ pub(crate) async fn write_note(
     content: &str,
     surface_condition: Option<&str>,
 ) -> Result<String> {
-    let session = session_id.to_owned();
     let (title, body) = split_note(content);
-    let condition = surface_condition.map(str::to_owned);
-    let status = if condition.is_some() {
+    let status = if surface_condition.is_some() {
         "pending"
     } else {
         "active"
     };
     let now = now_millis();
-    db.conn()
-        .call(move |c| -> rusqlite::Result<String> {
-            let tx = c.transaction()?;
-            let next: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(CAST(id AS INTEGER)), 0) + 1 FROM mc_note",
-                [],
-                |row| row.get(0),
-            )?;
-            let id = next.to_string();
-            tx.execute(
-                "INSERT INTO mc_note
-                     (id, session_id, title, body, status, surface_condition,
-                      created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-                rusqlite::params![id, session, title, body, status, condition, now],
-            )?;
-            tx.commit()?;
-            Ok(id)
-        })
-        .await
-        .with_context(|| format!("write note for session {session_id}"))
+    let result: Result<String> = async {
+        let tx = db.begin().await?;
+        let next = {
+            let mut stmt = tx
+                .prepare("SELECT COALESCE(MAX(CAST(id AS INTEGER)), 0) + 1 FROM mc_note")
+                .await?;
+            stmt.query_row(()).await?.get::<i64>(0)?
+        };
+        let id = next.to_string();
+        tx.execute(
+            "INSERT INTO mc_note
+                 (id, session_id, title, body, status, surface_condition,
+                  created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            (
+                id.as_str(),
+                session_id,
+                title.as_str(),
+                body.as_str(),
+                status,
+                surface_condition,
+                now,
+            ),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+    .await;
+    result.with_context(|| format!("write note for session {session_id}"))
 }
 
 /// The `read` page: newest first (parked smart notes would lead the page only
@@ -521,7 +644,6 @@ pub(crate) async fn list_notes(
     let Some(statuses) = filter.statuses() else {
         return Ok(Vec::new());
     };
-    let session = session_id.to_owned();
     let sql = format!(
         "SELECT id, title, body, status, surface_condition,
                 COALESCE(updated_at, created_at)
@@ -530,44 +652,44 @@ pub(crate) async fn list_notes(
          ORDER BY CAST(id AS INTEGER) DESC
          LIMIT ?2 OFFSET ?3"
     );
-    db.conn()
-        .call(move |c| -> rusqlite::Result<Vec<NoteRow>> {
-            let mut stmt = c.prepare(&sql)?;
-            let mapped = stmt.query_map(
-                rusqlite::params![session, limit as i64, offset as i64],
-                note_from_row,
-            )?;
-            mapped.collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .await
-        .with_context(|| format!("list notes for session {session_id}"))
+    let result: Result<Vec<NoteRow>> = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn.prepare(&sql).await?;
+        let mut rows = stmt
+            .query((session_id, limit as i64, offset as i64))
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(note_from_row(&row)?);
+        }
+        Ok(out)
+    }
+    .await;
+    result.with_context(|| format!("list notes for session {session_id}"))
 }
 
 /// Full note rows for the given ids, in the requested order (unknown ids
 /// are skipped).
 pub(crate) async fn get_notes(db: &Db, session_id: &str, ids: &[String]) -> Result<Vec<NoteRow>> {
-    let session = session_id.to_owned();
-    let ids = ids.to_vec();
-    db.conn()
-        .call(move |c| -> rusqlite::Result<Vec<NoteRow>> {
-            let mut out = Vec::new();
-            let mut stmt = c.prepare(
+    let result: Result<Vec<NoteRow>> = async {
+        let conn = db.acquire().await?;
+        let mut out = Vec::new();
+        let mut stmt = conn
+            .prepare(
                 "SELECT id, title, body, status, surface_condition,
                         COALESCE(updated_at, created_at)
                  FROM mc_note WHERE session_id = ?1 AND id = ?2",
-            )?;
-            for id in &ids {
-                let row = stmt
-                    .query_row(rusqlite::params![session, id], note_from_row)
-                    .optional()?;
-                if let Some(row) = row {
-                    out.push(row);
-                }
+            )
+            .await?;
+        for id in ids {
+            if let Some(row) = optional(&mut stmt, (session_id, id.as_str())).await? {
+                out.push(note_from_row(&row)?);
             }
-            Ok(out)
-        })
-        .await
-        .with_context(|| format!("get notes for session {session_id}"))
+        }
+        Ok(out)
+    }
+    .await;
+    result.with_context(|| format!("get notes for session {session_id}"))
 }
 
 /// Rewrite one note's text (title/body re-parsed like a write). `false` =
@@ -579,48 +701,47 @@ pub(crate) async fn update_note(
     content: &str,
 ) -> Result<bool> {
     let context = format!("update note #{id} for session {session_id}");
-    let session = session_id.to_owned();
-    let id = id.to_owned();
     let (title, body) = split_note(content);
     let now = now_millis();
-    db.conn()
-        .call(move |c| -> rusqlite::Result<bool> {
-            let changed = c.execute(
+    let result: Result<bool> = async {
+        let conn = db.acquire().await?;
+        let changed = conn
+            .execute(
                 "UPDATE mc_note SET title = ?3, body = ?4, updated_at = ?5
                  WHERE session_id = ?1 AND id = ?2",
-                rusqlite::params![session, id, title, body, now],
-            )?;
-            Ok(changed > 0)
-        })
-        .await
-        .with_context(|| context)
+                (session_id, id, title.as_str(), body.as_str(), now),
+            )
+            .await?;
+        Ok(changed > 0)
+    }
+    .await;
+    result.with_context(|| context)
 }
 
 /// Dismiss the given notes. Returns how many rows actually moved.
 pub(crate) async fn dismiss_notes(db: &Db, session_id: &str, ids: &[String]) -> Result<usize> {
-    let session = session_id.to_owned();
-    let ids = ids.to_vec();
     let now = now_millis();
-    db.conn()
-        .call(move |c| -> rusqlite::Result<usize> {
-            let tx = c.transaction()?;
-            let mut moved = 0;
-            for id in &ids {
-                moved += tx.execute(
+    let result: Result<usize> = async {
+        let tx = db.begin().await?;
+        let mut moved = 0;
+        for id in ids {
+            moved += tx
+                .execute(
                     "UPDATE mc_note SET status = 'dismissed', updated_at = ?3
                      WHERE session_id = ?1 AND id = ?2 AND status != 'dismissed'",
-                    rusqlite::params![session, id, now],
-                )?;
-            }
-            tx.commit()?;
-            Ok(moved)
-        })
-        .await
-        .with_context(|| format!("dismiss notes for session {session_id}"))
+                    (session_id, id.as_str(), now),
+                )
+                .await? as usize;
+        }
+        tx.commit().await?;
+        Ok(moved)
+    }
+    .await;
+    result.with_context(|| format!("dismiss notes for session {session_id}"))
 }
 
 /// Row → [`NoteRow`] (shared by the list and get statements).
-fn note_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NoteRow> {
+fn note_from_row(row: &turso::Row) -> turso::Result<NoteRow> {
     Ok(NoteRow {
         id: row.get(0)?,
         title: row.get(1)?,
@@ -1258,20 +1379,20 @@ fn full_note(row: &NoteRow, now: i64) -> String {
 /// session has no active notes. "Oldest" is the earliest last touch, matching
 /// how rows are aged everywhere else.
 async fn active_summary(db: &Db, session_id: &str) -> Result<String> {
-    let session = session_id.to_owned();
-    let (count, oldest): (i64, Option<i64>) = db
-        .conn()
-        .call(move |c| -> rusqlite::Result<(i64, Option<i64>)> {
-            // An aggregate without GROUP BY always yields exactly one row.
-            c.query_row(
+    let result: Result<(i64, Option<i64>)> = async {
+        let conn = db.acquire().await?;
+        // An aggregate without GROUP BY always yields exactly one row.
+        let mut stmt = conn
+            .prepare(
                 "SELECT COUNT(*), MIN(COALESCE(updated_at, created_at)) FROM mc_note
                  WHERE session_id = ?1 AND status = 'active'",
-                [&session],
-                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-        })
-        .await
-        .context("active note summary")?;
+            .await?;
+        let row = stmt.query_row([session_id]).await?;
+        Ok((row.get(0)?, row.get(1)?))
+    }
+    .await;
+    let (count, oldest) = result.context("active note summary")?;
     Ok(match oldest {
         Some(oldest) if count > 0 => {
             format!(
@@ -1384,17 +1505,14 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].status, "archived");
         assert_eq!(rows[0].content, "wrong");
-        let reason: Option<String> = db
-            .conn()
-            .call(|c| {
-                c.query_row(
-                    "SELECT archive_reason FROM mc_memory WHERE id = '1'",
-                    [],
-                    |row| row.get(0),
-                )
-            })
-            .await
-            .unwrap();
+        let reason: Option<String> = {
+            let conn = db.acquire().await.unwrap();
+            let mut stmt = conn
+                .prepare("SELECT archive_reason FROM mc_memory WHERE id = '1'")
+                .await
+                .unwrap();
+            stmt.query_row(()).await.unwrap().get(0).unwrap()
+        };
         assert_eq!(reason.as_deref(), Some("outdated"));
 
         // Archiving an already-archived row reports nothing archived.
@@ -1471,17 +1589,14 @@ mod tests {
         assert_eq!(active[0].id, "2");
         assert_eq!(active[0].content, "right");
         // The archived row keeps its own reason.
-        let reason: Option<String> = db
-            .conn()
-            .call(|c| {
-                c.query_row(
-                    "SELECT archive_reason FROM mc_memory WHERE id = '1'",
-                    [],
-                    |row| row.get(0),
-                )
-            })
-            .await
-            .unwrap();
+        let reason: Option<String> = {
+            let conn = db.acquire().await.unwrap();
+            let mut stmt = conn
+                .prepare("SELECT archive_reason FROM mc_memory WHERE id = '1'")
+                .await
+                .unwrap();
+            stmt.query_row(()).await.unwrap().get(0).unwrap()
+        };
         assert_eq!(reason.as_deref(), Some("outdated"));
     }
 
@@ -2017,16 +2132,14 @@ mod tests {
         let age = |db: &Db, days: i64| {
             let db = db.clone();
             async move {
-                db.conn()
-                    .call(move |c| {
-                        c.execute(
-                            "UPDATE mc_note
-                             SET created_at = created_at - ?1, updated_at = updated_at - ?1",
-                            [days * 86_400_000_i64],
-                        )
-                    })
-                    .await
-                    .unwrap();
+                let conn = db.acquire().await.unwrap();
+                conn.execute(
+                    "UPDATE mc_note
+                         SET created_at = created_at - ?1, updated_at = updated_at - ?1",
+                    [days * 86_400_000_i64],
+                )
+                .await
+                .unwrap();
             }
         };
         age(&db, 31).await;

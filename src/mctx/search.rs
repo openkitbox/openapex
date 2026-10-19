@@ -10,45 +10,44 @@
 //! - `transcript` — raw `session_message` text the historian has NOT folded
 //!   yet (the plan's 会话历史 LIKE 回退).
 //!
-//! The first three are served by the FTS5 table `mc_search_fts` (migration
-//! V7): one index row per source row, `source`/`ref` carrying the origin.
+//! The first three are each served by their own Tantivy-backed FTS index
+//! (migration V7): `mc_memory_fts`, `mc_note_fts` and `mc_compartments_fts`.
+//! The table itself is the source, so there is no shared shadow table and no
+//! `source`/`ref` columns to join on: each lane queries its own table.
 //! The transcript is deliberately NOT indexed: it is the live, un-folded tail
 //! that changes on every turn and belongs to `session_v2`, not to the
 //! magic-context store. ox reads it directly with a case-insensitive `LIKE`
 //! over the message JSON — the plan's 会话历史 LIKE 回退, and the same shape as
 //! the reference's fallback when its raw-message index is unavailable.
 //!
-//! # Index maintenance: triggers, not write-through
+//! # Index maintenance: none
 //!
-//! The index is maintained by SQL triggers (see `MIGRATION_V7` in
-//! [`crate::db`]). The alternative — writing to the index from the store
-//! functions in [`crate::mctx::memory`] and
-//! [`crate::mctx::compartments`] — was rejected because those functions
-//! already open their own transactions and know nothing about search; a
-//! trigger keeps the index in step with *every* write path, including ones
-//! added later, with no call-site discipline to forget. (SQLite forbids
-//! `CREATE INDEX` on a virtual table, so no unique index can backstop the
-//! one-row-per-`(source, ref)` invariant; the triggers hold it instead.)
+//! turso's FTS indexes follow every INSERT / UPDATE / DELETE by themselves
+//! (see `MIGRATION_V7` in [`crate::db`]), so no trigger, backfill query or
+//! write-through in the store functions is needed: every write path, including
+//! ones added later, is indexed without call-site discipline. The one derived
+//! value is `mc_compartments.search_text`, written by the compartment store
+//! because `tiers` is JSON rather than searchable columns.
 //!
 //! # Query hygiene
 //!
-//! FTS5's `MATCH` grammar gives meaning to quotes, `*`, `-`, `:`, `^`,
+//! The index's query grammar gives meaning to quotes, `*`, `-`, `:`, `^`,
 //! parentheses and the bare words `AND`/`OR`/`NOT`/`NEAR`, so a query as
-//! ordinary as `a OR b`, `"a b"`, or an unbalanced quote would raise
-//! `fts5: syntax error`. [`query_tokens`] therefore scans the raw query into
+//! ordinary as `a OR b`, `"a b"`, or an unbalanced quote would raise a syntax
+//! error. [`query_tokens`] therefore scans the raw query into
 //! word tokens and the tokens are wrapped in double quotes before they reach
-//! `MATCH`: nothing a model types can be interpreted as grammar. A token can
+//! `fts_match`: nothing a model types can be interpreted as grammar. A token can
 //! only contain alphanumerics and `_ . / : -`, so it can never contain the
 //! quote that would break the wrapping and `a OR b` searches for the three
 //! literal words `a`, `or`, `b`.
 //!
-//! Tokens are joined by the `OR` operator, not by FTS5's implicit AND: a
+//! Tokens are joined by the `OR` operator, not by the implicit AND: a
 //! natural-language question carries words the corpus does not ("where is the
 //! opencode source code path?"), and requiring all of them would return
-//! nothing. Every hit is still ranked by BM25, which orders rows matching more
-//! of the query's words first, so a row containing all of them outranks one
-//! matching a single coincidental word. This also matches the reference's note
-//! lane, whose `LIKE` predicates are joined by `OR`.
+//! nothing. Every hit is still ranked by the FTS score, which orders rows
+//! matching more of the query's words first, so a row containing all of them
+//! outranks one matching a single coincidental word. This also matches the
+//! reference's note lane, whose `LIKE` predicates are joined by `OR`.
 //!
 //! # Deviations from the reference (documented, not accidental)
 //!
@@ -58,10 +57,10 @@
 //! - **No result suppression.** The reference hides memories already visible
 //!   in `<project-memory>` and messages still in the live tail; ox returns
 //!   every match with its id so the model can decide.
-//! - **Ranking is per-source and deterministic**, not a blended BM25 score:
-//!   FTS5's `bm25` is not comparable across sources, so each source
+//! - **Ranking is per-source and deterministic**, not a blended score:
+//!   `fts_score` is not comparable across sources, so each source
 //!   contributes hits in its own relevance order and they merge by descending
-//!   score, then within-source rank, then id.
+//!   band, then within-source rank, then id.
 //! - **Dates are `YYYY-MM-DD` only** (the reference also accepts full ISO
 //!   datetimes). `from` is UTC midnight, `to` the last millisecond of that
 //!   UTC day; both are inclusive and checked against each row's `created_at`.
@@ -306,7 +305,7 @@ pub(crate) async fn search(db: &Db, request: &SearchRequest<'_>) -> Result<Vec<S
     Ok(ranked.into_iter().map(|ranked| ranked.hit).collect())
 }
 
-/// Active project memories matching every token, in BM25 order.
+/// Active project memories matching every token, in FTS-score order.
 async fn search_memories(
     db: &Db,
     request: &SearchRequest<'_>,
@@ -315,36 +314,37 @@ async fn search_memories(
     let Some(match_expr) = fts_match_expression(tokens) else {
         return Ok(Vec::new());
     };
-    let project = request.project.to_owned();
-    let rows = db
-        .conn()
-        .call(move |c| -> rusqlite::Result<Vec<MemoryRow>> {
-            let mut stmt = c.prepare(
-                "SELECT m.id, m.category, m.content, m.created_at
-                   FROM mc_search_fts
-                   JOIN mc_memory m ON m.id = mc_search_fts.ref
-                  WHERE mc_search_fts MATCH ?1
-                    AND mc_search_fts.source = 'memory'
-                    AND m.project = ?2
-                    AND m.status = 'active'
-                  ORDER BY bm25(mc_search_fts), mc_search_fts.rowid
+    // The source table is the index: the project and status predicates stay in
+    // SQL, so the fetch limit applies to the rows this lane may return.
+    let rows = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, category, content, created_at
+                   FROM mc_memory
+                  WHERE fts_match(content, ?1)
+                    AND project = ?2
+                    AND status = 'active'
+                  ORDER BY fts_score(content, ?1) DESC, rowid
                   LIMIT ?3",
-            )?;
-            let rows = stmt.query_map(
-                rusqlite::params![match_expr, project, SOURCE_FETCH_LIMIT],
-                |row| {
-                    Ok(MemoryRow {
-                        id: row.get(0)?,
-                        category: row.get(1)?,
-                        content: row.get(2)?,
-                        created_at: row.get(3)?,
-                    })
-                },
-            )?;
-            rows.collect()
-        })
-        .await
-        .context("search indexed memories")?;
+            )
+            .await?;
+        let mut candidates = stmt
+            .query((match_expr.as_str(), request.project, SOURCE_FETCH_LIMIT))
+            .await?;
+        let mut rows = Vec::new();
+        while let Some(row) = candidates.next().await? {
+            rows.push(MemoryRow {
+                id: row.get(0)?,
+                category: row.get(1)?,
+                content: row.get(2)?,
+                created_at: row.get(3)?,
+            });
+        }
+        Ok::<_, anyhow::Error>(rows)
+    }
+    .await
+    .context("search indexed memories")?;
 
     Ok(rows
         .into_iter()
@@ -379,39 +379,39 @@ async fn search_notes(
         return Ok(Vec::new());
     };
     // The note's searchable text is title + body + surface condition (the
-    // index body, migration V7); the snippet is taken from the same text.
-    let session = request.session_id.to_owned();
-    let rows = db
-        .conn()
-        .call(move |c| -> rusqlite::Result<Vec<NoteRow>> {
-            let mut stmt = c.prepare(
-                "SELECT n.id, n.title, n.body, n.status, n.surface_condition, n.created_at
-                   FROM mc_search_fts
-                   JOIN mc_note n ON n.id = mc_search_fts.ref
-                  WHERE mc_search_fts MATCH ?1
-                    AND mc_search_fts.source = 'note'
-                    AND n.session_id = ?2
-                    AND n.status != 'dismissed'
-                  ORDER BY bm25(mc_search_fts), mc_search_fts.rowid
+    // index's column list, migration V7); the snippet is taken from the same
+    // text.
+    let rows = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, title, body, status, surface_condition, created_at
+                   FROM mc_note
+                  WHERE fts_match(title, body, surface_condition, ?1)
+                    AND session_id = ?2
+                    AND status != 'dismissed'
+                  ORDER BY fts_score(title, body, surface_condition, ?1) DESC, rowid
                   LIMIT ?3",
-            )?;
-            let rows = stmt.query_map(
-                rusqlite::params![match_expr, session, SOURCE_FETCH_LIMIT],
-                |row| {
-                    Ok(NoteRow {
-                        id: row.get(0)?,
-                        title: row.get(1)?,
-                        body: row.get(2)?,
-                        status: row.get(3)?,
-                        surface_condition: row.get(4)?,
-                        created_at: row.get(5)?,
-                    })
-                },
-            )?;
-            rows.collect()
-        })
-        .await
-        .context("search indexed notes")?;
+            )
+            .await?;
+        let mut candidates = stmt
+            .query((match_expr.as_str(), request.session_id, SOURCE_FETCH_LIMIT))
+            .await?;
+        let mut rows = Vec::new();
+        while let Some(row) = candidates.next().await? {
+            rows.push(NoteRow {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                body: row.get(2)?,
+                status: row.get(3)?,
+                surface_condition: row.get(4)?,
+                created_at: row.get(5)?,
+            });
+        }
+        Ok::<_, anyhow::Error>(rows)
+    }
+    .await
+    .context("search indexed notes")?;
 
     Ok(rows
         .into_iter()
@@ -458,34 +458,35 @@ async fn search_compartments(
     let Some(match_expr) = fts_match_expression(tokens) else {
         return Ok(Vec::new());
     };
-    let session = request.session_id.to_owned();
-    let rows = db
-        .conn()
-        .call(move |c| -> rusqlite::Result<Vec<CompartmentRow>> {
-            let mut stmt = c.prepare(
-                "SELECT c.id, c.tiers, c.created_at
-                   FROM mc_search_fts
-                   JOIN mc_compartments c ON c.id = mc_search_fts.ref
-                  WHERE mc_search_fts MATCH ?1
-                    AND mc_search_fts.source = 'compartment'
-                    AND c.session_id = ?2
-                  ORDER BY bm25(mc_search_fts), mc_search_fts.rowid
+    // `search_text` is the derived column the compartment store fills from
+    // `tiers`; matching it is what makes a compartment reachable.
+    let rows = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, tiers, created_at
+                   FROM mc_compartments
+                  WHERE fts_match(search_text, ?1)
+                    AND session_id = ?2
+                  ORDER BY fts_score(search_text, ?1) DESC, rowid
                   LIMIT ?3",
-            )?;
-            let rows = stmt.query_map(
-                rusqlite::params![match_expr, session, SOURCE_FETCH_LIMIT],
-                |row| {
-                    Ok(CompartmentRow {
-                        id: row.get(0)?,
-                        tiers: row.get(1)?,
-                        created_at: row.get(2)?,
-                    })
-                },
-            )?;
-            rows.collect()
-        })
-        .await
-        .context("search indexed compartments")?;
+            )
+            .await?;
+        let mut candidates = stmt
+            .query((match_expr.as_str(), request.session_id, SOURCE_FETCH_LIMIT))
+            .await?;
+        let mut rows = Vec::new();
+        while let Some(row) = candidates.next().await? {
+            rows.push(CompartmentRow {
+                id: row.get(0)?,
+                tiers: row.get(1)?,
+                created_at: row.get(2)?,
+            });
+        }
+        Ok::<_, anyhow::Error>(rows)
+    }
+    .await
+    .context("search indexed compartments")?;
 
     Ok(rows
         .into_iter()
@@ -541,37 +542,37 @@ async fn search_transcript(
     // same extraction the tagger tags means a hit is always text the model could
     // have seen (never a JSON key). Rows stream, so a long session costs one row
     // at a time and stops at the fetch limit.
-    let session = request.session_id.to_owned();
     let needles: Vec<String> = tokens.iter().map(|token| token.to_lowercase()).collect();
-    let rows = db
-        .conn()
-        .call(move |c| -> rusqlite::Result<Vec<TranscriptRow>> {
-            let mut stmt = c.prepare(
+    let rows = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
                 "SELECT id, type, seq, data FROM session_message
                   WHERE session_id = ?1
                   ORDER BY seq ASC",
-            )?;
-            let mut candidates = stmt.query([&session])?;
-            let mut rows = Vec::new();
-            while let Some(row) = candidates.next()? {
-                let candidate = TranscriptRow {
-                    id: row.get(0)?,
-                    kind: row.get(1)?,
-                    seq: row.get(2)?,
-                    data: row.get(3)?,
-                };
-                let text = message_text(&candidate).to_lowercase();
-                if needles.iter().all(|needle| text.contains(needle.as_str())) {
-                    rows.push(candidate);
-                    if rows.len() as i64 == SOURCE_FETCH_LIMIT {
-                        break;
-                    }
+            )
+            .await?;
+        let mut candidates = stmt.query([request.session_id]).await?;
+        let mut rows = Vec::new();
+        while let Some(row) = candidates.next().await? {
+            let candidate = TranscriptRow {
+                id: row.get(0)?,
+                kind: row.get(1)?,
+                seq: row.get(2)?,
+                data: row.get(3)?,
+            };
+            let text = message_text(&candidate).to_lowercase();
+            if needles.iter().all(|needle| text.contains(needle.as_str())) {
+                rows.push(candidate);
+                if rows.len() as i64 == SOURCE_FETCH_LIMIT {
+                    break;
                 }
             }
-            Ok(rows)
-        })
-        .await
-        .context("search the raw transcript")?;
+        }
+        Ok::<_, anyhow::Error>(rows)
+    }
+    .await
+    .context("search the raw transcript")?;
 
     Ok(rows
         .into_iter()
@@ -657,7 +658,7 @@ const MAX_QUERY_TERMS: usize = 64;
 /// A token is a maximal run of alphanumeric characters plus the word-ish
 /// punctuation that appears in paths and symbols (`_ . / : -`), which mirrors
 /// the reference's `keyword_search_terms`. Nothing else survives, so a token
-/// can never contain a character that is meaningful to the FTS5 grammar.
+/// can never contain a character that is meaningful to the query grammar.
 /// Duplicates are dropped, preserving first-seen order.
 fn query_tokens(query: &str) -> Vec<String> {
     let mut tokens: Vec<String> = Vec::new();
@@ -687,10 +688,10 @@ fn is_token_char(ch: char) -> bool {
     ch.is_alphanumeric() || matches!(ch, '_' | '.' | '/' | ':' | '-')
 }
 
-/// A safe FTS5 `MATCH` expression: every token double-quoted (a phrase of one
-/// token, which FTS5 treats as a literal term) and joined by `OR`, so a hit is
-/// any row containing any term and BM25 ranks the rows containing more of
-/// them ahead. `None` when the query has no usable token.
+/// A safe `fts_match` query: every token double-quoted (a phrase of one
+/// token, which the index treats as a literal term) and joined by `OR`, so a
+/// hit is any row containing any term and the score ranks the rows containing
+/// more of them ahead. `None` when the query has no usable token.
 fn fts_match_expression(tokens: &[String]) -> Option<String> {
     if tokens.is_empty() {
         return None;
@@ -826,7 +827,7 @@ pub struct CtxSearchTool {
 }
 
 impl CtxSearchTool {
-    /// The tool over `db` (the `mc_search_fts` index and its sources).
+    /// The tool over `db` (the `mc_*` tables and their search indexes).
     pub fn new(db: Db) -> Self {
         Self { db }
     }
@@ -843,11 +844,11 @@ impl Tool for CtxSearchTool {
             "Search the archive — everything that ever happened in this project, not just \
              what is on your desk: project memories, session notes, folded conversation \
              summaries, and raw transcript text the historian has not folded yet.\n\n\
-             Retrieval matches exact words (FTS5 over memories, notes and compartments; a \
-             case-insensitive substring match over the raw transcript for anything not yet \
-             indexed). Phrase `query` as a natural-language question that still carries the \
-             exact terms you expect in the answer (paths, symbols, config keys, error \
-             strings); a bare keyword stack finds less.\n\n\
+             Retrieval matches exact words (full-text indexes over memories, notes and \
+             compartments; a case-insensitive substring match over the raw transcript \
+             for anything not yet indexed). Phrase `query` as a natural-language question \
+             that still carries the exact terms you expect in the answer (paths, symbols, \
+             config keys, error strings); a bare keyword stack finds less.\n\n\
              Sources (omit for all):\n\
              - memory — durable project facts; \"what's our convention for X\"\n\
              - note — parked follow-ups with their recorded text; \"did we leave a follow-up\"\n\
@@ -1208,12 +1209,25 @@ mod tests {
             &[json!({ "id": "msg_1", "type": "user", "text": "seahorse only in the raw tail" })],
         )
         .await;
-        // Nothing is in the index, so the raw transcript is the only hit.
-        let indexed: i64 = db
-            .conn()
-            .call(|c| c.query_row("SELECT count(*) FROM mc_search_fts", [], |row| row.get(0)))
-            .await
-            .unwrap();
+        // Nothing is in any of the three indexes, so the raw transcript is the
+        // only hit. Each index is its own table's, so emptiness is checked per
+        // table rather than on a shared shadow table.
+        let mut indexed: i64 = 0;
+        for table in ["mc_memory", "mc_note", "mc_compartments"] {
+            let conn = db.acquire().await.unwrap();
+            let mut stmt = conn
+                .prepare(&format!("SELECT count(*) FROM {table}"))
+                .await
+                .unwrap();
+            let mut rows = stmt.query(()).await.unwrap();
+            indexed += rows
+                .next()
+                .await
+                .unwrap()
+                .expect("count returns one row")
+                .get::<i64>(0)
+                .unwrap();
+        }
         assert_eq!(indexed, 0);
 
         let hits = search(&db, &request("seahorse", SourceFilter::ALL))
@@ -1472,7 +1486,7 @@ mod tests {
         );
     }
 
-    /// FTS5's grammar treats quotes, `*`, `-`, `:`, `^`, parentheses and the
+    /// The query grammar treats quotes, `*`, `-`, `:`, `^`, parentheses and the
     /// words AND/OR/NOT/NEAR as operators; every one of these must be a literal
     /// token instead of a syntax error.
     #[tokio::test]
@@ -1520,17 +1534,19 @@ mod tests {
     async fn malformed_compartment_tiers_degrade_without_error() {
         let db = db().await;
         publish(&db, "mc_ok", "Valid", "quokka here").await;
-        db.conn()
-            .call(|c| {
-                c.execute(
-                    "INSERT INTO mc_compartments
-                         (id, session_id, coverage_end, importance, tiers, created_at)
-                     VALUES ('mc_bad', ?1, '3', 50.0, '{not json', 1)",
-                    rusqlite::params![SESSION],
-                )
-            })
+        // A direct insert (no derived `search_text`) is not indexed at all, so
+        // it can never match; the malformed JSON is still loadable.
+        {
+            let conn = db.acquire().await.unwrap();
+            conn.execute(
+                "INSERT INTO mc_compartments
+                     (id, session_id, coverage_end, importance, tiers, created_at)
+                 VALUES ('mc_bad', ?1, '3', 50.0, '{not json', 1)",
+                [SESSION],
+            )
             .await
             .unwrap();
+        }
         let hits = search(&db, &request("quokka", SourceFilter::ALL))
             .await
             .unwrap();

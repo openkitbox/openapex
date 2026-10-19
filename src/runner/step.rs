@@ -1213,17 +1213,15 @@ async fn mctx_head(ctx: &DrainCtx) -> (Option<String>, Option<String>, i64) {
 
 /// The highest transcript ordinal in a session.
 async fn latest_seq(db: &crate::db::Db, session_id: &str) -> Result<i64> {
-    let session = session_id.to_owned();
-    let seq = db
-        .conn()
-        .call(move |c| -> rusqlite::Result<i64> {
-            c.query_row(
-                "SELECT COALESCE(MAX(seq), 0) FROM session_message WHERE session_id = ?1",
-                [&session],
-                |row| row.get(0),
-            )
-        })
+    let conn = db.acquire().await?;
+    let mut stmt = conn
+        .prepare("SELECT COALESCE(MAX(seq), 0) FROM session_message WHERE session_id = ?1")
         .await?;
+    let mut rows = stmt.query([session_id]).await?;
+    let seq = match rows.next().await? {
+        Some(row) => row.get::<i64>(0)?,
+        None => 0,
+    };
     Ok(seq)
 }
 
@@ -1489,26 +1487,24 @@ pub(crate) async fn rows_after_with_seq(
     session_id: &str,
     floor: i64,
 ) -> Result<Vec<(i64, serde_json::Value)>> {
-    let session_id = session_id.to_owned();
-    let rows: Vec<(String, String, String, i64)> = db
-        .conn()
-        .call(move |c| {
-            let mut stmt = c.prepare(
-                "SELECT id, type, data, seq FROM session_message
-                 WHERE session_id = ?1 AND seq > ?2 ORDER BY seq ASC",
-            )?;
-            let mapped = stmt.query_map(rusqlite::params![session_id, floor], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            })?;
-            mapped.collect::<rusqlite::Result<Vec<_>>>()
-        })
+    let conn = db.acquire().await?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, type, data, seq FROM session_message
+             WHERE session_id = ?1 AND seq > ?2 ORDER BY seq ASC",
+        )
         .await?;
-    rows.into_iter()
+    let mut rows = stmt.query((session_id, floor)).await?;
+    let mut raw = Vec::new();
+    while let Some(row) = rows.next().await? {
+        raw.push((
+            row.get::<String>(0)?,
+            row.get::<String>(1)?,
+            row.get::<String>(2)?,
+            row.get::<i64>(3)?,
+        ));
+    }
+    raw.into_iter()
         .map(|(id, kind, data, seq)| {
             let mut value: serde_json::Value = serde_json::from_str(&data)?;
             if let serde_json::Value::Object(map) = &mut value {

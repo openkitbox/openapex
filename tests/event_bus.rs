@@ -49,6 +49,17 @@ async fn bus() -> EventBus {
     EventBus::new(Db::open_in_memory().await.unwrap())
 }
 
+/// Run a query expected to return exactly one row.
+async fn one_row(
+    conn: &turso::Connection,
+    sql: &str,
+    params: impl turso::IntoParams,
+) -> turso::Row {
+    let mut stmt = conn.prepare(sql).await.expect("prepare");
+    let mut rows = stmt.query(params).await.expect("query");
+    rows.next().await.expect("next").expect("one row")
+}
+
 async fn create(bus: &EventBus, sid: &str) {
     bus.publish(SessionEventData::SessionCreated {
         session_id: sid.to_string(),
@@ -137,6 +148,76 @@ async fn concurrent_publishes_serialize() {
     assert_eq!(seqs, expected, "no duplicate or missing seqs");
 }
 
+/// The connection carries one transaction at a time, so concurrent writers
+/// must queue for it — different aggregates have no per-aggregate lock, and
+/// turso answers a second `BEGIN` with "cannot start a transaction within a
+/// transaction" rather than waiting.
+#[tokio::test]
+async fn concurrent_publishes_on_different_aggregates_queue() {
+    let bus = std::sync::Arc::new(bus().await);
+    create(&bus, "s1").await;
+    create(&bus, "s2").await;
+
+    let mut handles = Vec::new();
+    for i in 0..16 {
+        let b = std::sync::Arc::clone(&bus);
+        let session = if i % 2 == 0 { "s1" } else { "s2" };
+        handles.push(tokio::spawn(async move {
+            b.publish(SessionEventData::SessionRenamed {
+                session_id: session.to_string(),
+                title: format!("t{i}"),
+            })
+            .await
+            .map(|env| env.durable.unwrap().seq)
+        }));
+    }
+    let mut seqs = Vec::new();
+    for handle in handles {
+        seqs.push(handle.await.unwrap().expect("publish"));
+    }
+    seqs.sort_unstable();
+    // Each session is its own aggregate, so the two interleave 1..=8.
+    let expected: Vec<i64> = (1..=8).flat_map(|seq| [seq, seq]).collect();
+    assert_eq!(
+        seqs, expected,
+        "every publish landed, none lost to a BEGIN clash"
+    );
+}
+
+/// A projector conflict aborts its transaction mid-way; the next writer must
+/// not find that transaction still open.
+#[tokio::test]
+async fn a_failed_publish_leaves_no_open_transaction() {
+    let bus = bus().await;
+    create(&bus, "s1").await;
+
+    // No such inbox row: project_delivery_changed updates zero rows and fails.
+    let failed = bus
+        .publish(SessionEventData::InboxDeliveryChanged {
+            session_id: "s1".to_string(),
+            inbox_id: "missing".to_string(),
+            delivery: Delivery::Queue,
+        })
+        .await;
+    assert!(
+        failed.is_err(),
+        "a missing inbox row is a lifecycle conflict"
+    );
+
+    let env = bus
+        .publish(SessionEventData::SessionRenamed {
+            session_id: "s1".to_string(),
+            title: "after".to_string(),
+        })
+        .await
+        .expect("publish after a rolled-back one");
+    assert_eq!(
+        env.durable.unwrap().seq,
+        1,
+        "the conflict did not consume a seq"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Rollback on projector error
 // ---------------------------------------------------------------------------
@@ -156,30 +237,26 @@ async fn projector_error_rolls_back() {
     assert!(res.is_err());
 
     // event_sequence must be untouched (still at created's seq 0).
-    let conn = bus.db_conn().clone();
-    let seq: i64 = conn
-        .call(|c| {
-            c.query_row(
-                "SELECT seq FROM event_sequence WHERE aggregate_id = 's1'",
-                [],
-                |r| r.get(0),
-            )
-        })
-        .await
-        .unwrap();
+    let conn = bus.db().acquire().await.unwrap();
+    let seq = one_row(
+        &conn,
+        "SELECT seq FROM event_sequence WHERE aggregate_id = 's1'",
+        (),
+    )
+    .await
+    .get::<i64>(0)
+    .unwrap();
     assert_eq!(seq, 0);
 
     // No event rows beyond the created one.
-    let count: i64 = conn
-        .call(|c| {
-            c.query_row(
-                "SELECT count(*) FROM event WHERE aggregate_id = 's1'",
-                [],
-                |r| r.get(0),
-            )
-        })
-        .await
-        .unwrap();
+    let count = one_row(
+        &conn,
+        "SELECT count(*) FROM event WHERE aggregate_id = 's1'",
+        (),
+    )
+    .await
+    .get::<i64>(0)
+    .unwrap();
     assert_eq!(count, 1);
 }
 
@@ -211,17 +288,15 @@ async fn happy_path_projection() {
         .unwrap();
     let del_seq = del.durable.as_ref().unwrap().seq;
 
-    let conn = bus.db_conn().clone();
-    let (mtype, mseq): (String, i64) = conn
-        .call(move |c| {
-            c.query_row(
-                "SELECT type, seq FROM session_message WHERE id = 'ib1'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-        })
-        .await
-        .unwrap();
+    let conn = bus.db().acquire().await.unwrap();
+    let row = one_row(
+        &conn,
+        "SELECT type, seq FROM session_message WHERE id = 'ib1'",
+        (),
+    )
+    .await;
+    let mtype = row.get::<String>(0).unwrap();
+    let mseq = row.get::<i64>(1).unwrap();
     assert_eq!(mtype, "user");
     assert_eq!(mseq, del_seq, "promoted message seq = deliver event seq");
 
@@ -277,18 +352,18 @@ async fn happy_path_projection() {
     .await
     .unwrap();
 
-    let conn2 = bus.db_conn().clone();
-    let (cost, tin, tout, idle_outcome, time_idle): (f64, i64, i64, String, i64) = conn2
-        .call(move |c| {
-            c.query_row(
-                "SELECT cost, tokens_input, tokens_output, idle_outcome, time_idle \
-                 FROM session_v2 WHERE id = 's1'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-        })
-        .await
-        .unwrap();
+    let row = one_row(
+        &conn,
+        "SELECT cost, tokens_input, tokens_output, idle_outcome, time_idle \
+         FROM session_v2 WHERE id = 's1'",
+        (),
+    )
+    .await;
+    let cost = row.get::<f64>(0).unwrap();
+    let tin = row.get::<i64>(1).unwrap();
+    let tout = row.get::<i64>(2).unwrap();
+    let idle_outcome = row.get::<String>(3).unwrap();
+    let time_idle = row.get::<i64>(4).unwrap();
     assert!((cost - 0.5).abs() < 1e-9);
     assert_eq!(tin, 10);
     assert_eq!(tout, 5);
@@ -296,17 +371,14 @@ async fn happy_path_projection() {
     assert!(time_idle > 0);
 
     // Idle marker message exists.
-    let conn3 = bus.db_conn().clone();
-    let idle_count: i64 = conn3
-        .call(move |c| {
-            c.query_row(
-                "SELECT count(*) FROM session_message WHERE session_id = 's1' AND type = 'idle'",
-                [],
-                |r| r.get(0),
-            )
-        })
-        .await
-        .unwrap();
+    let idle_count = one_row(
+        &conn,
+        "SELECT count(*) FROM session_message WHERE session_id = 's1' AND type = 'idle'",
+        (),
+    )
+    .await
+    .get::<i64>(0)
+    .unwrap();
     assert_eq!(idle_count, 1);
 }
 
@@ -332,17 +404,15 @@ async fn inbox_cancel_removes_row() {
     .await
     .unwrap();
 
-    let conn = bus.db_conn().clone();
-    let n: i64 = conn
-        .call(move |c| {
-            c.query_row(
-                "SELECT count(*) FROM session_inbox WHERE id = 'ib1'",
-                [],
-                |r| r.get(0),
-            )
-        })
-        .await
-        .unwrap();
+    let conn = bus.db().acquire().await.unwrap();
+    let n = one_row(
+        &conn,
+        "SELECT count(*) FROM session_inbox WHERE id = 'ib1'",
+        (),
+    )
+    .await
+    .get::<i64>(0)
+    .unwrap();
     assert_eq!(n, 0);
 }
 
@@ -365,17 +435,15 @@ async fn inbox_delivery_change_updates() {
     .await
     .unwrap();
 
-    let conn = bus.db_conn().clone();
-    let d: String = conn
-        .call(move |c| {
-            c.query_row(
-                "SELECT delivery FROM session_inbox WHERE id = 'ib1'",
-                [],
-                |r| r.get(0),
-            )
-        })
-        .await
-        .unwrap();
+    let conn = bus.db().acquire().await.unwrap();
+    let d = one_row(
+        &conn,
+        "SELECT delivery FROM session_inbox WHERE id = 'ib1'",
+        (),
+    )
+    .await
+    .get::<String>(0)
+    .unwrap();
     assert_eq!(d, "steer");
 }
 
@@ -460,17 +528,15 @@ async fn ephemeral_events_broadcast_not_persisted() {
     assert!(got.is_some(), "ephemeral event broadcast");
 
     // And not persisted.
-    let conn = bus.db_conn().clone();
-    let n: i64 = conn
-        .call(move |c| {
-            c.query_row(
-                "SELECT count(*) FROM event WHERE aggregate_id = 's1' AND type LIKE 'session.text.delta%'",
-                [],
-                |r| r.get(0),
-            )
-        })
-        .await
-        .unwrap();
+    let conn = bus.db().acquire().await.unwrap();
+    let n = one_row(
+        &conn,
+        "SELECT count(*) FROM event WHERE aggregate_id = 's1' AND type LIKE 'session.text.delta%'",
+        (),
+    )
+    .await
+    .get::<i64>(0)
+    .unwrap();
     assert_eq!(n, 0);
 }
 
@@ -515,18 +581,15 @@ async fn completed_assistant_is_not_current() {
     .await
     .unwrap();
 
-    let conn = bus.db_conn().clone();
-    let before: String = conn
-        .clone()
-        .call(move |c| {
-            c.query_row(
-                "SELECT data FROM session_message WHERE id = 'am1'",
-                [],
-                |r| r.get(0),
-            )
-        })
-        .await
-        .unwrap();
+    let conn = bus.db().acquire().await.unwrap();
+    let before = one_row(
+        &conn,
+        "SELECT data FROM session_message WHERE id = 'am1'",
+        (),
+    )
+    .await
+    .get::<String>(0)
+    .unwrap();
 
     // A second step starts while am1 is complete. The "close current
     // incomplete assistant" path must not touch it (getCurrentAssistant ->
@@ -542,37 +605,33 @@ async fn completed_assistant_is_not_current() {
     .await
     .unwrap();
 
-    let after: String = conn
-        .call(move |c| {
-            c.query_row(
-                "SELECT data FROM session_message WHERE id = 'am1'",
-                [],
-                |r| r.get(0),
-            )
-        })
-        .await
-        .unwrap();
+    let after = one_row(
+        &conn,
+        "SELECT data FROM session_message WHERE id = 'am1'",
+        (),
+    )
+    .await
+    .get::<String>(0)
+    .unwrap();
     assert_eq!(before, after, "completed assistant must not be mutated");
 
     // The new assistant exists and the completed one still carries its finish.
-    let (count, finish): (i64, Option<String>) = bus
-        .db_conn()
-        .clone()
-        .call(move |c| {
-            let count = c.query_row(
-                "SELECT count(*) FROM session_message WHERE session_id = 's1' AND type = 'assistant'",
-                [],
-                |r| r.get(0),
-            )?;
-            let finish = c.query_row(
-                "SELECT json_extract(data, '$.finish') FROM session_message WHERE id = 'am1'",
-                [],
-                |r| r.get::<_, Option<String>>(0),
-            )?;
-            Ok::<(i64, Option<String>), rusqlite::Error>((count, finish))
-        })
-        .await
-        .unwrap();
+    let count = one_row(
+        &conn,
+        "SELECT count(*) FROM session_message WHERE session_id = 's1' AND type = 'assistant'",
+        (),
+    )
+    .await
+    .get::<i64>(0)
+    .unwrap();
+    let finish = one_row(
+        &conn,
+        "SELECT json_extract(data, '$.finish') FROM session_message WHERE id = 'am1'",
+        (),
+    )
+    .await
+    .get::<Option<String>>(0)
+    .unwrap();
     assert_eq!(count, 2);
     assert_eq!(finish.as_deref(), Some("stop"));
 }
@@ -600,18 +659,19 @@ async fn projected_message_ids_derive_from_event_id() {
         .unwrap();
 
     assert!(first.id.starts_with("evt_"));
-    let conn = bus.db_conn().clone();
-    let ids: Vec<String> = conn
-        .call(move |c| {
-            let mut stmt = c.prepare(
-                "SELECT id FROM session_message WHERE session_id = 's1' \
-                 AND type = 'idle' ORDER BY seq ASC",
-            )?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-        })
+    let conn = bus.db().acquire().await.unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT id FROM session_message WHERE session_id = 's1' \
+             AND type = 'idle' ORDER BY seq ASC",
+        )
         .await
         .unwrap();
+    let mut rows = stmt.query(()).await.unwrap();
+    let mut ids: Vec<String> = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        ids.push(row.get::<String>(0).unwrap());
+    }
 
     assert_eq!(
         ids,
@@ -652,41 +712,33 @@ async fn session_moved_projects_location_and_message() {
     let moved_id = ox::id::from_event(&moved.id);
 
     let created = moved.created;
-    let conn = bus.db_conn().clone();
-    let (directory, path, project_id, workspace_id, time_updated): (
-        String,
-        Option<String>,
-        String,
-        Option<String>,
-        i64,
-    ) = conn
-        .clone()
-        .call(move |c| {
-            c.query_row(
-                "SELECT directory, path, project_id, workspace_id, time_updated \
-                 FROM session_v2 WHERE id = 's1'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
-        })
-        .await
-        .unwrap();
+    let conn = bus.db().acquire().await.unwrap();
+    let row = one_row(
+        &conn,
+        "SELECT directory, path, project_id, workspace_id, time_updated \
+         FROM session_v2 WHERE id = 's1'",
+        (),
+    )
+    .await;
+    let directory = row.get::<String>(0).unwrap();
+    let path = row.get::<Option<String>>(1).unwrap();
+    let project_id = row.get::<String>(2).unwrap();
+    let workspace_id = row.get::<Option<String>>(3).unwrap();
+    let time_updated = row.get::<i64>(4).unwrap();
     assert_eq!(directory, "/tmp/moved");
     assert_eq!(path.as_deref(), Some("packages/app"));
     assert_eq!(project_id, "proj2");
     assert_eq!(workspace_id.as_deref(), Some("ws1"));
     assert_eq!(time_updated, created);
 
-    let data: String = conn
-        .call(move |c| {
-            c.query_row(
-                "SELECT data FROM session_message WHERE id = ?1 AND type = 'location-switched'",
-                rusqlite::params![moved_id],
-                |r| r.get(0),
-            )
-        })
-        .await
-        .unwrap();
+    let data = one_row(
+        &conn,
+        "SELECT data FROM session_message WHERE id = ?1 AND type = 'location-switched'",
+        [moved_id.as_str()],
+    )
+    .await
+    .get::<String>(0)
+    .unwrap();
     let value: serde_json::Value = serde_json::from_str(&data).unwrap();
     assert_eq!(value["location"]["directory"], "/tmp/moved");
     assert_eq!(value["projectID"], "proj2");
@@ -747,18 +799,15 @@ async fn usage_updated_broadcast_after_commit() {
     }
 
     // Ephemeral events are not persisted.
-    let n: i64 = bus
-        .db_conn()
-        .clone()
-        .call(move |c| {
-            c.query_row(
-                "SELECT count(*) FROM event WHERE aggregate_id = 's1' \
-                 AND type LIKE 'session.usage.updated%'",
-                [],
-                |r| r.get(0),
-            )
-        })
-        .await
-        .unwrap();
+    let conn = bus.db().acquire().await.unwrap();
+    let n = one_row(
+        &conn,
+        "SELECT count(*) FROM event WHERE aggregate_id = 's1' \
+         AND type LIKE 'session.usage.updated%'",
+        (),
+    )
+    .await
+    .get::<i64>(0)
+    .unwrap();
     assert_eq!(n, 0);
 }

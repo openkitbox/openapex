@@ -204,35 +204,29 @@ async fn query_projects(db: &Db) -> anyhow::Result<Vec<Project>> {
     // `worktree` column and exposes it as `canonical` in the protocol
     // (`core/src/project.ts`: `canonical: row.worktree`). `sandboxes` is a
     // JSON-encoded TEXT array of strings.
-    let rows = db
-        .conn()
-        .call(|c| -> rusqlite::Result<Vec<Project>> {
-            let mut stmt = c.prepare(
-                "SELECT id, worktree, time_created, time_updated, time_active, sandboxes FROM project",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                let sandboxes_raw: String = row.get(5)?;
-                let sandboxes: Vec<String> =
-                    serde_json::from_str(&sandboxes_raw).unwrap_or_default();
-                Ok(Project {
-                    id: row.get(0)?,
-                    canonical: row.get(1)?,
-                    time: ProjectTime {
-                        created: row.get(2)?,
-                        updated: row.get(3)?,
-                        active: row.get::<_, Option<i64>>(4)?.unwrap_or(0),
-                    },
-                    sandboxes,
-                })
-            })?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row?);
-            }
-            Ok(out)
-        })
+    let conn = db.acquire().await?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, worktree, time_created, time_updated, time_active, sandboxes FROM project",
+        )
         .await?;
-    Ok(rows)
+    let mut rows = stmt.query(()).await?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let sandboxes_raw: String = row.get(5)?;
+        let sandboxes: Vec<String> = serde_json::from_str(&sandboxes_raw).unwrap_or_default();
+        out.push(Project {
+            id: row.get(0)?,
+            canonical: row.get(1)?,
+            time: ProjectTime {
+                created: row.get(2)?,
+                updated: row.get(3)?,
+                active: row.get::<Option<i64>>(4)?.unwrap_or(0),
+            },
+            sandboxes,
+        });
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------

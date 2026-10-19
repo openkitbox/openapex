@@ -388,25 +388,16 @@ pub(crate) async fn resolve_selection(
     config: &Config,
 ) -> Result<(String, crate::schema::support::ModelRef)> {
     let row: Option<(Option<String>, Option<String>)> = {
-        let session_id = session_id.to_owned();
-        db.conn()
-            .call(
-                move |c| -> rusqlite::Result<Option<(Option<String>, Option<String>)>> {
-                    use rusqlite::OptionalExtension;
-                    c.query_row(
-                        "SELECT agent, model FROM session_v2 WHERE id = ?1",
-                        rusqlite::params![session_id],
-                        |r| {
-                            Ok((
-                                r.get::<_, Option<String>>(0)?,
-                                r.get::<_, Option<String>>(1)?,
-                            ))
-                        },
-                    )
-                    .optional()
-                },
-            )
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare("SELECT agent, model FROM session_v2 WHERE id = ?1")
+            .await?;
+        crate::db::optional(&mut stmt, [session_id])
             .await?
+            .map(|row| -> anyhow::Result<_> {
+                Ok((row.get::<Option<String>>(0)?, row.get::<Option<String>>(1)?))
+            })
+            .transpose()?
     };
     let Some((agent, model)) = row else {
         anyhow::bail!("session `{session_id}` is not projected");
@@ -435,27 +426,25 @@ pub(crate) async fn resolve_selection(
 
 /// `SessionInbox.list`: every pending row in arrival order.
 async fn list_rows(db: &Db, session_id: &str) -> Result<Vec<InboxRow>> {
-    let session_id = session_id.to_owned();
-    let raw: Vec<(String, String, String, String, String)> = db
-        .conn()
-        .call(move |c| {
-            let mut stmt = c.prepare(
-                "SELECT id, session_id, type, payload, delivery
-                 FROM session_inbox WHERE session_id = ?1
-                 ORDER BY enqueued_seq ASC",
-            )?;
-            let mapped = stmt.query_map(rusqlite::params![session_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                ))
-            })?;
-            mapped.collect::<rusqlite::Result<Vec<_>>>()
-        })
+    let conn = db.acquire().await?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, session_id, type, payload, delivery
+             FROM session_inbox WHERE session_id = ?1
+             ORDER BY enqueued_seq ASC",
+        )
         .await?;
+    let mut rows = stmt.query([session_id]).await?;
+    let mut raw = Vec::new();
+    while let Some(row) = rows.next().await? {
+        raw.push((
+            row.get::<String>(0)?,
+            row.get::<String>(1)?,
+            row.get::<String>(2)?,
+            row.get::<String>(3)?,
+            row.get::<String>(4)?,
+        ));
+    }
     raw.into_iter()
         .map(|(id, _session_id, kind, payload, delivery)| {
             InboxRow::from_columns(id, &kind, serde_json::from_str(&payload)?, &delivery)
@@ -575,11 +564,10 @@ async fn settle_stale_tool_calls(bus: &EventBus, db: &Db, session_id: &str) -> R
     // match mirrors the projector's stored shapes: `running` keeps
     // `{status, input, metadata}`, `streaming` keeps `{status, input}`.
     let rows: Vec<(String, String)> = {
-        let sid = session_id.to_owned();
-        db.conn()
-            .call(move |c| {
-                let mut stmt = c.prepare(
-                    "SELECT id, data FROM session_message
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, data FROM session_message
                  WHERE session_id = ?1 AND type = 'assistant'
                    AND (json_extract(data, '$.error') IS NULL)
                    AND EXISTS (
@@ -588,13 +576,14 @@ async fn settle_stale_tool_calls(bus: &EventBus, db: &Db, session_id: &str) -> R
                        AND json_extract(value, '$.state.status') IN ('running', 'streaming')
                    )
                  ORDER BY seq DESC",
-                )?;
-                let mapped = stmt.query_map(rusqlite::params![sid], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?;
-                mapped.collect::<rusqlite::Result<Vec<_>>>()
-            })
-            .await?
+            )
+            .await?;
+        let mut rows = stmt.query([session_id]).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push((row.get::<String>(0)?, row.get::<String>(1)?));
+        }
+        out
     };
     for (message_id, data) in rows {
         let message: Value = serde_json::from_str(&data)?;
@@ -638,21 +627,21 @@ async fn settle_stale_tool_calls(bus: &EventBus, db: &Db, session_id: &str) -> R
 /// left running by a process death, newest first.
 async fn settle_stale_compactions(bus: &EventBus, db: &Db, session_id: &str) -> Result<()> {
     let rows: Vec<(String, String)> = {
-        let sid = session_id.to_owned();
-        db.conn()
-            .call(move |c| {
-                let mut stmt = c.prepare(
-                    "SELECT id, data FROM session_message
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, data FROM session_message
                  WHERE session_id = ?1 AND type = 'compaction'
                    AND json_extract(data, '$.status') = 'running'
                  ORDER BY seq DESC",
-                )?;
-                let mapped = stmt.query_map(rusqlite::params![sid], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?;
-                mapped.collect::<rusqlite::Result<Vec<_>>>()
-            })
-            .await?
+            )
+            .await?;
+        let mut rows = stmt.query([session_id]).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push((row.get::<String>(0)?, row.get::<String>(1)?));
+        }
+        out
     };
     for (message_id, data) in rows {
         let reason = serde_json::from_str::<Value>(&data)?
@@ -751,17 +740,20 @@ mod tests {
         }
 
         async fn pending(&self) -> Vec<(String, String)> {
-            self.db
-                .conn()
-                .call(|c| -> rusqlite::Result<Vec<(String, String)>> {
-                    let mut stmt = c.prepare(
-                        "SELECT id, delivery FROM session_inbox ORDER BY enqueued_seq ASC",
-                    )?;
-                    let mapped = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
-                    mapped.collect()
-                })
+            let conn = self.db.acquire().await.expect("pending conn");
+            let mut stmt = conn
+                .prepare("SELECT id, delivery FROM session_inbox ORDER BY enqueued_seq ASC")
                 .await
-                .expect("pending")
+                .expect("prepare pending");
+            let mut rows = stmt.query(()).await.expect("query pending");
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().await.expect("pending") {
+                out.push((
+                    row.get::<String>(0).expect("id"),
+                    row.get::<String>(1).expect("delivery"),
+                ));
+            }
+            out
         }
 
         fn drain_ctx(&self) -> DrainCtx {

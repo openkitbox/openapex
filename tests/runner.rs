@@ -649,19 +649,19 @@ async fn prompt_runs_text_turn_and_accumulates_tokens() {
     assert_eq!(assistant["tokens"]["cache"]["write"], 0);
 
     // session_v2 accumulated the usage (projection of step.ended).
-    let sid = session_id.clone();
-    let tokens: (i64, i64) = harness
-        .db
-        .conn()
-        .call(move |c| {
-            c.query_row(
-                "SELECT tokens_input, tokens_output FROM session_v2 WHERE id = ?1",
-                [sid],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-        })
-        .await
-        .expect("query");
+    let tokens = {
+        let conn = harness.db.acquire().await.expect("conn");
+        let mut stmt = conn
+            .prepare("SELECT tokens_input, tokens_output FROM session_v2 WHERE id = ?1")
+            .await
+            .expect("prepare");
+        let mut rows = stmt.query([session_id.as_str()]).await.expect("query");
+        let row = rows.next().await.expect("next").expect("session row");
+        (
+            row.get::<i64>(0).expect("tokens_input"),
+            row.get::<i64>(1).expect("tokens_output"),
+        )
+    };
     assert_eq!(tokens, (60, 10));
 
     // Lifecycle: exactly one terminal opened and closed the busy period.
@@ -684,19 +684,19 @@ async fn prompt_runs_text_turn_and_accumulates_tokens() {
     assert!(!kinds.contains(&"session.execution.failed".to_owned()));
 
     // The delivered inbox row is gone.
-    let sid = session_id.clone();
-    let pending: i64 = harness
-        .db
-        .conn()
-        .call(move |c| {
-            c.query_row(
-                "SELECT count(*) FROM session_inbox WHERE session_id = ?1",
-                [sid],
-                |row| row.get(0),
-            )
-        })
+    let conn = harness.db.acquire().await.expect("conn");
+    let mut stmt = conn
+        .prepare("SELECT count(*) FROM session_inbox WHERE session_id = ?1")
         .await
-        .expect("query");
+        .expect("prepare");
+    let mut rows = stmt.query([session_id.as_str()]).await.expect("query");
+    let pending = rows
+        .next()
+        .await
+        .expect("next")
+        .expect("count row")
+        .get::<i64>(0)
+        .expect("pending");
     assert_eq!(pending, 0, "inbox drained");
 
     // The model saw the system prompt, then the user turn.
@@ -2377,19 +2377,19 @@ async fn queued_items_chain_across_turns_in_one_busy_period() {
         "one terminal"
     );
     assert_eq!(harness.chat.requests().len(), 2, "two model calls");
-    let sid = session_id.clone();
-    let pending: i64 = harness
-        .db
-        .conn()
-        .call(move |c| {
-            c.query_row(
-                "SELECT count(*) FROM session_inbox WHERE session_id = ?1",
-                [sid],
-                |row| row.get(0),
-            )
-        })
+    let conn = harness.db.acquire().await.expect("conn");
+    let mut stmt = conn
+        .prepare("SELECT count(*) FROM session_inbox WHERE session_id = ?1")
         .await
-        .expect("query");
+        .expect("prepare");
+    let mut rows = stmt.query([session_id.as_str()]).await.expect("query");
+    let pending = rows
+        .next()
+        .await
+        .expect("next")
+        .expect("count row")
+        .get::<i64>(0)
+        .expect("pending");
     assert_eq!(pending, 0, "no stranded inbox rows");
 }
 
@@ -2441,18 +2441,15 @@ async fn second_prompt_after_idle_runs_a_fresh_busy_period() {
 /// Seed one active memory for `project` straight into `mc_memory` (the store
 /// the pinboard render reads).
 async fn seed_memory(db: &ox::db::Db, project: &str) {
-    let project = project.to_owned();
-    db.conn()
-        .call(move |c| {
-            c.execute(
-                "INSERT INTO mc_memory
-                     (id, project, content, category, created_at, updated_at, status)
-                 VALUES ('7', ?1, 'The pinboard fact', 'ARCHITECTURE', 0, 0, 'active')",
-                [&project],
-            )
-        })
-        .await
-        .expect("seed memory");
+    let conn = db.acquire().await.expect("seed memory");
+    conn.execute(
+        "INSERT INTO mc_memory
+                 (id, project, content, category, created_at, updated_at, status)
+             VALUES ('7', ?1, 'The pinboard fact', 'ARCHITECTURE', 0, 0, 'active')",
+        [project],
+    )
+    .await
+    .expect("seed memory");
 }
 
 /// The system message of the first recorded request.
@@ -2626,21 +2623,20 @@ async fn tags_are_visible_and_an_applied_drop_leaves_the_request() {
     );
 
     // Stamp it through the store, exactly as the ctx_reduce tool does.
-    let tag: i64 = harness
-        .db
-        .conn()
-        .call({
-            let session_id = session_id.clone();
-            move |c| {
-                c.query_row(
-                    "SELECT tag FROM mc_tag WHERE session_id = ?1 AND part_path = 'text'",
-                    [&session_id],
-                    |row| row.get(0),
-                )
-            }
-        })
-        .await
-        .expect("the prompt's tag");
+    let tag = {
+        let conn = harness.db.acquire().await.expect("conn");
+        let mut stmt = conn
+            .prepare("SELECT tag FROM mc_tag WHERE session_id = ?1 AND part_path = 'text'")
+            .await
+            .expect("prepare");
+        let mut rows = stmt.query([session_id.as_str()]).await.expect("query");
+        rows.next()
+            .await
+            .expect("next")
+            .expect("the prompt's tag")
+            .get::<i64>(0)
+            .expect("tag")
+    };
     assert!(
         ox::mctx::tagger::queue_drop(&harness.db, &session_id, tag as u64, "used")
             .await

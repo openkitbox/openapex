@@ -40,9 +40,8 @@
 
 use anyhow::{Context as _, Result};
 use cortexkit_cache_core::{CoreState, DurabilityClass, FrozenUnit};
-use rusqlite::OptionalExtension;
 
-use crate::db::Db;
+use crate::db::{Db, optional};
 use crate::id::now_millis;
 use crate::mctx::cache::{HeadRenderer, McCache, PassOutcome, RenderedPass, Signals, run_pass};
 use crate::mctx::compartments::{self, Compartment};
@@ -431,35 +430,32 @@ async fn save_materialized_floor(db: &Db, session_id: &str, coverage: i64) -> Re
 
 /// Read a small integer the pass keeps in the session's `kv` row.
 async fn read_kv_int(db: &Db, key: &str, what: &str) -> Result<i64> {
-    let key = key.to_owned();
-    let value = db
-        .conn()
-        .call(move |c| -> rusqlite::Result<Option<String>> {
-            c.query_row("SELECT value FROM kv WHERE key = ?1", [&key], |row| {
-                row.get(0)
-            })
-            .optional()
-        })
+    let conn = db.acquire().await?;
+    let mut stmt = conn
+        .prepare("SELECT value FROM kv WHERE key = ?1")
         .await
+        .with_context(|| format!("load {what}"))?;
+    let row = optional(&mut stmt, [key])
+        .await
+        .with_context(|| format!("load {what}"))?;
+    let value = row
+        .map(|row| row.get::<String>(0))
+        .transpose()
         .with_context(|| format!("load {what}"))?;
     Ok(value.and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
 async fn write_kv_int(db: &Db, key: &str, value: i64, what: &str) -> Result<()> {
-    let key = key.to_owned();
     let value = value.to_string();
     let now = now_millis();
-    db.conn()
-        .call(move |c| -> rusqlite::Result<()> {
-            c.execute(
-                "INSERT INTO kv (key, value, time_created, time_updated) VALUES (?1, ?2, ?3, ?3)
-                 ON CONFLICT(key) DO UPDATE SET value = excluded.value, time_updated = ?3",
-                rusqlite::params![key, value, now],
-            )?;
-            Ok(())
-        })
-        .await
-        .with_context(|| format!("save {what}"))?;
+    let conn = db.acquire().await?;
+    conn.execute(
+        "INSERT INTO kv (key, value, time_created, time_updated) VALUES (?1, ?2, ?3, ?3)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value, time_updated = ?3",
+        (key, value.as_str(), now),
+    )
+    .await
+    .with_context(|| format!("save {what}"))?;
     Ok(())
 }
 

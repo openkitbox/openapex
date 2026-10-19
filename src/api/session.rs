@@ -19,13 +19,12 @@
 use anyhow::{Context as _, Result, anyhow};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use rusqlite::OptionalExtension;
-use rusqlite::types::Value as SqlValue;
 use salvo::http::StatusCode;
 use salvo::prelude::*;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use turso::Value as SqlValue;
 
 use crate::db::Db;
 use crate::id;
@@ -174,7 +173,7 @@ struct SessionRow {
     time_archived: Option<i64>,
 }
 
-fn map_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
+fn map_session_row(row: &turso::Row) -> turso::Result<SessionRow> {
     Ok(SessionRow {
         id: row.get(0)?,
         project_id: row.get(1)?,
@@ -311,30 +310,23 @@ fn insert_json(map: &mut Map<String, Value>, key: &str, raw: &Option<String>) {
 
 async fn load_session(db: &Db, session_id: &str) -> Result<Option<SessionRow>> {
     let sql = format!("SELECT {SESSION_COLUMNS} FROM session_v2 WHERE id = ?1");
-    let id = session_id.to_owned();
-    let row = db
-        .conn()
-        .call(move |c| {
-            c.query_row(&sql, rusqlite::params![id], map_session_row)
-                .optional()
-        })
-        .await?;
-    Ok(row)
+    let conn = db.acquire().await?;
+    let mut stmt = conn.prepare(&sql).await?;
+    let row = crate::db::optional(&mut stmt, [session_id]).await?;
+    Ok(row.map(|row| map_session_row(&row)).transpose()?)
 }
 
 /// Session ids whose `parent_id` is `parent_id` (upstream `list({ parentID })`).
 async fn load_children(db: &Db, parent_id: &str) -> Result<Vec<String>> {
-    let parent = parent_id.to_owned();
-    let ids = db
-        .conn()
-        .call(move |c| -> rusqlite::Result<Vec<String>> {
-            let mut stmt = c.prepare("SELECT id FROM session_v2 WHERE parent_id = ?1")?;
-            let rows = stmt
-                .query_map(rusqlite::params![parent], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
+    let conn = db.acquire().await?;
+    let mut stmt = conn
+        .prepare("SELECT id FROM session_v2 WHERE parent_id = ?1")
         .await?;
+    let mut rows = stmt.query([parent_id]).await?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next().await? {
+        ids.push(row.get::<String>(0)?);
+    }
     Ok(ids)
 }
 
@@ -343,18 +335,17 @@ async fn load_children(db: &Db, parent_id: &str) -> Result<Vec<String>> {
 /// the directory itself (ox has no worktree discovery).
 pub(crate) async fn resolve_project(db: &Db, directory: &str) -> (String, String) {
     if db.table_exists("project").await.unwrap_or(false) {
-        let wanted = directory.to_owned();
-        let found = db
-            .conn()
-            .call(move |c| -> rusqlite::Result<Option<String>> {
-                c.query_row(
-                    "SELECT id FROM project WHERE worktree = ?1 LIMIT 1",
-                    rusqlite::params![wanted],
-                    |row| row.get(0),
-                )
-                .optional()
-            })
-            .await;
+        // A missing or unreadable `project` table falls through to the
+        // synthetic project, exactly as the old `.call` error did.
+        let found: Result<Option<String>> = async {
+            let conn = db.acquire().await?;
+            let mut stmt = conn
+                .prepare("SELECT id FROM project WHERE worktree = ?1 LIMIT 1")
+                .await?;
+            let row = crate::db::optional(&mut stmt, [directory]).await?;
+            Ok(row.map(|row| row.get::<String>(0)).transpose()?)
+        }
+        .await;
         if let Ok(Some(id)) = found {
             return (id, directory.to_owned());
         }
@@ -550,17 +541,14 @@ async fn query_sessions(db: &Db, page: SessionsPage) -> Result<Vec<SessionRow>> 
     });
     sql.push_str(&format!(" LIMIT {limit}"));
 
-    let rows = db
-        .conn()
-        .call(move |c| -> rusqlite::Result<Vec<SessionRow>> {
-            let mut stmt = c.prepare(&sql)?;
-            let rows = stmt
-                .query_map(rusqlite::params_from_iter(params.iter()), map_session_row)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-        .await?;
-    Ok(rows)
+    let conn = db.acquire().await?;
+    let mut stmt = conn.prepare(&sql).await?;
+    let mut rows = stmt.query(params).await?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await? {
+        out.push(map_session_row(&row)?);
+    }
+    Ok(out)
 }
 
 #[handler] // operation_id: session.list
@@ -1092,35 +1080,32 @@ async fn find_fork_boundary(
     session_id: &str,
     before: Option<&str>,
 ) -> Result<Option<ForkBoundary>> {
-    let (sql, param) = match before {
-        Some(message_id) => (
-            "SELECT id FROM session_message WHERE session_id = ?1 AND id = ?2 \
-             ORDER BY seq DESC LIMIT 1",
-            Some(message_id.to_owned()),
-        ),
-        None => (
-            "SELECT id FROM session_message WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
-            None,
-        ),
+    let conn = db.acquire().await?;
+    let found: Option<String> = match before {
+        Some(message_id) => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM session_message WHERE session_id = ?1 AND id = ?2 \
+                     ORDER BY seq DESC LIMIT 1",
+                )
+                .await?;
+            crate::db::optional(&mut stmt, (session_id, message_id))
+                .await?
+                .map(|row| row.get::<String>(0))
+                .transpose()?
+        }
+        None => {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id FROM session_message WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
+                )
+                .await?;
+            crate::db::optional(&mut stmt, [session_id])
+                .await?
+                .map(|row| row.get::<String>(0))
+                .transpose()?
+        }
     };
-    let session = session_id.to_owned();
-    let found = db
-        .conn()
-        .call(move |c| -> rusqlite::Result<Option<String>> {
-            let mut stmt = c.prepare(sql)?;
-            let id = match param {
-                Some(message_id) => stmt
-                    .query_row(rusqlite::params![session, message_id], |row| {
-                        row.get::<_, String>(0)
-                    })
-                    .optional()?,
-                None => stmt
-                    .query_row(rusqlite::params![session], |row| row.get::<_, String>(0))
-                    .optional()?,
-            };
-            Ok(id)
-        })
-        .await?;
 
     Ok(found.map(|message_id| match before {
         Some(_) => ForkBoundary::Before { message_id },
@@ -1399,27 +1384,14 @@ async fn query_messages(db: &Db, page: MessagesPage) -> Result<Vec<Message>> {
     });
     sql.push_str(&format!(" LIMIT {limit}"));
 
-    let raw = db
-        .conn()
-        .call(
-            move |c| -> rusqlite::Result<Vec<(String, String, String)>> {
-                let mut stmt = c.prepare(&sql)?;
-                let rows = stmt
-                    .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                Ok(rows)
-            },
-        )
-        .await?;
-
-    let mut out = Vec::with_capacity(raw.len());
-    for (message_id, kind, data) in raw {
+    let conn = db.acquire().await?;
+    let mut stmt = conn.prepare(&sql).await?;
+    let mut rows = stmt.query(params).await?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let message_id = row.get::<String>(0)?;
+        let kind = row.get::<String>(1)?;
+        let data = row.get::<String>(2)?;
         let value: Value = serde_json::from_str(&data).context("decode session_message.data")?;
         out.push(
             Message::from_row_data(&message_id, &kind, value)
@@ -1433,20 +1405,12 @@ async fn query_messages(db: &Db, page: MessagesPage) -> Result<Vec<Message>> {
 }
 
 async fn message_seq(db: &Db, session_id: &str, message_id: &str) -> Result<Option<i64>> {
-    let session = session_id.to_owned();
-    let message = message_id.to_owned();
-    let seq = db
-        .conn()
-        .call(move |c| {
-            c.query_row(
-                "SELECT seq FROM session_message WHERE session_id = ?1 AND id = ?2",
-                rusqlite::params![session, message],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()
-        })
+    let conn = db.acquire().await?;
+    let mut stmt = conn
+        .prepare("SELECT seq FROM session_message WHERE session_id = ?1 AND id = ?2")
         .await?;
-    Ok(seq)
+    let row = crate::db::optional(&mut stmt, (session_id, message_id)).await?;
+    Ok(row.map(|row| row.get::<i64>(0)).transpose()?)
 }
 
 #[handler] // operation_id: session.message.list
@@ -1609,20 +1573,19 @@ pub(crate) async fn message_get(req: &mut Request, depot: &mut Depot, res: &mut 
         }
     }
 
-    let session = session_id.clone();
-    let message = message_id.clone();
-    let row = app
-        .db
-        .conn()
-        .call(move |c| -> rusqlite::Result<Option<(String, String)>> {
-            c.query_row(
-                "SELECT type, data FROM session_message WHERE session_id = ?1 AND id = ?2",
-                rusqlite::params![session, message],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()
-        })
-        .await;
+    let row: Result<Option<(String, String)>> = async {
+        let conn = app.db.acquire().await?;
+        let mut stmt = conn
+            .prepare("SELECT type, data FROM session_message WHERE session_id = ?1 AND id = ?2")
+            .await?;
+        let Some(row) =
+            crate::db::optional(&mut stmt, (session_id.as_str(), message_id.as_str())).await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some((row.get::<String>(0)?, row.get::<String>(1)?)))
+    }
+    .await;
     let row = match row {
         Ok(row) => row,
         Err(error) => {
@@ -1796,30 +1759,26 @@ type InboxTuple = (String, String, String, i64, String);
 
 /// Load one inbox row by id.
 async fn load_inbox_row(db: &Db, session_id: &str, inbox_id: &str) -> Result<Option<InboxRowInfo>> {
-    let session_id = session_id.to_owned();
-    let row: Option<InboxTuple> = {
-        let inbox_id = inbox_id.to_owned();
-        db.conn()
-            .call(move |c| -> rusqlite::Result<Option<InboxTuple>> {
-                use rusqlite::OptionalExtension;
-                c.query_row(
-                    "SELECT type, payload, delivery, time_created, session_id
+    let row: Option<InboxTuple> = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT type, payload, delivery, time_created, session_id
                  FROM session_inbox WHERE id = ?1 AND session_id = ?2",
-                    rusqlite::params![inbox_id, session_id],
-                    |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, String>(2)?,
-                            r.get::<_, i64>(3)?,
-                            r.get::<_, String>(4)?,
-                        ))
-                    },
-                )
-                .optional()
-            })
-            .await?
-    };
+            )
+            .await?;
+        let Some(row) = crate::db::optional(&mut stmt, (inbox_id, session_id)).await? else {
+            return Ok(None);
+        };
+        Ok::<_, anyhow::Error>(Some((
+            row.get::<String>(0)?,
+            row.get::<String>(1)?,
+            row.get::<String>(2)?,
+            row.get::<i64>(3)?,
+            row.get::<String>(4)?,
+        )))
+    }
+    .await?;
     row.map(|(kind, payload, delivery, created, session_id)| {
         decode_inbox_info(&session_id, inbox_id, &kind, &payload, &delivery, created).map(|info| {
             InboxRowInfo {
@@ -1879,45 +1838,39 @@ pub(crate) async fn inbox_list(req: &mut Request, depot: &mut Depot, res: &mut R
         session_not_found(res, &session_id);
         return;
     }
-    let rows: Vec<(String, String, String, String, i64, String)> = match app
-        .db
-        .conn()
-        .call(move |c| {
-            let mut stmt = c.prepare(
+    // Rows decode as they stream: the wire shape is built once, with no
+    // intermediate tuple vector to unpack.
+    let data: anyhow::Result<Vec<_>> = async {
+        let conn = app.db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
                 "SELECT id, type, payload, delivery, time_created, session_id
                  FROM session_inbox WHERE session_id = ?1
                  ORDER BY enqueued_seq ASC",
-            )?;
-            let mapped = stmt.query_map(rusqlite::params![session_id], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, String>(5)?,
-                ))
-            })?;
-            mapped.collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .await
-    {
-        Ok(rows) => rows,
+            )
+            .await?;
+        let mut rows = stmt.query([session_id.as_str()]).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(decode_inbox_info(
+                &row.get::<String>(5)?,
+                &row.get::<String>(0)?,
+                &row.get::<String>(1)?,
+                &row.get::<String>(2)?,
+                &row.get::<String>(3)?,
+                row.get::<i64>(4)?,
+            )?);
+        }
+        Ok(out)
+    }
+    .await;
+    let data = match data {
+        Ok(data) => data,
         Err(error) => {
-            unknown_error(res, &anyhow::Error::from(error));
+            unknown_error(res, &error);
             return;
         }
     };
-    let mut data = Vec::with_capacity(rows.len());
-    for (inbox_id, kind, payload, delivery, created, session_id) in rows {
-        match decode_inbox_info(&session_id, &inbox_id, &kind, &payload, &delivery, created) {
-            Ok(info) => data.push(info),
-            Err(error) => {
-                unknown_error(res, &error);
-                return;
-            }
-        }
-    }
     res.render(Json(json!({ "data": data })));
 }
 

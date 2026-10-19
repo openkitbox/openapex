@@ -14,8 +14,6 @@ use ox::event_bus::EventBus;
 use ox::schema::event::SessionEventData;
 use ox::schema::inbox::{Delivery, Item, UserPayload};
 use ox::schema::support::{FinishReason, Finite, ModelRef, Prompt, TokenCache, TokenUsage};
-use rusqlite::OptionalExtension;
-use rusqlite::types::Value as SqlValue;
 use salvo::prelude::*;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -157,40 +155,33 @@ impl Harness {
 // Direct database helpers
 // ---------------------------------------------------------------------------
 
-async fn query_one<T, F>(db: &Db, sql: &str, params: Vec<SqlValue>, f: F) -> Option<T>
+async fn query_one<T, F>(db: &Db, sql: &str, params: Vec<turso::Value>, f: F) -> Option<T>
 where
-    T: Send + 'static,
-    F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T> + Send + 'static,
+    F: FnOnce(&turso::Row) -> turso::Result<T>,
 {
-    let sql = sql.to_owned();
-    db.conn()
-        .call(move |c| {
-            c.query_row(sql.as_str(), rusqlite::params_from_iter(params.iter()), f)
-                .optional()
-        })
+    let conn = db.acquire().await.expect("query_one");
+    let mut stmt = conn.prepare(sql).await.expect("query_one");
+    let row = ox::db::optional(&mut stmt, params)
         .await
-        .expect("query_one")
+        .expect("query_one");
+    row.map(|row| f(&row).expect("query_one row"))
 }
 
-async fn query_all<T, F>(db: &Db, sql: &str, params: Vec<SqlValue>, f: F) -> Vec<T>
+async fn query_all<T, F>(db: &Db, sql: &str, params: Vec<turso::Value>, f: F) -> Vec<T>
 where
-    T: Send + 'static,
-    F: Fn(&rusqlite::Row<'_>) -> rusqlite::Result<T> + Send + 'static,
+    F: Fn(&turso::Row) -> turso::Result<T>,
 {
-    let sql = sql.to_owned();
-    db.conn()
-        .call(move |c| -> rusqlite::Result<Vec<T>> {
-            let mut stmt = c.prepare(sql.as_str())?;
-            let rows = stmt
-                .query_map(rusqlite::params_from_iter(params.iter()), f)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(rows)
-        })
-        .await
-        .expect("query_all")
+    let conn = db.acquire().await.expect("query_all");
+    let mut stmt = conn.prepare(sql).await.expect("query_all");
+    let mut rows = stmt.query(params).await.expect("query_all");
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.expect("query_all") {
+        out.push(f(&row).expect("query_all row"));
+    }
+    out
 }
 
-async fn count_rows(db: &Db, sql: &str, params: Vec<SqlValue>) -> i64 {
+async fn count_rows(db: &Db, sql: &str, params: Vec<turso::Value>) -> i64 {
     query_one(db, sql, params, |row| row.get(0))
         .await
         .expect("count")
@@ -202,8 +193,8 @@ async fn session_text(db: &Db, session_id: &str, column: &str) -> Option<String>
     query_one(
         db,
         &sql,
-        vec![SqlValue::Text(session_id.to_owned())],
-        |row| row.get::<_, Option<String>>(0),
+        vec![turso::Value::Text(session_id.to_owned())],
+        |row| row.get::<Option<String>>(0),
     )
     .await
     .flatten()
@@ -342,7 +333,7 @@ async fn create_get_list_update_delete_round_trip() {
     let n = count_rows(
         &h.db,
         "SELECT count(*) FROM session_v2 WHERE id = ?1",
-        vec![SqlValue::Text(session_id.clone())],
+        vec![turso::Value::Text(session_id.clone())],
     )
     .await;
     assert_eq!(n, 1);
@@ -397,7 +388,7 @@ async fn create_get_list_update_delete_round_trip() {
     let events_before = count_rows(
         &h.db,
         "SELECT count(*) FROM event WHERE aggregate_id = ?1",
-        vec![SqlValue::Text(session_id.clone())],
+        vec![turso::Value::Text(session_id.clone())],
     )
     .await;
     assert!(events_before > 0);
@@ -415,7 +406,7 @@ async fn create_get_list_update_delete_round_trip() {
         count_rows(
             &h.db,
             "SELECT count(*) FROM session_v2 WHERE id = ?1",
-            vec![SqlValue::Text(session_id.clone())],
+            vec![turso::Value::Text(session_id.clone())],
         )
         .await,
         0
@@ -424,7 +415,7 @@ async fn create_get_list_update_delete_round_trip() {
         count_rows(
             &h.db,
             "SELECT count(*) FROM event WHERE aggregate_id = ?1",
-            vec![SqlValue::Text(session_id.clone())],
+            vec![turso::Value::Text(session_id.clone())],
         )
         .await,
         0
@@ -433,7 +424,7 @@ async fn create_get_list_update_delete_round_trip() {
         count_rows(
             &h.db,
             "SELECT count(*) FROM event_sequence WHERE aggregate_id = ?1",
-            vec![SqlValue::Text(session_id.clone())],
+            vec![turso::Value::Text(session_id.clone())],
         )
         .await,
         0
@@ -574,7 +565,7 @@ async fn switch_agent_and_model_mutate_session_and_append_messages() {
     let switched: Vec<(String, String)> = query_all(
         &h.db,
         "SELECT type, data FROM session_message WHERE session_id = ?1 AND type = 'agent-switched'",
-        vec![SqlValue::Text(session_id.clone())],
+        vec![turso::Value::Text(session_id.clone())],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
     .await;
@@ -598,7 +589,7 @@ async fn switch_agent_and_model_mutate_session_and_append_messages() {
     let switched: Vec<String> = query_all(
         &h.db,
         "SELECT data FROM session_message WHERE session_id = ?1 AND type = 'agent-switched' ORDER BY seq",
-        vec![SqlValue::Text(session_id.clone())],
+        vec![turso::Value::Text(session_id.clone())],
         |row| row.get(0),
     )
     .await;
@@ -642,7 +633,7 @@ async fn switch_agent_and_model_mutate_session_and_append_messages() {
     let model_switched = count_rows(
         &h.db,
         "SELECT count(*) FROM session_message WHERE session_id = ?1 AND type = 'model-switched'",
-        vec![SqlValue::Text(session_id.clone())],
+        vec![turso::Value::Text(session_id.clone())],
     )
     .await;
     assert_eq!(model_switched, 1);
@@ -692,7 +683,7 @@ async fn view_advances_the_viewed_watermark_once() {
     let idle: i64 = query_one(
         &h.db,
         "SELECT time_idle FROM session_v2 WHERE id = ?1",
-        vec![SqlValue::Text(session_id.clone())],
+        vec![turso::Value::Text(session_id.clone())],
         |row| row.get(0),
     )
     .await
@@ -708,7 +699,7 @@ async fn view_advances_the_viewed_watermark_once() {
     let viewed: i64 = query_one(
         &h.db,
         "SELECT time_viewed FROM session_v2 WHERE id = ?1",
-        vec![SqlValue::Text(session_id.clone())],
+        vec![turso::Value::Text(session_id.clone())],
         |row| row.get(0),
     )
     .await
@@ -733,7 +724,7 @@ async fn view_advances_the_viewed_watermark_once() {
     let viewed_after: i64 = query_one(
         &h.db,
         "SELECT time_viewed FROM session_v2 WHERE id = ?1",
-        vec![SqlValue::Text(session_id.clone())],
+        vec![turso::Value::Text(session_id.clone())],
         |row| row.get(0),
     )
     .await
@@ -773,7 +764,7 @@ async fn fork_copies_settled_history_and_reserves_sequence() {
     let parent_messages: Vec<(String, i64)> = query_all(
         &h.db,
         "SELECT id, seq FROM session_message WHERE session_id = ?1 ORDER BY seq",
-        vec![SqlValue::Text(parent.clone())],
+        vec![turso::Value::Text(parent.clone())],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )
     .await;
@@ -816,7 +807,7 @@ async fn fork_copies_settled_history_and_reserves_sequence() {
     let parent_row: Vec<(String, String, Option<String>)> = query_all(
         &h.db,
         "SELECT project_id, directory, path FROM session_v2 WHERE id = ?1",
-        vec![SqlValue::Text(parent.clone())],
+        vec![turso::Value::Text(parent.clone())],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )
     .await;
@@ -833,7 +824,7 @@ async fn fork_copies_settled_history_and_reserves_sequence() {
         &h.db,
         "SELECT project_id, directory, path, fork_session_id, fork_boundary, parent_id
          FROM session_v2 WHERE id = ?1",
-        vec![SqlValue::Text(child.clone())],
+        vec![turso::Value::Text(child.clone())],
         |row| {
             Ok((
                 row.get(0)?,
@@ -865,7 +856,7 @@ async fn fork_copies_settled_history_and_reserves_sequence() {
     let copied: Vec<(String, i64, String)> = query_all(
         &h.db,
         "SELECT id, seq, type FROM session_message WHERE session_id = ?1 ORDER BY seq",
-        vec![SqlValue::Text(child.clone())],
+        vec![turso::Value::Text(child.clone())],
         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )
     .await;
@@ -897,7 +888,7 @@ async fn fork_copies_settled_history_and_reserves_sequence() {
     let reserved: i64 = query_one(
         &h.db,
         "SELECT seq FROM event_sequence WHERE aggregate_id = ?1",
-        vec![SqlValue::Text(child.clone())],
+        vec![turso::Value::Text(child.clone())],
         |row| row.get(0),
     )
     .await
@@ -929,7 +920,7 @@ async fn fork_copies_settled_history_and_reserves_sequence() {
     let copied_count = count_rows(
         &h.db,
         "SELECT count(*) FROM session_message WHERE session_id = ?1",
-        vec![SqlValue::Text(whole.clone())],
+        vec![turso::Value::Text(whole.clone())],
     )
     .await;
     assert_eq!(copied_count, 3);
@@ -973,7 +964,7 @@ async fn fork_copies_settled_history_and_reserves_sequence() {
         count_rows(
             &h.db,
             "SELECT count(*) FROM session_v2 WHERE id = ?1",
-            vec![SqlValue::Text(parent.clone())],
+            vec![turso::Value::Text(parent.clone())],
         )
         .await,
         0
@@ -983,7 +974,7 @@ async fn fork_copies_settled_history_and_reserves_sequence() {
             count_rows(
                 &h.db,
                 "SELECT count(*) FROM session_v2 WHERE id = ?1",
-                vec![SqlValue::Text(kept.clone())],
+                vec![turso::Value::Text(kept.clone())],
             )
             .await,
             1,

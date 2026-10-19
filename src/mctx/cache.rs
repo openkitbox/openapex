@@ -22,9 +22,8 @@
 
 use anyhow::Context as _;
 use cortexkit_cache_core::{Action, CoreState, DurabilityClass, FrozenUnit, PassInput, StepResult};
-use rusqlite::OptionalExtension;
 
-use crate::db::Db;
+use crate::db::{Db, optional};
 use crate::id::now_millis;
 
 /// Full mctx cache error type: `thiserror` plumbing (see `McCacheError`).
@@ -244,10 +243,16 @@ pub struct McCache {
     db: Db,
     session_id: String,
     /// Test-only race hook: invoked between the kernel step and the CAS
-    /// write-back so tests can inject a concurrent writer.
+    /// write-back so tests can inject a concurrent writer. Async because the
+    /// writer goes through the same driver as everything else.
     #[cfg(test)]
-    before_save: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    before_save: Option<std::sync::Arc<RaceHook>>,
 }
+
+/// The race-hook shape (see [`McCache::before_save`]).
+#[cfg(test)]
+type RaceHook =
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync;
 
 impl McCache {
     /// A cache handle for `session_id` over `db`.
@@ -272,23 +277,22 @@ impl McCache {
     /// are only ever written together, so divergence means an out-of-band
     /// edit).
     pub async fn load(&self) -> Result<Option<CoreState>, McCacheError> {
-        let sid = self.session_id.clone();
-        let row = self
-            .db
-            .conn()
-            .call(move |c| -> rusqlite::Result<Option<(String, i64)>> {
-                c.query_row(
-                    "SELECT state, version FROM mc_frozen_state WHERE session_id = ?1",
-                    [&sid],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-            })
+        let context = || format!("load mc_frozen_state for session {}", self.session_id);
+        let conn = self.db.acquire().await.with_context(context)?;
+        let mut stmt = conn
+            .prepare("SELECT state, version FROM mc_frozen_state WHERE session_id = ?1")
             .await
-            .with_context(|| format!("load mc_frozen_state for session {}", self.session_id))?;
-        let Some((json, column_version)) = row else {
+            .with_context(context)?;
+        let row = optional(&mut stmt, [self.session_id.as_str()])
+            .await
+            .with_context(context)?;
+        let Some(row) = row else {
             return Ok(None);
         };
+        let (json, column_version) = (|row: &turso::Row| -> anyhow::Result<(String, i64)> {
+            Ok((row.get(0)?, row.get(1)?))
+        })(&row)
+        .with_context(context)?;
         let state: CoreState = serde_json::from_str(&json).with_context(|| {
             format!(
                 "corrupt mc_frozen_state payload for session {}",
@@ -320,22 +324,23 @@ impl McCache {
         let json = serde_json::to_string(state).with_context(|| {
             format!("serialize mc_frozen_state for session {}", self.session_id)
         })?;
-        let sid = self.session_id.clone();
         // Versions are small monotonic counters; the i64 narrowing matches
         // the SQLite column type.
         let new_version = state.version as i64;
         let expected = expected_version as i64;
-        let affected = self
-            .db
-            .conn()
-            .call(move |c| -> rusqlite::Result<usize> {
-                c.execute(
-                    "INSERT INTO mc_frozen_state (session_id, state, version) VALUES (?1, ?2, ?3)
-                     ON CONFLICT(session_id) DO UPDATE SET state = ?2, version = ?3
-                     WHERE mc_frozen_state.version = ?4",
-                    rusqlite::params![sid, json, new_version, expected],
-                )
-            })
+        let conn = self.db.acquire().await?;
+        let affected = conn
+            .execute(
+                "INSERT INTO mc_frozen_state (session_id, state, version) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(session_id) DO UPDATE SET state = ?2, version = ?3
+                 WHERE mc_frozen_state.version = ?4",
+                (
+                    self.session_id.as_str(),
+                    json.as_str(),
+                    new_version,
+                    expected,
+                ),
+            )
             .await
             .with_context(|| format!("save mc_frozen_state for session {}", self.session_id))?;
         if affected == 0 {
@@ -349,11 +354,7 @@ impl McCache {
 
     /// Test-only constructor with a race hook (see `McCache`'s field doc).
     #[cfg(test)]
-    fn with_before_save_hook(
-        db: Db,
-        session_id: &str,
-        hook: std::sync::Arc<dyn Fn() + Send + Sync>,
-    ) -> Self {
+    fn with_before_save_hook(db: Db, session_id: &str, hook: std::sync::Arc<RaceHook>) -> Self {
         Self {
             db,
             session_id: session_id.to_string(),
@@ -436,7 +437,7 @@ pub async fn run_pass(
 
         #[cfg(test)]
         if let Some(hook) = &cache.before_save {
-            hook();
+            hook().await;
         }
 
         match cache.save_cas(expected_version, &state).await {
@@ -470,38 +471,33 @@ impl Lkg {
 
     /// The last-known-good prefix for the session, if any.
     pub async fn load_lkg(&self, session_id: &str) -> Result<Option<String>, McCacheError> {
+        let context = || format!("load LKG for session {session_id}");
         let key = lkg_key(session_id);
-        let value = self
-            .db
-            .conn()
-            .call(move |c| -> rusqlite::Result<Option<String>> {
-                c.query_row("SELECT value FROM kv WHERE key = ?1", [&key], |row| {
-                    row.get(0)
-                })
-                .optional()
-            })
+        let conn = self.db.acquire().await?;
+        let mut stmt = conn
+            .prepare("SELECT value FROM kv WHERE key = ?1")
             .await
-            .with_context(|| format!("load LKG for session {session_id}"))?;
-        Ok(value)
+            .with_context(context)?;
+        let row = optional(&mut stmt, [key.as_str()])
+            .await
+            .with_context(context)?;
+        Ok(row
+            .map(|row| row.get(0).map_err(anyhow::Error::from))
+            .transpose()?)
     }
 
     /// Record `prefix` as the session's last-known-good output.
     pub async fn save_lkg(&self, session_id: &str, prefix: &str) -> Result<(), McCacheError> {
         let key = lkg_key(session_id);
-        let prefix = prefix.to_string();
         let now = now_millis();
-        self.db
-            .conn()
-            .call(move |c| -> rusqlite::Result<()> {
-                c.execute(
-                    "INSERT INTO kv (key, value, time_created, time_updated) VALUES (?1, ?2, ?3, ?3)
-                     ON CONFLICT(key) DO UPDATE SET value = excluded.value, time_updated = ?3",
-                    rusqlite::params![key, prefix, now],
-                )?;
-                Ok(())
-            })
-            .await
-            .with_context(|| format!("save LKG for session {session_id}"))?;
+        let conn = self.db.acquire().await?;
+        conn.execute(
+            "INSERT INTO kv (key, value, time_created, time_updated) VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, time_updated = ?3",
+            (key.as_str(), prefix, now),
+        )
+        .await
+        .with_context(|| format!("save LKG for session {session_id}"))?;
         Ok(())
     }
 }
@@ -808,23 +804,28 @@ mod tests {
     /// Bump the durable row's version out from under the pass under test —
     /// exactly what a competing whole-value writer does: column AND the
     /// JSON payload's version move together (SQLite evaluates the SET
-    /// expressions against the pre-update row).
-    fn racer_hook(path: std::path::PathBuf, once: bool) -> Arc<dyn Fn() + Send + Sync> {
+    /// expressions against the pre-update row). The second handle is the same
+    /// [`Db`]: a separate connection is not needed to make the write land
+    /// between the pass's load and its save.
+    fn racer_hook(db: Db, once: bool) -> Arc<RaceHook> {
         let fired = Arc::new(AtomicBool::new(false));
         Arc::new(move || {
-            if once && fired.swap(true, Ordering::SeqCst) {
-                return;
-            }
-            let conn = rusqlite::Connection::open(&path).unwrap();
-            conn.busy_timeout(std::time::Duration::from_secs(5))
+            let db = db.clone();
+            let fired = fired.clone();
+            Box::pin(async move {
+                if once && fired.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let conn = db.acquire().await.unwrap();
+                conn.execute(
+                    "UPDATE mc_frozen_state
+                         SET version = version + 100,
+                             state = json_set(state, '$.version', version + 100)",
+                    (),
+                )
+                .await
                 .unwrap();
-            conn.execute(
-                "UPDATE mc_frozen_state
-                 SET version = version + 100,
-                     state = json_set(state, '$.version', version + 100)",
-                [],
-            )
-            .unwrap();
+            })
         })
     }
 
@@ -841,7 +842,7 @@ mod tests {
 
         // Between load and save of the first attempt, a competing writer
         // bumps the row 1 → 101; the retry then re-splices against 101.
-        let cache = McCache::with_before_save_hook(db, "sess_test", racer_hook(path, true));
+        let cache = McCache::with_before_save_hook(db.clone(), "sess_test", racer_hook(db, true));
         let forced = Signals {
             boundary_present: Some("b0".into()),
             forced: true,
@@ -875,7 +876,7 @@ mod tests {
             .unwrap();
 
         // The racer bumps on EVERY save: both attempts lose.
-        let cache = McCache::with_before_save_hook(db, "sess_test", racer_hook(path, false));
+        let cache = McCache::with_before_save_hook(db.clone(), "sess_test", racer_hook(db, false));
         let forced = Signals {
             boundary_present: Some("b0".into()),
             forced: true,

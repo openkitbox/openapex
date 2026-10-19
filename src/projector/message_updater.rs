@@ -3,11 +3,11 @@
 //!
 //! Each durable event mutates/appends assistant messages inside the durable
 //! transaction. The SQL adapter indirection of the TS original is collapsed to
-//! direct rusqlite calls; the projection logic is ported faithfully.
+//! direct turso calls; the projection logic is ported faithfully.
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use rusqlite::{Connection, OptionalExtension};
 use serde_json::Value;
+use turso::Connection;
 
 use crate::id;
 use crate::schema::event::{EventEnvelope, SessionEventData, StepFailedFinish};
@@ -19,6 +19,18 @@ use crate::schema::message::{
 use crate::schema::support::{FinishReason, ModelRef, Record};
 
 use super::{apply_usage, insert_message, touch};
+
+/// One optional row: rusqlite's `query_row(..).optional()` shape, on turso.
+/// `QueryReturnedNoRows` is the only error mapped to `None`, so a real failure
+/// is never read as an absent row.
+async fn optional_row(
+    tx: &Connection,
+    sql: &str,
+    params: impl turso::IntoParams,
+) -> Result<Option<turso::Row>> {
+    let mut stmt = tx.prepare(sql).await?;
+    crate::db::optional(&mut stmt, params).await
+}
 
 pub struct Output {
     /// Whether the event recorded usage (step.ended / step.failed with usage),
@@ -33,7 +45,7 @@ pub struct Output {
 /// Rewrite an assistant row's `data` without moving its `seq`: used when one
 /// event must settle a row other than the one the event's seq is about
 /// (closing a stale assistant while appending the fresh one).
-fn close_assistant_in_place(
+async fn close_assistant_in_place(
     tx: &Connection,
     session_id: &str,
     msg: &AssistantMessage,
@@ -44,8 +56,9 @@ fn close_assistant_in_place(
     tx.execute(
         "UPDATE session_message SET data = ?3, time_updated = ?4
          WHERE id = ?1 AND session_id = ?2",
-        rusqlite::params![msg.id, session_id, data, msg.time.created],
-    )?;
+        (msg.id.as_str(), session_id, data, msg.time.created),
+    )
+    .await?;
     Ok(())
 }
 
@@ -64,41 +77,51 @@ fn decode_assistant(id: &str, data: &str) -> Result<AssistantMessage> {
 /// keep it only if it has no `time.completed` (the filter happens on the
 /// decoded message, not in SQL — a completed latest row yields `None`, not an
 /// older incomplete row).
-fn load_current_assistant(tx: &Connection, session_id: &str) -> Result<Option<AssistantMessage>> {
-    let row = tx
-        .query_row(
-            "SELECT id, data FROM session_message \
-             WHERE type = 'assistant' AND session_id = ?1 ORDER BY seq DESC LIMIT 1",
-            rusqlite::params![session_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?;
-    let decoded = row
-        .map(|(id, data)| decode_assistant(&id, &data))
-        .transpose()?;
+async fn load_current_assistant(
+    tx: &Connection,
+    session_id: &str,
+) -> Result<Option<AssistantMessage>> {
+    let row = optional_row(
+        tx,
+        "SELECT id, data FROM session_message \
+         WHERE type = 'assistant' AND session_id = ?1 ORDER BY seq DESC LIMIT 1",
+        [session_id],
+    )
+    .await?;
+    let decoded = match row {
+        Some(row) => Some(decode_assistant(
+            &row.get::<String>(0)?,
+            &row.get::<String>(1)?,
+        )?),
+        None => None,
+    };
     Ok(decoded.filter(|msg| msg.time.completed.is_none()))
 }
 
 /// Load an assistant message by id.
-fn load_assistant(
+async fn load_assistant(
     tx: &Connection,
     session_id: &str,
     message_id: &str,
 ) -> Result<Option<AssistantMessage>> {
-    let row = tx
-        .query_row(
-            "SELECT id, data FROM session_message \
-             WHERE type = 'assistant' AND id = ?1 AND session_id = ?2",
-            rusqlite::params![message_id, session_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?;
-    row.map(|(id, data)| decode_assistant(&id, &data))
-        .transpose()
+    let row = optional_row(
+        tx,
+        "SELECT id, data FROM session_message \
+         WHERE type = 'assistant' AND id = ?1 AND session_id = ?2",
+        (message_id, session_id),
+    )
+    .await?;
+    match row {
+        Some(row) => Ok(Some(decode_assistant(
+            &row.get::<String>(0)?,
+            &row.get::<String>(1)?,
+        )?)),
+        None => Ok(None),
+    }
 }
 
 /// Persist an assistant message row (INSERT or UPDATE) with a new seq.
-fn store_assistant(
+async fn store_assistant(
     tx: &Connection,
     session_id: &str,
     seq: i64,
@@ -109,14 +132,16 @@ fn store_assistant(
         .to_row_data()
         .to_string();
     // UPDATE existing; INSERT if absent (mirrors upstream upsert behaviour).
-    let n = tx.execute(
-        "UPDATE session_message SET seq = ?3, data = ?4, time_updated = ?5
-         WHERE id = ?1 AND session_id = ?2",
-        rusqlite::params![message_id, session_id, seq, data, msg.time.created],
-    )?;
+    let n = tx
+        .execute(
+            "UPDATE session_message SET seq = ?3, data = ?4, time_updated = ?5
+             WHERE id = ?1 AND session_id = ?2",
+            (message_id, session_id, seq, data, msg.time.created),
+        )
+        .await?;
     if n == 0 {
         let m = Message::Assistant(Box::new(msg.clone()));
-        insert_message(tx, session_id, seq, &m)?;
+        insert_message(tx, session_id, seq, &m).await?;
     }
     Ok(())
 }
@@ -132,102 +157,106 @@ fn decode_compaction(id: &str, data: &str) -> Result<CompactionMessage> {
 }
 
 /// Load the latest compaction message for a session (upstream `getCompaction`).
-fn load_latest_compaction(tx: &Connection, session_id: &str) -> Result<Option<CompactionMessage>> {
-    let row = tx
-        .query_row(
-            "SELECT id, data FROM session_message \
-             WHERE type = 'compaction' AND session_id = ?1 ORDER BY id DESC LIMIT 1",
-            rusqlite::params![session_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()?;
-    row.map(|(id, data)| decode_compaction(&id, &data))
-        .transpose()
+async fn load_latest_compaction(
+    tx: &Connection,
+    session_id: &str,
+) -> Result<Option<CompactionMessage>> {
+    let row = optional_row(
+        tx,
+        "SELECT id, data FROM session_message \
+         WHERE type = 'compaction' AND session_id = ?1 ORDER BY id DESC LIMIT 1",
+        [session_id],
+    )
+    .await?;
+    match row {
+        Some(row) => Ok(Some(decode_compaction(
+            &row.get::<String>(0)?,
+            &row.get::<String>(1)?,
+        )?)),
+        None => Ok(None),
+    }
 }
 
 /// Read the current session's location for the `previous` field of a
 /// `location-switched` message. Port of upstream `getLocation`.
-fn load_location(tx: &Connection, session_id: &str) -> Result<Option<LocationSwitch>> {
-    let row = tx
-        .query_row(
-            "SELECT directory, workspace_id, project_id, path FROM session_v2 WHERE id = ?1",
-            rusqlite::params![session_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                ))
-            },
-        )
-        .optional()?;
-    Ok(row.map(
-        |(directory, workspace_id, project_id, subpath)| LocationSwitch {
-            location: crate::schema::support::LocationRef {
-                directory,
-                workspace_id,
-            },
-            project_id,
-            subpath,
+async fn load_location(tx: &Connection, session_id: &str) -> Result<Option<LocationSwitch>> {
+    let row = optional_row(
+        tx,
+        "SELECT directory, workspace_id, project_id, path FROM session_v2 WHERE id = ?1",
+        [session_id],
+    )
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    Ok(Some(LocationSwitch {
+        location: crate::schema::support::LocationRef {
+            directory: row.get::<String>(0)?,
+            workspace_id: row.get::<Option<String>>(1)?,
         },
-    ))
+        project_id: row.get::<Option<String>>(2)?,
+        subpath: row.get::<Option<String>>(3)?,
+    }))
 }
 
 /// Read the session row's current `agent` (upstream `getAgent`).
 /// `None` covers both a missing row and a NULL column.
-fn load_session_agent(tx: &Connection, session_id: &str) -> Result<Option<String>> {
-    let raw: Option<Option<String>> = tx
-        .query_row(
-            "SELECT agent FROM session_v2 WHERE id = ?1",
-            rusqlite::params![session_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?;
-    Ok(raw.flatten())
+async fn load_session_agent(tx: &Connection, session_id: &str) -> Result<Option<String>> {
+    let row = optional_row(
+        tx,
+        "SELECT agent FROM session_v2 WHERE id = ?1",
+        [session_id],
+    )
+    .await?;
+    match row {
+        Some(row) => Ok(row.get::<Option<String>>(0)?),
+        None => Ok(None),
+    }
 }
 
 /// Read the session row's current `model` JSON (upstream `getModel`).
-fn load_session_model(tx: &Connection, session_id: &str) -> Result<Option<ModelRef>> {
-    let raw: Option<Option<String>> = tx
-        .query_row(
-            "SELECT model FROM session_v2 WHERE id = ?1",
-            rusqlite::params![session_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()?;
-    raw.flatten()
-        .map(|s| Ok(serde_json::from_str(&s)?))
-        .transpose()
+async fn load_session_model(tx: &Connection, session_id: &str) -> Result<Option<ModelRef>> {
+    let row = optional_row(
+        tx,
+        "SELECT model FROM session_v2 WHERE id = ?1",
+        [session_id],
+    )
+    .await?;
+    let Some(raw) = row.map(|row| row.get::<Option<String>>(0)).transpose()? else {
+        return Ok(None);
+    };
+    raw.map(|s| Ok(serde_json::from_str(&s)?)).transpose()
 }
 
 /// Persist a compaction message row (UPDATE existing id, else INSERT).
-fn store_compaction(
+async fn store_compaction(
     tx: &Connection,
     session_id: &str,
     seq: i64,
     msg: &CompactionMessage,
 ) -> Result<()> {
     let data = Message::Compaction(msg.clone()).to_row_data().to_string();
-    let n = tx.execute(
-        "UPDATE session_message SET seq = ?3, data = ?4, time_updated = ?5
-         WHERE id = ?1 AND session_id = ?2",
-        rusqlite::params![msg.id, session_id, seq, data, msg.time.created],
-    )?;
+    let n = tx
+        .execute(
+            "UPDATE session_message SET seq = ?3, data = ?4, time_updated = ?5
+             WHERE id = ?1 AND session_id = ?2",
+            (msg.id.as_str(), session_id, seq, data, msg.time.created),
+        )
+        .await?;
     if n == 0 {
-        insert_message(tx, session_id, seq, &Message::Compaction(msg.clone()))?;
+        insert_message(tx, session_id, seq, &Message::Compaction(msg.clone())).await?;
     }
     Ok(())
 }
 
 /// Clear the `retry` block on the current (latest) assistant message.
 /// Upstream `clearCurrentRetry`.
-fn clear_current_retry(tx: &Connection, session_id: &str, seq: i64) -> Result<()> {
-    if let Some(mut current) = load_current_assistant(tx, session_id)?
+async fn clear_current_retry(tx: &Connection, session_id: &str, seq: i64) -> Result<()> {
+    if let Some(mut current) = load_current_assistant(tx, session_id).await?
         && current.retry.is_some()
     {
         current.retry = None;
-        store_assistant(tx, session_id, seq, &current.id, &current)?;
+        store_assistant(tx, session_id, seq, &current.id, &current).await?;
     }
     Ok(())
 }
@@ -235,16 +264,16 @@ fn clear_current_retry(tx: &Connection, session_id: &str, seq: i64) -> Result<()
 /// Mutable access to the assistant message owned by `message_id`, applying
 /// `recipe` then persisting. No-op if the row is missing (upstream
 /// `updateOwnedAssistant` returns void when not found).
-fn update_owned_assistant(
+async fn update_owned_assistant(
     tx: &Connection,
     session_id: &str,
     seq: i64,
     message_id: &str,
     recipe: impl FnOnce(&mut AssistantMessage),
 ) -> Result<()> {
-    if let Some(mut msg) = load_assistant(tx, session_id, message_id)? {
+    if let Some(mut msg) = load_assistant(tx, session_id, message_id).await? {
         recipe(&mut msg);
-        store_assistant(tx, session_id, seq, message_id, &msg)?;
+        store_assistant(tx, session_id, seq, message_id, &msg).await?;
     }
     Ok(())
 }
@@ -257,7 +286,7 @@ fn update_owned_assistant(
 // Main dispatcher
 // ---------------------------------------------------------------------------
 
-pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Output> {
+pub async fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Output> {
     use SessionEventData as E;
     let durable = env.durable.as_ref().context("durable envelope")?;
     let seq = durable.seq;
@@ -271,7 +300,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
         } => {
             // Append a `location-switched` message recording the new location,
             // with `previous` read from the current session_v2 row.
-            let previous = load_location(tx, session_id)?;
+            let previous = load_location(tx, session_id).await?;
             let msg = Message::LocationSwitched {
                 id: id::from_event(&env.id),
                 metadata: env.metadata.clone(),
@@ -283,7 +312,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                 },
                 previous,
             };
-            insert_message(tx, session_id, seq, &msg)?;
+            insert_message(tx, session_id, seq, &msg).await?;
         }
 
         E::SessionAgentSelected {
@@ -295,7 +324,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
             // session row (read before the projector updates it below).
             let previous = match previous {
                 Some(agent) => Some(agent.clone()),
-                None => load_session_agent(tx, session_id)?,
+                None => load_session_agent(tx, session_id).await?,
             };
             let msg = Message::AgentSwitched {
                 id: id::from_event(&env.id),
@@ -304,7 +333,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                 agent: agent.clone(),
                 previous,
             };
-            insert_message(tx, session_id, seq, &msg)?;
+            insert_message(tx, session_id, seq, &msg).await?;
         }
 
         E::SessionModelSelected {
@@ -314,7 +343,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
         } => {
             let previous = match previous {
                 Some(model) => Some(model.clone()),
-                None => load_session_model(tx, session_id)?,
+                None => load_session_model(tx, session_id).await?,
             };
             let msg = Message::ModelSwitched {
                 id: id::from_event(&env.id),
@@ -323,7 +352,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                 model: model.clone(),
                 previous,
             };
-            insert_message(tx, session_id, seq, &msg)?;
+            insert_message(tx, session_id, seq, &msg).await?;
         }
 
         E::SessionSynthetic {
@@ -339,7 +368,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                 text: text.clone(),
                 description: description.clone(),
             };
-            insert_message(tx, session_id, seq, &msg)?;
+            insert_message(tx, session_id, seq, &msg).await?;
         }
 
         E::SessionRetryScheduled {
@@ -349,14 +378,15 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
             at,
             error,
         } => {
-            let mut msg = load_assistant(tx, session_id, assistant_message_id)?
+            let mut msg = load_assistant(tx, session_id, assistant_message_id)
+                .await?
                 .ok_or_else(|| anyhow!("no assistant message `{assistant_message_id}`"))?;
             msg.retry = Some(AssistantRetry {
                 attempt: *attempt,
                 at: *at,
                 error: error.clone(),
             });
-            store_assistant(tx, session_id, seq, assistant_message_id, &msg)?;
+            store_assistant(tx, session_id, seq, assistant_message_id, &msg).await?;
         }
 
         E::SessionMessageContentUpdated {
@@ -364,10 +394,11 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
             message_id,
             content,
         } => {
-            let mut msg = load_assistant(tx, session_id, message_id)?
+            let mut msg = load_assistant(tx, session_id, message_id)
+                .await?
                 .ok_or_else(|| anyhow!("no assistant message `{message_id}`"))?;
             msg.content = content.clone();
-            store_assistant(tx, session_id, seq, message_id, &msg)?;
+            store_assistant(tx, session_id, seq, message_id, &msg).await?;
         }
 
         E::StepStarted {
@@ -384,7 +415,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
             //    merge snapshot.start);
             //  - else → close any current incomplete assistant (set completed,
             //    clear retry) and append a fresh assistant row.
-            let existing = load_assistant(tx, session_id, assistant_message_id)?;
+            let existing = load_assistant(tx, session_id, assistant_message_id).await?;
             if let Some(mut msg) = existing {
                 msg.agent = agent.clone();
                 msg.model = model.clone();
@@ -405,9 +436,9 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                         })
                         .start = Some(snap);
                 }
-                store_assistant(tx, session_id, seq, assistant_message_id, &msg)?;
+                store_assistant(tx, session_id, seq, assistant_message_id, &msg).await?;
             } else {
-                if let Some(mut current) = load_current_assistant(tx, session_id)? {
+                if let Some(mut current) = load_current_assistant(tx, session_id).await? {
                     current.retry = None;
                     current.time.completed = Some(created);
                     // Close the stale assistant in place: the row keeps its
@@ -416,7 +447,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                     // write at the event seq would collide with the
                     // UNIQUE(session_id, seq) index — and reorder the closed
                     // row after this turn's rows).
-                    close_assistant_in_place(tx, session_id, &current)?;
+                    close_assistant_in_place(tx, session_id, &current).await?;
                 }
                 let msg = AssistantMessage {
                     id: assistant_message_id.clone(),
@@ -442,19 +473,20 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                     error: None,
                     retry: None,
                 };
-                store_assistant(tx, session_id, seq, assistant_message_id, &msg)?;
+                store_assistant(tx, session_id, seq, assistant_message_id, &msg).await?;
             }
-            touch(tx, session_id, created)?;
+            touch(tx, session_id, created).await?;
         }
 
         E::StepStreamed {
             session_id,
             assistant_message_id,
         } => {
-            let mut msg = load_assistant(tx, session_id, assistant_message_id)?
+            let mut msg = load_assistant(tx, session_id, assistant_message_id)
+                .await?
                 .ok_or_else(|| anyhow!("no assistant message `{assistant_message_id}`"))?;
             msg.time.streamed = Some(created);
-            store_assistant(tx, session_id, seq, assistant_message_id, &msg)?;
+            store_assistant(tx, session_id, seq, assistant_message_id, &msg).await?;
         }
 
         E::StepEnded {
@@ -468,7 +500,8 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
             snapshot,
             files,
         } => {
-            let mut msg = load_assistant(tx, session_id, assistant_message_id)?
+            let mut msg = load_assistant(tx, session_id, assistant_message_id)
+                .await?
                 .ok_or_else(|| anyhow!("no assistant message `{assistant_message_id}`"))?;
             msg.finish = Some(*finish);
             msg.raw_finish = raw_finish.clone();
@@ -489,8 +522,8 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                 }
             }
             msg.time.completed = Some(created);
-            store_assistant(tx, session_id, seq, assistant_message_id, &msg)?;
-            apply_usage(tx, session_id, *cost, tokens, Some(created))?;
+            store_assistant(tx, session_id, seq, assistant_message_id, &msg).await?;
+            apply_usage(tx, session_id, *cost, tokens, Some(created)).await?;
             usage_recorded = true;
         }
 
@@ -506,7 +539,8 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
             snapshot,
             files,
         } => {
-            let mut msg = load_assistant(tx, session_id, assistant_message_id)?
+            let mut msg = load_assistant(tx, session_id, assistant_message_id)
+                .await?
                 .ok_or_else(|| anyhow!("no assistant message `{assistant_message_id}`"))?;
             msg.time.completed = Some(created);
             // Upstream: `finish = event.data.finish ?? "error"`.
@@ -533,13 +567,13 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                     snap.files = files.clone();
                 }
             }
-            store_assistant(tx, session_id, seq, assistant_message_id, &msg)?;
+            store_assistant(tx, session_id, seq, assistant_message_id, &msg).await?;
             // applyUsage only when both cost and tokens are present; else touch.
             if let (Some(c), Some(t)) = (cost, tokens) {
-                apply_usage(tx, session_id, *c, t, Some(created))?;
+                apply_usage(tx, session_id, *c, t, Some(created)).await?;
                 usage_recorded = true;
             } else {
-                touch(tx, session_id, created)?;
+                touch(tx, session_id, created).await?;
             }
         }
 
@@ -553,7 +587,8 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                     text: String::new(),
                     state: None,
                 });
-            })?;
+            })
+            .await?;
         }
 
         E::TextEnded {
@@ -575,7 +610,8 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                     *t = text.clone();
                     *s = state.clone();
                 }
-            })?;
+            })
+            .await?;
         }
 
         E::ReasoningStarted {
@@ -593,7 +629,8 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                         completed: None,
                     }),
                 });
-            })?;
+            })
+            .await?;
         }
 
         E::ReasoningEnded {
@@ -620,7 +657,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                         *s = Some(st);
                     }
                 }
-            })?;
+            }).await?;
         }
 
         E::ToolInputStarted {
@@ -629,7 +666,8 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
             id,
             name,
         } => {
-            let mut msg = load_assistant(tx, session_id, assistant_message_id)?
+            let mut msg = load_assistant(tx, session_id, assistant_message_id)
+                .await?
                 .ok_or_else(|| anyhow!("no assistant message `{assistant_message_id}`"))?;
             msg.content.push(AssistantContent::Tool {
                 id: id.clone(),
@@ -646,7 +684,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                     completed: None,
                 },
             });
-            store_assistant(tx, session_id, seq, assistant_message_id, &msg)?;
+            store_assistant(tx, session_id, seq, assistant_message_id, &msg).await?;
         }
 
         E::ToolInputEnded {
@@ -663,7 +701,8 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                         input: text.clone(),
                     };
                 }
-            })?;
+            })
+            .await?;
         }
 
         E::ToolCalled {
@@ -684,7 +723,8 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                         metadata: Record::new(),
                     };
                 }
-            })?;
+            })
+            .await?;
         }
 
         E::ToolSuccess {
@@ -711,7 +751,8 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                         metadata: metadata.clone(),
                     };
                 }
-            })?;
+            })
+            .await?;
         }
 
         E::ToolFailed {
@@ -749,7 +790,8 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                         metadata: metadata.clone(),
                     };
                 }
-            })?;
+            })
+            .await?;
         }
 
         E::CompactionStarted {
@@ -768,7 +810,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                     recent: recent.clone(),
                 },
             });
-            insert_message(tx, session_id, seq, &msg)?;
+            insert_message(tx, session_id, seq, &msg).await?;
         }
 
         E::CompactionEnded {
@@ -784,7 +826,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
         } => {
             // Upstream: if the latest compaction is `running`, update it to
             // `completed`; otherwise append a fresh completed compaction.
-            let current = load_latest_compaction(tx, session_id)?;
+            let current = load_latest_compaction(tx, session_id).await?;
             let mut running = match &current {
                 Some(c) if matches!(c.compaction, Compaction::Running { .. }) => current,
                 _ => None,
@@ -801,7 +843,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
             }));
             if let Some(c) = running.as_mut() {
                 c.compaction = completed;
-                store_compaction(tx, session_id, seq, c)?;
+                store_compaction(tx, session_id, seq, c).await?;
             } else {
                 let msg = CompactionMessage {
                     id: id::from_event(&env.id),
@@ -809,10 +851,10 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                     time: TimeCreated { created },
                     compaction: completed,
                 };
-                insert_message(tx, session_id, seq, &Message::Compaction(msg))?;
+                insert_message(tx, session_id, seq, &Message::Compaction(msg)).await?;
             }
             if let (Some(c), Some(t)) = (cost, tokens) {
-                apply_usage(tx, session_id, *c, t, Some(created))?;
+                apply_usage(tx, session_id, *c, t, Some(created)).await?;
                 usage_recorded = true;
             }
         }
@@ -827,7 +869,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
         } => {
             // Upstream: if the latest compaction is `running`, update it to
             // `failed`; otherwise append a fresh failed compaction.
-            let current = load_latest_compaction(tx, session_id)?;
+            let current = load_latest_compaction(tx, session_id).await?;
             let mut running = match &current {
                 Some(c) if matches!(c.compaction, Compaction::Running { .. }) => current,
                 _ => None,
@@ -840,7 +882,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
             };
             if let Some(c) = running.as_mut() {
                 c.compaction = failed;
-                store_compaction(tx, session_id, seq, c)?;
+                store_compaction(tx, session_id, seq, c).await?;
             } else {
                 let msg = CompactionMessage {
                     id: id::from_event(&env.id),
@@ -848,16 +890,16 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                     time: TimeCreated { created },
                     compaction: failed,
                 };
-                insert_message(tx, session_id, seq, &Message::Compaction(msg))?;
+                insert_message(tx, session_id, seq, &Message::Compaction(msg)).await?;
             }
             if let (Some(c), Some(t)) = (cost, tokens) {
-                apply_usage(tx, session_id, *c, t, Some(created))?;
+                apply_usage(tx, session_id, *c, t, Some(created)).await?;
                 usage_recorded = true;
             }
         }
 
         E::ExecutionSucceeded { session_id } => {
-            clear_current_retry(tx, session_id, seq)?;
+            clear_current_retry(tx, session_id, seq).await?;
             let msg = Message::Idle {
                 id: id::from_event(&env.id),
                 metadata: None,
@@ -865,11 +907,11 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                 outcome: IdleOutcome::Succeeded,
                 error: None,
             };
-            insert_message(tx, session_id, seq, &msg)?;
+            insert_message(tx, session_id, seq, &msg).await?;
         }
 
         E::ExecutionFailed { session_id, error } => {
-            clear_current_retry(tx, session_id, seq)?;
+            clear_current_retry(tx, session_id, seq).await?;
             let msg = Message::Idle {
                 id: id::from_event(&env.id),
                 metadata: None,
@@ -877,16 +919,16 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                 outcome: IdleOutcome::Failed,
                 error: Some(error.clone()),
             };
-            insert_message(tx, session_id, seq, &msg)?;
+            insert_message(tx, session_id, seq, &msg).await?;
         }
 
         E::ExecutionInterrupted { session_id, reason } => {
             // Shutdown keeps the execution claim and the resumed drain
             // continues the turn — only clear the retry, no idle message.
             if matches!(reason, crate::schema::event::InterruptReason::Shutdown) {
-                clear_current_retry(tx, session_id, seq)?;
+                clear_current_retry(tx, session_id, seq).await?;
             } else {
-                clear_current_retry(tx, session_id, seq)?;
+                clear_current_retry(tx, session_id, seq).await?;
                 let msg = Message::Idle {
                     id: id::from_event(&env.id),
                     metadata: None,
@@ -894,7 +936,7 @@ pub fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Result<Out
                     outcome: IdleOutcome::Interrupted,
                     error: None,
                 };
-                insert_message(tx, session_id, seq, &msg)?;
+                insert_message(tx, session_id, seq, &msg).await?;
             }
         }
 

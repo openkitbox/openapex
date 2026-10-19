@@ -268,31 +268,30 @@ async fn project_list_reads_upstream_project_table() {
         ..Config::default()
     };
     let db = Db::open(&config.db_path).await.unwrap();
-    db.conn()
-        .call(|c| -> rusqlite::Result<()> {
-            c.execute_batch(
-                "CREATE TABLE project (
-                  id text PRIMARY KEY,
-                  worktree text NOT NULL,
-                  vcs text,
-                  name text,
-                  icon_url text,
-                  icon_url_override text,
-                  icon_color text,
-                  time_created integer NOT NULL,
-                  time_updated integer NOT NULL,
-                  time_initialized integer,
-                  time_active integer DEFAULT 0 NOT NULL,
-                  sandboxes text NOT NULL,
-                  commands text
-                );
-                INSERT INTO project (id, worktree, vcs, name, time_created, time_updated, time_active, sandboxes)
-                VALUES ('prj_abc', '/repo/canonical', 'git', 'ox', 1000, 2000, 3000, '[\"sb1\"]');",
-            )?;
-            Ok(())
-        })
+    {
+        let conn = db.acquire().await.unwrap();
+        conn.execute_batch(
+            "CREATE TABLE project (
+              id text PRIMARY KEY,
+              worktree text NOT NULL,
+              vcs text,
+              name text,
+              icon_url text,
+              icon_url_override text,
+              icon_color text,
+              time_created integer NOT NULL,
+              time_updated integer NOT NULL,
+              time_initialized integer,
+              time_active integer DEFAULT 0 NOT NULL,
+              sandboxes text NOT NULL,
+              commands text
+            );
+            INSERT INTO project (id, worktree, vcs, name, time_created, time_updated, time_active, sandboxes)
+            VALUES ('prj_abc', '/repo/canonical', 'git', 'ox', 1000, 2000, 3000, '[\"sb1\"]');",
+        )
         .await
         .unwrap();
+    }
 
     let bus = ox::event_bus::EventBus::new(db.clone());
     let cardinal = ox::cardinal::client::CardinalClient::new(

@@ -50,10 +50,9 @@
 use std::collections::HashMap;
 
 use anyhow::{Context as _, Result};
-use rusqlite::OptionalExtension;
 use serde_json::Value;
 
-use crate::db::Db;
+use crate::db::{Db, optional};
 use crate::id::now_millis;
 
 /// One tagged item: the tag handle plus where the content lives.
@@ -113,10 +112,9 @@ impl Tagger {
         session_id: &str,
         messages: &[Value],
     ) -> Result<Vec<TaggedItem>> {
-        let session = session_id.to_owned();
-        // Extract only the taggable items before entering the blocking
-        // closure — cloning the whole decoded history per pass is wasted
-        // work on long sessions.
+        // Extract only the taggable items before entering the async body —
+        // cloning the whole decoded history per pass is wasted work on long
+        // sessions.
         let items: Vec<(String, Vec<(String, String)>)> = messages
             .iter()
             .filter_map(|message| {
@@ -125,83 +123,86 @@ impl Tagger {
                 (!taggables.is_empty()).then_some((id, taggables))
             })
             .collect();
-        db.conn()
-            .call(move |c| -> rusqlite::Result<Vec<TaggedItem>> {
-                // Existing identity mapping for the session, keyed by
-                // (message_id, part_path) → (tag, digest).
-                let mut existing: HashMap<(String, String), (u64, String)> = HashMap::new();
-                {
-                    let mut stmt = c.prepare(
+        let result: Result<Vec<TaggedItem>> = async {
+            let conn = db.acquire().await?;
+            // Existing identity mapping for the session, keyed by
+            // (message_id, part_path) → (tag, digest).
+            let mut existing: HashMap<(String, String), (u64, String)> = HashMap::new();
+            {
+                let mut stmt = conn
+                    .prepare(
                         "SELECT tag, message_id, part_path, digest
                          FROM mc_tag WHERE session_id = ?1",
-                    )?;
-                    let rows = stmt.query_map([&session], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                        ))
-                    })?;
-                    for row in rows {
-                        // Tags are small monotonic counters; the i64
-                        // narrowing matches the SQLite column type.
-                        let (tag, message_id, part_path, digest) = row?;
-                        existing.insert((message_id, part_path), (tag as u64, digest));
-                    }
+                    )
+                    .await?;
+                let mut rows = stmt.query([session_id]).await?;
+                while let Some(row) = rows.next().await? {
+                    // Tags are small monotonic counters; the i64
+                    // narrowing matches the SQLite column type.
+                    let (tag, message_id, part_path, digest) = (
+                        row.get::<i64>(0)?,
+                        row.get::<String>(1)?,
+                        row.get::<String>(2)?,
+                        row.get::<String>(3)?,
+                    );
+                    existing.insert((message_id, part_path), (tag as u64, digest));
                 }
-                // Durable counter: one past the session's highest tag.
-                let mut next: u64 = c.query_row(
-                    "SELECT COALESCE(MAX(tag), 0) FROM mc_tag WHERE session_id = ?1",
-                    [&session],
-                    |row| row.get::<_, i64>(0),
-                )? as u64;
-                next += 1;
+            }
+            // Durable counter: one past the session's highest tag.
+            let mut next: u64 = {
+                let mut stmt = conn
+                    .prepare("SELECT COALESCE(MAX(tag), 0) FROM mc_tag WHERE session_id = ?1")
+                    .await?;
+                stmt.query_row([session_id]).await?.get::<i64>(0)? as u64
+            };
+            next += 1;
 
-                let mut out = Vec::new();
-                for (message_id, taggables) in &items {
-                    for (part_path, content) in taggables {
-                        let content_digest = digest_hex(content);
-                        let key = (message_id.clone(), part_path.clone());
-                        if let Some(&(tag, ref stored)) = existing.get(&key) {
-                            if *stored != content_digest {
-                                c.execute(
-                                    "UPDATE mc_tag SET digest = ?3
+            let mut out = Vec::new();
+            for (message_id, taggables) in &items {
+                for (part_path, content) in taggables {
+                    let content_digest = digest_hex(content);
+                    let key = (message_id.clone(), part_path.clone());
+                    if let Some(&(tag, ref stored)) = existing.get(&key) {
+                        if *stored != content_digest {
+                            conn.execute(
+                                "UPDATE mc_tag SET digest = ?3
                                      WHERE session_id = ?1 AND tag = ?2",
-                                    rusqlite::params![session, tag as i64, content_digest],
-                                )?;
-                            }
-                            out.push(TaggedItem {
-                                tag,
-                                message_id: message_id.clone(),
-                                part_path: part_path.clone(),
-                            });
-                            continue;
+                                (session_id, tag as i64, content_digest),
+                            )
+                            .await?;
                         }
-                        let tag = next;
-                        next += 1;
-                        c.execute(
-                            "INSERT INTO mc_tag (session_id, tag, message_id, part_path, digest)
-                             VALUES (?1, ?2, ?3, ?4, ?5)",
-                            rusqlite::params![
-                                session,
-                                tag as i64,
-                                message_id,
-                                part_path,
-                                content_digest
-                            ],
-                        )?;
                         out.push(TaggedItem {
                             tag,
                             message_id: message_id.clone(),
                             part_path: part_path.clone(),
                         });
+                        continue;
                     }
+                    let tag = next;
+                    next += 1;
+                    conn.execute(
+                        "INSERT INTO mc_tag (session_id, tag, message_id, part_path, digest)
+                             VALUES (?1, ?2, ?3, ?4, ?5)",
+                        (
+                            session_id,
+                            tag as i64,
+                            message_id.as_str(),
+                            part_path.as_str(),
+                            content_digest.as_str(),
+                        ),
+                    )
+                    .await?;
+                    out.push(TaggedItem {
+                        tag,
+                        message_id: message_id.clone(),
+                        part_path: part_path.clone(),
+                    });
                 }
-                Ok(out)
-            })
-            .await
-            .with_context(|| format!("assign mctx tags for session {session_id}"))
+            }
+            Ok(out)
+        }
+        .await;
+        result.with_context(|| format!("assign mctx tags for session {session_id}"))
     }
 }
 
@@ -281,20 +282,24 @@ fn digest_hex(content: &str) -> String {
 
 /// Every drop row for a session: tag → lifecycle state.
 pub async fn drops(db: &Db, session_id: &str) -> Result<HashMap<u64, DropState>> {
-    let session = session_id.to_owned();
-    let rows: Vec<(i64, String)> = db
-        .conn()
-        .call(move |c| {
-            let mut stmt = c.prepare("SELECT tag, state FROM mc_drop WHERE session_id = ?1")?;
-            let rows = stmt.query_map([&session], |row| Ok((row.get(0)?, row.get(1)?)))?;
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .await
-        .context("load mctx drops")?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|(tag, state)| drop_state_of(Some(state)).map(|state| (tag as u64, state)))
-        .collect())
+    let result: Result<HashMap<u64, DropState>> = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare("SELECT tag, state FROM mc_drop WHERE session_id = ?1")
+            .await?;
+        let mut rows = stmt.query([session_id]).await?;
+        let mut out = HashMap::new();
+        while let Some(row) = rows.next().await? {
+            let tag = row.get::<i64>(0)?;
+            let state = row.get::<String>(1)?;
+            if let Some(state) = drop_state_of(Some(state)) {
+                out.insert(tag as u64, state);
+            }
+        }
+        Ok(out)
+    }
+    .await;
+    result.context("load mctx drops")
 }
 
 /// The placeholder that stands in for a dropped item's content.
@@ -452,50 +457,51 @@ pub async fn queue_drop_outcome(
     tag: u64,
     reason: &str,
 ) -> Result<QueueOutcome> {
-    let sid = session_id.to_owned();
-    let reason = reason.to_owned();
     let now = now_millis();
-    let tag = tag as i64;
-    db.conn()
-        .call(move |c| -> rusqlite::Result<QueueOutcome> {
-            let known: Option<i64> = c
-                .query_row(
-                    "SELECT tag FROM mc_tag WHERE session_id = ?1 AND tag = ?2",
-                    rusqlite::params![sid, tag],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let Some(_) = known else {
-                return Ok(QueueOutcome::UnknownTag);
-            };
-            let state: Option<String> = c
-                .query_row(
-                    "SELECT state FROM mc_drop WHERE session_id = ?1 AND tag = ?2",
-                    rusqlite::params![sid, tag],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            match state.as_deref() {
-                None => {
-                    c.execute(
-                        "INSERT INTO mc_drop (session_id, tag, reason, state, created_at)
-                         VALUES (?1, ?2, ?3, 'queued', ?4)",
-                        rusqlite::params![sid, tag, reason, now],
-                    )?;
-                    Ok(QueueOutcome::Queued)
-                }
-                Some("queued") => {
-                    c.execute(
-                        "UPDATE mc_drop SET reason = ?3 WHERE session_id = ?1 AND tag = ?2",
-                        rusqlite::params![sid, tag, reason],
-                    )?;
-                    Ok(QueueOutcome::Queued)
-                }
-                Some(_) => Ok(QueueOutcome::AlreadyApplied),
+    let tag_id = tag as i64;
+    let result: Result<QueueOutcome> = async {
+        let conn = db.acquire().await?;
+        let known = {
+            let mut stmt = conn
+                .prepare("SELECT tag FROM mc_tag WHERE session_id = ?1 AND tag = ?2")
+                .await?;
+            optional(&mut stmt, (session_id, tag_id)).await?
+        };
+        let Some(_) = known else {
+            return Ok(QueueOutcome::UnknownTag);
+        };
+        let state: Option<String> = {
+            let mut stmt = conn
+                .prepare("SELECT state FROM mc_drop WHERE session_id = ?1 AND tag = ?2")
+                .await?;
+            match optional(&mut stmt, (session_id, tag_id)).await? {
+                Some(row) => row.get(0)?,
+                None => None,
             }
-        })
-        .await
-        .with_context(|| format!("queue drop of tag {tag} for session {session_id}"))
+        };
+        match state.as_deref() {
+            None => {
+                conn.execute(
+                    "INSERT INTO mc_drop (session_id, tag, reason, state, created_at)
+                         VALUES (?1, ?2, ?3, 'queued', ?4)",
+                    (session_id, tag_id, reason, now),
+                )
+                .await?;
+                Ok(QueueOutcome::Queued)
+            }
+            Some("queued") => {
+                conn.execute(
+                    "UPDATE mc_drop SET reason = ?3 WHERE session_id = ?1 AND tag = ?2",
+                    (session_id, tag_id, reason),
+                )
+                .await?;
+                Ok(QueueOutcome::Queued)
+            }
+            Some(_) => Ok(QueueOutcome::AlreadyApplied),
+        }
+    }
+    .await;
+    result.with_context(|| format!("queue drop of tag {tag} for session {session_id}"))
 }
 
 /// Peek the session's queued drops: return them (tag, reason) in tag order
@@ -503,20 +509,23 @@ pub async fn queue_drop_outcome(
 /// and marks them applied with [`mark_drops_applied`] only after that pass
 /// commits — marking at hand-off would lose every drop to a failed pass.
 pub async fn peek_queued_drops(db: &Db, session_id: &str) -> Result<Vec<(u64, String)>> {
-    let sid = session_id.to_owned();
-    db.conn()
-        .call(move |c| -> rusqlite::Result<Vec<(u64, String)>> {
-            let mut stmt = c.prepare(
+    let result: Result<Vec<(u64, String)>> = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
                 "SELECT tag, reason FROM mc_drop
                  WHERE session_id = ?1 AND state = 'queued' ORDER BY tag",
-            )?;
-            let mapped = stmt.query_map([&sid], |row| {
-                Ok((row.get::<_, i64>(0)? as u64, row.get(1)?))
-            })?;
-            mapped.collect::<rusqlite::Result<Vec<_>>>()
-        })
-        .await
-        .with_context(|| format!("peek mc_drop queue for session {session_id}"))
+            )
+            .await?;
+        let mut rows = stmt.query([session_id]).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push((row.get::<i64>(0)? as u64, row.get(1)?));
+        }
+        Ok(out)
+    }
+    .await;
+    result.with_context(|| format!("peek mc_drop queue for session {session_id}"))
 }
 
 /// Mark the given tags' drop rows `'applied'` (rows are kept so `recover`
@@ -527,25 +536,23 @@ pub async fn mark_drops_applied(db: &Db, session_id: &str, tags: &[u64]) -> Resu
     if tags.is_empty() {
         return Ok(());
     }
-    let sid = session_id.to_owned();
-    let tags = tags.to_vec();
-    db.conn()
-        .call(move |c| -> rusqlite::Result<()> {
-            let placeholders = tags.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
-            let tags: Vec<i64> = tags.iter().map(|tag| *tag as i64).collect();
-            let mut params: Vec<&dyn rusqlite::ToSql> = vec![&sid];
-            params.extend(tags.iter().map(|tag| tag as &dyn rusqlite::ToSql));
-            c.execute(
-                &format!(
-                    "UPDATE mc_drop SET state = 'applied'
-                     WHERE session_id = ? AND tag IN ({placeholders}) AND state = 'queued'"
-                ),
-                params.as_slice(),
-            )?;
-            Ok(())
-        })
-        .await
-        .with_context(|| format!("mark mc_drop rows applied for session {session_id}"))
+    let placeholders = tags.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+    // Dynamic arity needs `Vec<Value>`; the tuple form only covers fixed
+    // parameter lists.
+    let mut params: Vec<turso::Value> = Vec::with_capacity(tags.len() + 1);
+    params.push(turso::Value::Text(session_id.to_owned()));
+    params.extend(tags.iter().map(|tag| turso::Value::Integer(*tag as i64)));
+    let conn = db.acquire().await?;
+    conn.execute(
+        &format!(
+            "UPDATE mc_drop SET state = 'applied'
+                 WHERE session_id = ? AND tag IN ({placeholders}) AND state = 'queued'"
+        ),
+        params,
+    )
+    .await
+    .with_context(|| format!("mark mc_drop rows applied for session {session_id}"))?;
+    Ok(())
 }
 
 /// What a tag resolves to when recovering its original content.
@@ -575,44 +582,52 @@ type RecoverRow = (Option<(String, String)>, Option<String>, Option<String>);
 /// `part_path`, and return the raw content. `None` = the tag is unknown for
 /// the session.
 pub async fn recover(db: &Db, session_id: &str, tag: u64) -> Result<Option<Recovered>> {
-    let sid = session_id.to_owned();
-    let tag = tag as i64;
-    let (mapping, dropped, data) = db
-        .conn()
-        .call(move |c| -> rusqlite::Result<RecoverRow> {
-            let mapping = c
-                .query_row(
+    let tag_id = tag as i64;
+    let (mapping, dropped, data): RecoverRow = async {
+        let conn = db.acquire().await?;
+        let mapping: Option<(String, String)> = {
+            let mut stmt = conn
+                .prepare(
                     "SELECT message_id, part_path FROM mc_tag
                      WHERE session_id = ?1 AND tag = ?2",
-                    rusqlite::params![sid, tag],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
-                .optional()?;
-            let dropped: Option<String> = match &mapping {
-                Some(_) => c
-                    .query_row(
-                        "SELECT state FROM mc_drop WHERE session_id = ?1 AND tag = ?2",
-                        rusqlite::params![sid, tag],
-                        |row| row.get(0),
-                    )
-                    .optional()?,
+                .await?;
+            match optional(&mut stmt, (session_id, tag_id)).await? {
+                Some(row) => Some((row.get(0)?, row.get(1)?)),
                 None => None,
-            };
-            let data: Option<String> = match &mapping {
-                Some((message_id, _)) => c
-                    .query_row(
+            }
+        };
+        let dropped: Option<String> = match &mapping {
+            Some(_) => {
+                let mut stmt = conn
+                    .prepare("SELECT state FROM mc_drop WHERE session_id = ?1 AND tag = ?2")
+                    .await?;
+                match optional(&mut stmt, (session_id, tag_id)).await? {
+                    Some(row) => row.get(0)?,
+                    None => None,
+                }
+            }
+            None => None,
+        };
+        let data: Option<String> = match &mapping {
+            Some((message_id, _)) => {
+                let mut stmt = conn
+                    .prepare(
                         "SELECT data FROM session_message
                          WHERE id = ?1 AND session_id = ?2",
-                        rusqlite::params![message_id, sid],
-                        |row| row.get(0),
                     )
-                    .optional()?,
-                None => None,
-            };
-            Ok((mapping, dropped, data))
-        })
-        .await
-        .with_context(|| format!("recover tag {tag} for session {session_id}"))?;
+                    .await?;
+                match optional(&mut stmt, (message_id.as_str(), session_id)).await? {
+                    Some(row) => row.get(0)?,
+                    None => None,
+                }
+            }
+            None => None,
+        };
+        Ok::<_, anyhow::Error>((mapping, dropped, data))
+    }
+    .await
+    .with_context(|| format!("recover tag {tag} for session {session_id}"))?;
     let Some((_message_id, part_path)) = mapping else {
         return Ok(None);
     };
@@ -673,36 +688,33 @@ pub(crate) mod test_support {
     /// Insert `session_v2` + one `session_message` row per message so
     /// `recover` can read originals back from the raw store.
     pub(crate) async fn store_messages(db: &Db, session_id: &str, messages: &[Value]) {
-        let session = session_id.to_owned();
-        let rows: Vec<Value> = messages.to_vec();
-        db.conn()
-            .call(move |c| -> rusqlite::Result<()> {
-                c.execute(
-                    "INSERT INTO session_v2 (id, project_id, slug, directory, version, cost,
-                        tokens_input, tokens_output, tokens_reasoning, tokens_cache_read,
-                        tokens_cache_write, time_created, time_updated)
-                     VALUES (?1, 'p', 'slug', '/tmp', 'v', 0, 0, 0, 0, 0, 0, 0, 0)",
-                    [session.as_str()],
-                )?;
-                for (seq, message) in rows.iter().enumerate() {
-                    let data = serde_json::to_string(&strip_envelope(message)).expect("serialize");
-                    c.execute(
-                        "INSERT INTO session_message (id, session_id, type, seq,
-                            time_created, time_updated, data)
-                         VALUES (?1, ?2, ?3, ?4, 0, 0, ?5)",
-                        rusqlite::params![
-                            message["id"].as_str().unwrap(),
-                            session,
-                            message["type"].as_str().unwrap(),
-                            seq as i64,
-                            data
-                        ],
-                    )?;
-                }
-                Ok(())
-            })
+        let conn = db.acquire().await.unwrap();
+        conn.execute(
+            "INSERT INTO session_v2 (id, project_id, slug, directory, version, cost,
+                    tokens_input, tokens_output, tokens_reasoning, tokens_cache_read,
+                    tokens_cache_write, time_created, time_updated)
+                 VALUES (?1, 'p', 'slug', '/tmp', 'v', 0, 0, 0, 0, 0, 0, 0, 0)",
+            [session_id],
+        )
+        .await
+        .unwrap();
+        for (seq, message) in messages.iter().enumerate() {
+            let data = serde_json::to_string(&strip_envelope(message)).expect("serialize");
+            conn.execute(
+                "INSERT INTO session_message (id, session_id, type, seq,
+                        time_created, time_updated, data)
+                     VALUES (?1, ?2, ?3, ?4, 0, 0, ?5)",
+                (
+                    message["id"].as_str().unwrap(),
+                    session_id,
+                    message["type"].as_str().unwrap(),
+                    seq as i64,
+                    data.as_str(),
+                ),
+            )
             .await
             .unwrap();
+        }
     }
 }
 
@@ -769,17 +781,14 @@ mod tests {
         assert_eq!(items[3].part_path, "tool:call_1");
         // The tool part's digest covers its serialized state.
         let expected_digest = digest_hex(&messages[1]["content"][2]["state"].to_string());
-        let stored: String = db
-            .conn()
-            .call(|c| {
-                c.query_row(
-                    "SELECT digest FROM mc_tag WHERE session_id = 's1' AND tag = 4",
-                    [],
-                    |row| row.get(0),
-                )
-            })
-            .await
-            .unwrap();
+        let stored: String = {
+            let conn = db.acquire().await.unwrap();
+            let mut stmt = conn
+                .prepare("SELECT digest FROM mc_tag WHERE session_id = 's1' AND tag = 4")
+                .await
+                .unwrap();
+            stmt.query_row(()).await.unwrap().get(0).unwrap()
+        };
         assert_eq!(stored, expected_digest);
     }
 
@@ -791,17 +800,14 @@ mod tests {
         let second = Tagger.assign(&db, "s1", &messages).await.unwrap();
         assert_eq!(first, second, "the same items must keep their tags");
         // No duplicate minting: the session's max tag is unchanged.
-        let max: i64 = db
-            .conn()
-            .call(|c| {
-                c.query_row(
-                    "SELECT COALESCE(MAX(tag), 0) FROM mc_tag WHERE session_id = 's1'",
-                    [],
-                    |row| row.get(0),
-                )
-            })
-            .await
-            .unwrap();
+        let max: i64 = {
+            let conn = db.acquire().await.unwrap();
+            let mut stmt = conn
+                .prepare("SELECT COALESCE(MAX(tag), 0) FROM mc_tag WHERE session_id = 's1'")
+                .await
+                .unwrap();
+            stmt.query_row(()).await.unwrap().get(0).unwrap()
+        };
         assert_eq!(max, 4);
     }
 
@@ -831,17 +837,14 @@ mod tests {
         messages[1]["content"][0]["text"] = json!("rewritten");
         let items = Tagger.assign(&db, "s1", &messages).await.unwrap();
         assert_eq!(tags(&items), vec![1, 2, 3, 4], "the slot keeps its tag");
-        let digest: String = db
-            .conn()
-            .call(|c| {
-                c.query_row(
-                    "SELECT digest FROM mc_tag WHERE session_id = 's1' AND tag = 2",
-                    [],
-                    |row| row.get(0),
-                )
-            })
-            .await
-            .unwrap();
+        let digest: String = {
+            let conn = db.acquire().await.unwrap();
+            let mut stmt = conn
+                .prepare("SELECT digest FROM mc_tag WHERE session_id = 's1' AND tag = 2")
+                .await
+                .unwrap();
+            stmt.query_row(()).await.unwrap().get(0).unwrap()
+        };
         assert_eq!(digest, digest_hex("rewritten"), "digest refreshed");
     }
 
@@ -852,17 +855,14 @@ mod tests {
         let items = Tagger.assign(&db, "s2", &sample_messages()).await.unwrap();
         assert_eq!(tags(&items), vec![1, 2, 3, 4], "tags restart per session");
         // s1's mapping is untouched.
-        let count: i64 = db
-            .conn()
-            .call(|c| {
-                c.query_row(
-                    "SELECT count(*) FROM mc_tag WHERE session_id = 's1'",
-                    [],
-                    |row| row.get(0),
-                )
-            })
-            .await
-            .unwrap();
+        let count: i64 = {
+            let conn = db.acquire().await.unwrap();
+            let mut stmt = conn
+                .prepare("SELECT count(*) FROM mc_tag WHERE session_id = 's1'")
+                .await
+                .unwrap();
+            stmt.query_row(()).await.unwrap().get(0).unwrap()
+        };
         assert_eq!(count, 4);
     }
 
@@ -906,17 +906,15 @@ mod tests {
                 .unwrap(),
             QueueOutcome::Queued
         );
-        let (state, reason): (String, String) = db
-            .conn()
-            .call(move |c| {
-                c.query_row(
-                    "SELECT state, reason FROM mc_drop WHERE session_id = 's1' AND tag = ?1",
-                    [tag as i64],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-            })
-            .await
-            .unwrap();
+        let (state, reason): (String, String) = {
+            let conn = db.acquire().await.unwrap();
+            let mut stmt = conn
+                .prepare("SELECT state, reason FROM mc_drop WHERE session_id = 's1' AND tag = ?1")
+                .await
+                .unwrap();
+            let row = stmt.query_row([tag as i64]).await.unwrap();
+            (row.get(0).unwrap(), row.get(1).unwrap())
+        };
         assert_eq!(state, "queued");
         assert_eq!(reason, "already read");
 
@@ -931,32 +929,26 @@ mod tests {
         // Peek: returns the row WITHOUT flipping its state.
         let drained = peek_queued_drops(&db, "s1").await.unwrap();
         assert_eq!(drained, vec![(tag, "superseded".to_owned())]);
-        let state: String = db
-            .conn()
-            .call(move |c| {
-                c.query_row(
-                    "SELECT state FROM mc_drop WHERE session_id = 's1' AND tag = ?1",
-                    [tag as i64],
-                    |row| row.get(0),
-                )
-            })
-            .await
-            .unwrap();
+        let state: String = {
+            let conn = db.acquire().await.unwrap();
+            let mut stmt = conn
+                .prepare("SELECT state FROM mc_drop WHERE session_id = 's1' AND tag = ?1")
+                .await
+                .unwrap();
+            stmt.query_row([tag as i64]).await.unwrap().get(0).unwrap()
+        };
         assert_eq!(state, "queued");
 
         // Mark applied only after the (simulated) pass commits.
         mark_drops_applied(&db, "s1", &[tag]).await.unwrap();
-        let state: String = db
-            .conn()
-            .call(move |c| {
-                c.query_row(
-                    "SELECT state FROM mc_drop WHERE session_id = 's1' AND tag = ?1",
-                    [tag as i64],
-                    |row| row.get(0),
-                )
-            })
-            .await
-            .unwrap();
+        let state: String = {
+            let conn = db.acquire().await.unwrap();
+            let mut stmt = conn
+                .prepare("SELECT state FROM mc_drop WHERE session_id = 's1' AND tag = ?1")
+                .await
+                .unwrap();
+            stmt.query_row([tag as i64]).await.unwrap().get(0).unwrap()
+        };
         assert_eq!(state, "applied");
 
         // A second peek returns nothing; re-queueing an applied tag is
@@ -1066,8 +1058,8 @@ mod tests {
         })];
         store_messages(&db, "s1", &messages).await;
         let items = Tagger.assign(&db, "s1", &messages).await.unwrap();
-        db.conn()
-            .call(|c| c.execute("DELETE FROM session_message WHERE id = 'msg_u1'", []))
+        let conn = db.acquire().await.unwrap();
+        conn.execute("DELETE FROM session_message WHERE id = 'msg_u1'", ())
             .await
             .unwrap();
         assert_eq!(

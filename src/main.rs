@@ -3,9 +3,6 @@
 //! This binary is the HTTP entrypoint. The library half (`lib.rs`) exposes
 //! config/db/id/api so integration tests can drive the real router.
 
-#[global_allocator]
-static GLOBAL: rustfs_mimalloc::MiMalloc = rustfs_mimalloc::MiMalloc;
-
 use anyhow::Result;
 
 #[tokio::main]

@@ -260,6 +260,8 @@ name = "Claude Sonnet 4.5"
         assert!(cfg.magic_context.historian_model.is_none());
         assert_eq!(cfg.magic_context.soft_threshold, 0.70);
         assert_eq!(cfg.magic_context.hard_threshold, 0.85);
+        assert!(!cfg.magic_context.dreamer_enabled);
+        assert_eq!(cfg.magic_context.dreamer_interval_minutes, 15);
     }
 
     #[test]
@@ -270,6 +272,8 @@ enabled = true
 historian_model = "cardinal/k3-256k"
 soft_threshold = 0.6
 hard_threshold = 0.9
+dreamer_enabled = true
+dreamer_interval_minutes = 1
 "#;
         let cfg: Config = toml::from_str(raw).unwrap();
         assert!(cfg.magic_context.enabled);
@@ -279,6 +283,8 @@ hard_threshold = 0.9
         );
         assert_eq!(cfg.magic_context.soft_threshold, 0.6);
         assert_eq!(cfg.magic_context.hard_threshold, 0.9);
+        assert!(cfg.magic_context.dreamer_enabled);
+        assert_eq!(cfg.magic_context.dreamer_interval_minutes, 1);
     }
 
     #[test]

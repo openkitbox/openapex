@@ -36,7 +36,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Result, bail};
 use dashmap::DashMap;
-use rusqlite::OptionalExtension;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -490,22 +489,19 @@ impl ActorTask {
     /// server's directory when the row predates the column or the path is
     /// gone.
     async fn session_directory(&self) -> std::path::PathBuf {
-        let raw: Option<String> = self
-            .inner
-            .db
-            .conn()
-            .call({
-                let session_id = self.session_id.clone();
-                move |c| {
-                    c.query_row(
-                        "SELECT directory FROM session_v2 WHERE id = ?1",
-                        rusqlite::params![session_id],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                }
-            })
-            .await
+        let looked_up: anyhow::Result<Option<String>> = async {
+            let conn = self.inner.db.acquire().await?;
+            let mut stmt = conn
+                .prepare("SELECT directory FROM session_v2 WHERE id = ?1")
+                .await?;
+            let row = crate::db::optional(&mut stmt, [self.session_id.as_str()]).await?;
+            match row {
+                Some(row) => Ok(row.get::<Option<String>>(0)?),
+                None => Ok(None),
+            }
+        }
+        .await;
+        let raw = looked_up
             .inspect_err(|error| {
                 tracing::warn!(
                     session = %self.session_id,

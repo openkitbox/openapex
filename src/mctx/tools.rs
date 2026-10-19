@@ -532,17 +532,18 @@ mod tests {
         );
         assert!(text.contains("Unknown tag: §999§."), "got: {text}");
         // The drop row is queued, not applied.
-        let state: String = db
-            .conn()
-            .call(move |c| {
-                c.query_row(
-                    "SELECT state FROM mc_drop WHERE session_id = ?1 AND tag = ?2",
-                    rusqlite::params![SESSION, tags[0] as i64],
-                    |row| row.get(0),
-                )
-            })
-            .await
-            .unwrap();
+        let state: String = {
+            let conn = db.acquire().await.unwrap();
+            let mut stmt = conn
+                .prepare("SELECT state FROM mc_drop WHERE session_id = ?1 AND tag = ?2")
+                .await
+                .unwrap();
+            stmt.query_row((SESSION, tags[0] as i64))
+                .await
+                .unwrap()
+                .get(0)
+                .unwrap()
+        };
         assert_eq!(state, "queued");
     }
 
@@ -726,25 +727,26 @@ mod tests {
             "text": long,
         })];
         let text_payload = json!({ "text": long }).to_string();
-        db.conn()
-            .call(move |c| -> rusqlite::Result<()> {
-                c.execute(
-                    "INSERT INTO session_v2 (id, project_id, slug, directory, version, cost,
-                        tokens_input, tokens_output, tokens_reasoning, tokens_cache_read,
-                        tokens_cache_write, time_created, time_updated)
-                     VALUES (?1, 'p', 'slug', '/tmp', 'v', 0, 0, 0, 0, 0, 0, 0, 0)",
-                    [SESSION],
-                )?;
-                c.execute(
-                    "INSERT INTO session_message (id, session_id, type, seq, time_created,
-                        time_updated, data)
-                     VALUES ('msg_u1', ?1, 'user', 0, 0, 0, ?2)",
-                    rusqlite::params![SESSION, text_payload],
-                )?;
-                Ok(())
-            })
+        {
+            let conn = db.acquire().await.unwrap();
+            conn.execute(
+                "INSERT INTO session_v2 (id, project_id, slug, directory, version, cost,
+                    tokens_input, tokens_output, tokens_reasoning, tokens_cache_read,
+                    tokens_cache_write, time_created, time_updated)
+                 VALUES (?1, 'p', 'slug', '/tmp', 'v', 0, 0, 0, 0, 0, 0, 0, 0)",
+                [SESSION],
+            )
             .await
             .unwrap();
+            conn.execute(
+                "INSERT INTO session_message (id, session_id, type, seq, time_created,
+                    time_updated, data)
+                 VALUES ('msg_u1', ?1, 'user', 0, 0, 0, ?2)",
+                (SESSION, text_payload.as_str()),
+            )
+            .await
+            .unwrap();
+        }
         let items = Tagger.assign(&db, SESSION, &messages).await.unwrap();
         let output = CtxExpandTool::new(db)
             .execute(tool_ctx(), json!({ "tag": items[0].tag }))
