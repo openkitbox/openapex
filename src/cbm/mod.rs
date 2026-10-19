@@ -34,6 +34,11 @@ use crate::runner::ToolOutput;
 use crate::tool::{fail, ok_text};
 use crate::which;
 
+pub(crate) mod tools;
+
+#[cfg(test)]
+mod teststub;
+
 /// Name of the binary on `PATH`.
 const BINARY_NAME: &str = "codebase-memory-mcp";
 
@@ -373,85 +378,21 @@ fn cap_stderr(raw: &[u8]) -> String {
     text[..end].trim_end().to_owned()
 }
 
-// T1 lands the gateway before its consumers: `cbm::tools` (T2) calls `call`
-// and `project_for`, and `run` (T3) calls `discover`. Until those exist, the
-// references below keep the private API live under `-D warnings` without
-// widening its visibility or suppressing the lint.
+// `cbm::tools` (T2) now uses `call` and `project_for`; only `discover` waits
+// for its consumer in `run` (T3). Until then the reference below keeps the
+// private API live under `-D warnings` without widening its visibility or
+// suppressing the lint. T3 deletes this scaffold.
 const _: () = {
     let _ = Cbm::discover;
-    let _ = Cbm::call;
-    let _ = Cbm::project_for;
 };
 
 #[cfg(test)]
 mod tests {
+    use super::teststub::{MAIN_STUB, SILENT_STUB, SLOW_STUB, STDERR_STUB, stub, write_projects};
     use super::*;
     use serde_json::json;
     use std::time::{Duration, Instant};
     use tempfile::tempdir;
-
-    /// Records argv and stdin, serves `list_projects` as JSON only when
-    /// `--format json` is present, and fails when the arguments carry
-    /// `"cbm_fail"`.
-    const MAIN_STUB: &str = r#"#!/bin/sh
-# $1=cli $2=--quiet $3=<tool>
-printf '%s\n' "$@" > .cbm-stub-argv
-tool="$3"
-cat > .cbm-stub-stdin.json
-case "$tool" in
-  list_projects)
-    case " $* " in
-      *" --format json "*) cat .cbm-stub-projects.json 2>/dev/null || printf '{"projects":[]}' ;;
-      *) printf 'tree-output\n' ;;
-    esac
-    ;;
-  *)
-    if grep -q '"cbm_fail"' .cbm-stub-stdin.json 2>/dev/null; then
-      printf '{"error":"stub boom","hint":"fix it"}' >&2
-      exit 1
-    fi
-    printf 'stub %s ok\n' "$tool"
-    ;;
-esac
-"#;
-
-    /// Announces itself, then sleeps so cancellation must kill it.
-    const SLOW_STUB: &str = r#"#!/bin/sh
-cat > .cbm-stub-stdin.json
-printf started > .cbm-stub-started
-sleep 5
-printf 'late\n'
-"#;
-
-    /// Exits non-zero without writing a diagnostic.
-    const SILENT_STUB: &str = r#"#!/bin/sh
-cat > .cbm-stub-stdin.json
-exit 1
-"#;
-
-    /// Emits a prepared stderr payload and fails.
-    const STDERR_STUB: &str = r#"#!/bin/sh
-cat > .cbm-stub-stdin.json
-cat .cbm-stub-stderr.txt >&2
-exit 1
-"#;
-
-    fn stub(path: &Path, script: &str) -> Cbm {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::write(path, script).unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Cbm {
-            binary: path.to_path_buf(),
-        }
-    }
-
-    fn write_projects(directory: &Path, projects: Value) {
-        std::fs::write(
-            directory.join(".cbm-stub-projects.json"),
-            serde_json::to_string(&projects).unwrap(),
-        )
-        .unwrap();
-    }
 
     #[tokio::test]
     async fn call_forwards_tool_and_arguments() {
