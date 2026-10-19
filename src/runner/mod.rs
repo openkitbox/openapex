@@ -176,6 +176,8 @@ struct Inner {
     bus: EventBus,
     chat: Arc<dyn Chat>,
     tools: Arc<ToolRegistry>,
+    /// The model catalogue (default-model resolution); shared with the API.
+    model_catalog: Arc<crate::model_catalog::ModelCatalog>,
     sessions: DashMap<String, SessionHandle>,
 }
 
@@ -211,6 +213,7 @@ impl Runner {
         bus: EventBus,
         chat: Arc<dyn Chat>,
         tools: Arc<ToolRegistry>,
+        model_catalog: Arc<crate::model_catalog::ModelCatalog>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -220,6 +223,7 @@ impl Runner {
                 bus,
                 chat,
                 tools,
+                model_catalog,
                 sessions: DashMap::new(),
             }),
         }
@@ -407,6 +411,7 @@ impl ActorTask {
                 bus: self.inner.bus.clone(),
                 chat: self.inner.chat.clone(),
                 tools: self.inner.tools.clone(),
+                model_catalog: Arc::clone(&self.inner.model_catalog),
             };
             let mut scope = drain::Promotable::Input;
             loop {

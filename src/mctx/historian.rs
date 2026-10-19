@@ -1296,6 +1296,8 @@ pub struct RunCtx<'a> {
     pub db: &'a crate::db::Db,
     pub config: &'a Config,
     pub chat: &'a Arc<dyn Chat>,
+    /// Default-model resolution for the hidden completion.
+    pub catalog: &'a crate::model_catalog::ModelCatalog,
 }
 
 /// One run's inputs. The caller (Task 9) resolves the chunk and the context
@@ -1376,7 +1378,7 @@ impl std::error::Error for ValidationFailure {}
 /// transport failure settles the row `failed` at once — retrying it is the
 /// caller's decision, not this run's.
 pub async fn run(ctx: &RunCtx<'_>, plan: &RunPlan<'_>) -> Result<RunOutcome> {
-    let model = historian_model(ctx.config)?;
+    let model = historian_model(ctx.config, ctx.catalog)?;
     // The stored ranges are read before the run is claimed: a store failure must
     // leave no row behind for a run that never started.
     let prior = stored_ranges(ctx.db, plan.session_id).await?;
@@ -1699,20 +1701,15 @@ pub struct SideChannels {
 /// `pub(crate)` because the dreamer runs its hidden completions through the
 /// same resolution and the same transport ([`collect_completion`]): one route
 /// to the model, not two.
-pub(crate) fn historian_model(config: &Config) -> Result<String> {
+pub(crate) fn historian_model(
+    config: &Config,
+    catalog: &crate::model_catalog::ModelCatalog,
+) -> Result<String> {
     if let Some(qualified) = &config.magic_context.historian_model {
-        let matched = qualified.split_once('/').and_then(|(provider, id)| {
-            config
-                .models
-                .iter()
-                .find(|model| model.provider == provider && model.id == id)
-        });
-        return Ok(matched
-            .map(|model| model.id.clone())
-            .unwrap_or_else(|| bare_model_id(qualified)));
+        return Ok(bare_model_id(qualified));
     }
-    match config.default_model_entry() {
-        Some(entry) => Ok(entry.id.clone()),
+    match catalog.default_entry(config) {
+        Some(entry) => Ok(entry.id),
         None => anyhow::bail!(
             "no model configured for the historian completion: set magic_context.historian_model or a default model"
         ),
@@ -2125,12 +2122,21 @@ mod tests {
     fn config_with_default_model() -> Config {
         toml::from_str(
             r#"
-[[models]]
-provider = "cardinal"
-id = "k3-256k"
+default_model = "cardinal/k3-256k"
 "#,
         )
         .expect("test config")
+    }
+
+    /// The catalogue the hidden completion resolves its default model from.
+    fn catalog() -> crate::model_catalog::ModelCatalog {
+        crate::model_catalog::ModelCatalog::from_entries(vec![crate::config::ModelEntry {
+            provider: "cardinal".to_owned(),
+            id: "k3-256k".to_owned(),
+            name: None,
+            context: None,
+            output: None,
+        }])
     }
 
     fn empty_inputs() -> CompartmentPromptInputs<'static> {
@@ -2227,10 +2233,12 @@ id = "k3-256k"
         let config = config_with_default_model();
         let scripted = Arc::new(ScriptedChat::new(valid_output(3, 4)));
         let chat: Arc<dyn Chat> = scripted.clone();
+        let catalog = catalog();
         let ctx = RunCtx {
             db: &db,
             config: &config,
             chat: &chat,
+            catalog: &catalog,
         };
         let rows = vec![
             user_row(3, "msg_3", "hello"),
@@ -2316,10 +2324,12 @@ id = "k3-256k"
             valid_output(1, 2),
         ]));
         let chat: Arc<dyn Chat> = scripted.clone();
+        let catalog = catalog();
         let ctx = RunCtx {
             db: &db,
             config: &config,
             chat: &chat,
+            catalog: &catalog,
         };
         let rows = vec![
             user_row(1, "msg_1", "hello"),
@@ -2371,10 +2381,12 @@ id = "k3-256k"
             incomplete(),
         ]));
         let chat: Arc<dyn Chat> = scripted.clone();
+        let catalog = catalog();
         let ctx = RunCtx {
             db: &db,
             config: &config,
             chat: &chat,
+            catalog: &catalog,
         };
         let rows = vec![
             user_row(1, "msg_1", "hello"),
@@ -2425,10 +2437,12 @@ id = "k3-256k"
         let config = config_with_default_model();
         let scripted = Arc::new(ScriptedChat::new(Script::Fail));
         let chat: Arc<dyn Chat> = scripted.clone();
+        let catalog = catalog();
         let ctx = RunCtx {
             db: &db,
             config: &config,
             chat: &chat,
+            catalog: &catalog,
         };
         let rows = vec![user_row(1, "msg_1", "hello")];
         let chunk = chunk(&rows, 1, 2, 10_000).expect("a chunk");
@@ -2464,13 +2478,15 @@ id = "k3-256k"
     #[tokio::test]
     async fn run_requires_a_configured_model() {
         let db = Db::open_in_memory().await.unwrap();
-        // No [[models]] and no historian_model: nothing to route to.
+        // No historian_model and an empty catalogue: nothing to route to.
         let config: Config = toml::from_str("").unwrap();
         let chat: Arc<dyn Chat> = Arc::new(ScriptedChat::new(Script::Text("x".to_owned())));
+        let catalog = crate::model_catalog::ModelCatalog::from_entries(Vec::new());
         let ctx = RunCtx {
             db: &db,
             config: &config,
             chat: &chat,
+            catalog: &catalog,
         };
         let rows = vec![user_row(1, "msg_1", "hello")];
         let chunk = chunk(&rows, 1, 2, 10_000).expect("a chunk");
@@ -2498,31 +2514,32 @@ id = "k3-256k"
 
     #[tokio::test]
     async fn historian_model_prefers_the_qualified_reference_and_routes_on_the_bare_id() {
+        let catalog = catalog();
         let config: Config = toml::from_str(
             r#"
-[[models]]
-provider = "cardinal"
-id = "k3-256k"
-
 [magic_context]
 historian_model = "cardinal/k3-256k"
 "#,
         )
         .unwrap();
-        assert_eq!(historian_model(&config).unwrap(), "k3-256k");
-        // An unmatched qualified reference still routes on its id half.
+        assert_eq!(historian_model(&config, &catalog).unwrap(), "k3-256k");
+        // A reference the catalogue does not know still routes on its id half.
         let config: Config = toml::from_str(
             r#"
-[[models]]
-provider = "cardinal"
-id = "k3-256k"
-
 [magic_context]
 historian_model = "anthropic/claude-sonnet-4-5"
 "#,
         )
         .unwrap();
-        assert_eq!(historian_model(&config).unwrap(), "claude-sonnet-4-5");
+        assert_eq!(
+            historian_model(&config, &catalog).unwrap(),
+            "claude-sonnet-4-5"
+        );
+        // Unset: the catalogue's default.
+        assert_eq!(
+            historian_model(&config_with_default_model(), &catalog).unwrap(),
+            "k3-256k"
+        );
     }
 
     #[tokio::test]

@@ -99,6 +99,7 @@ pub(crate) struct DrainCtx {
     pub bus: EventBus,
     pub chat: Arc<dyn Chat>,
     pub tools: Arc<ToolRegistry>,
+    pub model_catalog: Arc<crate::model_catalog::ModelCatalog>,
 }
 
 /// Run drains until the inbox is quiet, a control interrupts, or a turn
@@ -232,10 +233,11 @@ enum TurnOutcome {
 /// synthetic user prompt, giving up after three consecutive truncations
 /// (upstream `Outcome.OutputLimit`).
 async fn run_turn(ctx: &DrainCtx, token: &CancellationToken) -> Result<TurnOutcome> {
-    let (agent, model) = match resolve_selection(&ctx.db, &ctx.session_id, &ctx.config).await {
-        Ok(selection) => selection,
-        Err(error) => return Ok(TurnOutcome::Failed(unknown_error(error.to_string()))),
-    };
+    let (agent, model) =
+        match resolve_selection(&ctx.db, &ctx.session_id, &ctx.config, &ctx.model_catalog).await {
+            Ok(selection) => selection,
+            Err(error) => return Ok(TurnOutcome::Failed(unknown_error(error.to_string()))),
+        };
     let mut compacted = false;
     loop {
         if token.is_cancelled() {
@@ -386,6 +388,7 @@ pub(crate) async fn resolve_selection(
     db: &Db,
     session_id: &str,
     config: &Config,
+    model_catalog: &crate::model_catalog::ModelCatalog,
 ) -> Result<(String, crate::schema::support::ModelRef)> {
     let row: Option<(Option<String>, Option<String>)> = {
         let conn = db.acquire().await?;
@@ -404,7 +407,7 @@ pub(crate) async fn resolve_selection(
     };
     let model = match model.and_then(|raw| serde_json::from_str(&raw).ok()) {
         Some(model) => model,
-        None => match config.default_model_entry() {
+        None => match model_catalog.default_entry(config) {
             Some(configured) => crate::schema::support::ModelRef {
                 id: configured.id.clone(),
                 provider_id: configured.provider.clone(),
@@ -765,6 +768,9 @@ mod tests {
                 bus: self.bus.clone(),
                 chat: Arc::new(NoopChat),
                 tools: Arc::new(crate::runner::ToolRegistry::new()),
+                model_catalog: Arc::new(crate::model_catalog::ModelCatalog::from_entries(
+                    Vec::new(),
+                )),
             }
         }
     }

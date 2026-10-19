@@ -53,10 +53,11 @@ pub(crate) fn mctx_historian(ctx: &DrainCtx, floor: i64) {
     let config = ctx.config.clone();
     let chat = Arc::clone(&ctx.chat);
     let bus = ctx.bus.clone();
+    let catalog = Arc::clone(&ctx.model_catalog);
     let session_id = ctx.session_id.clone();
     let project = ctx.directory.to_string_lossy().into_owned();
     tokio::spawn(async move {
-        match fire_historian(&db, &config, &chat, &session_id, &project, floor).await {
+        match fire_historian(&db, &config, &chat, &catalog, &session_id, &project, floor).await {
             Ok(Some(published)) => {
                 // A transcript notice: a fold is background work with no tool
                 // call of its own, so without this the only trace is the head
@@ -96,6 +97,7 @@ async fn fire_historian(
     db: &Db,
     config: &Config,
     chat: &Arc<dyn Chat>,
+    catalog: &crate::model_catalog::ModelCatalog,
     session_id: &str,
     project: &str,
     floor: i64,
@@ -166,7 +168,12 @@ async fn fire_historian(
         user_observations_requested: config.magic_context.dreamer_enabled,
         extraction_free: false,
     };
-    let run_ctx = historian::RunCtx { db, config, chat };
+    let run_ctx = historian::RunCtx {
+        db,
+        config,
+        chat,
+        catalog,
+    };
     let plan = historian::RunPlan {
         session_id,
         chunk: &chunk,
@@ -293,15 +300,19 @@ mod tests {
         }
     }
 
+    /// A catalogue reporting one model — what a gateway would serve.
+    fn catalog() -> crate::model_catalog::ModelCatalog {
+        crate::model_catalog::ModelCatalog::from_entries(vec![ModelEntry {
+            provider: "cardinal".to_owned(),
+            id: "m".to_owned(),
+            name: Some("m".to_owned()),
+            context: None,
+            output: None,
+        }])
+    }
+
     fn config() -> Config {
         Config {
-            models: vec![ModelEntry {
-                provider: "cardinal".to_owned(),
-                id: "m".to_owned(),
-                name: Some("m".to_owned()),
-                context: None,
-                output: None,
-            }],
             default_model: Some("cardinal/m".to_owned()),
             magic_context: MctxConfig {
                 enabled: true,
@@ -392,7 +403,7 @@ mod tests {
         );
 
         let chat: Arc<dyn Chat> = Arc::new(TextChat::new(&valid_output(1, 4)));
-        let published = fire_historian(&db, &config, &chat, SESSION, "/p", 0)
+        let published = fire_historian(&db, &config, &chat, &catalog(), SESSION, "/p", 0)
             .await
             .expect("a published run")
             .expect("the run folded something");
@@ -421,7 +432,7 @@ mod tests {
         let chat: Arc<dyn Chat> = Arc::new(TextChat::new(&valid_output(1, 2)));
 
         assert!(
-            fire_historian(&db, &config, &chat, SESSION, "/p", 0)
+            fire_historian(&db, &config, &chat, &catalog(), SESSION, "/p", 0)
                 .await
                 .expect("a published run")
                 .is_some()
@@ -445,7 +456,7 @@ mod tests {
         let chat: Arc<dyn Chat> = mock.clone();
 
         assert!(
-            fire_historian(&db, &config, &chat, SESSION, "/p", 0)
+            fire_historian(&db, &config, &chat, &catalog(), SESSION, "/p", 0)
                 .await
                 .expect("no work is not an error")
                 .is_none()
@@ -474,7 +485,7 @@ mod tests {
         let mock = Arc::new(TextChat::new(&valid_output(1, 2)));
         let chat: Arc<dyn Chat> = mock.clone();
         assert!(
-            fire_historian(&db, &config, &chat, SESSION, "/p", 0)
+            fire_historian(&db, &config, &chat, &catalog(), SESSION, "/p", 0)
                 .await
                 .expect("a skipped firing is not an error")
                 .is_none()

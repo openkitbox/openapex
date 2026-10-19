@@ -171,30 +171,50 @@ async fn info_location_project_endpoints_respond() {
     handle.abort();
 }
 
-#[tokio::test]
-async fn model_catalog_serves_provider_and_default() {
-    use ox::config::ModelEntry;
+/// A stub gateway serving one `/v1/models` body: the catalogue now comes from
+/// the gateway, so this is the seam that replaces a configured model list.
+async fn spawn_gateway(body: &'static str) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buffer = [0u8; 4096];
+                let _ = socket.read(&mut buffer).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}")
+}
 
-    let entry = |provider: &str, id: &str, name: &str| ModelEntry {
-        provider: provider.to_owned(),
-        id: id.to_owned(),
-        name: Some(name.to_owned()),
-        context: None,
-        output: None,
-    };
+#[tokio::test]
+async fn model_catalog_comes_from_the_gateway_not_the_config_file() {
+    let gateway = spawn_gateway(
+        r#"{"data":[
+            {"id":"k3-256k","owned_by":"cardinal","context_length":262144},
+            {"id":"glm-5","owned_by":"cardinal","context_length":131072}
+        ]}"#,
+    )
+    .await;
     let (base, handle, _dir) = spawn_server_with(Config {
-        models: vec![
-            entry("cardinal", "k3-256k", "k3-256k"),
-            entry("cardinal", "glm-5", "GLM-5"),
-            entry("openai", "gpt-5", "GPT-5"),
-        ],
+        cardinal_url: gateway,
         default_model: Some("cardinal/glm-5".to_owned()),
         ..Config::default()
     })
     .await;
     let client = reqwest::Client::new();
 
-    // GET /api/model → all configured entries.
+    // GET /api/model → every entry the gateway reports, with its window.
     let models: serde_json::Value = client
         .get(format!("{base}/api/model"))
         .send()
@@ -204,17 +224,28 @@ async fn model_catalog_serves_provider_and_default() {
         .await
         .unwrap();
     let data = models.get("data").unwrap().as_array().unwrap();
-    assert_eq!(data.len(), 3);
+    assert_eq!(data.len(), 2, "{models}");
     // id and modelID are both the BARE model id (upstream Model.Info.default) —
     // a qualified id here would leak into client model selections.
-    assert_eq!(data[0].get("id").unwrap().as_str(), Some("k3-256k"));
-    assert_eq!(data[0].get("modelID").unwrap().as_str(), Some("k3-256k"));
+    assert_eq!(data[0].get("id").unwrap().as_str(), Some("glm-5"));
+    assert_eq!(data[0].get("modelID").unwrap().as_str(), Some("glm-5"));
     assert_eq!(
         data[0].get("providerID").unwrap().as_str(),
         Some("cardinal")
     );
+    // limit.context is what the client's context percentage divides by.
+    assert_eq!(
+        data[0]
+            .get("limit")
+            .unwrap()
+            .get("context")
+            .unwrap()
+            .as_i64(),
+        Some(131072)
+    );
 
-    // GET /api/model/default → the configured default, not the first entry.
+    // GET /api/model/default → the configured default, resolved against the
+    // gateway's list (so its limits come along).
     let default: serde_json::Value = client
         .get(format!("{base}/api/model/default"))
         .send()
@@ -228,8 +259,7 @@ async fn model_catalog_serves_provider_and_default() {
         Some("glm-5")
     );
 
-    // GET /api/provider → providers grouped from the models, in
-    // first-appearance order.
+    // GET /api/provider → providers grouped from the catalogue.
     let providers: serde_json::Value = client
         .get(format!("{base}/api/provider"))
         .send()
@@ -243,7 +273,7 @@ async fn model_catalog_serves_provider_and_default() {
         .iter()
         .map(|p| p.get("id").unwrap().as_str().unwrap())
         .collect();
-    assert_eq!(ids, vec!["cardinal", "openai"]);
+    assert_eq!(ids, vec!["cardinal"]);
     let provider = &data[0];
     assert_eq!(provider.get("name").unwrap().as_str(), Some("Cardinal"));
     assert_eq!(provider.get("activation").unwrap().as_str(), Some("auto"));
@@ -301,6 +331,7 @@ async fn project_list_reads_upstream_project_table() {
         config.cardinal_key.clone(),
     )
     .unwrap();
+    let model_catalog = ox::model_catalog::ModelCatalog::new(&config);
     let runner = ox::runner::Runner::new(
         config.clone(),
         std::env::current_dir().unwrap(),
@@ -308,6 +339,7 @@ async fn project_list_reads_upstream_project_table() {
         bus.clone(),
         std::sync::Arc::new(cardinal),
         std::sync::Arc::new(ox::runner::ToolRegistry::new()),
+        std::sync::Arc::clone(&model_catalog),
     );
     let state = AppState {
         config: config.clone(),
@@ -315,6 +347,7 @@ async fn project_list_reads_upstream_project_table() {
         db,
         directory: std::env::current_dir().unwrap(),
         runner,
+        model_catalog,
     };
     let router = ox::build_router(state);
     let listen: String = config.listen.clone();
@@ -455,6 +488,45 @@ async fn location_get_echoes_requested_directory() {
         .unwrap();
     assert_eq!(body["directory"], "/tmp/somewhere", "{body:?}");
     assert_eq!(body["project"]["canonical"], "/tmp/somewhere");
+    handle.abort();
+}
+
+/// Every catalog envelope must echo the directory the client asked about, not
+/// the server's own startup directory.
+///
+/// The client stores a catalog response under the key derived from the
+/// location **the response reports**, then reads it back under the key derived
+/// from the location **it requested**. If the two differ, the catalog reads
+/// empty — which surfaced in the TUI as "no model in the footer" and "Enter
+/// does nothing" (a submit bails out at `if (!agent) return false`), with no
+/// error anywhere.
+#[tokio::test]
+async fn catalog_envelopes_echo_the_requested_directory() {
+    let (base, handle, _dir) = spawn_server().await;
+    let client = reqwest::Client::new();
+    let requested = "/tmp/ox-elsewhere";
+    for path in [
+        "/api/agent",
+        "/api/model",
+        "/api/model/default",
+        "/api/provider",
+    ] {
+        let body: serde_json::Value = client
+            .get(format!(
+                "{base}{path}?location%5Bdirectory%5D={}",
+                urlencoding_encode(requested)
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            body["location"]["directory"], requested,
+            "{path} must echo the requested directory: {body:?}"
+        );
+    }
     handle.abort();
 }
 

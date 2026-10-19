@@ -29,13 +29,9 @@ fn default_db_path() -> PathBuf {
     ox_home().join("ox.db")
 }
 
-fn default_models() -> Vec<ModelEntry> {
-    Vec::new()
-}
-
-/// A statically configured model. Cardinal integration (Task 5) will replace
-/// this with a live model catalogue fetched from the gateway.
-#[derive(Debug, Clone, Deserialize)]
+/// One model as the client sees it, built from the gateway's model list
+/// ([`crate::model_catalog`]).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ModelEntry {
     /// Provider identifier, e.g. `anthropic`.
     pub provider: String,
@@ -70,14 +66,12 @@ pub struct Config {
     /// Address the HTTP server listens on.
     #[serde(default = "default_listen")]
     pub listen: String,
-    /// Statically configured models exposed by `model.list`.
-    #[serde(default = "default_models")]
-    pub models: Vec<ModelEntry>,
     /// Qualified model reference (`provider/id`, e.g. `cardinal/k3-256k`)
-    /// backing sessions without an explicit selection. Should match one of
-    /// `[[models]]`; an unmatched value is warned about and the first entry
-    /// is used instead. When unset the first `[[models]]` entry is the
-    /// default.
+    /// backing sessions without an explicit selection. The catalogue itself is
+    /// fetched from the gateway (`GET /v1/models`); this pins only which entry
+    /// to use by default, and a name the gateway does not report is sent
+    /// verbatim rather than rejected. When unset the first catalogue entry is
+    /// the default.
     #[serde(default)]
     pub default_model: Option<String>,
     /// Heartbeat interval for the `event.subscribe` SSE stream, in
@@ -104,7 +98,6 @@ impl Default for Config {
             cardinal_key: None,
             db_path: default_db_path(),
             listen: default_listen(),
-            models: default_models(),
             default_model: None,
             event_heartbeat_ms: default_event_heartbeat_ms(),
             magic_context: MctxConfig::default(),
@@ -121,36 +114,6 @@ pub fn ox_home() -> PathBuf {
 }
 
 impl Config {
-    /// The model backing sessions without an explicit selection: the
-    /// `default_model` entry when set and configured, else the first
-    /// `[[models]]` entry. `None` when nothing is configured. A
-    /// `default_model` that matches no entry warns and falls back to the
-    /// first entry.
-    pub fn default_model_entry(&self) -> Option<&ModelEntry> {
-        if let Some(qualified) = &self.default_model {
-            let matched = qualified.split_once('/').and_then(|(provider, id)| {
-                self.models
-                    .iter()
-                    .find(|m| m.provider == provider && m.id == id)
-            });
-            if matched.is_none() {
-                if self.models.is_empty() {
-                    tracing::warn!(
-                        default_model = %qualified,
-                        "default_model matches no [[models]] entry; no models configured"
-                    );
-                } else {
-                    tracing::warn!(
-                        default_model = %qualified,
-                        "default_model matches no [[models]] entry; using the first"
-                    );
-                }
-            }
-            return matched.or_else(|| self.models.first());
-        }
-        self.models.first()
-    }
-
     /// Default config file location: `~/.ox/ox.toml`.
     pub fn default_path() -> PathBuf {
         ox_home().join("ox.toml")
@@ -206,35 +169,7 @@ mod tests {
         assert!(cfg.cardinal_key.is_none());
         assert_eq!(cfg.event_heartbeat_ms, 15_000);
         assert!(cfg.db_path.ends_with("ox.db"));
-        assert!(cfg.models.is_empty());
         assert!(cfg.default_model.is_none());
-    }
-
-    #[test]
-    fn default_model_entry_precedence() {
-        let entry = |provider: &str, id: &str| ModelEntry {
-            provider: provider.to_owned(),
-            id: id.to_owned(),
-            name: None,
-            context: None,
-            output: None,
-        };
-        let mut cfg = Config {
-            models: vec![entry("cardinal", "k3-256k"), entry("cardinal", "glm-5")],
-            ..Config::default()
-        };
-        // Unset → first entry.
-        assert_eq!(cfg.default_model_entry().unwrap().id, "k3-256k");
-        // Set and matching → that entry.
-        cfg.default_model = Some("cardinal/glm-5".to_owned());
-        assert_eq!(cfg.default_model_entry().unwrap().id, "glm-5");
-        // Set but unknown → falls back to the first entry.
-        cfg.default_model = Some("cardinal/nope".to_owned());
-        assert_eq!(cfg.default_model_entry().unwrap().id, "k3-256k");
-        // No models at all → None.
-        cfg.models.clear();
-        cfg.default_model = None;
-        assert!(cfg.default_model_entry().is_none());
     }
 
     #[test]
@@ -244,20 +179,11 @@ cardinal_url = "http://localhost:1234"
 db_path = "/tmp/ox-test.db"
 listen = "0.0.0.0:9999"
 default_model = "anthropic/claude-sonnet-4-5"
-
-[[models]]
-provider = "anthropic"
-id = "claude-sonnet-4-5"
-name = "Claude Sonnet 4.5"
 "#;
         let cfg: Config = toml::from_str(raw).unwrap();
         assert_eq!(cfg.cardinal_url, "http://localhost:1234");
         assert_eq!(cfg.db_path, PathBuf::from("/tmp/ox-test.db"));
         assert_eq!(cfg.listen, "0.0.0.0:9999");
-        assert_eq!(cfg.models.len(), 1);
-        assert_eq!(cfg.models[0].provider, "anthropic");
-        assert_eq!(cfg.models[0].id, "claude-sonnet-4-5");
-        assert_eq!(cfg.models[0].name.as_deref(), Some("Claude Sonnet 4.5"));
         assert_eq!(
             cfg.default_model.as_deref(),
             Some("anthropic/claude-sonnet-4-5")

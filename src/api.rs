@@ -6,6 +6,7 @@
 //! `agent.list` / `model.list` -> `{ location, data }` envelopes.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use salvo::http::StatusCode;
 use salvo::prelude::*;
@@ -32,6 +33,8 @@ pub struct AppState {
     pub directory: PathBuf,
     /// Per-session execution actor registry (task 6).
     pub runner: Runner,
+    /// The model catalogue the client lists (`GET /v1/models` on the gateway).
+    pub model_catalog: Arc<crate::model_catalog::ModelCatalog>,
 }
 
 /// Fetch the injected app state; on failure logs the error and renders a
@@ -115,17 +118,10 @@ async fn location_get(req: &mut Request, depot: &mut Depot, res: &mut Response) 
         return;
     };
     // Upstream `location.get` echoes the REQUESTED directory (deepObject
-    // `location[directory]` query), resolving its project; the client anchors
-    // the session's project on this response.
-    let requested = req
-        .query::<String>("location[directory]")
-        .map(|raw| {
-            std::path::PathBuf::from(&raw)
-                .canonicalize()
-                .unwrap_or(std::path::PathBuf::from(&raw))
-        })
-        .unwrap_or_else(|| state.directory.clone());
-    let directory = requested.to_string_lossy().into_owned();
+    // `location[directory]` query, or the `x-opencode-directory` header),
+    // resolving its project; the client anchors the session's project on this
+    // response.
+    let directory = compat::directory_of(req);
     let (project_id, project_directory) =
         crate::api::session::resolve_project(&state.db, &directory).await;
     res.render(Json(LocationInfo {
@@ -290,14 +286,15 @@ struct ModelLimit {
 }
 
 #[handler] // operation_id: model.list
-async fn model_list(depot: &mut Depot, res: &mut Response) {
+async fn model_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let Some(state) = state(depot, res) else {
         return;
     };
-    let data = state.config.models.iter().map(model_info).collect();
+    let entries = state.model_catalog.entries().await;
+    let data = entries.iter().map(model_info).collect();
     res.render(Json(ModelList {
         location: LocationRef {
-            directory: state.directory.to_string_lossy().into_owned(),
+            directory: compat::directory_of(req),
         },
         data,
     }));
@@ -341,14 +338,17 @@ struct ModelDefault {
 }
 
 #[handler] // operation_id: model.default
-async fn model_default(depot: &mut Depot, res: &mut Response) {
+async fn model_default(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let Some(state) = state(depot, res) else {
         return;
     };
-    let data = state.config.default_model_entry().map(model_info);
+    let data = state
+        .model_catalog
+        .default_entry(&state.config)
+        .map(|entry| model_info(&entry));
     res.render(Json(ModelDefault {
         location: LocationRef {
-            directory: state.directory.to_string_lossy().into_owned(),
+            directory: compat::directory_of(req),
         },
         data,
     }));
@@ -379,12 +379,13 @@ struct ProviderList {
 }
 
 #[handler] // operation_id: provider.list
-async fn provider_list(depot: &mut Depot, res: &mut Response) {
+async fn provider_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let Some(state) = state(depot, res) else {
         return;
     };
+    let entries = state.model_catalog.entries().await;
     let mut data: Vec<ProviderInfo> = Vec::new();
-    for m in &state.config.models {
+    for m in entries.iter() {
         if data.iter().any(|p| p.id == m.provider) {
             continue;
         }
@@ -402,7 +403,7 @@ async fn provider_list(depot: &mut Depot, res: &mut Response) {
     }
     res.render(Json(ProviderList {
         location: LocationRef {
-            directory: state.directory.to_string_lossy().into_owned(),
+            directory: compat::directory_of(req),
         },
         data,
     }));
@@ -439,8 +440,8 @@ struct AgentRequest {
 }
 
 #[handler] // operation_id: agent.list
-async fn agent_list(depot: &mut Depot, res: &mut Response) {
-    let Some(state) = state(depot, res) else {
+async fn agent_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(_state) = state(depot, res) else {
         return;
     };
     let build = AgentInfo {
@@ -457,7 +458,7 @@ async fn agent_list(depot: &mut Depot, res: &mut Response) {
     };
     res.render(Json(AgentList {
         location: LocationRef {
-            directory: state.directory.to_string_lossy().into_owned(),
+            directory: compat::directory_of(req),
         },
         data: vec![build],
     }));

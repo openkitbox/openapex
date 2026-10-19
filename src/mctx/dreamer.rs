@@ -416,6 +416,8 @@ pub struct Dreamer {
     db: Db,
     config: Config,
     chat: Arc<dyn Chat>,
+    /// Default-model resolution for the hidden completion.
+    catalog: Arc<crate::model_catalog::ModelCatalog>,
     /// The `(project, task)` pairs currently running in this process. The
     /// re-entrancy guard: a tick that fires while another is still inside a
     /// task sees the key and leaves it alone. See the module docs for why this
@@ -445,11 +447,17 @@ impl Drop for TaskGuard<'_> {
 impl Dreamer {
     /// A dreamer over `db`, configured by `config.magic_context`, issuing its
     /// hidden completions through `chat`.
-    pub fn new(db: Db, config: Config, chat: Arc<dyn Chat>) -> Self {
+    pub fn new(
+        db: Db,
+        config: Config,
+        chat: Arc<dyn Chat>,
+        catalog: Arc<crate::model_catalog::ModelCatalog>,
+    ) -> Self {
         Self {
             db,
             config,
             chat,
+            catalog,
             in_flight: Mutex::new(HashSet::new()),
         }
     }
@@ -654,7 +662,7 @@ impl Dreamer {
     /// One hidden, tool-free completion through the historian's resolved model
     /// and transport (one route to the model, not two).
     async fn complete(&self, system: &str, user_prompt: &str) -> Result<String, TaskFailure> {
-        let model = historian_model(&self.config).map_err(|error| TaskFailure {
+        let model = historian_model(&self.config, &self.catalog).map_err(|error| TaskFailure {
             class: FailureClass::NoModels,
             message: error.root_cause().to_string(),
         })?;
@@ -1980,18 +1988,25 @@ mod tests {
         config.magic_context.enabled = true;
         config.magic_context.dreamer_enabled = true;
         config.magic_context.dreamer_interval_minutes = INTERVAL_MINUTES;
-        config.models = vec![ModelEntry {
-            provider: "cardinal".to_owned(),
-            id: "k3-256k".to_owned(),
-            name: None,
-            context: None,
-            output: None,
-        }];
+        config.default_model = Some("cardinal/k3-256k".to_owned());
         config
     }
 
+    /// A catalogue with one model, as the gateway would report it.
+    fn catalog() -> Arc<crate::model_catalog::ModelCatalog> {
+        Arc::new(crate::model_catalog::ModelCatalog::from_entries(vec![
+            ModelEntry {
+                provider: "cardinal".to_owned(),
+                id: "k3-256k".to_owned(),
+                name: None,
+                context: None,
+                output: None,
+            },
+        ]))
+    }
+
     fn dreamer(db: &Db, chat: Arc<dyn Chat>) -> Dreamer {
-        Dreamer::new(db.clone(), test_config(), chat)
+        Dreamer::new(db.clone(), test_config(), chat, catalog())
     }
 
     fn entry(report: &TickReport, task: DreamTask) -> Option<&TickStatus> {
@@ -2143,7 +2158,7 @@ mod tests {
         let chat = Arc::new(ScriptedChat::text("<verify></verify>"));
         let mut config = test_config();
         config.magic_context.dreamer_enabled = false;
-        let dreamer = Dreamer::new(db.clone(), config, chat.clone());
+        let dreamer = Dreamer::new(db.clone(), config, chat.clone(), catalog());
 
         let report = dreamer.tick(NOW).await.unwrap();
         assert!(report.entries.is_empty());

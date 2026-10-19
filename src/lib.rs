@@ -10,6 +10,7 @@ pub mod db;
 pub mod event_bus;
 pub mod id;
 pub mod mctx;
+pub mod model_catalog;
 pub mod projector;
 pub mod prompt;
 pub mod runner;
@@ -61,6 +62,7 @@ pub async fn build_state_with(
     let cwd = std::env::current_dir()?;
     let directory = cwd.canonicalize().unwrap_or(cwd);
     let bus = EventBus::new(db.clone());
+    let model_catalog = model_catalog::ModelCatalog::new(&config);
     let runner = Runner::new(
         config.clone(),
         directory.clone(),
@@ -68,6 +70,7 @@ pub async fn build_state_with(
         bus.clone(),
         chat,
         tools,
+        Arc::clone(&model_catalog),
     );
     Ok(AppState {
         config,
@@ -75,6 +78,7 @@ pub async fn build_state_with(
         bus,
         directory,
         runner,
+        model_catalog,
     })
 }
 
@@ -87,6 +91,10 @@ pub fn build_router(state: AppState) -> Router {
 pub async fn run(config: Config) -> Result<()> {
     let listen: String = config.listen.clone();
     let state = build_state(config).await?;
+    // Fetch the model list before serving, so the first client that asks
+    // (`/api/model` at TUI startup) gets models instead of an empty list. A
+    // failure only warns: the request path retries on its own TTL.
+    state.model_catalog.warm().await;
     // Background memory consolidation. Idle unless `[magic_context]` enables
     // it, and deliberately not part of `build_state_with`: tests must not
     // acquire a background loop that writes to their database.
@@ -95,6 +103,7 @@ pub async fn run(config: Config) -> Result<()> {
             state.db.clone(),
             state.config.clone(),
             state.runner.chat(),
+            Arc::clone(&state.model_catalog),
         ))
         .spawn();
     }

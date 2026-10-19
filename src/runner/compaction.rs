@@ -155,9 +155,14 @@ pub(crate) async fn compact(
     reason: CompactionReason,
     input_id: Option<String>,
 ) -> std::result::Result<String, SessionError> {
-    let (_, model) = crate::runner::drain::resolve_selection(&ctx.db, &ctx.session_id, &ctx.config)
-        .await
-        .map_err(|error| unknown_error(error.to_string()))?;
+    let (_, model) = crate::runner::drain::resolve_selection(
+        &ctx.db,
+        &ctx.session_id,
+        &ctx.config,
+        &ctx.model_catalog,
+    )
+    .await
+    .map_err(|error| unknown_error(error.to_string()))?;
 
     ctx.bus
         .publish(SessionEventData::CompactionStarted {

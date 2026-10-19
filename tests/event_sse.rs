@@ -52,6 +52,7 @@ async fn spawn_server(heartbeat_ms: u64) -> TestServer {
         config.cardinal_key.clone(),
     )
     .unwrap();
+    let model_catalog = ox::model_catalog::ModelCatalog::new(&config);
     let runner = ox::runner::Runner::new(
         config.clone(),
         std::env::current_dir().unwrap(),
@@ -59,6 +60,7 @@ async fn spawn_server(heartbeat_ms: u64) -> TestServer {
         bus.clone(),
         std::sync::Arc::new(cardinal),
         std::sync::Arc::new(ox::runner::ToolRegistry::new()),
+        std::sync::Arc::clone(&model_catalog),
     );
     let state = AppState {
         config,
@@ -66,6 +68,7 @@ async fn spawn_server(heartbeat_ms: u64) -> TestServer {
         db,
         directory: std::env::current_dir().unwrap(),
         runner,
+        model_catalog,
     };
     let router = ox::build_router(state);
     let listen = format!("127.0.0.1:{port}");
