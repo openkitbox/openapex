@@ -76,7 +76,9 @@ impl ToolRegistry {
     pub fn register_mctx(&mut self, db: Db) {
         self.register_all(vec![
             Arc::new(crate::mctx::tools::CtxReduceTool::new(db.clone())) as Arc<dyn Tool>,
-            Arc::new(crate::mctx::tools::CtxExpandTool::new(db)),
+            Arc::new(crate::mctx::tools::CtxExpandTool::new(db.clone())),
+            Arc::new(crate::mctx::memory::CtxMemoryTool::new(db.clone())),
+            Arc::new(crate::mctx::memory::CtxNoteTool::new(db)),
         ]);
     }
 }

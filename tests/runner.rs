@@ -22,7 +22,7 @@ use futures_core::Stream;
 use ox::cardinal::CardinalError;
 use ox::cardinal::chat::{BoxChatStream, ChatFuture};
 use ox::cardinal::stream::StreamEvent;
-use ox::cardinal::wire::{ChatRequest, FunctionDef, FunctionType, ToolDef, Usage};
+use ox::cardinal::wire::{ChatMessage, ChatRequest, FunctionDef, FunctionType, ToolDef, Usage};
 use ox::config::Config;
 use ox::runner::{Chat, Tool, ToolContext, ToolOutput, ToolRegistry};
 use salvo::prelude::*;
@@ -427,18 +427,28 @@ impl Drop for Harness {
 impl Harness {
     /// Spawn the server with the given chat scripts and an empty registry.
     async fn spawn(scripts: Vec<Script>) -> Self {
-        Self::spawn_with(scripts, ToolRegistry::new()).await
+        Self::spawn_inner(scripts, ToolRegistry::new(), false).await
     }
 
     /// Spawn the server with the given chat scripts and tool registry.
     async fn spawn_with(scripts: Vec<Script>, tools: ToolRegistry) -> Self {
+        Self::spawn_inner(scripts, tools, false).await
+    }
+
+    /// Spawn with `[magic_context] enabled` (the pinboard tail is rendered).
+    async fn spawn_mctx(scripts: Vec<Script>) -> Self {
+        Self::spawn_inner(scripts, ToolRegistry::new(), true).await
+    }
+
+    async fn spawn_inner(scripts: Vec<Script>, tools: ToolRegistry, magic_context: bool) -> Self {
         let port = free_port();
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = Config {
+        let mut config = Config {
             db_path: dir.path().join("ox.db"),
             listen: format!("127.0.0.1:{port}"),
             ..Config::default()
         };
+        config.magic_context.enabled = magic_context;
         let chat = Arc::new(MockChat::new(scripts));
         let state = ox::build_state_with(config.clone(), chat.clone(), tools)
             .await
@@ -508,6 +518,22 @@ impl Harness {
         let response = self
             .post("/api/session", json!({ "title": "runner test" }))
             .await;
+        assert_eq!(response.status(), 200, "session create");
+        let body: Value = response.json().await.expect("json");
+        body["data"]["id"].as_str().expect("session id").to_owned()
+    }
+
+    /// Create a session bound to `directory` (the per-request project
+    /// directory the client sends), returning its id.
+    async fn create_session_in(&self, directory: &str) -> String {
+        let response = self
+            .client
+            .post(format!("{}/api/session", self.base))
+            .header("x-opencode-directory", directory)
+            .json(&json!({ "title": "pinboard test" }))
+            .send()
+            .await
+            .expect("request");
         assert_eq!(response.status(), 200, "session create");
         let body: Value = response.json().await.expect("json");
         body["data"]["id"].as_str().expect("session id").to_owned()
@@ -2404,4 +2430,103 @@ async fn second_prompt_after_idle_runs_a_fresh_busy_period() {
             .count(),
         2
     );
+}
+
+// ---------------------------------------------------------------------------
+// magic-context pinboard (Task 4): the project-memory tail reaches the
+// provider request's system message when the integration is enabled, and the
+// prompt stays byte-identical to the pre-integration one when it is not.
+// ---------------------------------------------------------------------------
+
+/// Seed one active memory for `project` straight into `mc_memory` (the store
+/// the pinboard render reads).
+async fn seed_memory(db: &ox::db::Db, project: &str) {
+    let project = project.to_owned();
+    db.conn()
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO mc_memory
+                     (id, project, content, category, created_at, updated_at, status)
+                 VALUES ('7', ?1, 'The pinboard fact', 'ARCHITECTURE', 0, 0, 'active')",
+                [&project],
+            )
+        })
+        .await
+        .expect("seed memory");
+}
+
+/// The system message of the first recorded request.
+fn recorded_system(harness: &Harness) -> String {
+    harness
+        .chat
+        .requests()
+        .iter()
+        .find_map(|request| match request.messages.first() {
+            Some(ChatMessage::System { content }) => Some(content.clone()),
+            _ => None,
+        })
+        .expect("a system message")
+}
+
+/// Drive one text turn in `directory` and return the system message the
+/// model saw.
+async fn system_for_a_turn(harness: &Harness, directory: &str) -> String {
+    let session_id = harness.create_session_in(directory).await;
+    let response = harness
+        .client
+        .post(format!("{}/api/session/{session_id}/prompt", harness.base))
+        .header("x-opencode-directory", directory)
+        .json(&json!({ "text": "Say hello", "delivery": "queue" }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), 200, "prompt accepted");
+    harness
+        .wait_for(&session_id, "assistant completion", |messages| {
+            messages
+                .iter()
+                .any(|m| m["type"] == "assistant" && m["time"]["completed"].is_number())
+        })
+        .await;
+    recorded_system(harness)
+}
+
+#[tokio::test]
+async fn memory_pinboard_reaches_the_system_prompt_when_enabled() {
+    let harness = Harness::spawn_mctx(vec![MockChat::text("ok")]).await;
+    // The session works in this directory (canonical: the server canonicalizes
+    // the request directory before binding the session to it).
+    let project = harness
+        ._dir
+        .path()
+        .canonicalize()
+        .expect("canonical tempdir")
+        .display()
+        .to_string();
+    seed_memory(&harness.db, &project).await;
+
+    let system = system_for_a_turn(&harness, &project).await;
+    assert!(system.contains("<project-memory>"), "got: {system}");
+    assert!(
+        system.contains("<ARCHITECTURE>\n#7: The pinboard fact"),
+        "got: {system}"
+    );
+    assert!(system.ends_with("</project-memory>"), "the tail is last");
+}
+
+#[tokio::test]
+async fn memory_pinboard_is_absent_when_disabled() {
+    let harness = Harness::spawn(vec![MockChat::text("ok")]).await;
+    let project = harness
+        ._dir
+        .path()
+        .canonicalize()
+        .expect("canonical tempdir")
+        .display()
+        .to_string();
+    seed_memory(&harness.db, &project).await;
+
+    let system = system_for_a_turn(&harness, &project).await;
+    assert!(!system.contains("<project-memory>"), "got: {system}");
+    assert!(!system.contains("The pinboard fact"), "got: {system}");
 }

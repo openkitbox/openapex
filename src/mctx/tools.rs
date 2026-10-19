@@ -797,21 +797,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn register_mctx_adds_exactly_the_two_ctx_tools() {
+    async fn register_mctx_adds_exactly_the_four_ctx_tools() {
         let mut registry = crate::runner::ToolRegistry::with_builtins();
         // Not registered by with_builtins: a default-off config must keep
         // the advertised toolset byte-identical.
         assert!(registry.get("ctx_reduce").is_none());
         assert!(registry.get("ctx_expand").is_none());
+        assert!(registry.get("ctx_memory").is_none());
+        assert!(registry.get("ctx_note").is_none());
         registry.register_mctx(db().await);
         assert!(registry.get("ctx_reduce").is_some());
         assert!(registry.get("ctx_expand").is_some());
+        assert!(registry.get("ctx_memory").is_some());
+        assert!(registry.get("ctx_note").is_some());
         let names: Vec<String> = registry
             .definitions()
             .iter()
             .map(|def| def.function.name.clone())
             .collect();
-        assert_eq!(names.len(), 10, "8 builtins + 2 ctx tools: {names:?}");
+        assert_eq!(names.len(), 12, "8 builtins + 4 ctx tools: {names:?}");
         for definition in registry.definitions() {
             assert!(!definition.function.description.is_empty());
         }

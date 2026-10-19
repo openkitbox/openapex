@@ -198,10 +198,27 @@ CREATE TABLE IF NOT EXISTS mc_drop (
 CREATE INDEX IF NOT EXISTS mc_tag_session_message_idx ON mc_tag (session_id, message_id);
 "#;
 
+/// magic-context memory lifecycle columns (Task 4). `mc_memory` gains the
+/// archive lifecycle the reference has: archived rows stay `get`-able and
+/// their `archive_reason` is kept (`"merged"` marks merge losers). Purely
+/// additive (`ALTER TABLE ADD COLUMN`), so it applies onto any V3-stamped
+/// database; fresh databases get the columns via V2 + this migration in
+/// sequence — V2 itself stays byte-identical because it is already stamped
+/// into existing databases.
+const MIGRATION_V4: &str = r#"
+ALTER TABLE mc_memory ADD COLUMN status text NOT NULL DEFAULT 'active';
+ALTER TABLE mc_memory ADD COLUMN archive_reason text;
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
-const MIGRATIONS: &[(u32, &str)] = &[(1, MIGRATION_V1), (2, MIGRATION_V2), (3, MIGRATION_V3)];
+const MIGRATIONS: &[(u32, &str)] = &[
+    (1, MIGRATION_V1),
+    (2, MIGRATION_V2),
+    (3, MIGRATION_V3),
+    (4, MIGRATION_V4),
+];
 
 /// All indexes the migration creates: V1's verbatim from upstream
 /// (`packages/core/src/database/schema.gen.ts`), plus ox-owned `mc_*` indexes
@@ -365,11 +382,11 @@ mod tests {
     #[tokio::test]
     async fn migration_tracks_user_version_and_is_idempotent() {
         let db = Db::open_in_memory().await.unwrap();
-        assert_eq!(db.user_version().await, 3);
+        assert_eq!(db.user_version().await, 4);
         // Re-running must be a no-op: version stays, no error.
         db.migrate().await.unwrap();
         db.migrate().await.unwrap();
-        assert_eq!(db.user_version().await, 3);
+        assert_eq!(db.user_version().await, 4);
     }
 
     #[tokio::test]
@@ -416,7 +433,7 @@ mod tests {
             conn.pragma_update(None, "user_version", 1).unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await, 3);
+        assert_eq!(db.user_version().await, 4);
         for table in [
             "mc_frozen_state",
             "mc_compartments",
@@ -443,7 +460,7 @@ mod tests {
             conn.pragma_update(None, "user_version", 2).unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await, 3);
+        assert_eq!(db.user_version().await, 4);
         for table in ["mc_tag", "mc_drop"] {
             assert!(
                 db.table_exists(table).await.unwrap(),
@@ -477,6 +494,64 @@ mod tests {
                     |row| row.get(0),
                 )?;
                 assert_eq!(state, "queued", "state column defaults to 'queued'");
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_v4_upgrades_an_existing_v3_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade4.db");
+        // Build a v3 database by hand: apply V1..V3 and stamp version 3.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(MIGRATION_V2).unwrap();
+            conn.execute_batch(MIGRATION_V3).unwrap();
+            conn.pragma_update(None, "user_version", 3).unwrap();
+            // A pre-V4 row: no lifecycle columns yet.
+            conn.execute(
+                "INSERT INTO mc_memory (id, project, content, category, created_at, updated_at)
+                 VALUES ('mem_old', '/p', 'pre-existing fact', 'ARCHITECTURE', 1, 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).await.unwrap();
+        assert_eq!(db.user_version().await, 4);
+        // The pre-existing row reads back with the 'active' default and no
+        // archive reason — the additive columns converge both DB histories.
+        let (status, reason): (String, Option<String>) = db
+            .conn()
+            .call(|c| {
+                c.query_row(
+                    "SELECT status, archive_reason FROM mc_memory WHERE id = 'mem_old'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(status, "active");
+        assert_eq!(reason, None);
+        // Explicit archived rows round-trip both new columns.
+        db.conn()
+            .call(|c| -> rusqlite::Result<()> {
+                c.execute(
+                    "INSERT INTO mc_memory (id, project, content, category, created_at,
+                        updated_at, status, archive_reason)
+                     VALUES ('mem_a', '/p', 'gone', 'NAMING', 2, 2, 'archived', 'merged')",
+                    [],
+                )?;
+                let (status, reason): (String, Option<String>) = c.query_row(
+                    "SELECT status, archive_reason FROM mc_memory WHERE id = 'mem_a'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                assert_eq!(status, "archived");
+                assert_eq!(reason.as_deref(), Some("merged"));
                 Ok(())
             })
             .await

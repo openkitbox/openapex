@@ -196,7 +196,7 @@ pub(crate) async fn run(
         // on retry and continuation): a continuation attempt must observe
         // the settled partial row plus the continuation prompt.
         let rows = load_history(&ctx.db, &ctx.session_id).await?;
-        let system = prompt::build(&ctx.directory);
+        let system = prompt::build(&ctx.directory, &mctx_tail(ctx).await);
         let mut request = ChatRequest::new(
             // cardinal routes on the bare model id; the providerID/modelID
             // qualified form is upstream's provider-adapter vocabulary and
@@ -1162,6 +1162,28 @@ fn to_session_error(error: &CardinalError) -> SessionError {
 // ---------------------------------------------------------------------------
 // Context assembly (one named mapping; the e2e suite trusts this function)
 // ---------------------------------------------------------------------------
+
+/// The magic-context prompt tail for one step: the project-memory pinboard
+/// when `[magic_context]` is enabled, else an empty string (the prompt then
+/// stays byte-identical to the integration-off one). A failed render warns
+/// and degrades to empty — a broken pinboard must never fail the turn.
+async fn mctx_tail(ctx: &DrainCtx) -> String {
+    if !ctx.config.magic_context.enabled {
+        return String::new();
+    }
+    let project = ctx.directory.to_string_lossy();
+    match crate::mctx::render::render_memory_pinboard(&ctx.db, &project).await {
+        Ok(tail) => tail,
+        Err(error) => {
+            tracing::warn!(
+                session = %ctx.session_id,
+                error = %error,
+                "pinboard render failed; continuing without the memory tail"
+            );
+            String::new()
+        }
+    }
+}
 
 /// Build the OpenAI message list: the system prompt, then the session
 /// transcript in `seq` order.
