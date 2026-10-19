@@ -47,7 +47,7 @@ use crate::mctx::cache::{HeadRenderer, McCache, PassOutcome, RenderedPass, Signa
 use crate::mctx::compartments::{self, Compartment};
 use crate::mctx::memory::{MemoryRow, active_memories};
 use crate::mctx::render::{
-    DEFAULT_HISTORY_BUDGET_TOKENS, M1_PLACEHOLDER, assemble_m1, render_m0, render_new_compartments,
+    DEFAULT_HISTORY_BUDGET_TOKENS, assemble_m1, render_m0, render_new_compartments,
 };
 use crate::mctx::tagger::{mark_drops_applied, peek_queued_drops};
 
@@ -113,9 +113,8 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
     // baseline stays put. It is ox-owned state (the kernel's anchor is the
     // coverage token), so it lives in the session's kv row.
     let m0_coverage = materialized_m0_coverage(db, session_id).await?;
-    let rebuild_m0 = state.is_none()
-        || forced
-        || baseline_changed(state.as_ref(), &compartments, &memories, m0_coverage);
+    let rebuild_m0 =
+        state.is_none() || forced || baseline_changed(state.as_ref(), &compartments, m0_coverage);
     let m0_coverage_after = if rebuild_m0 { coverage } else { m0_coverage };
 
     let plan = plan_units(PlanInputs {
@@ -296,15 +295,13 @@ fn plan_units(inputs: PlanInputs<'_>) -> Plan {
 
     let m0 = render_m0(&crate::mctx::render::M0Inputs {
         compartments: &m0_compartments,
-        memories: inputs.memories,
         history_budget_tokens: DEFAULT_HISTORY_BUDGET_TOKENS,
     });
     let new_compartments = render_new_compartments(&delta_refs);
-    let m1_body = if new_compartments.is_empty() {
-        M1_PLACEHOLDER.to_string()
-    } else {
-        assemble_m1(&new_compartments)
-    };
+    // The pinboard rides the volatile half: a memory write must not rebuild the
+    // provider's cache anchor.
+    let memories = crate::mctx::render::render_memory_block(inputs.memories);
+    let m1_body = assemble_m1(&memories, &new_compartments);
     Plan {
         m0,
         // The unit payload carries the blank line that separates it from m[0]:
@@ -321,7 +318,6 @@ fn plan_units(inputs: PlanInputs<'_>) -> Plan {
 fn baseline_changed(
     state: Option<&CoreState>,
     compartments: &[Compartment],
-    memories: &[MemoryRow],
     m0_coverage: i64,
 ) -> bool {
     let Some(state) = state else {
@@ -329,7 +325,9 @@ fn baseline_changed(
     };
     let plan = plan_units(PlanInputs {
         compartments,
-        memories,
+        // Memories are not an m[0] input any more (they ride m[1]), so the
+        // baseline diff cannot see a memory write.
+        memories: &[],
         m0_coverage,
         // Only m[0] is compared here; the anchor is irrelevant to the diff.
         coverage: m0_coverage,
@@ -466,9 +464,15 @@ async fn write_kv_int(db: &Db, key: &str, value: i64, what: &str) -> Result<()> 
 /// line that separated the halves when they were concatenated is consumed at
 /// the seam (the halves travel as their own messages now).
 fn split_prefix(prefix: &str) -> (&str, &str) {
-    const M1_OPEN: &str = "<session-history-since>";
-    match prefix.find(M1_OPEN) {
-        Some(index) => (prefix[..index].trim_end_matches('\n'), &prefix[index..]),
+    // m[1] opens with the pinboard when there are memories and with the
+    // since-marker otherwise; the separator (a blank line) belongs to neither.
+    const M1_OPENERS: [&str; 2] = ["\n\n<project-memory>", "\n\n<session-history-since>"];
+    let start = M1_OPENERS
+        .iter()
+        .filter_map(|opener| prefix.find(opener))
+        .min();
+    match start {
+        Some(index) => (prefix[..index].trim_end_matches('\n'), &prefix[index + 2..]),
         None => (prefix.trim_end(), ""),
     }
 }
@@ -496,6 +500,7 @@ mod tests {
     use super::*;
     use crate::mctx::compartments::{NewCompartment, Tiers, insert};
     use crate::mctx::memory::write_memory;
+    use crate::mctx::render::M1_PLACEHOLDER;
     use crate::mctx::tagger::{QueueOutcome, Tagger, queue_drop_outcome};
     use serde_json::json;
 
@@ -546,7 +551,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_pass_materializes_everything_into_m0() {
+    async fn first_pass_materializes_the_baseline_and_the_pinboard() {
         let db = db().await;
         add_compartment(&db, "mc_1", 1, 9, "Alpha").await;
         write_memory(&db, PROJECT, "spine", "ARCHITECTURE")
@@ -563,12 +568,20 @@ mod tests {
             m0.contains("## 1-9 · Alpha\nAlpha full"),
             "compartment: {m0}"
         );
-        assert!(m0.contains("<project-memory>"), "pinboard: {m0}");
+        assert!(
+            !m0.contains("<project-memory>"),
+            "the pinboard is not part of the cache anchor: {m0}"
+        );
         assert!(
             !m0.contains("<session-history-since>"),
             "m0 is baseline only"
         );
-        assert_eq!(m1, M1_PLACEHOLDER, "m1 is the placeholder");
+        assert!(m1.starts_with("<project-memory>"), "pinboard first: {m1}");
+        assert!(m1.contains("#1: spine"), "pinboard body: {m1}");
+        assert!(
+            m1.ends_with(M1_PLACEHOLDER),
+            "the delta keeps its anchoring marker: {m1}"
+        );
     }
 
     #[tokio::test]
@@ -623,26 +636,45 @@ mod tests {
         assert_eq!(materialized_m0_coverage(&db, SESSION).await.unwrap(), 9);
     }
 
+    /// A memory write must NOT rebuild the baseline: the pinboard rides the
+    /// delta, so the provider's cached anchor survives (a `Soft` bust, not a
+    /// `Hard` one). The observable is that m[0] stays byte-identical while m[1]
+    /// gains the pinboard.
     #[tokio::test]
-    async fn a_memory_write_rebuilds_the_baseline() {
+    async fn a_memory_write_rides_the_delta_without_moving_the_baseline() {
         let db = db().await;
         add_compartment(&db, "mc_1", 1, 9, "Alpha").await;
         let first = run(request(&db, 9)).await.unwrap();
-        assert!(!first.head_m0.unwrap().contains("<project-memory>"));
+        assert!(!first.head_m1.unwrap().contains("<project-memory>"));
 
         write_memory(&db, PROJECT, "new fact", "NAMING")
             .await
             .unwrap();
         let second = run(request(&db, 9)).await.unwrap();
         assert!(matches!(second.outcome, PassOutcome::BustApplied { .. }));
-        assert!(
-            second.head_m0.unwrap().contains("#1: new fact"),
-            "memory lands in m0"
-        );
         assert_eq!(
-            second.head_m1.unwrap(),
-            M1_PLACEHOLDER,
-            "the delta resets on a Hard"
+            second.head_m0, first.head_m0,
+            "the cache anchor must not move on a memory write"
+        );
+        let delta = second.head_m1.expect("m1 carries the pinboard");
+        assert!(
+            delta.contains("#1: new fact"),
+            "memory lands in m1: {delta}"
+        );
+        assert!(delta.contains("<project-memory>"), "wrapped: {delta}");
+
+        // A second memory write keeps the baseline frozen too.
+        write_memory(&db, PROJECT, "another fact", "CONFIG_VALUES")
+            .await
+            .unwrap();
+        let third = run(request(&db, 9)).await.unwrap();
+        assert_eq!(
+            third.head_m0, first.head_m0,
+            "still the same anchor after a second write"
+        );
+        assert!(
+            third.head_m1.unwrap().contains("another fact"),
+            "the delta tracks the pinboard"
         );
     }
 

@@ -3,10 +3,17 @@
 //! The request head is two blocks the model sees before the live transcript:
 //!
 //! - **m[0]** — the frozen baseline: `<session-history>` (the decay-rendered
-//!   compartment set) followed by `<project-memory>` (the pinboard).
-//! - **m[1]** — the volatile delta: `<new-compartments>` for compartments
-//!   folded in since the baseline froze, or the placeholder when nothing is
-//!   new.
+//!   compartment set).
+//! - **m[1]** — the volatile half: the `<project-memory>` pinboard, then
+//!   `<new-compartments>` for compartments folded in since the baseline froze,
+//!   then the placeholder when nothing else is new.
+//!
+//! The pinboard lives in m[1], not m[0], and that placement is a cache
+//! decision: m[0] is the provider's cache anchor, so anything that changes with
+//! a memory write must not be part of it. A memory write is a `Soft` bust
+//! (the delta changes, the baseline does not), which keeps the cached prefix
+//! intact; putting the pinboard in m[0] made every write a `Hard` rebuild for
+//! every session of the project — including the dreamer's background writes.
 //!
 //! Faithful port of the reference `mc-module/src/memory_render.rs` composition
 //! (`render_m0` / `assemble_m1` / `render_memory_block` /
@@ -26,12 +33,12 @@
 //!   memory tier and covered system-role messages; ox has no source for them
 //!   yet (they land with the historian/system-message work if needed), so the
 //!   m0 section list here is `<session-history>` + `<project-memory>`.
-//! - **No m[1] `<memory-updates>` corrections block.** The reference emits a
-//!   mutation delta so the model trusts fresh memory writes over a still-frozen
-//!   baseline. ox re-renders m[0] on any memory change instead (memories change
-//!   on an explicit tool call, not per turn), so m[1] carries only
-//!   `<new-compartments>`. That keeps a single authoritative memory rendering
-//!   rather than two layers that can disagree.
+//! - **No m[1] `<memory-updates>` corrections block.** The reference freezes the
+//!   pinboard inside m[0] and patches it with per-entry mutations in m[1]. ox
+//!   instead renders the pinboard once, in m[1], so there is a single
+//!   authoritative rendering and no stale-frozen-vs-delta disagreement to
+//!   reconcile. The cost of that simplification is paid only when a memory
+//!   changes: the delta's bytes shift from the pinboard onwards, one turn.
 //! - **No workspace memory union** (the reference's `source_name_by_id` /
 //!   `WorkspaceMembership`): ox memories are scoped to one project directory.
 //! - **The token estimator is [`crate::mctx::decay_render::estimate_tokens`]**
@@ -174,13 +181,20 @@ pub(crate) fn render_new_compartments(compartments: &[&DecayRenderCompartment]) 
     )
 }
 
-/// Assemble the m1 delta body: the `<new-compartments>` block, or
-/// [`M1_PLACEHOLDER`] when there is nothing new.
-pub(crate) fn assemble_m1(new_compartments: &str) -> String {
-    if new_compartments.is_empty() {
-        return M1_PLACEHOLDER.to_string();
+/// Assemble the m1 body: the pinboard, then the `<new-compartments>` delta.
+///
+/// The placeholder is always present last, even when both blocks are empty:
+/// the m1 half must never vanish, or every byte after it shifts.
+pub(crate) fn assemble_m1(memories: &str, new_compartments: &str) -> String {
+    let delta = if new_compartments.is_empty() {
+        M1_PLACEHOLDER.to_string()
+    } else {
+        format!("<session-history-since>\n{new_compartments}\n</session-history-since>")
+    };
+    if memories.is_empty() {
+        return delta;
     }
-    format!("<session-history-since>\n{new_compartments}\n</session-history-since>")
+    format!("{memories}\n{delta}")
 }
 
 /// Inputs to [`render_m0`], after the caller has loaded the rows it means to
@@ -188,32 +202,23 @@ pub(crate) fn assemble_m1(new_compartments: &str) -> String {
 pub(crate) struct M0Inputs<'a> {
     /// The compartment history, chronological (oldest first).
     pub compartments: &'a [DecayRenderCompartment],
-    /// The selected project memories for the `<project-memory>` block.
-    pub memories: &'a [MemoryRow],
     /// The history budget in tokens, before pressure.
     pub history_budget_tokens: f64,
 }
 
-/// Compose the m0 baseline: `<session-history>` followed by `<project-memory>`,
-/// joined by a blank line. The history section is always present (empty history
-/// uses [`M0_EMPTY_BODY`]).
+/// Compose the m0 baseline: `<session-history>` alone. The history section is
+/// always present (empty history uses [`M0_EMPTY_BODY`]) because it is the
+/// provider cache's anchor.
 pub(crate) fn render_m0(inputs: &M0Inputs<'_>) -> String {
     let history = render_decayed_compartments(
         inputs.compartments,
         inputs.history_budget_tokens,
         estimate_tokens,
     );
-    let mut sections: Vec<String> = Vec::with_capacity(2);
-    sections.push(if history.is_empty() {
-        M0_EMPTY_BODY.to_string()
-    } else {
-        format!("<session-history>\n{history}\n</session-history>")
-    });
-    let memories = render_memory_block(inputs.memories);
-    if !memories.is_empty() {
-        sections.push(memories);
+    if history.is_empty() {
+        return M0_EMPTY_BODY.to_string();
     }
-    sections.join("\n\n").trim().to_string()
+    format!("<session-history>\n{history}\n</session-history>")
 }
 
 #[cfg(test)]
@@ -301,10 +306,8 @@ mod tests {
 
     #[tokio::test]
     async fn m0_always_carries_the_history_block() {
-        let empty: Vec<MemoryRow> = Vec::new();
         let rendered = render_m0(&M0Inputs {
             compartments: &[],
-            memories: &empty,
             history_budget_tokens: 0.0,
         });
         assert_eq!(rendered, M0_EMPTY_BODY);
@@ -323,14 +326,16 @@ mod tests {
         let comps = vec![comp(1, 9, "T", "HIST")];
         let m0 = render_m0(&M0Inputs {
             compartments: &comps,
-            memories: &memories,
             history_budget_tokens: 60_000.0,
         });
-        let history = m0.find("<session-history>").unwrap();
-        let memory = m0.find("<project-memory>").unwrap();
-        assert!(history < memory, "history before memories: {m0}");
+        assert!(m0.starts_with("<session-history>"), "{m0}");
         assert!(m0.contains("## 1-9 · T\nHIST"), "history rendered: {m0}");
-        assert!(m0.contains("#1: spine"), "memory rendered: {m0}");
+        // The pinboard must NOT be part of the cache anchor.
+        assert!(!m0.contains("<project-memory>"), "{m0}");
+
+        let m1 = assemble_m1(&render_memory_block(&memories), "");
+        assert!(m1.starts_with("<project-memory>"), "{m1}");
+        assert!(m1.contains("#1: spine"), "memory rendered: {m1}");
     }
 
     #[test]
@@ -349,21 +354,24 @@ mod tests {
             M1_PLACEHOLDER,
             "<session-history-since>(no new content since last materialization)</session-history-since>"
         );
-        assert_eq!(assemble_m1(""), M1_PLACEHOLDER);
+        assert_eq!(assemble_m1("", ""), M1_PLACEHOLDER);
         assert_eq!(
-            assemble_m1("<new-compartments>\nX\n</new-compartments>"),
+            assemble_m1("", "<new-compartments>\nX\n</new-compartments>"),
             "<session-history-since>\n<new-compartments>\nX\n</new-compartments>\n</session-history-since>"
+        );
+        // A pinboard with nothing new keeps the anchoring placeholder after it.
+        assert_eq!(
+            assemble_m1("<project-memory>\n#1: x\n</project-memory>", ""),
+            format!("<project-memory>\n#1: x\n</project-memory>\n{M1_PLACEHOLDER}")
         );
     }
 
     #[test]
     fn composition_is_deterministic() {
-        let memories = vec![mem("2", "NAMING", "n"), mem("1", "ARCHITECTURE", "a")];
         let comps = vec![comp(1, 4, "A", "a"), comp(5, 9, "B", "b")];
         let render = || {
             render_m0(&M0Inputs {
                 compartments: &comps,
-                memories: &memories,
                 history_budget_tokens: 500.0,
             })
         };

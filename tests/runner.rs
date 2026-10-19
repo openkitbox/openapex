@@ -2478,6 +2478,24 @@ fn recorded_head(harness: &Harness) -> Option<String> {
     })
 }
 
+/// The two magic-context head halves from the first recorded request,
+/// `(m[0], m[1])`.
+fn recorded_halves(harness: &Harness) -> Option<(String, String)> {
+    harness.chat.requests().iter().find_map(|request| {
+        let mut messages = request.messages.iter();
+        assert!(matches!(messages.next(), Some(ChatMessage::System { .. })));
+        let m0 = match messages.next() {
+            Some(ChatMessage::User { content }) => content.clone(),
+            _ => return None,
+        };
+        let m1 = match messages.next() {
+            Some(ChatMessage::User { content }) => content.clone(),
+            _ => return None,
+        };
+        Some((m0, m1))
+    })
+}
+
 /// Drive one text turn in `directory` and return the messages the model saw.
 async fn messages_for_a_turn(harness: &Harness, directory: &str) {
     let session_id = harness.create_session_in(directory).await;
@@ -2514,16 +2532,18 @@ async fn memory_pinboard_reaches_the_system_prompt_when_enabled() {
     seed_memory(&harness.db, &project).await;
 
     messages_for_a_turn(&harness, &project).await;
-    let head = recorded_head(&harness).expect("a magic-context head");
-    assert!(head.contains("<project-memory>"), "got: {head}");
+    let (m0, m1) = recorded_halves(&harness).expect("a magic-context head");
+    // The pinboard rides the volatile half: putting it in m[0] would make every
+    // memory write a cache-anchor rebuild for every session of the project.
     assert!(
-        head.contains("<ARCHITECTURE>\n#7: The pinboard fact"),
-        "got: {head}"
+        !m0.contains("<project-memory>"),
+        "the pinboard is not part of the anchor: {m0}"
     );
     assert!(
-        head.contains("</project-memory>"),
-        "the pinboard closes m[0]"
+        m1.contains("<ARCHITECTURE>\n#7: The pinboard fact"),
+        "got: {m1}"
     );
+    assert!(m1.contains("</project-memory>"), "the pinboard closes m[1]");
     // The head is not the system prompt: the system prompt stays
     // integration-independent.
     assert!(!recorded_system(&harness).contains("<project-memory>"));
