@@ -55,11 +55,6 @@ pub struct Signals {
     /// coverage boundary `id` is still present in the live message array,
     /// `None` when it is absent (e.g. a revert removed it).
     pub boundary_present: Option<String>,
-    /// A boundary loss observed on a prior defer pass (the harness mirrors
-    /// the previous `StepResult::reconcile_pending` here). The durable flag
-    /// on the loaded state is authoritative — it survives restarts; this
-    /// signal mirrors what the harness just observed in-process.
-    pub reconcile_pending: bool,
     /// Explicit refresh/compaction request (wired by later tasks).
     pub forced: bool,
     /// A run/episode boundary was crossed (lineage units reproduce
@@ -90,7 +85,7 @@ const BOUNDARY_ABSENT: &str = "\u{0}absent";
 /// | # | condition                                             | action     | rationale |
 /// |---|-------------------------------------------------------|------------|-----------|
 /// | 1 | no durable state (first-ever pass)                    | **Hard**   | mint the baseline |
-/// | 2 | boundary loss pending — the `signals.reconcile_pending` mirror OR the durable `state.reconcile_pending` flag | **Hard** | rematerialize against the live array |
+/// | 2 | boundary loss pending — the durable `state.reconcile_pending` flag | **Hard** | rematerialize against the live array |
 /// | 3 | `signals.forced` (explicit refresh/compaction)        | **Hard**   | the request demands a bust |
 /// | 4 | `signals.head_changed` (the m0 bytes differ)          | **Hard**   | a baseline input changed (memory write, budget) |
 /// | 5 | `signals.delta_changed` (only the m1 bytes differ)    | **Soft**   | new coverage rides the delta; the baseline stands |
@@ -104,9 +99,9 @@ pub fn classify(state: Option<&CoreState>, signals: &Signals) -> Action {
     let Some(state) = state else {
         return Action::Hard;
     };
-    // 2. A boundary was lost on a prior defer (signal mirror or the durable
-    //    flag): the next pass must rematerialize against the live array.
-    if signals.reconcile_pending || state.reconcile_pending {
+    // 2. A boundary was lost on a prior defer: the next pass must
+    //    rematerialize against the live array.
+    if state.reconcile_pending {
         return Action::Hard;
     }
     // 3. Explicit forced request.
@@ -559,10 +554,6 @@ mod tests {
             forced: true,
             ..present.clone()
         };
-        let lost_signal = Signals {
-            reconcile_pending: true,
-            ..present.clone()
-        };
         let none = Signals::default();
 
         // Row 1: first-ever pass is Hard, regardless of other signals.
@@ -572,16 +563,24 @@ mod tests {
         assert_eq!(classify(Some(&clean), &present), Action::SoftPlus);
         // Row 3: an explicit forced request busts.
         assert_eq!(classify(Some(&clean), &forced), Action::Hard);
-        // Row 2a: a boundary loss mirrored in the signal busts.
-        assert_eq!(classify(Some(&clean), &lost_signal), Action::Hard);
-        // Row 2b: so does the durable flag (e.g. across a restart).
+        // Row 2: a pending boundary loss busts (the durable flag survives a
+        // restart, which is why it — not a signal — is authoritative).
         assert_eq!(classify(Some(&lost), &present), Action::Hard);
-        // The MVP classifier never produces Soft.
-        for state in [None, Some(&clean), Some(&lost)] {
-            for signals in [&none, &present, &forced, &lost_signal] {
-                assert_ne!(classify(state, signals), Action::Soft);
-            }
-        }
+        // Row 5: only a delta change (not a baseline change) is a Soft.
+        let delta = Signals {
+            delta_changed: true,
+            ..present.clone()
+        };
+        assert_eq!(classify(Some(&clean), &delta), Action::Soft);
+        // A baseline change outranks it.
+        let head = Signals {
+            head_changed: true,
+            delta_changed: true,
+            ..present.clone()
+        };
+        assert_eq!(classify(Some(&clean), &head), Action::Hard);
+        // Row 6: nothing changed defers.
+        assert_eq!(classify(Some(&clean), &present), Action::SoftPlus);
     }
 
     #[tokio::test]

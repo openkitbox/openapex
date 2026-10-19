@@ -120,12 +120,12 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
         compartments: &compartments,
         memories: &memories,
         m0_coverage: m0_coverage_after,
+        coverage,
     });
 
     let (frozen_m0, frozen_m1) = frozen_halves(state.as_ref());
     let signals = Signals {
         boundary_present: boundary_present(state.as_ref(), coverage, last_seq),
-        reconcile_pending: false,
         forced,
         run_started,
         head_changed: state.is_none() || forced || plan.m0 != frozen_m0,
@@ -145,12 +145,20 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
     };
 
     let outcome = run_pass(&cache, &renderer, &signals).await?;
-    let (prefix, floor) = match &outcome {
+    // The prefix is taken by value (it can be hundreds of KB; the outcome
+    // rebuilt below carries no bytes).
+    let (prefix, floor, outcome) = match outcome {
         PassOutcome::DeferReplayed { prefix } => {
             // A defer replays the frozen bytes: the floor must be the one the
             // frozen head was materialized with, not this pass's coverage.
             let floor = materialized_floor(db, session_id).await?;
-            (prefix.clone(), floor)
+            (
+                prefix,
+                floor,
+                PassOutcome::DeferReplayed {
+                    prefix: String::new(),
+                },
+            )
         }
         PassOutcome::BustApplied { prefix } => {
             // The bust froze these bytes, so the queued drops they carry are
@@ -161,7 +169,13 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
             }
             save_materialized_floor(db, session_id, coverage).await?;
             save_materialized_m0_coverage(db, session_id, m0_coverage_after).await?;
-            (prefix.clone(), coverage)
+            (
+                prefix,
+                coverage,
+                PassOutcome::BustApplied {
+                    prefix: String::new(),
+                },
+            )
         }
         PassOutcome::ModulePanicked => {
             // LKG: serve the last bytes the pass actually produced, with the
@@ -181,7 +195,7 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
                 floor,
                 "mctx pass panicked; serving last-known-good head"
             );
-            (lkg.unwrap_or_default(), floor)
+            (lkg.unwrap_or_default(), floor, PassOutcome::ModulePanicked)
         }
     };
 
@@ -246,7 +260,13 @@ impl Plan {
 struct PlanInputs<'a> {
     compartments: &'a [Compartment],
     memories: &'a [MemoryRow],
+    /// The ordinal the baseline half covers.
     m0_coverage: i64,
+    /// The ordinal the whole head covers (the floor). The kernel's boundary
+    /// anchor is minted from THIS, not from the baseline's own coverage: a
+    /// delta extends coverage past the baseline, and a revert of those rows
+    /// must invalidate the head.
+    coverage: i64,
 }
 
 /// Render the two head halves: m[0] over the compartments m[0] covers,
@@ -282,7 +302,7 @@ fn plan_units(inputs: PlanInputs<'_>) -> Plan {
         // The unit payload carries the blank line that separates it from m[0]:
         // the kernel concatenates frozen payloads verbatim.
         m1: format!("\n\n{m1_body}"),
-        boundary_id: anchor_id(inputs.m0_coverage),
+        boundary_id: anchor_id(inputs.coverage),
     }
 }
 
@@ -303,6 +323,8 @@ fn baseline_changed(
         compartments,
         memories,
         m0_coverage,
+        // Only m[0] is compared here; the anchor is irrelevant to the diff.
+        coverage: m0_coverage,
     });
     let (frozen_m0, _) = frozen_halves(Some(state));
     plan.m0 != frozen_m0
@@ -464,19 +486,6 @@ impl HeadRenderer for PrecomputedRenderer {
     }
 }
 
-/// The planned head for a session without running a pass — used by tests and
-/// tooling that need the bytes without touching durable state.
-pub async fn preview(db: &Db, session_id: &str, project: &str) -> Result<String> {
-    let compartments = compartments::load(db, session_id).await?;
-    let memories = active_memories(db, project).await?;
-    let plan = plan_units(PlanInputs {
-        compartments: &compartments,
-        memories: &memories,
-        m0_coverage: compartments::coverage_end(&compartments).unwrap_or(0),
-    });
-    Ok(format!("{}{}", plan.m0, plan.m1))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -599,6 +608,16 @@ mod tests {
             "delta wrapper: {delta}"
         );
         assert_eq!(second.floor, 20, "the floor advances with the delta");
+        // The kernel anchor is the HEAD's coverage, not the baseline's: a revert
+        // of the rows the delta covers must invalidate the head.
+        let state = McCache::new(db.clone(), SESSION).load().await.unwrap();
+        assert_eq!(
+            state.expect("state after the delta").boundary_id,
+            anchor_id(20),
+            "the anchor advances with the delta"
+        );
+        // ... and the baseline's own coverage stays where it was frozen.
+        assert_eq!(materialized_m0_coverage(&db, SESSION).await.unwrap(), 9);
     }
 
     #[tokio::test]
@@ -690,16 +709,5 @@ mod tests {
         // A revert that removed covered rows reports it absent → the kernel
         // flags a reconcile, and the next pass rebuilds against the live tail.
         assert!(boundary_present(Some(&state), 9, 5).is_none());
-    }
-
-    #[tokio::test]
-    async fn preview_matches_the_planned_head() {
-        let db = db().await;
-        add_compartment(&db, "mc_1", 1, 9, "Alpha").await;
-        let previewed = preview(&db, SESSION, PROJECT).await.unwrap();
-        let result = run(request(&db, 9)).await.unwrap();
-        let (m0, m1) = split_prefix(&previewed);
-        assert_eq!(m0, result.head_m0.unwrap());
-        assert_eq!(m1, result.head_m1.unwrap());
     }
 }

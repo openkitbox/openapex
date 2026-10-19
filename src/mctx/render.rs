@@ -95,10 +95,15 @@ fn memory_render_order(left: &MemoryRow, right: &MemoryRow) -> std::cmp::Orderin
         (None, None) => left
             .category
             .cmp(&right.category)
-            .then_with(|| numeric_id(&left.id).cmp(&numeric_id(&right.id))),
+            .then_with(|| numeric_id(&left.id).cmp(&numeric_id(&right.id)))
+            // Ids are numeric today, but a non-numeric one must not make the
+            // byte order depend on row order: tie-break on the string.
+            .then_with(|| left.id.cmp(&right.id)),
     }
 }
 
+/// Sort key for a handle id: numeric ids order numerically, anything else
+/// sorts after them.
 fn numeric_id(id: &str) -> i64 {
     id.parse().unwrap_or(i64::MAX)
 }

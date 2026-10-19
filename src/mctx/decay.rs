@@ -19,30 +19,30 @@
 //! development cross-check against the reference TS, not a runtime contract.
 
 /// Half-life (in compartments) for importance 50 at pressure 1.
-pub const H50: f64 = 24.0;
+const H50: f64 = 24.0;
 /// Importance points needed to double the half-life (imp 75 → 2×, 100 → 4×).
-pub const D: f64 = 25.0;
+const D: f64 = 25.0;
 /// Max extra half-lives of P4 protection from full anchor overlap.
-pub const G: f64 = 2.0;
+const G: f64 = 2.0;
 
 // Log-cost tier boundaries — geometric means of adjacent measured tier costs.
 /// P1→P2 boundary.
-pub const Z1: f64 = 0.201;
+const Z1: f64 = 0.201;
 /// P2→P3 boundary.
-pub const Z2: f64 = 0.729;
+const Z2: f64 = 0.729;
 /// P3→P4 boundary.
-pub const Z3: f64 = 1.322;
+const Z3: f64 = 1.322;
 /// P4→P5 (archive candidate) boundary.
-pub const Z4: f64 = 2.587;
+const Z4: f64 = 2.587;
 
 /// Pressure floor: prevents div-by-zero and caps relaxation at 10×.
-pub const P_FLOOR: f64 = 0.1;
+const P_FLOOR: f64 = 0.1;
 
 /// Per-tier average token cost, indexed by tier number (1..5). Index 0 unused.
-pub const TIER_COST: [u32; 6] = [0, 322, 109, 35, 20, 5];
+const TIER_COST: [u32; 6] = [0, 322, 109, 35, 20, 5];
 
 /// A rendered paraphrase tier: 1 (verbose) .. 5 (archived / not rendered).
-pub type Tier = u8;
+type Tier = u8;
 
 /// A compartment's decay inputs for budget-pressure computation.
 #[derive(Debug, Clone, Copy)]
@@ -77,7 +77,7 @@ fn z_value(compartment_index: u32, importance: i32, budget_pressure: f64) -> f64
 /// `compartment_index` is 1-based from newest (1 = newest); `importance` is
 /// 1..100; `budget_pressure` is 0.10..∞ (computed once per pass via
 /// [`compute_budget_pressure`]).
-pub fn tier(compartment_index: u32, importance: i32, budget_pressure: f64) -> Tier {
+fn tier(compartment_index: u32, importance: i32, budget_pressure: f64) -> Tier {
     let z = z_value(compartment_index, importance, budget_pressure);
     if z < Z1 {
         1
@@ -96,7 +96,7 @@ pub fn tier(compartment_index: u32, importance: i32, budget_pressure: f64) -> Ti
 /// extends P4 protection by up to [`G`] half-lives; with `anchor_overlap =
 /// 0.0` (the default today, anchors not yet a first-class storage primitive)
 /// this reduces to `z >= Z4`.
-pub fn should_archive(
+fn should_archive(
     compartment_index: u32,
     importance: i32,
     budget_pressure: f64,

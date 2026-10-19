@@ -1588,4 +1588,31 @@ mod tests {
             |m| matches!(m, ChatMessage::Assistant { content: Some(text), .. } if text == "hi")
         ));
     }
+
+    // The head travels as two adjacent user messages, baseline first: the
+    // baseline is the provider's cache anchor, so merging the halves would
+    // rewrite the anchored bytes on every delta (the failure the cache kernel
+    // exists to prevent). An absent/empty half injects nothing.
+    #[test]
+    fn head_halves_stay_separate_and_empty_halves_vanish() {
+        let messages = Vec::new();
+        let chat = build_chat_messages("sys", &[Some("M0"), Some("M1")], &messages);
+        let heads: Vec<&str> = chat
+            .iter()
+            .filter_map(|m| match m {
+                ChatMessage::User { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(heads, vec!["M0", "M1"], "two messages, baseline first");
+
+        let chat = build_chat_messages("sys", &[Some("M0"), None], &messages);
+        assert_eq!(
+            chat.iter()
+                .filter(|m| matches!(m, ChatMessage::User { .. }))
+                .count(),
+            1,
+            "a None half injects nothing"
+        );
+    }
 }
