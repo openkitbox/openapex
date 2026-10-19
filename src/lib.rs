@@ -17,6 +17,7 @@ pub mod runner;
 pub mod schema;
 pub mod slug;
 pub mod tool;
+pub(crate) mod which;
 
 use std::sync::Arc;
 

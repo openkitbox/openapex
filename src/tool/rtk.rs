@@ -31,6 +31,8 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::sync::OnceCell;
 
+use crate::which;
+
 /// How long a single `rtk hook opencode` invocation may take before the
 /// rewrite is abandoned (the command runs unchanged). Matches the RTK
 /// plugin's default.
@@ -71,7 +73,7 @@ impl RtkRewriter {
     async fn binary(&self) -> Option<&PathBuf> {
         self.binary
             .get_or_init(|| async {
-                let path = find_on_path(BINARY)?;
+                let path = which::find_on_path(BINARY)?;
                 if probe(&path).await {
                     tracing::debug!(path = %path.display(), "rtk: hook opencode available");
                     Some(path)
@@ -92,31 +94,6 @@ impl RtkRewriter {
 /// whole session (RTK's own escape hatch).
 fn disabled() -> bool {
     std::env::var_os("RTK_DISABLED").is_some_and(|value| value == "1")
-}
-
-/// Resolve `name` on the process `PATH`, treating a directory entry as a miss
-/// (spawning it would fail). On Windows, also tries each `PATHEXT` suffix.
-fn find_on_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    let extensions: Vec<String> = if cfg!(windows) {
-        std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".to_owned())
-            .split(';')
-            .filter(|extension| !extension.is_empty())
-            .map(|extension| extension.to_owned())
-            .collect()
-    } else {
-        vec![String::new()]
-    };
-    for directory in std::env::split_paths(&path) {
-        for extension in &extensions {
-            let candidate = directory.join(format!("{name}{extension}"));
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
 }
 
 /// Whether `binary` supports the `hook opencode` subcommand. A broken or
@@ -163,16 +140,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn find_on_path_skips_missing_and_finds_self() {
+    fn find_on_path_skips_missing_names() {
         // A name that cannot exist resolves to None.
-        assert!(find_on_path("ox-definitely-not-a-real-binary-xyz").is_none());
+        assert!(which::find_on_path("ox-definitely-not-a-real-binary-xyz").is_none());
     }
 
     #[test]
-    fn find_on_path_locates_a_known_binary() {
+    fn find_on_path_locates_an_executable_binary() {
         // `sh` is on PATH on every unix; skip if the environment is unusual.
-        if let Some(path) = find_on_path("sh") {
+        // The shared finder rejects non-executable files on Unix, so a hit
+        // must carry the executable bit.
+        if let Some(path) = which::find_on_path("sh") {
             assert!(path.is_file());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+                assert!(mode & 0o111 != 0, "not executable: {}", path.display());
+            }
         }
     }
 
