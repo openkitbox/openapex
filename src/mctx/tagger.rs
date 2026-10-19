@@ -312,6 +312,18 @@ fn dropped_placeholder(tag: u64) -> String {
 ///
 /// This is the inverse of [`taggable_items`]; the two must stay in step (each
 /// `part_path` shape is resolved by both).
+///
+/// ## Deviations from the reference
+///
+/// - The reference strips line-leading `§N§` imitations from an assistant
+///   completion before prepending the official tag (models echo the notation).
+///   ox does not: a stray imitation would render as `§5§ §1§ …`, which is
+///   confusing but harmless, and the stripper is code-fence-aware machinery
+///   whose only job is cosmetic.
+/// - The reference reduces a dropped tool CALL to a skeleton carrying
+///   `{"dropped": …}`. ox keeps the call's real arguments and reduces only the
+///   result — the same shape as the reference's recency window (`SkeletonReal`),
+///   which is also what keeps the tool chain readable.
 pub fn apply_overlay(messages: &mut [Value], tags: &[TaggedItem], drops: &HashMap<u64, DropState>) {
     // Group by message so each row is walked once.
     let mut by_message: HashMap<&str, Vec<&TaggedItem>> = HashMap::new();
