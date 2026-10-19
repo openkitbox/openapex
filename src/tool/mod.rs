@@ -74,13 +74,16 @@ impl ToolRegistry {
     ///
     /// Called exactly once from `build_state_with`. Session scoping needs no
     /// dispatch change: `ToolContext` already carries `session_id`.
-    pub fn register_mctx(&mut self, db: Db) {
+    pub fn register_mctx(&mut self, db: Db, embedder: Option<Arc<crate::mctx::embed::Embedder>>) {
         self.register_all(vec![
             Arc::new(crate::mctx::tools::CtxReduceTool::new(db.clone())) as Arc<dyn Tool>,
             Arc::new(crate::mctx::tools::CtxExpandTool::new(db.clone())),
-            Arc::new(crate::mctx::memory::CtxMemoryTool::new(db.clone())),
+            Arc::new(crate::mctx::memory::CtxMemoryTool::new(
+                db.clone(),
+                embedder.clone(),
+            )),
             Arc::new(crate::mctx::memory::CtxNoteTool::new(db.clone())),
-            Arc::new(crate::mctx::search::CtxSearchTool::new(db)),
+            Arc::new(crate::mctx::search::CtxSearchTool::new(db, embedder)),
         ]);
     }
 }

@@ -33,6 +33,9 @@ pub struct MctxConfig {
     /// project actually holds memories whose cited files changed.
     #[serde(default = "default_enabled")]
     pub dreamer_enabled: bool,
+    /// Semantic search for project memories (off unless configured).
+    #[serde(default)]
+    pub embedding: EmbeddingConfig,
     /// Dreamer tick cadence in minutes. The reference's process-wide timer
     /// ticks every 15 minutes (`docs/architecture/dreamer.md`), the same
     /// default here; its per-task cron schedules are deliberately not ported
@@ -118,6 +121,7 @@ impl Default for MctxConfig {
             soft_threshold: default_soft_threshold(),
             hard_threshold: default_hard_threshold(),
             dreamer_enabled: default_enabled(),
+            embedding: EmbeddingConfig::default(),
             dreamer_interval_minutes: default_dreamer_interval_minutes(),
         }
     }
@@ -127,6 +131,88 @@ impl Default for MctxConfig {
 fn default_enabled() -> bool {
     true
 }
+
+/// `[magic_context.embedding]`: where memory vectors come from.
+///
+/// Only the OpenAI embeddings shape is supported (`POST {endpoint}/embeddings`,
+/// `{"model", "input"}` → `data[].embedding`): it is what every provider ox is
+/// deployed against speaks, and a dialect layer for one request shape would be
+/// more machinery than the four fields it replaces.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+pub struct EmbeddingConfig {
+    /// `"off"` (default) keeps `ctx_search` lexical.
+    #[serde(default)]
+    pub provider: EmbeddingProvider,
+    /// Base URL, without the trailing `/embeddings` (e.g.
+    /// `https://open.bigmodel.cn/api/paas/v4`).
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// Bearer token for the endpoint.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Embedding model id (e.g. `embedding-3`).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Prefix for the *query* text. Instruction-tuned models (Qwen3, e5, gte,
+    /// Nomic) expect a task instruction on the query side but not on stored
+    /// passages; leaving it unset sends both sides bare.
+    #[serde(default)]
+    pub query_instruction: Option<String>,
+    /// Prefix for *stored* text. Changing it changes every stored vector, so
+    /// the model identity written with a vector includes it.
+    #[serde(default)]
+    pub document_prefix: Option<String>,
+}
+
+impl EmbeddingConfig {
+    /// Whether semantic search can run at all.
+    pub fn is_enabled(&self) -> bool {
+        self.provider == EmbeddingProvider::OpenAiCompatible
+            && self.endpoint.as_deref().is_some_and(|v| !v.is_empty())
+            && self.model.as_deref().is_some_and(|v| !v.is_empty())
+    }
+
+    /// The identity written beside a stored vector: the model plus the
+    /// document prefix, because the same model with a different prefix
+    /// produces an incomparable vector space.
+    pub fn identity(&self) -> String {
+        match self.document_prefix.as_deref().filter(|p| !p.is_empty()) {
+            Some(prefix) => format!("{}|{prefix}", self.model.as_deref().unwrap_or("")),
+            None => self.model.clone().unwrap_or_default(),
+        }
+    }
+}
+
+impl Default for EmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            provider: EmbeddingProvider::Off,
+            endpoint: None,
+            api_key: None,
+            model: None,
+            query_instruction: None,
+            document_prefix: None,
+        }
+    }
+}
+
+/// Which embedding backend to use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum EmbeddingProvider {
+    /// No vectors: `ctx_search` stays lexical.
+    #[default]
+    Off,
+    /// Any endpoint speaking the OpenAI `/embeddings` shape.
+    ///
+    /// Spelled `openai-compatible`, which `rename_all = "kebab-case"` would
+    /// split into `open-ai-compatible`.
+    #[serde(rename = "openai-compatible")]
+    OpenAiCompatible,
+}
+
+/// The embedding client and its vector helpers.
+pub mod embed;
 
 /// cache-core integration: classification predicates, render handoff,
 /// whole-value CAS state and LKG.
@@ -237,6 +323,19 @@ mod tests {
         }
         .validated();
         assert!(cfg.dreamer_enabled, "an enabled module keeps its dreamer");
+    }
+
+    /// The config spelling is `openai-compatible`, not the `kebab-case`
+    /// splitting of the variant name (`open-ai-compatible`) — a real config
+    /// caught this.
+    #[test]
+    fn the_embedding_provider_spelling_round_trips() {
+        // `MctxConfig` is the section body, so its sub-table is `[embedding]`.
+        let cfg: MctxConfig =
+            toml::from_str("[embedding]\nprovider = \"openai-compatible\"").unwrap();
+        assert_eq!(cfg.embedding.provider, EmbeddingProvider::OpenAiCompatible);
+        let off: MctxConfig = toml::from_str("").unwrap();
+        assert_eq!(off.embedding.provider, EmbeddingProvider::Off);
     }
 
     #[test]

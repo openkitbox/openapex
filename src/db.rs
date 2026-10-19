@@ -326,6 +326,17 @@ const MIGRATION_V9: &str = r#"
 ALTER TABLE mc_memory ADD COLUMN verified_at integer NOT NULL DEFAULT 0;
 "#;
 
+/// Stored memory vectors for semantic `ctx_search` (Task 10 follow-up).
+///
+/// Two columns, no timestamp: a row is "embedded for the current model" when
+/// `embedding IS NOT NULL AND embedding_model = <identity>`, so a model change
+/// (or a document prefix change, which is part of the identity) re-embeds by
+/// the same test that fills a new row. Additive onto any V9 database.
+const MIGRATION_V10: &str = r#"
+ALTER TABLE mc_memory ADD COLUMN embedding BLOB;
+ALTER TABLE mc_memory ADD COLUMN embedding_model TEXT;
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
@@ -339,6 +350,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (7, MIGRATION_V7),
     (8, MIGRATION_V8),
     (9, MIGRATION_V9),
+    (10, MIGRATION_V10),
 ];
 
 /// All indexes the migration creates: V1's verbatim from upstream
@@ -742,11 +754,11 @@ mod tests {
     #[tokio::test]
     async fn migration_tracks_user_version_and_is_idempotent() {
         let db = Db::open_in_memory().await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 9);
+        assert_eq!(db.user_version().await.unwrap(), 10);
         // Re-running must be a no-op: version stays, no error.
         db.migrate().await.unwrap();
         db.migrate().await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 9);
+        assert_eq!(db.user_version().await.unwrap(), 10);
     }
 
     /// The pragmas [`Db::connect`] sets are the ones the storage layer relies
@@ -824,7 +836,7 @@ mod tests {
         let path = dir.path().join("upgrade.db");
         build_upto(&path, 1).await;
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 9);
+        assert_eq!(db.user_version().await.unwrap(), 10);
         for table in [
             "mc_frozen_state",
             "mc_compartments",
@@ -845,7 +857,7 @@ mod tests {
         let path = dir.path().join("upgrade3.db");
         build_upto(&path, 2).await;
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 9);
+        assert_eq!(db.user_version().await.unwrap(), 10);
         for table in ["mc_tag", "mc_drop"] {
             assert!(
                 db.table_exists(table).await.unwrap(),
@@ -898,7 +910,7 @@ mod tests {
             .unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 9);
+        assert_eq!(db.user_version().await.unwrap(), 10);
         // The pre-existing row reads back with the 'active' default and no
         // archive reason — the additive columns converge both DB histories.
         let row = query_row(
@@ -948,7 +960,7 @@ mod tests {
             .unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 9);
+        assert_eq!(db.user_version().await.unwrap(), 10);
         let row = query_row(
             &db,
             "SELECT updated_at, error FROM mc_historian_run WHERE id = 'hr_old'",
@@ -976,7 +988,7 @@ mod tests {
             .unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 9);
+        assert_eq!(db.user_version().await.unwrap(), 10);
         let compartments = columns(&db, "mc_compartments").await;
         let runs = columns(&db, "mc_historian_run").await;
         assert!(!compartments.iter().any(|c| c == "facts"));
@@ -1033,7 +1045,7 @@ mod tests {
         }
         let upgraded = Db::open(&path).await.unwrap();
         let fresh = Db::open_in_memory().await.unwrap();
-        assert_eq!(upgraded.user_version().await.unwrap(), 9);
+        assert_eq!(upgraded.user_version().await.unwrap(), 10);
         // Both histories must create exactly the same objects, SQL included.
         assert_eq!(
             schema_objects(&upgraded).await,
@@ -1123,7 +1135,7 @@ mod tests {
         build_upto(&path, 7).await;
         let upgraded = Db::open(&path).await.unwrap();
         let fresh = Db::open_in_memory().await.unwrap();
-        assert_eq!(upgraded.user_version().await.unwrap(), 9);
+        assert_eq!(upgraded.user_version().await.unwrap(), 10);
         assert_eq!(
             schema_objects(&upgraded).await,
             schema_objects(&fresh).await,
@@ -1177,7 +1189,7 @@ mod tests {
         }
         let upgraded = Db::open(&path).await.unwrap();
         let fresh = Db::open_in_memory().await.unwrap();
-        assert_eq!(upgraded.user_version().await.unwrap(), 9);
+        assert_eq!(upgraded.user_version().await.unwrap(), 10);
         assert_eq!(
             schema_objects(&upgraded).await,
             schema_objects(&fresh).await,
@@ -1194,6 +1206,40 @@ mod tests {
             5,
             "the write watermark is untouched"
         );
+    }
+
+    /// V10 adds the stored-vector columns; an existing row reads back as
+    /// "not embedded", which is what makes the first search backfill it.
+    #[tokio::test]
+    async fn migration_v10_adds_empty_embedding_columns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade10.db");
+        build_upto(&path, 9).await;
+        {
+            let conn = raw(&path).await;
+            conn.execute(
+                "INSERT INTO mc_memory (id, project, content, category, created_at, updated_at)
+                 VALUES ('1', '/p', 'a fact', 'ARCHITECTURE', 5, 5)",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        let upgraded = Db::open(&path).await.unwrap();
+        let fresh = Db::open_in_memory().await.unwrap();
+        assert_eq!(upgraded.user_version().await.unwrap(), 10);
+        assert_eq!(
+            schema_objects(&upgraded).await,
+            schema_objects(&fresh).await,
+            "upgraded and fresh V10 databases must converge"
+        );
+        let row = query_row(
+            &upgraded,
+            "SELECT embedding, embedding_model FROM mc_memory WHERE id = '1'",
+        )
+        .await;
+        assert!(row.get::<Option<Vec<u8>>>(0).unwrap().is_none());
+        assert!(row.get::<Option<String>>(1).unwrap().is_none());
     }
 
     #[tokio::test]

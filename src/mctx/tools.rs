@@ -808,7 +808,7 @@ mod tests {
         assert!(registry.get("ctx_memory").is_none());
         assert!(registry.get("ctx_note").is_none());
         assert!(registry.get("ctx_search").is_none());
-        registry.register_mctx(db().await);
+        registry.register_mctx(db().await, None);
         assert!(registry.get("ctx_reduce").is_some());
         assert!(registry.get("ctx_expand").is_some());
         assert!(registry.get("ctx_memory").is_some());

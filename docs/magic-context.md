@@ -15,7 +15,7 @@ no dreamer).
 | Frozen head | `m[0]` = `<session-history>` (compartment set), `m[1]` = pinboard + new compartments + the anchoring placeholder. The head replaces the transcript range it covers; the live tail follows. |
 | Historian | At a step boundary, when the live tail passes a pressure band, ox folds the oldest part of the tail into compartments with a hidden completion through cardinal. |
 | Dreamer | Every `dreamer_interval_minutes`, per project with memories: `verify` (do cited files still back the claims?) and `curate` (merge duplicates, archive redundancy). |
-| `ctx_search` | Full-text search over memories, notes and compartments (turso FTS indexes), plus a transcript scan. |
+| `ctx_search` | Memories, notes, compartments (turso FTS indexes) and a transcript scan. With `[magic_context.embedding]` configured, the **memory lane** ranks by cosine similarity instead. |
 
 ## Configuration
 
@@ -34,7 +34,25 @@ hard_threshold = 0.85
 # Scheduled memory maintenance (default true) and its cadence.
 dreamer_enabled = true
 dreamer_interval_minutes = 15
+
+# Semantic search for project memories. Omit the block (or provider = "off")
+# and the memory lane stays lexical.
+[magic_context.embedding]
+provider = "openai-compatible"        # or "off" (default)
+endpoint = "https://open.bigmodel.cn/api/paas/v4"   # base URL, no /embeddings
+model = "embedding-3"
+api_key = "…"
+# query_instruction = "query: "       # for instruction-tuned models
+# document_prefix = "search_document: "  # part of the vector identity
 ```
+
+Vectors live beside the text (`mc_memory.embedding`, `embedding_model`) and are
+written on the memory write itself; a failed embedding call never fails the
+write — the row simply has no vector and the next `ctx_search` backfills up to
+20 of them. Changing the model or the document prefix changes the identity, so
+every row is re-embedded by the same backfill instead of being compared across
+vector spaces. A search whose embedding call fails degrades to the index with a
+warning.
 
 ## Operator signals
 
@@ -62,7 +80,11 @@ dreamer_interval_minutes = 15
   cite files inside the session's directory (no `~`, no `..` escape, no symlink
   out), and a cited file larger than a few kilobytes is read only up to the
   excerpt budget.
-- Design deviations from the reference (message-count-free fence, no
-  `map-memories`, no staleness signal, one in-process claim instead of leases)
-  are documented at the top of the module that owns them — start with
-  `src/mctx/dreamer.rs` and `src/runner/historian_trigger.rs`.
+- **Embeddings are a second outbound path.** Chat traffic goes through
+  cardinal; embeddings do not (cardinal has no `/embeddings` route). The key
+  lives in `ox.toml` beside the cardinal key.
+- Design deviations from the reference (budget-as-fence, no `map-memories`, no
+  staleness signal, one in-process claim instead of leases, semantic ranking
+  only for memories) are documented at the top of the module that owns them —
+  start with `src/mctx/dreamer.rs`, `src/mctx/search.rs` and
+  `src/runner/historian_trigger.rs`.

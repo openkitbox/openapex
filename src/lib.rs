@@ -54,7 +54,8 @@ pub async fn build_state_with(
 ) -> Result<AppState> {
     let db = Db::open(&config.db_path).await?;
     if config.magic_context.enabled {
-        tools.register_mctx(db.clone());
+        let embedder = mctx::embed::Embedder::from_config(&config.magic_context.embedding);
+        tools.register_mctx(db.clone(), embedder);
     }
     let tools = Arc::new(tools);
     let cwd = std::env::current_dir()?;

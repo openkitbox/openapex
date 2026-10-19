@@ -52,6 +52,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
@@ -172,7 +173,7 @@ pub(crate) async fn update_memory(
             Some(category) => {
                 conn.execute(
                     "UPDATE mc_memory SET content = ?3, category = ?4, updated_at = ?5,
-                         verified_at = 0
+                         verified_at = 0, embedding = NULL, embedding_model = NULL
                          WHERE project = ?1 AND id = ?2",
                     (project, id, content, category, now),
                 )
@@ -180,7 +181,8 @@ pub(crate) async fn update_memory(
             }
             None => {
                 conn.execute(
-                    "UPDATE mc_memory SET content = ?3, updated_at = ?4, verified_at = 0
+                    "UPDATE mc_memory SET content = ?3, updated_at = ?4, verified_at = 0,
+                         embedding = NULL, embedding_model = NULL
                          WHERE project = ?1 AND id = ?2",
                     (project, id, content, now),
                 )
@@ -297,7 +299,7 @@ pub(crate) async fn merge_memories(
             Some(category) => {
                 tx.execute(
                     "UPDATE mc_memory SET content = ?3, category = ?4, updated_at = ?5,
-                         verified_at = 0
+                         verified_at = 0, embedding = NULL, embedding_model = NULL
                      WHERE project = ?1 AND id = ?2",
                     (project, survivor.as_str(), content, category, now),
                 )
@@ -305,7 +307,8 @@ pub(crate) async fn merge_memories(
             }
             None => {
                 tx.execute(
-                    "UPDATE mc_memory SET content = ?3, updated_at = ?4, verified_at = 0
+                    "UPDATE mc_memory SET content = ?3, updated_at = ?4, verified_at = 0,
+                         embedding = NULL, embedding_model = NULL
                      WHERE project = ?1 AND id = ?2",
                     (project, survivor.as_str(), content, now),
                 )
@@ -447,6 +450,111 @@ pub(crate) async fn active_memories_with_watermark(
                 content: row.get(2)?,
                 updated_at: row.get(3)?,
                 verified_at: row.get(4)?,
+            });
+        }
+        Ok(out)
+    }
+    .await;
+    result.with_context(|| context)
+}
+
+/// Store one memory's vector under `identity` (see [`crate::mctx::embed`]).
+pub(crate) async fn store_embedding(
+    db: &Db,
+    id: &str,
+    identity: &str,
+    vector: &[f32],
+) -> Result<()> {
+    let context = format!("store the embedding of memory #{id}");
+    let blob = crate::mctx::embed::to_blob(vector);
+    let result: Result<()> = async {
+        let conn = db.acquire().await?;
+        conn.execute(
+            "UPDATE mc_memory SET embedding = ?2, embedding_model = ?3 WHERE id = ?1",
+            (id, blob, identity),
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+    result.with_context(|| context)
+}
+
+/// Active memories of `project` whose vector is missing or was produced under
+/// another identity, newest first, up to `limit`.
+pub(crate) async fn memories_needing_embedding(
+    db: &Db,
+    project: &str,
+    identity: &str,
+    limit: i64,
+) -> Result<Vec<(String, String)>> {
+    let context = format!("find memories to embed for project {project}");
+    let result: Result<Vec<(String, String)>> = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, content FROM mc_memory
+                  WHERE project = ?1 AND status = 'active'
+                    AND (embedding IS NULL OR embedding_model IS NOT ?2)
+                  ORDER BY CAST(id AS INTEGER) DESC
+                  LIMIT ?3",
+            )
+            .await?;
+        let mut rows = stmt.query((project, identity, limit)).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push((row.get::<String>(0)?, row.get::<String>(1)?));
+        }
+        Ok(out)
+    }
+    .await;
+    result.with_context(|| context)
+}
+
+/// One active memory with its stored vector, as `ctx_search`'s semantic lane
+/// reads it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct EmbeddedMemory {
+    /// `#N` handle body.
+    pub(crate) id: String,
+    /// One of [`CATEGORIES`].
+    pub(crate) category: String,
+    /// The fact text.
+    pub(crate) content: String,
+    /// Creation time (ms), for the search's date filter.
+    pub(crate) created_at: i64,
+    /// The stored vector, decoded.
+    pub(crate) vector: Vec<f32>,
+}
+
+/// The project's active memories with the vectors stored under `identity`.
+/// Rows embedded under another identity are omitted (they rank as a mismatch
+/// anyway, and the backfill re-embeds them).
+pub(crate) async fn embedded_memories(
+    db: &Db,
+    project: &str,
+    identity: &str,
+) -> Result<Vec<EmbeddedMemory>> {
+    let context = format!("load embedded memories for project {project}");
+    let result: Result<Vec<EmbeddedMemory>> = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, category, content, created_at, embedding FROM mc_memory
+                  WHERE project = ?1 AND status = 'active' AND embedding_model = ?2
+                    AND embedding IS NOT NULL",
+            )
+            .await?;
+        let mut rows = stmt.query((project, identity)).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let blob: Vec<u8> = row.get(4)?;
+            out.push(EmbeddedMemory {
+                id: row.get(0)?,
+                category: row.get(1)?,
+                content: row.get(2)?,
+                created_at: row.get(3)?,
+                vector: crate::mctx::embed::from_blob(&blob),
             });
         }
         Ok(out)
@@ -854,12 +962,14 @@ pub(crate) fn internal_error(what: &str, error: &anyhow::Error) -> ToolOutput {
 /// `ctx_memory` — the project pinboard (see the module docs).
 pub struct CtxMemoryTool {
     db: Db,
+    /// `None` when semantic search is off: writes then skip embedding.
+    embedder: Option<Arc<crate::mctx::embed::Embedder>>,
 }
 
 impl CtxMemoryTool {
     /// The tool over `db` (the `mc_memory` table).
-    pub fn new(db: Db) -> Self {
-        Self { db }
+    pub fn new(db: Db, embedder: Option<Arc<crate::mctx::embed::Embedder>>) -> Self {
+        Self { db, embedder }
     }
 }
 
@@ -942,11 +1052,16 @@ impl Tool for CtxMemoryTool {
         ctx: ToolContext,
         input: Value,
     ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
-        Box::pin(async move { run_memory(&self.db, &ctx, &input).await })
+        Box::pin(async move { run_memory(&self.db, self.embedder.as_deref(), &ctx, &input).await })
     }
 }
 
-async fn run_memory(db: &Db, ctx: &ToolContext, input: &Value) -> ToolOutput {
+async fn run_memory(
+    db: &Db,
+    embedder: Option<&crate::mctx::embed::Embedder>,
+    ctx: &ToolContext,
+    input: &Value,
+) -> ToolOutput {
     let Some(action) = input.get("action").and_then(Value::as_str) else {
         return ok_text("Error: 'action' must be provided.");
     };
@@ -965,7 +1080,10 @@ async fn run_memory(db: &Db, ctx: &ToolContext, input: &Value) -> ToolOutput {
                 Err(message) => return ok_text(message),
             };
             match write_memory(db, &project, &content, &category).await {
-                Ok(id) => ok_text(format!("Wrote memory #{id}.")),
+                Ok(id) => {
+                    embed_inline(db, embedder, &id, &content).await;
+                    ok_text(format!("Wrote memory #{id}."))
+                }
                 Err(error) => internal_error("memory write", &error),
             }
         }
@@ -986,7 +1104,10 @@ async fn run_memory(db: &Db, ctx: &ToolContext, input: &Value) -> ToolOutput {
                 Err(message) => return ok_text(message),
             };
             match update_memory(db, &project, id, &content, category.as_deref()).await {
-                Ok(true) => ok_text(format!("Updated memory #{id}.")),
+                Ok(true) => {
+                    embed_inline(db, embedder, id, &content).await;
+                    ok_text(format!("Updated memory #{id}."))
+                }
                 Ok(false) => ok_text(format!("Error: no memory #{id}.")),
                 Err(error) => internal_error("memory update", &error),
             }
@@ -1033,11 +1154,14 @@ async fn run_memory(db: &Db, ctx: &ToolContext, input: &Value) -> ToolOutput {
                 Err(message) => return ok_text(message),
             };
             match merge_memories(db, &project, &ids, &content, category.as_deref()).await {
-                Ok(Some(merged)) => ok_text(format!(
-                    "Merged {} into #{}.",
-                    handles(&merged.sources),
-                    merged.survivor
-                )),
+                Ok(Some(merged)) => {
+                    embed_inline(db, embedder, &merged.survivor, &content).await;
+                    ok_text(format!(
+                        "Merged {} into #{}.",
+                        handles(&merged.sources),
+                        merged.survivor
+                    ))
+                }
                 Ok(None) => ok_text("Error: merge needs at least two active memories among 'ids'."),
                 Err(error) => internal_error("memory merge", &error),
             }
@@ -1067,6 +1191,34 @@ async fn run_memory(db: &Db, ctx: &ToolContext, input: &Value) -> ToolOutput {
         other => ok_text(format!(
             "Error: unknown action '{other}' (write, update, archive, merge, get)."
         )),
+    }
+}
+
+/// Embed a just-written fact and store its vector.
+///
+/// Best effort: a failed call logs and leaves the row without a vector, which
+/// the next `ctx_search` backfills. A write must never fail because the
+/// embedding endpoint is down.
+async fn embed_inline(
+    db: &Db,
+    embedder: Option<&crate::mctx::embed::Embedder>,
+    id: &str,
+    content: &str,
+) {
+    let Some(embedder) = embedder else {
+        return;
+    };
+    match embedder.embed_documents(&[content.to_owned()]).await {
+        Ok(mut vectors) => {
+            if let Some(vector) = vectors.pop()
+                && let Err(error) = store_embedding(db, id, embedder.identity(), &vector).await
+            {
+                tracing::warn!(memory = %id, error = %error, "store memory embedding failed");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(memory = %id, error = %error, "embed memory failed; the next search backfills it");
+        }
     }
 }
 
@@ -1449,7 +1601,7 @@ mod tests {
     }
 
     async fn memory_in(db: &Db, input: Value, session: &str, project: &str) -> String {
-        let tool = CtxMemoryTool::new(db.clone());
+        let tool = CtxMemoryTool::new(db.clone(), None);
         let output = tool.execute(ctx(session, project), input).await;
         assert!(output.error.is_none(), "ctx_memory must not fail the tool");
         text(&output)
@@ -2208,7 +2360,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_definitions_are_model_facing_and_serialize() {
-        let tool = CtxMemoryTool::new(db().await);
+        let tool = CtxMemoryTool::new(db().await, None);
         assert_eq!(tool.name(), "ctx_memory");
         let definition = tool.definition();
         assert_eq!(definition.function.name, "ctx_memory");

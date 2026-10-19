@@ -51,9 +51,13 @@
 //!
 //! # Deviations from the reference (documented, not accidental)
 //!
-//! - **No semantic search, auto-search hints, git-commit index or primers.**
-//!   ox has no embedding provider for those; the plan scopes search to the
-//!   three indexed corpora plus the transcript fallback.
+//! - **Semantic search only where it pays: the memory lane.** When
+//!   `[magic_context.embedding]` is configured, project memories are ranked by
+//!   cosine similarity to the query; notes, compartments and the transcript
+//!   keep their index (`LIKE`/FTS) because their corpora are small and
+//!   session-scoped. There is no blended score: cosine either replaces the
+//!   memory lane's BM25 order or, with the embedder off, BM25 is what runs.
+//!   No auto-search hints, git-commit index or primers.
 //! - **No result suppression.** The reference hides memories already visible
 //!   in `<project-memory>` and messages still in the live tail; ox returns
 //!   every match with its id so the model can decide.
@@ -69,6 +73,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
@@ -274,14 +279,33 @@ struct TranscriptRow {
 
 /// Run one search: query every selected source and return the merged,
 /// deterministically ordered hits (at most `request.limit`).
-pub(crate) async fn search(db: &Db, request: &SearchRequest<'_>) -> Result<Vec<SearchHit>> {
+pub(crate) async fn search(
+    db: &Db,
+    embedder: Option<&super::embed::Embedder>,
+    request: &SearchRequest<'_>,
+) -> Result<Vec<SearchHit>> {
     let tokens = query_tokens(request.query);
     if tokens.is_empty() || request.limit == 0 {
         return Ok(Vec::new());
     }
     let mut ranked: Vec<RankedHit> = Vec::new();
     if request.sources.contains(Source::Memory) {
-        ranked.extend(search_memories(db, request, &tokens).await?);
+        // Semantic when configured, lexical otherwise. An endpoint failure
+        // degrades this lane to its index rather than failing the search.
+        let hits = match embedder {
+            Some(embedder) => match semantic_memories(db, embedder, request, &tokens).await {
+                Ok(hits) => hits,
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "semantic memory search failed; falling back to the index"
+                    );
+                    search_memories(db, request, &tokens).await?
+                }
+            },
+            None => search_memories(db, request, &tokens).await?,
+        };
+        ranked.extend(hits);
     }
     if request.sources.contains(Source::Note) {
         ranked.extend(search_notes(db, request, &tokens).await?);
@@ -367,6 +391,97 @@ async fn search_memories(
             })
         })
         .collect())
+}
+
+/// Active project memories ranked by cosine similarity to the query.
+///
+/// Rows whose vector is missing or was produced under another identity are
+/// backfilled first (bounded per search), so the corpus converges without a
+/// scheduled sweep. No blended score: when semantic search is configured it
+/// replaces the memory lane's BM25 ranking rather than competing with it — the
+/// two scales are not comparable, and a blend would need a weight nobody can
+/// justify.
+async fn semantic_memories(
+    db: &Db,
+    embedder: &super::embed::Embedder,
+    request: &SearchRequest<'_>,
+    tokens: &[String],
+) -> Result<Vec<RankedHit>> {
+    backfill_embeddings(db, embedder, request.project).await;
+    let query = embedder.embed_query(request.query).await?;
+    let memories = super::memory::embedded_memories(db, request.project, embedder.identity())
+        .await
+        .context("load embedded memories")?;
+    let mut scored: Vec<(f32, super::memory::EmbeddedMemory)> = memories
+        .into_iter()
+        .map(|memory| (super::embed::cosine(&query, &memory.vector), memory))
+        .collect();
+    scored.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.id.cmp(&right.1.id))
+    });
+    Ok(scored
+        .into_iter()
+        .take(SOURCE_FETCH_LIMIT as usize)
+        .filter(|(_, memory)| in_range(memory.created_at, request.from_ms, request.to_ms))
+        .enumerate()
+        .map(|(rank, (_, memory))| RankedHit {
+            rank,
+            hit: SearchHit {
+                source: Source::Memory,
+                id: memory.id,
+                snippet: snippet_around_tokens(&memory.content, tokens),
+                score: 100,
+                scope: request.project.to_owned(),
+                category: Some(memory.category),
+                status: None,
+                title: None,
+                range: None,
+                ordinal: None,
+            },
+        })
+        .collect())
+}
+
+/// Embed up to [`BACKFILL_LIMIT`] memories of `project` that carry no vector
+/// for the current identity. Best effort: a failure logs and leaves the rows
+/// for the next search.
+async fn backfill_embeddings(db: &Db, embedder: &super::embed::Embedder, project: &str) {
+    const BACKFILL_LIMIT: i64 = 20;
+    let pending = match super::memory::memories_needing_embedding(
+        db,
+        project,
+        embedder.identity(),
+        BACKFILL_LIMIT,
+    )
+    .await
+    {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::warn!(error = %error, "find memories to embed failed");
+            return;
+        }
+    };
+    if pending.is_empty() {
+        return;
+    }
+    let texts: Vec<String> = pending.iter().map(|(_, content)| content.clone()).collect();
+    let vectors = match embedder.embed_documents(&texts).await {
+        Ok(vectors) => vectors,
+        Err(error) => {
+            tracing::warn!(error = %error, "backfill embeddings failed");
+            return;
+        }
+    };
+    for ((id, _), vector) in pending.iter().zip(vectors) {
+        if let Err(error) =
+            super::memory::store_embedding(db, id, embedder.identity(), &vector).await
+        {
+            tracing::warn!(memory = %id, error = %error, "store backfilled embedding failed");
+        }
+    }
 }
 
 /// Undismissed notes of the session matching every token, newest first.
@@ -824,12 +939,14 @@ fn render_hits(query: &str, hits: &[SearchHit]) -> String {
 /// `ctx_search` — unified retrieval over the magic-context store.
 pub struct CtxSearchTool {
     db: Db,
+    /// `None` when semantic search is off: every lane then uses its index.
+    embedder: Option<Arc<super::embed::Embedder>>,
 }
 
 impl CtxSearchTool {
     /// The tool over `db` (the `mc_*` tables and their search indexes).
-    pub fn new(db: Db) -> Self {
-        Self { db }
+    pub fn new(db: Db, embedder: Option<Arc<super::embed::Embedder>>) -> Self {
+        Self { db, embedder }
     }
 }
 
@@ -911,11 +1028,16 @@ impl Tool for CtxSearchTool {
         ctx: ToolContext,
         input: Value,
     ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
-        Box::pin(async move { run_search(&self.db, &ctx, &input).await })
+        Box::pin(async move { run_search(&self.db, self.embedder.as_deref(), &ctx, &input).await })
     }
 }
 
-async fn run_search(db: &Db, ctx: &ToolContext, input: &Value) -> ToolOutput {
+async fn run_search(
+    db: &Db,
+    embedder: Option<&super::embed::Embedder>,
+    ctx: &ToolContext,
+    input: &Value,
+) -> ToolOutput {
     let query = match input.get("query") {
         Some(Value::String(query)) if !query.trim().is_empty() => query.trim(),
         _ => return ok_text("Error: 'query' is required."),
@@ -952,7 +1074,7 @@ async fn run_search(db: &Db, ctx: &ToolContext, input: &Value) -> ToolOutput {
         from_ms,
         to_ms,
     };
-    match search(db, &request).await {
+    match search(db, embedder, &request).await {
         Ok(hits) => ok_text(render_hits(query, &hits)),
         Err(error) => internal_error("search", &error),
     }
@@ -1108,7 +1230,7 @@ mod tests {
 
     /// Drive the tool shell exactly as the runner does, and return its text.
     async fn run(db: &Db, directory: &str, input: Value) -> String {
-        let tool = CtxSearchTool::new(db.clone());
+        let tool = CtxSearchTool::new(db.clone(), None);
         tool.execute(tool_ctx(std::path::PathBuf::from(directory)), input)
             .await
             .content
@@ -1156,6 +1278,58 @@ mod tests {
         .unwrap();
     }
 
+    /// Semantic ranking replaces the memory lane's BM25 order, and a memory
+    /// written without a vector is backfilled by the search that needs it.
+    #[tokio::test]
+    async fn the_memory_lane_ranks_by_similarity_and_backfills() {
+        let db = db().await;
+        // Lexically the query shares a word with the WRONG memory, so an
+        // FTS-ordered lane would put it first.
+        write_memory(&db, PROJECT, "alpha zebra notes", "ARCHITECTURE")
+            .await
+            .unwrap();
+        let (endpoint, _handle) = crate::mctx::embed::stub::spawn(|text: &str| {
+            if text.contains("alpha") {
+                vec![1.0, 0.0]
+            } else {
+                vec![0.0, 1.0]
+            }
+        })
+        .await;
+        let config = crate::mctx::embed::stub::config(&endpoint);
+        let embedder = crate::mctx::embed::Embedder::from_config(&config).expect("embedder");
+        // The second memory is "beta ..." — no lexical overlap with the query.
+        write_memory(&db, PROJECT, "beta deployment notes", "ARCHITECTURE")
+            .await
+            .unwrap();
+
+        // Query "alpha" embeds to x; the beta row backfills to y, so similarity
+        // is decisive: both rows are visible either way, but only similarity
+        // can rank beta above alpha.
+        let hits = search(
+            &db,
+            Some(embedder.as_ref()),
+            &request("beta", SourceFilter::ALL),
+        )
+        .await
+        .unwrap();
+        let memory_hits: Vec<&SearchHit> = hits
+            .iter()
+            .filter(|hit| hit.source == Source::Memory)
+            .collect();
+        assert_eq!(memory_hits.len(), 2, "{hits:#?}");
+        assert_eq!(
+            memory_hits[0].id, "2",
+            "the semantically closer row wins over the lexically closer one: {hits:#?}"
+        );
+
+        // Both rows now carry a vector under the configured identity.
+        let embedded = crate::mctx::memory::embedded_memories(&db, PROJECT, embedder.identity())
+            .await
+            .unwrap();
+        assert_eq!(embedded.len(), 2, "the search backfilled every row");
+    }
+
     #[tokio::test]
     async fn finds_one_hit_per_indexed_source_with_its_label() {
         let db = db().await;
@@ -1173,7 +1347,7 @@ mod tests {
         )
         .await;
 
-        let hits = search(&db, &request("zebrafish", SourceFilter::ALL))
+        let hits = search(&db, None, &request("zebrafish", SourceFilter::ALL))
             .await
             .unwrap();
         assert_eq!(hits.len(), 3, "one hit per indexed source: {hits:#?}");
@@ -1230,7 +1404,7 @@ mod tests {
         }
         assert_eq!(indexed, 0);
 
-        let hits = search(&db, &request("seahorse", SourceFilter::ALL))
+        let hits = search(&db, None, &request("seahorse", SourceFilter::ALL))
             .await
             .unwrap();
         assert_eq!(hits.len(), 1, "{hits:#?}");
@@ -1243,7 +1417,7 @@ mod tests {
         // inert (nothing reaches SQL as a pattern any more): `%` separates terms
         // instead of matching anything, and `_` is an ordinary term character.
         for (query, expected) in [("SEAHORSE", 1), ("sea%horse", 1), ("sea_horse", 0)] {
-            let hits = search(&db, &request(query, SourceFilter::ALL))
+            let hits = search(&db, None, &request(query, SourceFilter::ALL))
                 .await
                 .unwrap();
             assert_eq!(hits.len(), expected, "query {query}");
@@ -1266,7 +1440,9 @@ mod tests {
         for query in ["Ökologie", "ökologie"] {
             let mut only_transcript = SourceFilter([false; 4]);
             only_transcript.enable(Source::Transcript);
-            let hits = search(&db, &request(query, only_transcript)).await.unwrap();
+            let hits = search(&db, None, &request(query, only_transcript))
+                .await
+                .unwrap();
             assert_eq!(hits.len(), 1, "query {query}: {hits:#?}");
             assert!(hits[0].snippet.contains("kologie"), "{}", hits[0].snippet);
         }
@@ -1309,7 +1485,7 @@ mod tests {
             .unwrap();
         publish(&db, "mc_n", "Narwhal", "narwhal summary").await;
 
-        let hits = search(&db, &request("narwhal", SourceFilter::ALL))
+        let hits = search(&db, None, &request("narwhal", SourceFilter::ALL))
             .await
             .unwrap();
         assert_eq!(hits.len(), 3, "every write path is indexed: {hits:#?}");
@@ -1320,13 +1496,13 @@ mod tests {
             .unwrap();
         let memory_only = SourceFilter([true, false, false, false]);
         assert!(
-            search(&db, &request("narwhal", memory_only))
+            search(&db, None, &request("narwhal", memory_only))
                 .await
                 .unwrap()
                 .is_empty(),
             "the updated memory must no longer match its old text"
         );
-        let hits = search(&db, &request("axolotl", SourceFilter::ALL))
+        let hits = search(&db, None, &request("axolotl", SourceFilter::ALL))
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
@@ -1349,7 +1525,7 @@ mod tests {
         )
         .await;
 
-        let first = search(&db, &request("quokka", SourceFilter::ALL))
+        let first = search(&db, None, &request("quokka", SourceFilter::ALL))
             .await
             .unwrap();
         let labels: Vec<&str> = first.iter().map(|hit| hit.source.label()).collect();
@@ -1358,7 +1534,7 @@ mod tests {
             vec!["memory", "compartment", "note", "transcript"],
             "{first:#?}"
         );
-        let second = search(&db, &request("quokka", SourceFilter::ALL))
+        let second = search(&db, None, &request("quokka", SourceFilter::ALL))
             .await
             .unwrap();
         assert_eq!(first, second, "ordering is deterministic");
@@ -1383,13 +1559,13 @@ mod tests {
 
         let mut only_notes = request("pangolin", SourceFilter([false; 4]));
         only_notes.sources.enable(Source::Note);
-        let hits = search(&db, &only_notes).await.unwrap();
+        let hits = search(&db, None, &only_notes).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].source, Source::Note);
 
         let mut limited = request("pangolin", SourceFilter::ALL);
         limited.limit = 2;
-        let hits = search(&db, &limited).await.unwrap();
+        let hits = search(&db, None, &limited).await.unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].source, Source::Memory);
         assert_eq!(hits[1].source, Source::Compartment);
@@ -1398,7 +1574,7 @@ mod tests {
         // index row exists.
         let mut other = request("pangolin", SourceFilter::ALL);
         other.project = "/tmp/other-project";
-        let hits = search(&db, &other).await.unwrap();
+        let hits = search(&db, None, &other).await.unwrap();
         assert!(
             hits.iter().all(|hit| hit.source != Source::Memory),
             "{hits:#?}"
@@ -1417,12 +1593,12 @@ mod tests {
             to_ms: Some(parse_utc_date_ms("2000-01-01").unwrap() + DAY_MS - 1),
             ..request("otter", SourceFilter::ALL)
         };
-        assert!(search(&db, &narrowed).await.unwrap().is_empty());
+        assert!(search(&db, None, &narrowed).await.unwrap().is_empty());
         let open = SearchRequest {
             from_ms: Some(parse_utc_date_ms("2000-01-01").unwrap()),
             ..request("otter", SourceFilter::ALL)
         };
-        assert_eq!(search(&db, &open).await.unwrap().len(), 1);
+        assert_eq!(search(&db, None, &open).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1520,13 +1696,17 @@ mod tests {
         }
         // The operator word is searched as a word (`OR` matches nothing here),
         // and the terms around it still match.
-        let hits = search(&db, &request("alpha OR beta", SourceFilter::ALL))
+        let hits = search(&db, None, &request("alpha OR beta", SourceFilter::ALL))
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
-        let hits = search(&db, &request("\"alpha beta gamma\"", SourceFilter::ALL))
-            .await
-            .unwrap();
+        let hits = search(
+            &db,
+            None,
+            &request("\"alpha beta gamma\"", SourceFilter::ALL),
+        )
+        .await
+        .unwrap();
         assert_eq!(hits.len(), 1);
     }
 
@@ -1547,7 +1727,7 @@ mod tests {
             .await
             .unwrap();
         }
-        let hits = search(&db, &request("quokka", SourceFilter::ALL))
+        let hits = search(&db, None, &request("quokka", SourceFilter::ALL))
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);
