@@ -36,6 +36,9 @@ use crate::which;
 pub(crate) mod tools;
 
 #[cfg(test)]
+mod live;
+
+#[cfg(test)]
 mod teststub;
 
 /// Name of the binary on `PATH`.
