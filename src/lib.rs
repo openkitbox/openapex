@@ -37,19 +37,26 @@ pub async fn build_state(config: Config) -> Result<AppState> {
     build_state_with(
         config,
         Arc::new(cardinal),
-        Arc::new(runner::ToolRegistry::with_builtins()),
+        runner::ToolRegistry::with_builtins(),
     )
     .await
 }
 
 /// [`build_state`] with an injected chat transport and tool registry —
-/// the seam tests (and later, alternate providers) use.
+/// the seam tests (and later, alternate providers) use. The registry is
+/// passed unwrapped so the wiring can attach the Db-holding magic-context
+/// tools (`register_mctx`) after the DB opens; they are advertised only
+/// when `magic_context.enabled`.
 pub async fn build_state_with(
     config: Config,
     chat: std::sync::Arc<dyn runner::Chat>,
-    tools: std::sync::Arc<runner::ToolRegistry>,
+    mut tools: runner::ToolRegistry,
 ) -> Result<AppState> {
     let db = Db::open(&config.db_path).await?;
+    if config.magic_context.enabled {
+        tools.register_mctx(db.clone());
+    }
+    let tools = Arc::new(tools);
     let cwd = std::env::current_dir()?;
     let directory = cwd.canonicalize().unwrap_or(cwd);
     let bus = EventBus::new(db.clone());

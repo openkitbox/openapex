@@ -169,10 +169,39 @@ CREATE INDEX IF NOT EXISTS mc_note_session_idx ON mc_note (session_id);
 CREATE INDEX IF NOT EXISTS mc_historian_run_session_idx ON mc_historian_run (session_id);
 "#;
 
+/// magic-context tag/drop tables (Task 3). `mc_tag` is the durable
+/// §N§-tag ↔ message-part identity mapping: tags are per-session, minted in
+/// arrival order, and STABLE across passes (the same item keeps its tag).
+/// `digest` is the first 16 hex chars of the tagged content's SHA-256, so a
+/// re-tag can verify identity cheaply (same content → same tag; changed
+/// content → the tag stays, the digest is refreshed). `mc_drop` is the
+/// ctx_reduce queue: rows start `state = 'queued'`, and `drain_drops` marks
+/// them `'applied'` when the render pipeline consumes them (the rows are
+/// kept so `ctx_expand` can report whether content is currently dropped).
+const MIGRATION_V3: &str = r#"
+CREATE TABLE IF NOT EXISTS mc_tag (
+  session_id text NOT NULL,
+  tag integer NOT NULL,
+  message_id text NOT NULL,
+  part_path text NOT NULL,
+  digest text NOT NULL,
+  PRIMARY KEY (session_id, tag)
+);
+CREATE TABLE IF NOT EXISTS mc_drop (
+  session_id text NOT NULL,
+  tag integer NOT NULL,
+  reason text NOT NULL,
+  state text NOT NULL DEFAULT 'queued',
+  created_at integer NOT NULL,
+  PRIMARY KEY (session_id, tag)
+);
+CREATE INDEX IF NOT EXISTS mc_tag_session_message_idx ON mc_tag (session_id, message_id);
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
-const MIGRATIONS: &[(u32, &str)] = &[(1, MIGRATION_V1), (2, MIGRATION_V2)];
+const MIGRATIONS: &[(u32, &str)] = &[(1, MIGRATION_V1), (2, MIGRATION_V2), (3, MIGRATION_V3)];
 
 /// All indexes the migration creates: V1's verbatim from upstream
 /// (`packages/core/src/database/schema.gen.ts`), plus ox-owned `mc_*` indexes
@@ -199,6 +228,7 @@ const EXPECTED_INDEXES: &[&str] = &[
     "mc_memory_project_idx",
     "mc_note_session_idx",
     "mc_historian_run_session_idx",
+    "mc_tag_session_message_idx",
 ];
 
 /// Tables created by the embedded migration, in creation order.
@@ -216,6 +246,8 @@ const EXPECTED_TABLES: &[&str] = &[
     "mc_memory",
     "mc_note",
     "mc_historian_run",
+    "mc_tag",
+    "mc_drop",
 ];
 
 /// Async handle to the SQLite database.
@@ -333,11 +365,11 @@ mod tests {
     #[tokio::test]
     async fn migration_tracks_user_version_and_is_idempotent() {
         let db = Db::open_in_memory().await.unwrap();
-        assert_eq!(db.user_version().await, 2);
+        assert_eq!(db.user_version().await, 3);
         // Re-running must be a no-op: version stays, no error.
         db.migrate().await.unwrap();
         db.migrate().await.unwrap();
-        assert_eq!(db.user_version().await, 2);
+        assert_eq!(db.user_version().await, 3);
     }
 
     #[tokio::test]
@@ -359,6 +391,7 @@ mod tests {
             vec![
                 "mc_compartments",
                 "mc_compartments_session_idx",
+                "mc_drop",
                 "mc_frozen_state",
                 "mc_historian_run",
                 "mc_historian_run_session_idx",
@@ -366,6 +399,8 @@ mod tests {
                 "mc_memory_project_idx",
                 "mc_note",
                 "mc_note_session_idx",
+                "mc_tag",
+                "mc_tag_session_message_idx",
             ]
         );
     }
@@ -381,7 +416,7 @@ mod tests {
             conn.pragma_update(None, "user_version", 1).unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await, 2);
+        assert_eq!(db.user_version().await, 3);
         for table in [
             "mc_frozen_state",
             "mc_compartments",
@@ -394,6 +429,58 @@ mod tests {
                 "expected table {table} after upgrade"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn migration_v3_upgrades_an_existing_v2_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade3.db");
+        // Build a v2 database by hand: apply V1+V2 and stamp version 2.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(MIGRATION_V2).unwrap();
+            conn.pragma_update(None, "user_version", 2).unwrap();
+        }
+        let db = Db::open(&path).await.unwrap();
+        assert_eq!(db.user_version().await, 3);
+        for table in ["mc_tag", "mc_drop"] {
+            assert!(
+                db.table_exists(table).await.unwrap(),
+                "expected table {table} after upgrade"
+            );
+        }
+        // The mc_drop default state and the tag lookup index survive the
+        // upgrade path exactly as on a fresh database.
+        let indexes = db
+            .conn()
+            .call(|c| -> rusqlite::Result<i64> {
+                c.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='mc_tag_session_message_idx'",
+                    [],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(indexes, 1);
+        let db2 = Db::open_in_memory().await.unwrap();
+        db2.conn()
+            .call(|c| -> rusqlite::Result<()> {
+                c.execute(
+                    "INSERT INTO mc_drop (session_id, tag, reason, created_at) VALUES ('s', 7, 'r', 0)",
+                    [],
+                )?;
+                let state: String = c.query_row(
+                    "SELECT state FROM mc_drop WHERE session_id = 's' AND tag = 7",
+                    [],
+                    |row| row.get(0),
+                )?;
+                assert_eq!(state, "queued", "state column defaults to 'queued'");
+                Ok(())
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

@@ -387,10 +387,10 @@ impl Tool for EchoTool {
 }
 
 /// A registry holding exactly one tool.
-fn registry_with(tool: Arc<dyn Tool>) -> Arc<ToolRegistry> {
+fn registry_with(tool: Arc<dyn Tool>) -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     registry.register(tool).expect("register");
-    Arc::new(registry)
+    registry
 }
 
 // ---------------------------------------------------------------------------
@@ -427,11 +427,11 @@ impl Drop for Harness {
 impl Harness {
     /// Spawn the server with the given chat scripts and an empty registry.
     async fn spawn(scripts: Vec<Script>) -> Self {
-        Self::spawn_with(scripts, Arc::new(ToolRegistry::new())).await
+        Self::spawn_with(scripts, ToolRegistry::new()).await
     }
 
     /// Spawn the server with the given chat scripts and tool registry.
-    async fn spawn_with(scripts: Vec<Script>, tools: Arc<ToolRegistry>) -> Self {
+    async fn spawn_with(scripts: Vec<Script>, tools: ToolRegistry) -> Self {
         let port = free_port();
         let dir = tempfile::tempdir().expect("tempdir");
         let config = Config {

@@ -31,9 +31,11 @@ pub mod webfetch;
 pub mod write;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 
+use crate::db::Db;
 use crate::runner::{Tool, ToolOutput, ToolRegistry};
 
 /// The eight built-in tools, registered under their upstream names.
@@ -55,7 +57,29 @@ impl ToolRegistry {
     }
 }
 
-use std::sync::Arc;
+/// The magic-context tools (`ctx_reduce`, `ctx_expand`), registered ON TOP
+/// of `with_builtins` at app-wiring time.
+impl ToolRegistry {
+    /// Register the two magic-context tools. Deliberately separate from
+    /// [`ToolRegistry::with_builtins`]:
+    ///
+    /// 1. They hold a [`Db`] handle (the `mc_tag`/`mc_drop` tables), which
+    ///    only exists after the DB is opened — `with_builtins` runs before
+    ///    that.
+    /// 2. They must only be advertised when `magic_context.enabled` — a
+    ///    default-off config keeps the advertised toolset byte-identical
+    ///    (Task 1's zero-behavior-change guarantee), and the tool list is
+    ///    part of the provider request.
+    ///
+    /// Called exactly once from `build_state_with`. Session scoping needs no
+    /// dispatch change: `ToolContext` already carries `session_id`.
+    pub fn register_mctx(&mut self, db: Db) {
+        self.register_all(vec![
+            Arc::new(crate::mctx::tools::CtxReduceTool::new(db.clone())) as Arc<dyn Tool>,
+            Arc::new(crate::mctx::tools::CtxExpandTool::new(db)),
+        ]);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Shared model-facing error/output helpers
