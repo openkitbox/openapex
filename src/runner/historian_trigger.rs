@@ -52,12 +52,40 @@ pub(crate) fn mctx_historian(ctx: &DrainCtx, floor: i64) {
     let db = ctx.db.clone();
     let config = ctx.config.clone();
     let chat = Arc::clone(&ctx.chat);
+    let bus = ctx.bus.clone();
     let session_id = ctx.session_id.clone();
     let project = ctx.directory.to_string_lossy().into_owned();
     tokio::spawn(async move {
-        if let Err(error) = fire_historian(&db, &config, &chat, &session_id, &project, floor).await
-        {
-            tracing::warn!(session = %session_id, error = %error, "historian run failed");
+        match fire_historian(&db, &config, &chat, &session_id, &project, floor).await {
+            Ok(Some(published)) => {
+                // A transcript notice: a fold is background work with no tool
+                // call of its own, so without this the only trace is the head
+                // changing under the conversation. `text` is empty — the model
+                // already has the compartments — so only the human-facing
+                // `description` is set (the TUI renders it as a `◈` row).
+                let notice = crate::schema::event::SessionEventData::SessionSynthetic {
+                    session_id: session_id.clone(),
+                    text: String::new(),
+                    description: Some(format!(
+                        "historian folded {} · {} compartment{}",
+                        published.covered,
+                        published.compartments,
+                        if published.compartments == 1 { "" } else { "s" }
+                    )),
+                    metadata: None,
+                };
+                if let Err(error) = bus.publish(notice).await {
+                    tracing::warn!(
+                        session = %session_id,
+                        error = %error,
+                        "publish the fold notice failed"
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(session = %session_id, error = %error, "historian run failed");
+            }
         }
     });
 }
@@ -71,21 +99,21 @@ async fn fire_historian(
     session_id: &str,
     project: &str,
     floor: i64,
-) -> Result<()> {
+) -> Result<Option<Published>> {
     let rows = rows_after_with_seq(db, session_id, floor).await?;
     if rows.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     // One pending run per session: a second step in the same burst must not
     // summarize the same range twice. The durable `running` row is the claim
     // (a crash leaves it, and `settle_running_runs` clears it at startup).
     if historian_has_running_run(db, session_id).await? {
-        return Ok(());
+        return Ok(None);
     }
     // The whole tail's estimate, measured by the chunker itself so the pressure
     // and the budget speak the same units.
     let Some(whole) = historian::chunk(&rows, floor + 1, i64::MAX, usize::MAX) else {
-        return Ok(());
+        return Ok(None);
     };
     let trigger = historian::trigger(
         whole.token_estimate as f64,
@@ -105,18 +133,18 @@ async fn fire_historian(
         "historian pressure"
     );
     if trigger == historian::Trigger::No {
-        return Ok(());
+        return Ok(None);
     }
 
     // The newest row is never covered: it is the turn in flight. Everything
     // older competes for the chunk budget, which stops the run at the fence.
     let Some((last_ordinal, _)) = rows.last() else {
-        return Ok(());
+        return Ok(None);
     };
     let eligible_end = *last_ordinal;
     let chunk_budget = (DEFAULT_HISTORY_BUDGET_TOKENS * CHUNK_BUDGET_SHARE) as usize;
     let Some(chunk) = historian::chunk(&rows, floor + 1, eligible_end, chunk_budget) else {
-        return Ok(());
+        return Ok(None);
     };
 
     let compartments = compartments::load(db, session_id).await?;
@@ -162,7 +190,18 @@ async fn fire_historian(
         compartments = outcome.compartment_ids.len(),
         "historian published"
     );
-    Ok(())
+    Ok(Some(Published {
+        covered: format!("{}..{}", chunk.start_ordinal, chunk.end_ordinal),
+        compartments: outcome.compartment_ids.len(),
+    }))
+}
+
+/// What one published run folded, for the transcript notice.
+struct Published {
+    /// Ordinal range the run covered (`a..b`).
+    covered: String,
+    /// Compartments the run published.
+    compartments: usize,
 }
 
 /// Whether this session already has a run in flight. A row is `running` from
@@ -260,6 +299,8 @@ mod tests {
                 provider: "cardinal".to_owned(),
                 id: "m".to_owned(),
                 name: Some("m".to_owned()),
+                context: None,
+                output: None,
             }],
             default_model: Some("cardinal/m".to_owned()),
             magic_context: MctxConfig {
@@ -351,9 +392,12 @@ mod tests {
         );
 
         let chat: Arc<dyn Chat> = Arc::new(TextChat::new(&valid_output(1, 4)));
-        fire_historian(&db, &config, &chat, SESSION, "/p", 0)
+        let published = fire_historian(&db, &config, &chat, SESSION, "/p", 0)
             .await
-            .expect("a published run");
+            .expect("a published run")
+            .expect("the run folded something");
+        assert_eq!(published.covered, "1..4");
+        assert_eq!(published.compartments, 1);
 
         let compartments = compartments::load(&db, SESSION).await.unwrap();
         assert_eq!(compartments.len(), 1, "one compartment published");
@@ -376,9 +420,12 @@ mod tests {
         // and the newest row is fenced off regardless.
         let chat: Arc<dyn Chat> = Arc::new(TextChat::new(&valid_output(1, 2)));
 
-        fire_historian(&db, &config, &chat, SESSION, "/p", 0)
-            .await
-            .expect("a published run");
+        assert!(
+            fire_historian(&db, &config, &chat, SESSION, "/p", 0)
+                .await
+                .expect("a published run")
+                .is_some()
+        );
 
         let compartments = compartments::load(&db, SESSION).await.unwrap();
         assert_eq!(compartments.len(), 1, "the tail was foldable");
@@ -397,9 +444,12 @@ mod tests {
         let mock = Arc::new(TextChat::new(&valid_output(1, 2)));
         let chat: Arc<dyn Chat> = mock.clone();
 
-        fire_historian(&db, &config, &chat, SESSION, "/p", 0)
-            .await
-            .expect("no work is not an error");
+        assert!(
+            fire_historian(&db, &config, &chat, SESSION, "/p", 0)
+                .await
+                .expect("no work is not an error")
+                .is_none()
+        );
 
         assert!(mock.requests().is_empty(), "no completion for a quiet tail");
         assert!(compartments::load(&db, SESSION).await.unwrap().is_empty());
@@ -423,9 +473,12 @@ mod tests {
         let config = config();
         let mock = Arc::new(TextChat::new(&valid_output(1, 2)));
         let chat: Arc<dyn Chat> = mock.clone();
-        fire_historian(&db, &config, &chat, SESSION, "/p", 0)
-            .await
-            .expect("a skipped firing is not an error");
+        assert!(
+            fire_historian(&db, &config, &chat, SESSION, "/p", 0)
+                .await
+                .expect("a skipped firing is not an error")
+                .is_none()
+        );
 
         assert!(mock.requests().is_empty(), "one run at a time");
         assert!(compartments::load(&db, SESSION).await.unwrap().is_empty());

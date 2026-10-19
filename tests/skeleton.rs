@@ -179,6 +179,8 @@ async fn model_catalog_serves_provider_and_default() {
         provider: provider.to_owned(),
         id: id.to_owned(),
         name: Some(name.to_owned()),
+        context: None,
+        output: None,
     };
     let (base, handle, _dir) = spawn_server_with(Config {
         models: vec![

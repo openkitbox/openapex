@@ -43,6 +43,15 @@ pub struct ModelEntry {
     pub id: String,
     /// Human-readable display name.
     pub name: Option<String>,
+    /// Context window in tokens. Drives the client's context-usage
+    /// percentage (it divides the last assistant turn's tokens by this), so a
+    /// missing value means the client shows a raw token count with no
+    /// percentage rather than a wrong one.
+    #[serde(default)]
+    pub context: Option<i64>,
+    /// Maximum output tokens, when the provider states one.
+    #[serde(default)]
+    pub output: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -207,6 +216,8 @@ mod tests {
             provider: provider.to_owned(),
             id: id.to_owned(),
             name: None,
+            context: None,
+            output: None,
         };
         let mut cfg = Config {
             models: vec![entry("cardinal", "k3-256k"), entry("cardinal", "glm-5")],

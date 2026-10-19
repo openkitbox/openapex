@@ -325,8 +325,8 @@ fn model_info(m: &crate::config::ModelEntry) -> ModelInfo {
         status: "active",
         enabled: true,
         limit: ModelLimit {
-            context: 0,
-            output: 0,
+            context: m.context.unwrap_or(0),
+            output: m.output.unwrap_or(0),
         },
     }
 }

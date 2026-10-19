@@ -54,6 +54,31 @@ every row is re-embedded by the same backfill instead of being compared across
 vector spaces. A search whose embedding call fails degrades to the index with a
 warning.
 
+Comparison is an in-memory cosine over the stored `f32` bytes (`src/mctx/embed.rs`);
+ox does not use turso's built-in vector index — only the FTS indexes are turso's.
+
+Verified end to end against a running instance (2026-10-19): a memory written with
+`ctx_memory`, then queried as *"which storage engine keeps the durable rows and
+the inverted word index"* — a query sharing **no literal word** with the stored
+text (`turso`, `ox.db`, `Tantivy`, `fts` all absent) — returned that memory as
+`[memory] id=#4`. That is semantic retrieval, not a keyword hit.
+
+## What the client shows
+
+- **Context percentage.** The TUI divides the last assistant turn's tokens
+  (input + output + reasoning + cache read/write) by the model's
+  `limit.context` (`packages/tui/src/util/session.ts:46-63`). ox serves that
+  number from `[[models]]`: add `context = 262144` (and optionally
+  `output = 32768`). Without it the client shows the token count and no
+  percentage — never a guessed one.
+- **Memory-operation notice lines.** When a historian run publishes
+  compartments, ox appends a `synthetic` message with an empty `text` and a
+  `description` such as `historian folded 99..155 · 1 compartment`. The TUI
+  renders that as an inline `◈` notice row in the transcript, and because the
+  text is empty the model never pays for it. Memory *tool* calls
+  (`ctx_memory`, `ctx_reduce`, …) already appear as their own tool rows, so
+  they need no notice.
+
 ## Operator signals
 
 - `historian pressure tail_tokens=… trigger=Forced|Speculative|No` (debug) — the
@@ -73,6 +98,11 @@ warning.
   fts`, which stock SQLite (and therefore upstream opencode) cannot parse, and
   it takes an exclusive lock on the file. External tools cannot read the
   database while ox runs; inspect through ox's API or a turso probe instead.
+  The schema incompatibility is not only a locking matter: even with the lock
+  bypassed (`mode=ro&immutable=1`), SQLite fails on the first schema read with
+  `malformed database schema (__turso_internal_fts_dir_mc_memory_fts_key) - near
+  "USING": syntax error`. A pre-migration copy lives at `~/.ox/ox.db.pre-turso`,
+  but it stops at the moment of the switch.
 - **Hidden completions are real completions.** A historian run summarizes up to
   75% of the history budget; the dreamer only fires when a project holds
   memories whose cited files changed (or two memories share a category).

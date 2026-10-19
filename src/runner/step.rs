@@ -1289,6 +1289,12 @@ pub(crate) fn build_chat_messages(
                 out.push(ChatMessage::User { content });
             }
             Message::Synthetic { text, .. } | Message::Skill { text, .. } => {
+                // A synthetic row with no text is display-only (a background
+                // notice: its `description` is what the transcript shows), so
+                // it must not become an empty user turn for the model.
+                if text.is_empty() {
+                    continue;
+                }
                 out.push(ChatMessage::User {
                     content: text.clone(),
                 })
@@ -1539,6 +1545,33 @@ mod tests {
         AssistantContent, AssistantMessage, AssistantTime, Message, TimeCreated,
     };
     use crate::schema::support::{ModelRef, Prompt};
+
+    /// A display-only notice must not become an empty user turn.
+    #[test]
+    fn an_empty_synthetic_notice_adds_no_message() {
+        let messages = vec![
+            Message::Synthetic {
+                id: "msg_1".to_owned(),
+                metadata: None,
+                time: TimeCreated { created: 0 },
+                text: String::new(),
+                description: Some("historian folded 1..4 · 1 compartment".to_owned()),
+            },
+            Message::Synthetic {
+                id: "msg_2".to_owned(),
+                metadata: None,
+                time: TimeCreated { created: 0 },
+                text: "real guidance".to_owned(),
+                description: None,
+            },
+        ];
+        let built = build_chat_messages("system", &[], &messages);
+        assert_eq!(built.len(), 2, "system + the one with text: {built:?}");
+        assert!(matches!(
+            &built[1],
+            ChatMessage::User { content } if content == "real guidance"
+        ));
+    }
 
     // Gap: upstream usage.ts maps `input` to the NON-cached prompt tokens —
     // input + cache.read must reconstruct prompt_tokens exactly once.

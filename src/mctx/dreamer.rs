@@ -1984,6 +1984,8 @@ mod tests {
             provider: "cardinal".to_owned(),
             id: "k3-256k".to_owned(),
             name: None,
+            context: None,
+            output: None,
         }];
         config
     }
