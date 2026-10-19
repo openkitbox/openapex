@@ -9,11 +9,12 @@
 //! `ctx_expand`, which reads the ORIGINAL content back from the raw
 //! `session_message` store — nothing is ever lost.
 //!
-//! Module layout: the tag identity store and the drop queue live here
-//! together (one module owns the whole tag lifecycle: mint → queue → drain
-//! → recover); the `ctx_reduce`/`ctx_expand` tool shells are in
-//! [`crate::mctx::tools`], and the actual live-array rewriting ([dropped
-//! §N§] placeholders) is the Task-5 renderer's job.
+//! Module layout: the tag identity store, the drop queue and the request-side
+//! overlay live here together (one module owns the whole tag lifecycle: mint →
+//! render → queue → drain → recover); the `ctx_reduce`/`ctx_expand` tool shells
+//! are in [`crate::mctx::tools`], and [`apply_overlay`] is the request-assembly
+//! half — it renders the tag beside each item and substitutes an applied drop's
+//! content with its placeholder.
 //!
 //! ## `part_path` — the stable addressing scheme
 //!
@@ -277,8 +278,137 @@ fn digest_hex(content: &str) -> String {
     format!("{hash:016x}")
 }
 
-/// Detailed queue outcome for the tool layer's per-tag reporting; the plain
-/// [`queue_drop`] collapses it to `true = Queued`.
+/// Every drop row for a session: tag → lifecycle state.
+pub async fn drops(db: &Db, session_id: &str) -> Result<HashMap<u64, DropState>> {
+    let session = session_id.to_owned();
+    let rows: Vec<(i64, String)> = db
+        .conn()
+        .call(move |c| {
+            let mut stmt = c.prepare("SELECT tag, state FROM mc_drop WHERE session_id = ?1")?;
+            let rows = stmt.query_map([&session], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+        })
+        .await
+        .context("load mctx drops")?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(tag, state)| drop_state_of(Some(state)).map(|state| (tag as u64, state)))
+        .collect())
+}
+
+/// The placeholder that stands in for a dropped item's content.
+fn dropped_placeholder(tag: u64) -> String {
+    format!("[dropped §{tag}§]")
+}
+
+/// Apply the §N§ overlay to decoded message JSONs, in place — the request-side
+/// half of the tag lifecycle.
+///
+/// Every taggable item gets its tag prepended (`§N§ text`), so the model can
+/// address it with `ctx_reduce`. An item under an APPLIED drop has its content
+/// replaced by the placeholder instead: the content left the live array and
+/// `ctx_expand` is the way back. A QUEUED drop changes nothing here — stamping
+/// only queues, the item stays fully readable until the mark materializes.
+///
+/// This is the inverse of [`taggable_items`]; the two must stay in step (each
+/// `part_path` shape is resolved by both).
+pub fn apply_overlay(messages: &mut [Value], tags: &[TaggedItem], drops: &HashMap<u64, DropState>) {
+    // Group by message so each row is walked once.
+    let mut by_message: HashMap<&str, Vec<&TaggedItem>> = HashMap::new();
+    for item in tags {
+        by_message
+            .entry(item.message_id.as_str())
+            .or_default()
+            .push(item);
+    }
+    for message in messages.iter_mut() {
+        let Some(id) = message.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(items) = by_message.get(id) else {
+            continue;
+        };
+        for item in items {
+            let dropped = matches!(drops.get(&item.tag), Some(DropState::Applied));
+            let placeholder = dropped.then(|| dropped_placeholder(item.tag));
+            let Some(part) = resolve_part(message, &item.part_path) else {
+                continue;
+            };
+            match part {
+                Addressed::Text(text) => {
+                    *text = match placeholder {
+                        Some(placeholder) => placeholder,
+                        None => format!("§{}§ {text}", item.tag),
+                    };
+                }
+                Addressed::ToolState(state) => {
+                    if let Some(placeholder) = placeholder {
+                        // Keep the call's arguments (the reference keeps the call
+                        // with real arguments and reduces only the result) and
+                        // replace what the result carried.
+                        let input = state.get("input").cloned().unwrap_or(Value::Null);
+                        *state = serde_json::json!({
+                            "status": "completed",
+                            "input": input,
+                            "content": [ { "type": "text", "text": placeholder } ],
+                        });
+                        continue;
+                    }
+                    // Tools are tagged on their serialized state; a readable
+                    // prefix on the result text is what the model needs.
+                    let Some(slot) = state
+                        .get_mut("content")
+                        .and_then(Value::as_array_mut)
+                        .and_then(|content| content.first_mut())
+                        .and_then(|part| part.get_mut("text"))
+                    else {
+                        continue;
+                    };
+                    let Some(text) = slot.as_str() else { continue };
+                    let tagged = format!("§{}§ {text}", item.tag);
+                    *slot = Value::String(tagged);
+                }
+            }
+        }
+    }
+}
+
+/// A mutable handle to the text an item's `part_path` addresses.
+enum Addressed<'a> {
+    /// A plain text slot (`data.text`, or a `text`/`reasoning` part's `text`).
+    Text(&'a mut String),
+    /// A tool part's `state` object.
+    ToolState(&'a mut Value),
+}
+
+/// Resolve a `part_path` against one decoded message (the set-side inverse of
+/// [`taggable_items`]).
+fn resolve_part<'a>(message: &'a mut Value, part_path: &str) -> Option<Addressed<'a>> {
+    if part_path == "text" {
+        return message.get_mut("text").and_then(|value| match value {
+            Value::String(text) => Some(Addressed::Text(text)),
+            _ => None,
+        });
+    }
+    let parts = message.get_mut("content").and_then(Value::as_array_mut)?;
+    if let Some(id) = part_path.strip_prefix("tool:") {
+        let part = parts
+            .iter_mut()
+            .find(|part| part.get("id").and_then(Value::as_str) == Some(id))?;
+        return part.get_mut("state").map(Addressed::ToolState);
+    }
+    let index: usize = part_path
+        .strip_prefix("content[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()?;
+    let part = parts.get_mut(index)?;
+    part.get_mut("text").and_then(|value| match value {
+        Value::String(text) => Some(Addressed::Text(text)),
+        _ => None,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueueOutcome {
     /// The mark is (now) queued.
@@ -941,6 +1071,84 @@ mod tests {
         assert_ne!(one, digest_hex("hello worlD"));
         // FNV-1a 64-bit offset basis (empty input).
         assert_eq!(digest_hex(""), "cbf29ce484222325");
+    }
+
+    #[test]
+    fn overlay_tags_every_kind_and_leaves_queued_content_readable() {
+        let mut messages = sample_messages();
+        let tags = vec![
+            TaggedItem {
+                tag: 1,
+                message_id: "msg_u1".into(),
+                part_path: "text".into(),
+            },
+            TaggedItem {
+                tag: 2,
+                message_id: "msg_a1".into(),
+                part_path: "content[0]".into(),
+            },
+            TaggedItem {
+                tag: 3,
+                message_id: "msg_a1".into(),
+                part_path: "tool:call_1".into(),
+            },
+        ];
+        // A queued (not applied) drop changes nothing: stamping only queues.
+        let queued = HashMap::from([(1u64, DropState::Queued)]);
+        apply_overlay(&mut messages, &tags, &queued);
+        assert_eq!(messages[0]["text"], json!("§1§ hello world"));
+        assert_eq!(
+            messages[1]["content"][0]["text"],
+            json!("§2§ thinking out loud")
+        );
+        assert_eq!(
+            messages[1]["content"][2]["state"]["content"][0]["text"],
+            json!("§3§ file body"),
+            "tool results carry their tag on the result text"
+        );
+    }
+
+    #[test]
+    fn overlay_replaces_applied_drop_content_with_the_placeholder() {
+        let mut messages = sample_messages();
+        let tags = vec![
+            TaggedItem {
+                tag: 1,
+                message_id: "msg_u1".into(),
+                part_path: "text".into(),
+            },
+            TaggedItem {
+                tag: 3,
+                message_id: "msg_a1".into(),
+                part_path: "tool:call_1".into(),
+            },
+        ];
+        let applied = HashMap::from([(1u64, DropState::Applied), (3u64, DropState::Applied)]);
+        apply_overlay(&mut messages, &tags, &applied);
+
+        assert_eq!(
+            messages[0]["text"],
+            json!("[dropped §1§]"),
+            "the content left the live array; ctx_expand is the way back"
+        );
+        let state = &messages[1]["content"][2]["state"];
+        assert_eq!(state["content"][0]["text"], json!("[dropped §3§]"));
+        assert_eq!(
+            state["input"],
+            json!({ "path": "a.txt" }),
+            "the call keeps its real arguments (only the result is reduced)"
+        );
+    }
+
+    #[test]
+    fn overlay_leaves_untagged_rows_alone() {
+        let mut messages = sample_messages();
+        apply_overlay(&mut messages, &[], &HashMap::new());
+        assert_eq!(messages[0]["text"], json!("hello world"));
+        assert_eq!(
+            messages[1]["content"][0]["text"],
+            json!("thinking out loud")
+        );
     }
 
     #[tokio::test]

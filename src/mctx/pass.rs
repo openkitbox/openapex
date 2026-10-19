@@ -22,14 +22,17 @@
 //! row): a `Soft` folds new coverage into the delta while the baseline stays
 //! frozen at the ordinal it was built at, so the two only coincide on a `Hard`.
 //!
-//! ## Not implemented here (explicit deferral)
+//! ## The drop contract, both halves
 //!
-//! The head carries `[dropped §N§]` placeholders for queued drops, but the drop
-//! does NOT rewrite the live transcript: `Tagger::assign` has no production
-//! caller yet, so no `§N§` tag is rendered beside a transcript item and a drop
-//! of a row above the floor leaves that row's raw content in the tail. Wiring
-//! the tagger pass and the tail rewrite belongs with the request-assembly work
-//! (Task 5b), not with the head producer.
+//! This module produces the head half: a queued drop's `[dropped §N§]`
+//! placeholder rides the head at the next bust, and the bust applies the drops.
+//! The tail half is [`crate::mctx::tagger::apply_overlay`], which runs at
+//! request assembly and replaces an applied drop's content in the live
+//! transcript. A queued drop is itself a bust signal ([`Signals::head_changed`]),
+//! so a stamp takes effect on the next pass and the signal then converges (the
+//! bust empties the queue). A row below the floor is covered by the head alone;
+//! a row above it is covered by the overlay — exactly one placeholder either
+//! way.
 //!
 //! Freeze/replay discipline is NOT re-implemented here: on a defer the kernel
 //! replays the frozen bytes verbatim and this module only plans (it never
@@ -123,20 +126,26 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
         coverage,
     });
 
-    let (frozen_m0, frozen_m1) = frozen_halves(state.as_ref());
-    let signals = Signals {
-        boundary_present: boundary_present(state.as_ref(), coverage, last_seq),
-        forced,
-        run_started,
-        head_changed: state.is_none() || forced || plan.m0 != frozen_m0,
-        delta_changed: plan.m1 != frozen_m1,
-    };
-
     // Queued drops ride the planned units, not the kernel's defer queue: our
     // durable `mc_drop` rows are the carrier ("queued, not immediate" — the
     // placeholder materializes when a bust freezes the prefix, and until then
     // the frozen bytes replay verbatim).
     let drops = peek_queued_drops(db, session_id).await?;
+
+    let (frozen_m0, frozen_m1) = frozen_halves(state.as_ref());
+    let signals = Signals {
+        boundary_present: boundary_present(state.as_ref(), coverage, last_seq),
+        forced,
+        run_started,
+        // A queued drop makes the head itself stale (its placeholder has to
+        // appear beside the frozen history), and it must be a bust: a defer
+        // would replay the frozen bytes and the mark would never take effect.
+        // The signal converges — the bust applies the drops, so the next pass
+        // sees an empty queue.
+        head_changed: state.is_none() || forced || !drops.is_empty() || plan.m0 != frozen_m0,
+        delta_changed: plan.m1 != frozen_m1,
+    };
+
     let mut units = plan.units();
     units.extend(drop_units(&drops));
     let renderer = PrecomputedRenderer {
@@ -656,7 +665,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_queued_drop_waits_for_a_bust_and_is_marked_applied() {
+    async fn a_queued_drop_materializes_on_the_next_pass_and_is_marked_applied() {
         let db = db().await;
         add_compartment(&db, "mc_1", 1, 9, "Alpha").await;
         run(request(&db, 9)).await.unwrap();
@@ -675,24 +684,27 @@ mod tests {
             QueueOutcome::Queued
         ));
 
-        // A defer carries the drop forward and leaves it unapplied.
-        let deferred = run(request(&db, 9)).await.unwrap();
-        assert!(matches!(
-            deferred.outcome,
-            PassOutcome::DeferReplayed { .. }
-        ));
-        let pending = peek_queued_drops(&db, SESSION).await.unwrap();
-        assert_eq!(pending.len(), 1, "the drop is still queued after a defer");
-
-        // The next bust drains it into the prefix and marks it applied.
-        add_compartment(&db, "mc_2", 10, 20, "Beta").await;
-        let busted = run(request(&db, 20)).await.unwrap();
+        // A queued drop makes the head itself stale, so the next pass busts and
+        // the placeholder lands beside the frozen history in one go.
+        let busted = run(request(&db, 9)).await.unwrap();
+        assert!(matches!(busted.outcome, PassOutcome::BustApplied { .. }));
         let head = format!("{}{}", busted.head_m0.unwrap(), busted.head_m1.unwrap());
         assert!(
             head.contains(&format!("[dropped §{tag}§]")),
             "placeholder in head: {head}"
         );
-        assert!(peek_queued_drops(&db, SESSION).await.unwrap().is_empty());
+        assert!(
+            peek_queued_drops(&db, SESSION).await.unwrap().is_empty(),
+            "the bust consumed the queue"
+        );
+
+        // ... and the signal converges: with an empty queue the next pass is a
+        // plain defer again, so a stamp never keeps the prefix churning.
+        let deferred = run(request(&db, 9)).await.unwrap();
+        assert!(matches!(
+            deferred.outcome,
+            PassOutcome::DeferReplayed { .. }
+        ));
     }
 
     #[tokio::test]

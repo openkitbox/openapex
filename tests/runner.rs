@@ -2553,3 +2553,130 @@ async fn memory_pinboard_is_absent_when_disabled() {
     assert!(!head.contains("<project-memory>"), "got: {head}");
     assert!(!head.contains("The pinboard fact"), "got: {head}");
 }
+
+/// The user prompt as the model saw it in the LAST recorded request (the §N§
+/// overlay runs at request assembly, so this is where the tags appear).
+fn last_user_text(harness: &Harness) -> String {
+    harness
+        .chat
+        .requests()
+        .last()
+        .expect("a recorded request")
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            ChatMessage::User { content } => Some(content.clone()),
+            _ => None,
+        })
+        .expect("a user message")
+}
+
+/// Send one prompt in `directory` and wait for one more completed assistant row.
+async fn prompt_turn(
+    harness: &Harness,
+    session_id: &str,
+    directory: &str,
+    text: &str,
+    completions: usize,
+) {
+    let response = harness
+        .client
+        .post(format!("{}/api/session/{session_id}/prompt", harness.base))
+        .header("x-opencode-directory", directory)
+        .json(&json!({ "text": text, "delivery": "queue" }))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(response.status(), 200, "prompt accepted");
+    harness
+        .wait_for(session_id, "assistant completion", |messages| {
+            messages
+                .iter()
+                .filter(|m| m["type"] == "assistant" && m["time"]["completed"].is_number())
+                .count()
+                >= completions
+        })
+        .await;
+}
+
+/// End-to-end §N§ lifecycle: the model sees a tag beside the prompt, a stamp on
+/// that tag takes effect on the next pass, and the stamped content leaves the
+/// request while the way back (`ctx_expand`) stays intact.
+#[tokio::test]
+async fn tags_are_visible_and_an_applied_drop_leaves_the_request() {
+    let harness =
+        Harness::spawn_mctx(vec![MockChat::text("first"), MockChat::text("second")]).await;
+    let project = harness
+        ._dir
+        .path()
+        .canonicalize()
+        .expect("canonical tempdir")
+        .display()
+        .to_string();
+    let session_id = harness.create_session_in(&project).await;
+
+    // Turn 1: the prompt carries tag §1§ (the session's first tagged item), so
+    // the model can address it at all.
+    prompt_turn(&harness, &session_id, &project, "Say hello", 1).await;
+    assert_eq!(
+        last_user_text(&harness),
+        "§1§ Say hello",
+        "the model sees the tag beside the item"
+    );
+
+    // Stamp it through the store, exactly as the ctx_reduce tool does.
+    let tag: i64 = harness
+        .db
+        .conn()
+        .call({
+            let session_id = session_id.clone();
+            move |c| {
+                c.query_row(
+                    "SELECT tag FROM mc_tag WHERE session_id = ?1 AND part_path = 'text'",
+                    [&session_id],
+                    |row| row.get(0),
+                )
+            }
+        })
+        .await
+        .expect("the prompt's tag");
+    assert!(
+        ox::mctx::tagger::queue_drop(&harness.db, &session_id, tag as u64, "used")
+            .await
+            .expect("queue"),
+        "the stamp is accepted"
+    );
+
+    // Turn 2: the stamp materializes on the next pass, so what the model saw in
+    // turn 1 is represented by its placeholder.
+    prompt_turn(&harness, &session_id, &project, "Say hello again", 2).await;
+    let users: Vec<String> = harness
+        .chat
+        .requests()
+        .last()
+        .expect("second request")
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            ChatMessage::User { content } => Some(content.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        users
+            .iter()
+            .any(|text| text.contains(&format!("[dropped §{tag}§]"))),
+        "the dropped item is represented by its placeholder: {users:?}"
+    );
+    assert!(
+        !users
+            .iter()
+            .any(|text| text.starts_with(&format!("§{tag}§ Say hello"))),
+        "the stamped content left the live array: {users:?}"
+    );
+    assert!(
+        users.iter().any(|text| text.contains("Say hello again")),
+        "the new turn is present: {users:?}"
+    );
+}

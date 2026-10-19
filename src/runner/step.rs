@@ -51,7 +51,7 @@ use std::future::poll_fn;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -199,7 +199,14 @@ pub(crate) async fn run(
         // the frozen bytes and reports the ordinal floor, so the transcript
         // starts after the covered range.
         let (head_m0, head_m1, floor) = mctx_head(ctx).await;
-        let rows = load_history_after(&ctx.db, &ctx.session_id, floor).await?;
+        let rows = if ctx.config.magic_context.enabled {
+            // The §N§ overlay (tag prefixes + drop placeholders) is part of the
+            // integration: with it off the request must stay byte-identical to
+            // the integration-free one.
+            load_overlaid_tail(&ctx.db, &ctx.session_id, floor).await?
+        } else {
+            load_history_after(&ctx.db, &ctx.session_id, floor).await?
+        };
         let system = prompt::build(&ctx.directory);
         let mut request = ChatRequest::new(
             // cardinal routes on the bare model id; the providerID/modelID
@@ -1431,6 +1438,42 @@ pub(crate) async fn load_history_after(
     session_id: &str,
     floor: i64,
 ) -> Result<Vec<Message>> {
+    rows_after(db, session_id, floor)
+        .await?
+        .into_iter()
+        .map(|row| decode_row(&row))
+        .collect()
+}
+
+/// The tail with the magic-context §N§ overlay applied: tags minted (stable
+/// across passes), tag prefixes rendered beside each taggable item, and the
+/// content of an applied drop replaced by its placeholder.
+pub(crate) async fn load_overlaid_tail(
+    db: &crate::db::Db,
+    session_id: &str,
+    floor: i64,
+) -> Result<Vec<Message>> {
+    let mut rows = rows_after(db, session_id, floor).await?;
+    let tags = crate::mctx::tagger::Tagger
+        .assign(db, session_id, &rows)
+        .await
+        .context("assign §N§ tags")?;
+    let drops = crate::mctx::tagger::drops(db, session_id)
+        .await
+        .context("load drops")?;
+    crate::mctx::tagger::apply_overlay(&mut rows, &tags, &drops);
+    rows.into_iter().map(|row| decode_row(&row)).collect()
+}
+
+/// One `session_message` row as the decoded message JSON: the row's `data`
+/// column with `id`/`type` merged back in, exactly the shape the tagger's
+/// `part_path` addresses (`decode({ ...row.data, id, type })` upstream).
+/// [`decode_row`] reads `id`/`type` off the same object.
+async fn rows_after(
+    db: &crate::db::Db,
+    session_id: &str,
+    floor: i64,
+) -> Result<Vec<serde_json::Value>> {
     let session_id = session_id.to_owned();
     let rows: Vec<(String, String, String)> = db
         .conn()
@@ -1451,10 +1494,26 @@ pub(crate) async fn load_history_after(
         .await?;
     rows.into_iter()
         .map(|(id, kind, data)| {
-            let value = serde_json::from_str(&data)?;
-            Ok(Message::from_row_data(&id, &kind, value)?)
+            let mut value: serde_json::Value = serde_json::from_str(&data)?;
+            if let serde_json::Value::Object(map) = &mut value {
+                map.insert("id".to_owned(), serde_json::Value::String(id));
+                map.insert("type".to_owned(), serde_json::Value::String(kind));
+            }
+            Ok(value)
         })
         .collect()
+}
+
+fn decode_row(value: &serde_json::Value) -> Result<Message> {
+    let id = value
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .context("session_message row without an id")?;
+    let kind = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .context("session_message row without a type")?;
+    Ok(Message::from_row_data(id, kind, value.clone())?)
 }
 
 #[cfg(test)]
