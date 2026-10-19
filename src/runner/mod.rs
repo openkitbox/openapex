@@ -26,6 +26,7 @@ pub use crate::cardinal::chat::Chat;
 
 pub(crate) mod compaction;
 pub mod drain;
+mod historian_trigger;
 pub(crate) mod provider_error;
 pub mod step;
 

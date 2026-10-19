@@ -81,6 +81,26 @@ impl Compartment {
         self.coverage_end.trim().parse::<i64>().ok()
     }
 
+    /// Projection into the historian prompt's reference shape (the
+    /// `<session_references>` block: coverage range plus every paraphrase
+    /// tier, no row id and no dates).
+    pub fn reference_input(&self) -> crate::mctx::historian::ReferenceCompartment {
+        crate::mctx::historian::ReferenceCompartment {
+            start_message: self.tiers.start_message,
+            end_message: self.tiers.end_message,
+            title: self.tiers.title.clone(),
+            content: String::new(),
+            p1: self.tiers.p1.clone(),
+            p2: self.tiers.p2.clone(),
+            p3: self.tiers.p3.clone(),
+            p4: self.tiers.p4.clone(),
+            importance: Some(self.importance.round().clamp(1.0, 100.0) as i32),
+            // ox's compartment rows carry no episode type: the reference uses
+            // it only for its own prompt labels.
+            episode_type: None,
+        }
+    }
+
     /// Projection into the decay renderer's input shape.
     pub fn render_input(&self) -> DecayRenderCompartment {
         DecayRenderCompartment {

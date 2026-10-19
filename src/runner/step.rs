@@ -199,6 +199,9 @@ pub(crate) async fn run(
         // the frozen bytes and reports the ordinal floor, so the transcript
         // starts after the covered range.
         let (head_m0, head_m1, floor) = mctx_head(ctx).await;
+        // Pressure is checked after the pass: the floor it reports is what the
+        // live tail is measured above.
+        super::historian_trigger::mctx_historian(ctx, floor);
         let rows = if ctx.config.magic_context.enabled {
             // The §N§ overlay (tag prefixes + drop placeholders) is part of the
             // integration: with it off the request must stay byte-identical to
