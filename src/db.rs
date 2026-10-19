@@ -399,8 +399,14 @@ pub struct Db {
     write_gate: Arc<Mutex<()>>,
 }
 
-/// Most connections ox will hold open at once (idle ones are kept for reuse).
+/// Most connections ox will hold open at once.
 const MAX_CONNECTIONS: usize = 8;
+
+/// Connections kept for reuse after a burst. The rest are closed, releasing
+/// their page caches: a single-user server's steady state is one reader plus
+/// the occasional writer, and each idle connection costs memory (the reason
+/// this server exists).
+const MAX_IDLE: usize = 2;
 
 impl Db {
     /// Open (creating if needed) the database at `path` and apply migrations.
@@ -589,7 +595,7 @@ impl Drop for Conn<'_> {
             handle.spawn(async move {
                 let _ = conn.execute("ROLLBACK", ()).await;
                 let mut idle = idle.lock().await;
-                if idle.len() < MAX_CONNECTIONS {
+                if idle.len() < MAX_IDLE {
                     idle.push(conn);
                 }
             });
@@ -597,7 +603,7 @@ impl Drop for Conn<'_> {
         }
         // `try_lock` is enough: an idle slot is an optimisation.
         if let Ok(mut idle) = self.db.idle.try_lock()
-            && idle.len() < MAX_CONNECTIONS
+            && idle.len() < MAX_IDLE
         {
             idle.push(conn);
         }
