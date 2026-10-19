@@ -154,6 +154,9 @@ pub(crate) async fn write_memory(
 
 /// Rewrite one memory. `category` omitted keeps the stored one. `false` =
 /// no such id in this project.
+///
+/// A rewrite clears `verified_at`: the claims are new text, so the old
+/// verification says nothing about them.
 pub(crate) async fn update_memory(
     db: &Db,
     project: &str,
@@ -168,7 +171,8 @@ pub(crate) async fn update_memory(
         let changed = match category {
             Some(category) => {
                 conn.execute(
-                    "UPDATE mc_memory SET content = ?3, category = ?4, updated_at = ?5
+                    "UPDATE mc_memory SET content = ?3, category = ?4, updated_at = ?5,
+                         verified_at = 0
                          WHERE project = ?1 AND id = ?2",
                     (project, id, content, category, now),
                 )
@@ -176,7 +180,7 @@ pub(crate) async fn update_memory(
             }
             None => {
                 conn.execute(
-                    "UPDATE mc_memory SET content = ?3, updated_at = ?4
+                    "UPDATE mc_memory SET content = ?3, updated_at = ?4, verified_at = 0
                          WHERE project = ?1 AND id = ?2",
                     (project, id, content, now),
                 )
@@ -292,7 +296,8 @@ pub(crate) async fn merge_memories(
         match category {
             Some(category) => {
                 tx.execute(
-                    "UPDATE mc_memory SET content = ?3, category = ?4, updated_at = ?5
+                    "UPDATE mc_memory SET content = ?3, category = ?4, updated_at = ?5,
+                         verified_at = 0
                      WHERE project = ?1 AND id = ?2",
                     (project, survivor.as_str(), content, category, now),
                 )
@@ -300,7 +305,7 @@ pub(crate) async fn merge_memories(
             }
             None => {
                 tx.execute(
-                    "UPDATE mc_memory SET content = ?3, updated_at = ?4
+                    "UPDATE mc_memory SET content = ?3, updated_at = ?4, verified_at = 0
                      WHERE project = ?1 AND id = ?2",
                     (project, survivor.as_str(), content, now),
                 )
@@ -410,10 +415,14 @@ pub(crate) struct StoredMemory {
     pub content: String,
     /// Last write to the row, in epoch milliseconds.
     pub updated_at: i64,
+    /// Last verification against the cited files, in epoch milliseconds; `0`
+    /// means never verified.
+    pub verified_at: i64,
 }
 
-/// [`active_memories`] with the `updated_at` watermark attached. Kept separate
-/// from the pinboard read: the renderer has no use for the timestamp, and the
+/// [`active_memories`] with both watermarks attached (`updated_at` for the
+/// write, `verified_at` for the dreamer's gate). Kept separate from the
+/// pinboard read: the renderer has no use for the timestamps, and the
 /// dreamer is the only caller that does.
 pub(crate) async fn active_memories_with_watermark(
     db: &Db,
@@ -424,7 +433,7 @@ pub(crate) async fn active_memories_with_watermark(
         let conn = db.acquire().await?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, category, content, updated_at FROM mc_memory
+                "SELECT id, category, content, updated_at, verified_at FROM mc_memory
                  WHERE project = ?1 AND status = 'active'
                  ORDER BY CAST(id AS INTEGER)",
             )
@@ -437,6 +446,7 @@ pub(crate) async fn active_memories_with_watermark(
                 category: row.get(1)?,
                 content: row.get(2)?,
                 updated_at: row.get(3)?,
+                verified_at: row.get(4)?,
             });
         }
         Ok(out)
@@ -469,31 +479,33 @@ pub(crate) async fn projects_with_active_memories(db: &Db) -> Result<Vec<String>
     result.context("enumerate projects with active memories")
 }
 
-/// Advance the "last checked against the code" watermark of the given active
-/// memories: `updated_at = now`, nothing else about the row.
+/// Stamp the "last checked against the cited files" watermark of the given
+/// active memories: `verified_at = at`, nothing else about the row.
 ///
-/// The `verify` task uses this as the reference's per-memory `verified_at`
-/// (`recordMemoryVerifications`): a re-affirmed memory is newer than the files
-/// it cites, so it is not a candidate again until one of them changes. ox has
-/// no `verified_at` column, and `updated_at` is the row's only touch stamp —
-/// which is safe because no render reads it (the pinboard and the historian
-/// block render id, category and content only), so the prompt text and the
-/// prompt cache are unaffected. Returns the number of rows touched.
-pub(crate) async fn touch_memories(db: &Db, project: &str, ids: &[String]) -> Result<usize> {
-    let context = format!("touch memories for project {project}");
-    let now = now_millis();
+/// `at` is the START of the run that produced the verdict, not the moment the
+/// verdict is applied: a file changed while the verification was in flight must
+/// stay newer than the watermark, or that change would only be noticed after
+/// the file changed again. `updated_at` is untouched — a verification is not a
+/// write, and conflating them made an edited memory look freshly verified.
+pub(crate) async fn touch_memories(
+    db: &Db,
+    project: &str,
+    ids: &[String],
+    at: i64,
+) -> Result<usize> {
+    let context = format!("verify memories for project {project}");
     let result: Result<usize> = async {
         let tx = db.begin().await?;
         let mut touched = 0;
         {
             let mut stmt = tx
                 .prepare(
-                    "UPDATE mc_memory SET updated_at = ?3
+                    "UPDATE mc_memory SET verified_at = ?3
                       WHERE project = ?1 AND id = ?2 AND status = 'active'",
                 )
                 .await?;
             for id in ids {
-                touched += stmt.execute((project, id.as_str(), now)).await? as usize;
+                touched += stmt.execute((project, id.as_str(), at)).await? as usize;
             }
         }
         tx.commit().await?;
@@ -1456,6 +1468,44 @@ mod tests {
     }
 
     // ---- memory store ----
+
+    /// The two watermarks are different facts: verifying stamps `verified_at`
+    /// and leaves `updated_at` alone, while a content rewrite clears the
+    /// verification (new text is unverified text).
+    #[tokio::test]
+    async fn verifying_and_rewriting_touch_different_watermarks() {
+        let db = db().await;
+        write_memory(&db, PROJECT, "a fact", "ARCHITECTURE")
+            .await
+            .unwrap();
+        let before = active_memories_with_watermark(&db, PROJECT).await.unwrap();
+        assert_eq!(before[0].verified_at, 0, "a fresh memory is unverified");
+
+        touch_memories(
+            &db,
+            PROJECT,
+            &["1".to_owned()],
+            before[0].updated_at + 5_000,
+        )
+        .await
+        .unwrap();
+        let verified = active_memories_with_watermark(&db, PROJECT).await.unwrap();
+        assert_eq!(verified[0].verified_at, before[0].updated_at + 5_000);
+        assert_eq!(
+            verified[0].updated_at, before[0].updated_at,
+            "a verification is not a write"
+        );
+
+        update_memory(&db, PROJECT, "1", "rewritten fact", None)
+            .await
+            .unwrap();
+        let rewritten = active_memories_with_watermark(&db, PROJECT).await.unwrap();
+        assert_eq!(
+            rewritten[0].verified_at, 0,
+            "the rewritten text has never been verified"
+        );
+        assert!(rewritten[0].updated_at > verified[0].updated_at);
+    }
 
     #[tokio::test]
     async fn write_mints_ascending_ids_and_update_recategorizes() {

@@ -108,22 +108,28 @@
 //!   text already names. A memory that names no path is therefore never a
 //!   verify candidate (the reference's "file-independent" case, which its
 //!   gate also excludes).
-//! - **`verified_at` is banked in `updated_at`, not its own column.** The
-//!   reference keeps a per-memory `verified_at` and drops verified memories out
-//!   of the gate until their file changes again. ox has no such column, so it
-//!   advances the row's only touch stamp, `updated_at`
-//!   ([`memory::touch_memories`]) — cache-neutral, because no render reads a
-//!   memory's `updated_at` (the pinboard and the historian block render id,
-//!   category and content). What is *not* ported is per-memory *resume* after a
-//!   dead batch: ox re-checks the whole remaining batch next slot, so a run's
-//!   progress is all-or-nothing at the batch level. A memory the manifest never
-//!   mentions keeps its old watermark and stays a candidate — which is also why
-//!   ox has no `skip` verdict: "keep it, do not claim verification" is already
-//!   the meaning of omission.
-//! - **`verify`'s gate is mtime-vs-`updated_at`, not mtime-vs-git.** The
+//! - **`verified_at` is its own column** (V9), like the reference's: a
+//!   verification is banked there and drops the memory out of the gate until a
+//!   cited file changes again. The write watermark (`updated_at`) is a
+//!   different fact and does not move on a verification; a content rewrite
+//!   clears `verified_at` to 0, because new text is unverified text. `0` also
+//!   means "this memory has never been checked", which is what makes the first
+//!   slot check it — banking into `updated_at` used to make a freshly written
+//!   memory look already verified, and an edit looked like a fresh check.
+//!   What is *not* ported is per-memory *resume* after a dead batch: ox
+//!   re-checks the whole remaining batch next slot, so a run's progress is
+//!   all-or-nothing at the batch level. A memory the manifest never mentions
+//!   keeps its old watermark and stays a candidate — which is also why ox has no
+//!   `skip` verdict: "keep it, do not claim verification" is already the
+//!   meaning of omission.
+//! - **The watermark is the run's start** ([`memory::touch_memories`]'s `at`),
+//!   not the moment the verdict lands: a file written while the completion was
+//!   in flight stays newer than the watermark and is re-checked next slot
+//!   instead of being silently covered by a verification that never saw it.
+//! - **`verify`'s gate is mtime-vs-`verified_at`, not mtime-vs-git.** The
 //!   reference's incremental mode compares file mtimes against a *git* commit
 //!   watermark; ox compares the file mtime against the memory's own
-//!   `updated_at`, which needs no git and no history scan.
+//!   `verified_at`, which needs no git and no history scan.
 //! - **No `ctx_memory` tool calls by the model.** The reference lets the
 //!   curate child call the memory tool under a category scope;
 //!   ox parses a `curate` manifest and applies it through the same store
@@ -473,7 +479,29 @@ impl Dreamer {
         let projects = memory::projects_with_active_memories(&self.db).await?;
         for project in projects {
             for task in DreamTask::ALL {
-                let state = load_state(&self.db, &project, task).await?;
+                // A host failure on one task is that task's failure: it must not
+                // cancel the rest of the tick (the other tasks, the other
+                // projects, and the results already gathered).
+                let state = match load_state(&self.db, &project, task).await {
+                    Ok(state) => state,
+                    Err(error) => {
+                        tracing::warn!(
+                            project = %project,
+                            task = task.as_str(),
+                            error = %error,
+                            "dreamer could not read its schedule state"
+                        );
+                        report.entries.push(TaskEntry {
+                            project: project.clone(),
+                            task,
+                            status: TickStatus::Failed {
+                                class: FailureClass::Unknown,
+                                message: error.root_cause().to_string(),
+                            },
+                        });
+                        continue;
+                    }
+                };
                 if !is_due(&state, now, interval) {
                     continue;
                 }
@@ -493,8 +521,23 @@ impl Dreamer {
                     });
                     continue;
                 };
-                let outcome = self.run_task(&project, task, &state).await;
-                let status = self.settle(&project, task, now, outcome).await?;
+                let outcome = self.run_task(&project, task, &state, now).await;
+                let status = match self.settle(&project, task, now, outcome).await {
+                    Ok(status) => status,
+                    Err(error) => {
+                        // The task's own work is done; only recording it failed.
+                        tracing::warn!(
+                            project = %project,
+                            task = task.as_str(),
+                            error = %error,
+                            "dreamer could not settle a task"
+                        );
+                        TickStatus::Failed {
+                            class: FailureClass::Unknown,
+                            message: error.root_cause().to_string(),
+                        }
+                    }
+                };
                 drop(guard);
                 report.entries.push(TaskEntry {
                     project: project.clone(),
@@ -573,9 +616,15 @@ impl Dreamer {
 
     /// Run one task. Errors are values, never `?`: a task failing is a normal
     /// tick outcome.
-    async fn run_task(&self, project: &str, task: DreamTask, state: &DreamState) -> TaskOutcome {
+    async fn run_task(
+        &self,
+        project: &str,
+        task: DreamTask,
+        state: &DreamState,
+        started_at: i64,
+    ) -> TaskOutcome {
         match task {
-            DreamTask::Verify => self.run_verify(project).await,
+            DreamTask::Verify => self.run_verify(project, started_at).await,
             DreamTask::Curate => self.run_curate(project, state).await,
         }
     }
@@ -620,7 +669,7 @@ impl Dreamer {
 
     /// `verify`: candidates are memories whose referenced files are missing or
     /// newer than the memory itself; only then is one completion issued.
-    async fn run_verify(&self, project: &str) -> TaskOutcome {
+    async fn run_verify(&self, project: &str, started_at: i64) -> TaskOutcome {
         let memories = match memory::active_memories_with_watermark(&self.db, project).await {
             Ok(memories) => memories,
             Err(error) => return TaskOutcome::Failed(TaskFailure::host("read memories", &error)),
@@ -649,7 +698,7 @@ impl Dreamer {
                 });
             }
         };
-        match apply_verify_manifest(&self.db, project, &batch, &manifest).await {
+        match apply_verify_manifest(&self.db, project, &batch, &manifest, started_at).await {
             Ok(report) => TaskOutcome::Completed {
                 detail: report.describe(),
                 cursor: None,
@@ -881,7 +930,9 @@ struct PathState {
     exists: bool,
     /// The file's mtime in epoch milliseconds, when readable.
     mtime: Option<i64>,
-    /// `mtime > updated_at`: the file changed after the memory was written.
+    /// `mtime > verified_at`: the file changed after the memory was last
+    /// checked against it (a never-verified memory has `verified_at = 0`, so
+    /// every existing file counts as newer and it is checked once).
     newer: bool,
 }
 
@@ -892,7 +943,7 @@ struct PathState {
 fn candidate(project_dir: &str, memory: &memory::StoredMemory) -> Option<Candidate> {
     let paths: Vec<PathState> = referenced_paths(&memory.content)
         .into_iter()
-        .map(|written| inspect(project_dir, &written, memory.updated_at))
+        .map(|written| inspect(project_dir, &written, memory.verified_at))
         .collect();
     if !paths.iter().any(|state| !state.exists || state.newer) {
         return None;
@@ -909,7 +960,7 @@ fn candidate(project_dir: &str, memory: &memory::StoredMemory) -> Option<Candida
 /// Resolve one written path against the project directory and read the
 /// filesystem's answer. A path that cannot be stat'ed counts as missing — the
 /// safe direction, because the model is then asked and may say "still fine".
-fn inspect(project_dir: &str, written: &str, updated_at: i64) -> PathState {
+fn inspect(project_dir: &str, written: &str, verified_at: i64) -> PathState {
     let path = resolve_path(project_dir, written);
     let (exists, mtime) = match path.as_deref().map(std::fs::metadata) {
         Some(Ok(meta)) => {
@@ -927,10 +978,10 @@ fn inspect(project_dir: &str, written: &str, updated_at: i64) -> PathState {
         path,
         written: written.to_owned(),
         mtime,
-        // Strictly newer: a file written in the same millisecond as the memory
-        // is not treated as a change (which would make every freshly written
-        // memory immediately re-check itself).
-        newer: mtime.is_some_and(|mtime| mtime > updated_at),
+        // Strictly newer: a file whose mtime equals the watermark is not a
+        // change. The watermark is the run's START, so anything written during
+        // the verification stays newer and is picked up next time.
+        newer: mtime.is_some_and(|mtime| mtime > verified_at),
     }
 }
 
@@ -1266,14 +1317,14 @@ async fn apply_verify_manifest(
     project: &str,
     batch: &[Candidate],
     manifest: &VerifyManifest,
+    started_at: i64,
 ) -> Result<ApplyReport> {
     let mut report = ApplyReport::default();
-    // The reference banks a `verified_at` per memory, so an unchanged pool is
-    // not re-checked on the next slot; ox banks the same fact in `updated_at`
-    // (the row's only touch stamp — see `memory::touch_memories`). Memories the
-    // manifest omitted keep their old watermark and stay candidates, which is
-    // the reference's "omissions keep their old verified_at, the next run picks
-    // them up".
+    // A `verified` verdict stamps `verified_at` with the run's START, so an
+    // unchanged pool is not re-checked on the next slot while anything written
+    // during this run stays newer and is picked up then. Memories the manifest
+    // omitted keep their old watermark and stay candidates ("omissions keep
+    // their old verified_at, the next run picks them up").
     let banked: Vec<String> = manifest
         .verified
         .iter()
@@ -1287,7 +1338,7 @@ async fn apply_verify_manifest(
         .cloned()
         .collect();
     if !banked.is_empty() {
-        report.verified = memory::touch_memories(db, project, &banked).await?;
+        report.verified = memory::touch_memories(db, project, &banked, started_at).await?;
     }
     for update in &manifest.updates {
         let Some(original) = batch.iter().find(|memory| memory.id == update.id) else {
@@ -1950,6 +2001,20 @@ mod tests {
             category: category.to_owned(),
             content: content.to_owned(),
             updated_at,
+            verified_at: 0,
+        }
+    }
+
+    /// A memory that has already been verified at `verified_at`.
+    fn verified(
+        id: &str,
+        content: &str,
+        updated_at: i64,
+        verified_at: i64,
+    ) -> memory::StoredMemory {
+        memory::StoredMemory {
+            verified_at,
+            ..stored(id, "ARCHITECTURE", content, updated_at)
         }
     }
 
@@ -2245,8 +2310,8 @@ mod tests {
     // -- verify gate and safety --------------------------------------------
 
     /// Acceptance: a missing or newer referenced file is a candidate; no path
-    /// reference (or an unchanged file) is not. The watermark comparison is
-    /// `mtime > updated_at`, checked here against a real file's real mtime.
+    /// reference (or an unchanged file) is not. The comparison is
+    /// `mtime > verified_at`, checked here against a real file's real mtime.
     #[test]
     fn the_gate_candidates_missing_and_newer_files_only() {
         let dir = tempfile::tempdir().unwrap();
@@ -2261,44 +2326,52 @@ mod tests {
             .unwrap()
             .as_millis() as i64;
 
+        // Compared against the verification watermark, NOT the write time: a
+        // freshly written memory has never been verified and must be checked.
+        assert!(
+            candidate(
+                &project,
+                &verified("1", "see arch.md", mtime + 1, mtime + 1)
+            )
+            .is_none(),
+            "verified after the file's last change: no work"
+        );
+        assert!(
+            candidate(
+                &project,
+                &verified("1", "see arch.md", mtime + 1, mtime - 1)
+            )
+            .is_some(),
+            "the file changed since the last check: re-check"
+        );
         assert!(
             candidate(
                 &project,
                 &stored("1", "ARCHITECTURE", "see arch.md", mtime + 1)
             )
-            .is_none(),
-            "the file is no newer than the memory: no work"
+            .is_some(),
+            "never verified (verified_at = 0): the first check happens"
         );
         assert!(
-            candidate(
-                &project,
-                &stored("1", "ARCHITECTURE", "see arch.md", mtime - 1)
-            )
-            .is_some(),
-            "the file is newer than the memory: re-check"
-        );
-        assert!(
-            candidate(
-                &project,
-                &stored("1", "ARCHITECTURE", "see src/gone.rs", mtime)
-            )
-            .is_some(),
+            candidate(&project, &verified("1", "see src/gone.rs", mtime, mtime)).is_some(),
             "a referenced file that no longer exists: re-check"
         );
         assert!(
             candidate(
                 &project,
-                &stored("1", "ARCHITECTURE", "no file is named here", mtime)
+                &verified("1", "no file is named here", mtime, mtime)
             )
             .is_none(),
             "a memory with no path references is never a candidate"
         );
     }
 
-    /// Acceptance: neither a pathless memory nor one whose file is unchanged
-    /// issues a completion.
+    /// Acceptance: a memory is checked the first time the gate sees it, even
+    /// though its files are older than the memory — the gate compares against
+    /// `verified_at` (0 = never), so an unverified memory cannot be skipped
+    /// forever. A pathless memory still costs nothing.
     #[tokio::test]
-    async fn the_verify_gate_costs_an_idle_project_nothing() {
+    async fn an_unverified_memory_is_checked_on_the_first_slot() {
         let db = Db::open_in_memory().await.unwrap();
         let dir = tempfile::tempdir().unwrap();
         let project = project_dir(&dir);
@@ -2332,15 +2405,21 @@ mod tests {
         )
         .await
         .unwrap();
-        let chat = Arc::new(ScriptedChat::text("<verify></verify>"));
+        let chat = Arc::new(ScriptedChat::text(
+            "<verify>\n<verified id=\"2\"/>\n</verify>",
+        ));
         let dreamer = dreamer(&db, chat.clone());
 
         let report = dreamer.tick(NOW).await.unwrap();
         assert!(matches!(
             entry(&report, DreamTask::Verify),
-            Some(TickStatus::Skipped { .. })
+            Some(TickStatus::Completed { .. })
         ));
-        assert_eq!(chat.requests().len(), 0, "an idle project costs nothing");
+        assert_eq!(
+            chat.requests().len(),
+            1,
+            "exactly the memory with citations, never the pathless one"
+        );
     }
 
     /// A verified memory is banked: its watermark moves past the file that made
@@ -2370,7 +2449,11 @@ mod tests {
         ));
         let dreamer = dreamer(&db, chat.clone());
 
-        let report = dreamer.tick(NOW).await.unwrap();
+        // A real clock for this test: the watermark is compared against file
+        // mtimes, so an injected past `now` would leave every file looking
+        // newer than the verification that just covered it.
+        let now = now_millis();
+        let report = dreamer.tick(now).await.unwrap();
         assert!(matches!(
             entry(&report, DreamTask::Verify),
             Some(TickStatus::Completed { .. })
@@ -2387,14 +2470,18 @@ mod tests {
             .unwrap()
             .as_millis() as i64;
         assert!(
-            banked[0].updated_at >= mtime,
-            "verifying moves the memory's watermark up to the file's age"
+            banked[0].verified_at >= mtime,
+            "verifying stamps the run's start as the verification watermark"
+        );
+        assert!(
+            banked[0].updated_at < banked[0].verified_at,
+            "a verification is not a write: updated_at must not move"
         );
         assert_eq!(banked[0].content, "The layout is described in arch.md.");
 
         // Due again next slot, but the gate now finds nothing: the watermark is
         // newer than the file, so no completion is issued.
-        let report = dreamer.tick(NOW + SLOT).await.unwrap();
+        let report = dreamer.tick(now + SLOT).await.unwrap();
         assert!(matches!(
             entry(&report, DreamTask::Verify),
             Some(TickStatus::Skipped { .. })
@@ -2408,9 +2495,49 @@ mod tests {
             state_row(&db, &project, DreamTask::Verify)
                 .await
                 .last_run_at,
-            Some(NOW),
+            Some(now),
             "a skip does not advance the success watermark"
         );
+    }
+
+    /// A host failure on one task is that task's failure: the tick still
+    /// reports every other task instead of aborting on the first `?`.
+    #[tokio::test]
+    async fn a_host_failure_fails_one_task_and_not_the_tick() {
+        let db = Db::open_in_memory().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_dir(&dir);
+        write_memory(&db, &project, "a fact", "ARCHITECTURE")
+            .await
+            .unwrap();
+        // Removing the schedule table makes every `load_state` fail.
+        db.acquire()
+            .await
+            .unwrap()
+            .execute("DROP TABLE mc_dream_state", ())
+            .await
+            .unwrap();
+
+        let chat = Arc::new(ScriptedChat::text("<verify></verify>"));
+        let dreamer = dreamer(&db, chat.clone());
+
+        let report = dreamer
+            .tick(NOW)
+            .await
+            .expect("a host failure is a task result, not a tick error");
+        assert_eq!(
+            report.entries.len(),
+            DreamTask::ALL.len(),
+            "every task still reported: {:?}",
+            report.entries
+        );
+        for entry in &report.entries {
+            assert!(
+                matches!(entry.status, TickStatus::Failed { .. }),
+                "{entry:?}"
+            );
+        }
+        assert_eq!(chat.requests().len(), 0, "nothing ran");
     }
 
     /// Acceptance: directive-shaped `PROJECT_RULES` update/archive refused, and

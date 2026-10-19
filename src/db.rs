@@ -312,6 +312,20 @@ CREATE TABLE IF NOT EXISTS mc_dream_state (
 );
 "#;
 
+/// The dreamer's own verification watermark (Task 8 follow-up). `updated_at`
+/// answers "when was this memory written" and `verified_at` answers "when was
+/// this memory last checked against the files it cites" — two different facts
+/// that a single column cannot carry: banking a verification used to advance
+/// `updated_at`, so a later content edit looked freshly verified, and a memory
+/// that had never been checked looked checked.
+///
+/// `0` means never verified, which is what makes the verify task check a
+/// memory's citations the first time it sees it. Additive, so it applies onto
+/// any V8-stamped database.
+const MIGRATION_V9: &str = r#"
+ALTER TABLE mc_memory ADD COLUMN verified_at integer NOT NULL DEFAULT 0;
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
@@ -324,6 +338,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (6, MIGRATION_V6),
     (7, MIGRATION_V7),
     (8, MIGRATION_V8),
+    (9, MIGRATION_V9),
 ];
 
 /// All indexes the migration creates: V1's verbatim from upstream
@@ -727,11 +742,11 @@ mod tests {
     #[tokio::test]
     async fn migration_tracks_user_version_and_is_idempotent() {
         let db = Db::open_in_memory().await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 8);
+        assert_eq!(db.user_version().await.unwrap(), 9);
         // Re-running must be a no-op: version stays, no error.
         db.migrate().await.unwrap();
         db.migrate().await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 8);
+        assert_eq!(db.user_version().await.unwrap(), 9);
     }
 
     /// The pragmas [`Db::connect`] sets are the ones the storage layer relies
@@ -809,7 +824,7 @@ mod tests {
         let path = dir.path().join("upgrade.db");
         build_upto(&path, 1).await;
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 8);
+        assert_eq!(db.user_version().await.unwrap(), 9);
         for table in [
             "mc_frozen_state",
             "mc_compartments",
@@ -830,7 +845,7 @@ mod tests {
         let path = dir.path().join("upgrade3.db");
         build_upto(&path, 2).await;
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 8);
+        assert_eq!(db.user_version().await.unwrap(), 9);
         for table in ["mc_tag", "mc_drop"] {
             assert!(
                 db.table_exists(table).await.unwrap(),
@@ -883,7 +898,7 @@ mod tests {
             .unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 8);
+        assert_eq!(db.user_version().await.unwrap(), 9);
         // The pre-existing row reads back with the 'active' default and no
         // archive reason — the additive columns converge both DB histories.
         let row = query_row(
@@ -933,7 +948,7 @@ mod tests {
             .unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 8);
+        assert_eq!(db.user_version().await.unwrap(), 9);
         let row = query_row(
             &db,
             "SELECT updated_at, error FROM mc_historian_run WHERE id = 'hr_old'",
@@ -961,7 +976,7 @@ mod tests {
             .unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 8);
+        assert_eq!(db.user_version().await.unwrap(), 9);
         let compartments = columns(&db, "mc_compartments").await;
         let runs = columns(&db, "mc_historian_run").await;
         assert!(!compartments.iter().any(|c| c == "facts"));
@@ -1018,7 +1033,7 @@ mod tests {
         }
         let upgraded = Db::open(&path).await.unwrap();
         let fresh = Db::open_in_memory().await.unwrap();
-        assert_eq!(upgraded.user_version().await.unwrap(), 8);
+        assert_eq!(upgraded.user_version().await.unwrap(), 9);
         // Both histories must create exactly the same objects, SQL included.
         assert_eq!(
             schema_objects(&upgraded).await,
@@ -1108,7 +1123,7 @@ mod tests {
         build_upto(&path, 7).await;
         let upgraded = Db::open(&path).await.unwrap();
         let fresh = Db::open_in_memory().await.unwrap();
-        assert_eq!(upgraded.user_version().await.unwrap(), 8);
+        assert_eq!(upgraded.user_version().await.unwrap(), 9);
         assert_eq!(
             schema_objects(&upgraded).await,
             schema_objects(&fresh).await,
@@ -1139,6 +1154,45 @@ mod tests {
                 row.get::<i64>(3).unwrap(),
             ),
             (None, 0, 0, 0)
+        );
+    }
+
+    /// V9 adds the dreamer's verification watermark; a memory that predates it
+    /// must read back as "never verified", which is what makes the verify task
+    /// check it at all.
+    #[tokio::test]
+    async fn migration_v9_adds_an_unverified_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade9.db");
+        build_upto(&path, 8).await;
+        {
+            let conn = raw(&path).await;
+            conn.execute(
+                "INSERT INTO mc_memory (id, project, content, category, created_at, updated_at)
+                 VALUES ('1', '/p', 'a fact', 'ARCHITECTURE', 5, 5)",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        let upgraded = Db::open(&path).await.unwrap();
+        let fresh = Db::open_in_memory().await.unwrap();
+        assert_eq!(upgraded.user_version().await.unwrap(), 9);
+        assert_eq!(
+            schema_objects(&upgraded).await,
+            schema_objects(&fresh).await,
+            "upgraded and fresh V9 databases must converge"
+        );
+        let row = query_row(
+            &upgraded,
+            "SELECT verified_at, updated_at FROM mc_memory WHERE id = '1'",
+        )
+        .await;
+        assert_eq!(row.get::<i64>(0).unwrap(), 0, "never verified");
+        assert_eq!(
+            row.get::<i64>(1).unwrap(),
+            5,
+            "the write watermark is untouched"
         );
     }
 
