@@ -887,7 +887,9 @@ mod tests {
         // After peek + mark it reports applied — and the content is still
         // there.
         let drained = peek_queued_drops(&db, "s1").await.unwrap();
-        mark_drops_applied(&db, "s1", &[drained[0].0]).await.unwrap();
+        mark_drops_applied(&db, "s1", &[drained[0].0])
+            .await
+            .unwrap();
         match recover(&db, "s1", items[0].tag).await.unwrap().unwrap() {
             Recovered::Found { content, dropped } => {
                 assert_eq!(content, "hello world");
