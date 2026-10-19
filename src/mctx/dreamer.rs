@@ -103,6 +103,21 @@
 //!   task is a single tool-free completion whose whole evidence the host
 //!   renders into the prompt. That is why `verify` prints file excerpts
 //!   instead of letting the model read files.
+//! - **`curate` has no staleness signal.** The reference's curate judges
+//!   duplicate *and stale* pools; staleness needs a freshness input ox does not
+//!   carry (its memories have no age signal the model can weigh beyond the
+//!   `updated_at` the prompt already prints). ox scopes curate to what the pool
+//!   itself shows: same-category merges of duplicates, and archives of wording
+//!   or redundancy. The task keeps its slot and its name.
+//! - **A skip does not push the next due time.** `is_due` looks at
+//!   `last_run_at` (successes only), so a task that skips is re-evaluated on
+//!   every tick instead of at a skip cadence. That costs one state-row read
+//!   plus a `stat` per cited file, and issues no model call when nothing is a
+//!   candidate, so the reference's skip-cadence bookkeeping is not ported.
+//! - **`last_run_at` is the tick start**, not that task's own start (the
+//!   reference stamps the task). A tick starts before its tasks, so the next
+//!   due time is never earlier than the reference's would be — the safe
+//!   direction.
 //! - **No `map-memories`.** The reference spends a model call per memory
 //!   mapping it to the files that back it; ox MVP-extracts the paths the memory
 //!   text already names. A memory that names no path is therefore never a
@@ -1308,8 +1323,9 @@ fn keep_batch_id(
 /// - a directive-shaped `PROJECT_RULES` memory refuses BOTH update and archive;
 /// - an update is refused when it loses more than half the text unless the
 ///   model declared it a consolidation;
-/// - an empty (or absurdly large) update is not a wipe: the verdict is dropped
-///   and the memory is left alone.
+/// - an empty (or absurdly large) update is not a wipe: the text is left alone
+///   and the verdict degrades to a plain re-verify (`verified_at` banked), so
+///   the same unsafe rewrite is not re-asked every slot.
 ///
 /// Refusals are logged and counted, never fatal.
 async fn apply_verify_manifest(
@@ -1356,16 +1372,19 @@ async fn apply_verify_manifest(
         }
         let content = update.content.trim();
         if content.is_empty() || content.chars().count() > 20_000 {
-            // An empty or oversized rewrite is unsafe. The reference falls back
-            // to a plain re-verify; ox drops the verdict, which leaves the
-            // memory exactly as it was.
+            // An empty or oversized rewrite is unsafe, but the memory was judged
+            // and not contradicted: bank a plain re-verify (text untouched)
+            // instead of dropping the verdict, which would re-ask the same
+            // unsafe rewrite on every slot.
             tracing::warn!(
                 memory_id = %update.id,
                 verdict = "update",
                 reason = "unsafe-length",
-                "verify safety refusal"
+                "verify update refused; banking a re-verify"
             );
-            report.refused += 1;
+            report.verified +=
+                memory::touch_memories(db, project, std::slice::from_ref(&update.id), started_at)
+                    .await?;
             continue;
         }
         let original_chars = original.content.trim().chars().count();
@@ -1645,8 +1664,24 @@ async fn apply_curate_manifest(
             continue;
         }
         let content = merge.content.trim();
-        if content.is_empty() {
-            tracing::warn!("curate merge with empty content refusal");
+        if content.is_empty() || content.chars().count() > 20_000 {
+            tracing::warn!("curate merge with an unsafe content length refusal");
+            report.refused += 1;
+            continue;
+        }
+        // A merge rewrites the survivor's text, so it carries the same risk as
+        // an update: consolidating a directive-shaped rule into prose would
+        // launder a directive into a description.
+        if merge.ids.iter().any(|id| {
+            scope.memories.iter().any(|memory| {
+                &memory.id == id && directive_shaped_project_rule(&memory.category, &memory.content)
+            })
+        }) {
+            tracing::warn!(
+                scope = scope.category,
+                reason = "directive-shaped-project-rule",
+                "curate safety refusal"
+            );
             report.refused += 1;
             continue;
         }
@@ -2540,6 +2575,55 @@ mod tests {
         assert_eq!(chat.requests().len(), 0, "nothing ran");
     }
 
+    /// An unsafe rewrite is not a wipe and not a silent drop: the text stays,
+    /// and the verdict degrades to a re-verify so the same unsafe rewrite is
+    /// not re-asked on the next slot.
+    #[tokio::test]
+    async fn a_refused_unsafe_update_banks_a_plain_reverify() {
+        let db = Db::open_in_memory().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_dir(&dir);
+        let id = write_memory(
+            &db,
+            &project,
+            "The layout is described in arch.md.",
+            "ARCHITECTURE",
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        std::fs::write(dir.path().join("arch.md"), "the layout").unwrap();
+
+        let chat = Arc::new(ScriptedChat::text(&format!(
+            "<verify>\n<update id=\"{id}\"></update>\n</verify>"
+        )));
+        let dreamer = dreamer(&db, chat.clone());
+
+        let now = now_millis();
+        let report = dreamer.tick(now).await.unwrap();
+        let Some(TickStatus::Completed { detail }) = entry(&report, DreamTask::Verify) else {
+            panic!("a refusal is not a failure: {report:?}");
+        };
+        assert!(detail.contains("verified=1"), "{detail}");
+        assert_eq!(
+            contents(&db, &project).await,
+            vec![(id, "The layout is described in arch.md.".to_owned())],
+            "an unsafe rewrite never touches the text"
+        );
+        let banked = memory::active_memories_with_watermark(&db, &project)
+            .await
+            .unwrap();
+        assert!(banked[0].verified_at >= now - 1_000, "the re-verify banked");
+
+        // Next slot: nothing to ask, so the unsafe rewrite is not re-proposed.
+        let report = dreamer.tick(now + SLOT).await.unwrap();
+        assert!(matches!(
+            entry(&report, DreamTask::Verify),
+            Some(TickStatus::Skipped { .. })
+        ));
+        assert_eq!(chat.requests().len(), 1);
+    }
+
     /// Acceptance: directive-shaped `PROJECT_RULES` update/archive refused, and
     /// the store is unchanged — but the run itself is a success.
     #[tokio::test]
@@ -2727,6 +2811,51 @@ mod tests {
     }
 
     /// Acceptance: a cross-category merge is refused and changes nothing.
+    /// A merge rewrites the survivor's text, so consolidating a directive into
+    /// prose is the same laundering the update gate refuses.
+    #[tokio::test]
+    async fn curate_refuses_a_merge_that_touches_a_directive() {
+        let db = Db::open_in_memory().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_dir(&dir);
+        let directive = write_memory(
+            &db,
+            &project,
+            "Never edit src/gen.rs by hand.",
+            "PROJECT_RULES",
+        )
+        .await
+        .unwrap();
+        let sibling = write_memory(
+            &db,
+            &project,
+            "src/gen.rs comes from the schema.",
+            "PROJECT_RULES",
+        )
+        .await
+        .unwrap();
+        let before = contents(&db, &project).await;
+        // Verify runs first in DreamTask::ALL order: the memories cite
+        // src/gen.rs, which does not exist, so it asks once.
+        let chat = Arc::new(ScriptedChat::sequence(vec![
+            Script::Text(format!(
+                "<verify>\n<verified id=\"{directive}\"/>\n<verified id=\"{sibling}\"/>\n</verify>"
+            )),
+            Script::Text(format!(
+                "<curate>\n<merge ids=\"{directive},{sibling}\" category=\"PROJECT_RULES\">\
+                 Generated files come from the schema.</merge>\n</curate>"
+            )),
+        ]));
+        let dreamer = dreamer(&db, chat.clone());
+
+        let report = dreamer.tick(NOW).await.unwrap();
+        let Some(TickStatus::Completed { detail }) = entry(&report, DreamTask::Curate) else {
+            panic!("a refusal is not a failure: {report:?}");
+        };
+        assert!(detail.contains("refused=1"), "{detail}");
+        assert_eq!(contents(&db, &project).await, before, "store untouched");
+    }
+
     #[tokio::test]
     async fn curate_refuses_a_cross_category_merge() {
         let db = Db::open_in_memory().await.unwrap();
