@@ -310,11 +310,13 @@ async fn model_list(depot: &mut Depot, res: &mut Response) {
 }
 
 /// The `Model.Info` projection of a configured model (required upstream
-/// fields; limits default to zero — cardinal owns the real routing).
+/// fields; limits default to zero — cardinal owns the real routing). `id`
+/// and `modelID` are both the bare model id, matching upstream's
+/// `Model.Info.default` — clients use `id` as the model identifier when
+/// selecting, so a qualified value would leak into requests.
 fn model_info(m: &crate::config::ModelEntry) -> ModelInfo {
-    let qualified = format!("{}/{}", m.provider, m.id);
     ModelInfo {
-        id: qualified,
+        id: m.id.clone(),
         model_id: m.id.clone(),
         provider_id: m.provider.clone(),
         name: m.name.clone().unwrap_or_else(|| m.id.clone()),

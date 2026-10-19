@@ -203,10 +203,10 @@ async fn model_catalog_serves_provider_and_default() {
         .unwrap();
     let data = models.get("data").unwrap().as_array().unwrap();
     assert_eq!(data.len(), 3);
-    assert_eq!(
-        data[0].get("id").unwrap().as_str(),
-        Some("cardinal/k3-256k")
-    );
+    // id and modelID are both the BARE model id (upstream Model.Info.default) —
+    // a qualified id here would leak into client model selections.
+    assert_eq!(data[0].get("id").unwrap().as_str(), Some("k3-256k"));
+    assert_eq!(data[0].get("modelID").unwrap().as_str(), Some("k3-256k"));
     assert_eq!(
         data[0].get("providerID").unwrap().as_str(),
         Some("cardinal")
@@ -223,7 +223,7 @@ async fn model_catalog_serves_provider_and_default() {
         .unwrap();
     assert_eq!(
         default.get("data").unwrap().get("id").unwrap().as_str(),
-        Some("cardinal/glm-5")
+        Some("glm-5")
     );
 
     // GET /api/provider → providers grouped from the models, in
