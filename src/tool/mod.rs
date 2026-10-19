@@ -57,10 +57,11 @@ impl ToolRegistry {
     }
 }
 
-/// The magic-context tools (`ctx_reduce`, `ctx_expand`), registered ON TOP
-/// of `with_builtins` at app-wiring time.
+/// The magic-context tools (`ctx_reduce`, `ctx_expand`, `ctx_memory`,
+/// `ctx_note`, `ctx_search`), registered ON TOP of `with_builtins` at
+/// app-wiring time.
 impl ToolRegistry {
-    /// Register the two magic-context tools. Deliberately separate from
+    /// Register the magic-context tools. Deliberately separate from
     /// [`ToolRegistry::with_builtins`]:
     ///
     /// 1. They hold a [`Db`] handle (the `mc_tag`/`mc_drop` tables), which
@@ -78,7 +79,8 @@ impl ToolRegistry {
             Arc::new(crate::mctx::tools::CtxReduceTool::new(db.clone())) as Arc<dyn Tool>,
             Arc::new(crate::mctx::tools::CtxExpandTool::new(db.clone())),
             Arc::new(crate::mctx::memory::CtxMemoryTool::new(db.clone())),
-            Arc::new(crate::mctx::memory::CtxNoteTool::new(db)),
+            Arc::new(crate::mctx::memory::CtxNoteTool::new(db.clone())),
+            Arc::new(crate::mctx::search::CtxSearchTool::new(db)),
         ]);
     }
 }

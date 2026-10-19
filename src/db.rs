@@ -172,9 +172,9 @@ CREATE INDEX IF NOT EXISTS mc_historian_run_session_idx ON mc_historian_run (ses
 /// magic-context tag/drop tables (Task 3). `mc_tag` is the durable
 /// §N§-tag ↔ message-part identity mapping: tags are per-session, minted in
 /// arrival order, and STABLE across passes (the same item keeps its tag).
-/// `digest` is the first 16 hex chars of the tagged content's SHA-256, so a
-/// re-tag can verify identity cheaply (same content → same tag; changed
-/// content → the tag stays, the digest is refreshed). `mc_drop` is the
+/// `digest` is the tagged content's FNV-1a hash as hex, so a re-tag can verify
+/// identity cheaply (same content → same tag; changed content → the tag stays,
+/// the digest is refreshed). `mc_drop` is the
 /// ctx_reduce queue: rows start `state = 'queued'`, and `drain_drops` marks
 /// them `'applied'` when the render pipeline consumes them (the rows are
 /// kept so `ctx_expand` can report whether content is currently dropped).
@@ -241,6 +241,101 @@ ALTER TABLE mc_historian_run ADD COLUMN facts text;
 ALTER TABLE mc_historian_run ADD COLUMN events text;
 "#;
 
+/// The unified retrieval index behind `ctx_search` (Task 7). One FTS5 table
+/// holds the searchable text of all three indexed corpora, tagged by `source`
+/// (`memory`/`note`/`compartment`) and addressed by `ref` (the source row's
+/// id). `source` and `ref` are UNINDEXED — they are filters and join keys,
+/// never search terms — so `body` is the only indexed column.
+///
+/// Maintenance is by **trigger**, not write-through in the store functions:
+/// `mctx::memory` and `mctx::compartments` already open their own
+/// transactions and know nothing about search, so triggers on the three
+/// source tables keep the index in step with every write path — including
+/// ones added later — without a call site having to remember. SQLite forbids
+/// `CREATE INDEX` on a virtual table, so the one-row-per-`(source, ref)`
+/// invariant is held by the trigger discipline itself: `INSERT` adds one row,
+/// `UPDATE` deletes the old `ref` then adds the new one, `DELETE` removes it.
+///
+/// The three `INSERT ... SELECT` statements backfill rows that already exist
+/// when V7 runs (a database upgraded from a pre-V7 version); a fresh database
+/// finds them empty. They must mirror the `AFTER INSERT` trigger bodies — the
+/// same text expression per source — so both histories converge on the same
+/// index.
+///
+/// Each `AFTER INSERT` trigger deletes its `(source, ref)` rows BEFORE inserting
+/// its own. A plain `INSERT` would leave a duplicate behind under
+/// `INSERT OR REPLACE`/`REPLACE`: with `recursive_triggers` off (the default)
+/// the conflict's implicit delete does not fire `AFTER DELETE`, so the stale
+/// index row would survive. Deleting in the insert trigger makes one row per
+/// `(source, ref)` hold for every write style, which matters because SQLite
+/// cannot index a virtual table. `json_valid` guards the compartment tiers, which the store parses
+/// leniently ([`crate::mctx::compartments`] treats malformed JSON as empty);
+/// on this SQLite build `json_extract` of malformed text would raise, so the
+/// guard is load-bearing, not decorative.
+const MIGRATION_V7: &str = r#"
+CREATE VIRTUAL TABLE IF NOT EXISTS mc_search_fts USING fts5(body, source UNINDEXED, ref UNINDEXED);
+CREATE TRIGGER IF NOT EXISTS mc_memory_fts_ai AFTER INSERT ON mc_memory BEGIN
+  DELETE FROM mc_search_fts WHERE source = 'memory' AND ref = new.id;
+  INSERT INTO mc_search_fts(body, source, ref) VALUES (new.content, 'memory', new.id);
+END;
+CREATE TRIGGER IF NOT EXISTS mc_memory_fts_au AFTER UPDATE ON mc_memory BEGIN
+  DELETE FROM mc_search_fts WHERE source = 'memory' AND ref = old.id;
+  INSERT INTO mc_search_fts(body, source, ref) VALUES (new.content, 'memory', new.id);
+END;
+CREATE TRIGGER IF NOT EXISTS mc_memory_fts_ad AFTER DELETE ON mc_memory BEGIN
+  DELETE FROM mc_search_fts WHERE source = 'memory' AND ref = old.id;
+END;
+CREATE TRIGGER IF NOT EXISTS mc_note_fts_ai AFTER INSERT ON mc_note BEGIN
+  DELETE FROM mc_search_fts WHERE source = 'note' AND ref = new.id;
+  INSERT INTO mc_search_fts(body, source, ref)
+    VALUES (trim(new.title || ' ' || new.body || ' ' || COALESCE(new.surface_condition, '')), 'note', new.id);
+END;
+CREATE TRIGGER IF NOT EXISTS mc_note_fts_au AFTER UPDATE ON mc_note BEGIN
+  DELETE FROM mc_search_fts WHERE source = 'note' AND ref = old.id;
+  INSERT INTO mc_search_fts(body, source, ref)
+    VALUES (trim(new.title || ' ' || new.body || ' ' || COALESCE(new.surface_condition, '')), 'note', new.id);
+END;
+CREATE TRIGGER IF NOT EXISTS mc_note_fts_ad AFTER DELETE ON mc_note BEGIN
+  DELETE FROM mc_search_fts WHERE source = 'note' AND ref = old.id;
+END;
+CREATE TRIGGER IF NOT EXISTS mc_compartments_fts_ai AFTER INSERT ON mc_compartments BEGIN
+  DELETE FROM mc_search_fts WHERE source = 'compartment' AND ref = new.id;
+  INSERT INTO mc_search_fts(body, source, ref)
+    VALUES (CASE WHEN json_valid(new.tiers) THEN trim(
+              COALESCE(json_extract(new.tiers, '$.title'), '') || ' ' ||
+              COALESCE(json_extract(new.tiers, '$.p1'), '') || ' ' ||
+              COALESCE(json_extract(new.tiers, '$.p2'), '') || ' ' ||
+              COALESCE(json_extract(new.tiers, '$.p3'), '') || ' ' ||
+              COALESCE(json_extract(new.tiers, '$.p4'), '')) ELSE '' END,
+            'compartment', new.id);
+END;
+CREATE TRIGGER IF NOT EXISTS mc_compartments_fts_au AFTER UPDATE ON mc_compartments BEGIN
+  DELETE FROM mc_search_fts WHERE source = 'compartment' AND ref = old.id;
+  INSERT INTO mc_search_fts(body, source, ref)
+    VALUES (CASE WHEN json_valid(new.tiers) THEN trim(
+              COALESCE(json_extract(new.tiers, '$.title'), '') || ' ' ||
+              COALESCE(json_extract(new.tiers, '$.p1'), '') || ' ' ||
+              COALESCE(json_extract(new.tiers, '$.p2'), '') || ' ' ||
+              COALESCE(json_extract(new.tiers, '$.p3'), '') || ' ' ||
+              COALESCE(json_extract(new.tiers, '$.p4'), '')) ELSE '' END,
+            'compartment', new.id);
+END;
+CREATE TRIGGER IF NOT EXISTS mc_compartments_fts_ad AFTER DELETE ON mc_compartments BEGIN
+  DELETE FROM mc_search_fts WHERE source = 'compartment' AND ref = old.id;
+END;
+INSERT INTO mc_search_fts(body, source, ref) SELECT content, 'memory', id FROM mc_memory;
+INSERT INTO mc_search_fts(body, source, ref)
+  SELECT trim(title || ' ' || body || ' ' || COALESCE(surface_condition, '')), 'note', id FROM mc_note;
+INSERT INTO mc_search_fts(body, source, ref)
+  SELECT CASE WHEN json_valid(tiers) THEN trim(
+           COALESCE(json_extract(tiers, '$.title'), '') || ' ' ||
+           COALESCE(json_extract(tiers, '$.p1'), '') || ' ' ||
+           COALESCE(json_extract(tiers, '$.p2'), '') || ' ' ||
+           COALESCE(json_extract(tiers, '$.p3'), '') || ' ' ||
+           COALESCE(json_extract(tiers, '$.p4'), '')) ELSE '' END,
+         'compartment', id FROM mc_compartments;
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
@@ -251,6 +346,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (4, MIGRATION_V4),
     (5, MIGRATION_V5),
     (6, MIGRATION_V6),
+    (7, MIGRATION_V7),
 ];
 
 /// All indexes the migration creates: V1's verbatim from upstream
@@ -298,6 +394,15 @@ const EXPECTED_TABLES: &[&str] = &[
     "mc_historian_run",
     "mc_tag",
     "mc_drop",
+    // FTS5 keeps its index in shadow tables that SQLite creates alongside the
+    // virtual table (one per FTS5 table, named after it: `<name>_config`,
+    // `_content`, `_data`, `_docsize`, `_idx`).
+    "mc_search_fts",
+    "mc_search_fts_config",
+    "mc_search_fts_content",
+    "mc_search_fts_data",
+    "mc_search_fts_docsize",
+    "mc_search_fts_idx",
 ];
 
 /// Async handle to the SQLite database.
@@ -415,11 +520,11 @@ mod tests {
     #[tokio::test]
     async fn migration_tracks_user_version_and_is_idempotent() {
         let db = Db::open_in_memory().await.unwrap();
-        assert_eq!(db.user_version().await, 6);
+        assert_eq!(db.user_version().await, 7);
         // Re-running must be a no-op: version stays, no error.
         db.migrate().await.unwrap();
         db.migrate().await.unwrap();
-        assert_eq!(db.user_version().await, 6);
+        assert_eq!(db.user_version().await, 7);
     }
 
     #[tokio::test]
@@ -428,8 +533,12 @@ mod tests {
         let names = db
             .conn()
             .call(|c| -> rusqlite::Result<Vec<String>> {
+                // Triggers are excluded here (V7 adds nine); the migration
+                // convergence test below compares every object type.
                 let mut stmt = c.prepare(
-                    "SELECT name FROM sqlite_master WHERE name LIKE 'mc\\_%' ESCAPE '\\' ORDER BY name",
+                    "SELECT name FROM sqlite_master
+                      WHERE type IN ('table', 'index') AND name LIKE 'mc\\_%' ESCAPE '\\'
+                      ORDER BY name",
                 )?;
                 let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
                 rows.collect()
@@ -449,6 +558,12 @@ mod tests {
                 "mc_memory_project_idx",
                 "mc_note",
                 "mc_note_session_idx",
+                "mc_search_fts",
+                "mc_search_fts_config",
+                "mc_search_fts_content",
+                "mc_search_fts_data",
+                "mc_search_fts_docsize",
+                "mc_search_fts_idx",
                 "mc_tag",
                 "mc_tag_session_message_idx",
             ]
@@ -466,7 +581,7 @@ mod tests {
             conn.pragma_update(None, "user_version", 1).unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await, 6);
+        assert_eq!(db.user_version().await, 7);
         for table in [
             "mc_frozen_state",
             "mc_compartments",
@@ -493,7 +608,7 @@ mod tests {
             conn.pragma_update(None, "user_version", 2).unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await, 6);
+        assert_eq!(db.user_version().await, 7);
         for table in ["mc_tag", "mc_drop"] {
             assert!(
                 db.table_exists(table).await.unwrap(),
@@ -553,7 +668,7 @@ mod tests {
             .unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await, 6);
+        assert_eq!(db.user_version().await, 7);
         // The pre-existing row reads back with the 'active' default and no
         // archive reason — the additive columns converge both DB histories.
         let (status, reason): (String, Option<String>) = db
@@ -612,7 +727,7 @@ mod tests {
             .unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await, 6);
+        assert_eq!(db.user_version().await, 7);
         // The pre-existing row reads back with the additive defaults.
         let (updated_at, error): (i64, Option<String>) = db
             .conn()
@@ -652,7 +767,7 @@ mod tests {
             .unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await, 6);
+        assert_eq!(db.user_version().await, 7);
         let (compartments, runs): (Vec<String>, Vec<String>) = db
             .conn()
             .call(|c| -> rusqlite::Result<(Vec<String>, Vec<String>)> {
@@ -679,6 +794,92 @@ mod tests {
         let compartments = crate::mctx::compartments::load(&db, "ses_1").await.unwrap();
         assert_eq!(compartments.len(), 1);
         assert_eq!(compartments[0].coverage_end, "4");
+    }
+
+    /// Every schema object a database owns, as `(type, name, sql)` ordered
+    /// deterministically. `sql` is NULL for FTS5's internal shadow tables.
+    async fn schema_objects(db: &Db) -> Vec<(String, String, Option<String>)> {
+        db.conn()
+            .call(
+                |c| -> rusqlite::Result<Vec<(String, String, Option<String>)>> {
+                    let mut stmt = c.prepare(
+                        "SELECT type, name, sql FROM sqlite_master
+                      WHERE name NOT LIKE 'sqlite_%'
+                      ORDER BY type, name",
+                    )?;
+                    let rows =
+                        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+                    rows.collect()
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn migration_v7_converges_upgraded_and_fresh_databases() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade7.db");
+        // Build a v6 database by hand: apply V1..V6, stamp version 6, and
+        // leave a row behind so the V7 backfill has something to index.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(MIGRATION_V2).unwrap();
+            conn.execute_batch(MIGRATION_V3).unwrap();
+            conn.execute_batch(MIGRATION_V4).unwrap();
+            conn.execute_batch(MIGRATION_V5).unwrap();
+            conn.execute_batch(MIGRATION_V6).unwrap();
+            conn.pragma_update(None, "user_version", 6).unwrap();
+            conn.execute(
+                "INSERT INTO mc_memory (id, project, content, category, created_at, updated_at)
+                 VALUES ('1', '/p', 'legacy pre-existing fact', 'ARCHITECTURE', 1, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO mc_note (id, session_id, title, body, status, surface_condition, created_at, updated_at)
+                 VALUES ('1', 'ses_1', 'legacy note', 'pre-existing note body', 'active', NULL, 1, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO mc_compartments (id, session_id, coverage_end, importance, tiers, created_at)
+                 VALUES ('mc_1', 'ses_1', '4', 50.0, '{\"title\":\"Legacy\",\"p1\":\"pre-existing body\"}', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let upgraded = Db::open(&path).await.unwrap();
+        let fresh = Db::open_in_memory().await.unwrap();
+        assert_eq!(upgraded.user_version().await, 7);
+        // Both histories must create exactly the same objects, SQL included.
+        assert_eq!(
+            schema_objects(&upgraded).await,
+            schema_objects(&fresh).await,
+            "upgraded and fresh V7 databases must converge"
+        );
+        // And the backfill is real: every source's pre-V7 rows are searchable,
+        // through the same text expression the triggers use.
+        for (term, source) in [
+            ("\"legacy\"", "memory"),
+            ("\"note\"", "note"),
+            ("\"pre-existing\"", "compartment"),
+        ] {
+            let hits: i64 = upgraded
+                .conn()
+                .call(move |c| {
+                    c.query_row(
+                        "SELECT count(*) FROM mc_search_fts
+                          WHERE mc_search_fts MATCH ?1 AND source = ?2",
+                        rusqlite::params![term, source],
+                        |row| row.get(0),
+                    )
+                })
+                .await
+                .unwrap();
+            assert_eq!(hits, 1, "V7 backfills {source} rows that predate the index");
+        }
     }
 
     #[tokio::test]

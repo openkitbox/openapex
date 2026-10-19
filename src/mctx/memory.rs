@@ -705,8 +705,9 @@ fn optional_text(input: &Value, field: &str) -> Result<Option<String>, String> {
 }
 
 /// Log an internal failure and render it for the model (never a panic, never
-/// a silent no-op).
-fn internal_error(what: &str, error: &anyhow::Error) -> ToolOutput {
+/// a silent no-op). Shared with [`crate::mctx::search`], which reports the
+/// same way.
+pub(crate) fn internal_error(what: &str, error: &anyhow::Error) -> ToolOutput {
     // The operator gets the whole chain (and its context) from the log; the
     // model gets the root cause, not ox's internal call path.
     tracing::error!(error = %error, "mctx {what} failed");

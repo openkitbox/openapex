@@ -208,8 +208,9 @@ impl Tagger {
 /// The taggable items of one decoded message: `(part_path, content)` pairs
 /// in part order. Assistant text/reasoning parts contribute their `text`;
 /// tool parts contribute their serialized `state` (input + output);
-/// user messages contribute their prompt text.
-fn taggable_items(message: &Value) -> Vec<(String, String)> {
+/// user messages contribute their prompt text. [`crate::mctx::search`] reuses
+/// this to render a transcript hit from the same text the tagger tags.
+pub(crate) fn taggable_items(message: &Value) -> Vec<(String, String)> {
     let mut items = Vec::new();
     match message.get("type").and_then(Value::as_str) {
         Some("user") => {
