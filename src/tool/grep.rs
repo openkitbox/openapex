@@ -1,15 +1,23 @@
-//! Port of upstream `packages/core/src/tool/plugin/grep.ts` (+ its
-//! ripgrep JSON adapter): content search with regex or literal matching,
-//! include-glob filtering, case control, and a result limit.
+//! Port of upstream `packages/core/src/tool/plugin/grep.ts`.
 //!
-//! The `ignore` crate walks files and the `regex` crate matches lines —
-//! the same engines ripgrep itself is built on. One presentation quirk is
-//! ported verbatim: upstream keeps rg's line text with its trailing
-//! newline, so each match line renders followed by a blank line.
+//! Matching and searching use ripgrep's own library crates —
+//! `grep-regex` (the regex matcher) and `grep-searcher` (the line searcher)
+//! — and directory traversal uses the `ignore` crate. Together these are the
+//! exact stack ripgrep itself is built from, so match semantics, line
+//! splitting, binary detection, and encoding handling all come from
+//! ripgrep's engines rather than a reimplementation.
+//!
+//! The tool's observable contract is unchanged: the upstream name,
+//! model-facing description, parameter schema, error strings, and the
+//! `FileSystem.Match`-shaped `toModelContent` output are byte-for-byte what
+//! the previous line-scanner produced. One presentation quirk is kept
+//! verbatim: upstream keeps rg's line text with its trailing newline, so
+//! each match line renders followed by a blank line.
 
 use globset::{Glob, GlobSetBuilder};
+use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::WalkBuilder;
-use regex::RegexBuilder;
 use serde_json::Value;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -162,16 +170,16 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
     } else {
         target.clone()
     };
-    let pattern_text = if literal {
-        regex::escape(pattern)
-    } else {
-        pattern.to_owned()
-    };
-    let regex = match RegexBuilder::new(&pattern_text)
+    // `grep-regex` is ripgrep's own matcher: single-line mode is selected by
+    // setting the line terminator, `fixed_strings` is `--fixed-strings`, and
+    // case folding follows the same builder as `-i`.
+    let matcher = match RegexMatcherBuilder::new()
         .case_insensitive(!case_sensitive)
-        .build()
+        .fixed_strings(literal)
+        .line_terminator(Some(b'\n'))
+        .build(pattern)
     {
-        Ok(regex) => regex,
+        Ok(matcher) => matcher,
         Err(error) => return fail(format!("Invalid regex pattern: {error}")),
     };
     let include_set = match include {
@@ -184,11 +192,17 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
         },
         None => None,
     };
+    // `grep-searcher` with line numbers on and binary detection that quits at
+    // the first NUL — the same defaults rg uses for `--json` line matches.
+    let mut searcher = SearcherBuilder::new()
+        .line_number(true)
+        .binary_detection(BinaryDetection::quit(0))
+        .build();
     let mut matches: Vec<GrepMatch> = Vec::new();
     let mut timed_out = false;
     let started = Instant::now();
     if is_file {
-        grep_file(&target, &cwd, &regex, limit, &mut matches);
+        grep_file(&mut searcher, &matcher, &target, &cwd, limit, &mut matches);
     } else {
         // rg grep passes `--hidden` unconditionally; `.git` stays excluded.
         for entry in WalkBuilder::new(&target)
@@ -217,7 +231,14 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
                     continue;
                 }
             }
-            grep_file(entry.path(), &cwd, &regex, limit, &mut matches);
+            grep_file(
+                &mut searcher,
+                &matcher,
+                entry.path(),
+                &cwd,
+                limit,
+                &mut matches,
+            );
             if matches.len() > limit {
                 break;
             }
@@ -233,46 +254,61 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
     ok_text(model_content(&matches, truncated))
 }
 
-/// Collect matching lines of one file. `cwd` mirrors the rg invocation's
-/// working directory for path resolution.
+/// Collects one file's matching lines through ripgrep's searcher.
+struct CollectSink<'a> {
+    /// Absolute path recorded on every match for this file.
+    absolute: String,
+    /// Stop once this many matches have been collected (+1 for truncation
+    /// detection).
+    limit: usize,
+    matches: &'a mut Vec<GrepMatch>,
+}
+
+impl Sink for CollectSink<'_> {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _searcher: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        let line = mat.line_number().unwrap_or(0) as usize;
+        self.matches.push(GrepMatch {
+            path: self.absolute.clone(),
+            line,
+            text: render_line(mat.bytes()),
+        });
+        // Keep searching while at or below the limit; stop after the first
+        // match past it (so `truncated` can be reported).
+        Ok(self.matches.len() <= self.limit)
+    }
+}
+
+/// Run one file through the searcher. `cwd` mirrors the rg invocation's
+/// working directory for path resolution; I/O and decode errors skip the
+/// file (matching rg's `--no-messages` silence).
 fn grep_file(
+    searcher: &mut Searcher,
+    matcher: &RegexMatcher,
     path: &Path,
     cwd: &Path,
-    regex: &regex::Regex,
     limit: usize,
     matches: &mut Vec<GrepMatch>,
 ) {
-    let Ok(bytes) = std::fs::read(path) else {
-        return;
-    };
-    // Binary files are skipped by rg (`--binary` off: NUL in first block
-    // suppresses output); approximate with a whole-file NUL check.
-    if bytes.contains(&0) {
-        return;
-    }
-    let text = String::from_utf8_lossy(&bytes);
     let absolute = cwd.join(path);
-    for (line_number, line) in text.split('\n').enumerate() {
-        let line_number = line_number + 1;
-        if regex.is_match(line) {
-            let display = if line.chars().count() > MAX_LINE_TEXT {
-                let mut end = MAX_LINE_TEXT;
-                while !line.is_char_boundary(end) {
-                    end -= 1;
-                }
-                format!("{}...", &line[..end])
-            } else {
-                format!("{line}\n")
-            };
-            matches.push(GrepMatch {
-                path: absolute.to_string_lossy().to_string(),
-                line: line_number,
-                text: display,
-            });
-            if matches.len() > limit {
-                return;
-            }
-        }
+    let mut sink = CollectSink {
+        absolute: absolute.to_string_lossy().into_owned(),
+        limit,
+        matches,
+    };
+    let _ = searcher.search_path(matcher, path, &mut sink);
+}
+
+/// Render one matched line's bytes as model text, capped at
+/// [`MAX_LINE_TEXT`] characters with a trailing `...` when truncated.
+fn render_line(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    if text.chars().count() > MAX_LINE_TEXT {
+        let truncated: String = text.chars().take(MAX_LINE_TEXT).collect();
+        format!("{truncated}...")
+    } else {
+        text.into_owned()
     }
 }
 
