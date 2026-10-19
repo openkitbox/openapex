@@ -300,35 +300,111 @@ async fn model_list(depot: &mut Depot, res: &mut Response) {
     let Some(state) = state(depot, res) else {
         return;
     };
-    let data = state
-        .config
-        .models
-        .iter()
-        .map(|m| {
-            let qualified = format!("{}/{}", m.provider, m.id);
-            ModelInfo {
-                id: qualified.clone(),
-                model_id: m.id.clone(),
-                provider_id: m.provider.clone(),
-                name: m.name.clone().unwrap_or_else(|| m.id.clone()),
-                capabilities: ModelCapabilities {
-                    tools: true,
-                    input: vec!["text"],
-                    output: vec!["text"],
-                },
-                variants: Vec::new(),
-                time: ModelTime { released: 0 },
-                cost: Vec::new(),
-                status: "active",
-                enabled: true,
-                limit: ModelLimit {
-                    context: 0,
-                    output: 0,
-                },
-            }
-        })
-        .collect();
+    let data = state.config.models.iter().map(model_info).collect();
     res.render(Json(ModelList {
+        location: LocationRef {
+            directory: state.directory.to_string_lossy().into_owned(),
+        },
+        data,
+    }));
+}
+
+/// The `Model.Info` projection of a configured model (required upstream
+/// fields; limits default to zero — cardinal owns the real routing).
+fn model_info(m: &crate::config::ModelEntry) -> ModelInfo {
+    let qualified = format!("{}/{}", m.provider, m.id);
+    ModelInfo {
+        id: qualified,
+        model_id: m.id.clone(),
+        provider_id: m.provider.clone(),
+        name: m.name.clone().unwrap_or_else(|| m.id.clone()),
+        capabilities: ModelCapabilities {
+            tools: true,
+            input: vec!["text"],
+            output: vec!["text"],
+        },
+        variants: Vec::new(),
+        time: ModelTime { released: 0 },
+        cost: Vec::new(),
+        status: "active",
+        enabled: true,
+        limit: ModelLimit {
+            context: 0,
+            output: 0,
+        },
+    }
+}
+
+/// `model.default` — GET /api/model/default. The model backing sessions
+/// without an explicit selection (config `default_model`, else the first
+/// `[[models]]` entry); `data: null` when nothing is configured.
+#[derive(Serialize)]
+struct ModelDefault {
+    location: LocationRef,
+    data: Option<ModelInfo>,
+}
+
+#[handler] // operation_id: model.default
+async fn model_default(depot: &mut Depot, res: &mut Response) {
+    let Some(state) = state(depot, res) else {
+        return;
+    };
+    let data = state.config.default_model_entry().map(model_info);
+    res.render(Json(ModelDefault {
+        location: LocationRef {
+            directory: state.directory.to_string_lossy().into_owned(),
+        },
+        data,
+    }));
+}
+
+// ---------------------------------------------------------------------------
+// provider.list — GET /api/provider
+// ---------------------------------------------------------------------------
+
+/// Upstream `Provider.Info` (required: id, name, activation, package).
+#[derive(Serialize)]
+struct ProviderInfo {
+    id: String,
+    name: String,
+    activation: &'static str,
+    package: &'static str,
+}
+
+/// Upstream `Provider.Info[]` envelope: `{ location: { directory }, data }`.
+/// Derived from `[[models]]`: one provider per distinct `provider` id, in
+/// first-appearance order. ox never loads npm provider packages; the
+/// package value mirrors what an OpenAI-compatible provider uses
+/// (`provider.npm` in upstream config).
+#[derive(Serialize)]
+struct ProviderList {
+    location: LocationRef,
+    data: Vec<ProviderInfo>,
+}
+
+#[handler] // operation_id: provider.list
+async fn provider_list(depot: &mut Depot, res: &mut Response) {
+    let Some(state) = state(depot, res) else {
+        return;
+    };
+    let mut data: Vec<ProviderInfo> = Vec::new();
+    for m in &state.config.models {
+        if data.iter().any(|p| p.id == m.provider) {
+            continue;
+        }
+        // Display name: capitalize the provider id ("cardinal" → "Cardinal").
+        let mut name = m.provider.clone();
+        if let Some(first) = name.chars().next() {
+            name = first.to_uppercase().collect::<String>() + &name[first.len_utf8()..];
+        }
+        data.push(ProviderInfo {
+            id: m.provider.clone(),
+            name,
+            activation: "auto",
+            package: "@ai-sdk/openai-compatible",
+        });
+    }
+    res.render(Json(ProviderList {
         location: LocationRef {
             directory: state.directory.to_string_lossy().into_owned(),
         },
@@ -401,6 +477,7 @@ pub fn build_router(state: AppState) -> Router {
                 .push(Router::with_path("location").get(location_get))
                 .push(Router::with_path("project").get(project_list))
                 .push(Router::with_path("model").get(model_list))
+                .push(Router::with_path("model/default").get(model_default))
                 .push(Router::with_path("agent").get(agent_list))
                 .push(Router::with_path("event").get(event::subscribe))
                 .push(compat::mount(Router::new()))

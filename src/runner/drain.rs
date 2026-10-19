@@ -379,8 +379,9 @@ async fn deliver_pending_steers(ctx: &DrainCtx) -> Result<()> {
 }
 
 /// Resolve the session's agent + model (`context.resolveModel`): the
-/// projected selection when set, else the config's first model, else the
-/// cardinal default id.
+/// projected selection when set, else the config's default model
+/// (`default_model`, falling back to the first `[[models]]` entry), else the
+/// cardinal placeholder id.
 pub(crate) async fn resolve_selection(
     db: &Db,
     session_id: &str,
@@ -412,18 +413,18 @@ pub(crate) async fn resolve_selection(
     };
     let model = match model.and_then(|raw| serde_json::from_str(&raw).ok()) {
         Some(model) => model,
-        None => {
-            let configured = config.models.first();
-            crate::schema::support::ModelRef {
-                id: configured
-                    .map(|m| m.id.clone())
-                    .unwrap_or_else(|| "default".to_owned()),
-                provider_id: configured
-                    .map(|m| m.provider.clone())
-                    .unwrap_or_else(|| "opencode".to_owned()),
+        None => match config.default_model_entry() {
+            Some(configured) => crate::schema::support::ModelRef {
+                id: configured.id.clone(),
+                provider_id: configured.provider.clone(),
                 variant: None,
-            }
-        }
+            },
+            None => crate::schema::support::ModelRef {
+                id: "default".to_owned(),
+                provider_id: "opencode".to_owned(),
+                variant: None,
+            },
+        },
     };
     Ok((agent.unwrap_or_else(|| "build".to_owned()), model))
 }

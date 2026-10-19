@@ -13,6 +13,7 @@ pub const ENV_CARDINAL_URL: &str = "OX_CARDINAL_URL";
 pub const ENV_CARDINAL_KEY: &str = "OX_CARDINAL_KEY";
 pub const ENV_DB_PATH: &str = "OX_DB_PATH";
 pub const ENV_LISTEN: &str = "OX_LISTEN";
+pub const ENV_DEFAULT_MODEL: &str = "OX_DEFAULT_MODEL";
 
 fn default_cardinal_url() -> String {
     DEFAULT_CARDINAL_URL.to_owned()
@@ -61,6 +62,13 @@ pub struct Config {
     /// Statically configured models exposed by `model.list`.
     #[serde(default = "default_models")]
     pub models: Vec<ModelEntry>,
+    /// Qualified model reference (`provider/id`, e.g. `cardinal/k3-256k`)
+    /// backing sessions without an explicit selection. Should match one of
+    /// `[[models]]`; an unmatched value is warned about and the first entry
+    /// is used instead. When unset the first `[[models]]` entry is the
+    /// default.
+    #[serde(default)]
+    pub default_model: Option<String>,
     /// Heartbeat interval for the `event.subscribe` SSE stream, in
     /// milliseconds. Upstream hardcodes 15 seconds
     /// (`Stream.tick("15 seconds")`); the default matches. Exposed for
@@ -81,6 +89,7 @@ impl Default for Config {
             db_path: default_db_path(),
             listen: default_listen(),
             models: default_models(),
+            default_model: None,
             event_heartbeat_ms: default_event_heartbeat_ms(),
         }
     }
@@ -95,6 +104,36 @@ pub fn ox_home() -> PathBuf {
 }
 
 impl Config {
+    /// The model backing sessions without an explicit selection: the
+    /// `default_model` entry when set and configured, else the first
+    /// `[[models]]` entry. `None` when nothing is configured. A
+    /// `default_model` that matches no entry warns and falls back to the
+    /// first entry.
+    pub fn default_model_entry(&self) -> Option<&ModelEntry> {
+        if let Some(qualified) = &self.default_model {
+            let matched = qualified.split_once('/').and_then(|(provider, id)| {
+                self.models
+                    .iter()
+                    .find(|m| m.provider == provider && m.id == id)
+            });
+            if matched.is_none() {
+                if self.models.is_empty() {
+                    tracing::warn!(
+                        default_model = %qualified,
+                        "default_model matches no [[models]] entry; no models configured"
+                    );
+                } else {
+                    tracing::warn!(
+                        default_model = %qualified,
+                        "default_model matches no [[models]] entry; using the first"
+                    );
+                }
+            }
+            return matched.or_else(|| self.models.first());
+        }
+        self.models.first()
+    }
+
     /// Default config file location: `~/.ox/ox.toml`.
     pub fn default_path() -> PathBuf {
         ox_home().join("ox.toml")
@@ -129,6 +168,9 @@ impl Config {
         if let Ok(listen) = std::env::var(ENV_LISTEN) {
             config.listen = listen;
         }
+        if let Ok(model) = std::env::var(ENV_DEFAULT_MODEL) {
+            config.default_model = Some(model);
+        }
 
         Ok(config)
     }
@@ -147,6 +189,32 @@ mod tests {
         assert_eq!(cfg.event_heartbeat_ms, 15_000);
         assert!(cfg.db_path.ends_with("ox.db"));
         assert!(cfg.models.is_empty());
+        assert!(cfg.default_model.is_none());
+    }
+
+    #[test]
+    fn default_model_entry_precedence() {
+        let entry = |provider: &str, id: &str| ModelEntry {
+            provider: provider.to_owned(),
+            id: id.to_owned(),
+            name: None,
+        };
+        let mut cfg = Config {
+            models: vec![entry("cardinal", "k3-256k"), entry("cardinal", "glm-5")],
+            ..Config::default()
+        };
+        // Unset → first entry.
+        assert_eq!(cfg.default_model_entry().unwrap().id, "k3-256k");
+        // Set and matching → that entry.
+        cfg.default_model = Some("cardinal/glm-5".to_owned());
+        assert_eq!(cfg.default_model_entry().unwrap().id, "glm-5");
+        // Set but unknown → falls back to the first entry.
+        cfg.default_model = Some("cardinal/nope".to_owned());
+        assert_eq!(cfg.default_model_entry().unwrap().id, "k3-256k");
+        // No models at all → None.
+        cfg.models.clear();
+        cfg.default_model = None;
+        assert!(cfg.default_model_entry().is_none());
     }
 
     #[test]
@@ -155,6 +223,7 @@ mod tests {
 cardinal_url = "http://localhost:1234"
 db_path = "/tmp/ox-test.db"
 listen = "0.0.0.0:9999"
+default_model = "anthropic/claude-sonnet-4-5"
 
 [[models]]
 provider = "anthropic"
@@ -169,5 +238,9 @@ name = "Claude Sonnet 4.5"
         assert_eq!(cfg.models[0].provider, "anthropic");
         assert_eq!(cfg.models[0].id, "claude-sonnet-4-5");
         assert_eq!(cfg.models[0].name.as_deref(), Some("Claude Sonnet 4.5"));
+        assert_eq!(
+            cfg.default_model.as_deref(),
+            Some("anthropic/claude-sonnet-4-5")
+        );
     }
 }

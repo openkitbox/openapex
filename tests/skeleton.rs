@@ -22,14 +22,17 @@ fn free_port() -> u16 {
 /// Returns (base_url, handle, tempdir) — the tempdir guard must outlive the
 /// server so the DB files are cleaned up on drop.
 async fn spawn_server() -> (String, JoinHandle<()>, TempDir) {
+    spawn_server_with(Config::default()).await
+}
+
+/// Spawn the server against a temp DB with a caller-supplied config (the
+/// listen address and DB path are always overridden so instances don't clash).
+async fn spawn_server_with(mut config: Config) -> (String, JoinHandle<()>, TempDir) {
     let port = free_port();
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("ox.db");
-    let config = Config {
-        db_path,
-        listen: format!("127.0.0.1:{port}"),
-        ..Config::default()
-    };
+    config.db_path = db_path;
+    config.listen = format!("127.0.0.1:{port}");
     let state = ox::build_state(config.clone()).await.unwrap();
     let router = ox::build_router(state);
     let listen: String = config.listen.clone();
@@ -138,6 +141,114 @@ async fn info_location_project_endpoints_respond() {
         .unwrap();
     assert!(models.get("location").is_some());
     assert!(models.get("data").and_then(|v| v.as_array()).is_some());
+    // Unconfigured defaults: no default model, empty provider list.
+    let default: serde_json::Value = client
+        .get(format!("{base}/api/model/default"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(default.get("data").unwrap().is_null());
+    let providers: serde_json::Value = client
+        .get(format!("{base}/api/provider"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        providers
+            .get("data")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn model_catalog_serves_provider_and_default() {
+    use ox::config::ModelEntry;
+
+    let entry = |provider: &str, id: &str, name: &str| ModelEntry {
+        provider: provider.to_owned(),
+        id: id.to_owned(),
+        name: Some(name.to_owned()),
+    };
+    let (base, handle, _dir) = spawn_server_with(Config {
+        models: vec![
+            entry("cardinal", "k3-256k", "k3-256k"),
+            entry("cardinal", "glm-5", "GLM-5"),
+            entry("openai", "gpt-5", "GPT-5"),
+        ],
+        default_model: Some("cardinal/glm-5".to_owned()),
+        ..Config::default()
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    // GET /api/model → all configured entries.
+    let models: serde_json::Value = client
+        .get(format!("{base}/api/model"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let data = models.get("data").unwrap().as_array().unwrap();
+    assert_eq!(data.len(), 3);
+    assert_eq!(
+        data[0].get("id").unwrap().as_str(),
+        Some("cardinal/k3-256k")
+    );
+    assert_eq!(
+        data[0].get("providerID").unwrap().as_str(),
+        Some("cardinal")
+    );
+
+    // GET /api/model/default → the configured default, not the first entry.
+    let default: serde_json::Value = client
+        .get(format!("{base}/api/model/default"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        default.get("data").unwrap().get("id").unwrap().as_str(),
+        Some("cardinal/glm-5")
+    );
+
+    // GET /api/provider → providers grouped from the models, in
+    // first-appearance order.
+    let providers: serde_json::Value = client
+        .get(format!("{base}/api/provider"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let data = providers.get("data").unwrap().as_array().unwrap();
+    let ids: Vec<&str> = data
+        .iter()
+        .map(|p| p.get("id").unwrap().as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["cardinal", "openai"]);
+    let provider = &data[0];
+    assert_eq!(provider.get("name").unwrap().as_str(), Some("Cardinal"));
+    assert_eq!(provider.get("activation").unwrap().as_str(), Some("auto"));
+    assert_eq!(
+        provider.get("package").unwrap().as_str(),
+        Some("@ai-sdk/openai-compatible")
+    );
 
     handle.abort();
 }
