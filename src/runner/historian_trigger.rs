@@ -1,5 +1,11 @@
 //! The step-boundary historian trigger: measure the live tail, classify the
 //! pressure band, and fold the oldest eligible range into compartments.
+//!
+//! One property is worth knowing when reading the logs: the chunker admits an
+//! oversize block (a single message bigger than the chunk budget) only as the
+//! first block of a run. So a huge message that follows small ones costs one
+//! cheap run to reach it, and the next run folds it. Pressure converges either
+//! way, because every run covers its budget and the floor advances.
 
 use std::sync::Arc;
 
