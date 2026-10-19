@@ -25,6 +25,7 @@ pub mod glob;
 pub mod grep;
 pub mod patch;
 pub mod read;
+pub(crate) mod rtk;
 pub mod shell;
 pub mod webfetch;
 pub mod write;

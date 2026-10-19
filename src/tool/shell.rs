@@ -15,7 +15,10 @@ use crate::cardinal::wire::ToolDef;
 use crate::runner::{Tool, ToolContext, ToolOutput};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
+
+use super::rtk::RtkRewriter;
 
 use super::{
     fail, object_param, ok_text, optional_bool, optional_nonneg_int, optional_str, param,
@@ -32,6 +35,9 @@ const MAX_BYTES: usize = 50 * 1024;
 pub struct ShellTool {
     shell: PathBuf,
     shell_name: String,
+    /// Optional RTK rewrite seam: when an `rtk` binary is available, each
+    /// command is passed through it before execution (path A integration).
+    rtk: Arc<RtkRewriter>,
 }
 
 impl ShellTool {
@@ -56,6 +62,7 @@ impl ShellTool {
         Self {
             shell,
             shell_name: name,
+            rtk: Arc::new(RtkRewriter::new()),
         }
     }
 }
@@ -208,14 +215,23 @@ async fn run(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> ToolOutput {
         Ok(value) => value.unwrap_or(false),
         Err(output) => return output,
     };
+    if background {
+        // Upstream background shells need the synthetic-notification loop;
+        // ox's runner does not deliver those yet. Rejected before the RTK
+        // rewrite so the message names the command the model sent.
+        return fail(format!("Unable to execute command: {command}"));
+    }
+    // RTK path A: rewrite the command before execution when an `rtk` binary is
+    // available and capable. A missing/incapable/failing rtk returns the
+    // command unchanged (fail-open), so this is transparent when RTK is absent.
+    let command = tool
+        .rtk
+        .rewrite(command)
+        .await
+        .unwrap_or_else(|| command.to_owned());
     // Upstream prepare() failures and spawn failures are both wrapped by the
     // execute mapError, so the model only sees the generic message.
     let wrap = |_cause: String| fail(format!("Unable to execute command: {command}"));
-    if background {
-        // Upstream background shells need the synthetic-notification loop;
-        // ox's runner does not deliver those yet.
-        return wrap("background execution is not supported in this build".to_owned());
-    }
     let workdir: PathBuf = match workdir {
         Some(workdir) => {
             let absolute = resolve_path(&ctx.directory, workdir);
@@ -248,7 +264,7 @@ async fn run(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> ToolOutput {
         let mut spawn = tokio::process::Command::new(&tool.shell);
         spawn
             .arg("-c")
-            .arg(command)
+            .arg(&command)
             .current_dir(&workdir)
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
@@ -609,5 +625,40 @@ mod tests {
         );
         assert!(!picked.contains("fish"), "picked: {picked}");
         drop(lock);
+    }
+}
+
+#[cfg(test)]
+mod rtk_integration_tests {
+    use super::*;
+    use serde_json::json;
+    use std::path::Path;
+    use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
+
+    fn ctx(directory: &Path) -> ToolContext {
+        ToolContext {
+            session_id: "ses_test".to_owned(),
+            directory: directory.to_path_buf(),
+            call_id: "call_rtk".to_owned(),
+            cancellation: CancellationToken::new(),
+        }
+    }
+
+    /// Live end-to-end: a rewritable command runs through `rtk` and still
+    /// produces output (RTK passes non-rewritten commands through, so this
+    /// works whether or not rtk is installed). Ignored by default.
+    #[tokio::test]
+    #[ignore = "requires rtk on PATH"]
+    async fn shell_runs_rewritten_command() {
+        let _ = TempDir::new();
+        let dir = std::env::temp_dir();
+        let tool = ShellTool::with_shell(std::path::PathBuf::from("/bin/sh"));
+        let output = tool
+            .execute(ctx(&dir), json!({"command": "git status"}))
+            .await;
+        assert!(output.error.is_none(), "unexpected error: {output:?}");
+        // Whatever rtk does, the tool still returns text (never blank-fails).
+        assert!(output.content.is_string());
     }
 }

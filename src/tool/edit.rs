@@ -497,7 +497,11 @@ fn align_lines(before: &[Chars], after: &[Chars]) -> Vec<Option<usize>> {
 
 fn flush(result: &mut [Option<usize>], gap_before: &mut Vec<usize>, gap_after: &mut Vec<usize>) {
     for (k, &j) in gap_after.iter().enumerate() {
-        result[j] = Some(gap_before[k]);
+        // Mirror upstream's JavaScript: a gap whose `after` side has more
+        // lines than its `before` side maps the surplus lines to `undefined`
+        // (here `None`, which the caller renders as the fallback ending).
+        // Indexing `gap_before` directly panics on those surplus lines.
+        result[j] = gap_before.get(k).copied();
     }
     gap_before.clear();
     gap_after.clear();
@@ -716,6 +720,26 @@ mod tests {
         assert_eq!(
             output.error.as_deref(),
             Some("Path is a directory, not a file: sub")
+        );
+    }
+
+    /// Regression: a replacement that adds lines may leave a region whose
+    /// `after` side has more lines than its `before` side. Upstream's JS maps
+    /// those surplus lines to `undefined`; the alignment must not index past
+    /// the `before` gap (previously a panic at `edit.rs` flush).
+    #[tokio::test]
+    async fn replacement_adding_lines_does_not_panic() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("a.txt"), "a\nc\n").unwrap();
+        let output = edit(
+            &directory,
+            json!({"path": "a.txt", "oldString": "a\nc", "newString": "a\nx\nc"}),
+        )
+        .await;
+        assert_eq!(output.content, json!("Edited a.txt (1 replacement)"));
+        assert_eq!(
+            fs::read_to_string(directory.path().join("a.txt")).unwrap(),
+            "a\nx\nc\n"
         );
     }
 }
