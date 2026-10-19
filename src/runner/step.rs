@@ -198,7 +198,7 @@ pub(crate) async fn run(
         // The magic-context head replaces everything it covers: the pass mints
         // the frozen bytes and reports the ordinal floor, so the transcript
         // starts after the covered range.
-        let (head, floor) = mctx_head(ctx).await;
+        let (head_m0, head_m1, floor) = mctx_head(ctx).await;
         let rows = load_history_after(&ctx.db, &ctx.session_id, floor).await?;
         let system = prompt::build(&ctx.directory);
         let mut request = ChatRequest::new(
@@ -206,7 +206,7 @@ pub(crate) async fn run(
             // qualified form is upstream's provider-adapter vocabulary and
             // cardinal answers "no route for model cardinal/<id>" to it.
             params.model.id.clone(),
-            build_chat_messages(&system, head.as_deref(), &rows),
+            build_chat_messages(&system, &[head_m0.as_deref(), head_m1.as_deref()], &rows),
         );
         request.tools = ctx.tools.definitions();
 
@@ -1167,19 +1167,19 @@ fn to_session_error(error: &CardinalError) -> SessionError {
 // Context assembly (one named mapping; the e2e suite trusts this function)
 // ---------------------------------------------------------------------------
 
-/// The magic-context head for one step: the frozen `m[0]`/`m[1]` bytes plus
-/// the transcript floor they cover, or `(None, 0)` when the integration is off
-/// or the pass failed (the prompt then stays byte-identical to the
+/// The magic-context head for one step: the frozen `m[0]`/`m[1]` halves plus
+/// the transcript floor they cover, or `(None, None, 0)` when the integration
+/// is off or the pass failed (the prompt then stays byte-identical to the
 /// integration-off one — a broken head must never fail the turn).
-async fn mctx_head(ctx: &DrainCtx) -> (Option<String>, i64) {
+async fn mctx_head(ctx: &DrainCtx) -> (Option<String>, Option<String>, i64) {
     if !ctx.config.magic_context.enabled {
-        return (None, 0);
+        return (None, None, 0);
     }
     let last_seq = match latest_seq(&ctx.db, &ctx.session_id).await {
         Ok(seq) => seq,
         Err(error) => {
             tracing::warn!(session = %ctx.session_id, error = %error, "mctx pass failed; continuing without a head");
-            return (None, 0);
+            return (None, None, 0);
         }
     };
     let project = ctx.directory.to_string_lossy().into_owned();
@@ -1192,14 +1192,14 @@ async fn mctx_head(ctx: &DrainCtx) -> (Option<String>, i64) {
         run_started: false,
     };
     match crate::mctx::pass::run(request).await {
-        Ok(result) => (result.head, result.floor),
+        Ok(result) => (result.head_m0, result.head_m1, result.floor),
         Err(error) => {
             tracing::warn!(
                 session = %ctx.session_id,
                 error = %error,
                 "mctx pass failed; continuing without a head"
             );
-            (None, 0)
+            (None, None, 0)
         }
     }
 }
@@ -1243,7 +1243,7 @@ async fn latest_seq(db: &crate::db::Db, session_id: &str) -> Result<i64> {
 /// - idle/shell/switch markers never reach the model.
 pub(crate) fn build_chat_messages(
     system: &str,
-    head: Option<&str>,
+    head: &[Option<&str>],
     messages: &[Message],
 ) -> Vec<ChatMessage> {
     // Upstream `messageEntries`: history starts at the latest completed
@@ -1260,11 +1260,13 @@ pub(crate) fn build_chat_messages(
     let mut out = vec![ChatMessage::System {
         content: system.to_owned(),
     }];
-    if let Some(head) = head {
-        // The head is synthetic: it stands in for the covered history, so it
-        // leads the transcript as a user message.
+    // The head halves are synthetic user messages leading the transcript: they
+    // stand in for the covered history. They stay SEPARATE because the baseline
+    // (`m[0]`) is the provider's cache anchor — merging them would rewrite the
+    // anchored bytes on every delta.
+    for half in head.iter().flatten() {
         out.push(ChatMessage::User {
-            content: head.to_owned(),
+            content: (*half).to_owned(),
         });
     }
     for message in messages.iter().skip(boundary.unwrap_or(0)) {
@@ -1555,7 +1557,7 @@ mod tests {
             },
             assistant,
         ];
-        let chat = build_chat_messages("sys", None, &messages);
+        let chat = build_chat_messages("sys", &[], &messages);
         let system_roles: Vec<&str> = chat
             .iter()
             .filter_map(|m| match m {

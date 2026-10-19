@@ -187,7 +187,7 @@ pub(crate) async fn compact(
         let mut request = summarization_request(
             // Same cardinal routing rule as step.rs: bare model id.
             &model.id,
-            &super::step::build_chat_messages("", None, &rows),
+            &super::step::build_chat_messages("", &[], &rows),
         );
         let mut summary = stream_summary(ctx, &request).await?;
         // Upstream `send` (compaction.ts): a reply that ignores the summary

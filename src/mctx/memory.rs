@@ -6,7 +6,7 @@
 //! - **Memories** are project-scoped facts that stay true for months: a
 //!   project rule, an architectural fact, a hard-won constraint, a config
 //!   value, a naming convention. Every active memory is rendered into the
-//!   system prompt's tail by [`crate::mctx::render::render_memory_pinboard`],
+//!   `<project-memory>` block of the request head ([`crate::mctx::render`]),
 //!   so it reaches every future session of the project without being asked
 //!   for.
 //! - **Notes** are session-scoped pending intentions: work to return to,

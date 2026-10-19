@@ -12,9 +12,24 @@
 //!   opaque bytes.
 //! - **Classification** — m[0] bytes changed ⇒ `Hard`; only m[1] changed ⇒
 //!   `Soft`; nothing changed ⇒ `SoftPlus` defer (see [`Signals`]).
-//! - **The coverage anchor** — the boundary id carries the ordinal m[0]
-//!   covers (`mc:<ordinal>`), which is also the transcript floor for request
-//!   assembly: everything at or below it is represented by the head.
+//! - **The coverage anchor and the floor** — the boundary id carries the
+//!   *coverage* ordinal (`mc:<ordinal>`): the highest transcript ordinal the
+//!   whole prefix (m[0] and m[1] together) represents. That same ordinal is the
+//!   transcript floor for request assembly — everything at or below it is
+//!   represented by the head and dropped from the tail.
+//!
+//! The baseline's own coverage is a *separate*, ox-owned fact (a session `kv`
+//! row): a `Soft` folds new coverage into the delta while the baseline stays
+//! frozen at the ordinal it was built at, so the two only coincide on a `Hard`.
+//!
+//! ## Not implemented here (explicit deferral)
+//!
+//! The head carries `[dropped §N§]` placeholders for queued drops, but the drop
+//! does NOT rewrite the live transcript: `Tagger::assign` has no production
+//! caller yet, so no `§N§` tag is rendered beside a transcript item and a drop
+//! of a row above the floor leaves that row's raw content in the tail. Wiring
+//! the tagger pass and the tail rewrite belongs with the request-assembly work
+//! (Task 5b), not with the head producer.
 //!
 //! Freeze/replay discipline is NOT re-implemented here: on a defer the kernel
 //! replays the frozen bytes verbatim and this module only plans (it never
@@ -37,10 +52,13 @@ use crate::mctx::tagger::{mark_drops_applied, peek_queued_drops};
 /// What one pass produced for the request builder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PassResult {
-    /// The head bytes to inject ahead of the live transcript, or `None` when
-    /// there is no usable head (first-ever pass with nothing to say, or a
-    /// panicked pass with no last-known-good).
-    pub head: Option<String>,
+    /// The baseline half of the head (`m[0]`), or `None` when there is no
+    /// usable head (a panicked pass with no last-known-good). It is injected
+    /// as its own message: the stable baseline is the provider's cache anchor,
+    /// so it must stay byte-identical while the delta moves.
+    pub head_m0: Option<String>,
+    /// The delta half of the head (`m[1]`).
+    pub head_m1: Option<String>,
     /// Highest transcript ordinal the head covers: rows at or below it are
     /// dropped from the request (the head represents them).
     pub floor: i64,
@@ -81,32 +99,32 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
     let cache = McCache::new(db.clone(), session_id);
     let state = cache.load().await?;
 
-    // The ordinal m[0] covers. On a pass that must rebuild (no state yet, or
-    // an explicit/forced rebuild) m[0] folds the whole compartment set;
-    // otherwise it stays pinned to the anchor the frozen m[0] was built at.
-    let coverage = compartments::coverage_end(&compartments);
-    let m0_coverage = if let Some(state) = state.as_ref() {
-        anchor_coverage(&state.boundary_id).unwrap_or(0)
-    } else {
-        coverage.unwrap_or(0)
-    };
+    // The materialized coverage: the highest ordinal the head represents, and
+    // therefore the transcript floor. Clamped to the live tail so a revert that
+    // removed rows can never leave the head claiming coverage of rows that no
+    // longer exist (which would strand a stale head under a live anchor).
+    let coverage = compartments::coverage_end(&compartments)
+        .unwrap_or(0)
+        .min(last_seq);
+    // The ordinal the frozen baseline (`m[0]`) covers. It is not the same thing
+    // as the coverage: a `Soft` folds new coverage into the delta while the
+    // baseline stays put. It is ox-owned state (the kernel's anchor is the
+    // coverage token), so it lives in the session's kv row.
+    let m0_coverage = materialized_m0_coverage(db, session_id).await?;
     let rebuild_m0 = state.is_none()
         || forced
         || baseline_changed(state.as_ref(), &compartments, &memories, m0_coverage);
+    let m0_coverage_after = if rebuild_m0 { coverage } else { m0_coverage };
 
     let plan = plan_units(PlanInputs {
         compartments: &compartments,
         memories: &memories,
-        m0_coverage: if rebuild_m0 {
-            coverage.unwrap_or(0)
-        } else {
-            m0_coverage
-        },
+        m0_coverage: m0_coverage_after,
     });
 
     let (frozen_m0, frozen_m1) = frozen_halves(state.as_ref());
     let signals = Signals {
-        boundary_present: boundary_present(state.as_ref(), m0_coverage, last_seq),
+        boundary_present: boundary_present(state.as_ref(), coverage, last_seq),
         reconcile_pending: false,
         forced,
         run_started,
@@ -127,37 +145,31 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
     };
 
     let outcome = run_pass(&cache, &renderer, &signals).await?;
-    let result = match &outcome {
+    let (prefix, floor) = match &outcome {
         PassOutcome::DeferReplayed { prefix } => {
+            // A defer replays the frozen bytes: the floor must be the one the
+            // frozen head was materialized with, not this pass's coverage.
             let floor = materialized_floor(db, session_id).await?;
-            PassResult {
-                head: Some(prefix.clone()),
-                floor,
-                outcome,
-            }
+            (prefix.clone(), floor)
         }
         PassOutcome::BustApplied { prefix } => {
-            // The bust froze these bytes, so the queued drops it drained are
+            // The bust froze these bytes, so the queued drops they carry are
             // now reflected in the prefix: mark them applied.
             let tags: Vec<u64> = drops.iter().map(|(tag, _)| *tag).collect();
             if !tags.is_empty() {
                 mark_drops_applied(db, session_id, &tags).await?;
             }
-            if let Some(coverage) = coverage {
-                save_materialized_floor(db, session_id, coverage).await?;
-            }
-            PassResult {
-                head: Some(prefix.clone()),
-                floor: coverage.unwrap_or(0),
-                outcome,
-            }
+            save_materialized_floor(db, session_id, coverage).await?;
+            save_materialized_m0_coverage(db, session_id, m0_coverage_after).await?;
+            (prefix.clone(), coverage)
         }
         PassOutcome::ModulePanicked => {
             // LKG: serve the last bytes the pass actually produced, with the
-            // transcript floor that went with them. With no LKG there is
-            // nothing coherent to inject, so the request falls back to the
-            // raw transcript (the head is an optimization, never a
-            // correctness boundary).
+            // transcript floor that went with them (both are written by the
+            // same bust, so they always agree). With no LKG there is nothing
+            // coherent to inject, so the request falls back to the raw
+            // transcript — the head is an optimization, never a correctness
+            // boundary.
             let lkg = crate::mctx::cache::Lkg::new(db.clone())
                 .load_lkg(session_id)
                 .await
@@ -169,20 +181,34 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
                 floor,
                 "mctx pass panicked; serving last-known-good head"
             );
-            PassResult {
-                head: lkg,
-                floor,
-                outcome,
-            }
+            (lkg.unwrap_or_default(), floor)
+        }
+    };
+
+    // The prefix is the two halves in order; `split_prefix` recovers them (both
+    // are non-empty by construction — the baseline always carries the history
+    // block, the delta always carries its marker).
+    let (head_m0, head_m1) = split_prefix(&prefix);
+    let result = if prefix.is_empty() {
+        PassResult {
+            head_m0: None,
+            head_m1: None,
+            floor,
+            outcome,
+        }
+    } else {
+        PassResult {
+            head_m0: Some(head_m0.to_string()),
+            head_m1: Some(head_m1.to_string()),
+            floor,
+            outcome,
         }
     };
 
     // Record the head actually served as the session's last-known-good.
-    if let Some(head) = result.head.as_deref()
-        && !matches!(result.outcome, PassOutcome::ModulePanicked)
-    {
+    if !prefix.is_empty() && !matches!(result.outcome, PassOutcome::ModulePanicked) {
         crate::mctx::cache::Lkg::new(db.clone())
-            .save_lkg(session_id, head)
+            .save_lkg(session_id, &prefix)
             .await
             .context("save LKG")?;
     }
@@ -287,11 +313,6 @@ fn anchor_id(coverage: i64) -> String {
     format!("mc:{coverage}")
 }
 
-/// The coverage ordinal encoded in an anchor id.
-fn anchor_coverage(boundary_id: &str) -> Option<i64> {
-    boundary_id.strip_prefix("mc:")?.parse().ok()
-}
-
 /// The frozen `(m0, m1)` payload halves, if the state carries them.
 fn frozen_halves(state: Option<&CoreState>) -> (String, String) {
     let Some(state) = state else {
@@ -310,19 +331,16 @@ fn frozen_halves(state: Option<&CoreState>) -> (String, String) {
     )
 }
 
-/// Boundary-presence token: the frozen anchor when the range it covers is
-/// still in the live transcript, else the absent sentinel the kernel expects.
-fn boundary_present(state: Option<&CoreState>, m0_coverage: i64, last_seq: i64) -> Option<String> {
+/// Boundary-presence token: the anchor when the range it covers (everything at
+/// or below the coverage, i.e. the floor) is still in the live transcript, else
+/// the absent sentinel the kernel expects.
+///
+/// The anchor token is the *coverage*, not the baseline's own coverage: the
+/// prefix covers m[0] AND m[1], so a delta that extends coverage past the
+/// baseline must still be invalidated by a revert of those rows.
+fn boundary_present(state: Option<&CoreState>, coverage: i64, last_seq: i64) -> Option<String> {
     let state = state?;
-    if m0_coverage <= last_seq && m0_coverage > 0 {
-        Some(state.boundary_id.clone())
-    } else if m0_coverage == 0 {
-        // Nothing folded yet: the anchor describes an empty coverage, which is
-        // present by construction.
-        Some(state.boundary_id.clone())
-    } else {
-        None
-    }
+    (coverage <= last_seq).then(|| state.boundary_id.clone())
 }
 
 /// One queued drop's frozen unit: the placeholder the model sees in place of
@@ -346,9 +364,43 @@ fn materialized_key(session_id: &str) -> String {
     format!("mctx_seq:{session_id}")
 }
 
+fn materialized_m0_key(session_id: &str) -> String {
+    format!("mctx_m0_cov:{session_id}")
+}
+
+/// The ordinal the frozen baseline (`m[0]`) covers; 0 before the first pass.
+async fn materialized_m0_coverage(db: &Db, session_id: &str) -> Result<i64> {
+    read_kv_int(db, &materialized_m0_key(session_id), "mctx m0 coverage").await
+}
+
+async fn save_materialized_m0_coverage(db: &Db, session_id: &str, coverage: i64) -> Result<()> {
+    write_kv_int(
+        db,
+        &materialized_m0_key(session_id),
+        coverage,
+        "mctx m0 coverage",
+    )
+    .await
+}
+
 /// The transcript floor to pair with a last-known-good head.
 async fn materialized_floor(db: &Db, session_id: &str) -> Result<i64> {
-    let key = materialized_key(session_id);
+    read_kv_int(db, &materialized_key(session_id), "mctx materialized floor").await
+}
+
+async fn save_materialized_floor(db: &Db, session_id: &str, coverage: i64) -> Result<()> {
+    write_kv_int(
+        db,
+        &materialized_key(session_id),
+        coverage,
+        "mctx materialized floor",
+    )
+    .await
+}
+
+/// Read a small integer the pass keeps in the session's `kv` row.
+async fn read_kv_int(db: &Db, key: &str, what: &str) -> Result<i64> {
+    let key = key.to_owned();
     let value = db
         .conn()
         .call(move |c| -> rusqlite::Result<Option<String>> {
@@ -358,13 +410,13 @@ async fn materialized_floor(db: &Db, session_id: &str) -> Result<i64> {
             .optional()
         })
         .await
-        .context("load mctx materialized floor")?;
+        .with_context(|| format!("load {what}"))?;
     Ok(value.and_then(|v| v.parse().ok()).unwrap_or(0))
 }
 
-async fn save_materialized_floor(db: &Db, session_id: &str, coverage: i64) -> Result<()> {
-    let key = materialized_key(session_id);
-    let value = coverage.to_string();
+async fn write_kv_int(db: &Db, key: &str, value: i64, what: &str) -> Result<()> {
+    let key = key.to_owned();
+    let value = value.to_string();
     let now = now_millis();
     db.conn()
         .call(move |c| -> rusqlite::Result<()> {
@@ -376,8 +428,22 @@ async fn save_materialized_floor(db: &Db, session_id: &str, coverage: i64) -> Re
             Ok(())
         })
         .await
-        .context("save mctx materialized floor")?;
+        .with_context(|| format!("save {what}"))?;
     Ok(())
+}
+
+/// Split the frozen prefix into its two halves at the delta's opening marker.
+///
+/// The marker is unambiguous: m[0] content is XML-escaped, so a literal
+/// `<session-history-since>` can only appear as the real delta tag. The blank
+/// line that separated the halves when they were concatenated is consumed at
+/// the seam (the halves travel as their own messages now).
+fn split_prefix(prefix: &str) -> (&str, &str) {
+    const M1_OPEN: &str = "<session-history-since>";
+    match prefix.find(M1_OPEN) {
+        Some(index) => (prefix[..index].trim_end_matches('\n'), &prefix[index..]),
+        None => (prefix.trim_end(), ""),
+    }
 }
 
 /// Hands the kernel the units planned for this pass. Determinism is structural
@@ -478,14 +544,19 @@ mod tests {
         let result = run(request(&db, 9)).await.unwrap();
         assert!(matches!(result.outcome, PassOutcome::BustApplied { .. }));
         assert_eq!(result.floor, 9);
-        let head = result.head.unwrap();
-        assert!(head.contains("<session-history>"), "m0 history: {head}");
+        let m0 = result.head_m0.unwrap();
+        let m1 = result.head_m1.unwrap();
+        assert!(m0.contains("<session-history>"), "m0 history: {m0}");
         assert!(
-            head.contains("## 1-9 · Alpha\nAlpha full"),
-            "compartment: {head}"
+            m0.contains("## 1-9 · Alpha\nAlpha full"),
+            "compartment: {m0}"
         );
-        assert!(head.contains("<project-memory>"), "pinboard: {head}");
-        assert!(head.contains(M1_PLACEHOLDER), "m1 placeholder: {head}");
+        assert!(m0.contains("<project-memory>"), "pinboard: {m0}");
+        assert!(
+            !m0.contains("<session-history-since>"),
+            "m0 is baseline only"
+        );
+        assert_eq!(m1, M1_PLACEHOLDER, "m1 is the placeholder");
     }
 
     #[tokio::test]
@@ -496,7 +567,11 @@ mod tests {
         let second = run(request(&db, 9)).await.unwrap();
 
         assert!(matches!(second.outcome, PassOutcome::DeferReplayed { .. }));
-        assert_eq!(first.head, second.head, "defer replays the same bytes");
+        assert_eq!(
+            first.head_m0, second.head_m0,
+            "defer replays the same bytes"
+        );
+        assert_eq!(first.head_m1, second.head_m1, "both halves stay frozen");
     }
 
     #[tokio::test]
@@ -514,15 +589,14 @@ mod tests {
             "new coverage is a bust: {:?}",
             second.outcome
         );
-        let head = second.head.unwrap();
-        let m0 = head.find("<session-history>").unwrap();
-        let delta = head.find("<new-compartments>").unwrap();
-        assert!(m0 < delta, "delta follows the baseline: {head}");
-        assert!(head.contains("## 10-20 · Beta"), "delta body: {head}");
-        // The baseline still renders the compartment it was frozen at.
+        // The baseline half is untouched — that is the whole point of a Soft: the
+        // provider's cached anchor survives while the delta moves.
+        assert_eq!(second.head_m0, first.head_m0, "m0 stays frozen");
+        let delta = second.head_m1.unwrap();
+        assert!(delta.contains("## 10-20 · Beta"), "delta body: {delta}");
         assert!(
-            head.contains("## 1-9 · Alpha\nAlpha full"),
-            "frozen m0: {head}"
+            delta.contains("<new-compartments>"),
+            "delta wrapper: {delta}"
         );
         assert_eq!(second.floor, 20, "the floor advances with the delta");
     }
@@ -532,16 +606,22 @@ mod tests {
         let db = db().await;
         add_compartment(&db, "mc_1", 1, 9, "Alpha").await;
         let first = run(request(&db, 9)).await.unwrap();
-        assert!(!first.head.as_deref().unwrap().contains("<project-memory>"));
+        assert!(!first.head_m0.unwrap().contains("<project-memory>"));
 
         write_memory(&db, PROJECT, "new fact", "NAMING")
             .await
             .unwrap();
         let second = run(request(&db, 9)).await.unwrap();
         assert!(matches!(second.outcome, PassOutcome::BustApplied { .. }));
-        let head = second.head.unwrap();
-        assert!(head.contains("#1: new fact"), "memory lands in m0: {head}");
-        assert!(head.contains(M1_PLACEHOLDER), "the delta resets: {head}");
+        assert!(
+            second.head_m0.unwrap().contains("#1: new fact"),
+            "memory lands in m0"
+        );
+        assert_eq!(
+            second.head_m1.unwrap(),
+            M1_PLACEHOLDER,
+            "the delta resets on a Hard"
+        );
     }
 
     #[tokio::test]
@@ -588,7 +668,7 @@ mod tests {
         // The next bust drains it into the prefix and marks it applied.
         add_compartment(&db, "mc_2", 10, 20, "Beta").await;
         let busted = run(request(&db, 20)).await.unwrap();
-        let head = busted.head.unwrap();
+        let head = format!("{}{}", busted.head_m0.unwrap(), busted.head_m1.unwrap());
         assert!(
             head.contains(&format!("[dropped §{tag}§]")),
             "placeholder in head: {head}"
@@ -604,11 +684,11 @@ mod tests {
 
         let state = McCache::new(db.clone(), SESSION).load().await.unwrap();
         let state = state.expect("state after the first pass");
-        assert_eq!(anchor_coverage(&state.boundary_id), Some(9));
+        assert_eq!(state.boundary_id, anchor_id(9));
         // The covered range is still live: the anchor is present.
         assert!(boundary_present(Some(&state), 9, 20).is_some());
-        // A revert past the coverage reports it absent → the kernel flags a
-        // reconcile, and the next pass rebuilds.
+        // A revert that removed covered rows reports it absent → the kernel
+        // flags a reconcile, and the next pass rebuilds against the live tail.
         assert!(boundary_present(Some(&state), 9, 5).is_none());
     }
 
@@ -617,7 +697,9 @@ mod tests {
         let db = db().await;
         add_compartment(&db, "mc_1", 1, 9, "Alpha").await;
         let previewed = preview(&db, SESSION, PROJECT).await.unwrap();
-        let head = run(request(&db, 9)).await.unwrap().head.unwrap();
-        assert_eq!(previewed, head);
+        let result = run(request(&db, 9)).await.unwrap();
+        let (m0, m1) = split_prefix(&previewed);
+        assert_eq!(m0, result.head_m0.unwrap());
+        assert_eq!(m1, result.head_m1.unwrap());
     }
 }

@@ -399,20 +399,6 @@ pub fn render_decayed_compartments(
     body
 }
 
-/// Extract a top-level m0 block slice (e.g. `"session-history"`) for budget
-/// measurement and token attribution. Returns the full `<tag>…</tag>` slice or
-/// `None`. Manual shortest-match (the non-greedy `<tag>[\s\S]*?</tag>`): the
-/// first `</tag>` after the first `<tag>`.
-pub fn extract_m0_block(m0_text: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = m0_text.find(&open)?;
-    let after_open = start + open.len();
-    let close_rel = m0_text[after_open..].find(&close)?;
-    let end = after_open + close_rel + close.len();
-    Some(m0_text[start..end].to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,16 +617,6 @@ mod tests {
         );
         // the newest should retain more fidelity than the oldest after demotion
         assert!(out.contains(" · NEW"), "newest survives: {out}");
-    }
-
-    #[test]
-    fn extract_m0_block_shortest_match() {
-        let m0 = "<a>x</a><session-history>HIST</session-history><b>y</b>";
-        assert_eq!(
-            extract_m0_block(m0, "session-history").as_deref(),
-            Some("<session-history>HIST</session-history>")
-        );
-        assert_eq!(extract_m0_block(m0, "missing"), None);
     }
 
     #[test]
