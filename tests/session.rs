@@ -311,6 +311,8 @@ async fn create_get_list_update_delete_round_trip() {
             "title",
             "tokens"
         ],
+        // The root session's subpath is the empty string in the DB, and the
+        // wire shape omits it (upstream `row.path ? … : undefined`).
         "Session.Info key set"
     );
     assert_eq!(info["id"], json!(session_id));
@@ -542,6 +544,77 @@ async fn list_orders_newest_first_and_filters_by_parent() {
         .filter_map(|s| s["id"].as_str())
         .collect();
     assert_eq!(search_ids, vec![first.as_str()]);
+}
+
+// The TUI's session list (`dialog-session-list.tsx`) filters by
+// `project` + `subpath`, where `subpath` is `path.relative(project.directory,
+// directory)` — the empty string when the two are equal. Upstream stores a
+// root session's path as `''` (never NULL), so that page lists the roots; a
+// NULL root path (ox's old behavior) makes the list permanently empty.
+//
+// ox models one synthetic project per directory, so a nested directory is its
+// own project root with subpath `''` too — the filter below still matches it
+// only because both sessions share the synthetic `default` project id. The
+// assertion pinned here is the wire/DB shape: root paths are `''`, never NULL.
+#[tokio::test]
+async fn list_by_project_and_empty_subpath_returns_root_sessions() {
+    let h = Harness::spawn().await;
+
+    let root = h.create(json!({"title": "root"})).await;
+    let other = h
+        .create(json!({
+            "title": "other",
+            "location": {"directory": format!("{}/sub/dir", h.base)}
+        }))
+        .await;
+
+    // What the TUI actually sends: project + subpath= (empty string).
+    let listed: Value = h
+        .get("/api/session?parentID=null&order=desc&project=default&subpath=")
+        .await
+        .json()
+        .await
+        .expect("json");
+    let ids: Vec<String> = listed["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .filter_map(|s| s["id"].as_str().map(str::to_owned))
+        .collect();
+    assert!(
+        ids.iter().any(|id| id == &root),
+        "root session must match subpath=\"\": {ids:?}"
+    );
+
+    // The wire shape omits `subpath` for roots (upstream `row.path ? … :
+    // undefined`); the DB row carries `''`, not NULL.
+    let info = h.session_info(&root).await;
+    assert!(info.get("subpath").is_none(), "info: {info}");
+    for id in [&root, &other] {
+        let n = count_rows(
+            &h.db,
+            "SELECT count(*) FROM session_v2 WHERE id = ?1 AND path = ''",
+            vec![turso::Value::Text(id.clone())],
+        )
+        .await;
+        assert_eq!(n, 1, "session `{id}` path must be the empty string");
+    }
+}
+
+// Upstream's `session.form.list` filters its form cache by the raw `sessionID`
+// string without checking the session exists (`form.ts:168-174`), so the TUI's
+// bootstrap call with the literal id `"global"` gets `200 []`. It must not 404.
+#[tokio::test]
+async fn session_form_list_answers_empty_for_unknown_sessions() {
+    let h = Harness::spawn().await;
+
+    let resp = h.get("/api/session/global/form").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["data"].as_array().expect("data").len(), 0);
+
+    let resp = h.get("/api/session/ses_unknown/form").await;
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
 }
 
 #[tokio::test]

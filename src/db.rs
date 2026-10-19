@@ -337,6 +337,19 @@ ALTER TABLE mc_memory ADD COLUMN embedding BLOB;
 ALTER TABLE mc_memory ADD COLUMN embedding_model TEXT;
 "#;
 
+/// The project-root `path` empty-string convention (session-list fix).
+///
+/// Upstream stores a root session's subpath as `''`, never NULL (`move.ts:89`
+/// builds it with `path.relative`, which yields `''` at the root), and the TUI
+/// lists sessions with `subpath=""` filters — so a NULL root path makes the
+/// session list permanently empty. ox used to write NULL for roots; the
+/// rewrite runs in [`Db::migrate`] after the static migrations because it
+/// depends on whether a `project` table exists (a shared upstream DB narrows
+/// the rewrite to rows whose directory equals the project worktree), and
+/// SQLite raises "no such table" at prepare time, so static SQL cannot branch
+/// on that.
+const MIGRATION_V11: &str = r#""#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
@@ -351,6 +364,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (8, MIGRATION_V8),
     (9, MIGRATION_V9),
     (10, MIGRATION_V10),
+    (11, MIGRATION_V11),
 ];
 
 /// All indexes the migration creates: V1's verbatim from upstream
@@ -541,7 +555,9 @@ impl Db {
 
     /// Apply pending migrations in version order. Each migration runs in a
     /// transaction that bumps `PRAGMA user_version`, so re-running is a no-op
-    /// once the database is current.
+    /// once the database is current. After the static migrations, the V11
+    /// data rewrite runs (its SQL depends on whether a `project` table
+    /// exists, which static migration SQL cannot branch on).
     pub async fn migrate(&self) -> Result<()> {
         let current = self.user_version().await?;
         for &(version, sql) in MIGRATIONS {
@@ -554,6 +570,38 @@ impl Db {
             tx.commit().await?;
             tracing::info!(version, "applied db migration");
         }
+        if current < 11 {
+            self.backfill_root_paths().await?;
+        }
+        Ok(())
+    }
+
+    /// MIGRATION_V11's data rewrite: NULL root paths become `''` (see the
+    /// constant's doc comment). Idempotent and bounded by the same
+    /// `user_version < 11` gate as the static migrations.
+    async fn backfill_root_paths(&self) -> Result<()> {
+        let tx = self.begin().await?;
+        // With a shared upstream `project` table, only a directory equal to
+        // its project's worktree is a root; without one, every row's directory
+        // is the synthetic project's root by construction. A subpath that
+        // genuinely nests keeps its NULL (upstream also stores nested paths,
+        // never NULL, so this branch is defensive for malformed rows only).
+        if self.table_exists("project").await.unwrap_or(false) {
+            tx.execute(
+                "UPDATE session_v2 SET path = ''
+                 WHERE path IS NULL
+                   AND directory = (SELECT worktree FROM project WHERE project.id = session_v2.project_id)",
+                (),
+            )
+            .await?;
+        } else {
+            tx.execute(
+                "UPDATE session_v2 SET path = '' WHERE path IS NULL",
+                (),
+            )
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -751,14 +799,54 @@ mod tests {
         assert!(!db.table_exists("no_such_table").await.unwrap());
     }
 
+    /// V11 rewrites NULL root paths to `''`: the TUI's session list filters
+    /// `subpath=""`, which upstream answers for root sessions because it
+    /// stores roots as `''`, never NULL. Without a `project` table (ox's own
+    /// databases) every NULL path is a synthetic-project root.
+    #[tokio::test]
+    async fn migration_v11_rewrites_null_root_paths_to_empty_strings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade11.db");
+        build_upto(&path, 10).await;
+        {
+            let conn = raw(&path).await;
+            for (id, path_col) in [("root", None), ("nested", Some("sub/dir"))] {
+                conn.execute(
+                    "INSERT INTO session_v2 (id, project_id, slug, directory, path, version, time_created, time_updated)
+                     VALUES (?1, 'default', 's', '/p', ?2, 'test', 1, 1)",
+                    (id, path_col),
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let db = Db::open(&path).await.unwrap();
+        assert_eq!(
+            count(&db, "SELECT count(*) FROM session_v2 WHERE path = ''").await,
+            1,
+            "the root path becomes the empty string"
+        );
+        assert_eq!(
+            count(&db, "SELECT count(*) FROM session_v2 WHERE path IS NULL").await,
+            0,
+            "no NULL paths remain"
+        );
+        let row = query_row(&db, "SELECT path FROM session_v2 WHERE id = 'nested'").await;
+        assert_eq!(
+            row.get::<Option<String>>(0).unwrap().as_deref(),
+            Some("sub/dir"),
+            "nested subpaths are untouched"
+        );
+    }
+
     #[tokio::test]
     async fn migration_tracks_user_version_and_is_idempotent() {
         let db = Db::open_in_memory().await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 10);
+        assert_eq!(db.user_version().await.unwrap(), 11);
         // Re-running must be a no-op: version stays, no error.
         db.migrate().await.unwrap();
         db.migrate().await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 10);
+        assert_eq!(db.user_version().await.unwrap(), 11);
     }
 
     /// The pragmas [`Db::connect`] sets are the ones the storage layer relies
@@ -836,7 +924,7 @@ mod tests {
         let path = dir.path().join("upgrade.db");
         build_upto(&path, 1).await;
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 10);
+        assert_eq!(db.user_version().await.unwrap(), 11);
         for table in [
             "mc_frozen_state",
             "mc_compartments",
@@ -857,7 +945,7 @@ mod tests {
         let path = dir.path().join("upgrade3.db");
         build_upto(&path, 2).await;
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 10);
+        assert_eq!(db.user_version().await.unwrap(), 11);
         for table in ["mc_tag", "mc_drop"] {
             assert!(
                 db.table_exists(table).await.unwrap(),
@@ -910,7 +998,7 @@ mod tests {
             .unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 10);
+        assert_eq!(db.user_version().await.unwrap(), 11);
         // The pre-existing row reads back with the 'active' default and no
         // archive reason — the additive columns converge both DB histories.
         let row = query_row(
@@ -960,7 +1048,7 @@ mod tests {
             .unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 10);
+        assert_eq!(db.user_version().await.unwrap(), 11);
         let row = query_row(
             &db,
             "SELECT updated_at, error FROM mc_historian_run WHERE id = 'hr_old'",
@@ -988,7 +1076,7 @@ mod tests {
             .unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 10);
+        assert_eq!(db.user_version().await.unwrap(), 11);
         let compartments = columns(&db, "mc_compartments").await;
         let runs = columns(&db, "mc_historian_run").await;
         assert!(!compartments.iter().any(|c| c == "facts"));
@@ -1045,7 +1133,7 @@ mod tests {
         }
         let upgraded = Db::open(&path).await.unwrap();
         let fresh = Db::open_in_memory().await.unwrap();
-        assert_eq!(upgraded.user_version().await.unwrap(), 10);
+        assert_eq!(upgraded.user_version().await.unwrap(), 11);
         // Both histories must create exactly the same objects, SQL included.
         assert_eq!(
             schema_objects(&upgraded).await,
@@ -1135,7 +1223,7 @@ mod tests {
         build_upto(&path, 7).await;
         let upgraded = Db::open(&path).await.unwrap();
         let fresh = Db::open_in_memory().await.unwrap();
-        assert_eq!(upgraded.user_version().await.unwrap(), 10);
+        assert_eq!(upgraded.user_version().await.unwrap(), 11);
         assert_eq!(
             schema_objects(&upgraded).await,
             schema_objects(&fresh).await,
@@ -1189,7 +1277,7 @@ mod tests {
         }
         let upgraded = Db::open(&path).await.unwrap();
         let fresh = Db::open_in_memory().await.unwrap();
-        assert_eq!(upgraded.user_version().await.unwrap(), 10);
+        assert_eq!(upgraded.user_version().await.unwrap(), 11);
         assert_eq!(
             schema_objects(&upgraded).await,
             schema_objects(&fresh).await,
@@ -1227,7 +1315,7 @@ mod tests {
         }
         let upgraded = Db::open(&path).await.unwrap();
         let fresh = Db::open_in_memory().await.unwrap();
-        assert_eq!(upgraded.user_version().await.unwrap(), 10);
+        assert_eq!(upgraded.user_version().await.unwrap(), 11);
         assert_eq!(
             schema_objects(&upgraded).await,
             schema_objects(&fresh).await,

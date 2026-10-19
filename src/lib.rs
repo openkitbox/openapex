@@ -60,13 +60,26 @@ pub async fn build_state(config: Config) -> Result<AppState> {
 /// when `magic_context.enabled`.
 ///
 /// Callers may pre-populate `tools` before handing it over (as [`run`] does
-/// with the CBM tools); this function only adds the magic-context tools.
+/// with the CBM and todo tools); this function only adds the magic-context
+/// tools.
 pub async fn build_state_with(
     config: Config,
     chat: std::sync::Arc<dyn runner::Chat>,
-    mut tools: runner::ToolRegistry,
+    tools: runner::ToolRegistry,
 ) -> Result<AppState> {
     let db = Db::open(&config.db_path).await?;
+    build_state_on(config, chat, tools, db).await
+}
+
+/// The shared tail of [`build_state_with`]: state over an already-open
+/// database, so [`run`] can register DB-holding tools before handing the
+/// registry over without opening the database twice.
+async fn build_state_on(
+    config: Config,
+    chat: std::sync::Arc<dyn runner::Chat>,
+    mut tools: runner::ToolRegistry,
+    db: Db,
+) -> Result<AppState> {
     if config.magic_context.enabled {
         let embedder = mctx::embed::Embedder::from_config(&config.magic_context.embedding);
         tools.register_mctx(db.clone(), embedder);
@@ -112,8 +125,14 @@ pub async fn run(config: Config) -> Result<()> {
              get_architecture. Install it on the server's PATH to enable them"
         ),
     }
+    // The session todo list needs the DB (it stores state in the `kv` table),
+    // so it joins here at the composition root rather than in
+    // `with_builtins` — the same seam the CBM tools use. Tests that inject
+    // their own registry keep a deterministic toolset.
+    let db = Db::open(&config.db_path).await?;
+    tools.register_todo(db.clone());
     let chat = cardinal_chat(&config)?;
-    let state = build_state_with(config, chat, tools).await?;
+    let state = build_state_on(config, chat, tools, db).await?;
     // Fetch the model list before serving, so the first client that asks
     // (`/api/model` at TUI startup) gets models instead of an empty list. A
     // failure only warns: the request path retries on its own TTL.

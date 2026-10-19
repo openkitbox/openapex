@@ -292,8 +292,10 @@ impl SessionRow {
         if let Some(title) = &self.title {
             m.insert("title".to_owned(), json!(title));
         }
-        if let Some(subpath) = &self.path {
-            m.insert("subpath".to_owned(), json!(subpath));
+        // Upstream `row.path ? RelativePath.make(row.path) : undefined`: the
+        // empty-string root subpath stays absent from the wire shape.
+        if self.path.as_deref().is_some_and(|p| !p.is_empty()) {
+            m.insert("subpath".to_owned(), json!(self.path));
         }
         insert_json(&mut m, "metadata", &self.metadata);
         insert_json(&mut m, "permissions", &self.permission);
@@ -362,15 +364,17 @@ pub(crate) async fn resolve_project(db: &Db, directory: &str) -> (String, String
 }
 
 /// `subpath` for a location inside a project directory: the relative remainder,
-/// or `None` when the location *is* the project directory.
+/// or the empty string when the location *is* the project directory.
+///
+/// Upstream stores the project-root subpath as `''` — never NULL
+/// (`move.ts:89`: `RelativePath.make(path.relative(...))`, which yields `''`
+/// at the root) — and the TUI's session list filters `subpath=""` to mean
+/// "sessions at the project root". A `None` here would make that page
+/// permanently empty.
 fn subpath_of(directory: &str, project_directory: &str) -> Option<String> {
     let relative = directory.strip_prefix(project_directory)?;
     let trimmed = relative.trim_start_matches('/');
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_owned())
-    }
+    Some(trimmed.to_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -2036,20 +2040,22 @@ pub(crate) async fn permission_list(req: &mut Request, depot: &mut Depot, res: &
 
 /// `GET /api/session/{sessionID}/form` — upstream `session.form.list`.
 /// ox has no form channel; the list is always empty.
+///
+/// Upstream's form service filters its in-memory cache by `sessionID`
+/// (`form.ts:168-174`) without checking the session exists, and the protocol
+/// types `sessionID` as a plain string — so the TUI's `session.form.sync`
+/// bootstrap call with the literal id `"global"` gets `200 []`, not a 404.
+/// Mirror that: unknown sessions (including `"global"`) answer an empty list.
 #[handler]
 pub(crate) async fn form_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let Some(app) = state(depot, res) else {
+    let Some(_app) = state(depot, res) else {
         return;
     };
-    let Some(session_id) = req.param::<String>("sessionID") else {
+    if req.param::<String>("sessionID").is_none() {
         invalid_request(res, "Missing sessionID");
         return;
-    };
-    match load_session(&app.db, &session_id).await {
-        Ok(Some(_)) => res.render(Json(json!({ "data": [] }))),
-        Ok(None) => session_not_found(res, &session_id),
-        Err(error) => unknown_error(res, &error),
     }
+    res.render(Json(json!({ "data": [] })));
 }
 
 /// `POST /api/experimental/session/{sessionID}/wait` — upstream

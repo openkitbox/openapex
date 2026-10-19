@@ -27,6 +27,7 @@ pub mod patch;
 pub mod read;
 pub(crate) mod rtk;
 pub mod shell;
+pub mod todo;
 pub mod webfetch;
 pub mod write;
 
@@ -54,6 +55,20 @@ impl ToolRegistry {
             Arc::new(write::WriteTool),
         ]);
         registry
+    }
+}
+
+/// The `todo` tool, registered ON TOP of `with_builtins` at app-wiring time.
+impl ToolRegistry {
+    /// Register the session todo tool. Separate from
+    /// [`ToolRegistry::with_builtins`] for the same reason as the
+    /// magic-context tools: it stores its state in the `kv` table, which only
+    /// exists once the database is open. Unlike those tools it is always
+    /// advertised — tracking a task list needs no configuration.
+    pub fn register_todo(&mut self, db: Db) {
+        self.register_all(vec![
+            Arc::new(crate::tool::todo::TodoTool::new(db)) as Arc<dyn Tool>
+        ]);
     }
 }
 
