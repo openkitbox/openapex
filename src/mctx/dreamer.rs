@@ -871,11 +871,13 @@ struct Candidate {
 /// What the filesystem says about one referenced path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PathState {
-    /// The path as resolved for this project (absolute).
-    path: PathBuf,
+    /// The path as resolved for this project (absolute), or `None` when the
+    /// written path leaves the project — those are never read.
+    path: Option<PathBuf>,
     /// The path as the memory wrote it, for the prompt.
     written: String,
-    /// False when the file does not exist (the reference's "was deleted").
+    /// False when the file does not exist (the reference's "was deleted"), or
+    /// when the path is outside the project.
     exists: bool,
     /// The file's mtime in epoch milliseconds, when readable.
     mtime: Option<i64>,
@@ -909,8 +911,8 @@ fn candidate(project_dir: &str, memory: &memory::StoredMemory) -> Option<Candida
 /// safe direction, because the model is then asked and may say "still fine".
 fn inspect(project_dir: &str, written: &str, updated_at: i64) -> PathState {
     let path = resolve_path(project_dir, written);
-    let (exists, mtime) = match std::fs::metadata(&path) {
-        Ok(meta) => {
+    let (exists, mtime) = match path.as_deref().map(std::fs::metadata) {
+        Some(Ok(meta)) => {
             let mtime = meta
                 .modified()
                 .ok()
@@ -918,12 +920,12 @@ fn inspect(project_dir: &str, written: &str, updated_at: i64) -> PathState {
                 .map(|elapsed| elapsed.as_millis() as i64);
             (true, mtime)
         }
-        Err(_) => (false, None),
+        _ => (false, None),
     };
     PathState {
+        exists: path.is_some() && exists,
         path,
         written: written.to_owned(),
-        exists,
         mtime,
         // Strictly newer: a file written in the same millisecond as the memory
         // is not treated as a change (which would make every freshly written
@@ -932,19 +934,52 @@ fn inspect(project_dir: &str, written: &str, updated_at: i64) -> PathState {
     }
 }
 
-/// The absolute path a memory's written path refers to: `~/` under the home
-/// directory, an absolute path as-is, anything else under the project.
-fn resolve_path(project_dir: &str, written: &str) -> PathBuf {
-    if let Some(rest) = written.strip_prefix("~/") {
-        return dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(rest);
+/// The absolute path a memory's written path refers to, if it stays inside the
+/// project.
+///
+/// Confined to the project on purpose: the verify prompt prints file contents
+/// to a model, and a memory is model-writable, so `~/.ssh/id_rsa.pub`, a
+/// `../../etc/passwd` climb, or a symlink pointing out of the tree must not
+/// turn the verify task into a file-disclosure primitive. `None` means "outside
+/// the project — never read".
+fn resolve_path(project_dir: &str, written: &str) -> Option<PathBuf> {
+    if written.starts_with('~') {
+        return None;
     }
-    let path = Path::new(written);
-    if path.is_absolute() {
-        return path.to_path_buf();
+    let root = normalize_lexically(Path::new(project_dir))?;
+    let joined = normalize_lexically(&root.join(written))?;
+    if !joined.starts_with(&root) {
+        return None;
     }
-    Path::new(project_dir).join(path)
+    // A symlink inside the tree can still point out of it, so the real path
+    // decides. A path that does not exist has no real path; it stays a
+    // "missing" state, which never reads anything.
+    match std::fs::canonicalize(&joined) {
+        Ok(real) => {
+            let real_root = std::fs::canonicalize(&root).unwrap_or(root);
+            real.starts_with(&real_root).then_some(real)
+        }
+        Err(_) => Some(joined),
+    }
+}
+
+/// Resolve `.` and `..` without touching the filesystem. `None` when `..`
+/// climbs above the root, which no valid project path does.
+fn normalize_lexically(path: &Path) -> Option<PathBuf> {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    Some(out)
 }
 
 /// The file paths a memory's text names.
@@ -985,6 +1020,21 @@ fn referenced_paths(content: &str) -> Vec<String> {
     seen
 }
 
+/// Read at most `chars` characters' worth of bytes (UTF-8 is at most 4 bytes
+/// per character) and report whether the file had more. One byte past the
+/// bound is read to tell "exactly the bound" from "more".
+fn read_head(path: &Path, chars: usize) -> std::io::Result<(Vec<u8>, bool)> {
+    use std::io::Read as _;
+    let cap = chars.saturating_mul(4);
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(cap as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    let cut = bytes.len() > cap;
+    bytes.truncate(cap);
+    Ok((bytes, cut))
+}
+
 /// The `verify` user prompt: the candidate memories with their path states,
 /// then the excerpts of the files that exist.
 fn render_verify_prompt(project: &str, batch: &[Candidate]) -> String {
@@ -1023,15 +1073,20 @@ fn render_verify_prompt(project: &str, batch: &[Candidate]) -> String {
     let mut budget = VERIFY_EXCERPT_TOTAL_CHARS;
     for candidate in batch {
         for state in &candidate.paths {
-            if !state.exists || seen.contains(&state.path.as_path()) {
+            let Some(path) = state.path.as_deref() else {
+                continue;
+            };
+            if !state.exists || seen.contains(&path) {
                 continue;
             }
-            seen.push(state.path.as_path());
+            seen.push(path);
             if budget == 0 {
                 continue;
             }
-            match std::fs::read(&state.path) {
-                Ok(bytes) => {
+            match read_head(path, budget) {
+                Ok((bytes, cut)) => {
+                    // Bounded before decoding: a cited multi-gigabyte file must
+                    // not be read into memory just to keep 4k characters.
                     let text = String::from_utf8_lossy(&bytes);
                     // Char-counted, never byte-indexed: lossy replacement
                     // characters are multi-byte, so a byte slice can split one
@@ -1041,19 +1096,19 @@ fn render_verify_prompt(project: &str, batch: &[Candidate]) -> String {
                         .take(VERIFY_EXCERPT_CHARS.min(budget))
                         .collect();
                     let taken = excerpt.chars().count();
-                    if taken < text.chars().count() {
+                    if cut || taken < text.chars().count() {
                         excerpt.push_str("\n… (truncated)");
                     }
                     budget = budget.saturating_sub(taken);
                     files.push(format!(
                         "<file path=\"{}\">\n{excerpt}\n</file>",
-                        state.path.display()
+                        path.display()
                     ));
                 }
                 Err(error) => {
                     files.push(format!(
                         "<file path=\"{}\">\n(unreadable: {error})\n</file>",
-                        state.path.display()
+                        path.display()
                     ));
                 }
             }
@@ -2726,6 +2781,84 @@ mod tests {
             vec!["src/nested/deep.rs"]
         );
         assert!(referenced_paths("No files are named here.").is_empty());
+    }
+
+    /// A memory is model-writable, so a cited path outside the project must
+    /// never be read into the verify prompt.
+    #[test]
+    fn cited_paths_outside_the_project_are_never_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = project_dir(&dir);
+        std::fs::write(dir.path().join("inside.rs"), "inside content").unwrap();
+
+        // Home-relative, absolute outside, and a `..` climb all resolve to
+        // nothing, regardless of whether the file exists.
+        for written in [
+            "~/.ssh/id_rsa.pub",
+            "/etc/passwd",
+            "../../etc/passwd",
+            "src/../../outside.rs",
+        ] {
+            let state = inspect(&project, written, 0);
+            assert!(!state.exists, "{written} must not be readable");
+            assert!(state.path.is_none(), "{written} must not resolve");
+        }
+        // The legitimate shapes still resolve.
+        assert!(inspect(&project, "inside.rs", 0).exists);
+        assert!(inspect(&project, "./sub/../inside.rs", 0).exists);
+    }
+
+    /// A symlink inside the tree that points out of it is a path out of it.
+    #[test]
+    fn a_symlink_out_of_the_project_is_not_followed() {
+        let project = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        let link = project.path().join("link.txt");
+        std::os::unix::fs::symlink(outside.path().join("secret.txt"), &link).unwrap();
+
+        let state = inspect(&project_dir(&project), "link.txt", 0);
+        assert!(state.path.is_none(), "the real path is outside the project");
+        assert!(!state.exists);
+
+        let prompt = render_verify_prompt(
+            &project_dir(&project),
+            &[Candidate {
+                id: "1".to_owned(),
+                category: "ARCHITECTURE".to_owned(),
+                content: "mentions link.txt".to_owned(),
+                updated_at: 0,
+                paths: vec![state],
+            }],
+        );
+        assert!(!prompt.contains("secret"), "{prompt}");
+    }
+
+    /// The excerpt reader is bounded before decoding: a huge cited file must
+    /// not be pulled into memory to keep a few thousand characters.
+    #[test]
+    fn a_huge_cited_file_is_read_only_up_to_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big.txt");
+        // 2 MiB of 'x', far past the excerpt budget.
+        std::fs::write(&big, "x".repeat(2 * 1024 * 1024)).unwrap();
+
+        let state = inspect(&project_dir(&dir), "big.txt", 0);
+        let prompt = render_verify_prompt(
+            &project_dir(&dir),
+            &[Candidate {
+                id: "1".to_owned(),
+                category: "ARCHITECTURE".to_owned(),
+                content: "mentions big.txt".to_owned(),
+                updated_at: 0,
+                paths: vec![state],
+            }],
+        );
+        assert!(prompt.contains("(truncated)"), "the excerpt must be cut");
+        assert!(
+            prompt.chars().count() < VERIFY_EXCERPT_TOTAL_CHARS * 2,
+            "the prompt stays within the budget"
+        );
     }
 
     #[test]
