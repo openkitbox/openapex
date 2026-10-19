@@ -532,8 +532,6 @@ mod tests {
                 session_id: SESSION,
                 importance: 50.0,
                 tiers: &tiers,
-                facts: &json!({}),
-                events: &json!([]),
             },
         )
         .await

@@ -112,6 +112,10 @@ pub mod pass;
 /// and publication of compartments.
 pub mod historian;
 
+/// Validation of the historian's raw completion: the `<output>` parser plus the
+/// coverage/boundary rules that decide what is safe to publish.
+pub mod historian_validate;
+
 /// `ctx_search`: unified retrieval over memories, notes and compartments.
 pub mod search;
 

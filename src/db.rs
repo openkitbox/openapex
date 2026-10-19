@@ -222,6 +222,25 @@ ALTER TABLE mc_historian_run ADD COLUMN updated_at integer NOT NULL DEFAULT 0;
 ALTER TABLE mc_historian_run ADD COLUMN error text;
 "#;
 
+/// magic-context side-channel columns (Task 6b). `mc_compartments` carried
+/// `facts`/`events` columns from Task 1, but a compartment has no such fields in
+/// the reference (`mc-store/src/lib.rs:583`) and the historian emits both
+/// **once per run**, not per compartment: they are the run's memory-promotion
+/// channel, so they belong on the run row that produced them. V6 therefore drops
+/// the two dead columns and gives the run row the pair. The drops are safe on
+/// any existing database: nothing ever wrote anything but the neutral `{}`/`[]`
+/// placeholders into them.
+///
+/// `mc_compartments` is never empty in practice, so this is a real column drop,
+/// not a table rewrite: SQLite drops a column in place when it is not indexed
+/// and no view or partial index references it (neither column is).
+const MIGRATION_V6: &str = r#"
+ALTER TABLE mc_compartments DROP COLUMN facts;
+ALTER TABLE mc_compartments DROP COLUMN events;
+ALTER TABLE mc_historian_run ADD COLUMN facts text;
+ALTER TABLE mc_historian_run ADD COLUMN events text;
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
@@ -231,6 +250,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (3, MIGRATION_V3),
     (4, MIGRATION_V4),
     (5, MIGRATION_V5),
+    (6, MIGRATION_V6),
 ];
 
 /// All indexes the migration creates: V1's verbatim from upstream
@@ -395,11 +415,11 @@ mod tests {
     #[tokio::test]
     async fn migration_tracks_user_version_and_is_idempotent() {
         let db = Db::open_in_memory().await.unwrap();
-        assert_eq!(db.user_version().await, 5);
+        assert_eq!(db.user_version().await, 6);
         // Re-running must be a no-op: version stays, no error.
         db.migrate().await.unwrap();
         db.migrate().await.unwrap();
-        assert_eq!(db.user_version().await, 5);
+        assert_eq!(db.user_version().await, 6);
     }
 
     #[tokio::test]
@@ -446,7 +466,7 @@ mod tests {
             conn.pragma_update(None, "user_version", 1).unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await, 5);
+        assert_eq!(db.user_version().await, 6);
         for table in [
             "mc_frozen_state",
             "mc_compartments",
@@ -473,7 +493,7 @@ mod tests {
             conn.pragma_update(None, "user_version", 2).unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await, 5);
+        assert_eq!(db.user_version().await, 6);
         for table in ["mc_tag", "mc_drop"] {
             assert!(
                 db.table_exists(table).await.unwrap(),
@@ -533,7 +553,7 @@ mod tests {
             .unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await, 5);
+        assert_eq!(db.user_version().await, 6);
         // The pre-existing row reads back with the 'active' default and no
         // archive reason — the additive columns converge both DB histories.
         let (status, reason): (String, Option<String>) = db
@@ -592,7 +612,7 @@ mod tests {
             .unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await, 5);
+        assert_eq!(db.user_version().await, 6);
         // The pre-existing row reads back with the additive defaults.
         let (updated_at, error): (i64, Option<String>) = db
             .conn()
@@ -607,6 +627,58 @@ mod tests {
             .unwrap();
         assert_eq!(updated_at, 0);
         assert_eq!(error, None);
+    }
+
+    #[tokio::test]
+    async fn migration_v6_moves_the_side_channels_off_the_compartment_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade6.db");
+        // Build a v5 database by hand: apply V1..V5 and stamp version 5.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.execute_batch(MIGRATION_V2).unwrap();
+            conn.execute_batch(MIGRATION_V3).unwrap();
+            conn.execute_batch(MIGRATION_V4).unwrap();
+            conn.execute_batch(MIGRATION_V5).unwrap();
+            conn.pragma_update(None, "user_version", 5).unwrap();
+            // A pre-V6 compartment row carries the (neutral) placeholders.
+            conn.execute(
+                "INSERT INTO mc_compartments
+                     (id, session_id, coverage_end, importance, tiers, facts, events, created_at)
+                 VALUES ('mc_old', 'ses_1', '4', 50.0, '{}', '{}', '[]', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).await.unwrap();
+        assert_eq!(db.user_version().await, 6);
+        let (compartments, runs): (Vec<String>, Vec<String>) = db
+            .conn()
+            .call(|c| -> rusqlite::Result<(Vec<String>, Vec<String>)> {
+                let mut stmt =
+                    c.prepare("SELECT name FROM pragma_table_info('mc_compartments')")?;
+                let compartments = stmt
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                let mut stmt =
+                    c.prepare("SELECT name FROM pragma_table_info('mc_historian_run')")?;
+                let runs = stmt
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<Vec<String>>>()?;
+                Ok((compartments, runs))
+            })
+            .await
+            .unwrap();
+        // The compartment row's side channels are gone; the run row owns them.
+        // The surviving row still loads (it only ever held placeholders).
+        assert!(!compartments.iter().any(|c| c == "facts"));
+        assert!(!compartments.iter().any(|c| c == "events"));
+        assert!(runs.iter().any(|c| c == "facts"));
+        assert!(runs.iter().any(|c| c == "events"));
+        let compartments = crate::mctx::compartments::load(&db, "ses_1").await.unwrap();
+        assert_eq!(compartments.len(), 1);
+        assert_eq!(compartments[0].coverage_end, "4");
     }
 
     #[tokio::test]

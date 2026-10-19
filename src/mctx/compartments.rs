@@ -1,12 +1,12 @@
 //! Compartment records: what the historian has folded out of the live
 //! transcript, plus the coverage end the request assembly uses as its floor.
 //!
-//! One row per compartment in `mc_compartments` (columns fixed by the plan:
-//! `id, session_id, coverage_end, importance, tiers JSON, facts JSON,
-//! events JSON, created_at`). `tiers` carries the row fields the decay
-//! renderer consumes; `facts`/`events` are historian-side payloads the render
-//! path deliberately ignores (the reference never renders session facts into
-//! the history block).
+//! One row per compartment in `mc_compartments` (`id, session_id,
+//! coverage_end, importance, tiers JSON, created_at`). `tiers` carries every
+//! field the decay renderer consumes; the historian's `<facts>`/`<events>` side
+//! channels are NOT compartment fields (the reference's own compartment table
+//! has none) — they are emitted once per run and live on the producing
+//! `mc_historian_run` row.
 //!
 //! Chronological order is insertion order (`created_at`, tie-broken by `id`):
 //! the historian only ever appends, and `coverage_end` is text in the schema
@@ -65,10 +65,6 @@ pub struct Compartment {
     pub importance: f64,
     /// Heading + paraphrase tiers.
     pub tiers: Tiers,
-    /// Historian-side facts payload (not rendered).
-    pub facts: serde_json::Value,
-    /// Historian-side events payload (not rendered).
-    pub events: serde_json::Value,
     /// Insertion time (ms); chronological order.
     pub created_at: i64,
 }
@@ -98,12 +94,10 @@ impl Compartment {
     }
 }
 
-const COLUMNS: &str = "id, session_id, coverage_end, importance, tiers, facts, events, created_at";
+const COLUMNS: &str = "id, session_id, coverage_end, importance, tiers, created_at";
 
 fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Compartment> {
     let tiers: String = row.get(4)?;
-    let facts: String = row.get(5)?;
-    let events: String = row.get(6)?;
     Ok(Compartment {
         id: row.get(0)?,
         session_id: row.get(1)?,
@@ -113,9 +107,7 @@ fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Compartment> {
             tracing::warn!(error = %error, "malformed mc_compartments.tiers; treating as empty");
             Tiers::default()
         }),
-        facts: serde_json::from_str(&facts).unwrap_or(serde_json::Value::Null),
-        events: serde_json::from_str(&events).unwrap_or(serde_json::Value::Null),
-        created_at: row.get(7)?,
+        created_at: row.get(5)?,
     })
 }
 
@@ -158,55 +150,61 @@ pub struct NewCompartment<'a> {
     pub importance: f64,
     /// Heading + paraphrase tiers.
     pub tiers: &'a Tiers,
-    /// Historian-side facts payload.
-    pub facts: &'a serde_json::Value,
-    /// Historian-side events payload.
-    pub events: &'a serde_json::Value,
 }
 
 /// Append one compartment.
 pub async fn insert(db: &Db, compartment: &NewCompartment<'_>) -> Result<()> {
-    let id = compartment.id.to_owned();
-    let session = compartment.session_id.to_owned();
-    let coverage_end = compartment.tiers.end_message.to_string();
-    let importance = compartment.importance;
-    let tiers_json =
-        serde_json::to_string(compartment.tiers).context("serialize compartment tiers")?;
-    let facts_json =
-        serde_json::to_string(compartment.facts).context("serialize compartment facts")?;
-    let events_json =
-        serde_json::to_string(compartment.events).context("serialize compartment events")?;
+    insert_all(db, std::slice::from_ref(compartment)).await
+}
+
+/// Append several compartments atomically, in the order given.
+///
+/// One transaction, because coverage is derived from these rows: a publish that
+/// failed halfway would advance the floor past content that was never
+/// summarized.
+pub async fn insert_all(db: &Db, compartments: &[NewCompartment<'_>]) -> Result<()> {
+    if compartments.is_empty() {
+        return Ok(());
+    }
+    // Serialize before entering the connection closure: a `serde` failure is not
+    // a `rusqlite::Error`, and the closure must stay infallible-but-for-SQL.
     let now = crate::id::now_millis();
+    let mut rows = Vec::with_capacity(compartments.len());
+    for compartment in compartments {
+        rows.push((
+            compartment.id.to_owned(),
+            compartment.session_id.to_owned(),
+            compartment.tiers.end_message.to_string(),
+            compartment.importance,
+            serde_json::to_string(compartment.tiers).context("serialize compartment tiers")?,
+            now,
+        ));
+    }
+    let session_id = compartments[0].session_id.to_owned();
+    let count = rows.len();
     db.conn()
-        .call(move |c| -> rusqlite::Result<usize> {
-            c.execute(
-                &format!("INSERT INTO mc_compartments ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"),
-                rusqlite::params![
-                    id,
-                    session,
-                    coverage_end,
-                    importance,
-                    tiers_json,
-                    facts_json,
-                    events_json,
-                    now
-                ],
-            )
+        .call(move |c| -> rusqlite::Result<()> {
+            let tx = c.transaction()?;
+            {
+                let mut stmt = tx.prepare(&format!(
+                    "INSERT INTO mc_compartments ({COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+                ))?;
+                for row in &rows {
+                    stmt.execute(rusqlite::params![
+                        &row.0, &row.1, &row.2, &row.3, &row.4, &row.5
+                    ])?;
+                }
+            }
+            tx.commit()
         })
         .await
-        .with_context(|| {
-            format!(
-                "insert mc_compartments row for session {}",
-                compartment.session_id
-            )
-        })?;
+        .with_context(|| format!("insert {count} mc_compartments rows for session {session_id}"))?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     async fn db() -> Db {
         let db = Db::open_in_memory().await.unwrap();
@@ -230,8 +228,6 @@ mod tests {
         let first = tiers(1, 4, "First");
         let second = tiers(5, 9, "Second");
         let other = tiers(1, 2, "Other");
-        let empty = json!({});
-        let none = json!([]);
         for (id, session, importance, tiers) in [
             ("mc_1", "ses_a", 80.0, &first),
             ("mc_2", "ses_a", 40.0, &second),
@@ -244,8 +240,6 @@ mod tests {
                     session_id: session,
                     importance,
                     tiers,
-                    facts: &empty,
-                    events: &none,
                 },
             )
             .await
@@ -272,8 +266,8 @@ mod tests {
             .call(|c| -> rusqlite::Result<usize> {
                 c.execute(
                     "INSERT INTO mc_compartments
-                         (id, session_id, coverage_end, importance, tiers, facts, events, created_at)
-                     VALUES ('mc_bad', 'ses_a', '3', 50.0, '{not json', 'null', 'null', 1)",
+                         (id, session_id, coverage_end, importance, tiers, created_at)
+                     VALUES ('mc_bad', 'ses_a', '3', 50.0, '{not json', 1)",
                     [],
                 )
             })
@@ -304,8 +298,6 @@ mod tests {
                 p3: None,
                 p4: None,
             },
-            facts: json!({}),
-            events: json!([]),
             created_at: 1,
         };
         let input = compartment.render_input();

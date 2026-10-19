@@ -1,27 +1,25 @@
-//! Historian — Task 6a: trigger, chunk, prompt, cardinal execution and the
-//! durable run half.
-//!
-//! Task 6 is split in two, and this module is only the first half. It owns
-//! everything up to (and including) handing a raw completion back to its
-//! caller:
+//! Historian — Tasks 6a/6b: trigger, chunk, prompt, cardinal execution, the
+//! durable run half, validation and publication.
 //!
 //! 1. [`trigger`] — may a run start at all, judged by tail pressure.
 //! 2. [`chunk`] — which tail messages a run would cover, and the transcript
 //!    text the model sees for them.
 //! 3. the prompt — [`HISTORIAN_SYSTEM_PROMPT`] plus
 //!    [`build_compartment_agent_prompt`], the production-tuned instruction
-//!    surface.
-//! 4. [`run`] — the orchestration: a durable `mc_historian_run` row is
-//!    written `running` *before* the completion starts, a hidden
-//!    (session-less, tool-less) completion is driven through [`Chat`], and the
-//!    row settles `completed`/`failed` with the attempt recorded.
+//!    surface, and [`build_historian_repair_prompt`], the re-prompt used after
+//!    a completion that does not validate.
+//! 4. [`run`] — the orchestration: a durable `mc_historian_run` row is written
+//!    `running` *before* the completion starts, a hidden (session-less,
+//!    tool-less) completion is driven through [`Chat`], the raw text is
+//!    validated and published as compartments
+//!    ([`crate::mctx::historian_validate`]), and the row settles
+//!    `completed`/`failed` with the attempt recorded.
 //! 5. [`settle_running_runs`] — the crash-recovery half: a `running` row left
 //!    by a killed process is settled `aborted` instead of staying in flight.
 //!
-//! NOT here (Task 6b): validating the completion (the reference's
-//! `historian_validate.rs`), publishing compartments, advancing coverage, and
-//! resolving the completion's raw text into a `Compartment`. [`run`] returns
-//! the raw text for that work.
+//! Publication is what advances coverage: [`compartments::coverage_end`]
+//! derives the floor from the `mc_compartments` rows, so writing a row with the
+//! chunk's range is all a later pass needs to pick the new floor up.
 //!
 //! ## Port map (reference = `reference/magic-context/crates/`)
 //!
@@ -36,12 +34,18 @@
 //!   `clean_user_text` ~1876, `extract_key_arg`, `truncate_utf16`).
 //! - the prompt ← `mc-module/src/historian_prompt.rs` (whole file): the vendored
 //!   `HISTORIAN_SYSTEM_PROMPT`, the seed/reference calibration blocks, the
-//!   historian memory block and `build_compartment_agent_prompt` (line ~569).
+//!   historian memory block and `build_compartment_agent_prompt` (line ~569);
+//!   [`build_historian_repair_prompt`] ← `build_historian_repair_prompt`
+//!   (line ~159).
 //! - [`run`] / [`settle_running_runs`] ← `mc-store/src/historian_claim.rs` (the
 //!   durable `mc_historian_pending_run` lifecycle: the row exists before the
 //!   completion is handed to a claimant, and a run whose queuing process
 //!   restarted is settled rather than left in flight — its `parked` phase) and
 //!   `mc-module/src/historian_producer.rs` (the completion call itself).
+//! - validation and publication ← `mc-module/src/historian_validate.rs`
+//!   (see [`crate::mctx::historian_validate`] for the port map) plus the
+//!   invalid-output retry in `mc-module/src/historian.rs::run_historian_firing`
+//!   (line ~2610, which swaps in the repair prompt and re-runs the completion).
 //!
 //! ## Documented deviations from the reference
 //!
@@ -93,6 +97,34 @@
 //!   a by-id correction. ox's memory store only admits the five canonical
 //!   categories, so the priority list is that closed set rather than the
 //!   reference's twelve (which carry legacy categories ox cannot store).
+//! - **Coverage is ordinal-derived, not anchored to a provider message id.**
+//!   Publication writes the compartment's end *ordinal* into
+//!   `mc_compartments.coverage_end`, which is what
+//!   [`compartments::coverage_end`] and the next pass read; the reference
+//!   instead resolves the boundary to a message id and validates that stored
+//!   ids stay ordered. [`Chunk::end_message_id`] is still carried as the run's
+//!   anchor (and as the transcript's last covered message), but validation
+//!   needs no id, so ox has no id-ordering rule to port.
+//! - **The repair retry is bounded here, and re-prompts the same model.** The
+//!   reference's invalid-output retry lives in its producer loop
+//!   (`run_historian_firing`) and walks its *fallback model chain*, re-prompting
+//!   the next available model with the repair prompt. ox's [`run`] drives one
+//!   model, so the bound is the local [`HISTORIAN_MAX_ATTEMPTS`] and every
+//!   attempt goes to the same model.
+//! - **Tool-arc metadata is not reconstructed.** The reference's chunk carries
+//!   `tool_only_ranges` and `completed_tool_arcs`, derived from the raw
+//!   invocation/result pairs in its coverage window; ox's [`Chunk`] (Task 6a)
+//!   records ordinals only, so [`run`] passes empty slices and the three rules
+//!   that read them (terminal-arc healing, tool-only gap healing and the
+//!   terminal-boundary arc check) are inert in production. They are still
+//!   ported and unit-tested in [`crate::mctx::historian_validate`], and become
+//!   live the moment the chunker exposes invocation/result pairs.
+//! - **The parsed side channels are not persisted.** [`historian_validate`]
+//!   parses `<facts>`/`<events>` and returns them on `ValidatedChunk`, but
+//!   `mc_compartments` has no session-level column for them (the reference
+//!   keeps them on its assembly snapshot) and nothing consumes them until
+//!   Task 8/Task 3, so publication writes the neutral `{}`/`[]` payloads
+//!   instead of duplicating a run-level list onto every row.
 
 use std::sync::Arc;
 
@@ -105,7 +137,9 @@ use crate::cardinal::stream::StreamEvent;
 use crate::cardinal::wire::{ChatMessage, ChatRequest};
 use crate::config::Config;
 use crate::id::{id, now_millis};
+use crate::mctx::compartments::{self, NewCompartment, Tiers};
 use crate::mctx::decay_render::estimate_tokens;
+use crate::mctx::historian_validate::{self, ValidateOptions};
 use crate::mctx::memory::MemoryRow;
 use crate::schema::message::{AssistantContent, Message};
 use crate::schema::support::Record;
@@ -179,8 +213,10 @@ pub struct Chunk {
     pub start_ordinal: i64,
     /// Last covered ordinal (inclusive).
     pub end_ordinal: i64,
-    /// Message id of the last covered message — the run's anchor, and what
-    /// Task 6b publishes as the compartment's `coverage_end` anchor.
+    /// Message id of the last covered message — the run's anchor. ox's
+    /// publication writes the end *ordinal* (see the module docs), so this is
+    /// carried for logging and for the reference's anchor shape, not for
+    /// validation.
     pub end_message_id: String,
     /// The formatted transcript, used verbatim as the `<new_messages>` body.
     pub text: String,
@@ -189,6 +225,12 @@ pub struct Chunk {
     /// True when the eligible range held more content than the budget: a later
     /// run must continue from `end_ordinal + 1`.
     pub has_more: bool,
+    /// Every ordinal the transcript shows, ascending — the ordinals validation
+    /// chunks against. It is the union of the emitted blocks' `[start-end]`
+    /// ranges, because a block's range is what the model reads; an ordinal that
+    /// rendered no line (a system note, a skipped row) is part of a block's
+    /// range and may therefore be a compartment boundary.
+    pub present_ordinals: Vec<i64>,
 }
 
 /// Pick the chunk a run would cover.
@@ -279,6 +321,9 @@ struct Builder {
     start_ordinal: Option<i64>,
     end_ordinal: i64,
     end_message_id: String,
+    /// Ordinals of the blocks actually emitted, ascending. A block that does not
+    /// fit the budget is dropped whole, so only emitted ranges may contribute.
+    present_ordinals: Vec<i64>,
 }
 
 impl Builder {
@@ -292,6 +337,7 @@ impl Builder {
             start_ordinal: None,
             end_ordinal: 0,
             end_message_id: String::new(),
+            present_ordinals: Vec::new(),
         }
     }
 
@@ -364,6 +410,8 @@ impl Builder {
         self.end_ordinal = block.end_ordinal;
         self.end_message_id.clone_from(&block.last_message_id);
         self.total_tokens += block_tokens;
+        self.present_ordinals
+            .extend(block.start_ordinal..=block.end_ordinal);
         self.lines.push(text);
         true
     }
@@ -380,6 +428,7 @@ impl Builder {
             text: self.lines.join("\n"),
             token_estimate: self.total_tokens,
             has_more: !flushed,
+            present_ordinals: self.present_ordinals,
         })
     }
 }
@@ -1148,8 +1197,25 @@ pub fn build_compartment_agent_prompt(inputs: &CompartmentPromptInputs<'_>) -> S
     parts.join("\n\n")
 }
 
-/// The historian's hidden completion request: the system prompt role-scoped,
-/// plus the assembled user prompt. No tools — a hidden sub-completion has none.
+/// The historian's hidden completion request with an already-assembled user
+/// prompt: the system prompt role-scoped, plus `user_prompt` verbatim. No tools —
+/// a hidden sub-completion has none.
+pub fn historian_request_with_prompt(model: &str, user_prompt: &str) -> ChatRequest {
+    ChatRequest::new(
+        model.to_owned(),
+        vec![
+            ChatMessage::System {
+                content: HISTORIAN_SYSTEM_PROMPT.to_owned(),
+            },
+            ChatMessage::User {
+                content: user_prompt.to_owned(),
+            },
+        ],
+    )
+}
+
+/// [`historian_request_with_prompt`] with the user prompt assembled from the
+/// run's context blocks.
 pub fn historian_request(
     model: &str,
     chunk_text: &str,
@@ -1159,17 +1225,40 @@ pub fn historian_request(
         input_source: chunk_text,
         ..*inputs
     });
-    ChatRequest::new(
-        model.to_owned(),
-        vec![
-            ChatMessage::System {
-                content: HISTORIAN_SYSTEM_PROMPT.to_owned(),
-            },
-            ChatMessage::User {
-                content: user_prompt,
-            },
-        ],
-    )
+    historian_request_with_prompt(model, &user_prompt)
+}
+
+/// The re-prompt used after a completion that could not be parsed or did not
+/// validate, ported from `historian_prompt.rs::build_historian_repair_prompt`
+/// (line ~159): the original prompt verbatim, then why the output was rejected
+/// and the rejected XML itself.
+///
+/// Two deviations, both from the module's documented list: the reference appends
+/// a content-language directive (ox has no language resolver), and it re-prompts
+/// the *next* model in its fallback chain, where ox re-prompts the same model up
+/// to [`HISTORIAN_MAX_ATTEMPTS`] times.
+///
+/// `previous_output` is the model's own rejected text; it is echoed back as data
+/// under a plain label, never as instructions.
+pub fn build_historian_repair_prompt(
+    original_prompt: &str,
+    previous_output: &str,
+    validation_error: &str,
+) -> String {
+    let validation_line = format!("Validation error: {validation_error}");
+    [
+        original_prompt,
+        "",
+        "Your previous XML response was invalid and cannot be persisted.",
+        validation_line.as_str(),
+        "Return a corrected full XML response for the same existing state and new messages.",
+        "Do not skip any displayed raw ordinal or displayed raw range, even if the message looks trivial.",
+        "Every displayed message range must belong to exactly one compartment unless it is intentionally left in one trailing suffix marked by <unprocessed_from>.",
+        "",
+        "Previous invalid XML:",
+        previous_output,
+    ]
+    .join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -1181,7 +1270,7 @@ pub fn historian_request(
 pub enum RunState {
     /// Claimed, completion in flight.
     Running,
-    /// Completion returned; Task 6b validates and publishes its text.
+    /// Completion returned, validated and published.
     Completed,
     /// The completion failed; the row carries the error text.
     Failed,
@@ -1209,58 +1298,276 @@ pub struct RunCtx<'a> {
     pub chat: &'a Arc<dyn Chat>,
 }
 
-/// One run's inputs. The caller (Task 9, later 6b) resolves the chunk and the
-/// context blocks; this keeps [`run`] a pure orchestration.
+/// One run's inputs. The caller (Task 9) resolves the chunk and the context
+/// blocks; this keeps [`run`] a pure orchestration.
 pub struct RunPlan<'a> {
+    /// Owning session.
     pub session_id: &'a str,
+    /// The chunk to summarize, with the ordinals validation checks against.
     pub chunk: &'a Chunk,
+    /// The first attempt this run makes; a retry increments the row's attempt.
     pub attempt: i64,
+    /// The context blocks assembled for the prompt (the chunk text is taken from
+    /// [`Chunk::text`], not from this).
     pub prompt: CompartmentPromptInputs<'a>,
 }
 
-/// A settled run: the raw completion text for Task 6b to validate and publish.
+/// A settled run: the published compartments and the raw completion that
+/// produced them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunOutcome {
     /// The `mc_historian_run` row id.
     pub run_id: String,
-    /// The completion's text, verbatim.
+    /// The completion's text, verbatim (the last attempt's).
     pub text: String,
     /// The attempt the run settled with.
     pub attempt: i64,
+    /// The `mc_compartments` rows published, in covered order. Shorter than the
+    /// model's compartment count when validation withheld the provisional last
+    /// one (the default boundary healing), never empty.
+    pub compartment_ids: Vec<String>,
+    /// The run's memory-promotion side channels, also stored on the run row.
+    pub side_channels: SideChannels,
 }
 
-/// Run one historian completion.
+/// Total completion attempts one run may make, including the first
+/// (`plan.attempt` counts up from there).
+///
+/// The reference retries an invalid output by re-prompting the *next* model in
+/// its fallback chain (`historian.rs::run_historian_firing`), so its bound is the
+/// chain's length; ox drives a single model, so it re-prompts the same one a
+/// fixed number of times. Three is one original plus two repairs — enough for the
+/// common truncation and mismatched-close failures to self-correct. A validation
+/// failure is a *model* failure, so the same chunk is retried; a transport
+/// failure is not retried here at all.
+pub const HISTORIAN_MAX_ATTEMPTS: i64 = 3;
+
+/// Importance a validated compartment gets when the model omitted the attribute.
+const DEFAULT_COMPARTMENT_IMPORTANCE: i64 = 50;
+
+/// A completion that could not be parsed or did not validate, carried with the
+/// validator's own message.
+///
+/// It is its own error type because the distinction is load-bearing: [`run`]
+/// re-prompts on this and gives up on a transport failure, and a caller (or a
+/// test) can tell the two apart with `Error::downcast_ref`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationFailure {
+    /// The last attempt's validation message.
+    pub message: String,
+}
+
+impl std::fmt::Display for ValidationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ValidationFailure {}
+
+/// Run one historian completion, validate it and publish the result.
 ///
 /// The durable row is written `running` BEFORE the completion starts, so a
 /// process that dies mid-completion leaves evidence ([`settle_running_runs`]
-/// cleans it up). On a completion error the row settles `failed` with the
-/// error text and the error is returned — the caller decides whether to retry.
+/// cleans it up). A completion that cannot be parsed or does not validate is a
+/// model failure: the same chunk is re-prompted through
+/// [`build_historian_repair_prompt`] until [`HISTORIAN_MAX_ATTEMPTS`] attempts
+/// have been made, then the row settles `failed` and the error is returned. A
+/// transport failure settles the row `failed` at once — retrying it is the
+/// caller's decision, not this run's.
 pub async fn run(ctx: &RunCtx<'_>, plan: &RunPlan<'_>) -> Result<RunOutcome> {
     let model = historian_model(ctx.config)?;
-    let request = historian_request(&model, &plan.chunk.text, &plan.prompt);
+    // The stored ranges are read before the run is claimed: a store failure must
+    // leave no row behind for a run that never started.
+    let prior = stored_ranges(ctx.db, plan.session_id).await?;
+    let request_prompt = build_compartment_agent_prompt(&plan.prompt);
     let chunk_ref = format!("{}..{}", plan.chunk.start_ordinal, plan.chunk.end_ordinal);
     let run_id = insert_run(ctx.db, plan.session_id, &chunk_ref, plan.attempt).await?;
 
-    match collect_completion(ctx.chat, &request).await {
-        Ok(text) => {
-            settle_run(ctx.db, &run_id, RunState::Completed, None).await?;
-            Ok(RunOutcome {
-                run_id,
-                text,
-                attempt: plan.attempt,
-            })
-        }
-        Err(error) => {
-            // A failed settle must not mask the completion error the caller
-            // needs to see; it only warns.
-            if let Err(settle) =
-                settle_run(ctx.db, &run_id, RunState::Failed, Some(&error.to_string())).await
-            {
-                tracing::warn!(run = %run_id, error = %settle, "failed to settle historian run as failed");
+    let last_attempt = plan.attempt + HISTORIAN_MAX_ATTEMPTS - 1;
+    let mut attempt = plan.attempt;
+    // The rejected attempt's raw text and the message that rejected it; both feed
+    // the next attempt's repair prompt.
+    let mut repair: Option<(String, String)> = None;
+    loop {
+        let user_prompt = match &repair {
+            Some((previous, error)) => {
+                build_historian_repair_prompt(&request_prompt, previous, error)
             }
-            Err(error)
+            None => request_prompt.clone(),
+        };
+        let request = historian_request_with_prompt(&model, &user_prompt);
+
+        let text = match collect_completion(ctx.chat, &request).await {
+            Ok(text) => text,
+            Err(error) => {
+                settle_failed(ctx.db, &run_id, &error).await;
+                return Err(error);
+            }
+        };
+
+        match validate_text(&text, plan.chunk, &prior) {
+            Ok(validated) => {
+                let compartment_ids =
+                    match publish_compartments(ctx.db, plan.session_id, &validated).await {
+                        Ok(ids) => ids,
+                        Err(error) => {
+                            settle_failed(ctx.db, &run_id, &error).await;
+                            return Err(error);
+                        }
+                    };
+                let side_channels = SideChannels {
+                    facts: validated.facts.clone(),
+                    events: validated.events.clone(),
+                };
+                settle_run(
+                    ctx.db,
+                    &run_id,
+                    RunState::Completed,
+                    None,
+                    Some(&side_channels),
+                )
+                .await?;
+                return Ok(RunOutcome {
+                    run_id,
+                    text,
+                    attempt,
+                    compartment_ids,
+                    side_channels,
+                });
+            }
+            Err(failure) => {
+                if attempt >= last_attempt {
+                    let error = anyhow::Error::new(failure);
+                    settle_failed(ctx.db, &run_id, &error).await;
+                    return Err(error);
+                }
+                attempt += 1;
+                update_run_attempt(ctx.db, &run_id, attempt).await?;
+                repair = Some((text, failure.message));
+            }
         }
     }
+}
+
+/// Validate one completion against the chunk it was asked to summarize.
+fn validate_text(
+    text: &str,
+    chunk: &Chunk,
+    prior: &[historian_validate::MessageRange],
+) -> Result<historian_validate::ValidatedChunk, ValidationFailure> {
+    let view = historian_validate::ChunkView {
+        start_ordinal: chunk.start_ordinal,
+        end_ordinal: chunk.end_ordinal,
+        line_ordinals: &chunk.present_ordinals,
+        present_ordinals: &chunk.present_ordinals,
+        // ox's chunk carries no tool metadata: `Chunk` (Task 6a) records ordinals
+        // only, so the invocation/result arcs and tool-only ranges the reference
+        // derives from its `BoundaryMsg` list are not reconstructible here. These
+        // two rules are therefore inert on the production path (see the module
+        // docs) — they stay ported and unit-tested in `historian_validate`.
+        tool_only_ranges: &[],
+        completed_tool_arcs: &[],
+    };
+    historian_validate::validate_historian_output(text, &view, prior, ValidateOptions::default())
+        .map_err(|error| ValidationFailure {
+            message: error.message,
+        })
+}
+
+/// The session's published compartment ranges, chronological — validation's
+/// `prior_compartments`, read from ox's own store.
+async fn stored_ranges(
+    db: &crate::db::Db,
+    session_id: &str,
+) -> Result<Vec<historian_validate::MessageRange>> {
+    Ok(compartments::load(db, session_id)
+        .await?
+        .into_iter()
+        .map(|compartment| historian_validate::MessageRange {
+            start: compartment.tiers.start_message,
+            end: compartment.tiers.end_message,
+        })
+        .collect())
+}
+
+/// Publish validated compartments and return the minted row ids.
+///
+/// Coverage is derived from these rows, so writing the chunk's range is what
+/// advances the floor a later pass reads. The rows go in one transaction: a
+/// partial publish would advance coverage past content that was never
+/// summarized.
+async fn publish_compartments(
+    db: &crate::db::Db,
+    session_id: &str,
+    validated: &historian_validate::ValidatedChunk,
+) -> Result<Vec<String>> {
+    let mut pending: Vec<(String, Tiers, f64)> = Vec::with_capacity(validated.compartments.len());
+    for compartment in &validated.compartments {
+        pending.push((
+            id("mc"),
+            Tiers {
+                title: compartment.title.clone(),
+                start_message: compartment.start_message,
+                end_message: compartment.end_message,
+                // The historian output carries no dates and ox's chunk tracks
+                // none, so the decay renderer gets no span for a live row.
+                start_date: None,
+                end_date: None,
+                p1: compartment.p1.clone(),
+                p2: compartment.p2.clone(),
+                p3: compartment.p3.clone(),
+                p4: compartment.p4.clone(),
+            },
+            importance_of(compartment.importance),
+        ));
+    }
+
+    let rows: Vec<NewCompartment<'_>> = pending
+        .iter()
+        .map(|(compartment_id, tiers, importance)| NewCompartment {
+            id: compartment_id,
+            session_id,
+            importance: *importance,
+            tiers,
+        })
+        .collect();
+    compartments::insert_all(db, &rows).await?;
+    Ok(pending.into_iter().map(|(id, _, _)| id).collect())
+}
+
+/// A validated importance clamped into the store's 1..100 decay band.
+fn importance_of(importance: Option<i64>) -> f64 {
+    importance
+        .unwrap_or(DEFAULT_COMPARTMENT_IMPORTANCE)
+        .clamp(1, 100) as f64
+}
+
+/// Settle a row `failed` without masking the error that caused it: a failed
+/// settle only warns, so the caller still sees the original cause.
+async fn settle_failed(db: &crate::db::Db, run_id: &str, error: &anyhow::Error) {
+    if let Err(settle) =
+        settle_run(db, run_id, RunState::Failed, Some(&error.to_string()), None).await
+    {
+        tracing::warn!(run = %run_id, error = %settle, "failed to settle historian run as failed");
+    }
+}
+
+/// Record the attempt a retry is about to make, so the row's `attempt` column
+/// always names the try that produced its terminal state.
+async fn update_run_attempt(db: &crate::db::Db, run_id: &str, attempt: i64) -> Result<()> {
+    let run_id = run_id.to_owned();
+    let now = now_millis();
+    db.conn()
+        .call(move |c| {
+            c.execute(
+                "UPDATE mc_historian_run SET attempt = ?2, updated_at = ?3 WHERE id = ?1",
+                rusqlite::params![run_id, attempt, now],
+            )
+        })
+        .await
+        .with_context(|| format!("record mc_historian_run attempt {attempt}"))?;
+    Ok(())
 }
 
 /// Settle every `running` row `aborted`.
@@ -1335,16 +1642,36 @@ async fn settle_run(
     run_id: &str,
     state: RunState,
     error: Option<&str>,
+    side_channels: Option<&SideChannels>,
 ) -> Result<()> {
     let run_id = run_id.to_owned();
     let error = error.map(str::to_owned);
+    // The run row owns the side channels: the historian emits `<facts>` and
+    // `<events>` once per run, for the memory-promotion pass that consumes them
+    // (a compartment has no such fields). Serialized here so the connection
+    // closure stays infallible-but-for-SQL.
+    let facts = match side_channels {
+        Some(channels) => Some(
+            serde_json::to_string(&channels.facts).context("serialize run facts side channel")?,
+        ),
+        None => None,
+    };
+    let events = match side_channels {
+        Some(channels) => Some(
+            serde_json::to_string(&channels.events).context("serialize run events side channel")?,
+        ),
+        None => None,
+    };
     let now = now_millis();
     let settled = db
         .conn()
         .call(move |c| {
             c.execute(
-                "UPDATE mc_historian_run SET state = ?2, updated_at = ?3, error = ?4 WHERE id = ?1",
-                rusqlite::params![run_id, state.as_str(), now, error],
+                "UPDATE mc_historian_run
+                 SET state = ?2, updated_at = ?3, error = ?4,
+                     facts = COALESCE(?5, facts), events = COALESCE(?6, events)
+                 WHERE id = ?1",
+                rusqlite::params![run_id, state.as_str(), now, error, facts, events],
             )
         })
         .await
@@ -1353,6 +1680,17 @@ async fn settle_run(
         anyhow::bail!("no mc_historian_run row settled as {}", state.as_str());
     }
     Ok(())
+}
+
+/// The memory-promotion side channels one historian completion carries: the
+/// reference parses both out of the model's output and hands them to the
+/// memory path rather than to the compartment store.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SideChannels {
+    /// `<facts>` candidates, as parsed (each keeps its anchor and text).
+    pub facts: Vec<historian_validate::FactCandidate>,
+    /// `<events>` entries, as parsed.
+    pub events: Vec<historian_validate::ParsedEvent>,
 }
 
 /// The model the historian completion routes to. Cardinal routes on the BARE
@@ -1694,9 +2032,13 @@ mod tests {
 
     // -- run ----------------------------------------------------------------
 
-    /// A chat seam yielding one canned script (the same port the runner mocks).
+    /// A chat seam yielding one canned script per completion (the same port the
+    /// runner mocks).
     struct ScriptedChat {
-        script: Script,
+        /// One script per completion, consumed in call order. A call past the end
+        /// fails the transport, so an attempt the test did not expect surfaces as
+        /// an error instead of silently repeating.
+        scripts: Mutex<VecDeque<Script>>,
         requests: Mutex<Vec<ChatRequest>>,
     }
 
@@ -1709,8 +2051,12 @@ mod tests {
 
     impl ScriptedChat {
         fn new(script: Script) -> Self {
+            Self::sequence(vec![script])
+        }
+
+        fn sequence(scripts: Vec<Script>) -> Self {
             Self {
-                script,
+                scripts: Mutex::new(scripts.into()),
                 requests: Mutex::new(Vec::new()),
             }
         }
@@ -1726,9 +2072,15 @@ mod tests {
                 .lock()
                 .expect("requests lock")
                 .push(request.clone());
-            let script = match &self.script {
+            let script = self
+                .scripts
+                .lock()
+                .expect("scripts lock")
+                .pop_front()
+                .unwrap_or(Script::Fail);
+            let script = match script {
                 Script::Text(text) => Ok(vec![
-                    StreamEvent::TextDelta(text.clone()),
+                    StreamEvent::TextDelta(text),
                     StreamEvent::Finish {
                         reason: "stop".to_owned(),
                     },
@@ -1792,6 +2144,47 @@ id = "k3-256k"
         }
     }
 
+    /// A completion the validator accepts for `start..=end`: one compartment with
+    /// all four paraphrase tiers, exactly as the historian is tuned to emit.
+    fn valid_output_text(start: i64, end: i64) -> String {
+        format!(
+            "<output><compartments>\
+<compartment start=\"{start}\" end=\"{end}\" title=\"Work\" episode_type=\"feature\" importance=\"60\">\
+<p1>P1 body</p1><p2>P2 body</p2><p3>P3 body</p3><p4>P4 body</p4>\
+</compartment></compartments>\
+<facts><ARCHITECTURE>\n* the store owns coverage\n</ARCHITECTURE></facts>\
+<events><decision at_compartment=\"1\"><summary>publish the run's facts</summary></decision></events>\
+</output>"
+        )
+    }
+
+    fn valid_output(start: i64, end: i64) -> Script {
+        Script::Text(valid_output_text(start, end))
+    }
+
+    /// Drop one already-published compartment into the session's store, the way a
+    /// previous run would have.
+    async fn seed_compartment(db: &Db, id: &str, start: i64, end: i64) {
+        let tiers = Tiers {
+            title: "Seed".to_owned(),
+            start_message: start,
+            end_message: end,
+            p1: Some("seed body".to_owned()),
+            ..Default::default()
+        };
+        compartments::insert(
+            db,
+            &NewCompartment {
+                id,
+                session_id: "ses_1",
+                importance: 50.0,
+                tiers: &tiers,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
     async fn run_columns(db: &Db, run_id: &str) -> (String, i64, Option<String>) {
         let run_id = run_id.to_owned();
         db.conn()
@@ -1806,32 +2199,96 @@ id = "k3-256k"
             .unwrap()
     }
 
+    /// The user half of a recorded request.
+    fn user_content(request: &ChatRequest) -> &str {
+        match &request.messages[1] {
+            ChatMessage::User { content } => content,
+            other => panic!("expected a user message, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
-    async fn run_records_a_completed_row_and_returns_the_completion_text() {
+    async fn run_publishes_a_valid_completion_and_advances_coverage() {
         let db = Db::open_in_memory().await.unwrap();
+        // A session whose first compartment already covers 1-2.
+        seed_compartment(&db, "mc_seed", 1, 2).await;
+
         let config = config_with_default_model();
-        let scripted = Arc::new(ScriptedChat::new(Script::Text("<compartment/>".to_owned())));
+        let scripted = Arc::new(ScriptedChat::new(valid_output(3, 4)));
         let chat: Arc<dyn Chat> = scripted.clone();
         let ctx = RunCtx {
             db: &db,
             config: &config,
             chat: &chat,
         };
-        let rows = vec![user_row(1, "msg_1", "hello")];
-        let chunk = chunk(&rows, 1, 2, 10_000).expect("a chunk");
+        let rows = vec![
+            user_row(3, "msg_3", "hello"),
+            assistant_row(4, "msg_4", "hi there"),
+        ];
+        let chunk = chunk(&rows, 3, 5, 10_000).expect("a chunk");
+        assert_eq!(chunk.present_ordinals, vec![3, 4]);
 
-        let outcome = run(&ctx, &plan_for(&chunk, 2))
+        let outcome = run(&ctx, &plan_for(&chunk, 1))
             .await
             .expect("a completed run");
 
-        assert_eq!(outcome.text, "<compartment/>");
-        assert_eq!(outcome.attempt, 2);
+        assert_eq!(outcome.text, valid_output_text(3, 4));
+        assert_eq!(outcome.attempt, 1);
+        assert_eq!(outcome.compartment_ids.len(), 1);
+
         let (state, attempt, error) = run_columns(&db, &outcome.run_id).await;
         assert_eq!(state, RunState::Completed.as_str());
-        assert_eq!(attempt, 2);
+        assert_eq!(attempt, 1);
         assert_eq!(error, None);
-        // The completion was driven exactly once, and it was the historian
-        // request (system + user prompt), not a tool-bearing turn.
+
+        // The completion's side channels are the run's, not a compartment's: the
+        // run row keeps them for the memory-promotion pass.
+        assert_eq!(
+            outcome.side_channels.facts,
+            vec![historian_validate::FactCandidate {
+                category: "ARCHITECTURE".to_owned(),
+                content: "the store owns coverage".to_owned(),
+                origin_compartment_index: None,
+            }]
+        );
+        assert_eq!(outcome.side_channels.events.len(), 1);
+        let (facts, events): (Option<String>, Option<String>) = db
+            .conn()
+            .call({
+                let run_id = outcome.run_id.clone();
+                move |c| {
+                    c.query_row(
+                        "SELECT facts, events FROM mc_historian_run WHERE id = ?1",
+                        rusqlite::params![run_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                }
+            })
+            .await
+            .unwrap();
+        let facts: Vec<historian_validate::FactCandidate> =
+            serde_json::from_str(facts.as_deref().expect("facts stored")).unwrap();
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].content, "the store owns coverage");
+        assert!(events.is_some());
+
+        // Exactly one row was published, with the chunk's range, and it is now the
+        // coverage end a later pass reads.
+        let published = compartments::load(&db, "ses_1").await.unwrap();
+        assert_eq!(published.len(), 2);
+        assert_eq!(compartments::coverage_end(&published), Some(4));
+        let advanced = published
+            .iter()
+            .find(|compartment| compartment.tiers.end_message == 4)
+            .expect("the newly published compartment");
+        assert_eq!(advanced.id, outcome.compartment_ids[0]);
+        assert_eq!(advanced.tiers.start_message, 3);
+        assert_eq!(advanced.tiers.title, "Work");
+        assert_eq!(advanced.tiers.p1.as_deref(), Some("P1 body"));
+        assert_eq!(advanced.importance, 60.0);
+
+        // A valid first completion is never re-prompted, and the request is the
+        // hidden historian one (system + user prompt, no tools).
         let requests = scripted.requests();
         assert_eq!(requests.len(), 1);
         assert!(requests[0].tools.is_empty());
@@ -1839,10 +2296,128 @@ id = "k3-256k"
     }
 
     #[tokio::test]
+    async fn run_repairs_an_invalid_completion_then_publishes_the_second_attempt() {
+        let db = Db::open_in_memory().await.unwrap();
+        let config = config_with_default_model();
+        // First attempt: no <output> envelope at all. Second: valid.
+        let rejected = "<compartment start=\"1\" end=\"2\"/>".to_owned();
+        let scripted = Arc::new(ScriptedChat::sequence(vec![
+            Script::Text(rejected.clone()),
+            valid_output(1, 2),
+        ]));
+        let chat: Arc<dyn Chat> = scripted.clone();
+        let ctx = RunCtx {
+            db: &db,
+            config: &config,
+            chat: &chat,
+        };
+        let rows = vec![
+            user_row(1, "msg_1", "hello"),
+            assistant_row(2, "msg_2", "hi"),
+        ];
+        let chunk = chunk(&rows, 1, 3, 10_000).expect("a chunk");
+
+        let outcome = run(&ctx, &plan_for(&chunk, 1))
+            .await
+            .expect("a repaired run");
+
+        assert_eq!(outcome.attempt, 2, "the retry is the second attempt");
+        assert_eq!(outcome.compartment_ids.len(), 1);
+        let (state, attempt, error) = run_columns(&db, &outcome.run_id).await;
+        assert_eq!(state, RunState::Completed.as_str());
+        assert_eq!(attempt, 2);
+        assert_eq!(error, None);
+
+        // The retry re-sends the original request plus the rejected output and the
+        // validator's own message; the first attempt had neither.
+        let requests = scripted.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(!user_content(&requests[0]).contains("Previous invalid XML:"));
+        let retry = user_content(&requests[1]);
+        assert!(
+            retry.starts_with(user_content(&requests[0])),
+            "the repair prompt repeats the original prompt verbatim"
+        );
+        assert!(retry.contains("Previous invalid XML:"));
+        assert!(retry.contains(&rejected));
+        assert!(retry.contains("Validation error:"));
+        assert!(retry.contains("<output> root document"));
+
+        let published = compartments::load(&db, "ses_1").await.unwrap();
+        assert_eq!(published.len(), 1);
+        assert_eq!(compartments::coverage_end(&published), Some(2));
+    }
+
+    #[tokio::test]
+    async fn run_gives_up_after_the_repair_bound_and_classifies_the_failure() {
+        let db = Db::open_in_memory().await.unwrap();
+        let config = config_with_default_model();
+        // Every attempt covers only ordinal 1, leaving 2-3 uncovered with no
+        // <unprocessed_from>, which validation rejects.
+        let incomplete = || valid_output(1, 1);
+        let scripted = Arc::new(ScriptedChat::sequence(vec![
+            incomplete(),
+            incomplete(),
+            incomplete(),
+        ]));
+        let chat: Arc<dyn Chat> = scripted.clone();
+        let ctx = RunCtx {
+            db: &db,
+            config: &config,
+            chat: &chat,
+        };
+        let rows = vec![
+            user_row(1, "msg_1", "hello"),
+            assistant_row(2, "msg_2", "hi"),
+            user_row(3, "msg_3", "again"),
+        ];
+        let chunk = chunk(&rows, 1, 4, 10_000).expect("a chunk");
+        assert_eq!(chunk.present_ordinals, vec![1, 2, 3]);
+
+        let error = run(&ctx, &plan_for(&chunk, 1))
+            .await
+            .expect_err("an unusable completion");
+
+        let failure = error
+            .downcast_ref::<ValidationFailure>()
+            .expect("classified as a validation failure");
+        assert!(
+            failure.message.contains("left uncovered messages 2-3"),
+            "unexpected message: {}",
+            failure.message
+        );
+
+        assert_eq!(scripted.requests().len(), HISTORIAN_MAX_ATTEMPTS as usize);
+        let (state, attempt, message) = db
+            .conn()
+            .call(|c| {
+                c.query_row(
+                    "SELECT state, attempt, error FROM mc_historian_run",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(state, RunState::Failed.as_str());
+        assert_eq!(attempt, HISTORIAN_MAX_ATTEMPTS);
+        assert!(message.is_some_and(|text| text.contains("left uncovered messages 2-3")));
+        // Nothing was published: validation failed every attempt.
+        assert!(compartments::load(&db, "ses_1").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn run_settles_failed_and_reports_the_transport_error() {
         let db = Db::open_in_memory().await.unwrap();
         let config = config_with_default_model();
-        let chat: Arc<dyn Chat> = Arc::new(ScriptedChat::new(Script::Fail));
+        let scripted = Arc::new(ScriptedChat::new(Script::Fail));
+        let chat: Arc<dyn Chat> = scripted.clone();
         let ctx = RunCtx {
             db: &db,
             config: &config,
@@ -1856,6 +2431,9 @@ id = "k3-256k"
             .expect_err("a transport failure must be reported, not panic");
 
         assert!(error.to_string().contains("historian completion"));
+        // A transport failure is not a validation failure, and it is not retried.
+        assert!(error.downcast_ref::<ValidationFailure>().is_none());
+        assert_eq!(scripted.requests().len(), 1);
         // The row is failed, not left running, and it kept the attempt.
         let (state, attempt, message) = db
             .conn()
