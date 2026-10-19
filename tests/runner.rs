@@ -597,6 +597,28 @@ impl Harness {
     }
 }
 
+/// A large pasted message is a legal prompt: salvo's 64 KB default body limit
+/// would answer it with `InvalidRequestError`, which upstream never does.
+#[tokio::test]
+async fn a_large_prompt_body_is_accepted() {
+    let harness = Harness::spawn(vec![MockChat::text("ok")]).await;
+    let session_id = harness.create_session().await;
+    let text = "x".repeat(200_000);
+
+    let response = harness
+        .post(
+            &format!("/api/session/{session_id}/prompt"),
+            json!({ "text": text, "delivery": "queue" }),
+        )
+        .await;
+    assert_eq!(response.status(), 200, "a 200 KB prompt is accepted");
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(
+        body["data"]["payload"]["text"].as_str().unwrap().len(),
+        200_000
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Text-only e2e: prompt → actor → user + assistant rows, tokens accumulated
 // ---------------------------------------------------------------------------

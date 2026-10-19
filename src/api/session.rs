@@ -105,6 +105,14 @@ fn no_content(res: &mut Response) {
     res.status_code(StatusCode::NO_CONTENT);
 }
 
+/// Largest JSON request body ox accepts.
+///
+/// salvo's default is 64 KB, which a single pasted message or an inline
+/// attachment exceeds — upstream has no such limit, so a client would see
+/// `InvalidRequestError` for a legal prompt. This is generous enough for a
+/// large paste while staying a bounded read (the body is buffered once).
+const MAX_JSON_BODY_BYTES: usize = 8 * 1024 * 1024;
+
 /// Parse an optional JSON request body; an empty body yields `T::default()`
 /// (every body schema here has all-optional properties except where the
 /// handler validates required fields itself). Malformed JSON is a 400.
@@ -112,7 +120,7 @@ async fn parse_body<T>(req: &mut Request, res: &mut Response) -> Option<T>
 where
     T: DeserializeOwned + Default,
 {
-    let bytes = match req.payload().await {
+    let bytes = match req.payload_with_max_size(MAX_JSON_BODY_BYTES).await {
         Ok(bytes) => bytes,
         Err(_) => {
             invalid_request(res, "Invalid request body");
