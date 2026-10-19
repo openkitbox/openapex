@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::mctx::MctxConfig;
+
 const DEFAULT_CARDINAL_URL: &str = "http://127.0.0.1:10202";
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
 
@@ -75,6 +77,11 @@ pub struct Config {
     /// tests and tuning.
     #[serde(default = "default_event_heartbeat_ms")]
     pub event_heartbeat_ms: u64,
+    /// magic-context integration (`[magic_context]` section). Disabled by
+    /// default; while off, the server behaves exactly as if the module did
+    /// not exist.
+    #[serde(default)]
+    pub magic_context: MctxConfig,
 }
 
 fn default_event_heartbeat_ms() -> u64 {
@@ -91,6 +98,7 @@ impl Default for Config {
             models: default_models(),
             default_model: None,
             event_heartbeat_ms: default_event_heartbeat_ms(),
+            magic_context: MctxConfig::default(),
         }
     }
 }
@@ -242,5 +250,55 @@ name = "Claude Sonnet 4.5"
             cfg.default_model.as_deref(),
             Some("anthropic/claude-sonnet-4-5")
         );
+    }
+
+    #[test]
+    fn magic_context_defaults_when_section_missing() {
+        let cfg: Config = toml::from_str("listen = \"127.0.0.1:9999\"").unwrap();
+        assert!(!cfg.magic_context.enabled);
+        assert!(cfg.magic_context.historian_model.is_none());
+        assert_eq!(cfg.magic_context.soft_threshold, 0.70);
+        assert_eq!(cfg.magic_context.hard_threshold, 0.85);
+    }
+
+    #[test]
+    fn magic_context_section_parses() {
+        let raw = r#"
+[magic_context]
+enabled = true
+historian_model = "cardinal/k3-256k"
+soft_threshold = 0.6
+hard_threshold = 0.9
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(cfg.magic_context.enabled);
+        assert_eq!(
+            cfg.magic_context.historian_model.as_deref(),
+            Some("cardinal/k3-256k")
+        );
+        assert_eq!(cfg.magic_context.soft_threshold, 0.6);
+        assert_eq!(cfg.magic_context.hard_threshold, 0.9);
+    }
+
+    #[test]
+    fn magic_context_partial_section_tolerates_missing_keys() {
+        let raw = r#"
+[magic_context]
+enabled = true
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert!(cfg.magic_context.enabled);
+        assert!(cfg.magic_context.historian_model.is_none());
+        assert_eq!(cfg.magic_context.soft_threshold, 0.70);
+        assert_eq!(cfg.magic_context.hard_threshold, 0.85);
+    }
+
+    #[test]
+    fn magic_context_invalid_value_is_a_parse_error_like_any_config() {
+        let raw = r#"
+[magic_context]
+soft_threshold = "high"
+"#;
+        assert!(toml::from_str::<Config>(raw).is_err());
     }
 }

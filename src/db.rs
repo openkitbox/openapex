@@ -117,14 +117,67 @@ CREATE INDEX IF NOT EXISTS session_pending_session_delivery_seq_idx ON session_p
 CREATE UNIQUE INDEX IF NOT EXISTS session_pending_session_compaction_idx ON session_pending (session_id) WHERE type = 'compaction';
 "#;
 
+/// magic-context tables (ox-owned, `mc_` prefix). JSON payloads are stored
+/// as TEXT per project convention. Deliberately no foreign keys: rows are
+/// keyed by session id and managed by the mctx layer itself, so deleting a
+/// session must not silently depend on cascade order.
+const MIGRATION_V2: &str = r#"
+CREATE TABLE IF NOT EXISTS mc_frozen_state (
+  session_id text PRIMARY KEY,
+  state text NOT NULL,
+  version integer NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mc_compartments (
+  id text PRIMARY KEY,
+  session_id text NOT NULL,
+  coverage_end text NOT NULL,
+  importance real NOT NULL,
+  tiers text NOT NULL,
+  facts text NOT NULL,
+  events text NOT NULL,
+  created_at integer NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mc_memory (
+  id text PRIMARY KEY,
+  project text NOT NULL,
+  content text NOT NULL,
+  category text NOT NULL,
+  created_at integer NOT NULL,
+  updated_at integer NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mc_note (
+  id text PRIMARY KEY,
+  session_id text NOT NULL,
+  title text NOT NULL,
+  body text NOT NULL,
+  status text NOT NULL,
+  surface_condition text,
+  created_at integer NOT NULL,
+  updated_at integer NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mc_historian_run (
+  id text PRIMARY KEY,
+  session_id text NOT NULL,
+  state text NOT NULL,
+  chunk_ref text,
+  attempt integer NOT NULL,
+  created_at integer NOT NULL
+);
+CREATE INDEX IF NOT EXISTS mc_compartments_session_idx ON mc_compartments (session_id);
+CREATE INDEX IF NOT EXISTS mc_memory_project_idx ON mc_memory (project);
+CREATE INDEX IF NOT EXISTS mc_note_session_idx ON mc_note (session_id);
+CREATE INDEX IF NOT EXISTS mc_historian_run_session_idx ON mc_historian_run (session_id);
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
-const MIGRATIONS: &[(u32, &str)] = &[(1, MIGRATION_V1)];
+const MIGRATIONS: &[(u32, &str)] = &[(1, MIGRATION_V1), (2, MIGRATION_V2)];
 
-/// All indexes the migration creates, verbatim from upstream
-/// (`packages/core/src/database/schema.gen.ts`). Kept next to the schema so
-/// the test stays in sync with what we actually create.
+/// All indexes the migration creates: V1's verbatim from upstream
+/// (`packages/core/src/database/schema.gen.ts`), plus ox-owned `mc_*` indexes
+/// from MIGRATION_V2. Kept next to the schema so the test stays in sync with
+/// what we actually create.
 #[cfg(test)]
 const EXPECTED_INDEXES: &[&str] = &[
     "event_aggregate_seq_idx",
@@ -142,6 +195,10 @@ const EXPECTED_INDEXES: &[&str] = &[
     "session_pending_session_admitted_seq_idx",
     "session_pending_session_delivery_seq_idx",
     "session_pending_session_compaction_idx",
+    "mc_compartments_session_idx",
+    "mc_memory_project_idx",
+    "mc_note_session_idx",
+    "mc_historian_run_session_idx",
 ];
 
 /// Tables created by the embedded migration, in creation order.
@@ -154,6 +211,11 @@ const EXPECTED_TABLES: &[&str] = &[
     "session_message",
     "session_inbox",
     "session_pending",
+    "mc_frozen_state",
+    "mc_compartments",
+    "mc_memory",
+    "mc_note",
+    "mc_historian_run",
 ];
 
 /// Async handle to the SQLite database.
@@ -271,11 +333,67 @@ mod tests {
     #[tokio::test]
     async fn migration_tracks_user_version_and_is_idempotent() {
         let db = Db::open_in_memory().await.unwrap();
-        assert_eq!(db.user_version().await, 1);
+        assert_eq!(db.user_version().await, 2);
         // Re-running must be a no-op: version stays, no error.
         db.migrate().await.unwrap();
         db.migrate().await.unwrap();
-        assert_eq!(db.user_version().await, 1);
+        assert_eq!(db.user_version().await, 2);
+    }
+
+    #[tokio::test]
+    async fn mc_migration_creates_tables_and_indexes() {
+        let db = Db::open_in_memory().await.unwrap();
+        let names = db
+            .conn()
+            .call(|c| -> rusqlite::Result<Vec<String>> {
+                let mut stmt = c.prepare(
+                    "SELECT name FROM sqlite_master WHERE name LIKE 'mc\\_%' ESCAPE '\\' ORDER BY name",
+                )?;
+                let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+                rows.collect()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            names,
+            vec![
+                "mc_compartments",
+                "mc_compartments_session_idx",
+                "mc_frozen_state",
+                "mc_historian_run",
+                "mc_historian_run_session_idx",
+                "mc_memory",
+                "mc_memory_project_idx",
+                "mc_note",
+                "mc_note_session_idx",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn migration_v2_upgrades_an_existing_v1_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade.db");
+        // Build a v1 database by hand: apply only MIGRATION_V1 and stamp it.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATION_V1).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+        }
+        let db = Db::open(&path).await.unwrap();
+        assert_eq!(db.user_version().await, 2);
+        for table in [
+            "mc_frozen_state",
+            "mc_compartments",
+            "mc_memory",
+            "mc_note",
+            "mc_historian_run",
+        ] {
+            assert!(
+                db.table_exists(table).await.unwrap(),
+                "expected table {table} after upgrade"
+            );
+        }
     }
 
     #[tokio::test]

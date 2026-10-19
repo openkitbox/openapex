@@ -9,6 +9,7 @@ pub mod config;
 pub mod db;
 pub mod event_bus;
 pub mod id;
+pub mod mctx;
 pub mod projector;
 pub mod prompt;
 pub mod runner;
