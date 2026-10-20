@@ -1609,6 +1609,79 @@ async fn tool_flow_executes_and_continues_with_results() {
 }
 
 #[tokio::test]
+async fn todo_metadata_reaches_the_client_on_the_tool_part() {
+    // The todo tool keeps its state in its own `kv` row, so a throwaway DB is
+    // enough: what this asserts is the *transport* — metadata set by the tool
+    // survives `session.tool.success`, the projector and the message endpoint.
+    let db = ox::db::Db::open_in_memory().await.expect("todo db");
+    let mut registry = ToolRegistry::new();
+    registry
+        .register(Arc::new(ox::tool::todo::TodoTool::new(db)))
+        .expect("register todo");
+    let harness = Harness::spawn_with(
+        vec![
+            MockChat::tool_turn(
+                "call_1",
+                "todo",
+                r#"{"op":"init","list":[{"phase":"Investigate","items":["read","grep"]},{"phase":"Fix","items":["edit"]}]}"#,
+            ),
+            MockChat::text("done"),
+        ],
+        registry,
+    )
+    .await;
+    let session_id = harness.create_session().await;
+    let response = harness
+        .post(
+            &format!("/api/session/{session_id}/prompt"),
+            json!({ "text": "plan the work" }),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    harness.wait_event("session.execution.succeeded").await;
+
+    let part = harness
+        .messages(&session_id)
+        .await
+        .into_iter()
+        .find(|m| m["type"] == "assistant")
+        .expect("assistant row")["content"]
+        .as_array()
+        .expect("parts")
+        .iter()
+        .find(|p| p["type"] == "tool" && p["name"] == "todo")
+        .expect("todo tool part")
+        .clone();
+    assert_eq!(part["state"]["status"], "completed");
+
+    // The structured list a TUI plugin renders (plugins/ox-todo reads exactly
+    // this): phases → tasks with the full ox status set and blocker notes.
+    let phases = part["state"]["metadata"]["phases"]
+        .as_array()
+        .expect("metadata.phases");
+    assert_eq!(phases.len(), 2, "{phases:?}");
+    assert_eq!(phases[0]["name"], "Investigate");
+    assert_eq!(
+        phases[0]["tasks"],
+        json!([
+            { "content": "read", "status": "in_progress" },
+            { "content": "grep", "status": "pending" }
+        ])
+    );
+    assert_eq!(
+        phases[1]["tasks"],
+        json!([{ "content": "edit", "status": "pending" }])
+    );
+
+    // The rendered text the model reads carries the same list.
+    let text = part["state"]["content"][0]["text"]
+        .as_str()
+        .expect("output text");
+    assert!(text.contains("  Investigate:"), "{text}");
+    assert!(text.contains("Overall: 0/3 done, 3 open."), "{text}");
+}
+
+#[tokio::test]
 async fn tool_failure_continues_with_error_result() {
     let (echo, _executed) = EchoTool::tool(true, Duration::ZERO, None);
     let harness = Harness::spawn_with(

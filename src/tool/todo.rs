@@ -7,22 +7,32 @@
 //! - **The `content` is the rendering.** The tool result's model-facing text
 //!   is oh-my-pi's `formatSummary` output — the summary line plus the
 //!   per-phase tree. opencode's TUI has no todo renderer and shows a tool's
-//!   text verbatim, so that same string is what the user sees. No `metadata`
-//!   channel, no TUI change.
+//!   text verbatim, so that same string is what the user sees.
+//! - **The `metadata` is the structure.** The same phases also travel as
+//!   `ToolOutput.metadata.phases`, i.e. the `metadata` field of the
+//!   `session.tool.success` event, mirroring upstream `todowrite`'s
+//!   `metadata: { todos }`. That is the only channel a client can read without
+//!   parsing the rendered text, and it is what the companion TUI plugin
+//!   renders as a two-level tree (`.opencode/plans/ox-todo-metadata.md`). The
+//!   two stay in lockstep because both are built from the same `effective`
+//!   list, after the error-is-rollback rule has been applied.
 //! - **State lives in the session's `kv` row** (`todo:{sessionID}`), the same
 //!   store magic-context keeps its own per-session facts in. oh-my-pi reads
 //!   the latest `todo` tool-result `details` back off the transcript; ox's
-//!   tool output is content-only, so a durable side row is the equivalent —
-//!   it also survives the compaction floor that drops the tool result itself.
+//!   tool output is content plus client-facing metadata, so a durable side row
+//!   is the equivalent — it also survives the compaction floor that drops the
+//!   tool result itself.
 //! - **Every op is ported exactly**, including the error-is-rollback rule
 //!   (a batch with any error commits nothing), the single-active-task
 //!   invariant (`normalize_in_progress_task`), content-as-identity targeting,
 //!   and the `append`-only phase creation rule.
 //!
 //! Deviations, all deliberate:
-//! - `details` (`phases`, `storage`, `completedTasks`, `op`) has no wire
-//!   channel in ox (`ToolOutput` is content + error), so progress reaches the
-//!   client through the rendered text only.
+//! - `details` (`phases`, `storage`, `completedTasks`, `op`) is reduced to
+//!   `metadata.phases`. The storage key, the op and the completion transitions
+//!   stay internal: the first two are things the client already knows from the
+//!   call itself, and oh-my-pi's `completedTasks` only feeds its HUD/reminders,
+//!   which ox does not have.
 //! - No `lenientArgValidation` repair of a missing `op`: ox validates the
 //!   arguments against the advertised schema before dispatch, so a stale or
 //!   flattened payload gets the ordinary schema error and a retry.
@@ -454,10 +464,10 @@ async fn run_op(
     previous: Vec<TodoPhase>,
     params: Params,
 ) -> ToolOutput {
-    // `view` is a pure read: no normalization, no state write.
-    let read_only = params.op == Some(Op::View);
-    if read_only {
-        return ok_text(format_summary(&previous, &[], true));
+    // `view` is a pure read: no normalization, no state write. It still
+    // carries `metadata`, so a client can treat it as a refresh.
+    if params.op == Some(Op::View) {
+        return render(&previous, &[], true);
     }
 
     let (updated, errors) = match params.op {
@@ -486,10 +496,23 @@ async fn run_op(
         return fail(format!("Failed to save the todo list: {error}"));
     }
     // oh-my-pi reports op errors as a successful tool result whose content
-    // starts with `Errors: …` (details carry `isError` instead); ox has no
-    // details channel, so mirror the content and let the rendered summary
-    // carry the failure.
-    ok_text(format_summary(&effective, &errors, false))
+    // starts with `Errors: …` (details carry `isError` instead); ox mirrors
+    // that in the content and lets the rendered summary carry the failure.
+    // `effective` is the pre-op list whenever anything failed, so both the text
+    // and the metadata describe the state that actually persisted.
+    render(&effective, &errors, false)
+}
+
+/// Build the tool result: the rendered summary the model reads plus the
+/// structured phases a client renders.
+///
+/// oh-my-pi's `details` carries `{ op, phases, storage, completedTasks }`; only
+/// the list is published, under `phases`, because ox's model is two-level. The
+/// wire type is a JSON *object* (`step::tool_metadata` drops anything else), so
+/// the array is wrapped.
+fn render(phases: &[TodoPhase], errors: &[String], read_only: bool) -> ToolOutput {
+    ok_text(format_summary(phases, errors, read_only))
+        .with_metadata(json!({ "phases": encode_phases(phases) }))
 }
 
 /// Apply one op to `phases` in place, recording recoverable errors.
@@ -1339,5 +1362,116 @@ mod tests {
         assert!(text.contains("  Fix:"), "{text}");
         assert!(text.contains("    - [ ] edit"), "{text}");
         assert!(text.contains("Overall: 0/3 done, 3 open."), "{text}");
+    }
+
+    // -----------------------------------------------------------------------
+    // The metadata channel a client renders instead of parsing the text
+    // -----------------------------------------------------------------------
+
+    /// The `phases` array of a result's metadata, or a panic naming the shape
+    /// the projector requires (an object, see `step::tool_metadata`).
+    fn phases_of_output(output: &ToolOutput) -> &Vec<Value> {
+        let metadata = output
+            .metadata
+            .as_ref()
+            .expect("every todo result carries metadata");
+        metadata
+            .get("phases")
+            .and_then(Value::as_array)
+            .expect("metadata.phases must be an array")
+    }
+
+    #[tokio::test]
+    async fn metadata_carries_the_same_tree_as_the_content() {
+        let db = Db::open_in_memory().await.unwrap();
+        let tool = TodoTool::new(db);
+        let output = run(
+            &tool,
+            "ses",
+            json!({"op": "init", "list": [
+                {"phase": "Investigate", "items": ["read", "grep"]},
+                {"phase": "Fix", "items": ["edit"]}
+            ]}),
+        )
+        .await;
+        assert!(output.error.is_none(), "{:?}", output.error);
+
+        let phases = phases_of_output(&output);
+        assert_eq!(phases.len(), 2, "{phases:?}");
+        assert_eq!(phases[0]["name"], json!("Investigate"));
+        assert_eq!(
+            phases[0]["tasks"],
+            json!([
+                {"content": "read", "status": "in_progress"},
+                {"content": "grep", "status": "pending"}
+            ]),
+            "the single-active-task invariant lands in metadata too"
+        );
+        assert_eq!(phases[1]["name"], json!("Fix"));
+        assert_eq!(
+            phases[1]["tasks"],
+            json!([{"content": "edit", "status": "pending"}])
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_tracks_blocked_tasks_with_their_note() {
+        let db = Db::open_in_memory().await.unwrap();
+        let tool = TodoTool::new(db);
+        run(&tool, "ses", json!({"op": "init", "items": ["a", "b"]})).await;
+        let output = run(
+            &tool,
+            "ses",
+            json!({"op": "block", "task": "b", "reason": "waiting on upstream"}),
+        )
+        .await;
+        assert!(output.error.is_none());
+        let phases = phases_of_output(&output);
+        let tasks = phases[0]["tasks"].as_array().unwrap();
+        // `b` was the active task; blocking it releases the pointer to `a`.
+        assert_eq!(
+            tasks[1],
+            json!({
+                "content": "b",
+                "status": "blocked",
+                "blocker": "waiting on upstream"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_op_metadata_reflects_the_rollback() {
+        let db = Db::open_in_memory().await.unwrap();
+        let tool = TodoTool::new(db);
+        run(&tool, "ses", json!({"op": "init", "items": ["a"]})).await;
+        // `done` on an unknown task discards the batch, so metadata must still
+        // describe the pre-op list — the same state the text shows.
+        let output = run(&tool, "ses", json!({"op": "done", "task": "ghost"})).await;
+        assert!(output.content.as_str().unwrap().starts_with("Errors:"));
+        let phases = phases_of_output(&output);
+        assert_eq!(
+            phases[0]["tasks"],
+            json!([{"content": "a", "status": "in_progress"}]),
+            "a failed op publishes the state that persisted, not the working copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn view_carries_metadata_so_a_client_can_refresh() {
+        let db = Db::open_in_memory().await.unwrap();
+        let tool = TodoTool::new(db);
+        run(&tool, "ses", json!({"op": "init", "items": ["a"]})).await;
+        let output = run(&tool, "ses", json!({"op": "view"})).await;
+        let text = output.content.as_str().expect("view content");
+        assert!(text.starts_with("Remaining items"), "{text}");
+        let phases = phases_of_output(&output);
+        assert_eq!(
+            phases[0]["tasks"],
+            json!([{"content": "a", "status": "in_progress"}])
+        );
+
+        // An empty list is still a well-formed object: `{ "phases": [] }`.
+        let output = run(&tool, "other", json!({"op": "view"})).await;
+        assert!(phases_of_output(&output).is_empty());
     }
 }

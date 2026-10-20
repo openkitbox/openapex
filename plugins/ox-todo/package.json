@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "ox-todo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Renders ox's two-level todo list (metadata.phases) in the opencode TUI sidebar.",
+  "exports": {
+    "./tui": "./tui.tsx"
+  },
+  "scripts": {
+    "test": "bun test"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "*",
+    "@opentui/core": ">=0.6.6",
+    "@opentui/solid": ">=0.6.6",
+    "solid-js": ">=1.9.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": { "optional": true },
+    "@opentui/core": { "optional": true },
+    "@opentui/solid": { "optional": true },
+    "solid-js": { "optional": true }
+  }
+}
