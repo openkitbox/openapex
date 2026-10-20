@@ -45,6 +45,7 @@ use crate::schema::support::{FinishReason, SessionError};
 
 use super::ToolRegistry;
 use super::compaction;
+use super::resolve_selection;
 use super::unknown_error;
 
 /// Which delivery classes a drain pass may promote. Upstream `Promotable`:
@@ -199,6 +200,13 @@ pub(crate) async fn drain(
                     // no force paths, so the drain ends.
                     return DrainOutcome::Complete;
                 }
+                // Upstream llm.ts:177: the first promoted steer of an untitled
+                // root session spawns one title generation. `onlyIfMissing`
+                // keeps it to a single attempt per session under the same
+                // FiberMap key; ox spawns per promotion, and the guard below
+                // (untitled + generated titles are never untitled) keeps it to
+                // one completion in practice.
+                maybe_spawn_title_generation(ctx).await;
                 match run_turn(ctx, token).await {
                     Ok(TurnOutcome::Ended) => {
                         // The next scan re-opens the entry boundary when the
@@ -353,6 +361,51 @@ async fn output_limit_exhausted(db: &Db, session_id: &str) -> Result<bool> {
         }))
 }
 
+/// Spawn the automatic title generation for a root session that still has no
+/// title (upstream `llm.ts:177`: the first promoted steer of an untitled root
+/// session, `SessionTitle.isUntitled`). Non-root sessions are skipped: a child
+/// session inherits its parent's context, so a generated title there is noise.
+///
+/// Fire-and-forget: the completion runs off the drain, and any failure is
+/// logged inside [`crate::runner::title::generate`].
+async fn maybe_spawn_title_generation(ctx: &DrainCtx) {
+    let untitled = match crate::runner::title::is_untitled(&ctx.db, &ctx.session_id).await {
+        Ok(untitled) => untitled,
+        Err(error) => {
+            tracing::debug!(
+                session = %ctx.session_id,
+                error = %error,
+                "title generation: untitled check failed"
+            );
+            return;
+        }
+    };
+    if !untitled {
+        return;
+    }
+    match crate::runner::title::is_root_session(&ctx.db, &ctx.session_id).await {
+        Ok(true) => {}
+        Ok(false) => return,
+        Err(error) => {
+            tracing::debug!(
+                session = %ctx.session_id,
+                error = %error,
+                "title generation: root check failed"
+            );
+            return;
+        }
+    }
+    let db = ctx.db.clone();
+    let bus = ctx.bus.clone();
+    let chat = Arc::clone(&ctx.chat);
+    let config = ctx.config.clone();
+    let catalog = Arc::clone(&ctx.model_catalog);
+    let session_id = ctx.session_id.clone();
+    tokio::spawn(async move {
+        crate::runner::title::generate(db, bus, chat, config, catalog, session_id).await;
+    });
+}
+
 /// Deliver the steers pending at a step boundary, steer-scope only: queued
 /// items wait for the next turn entry. A compaction control at the steer
 /// head owns the boundary — it runs before the continuation step; a move
@@ -378,49 +431,6 @@ async fn deliver_pending_steers(ctx: &DrainCtx) -> Result<()> {
     }
     deliver_up_to_control(ctx, steers).await?;
     Ok(())
-}
-
-/// Resolve the session's agent + model (`context.resolveModel`): the
-/// projected selection when set, else the config's default model
-/// (`default_model`, falling back to the first `[[models]]` entry), else the
-/// cardinal placeholder id.
-pub(crate) async fn resolve_selection(
-    db: &Db,
-    session_id: &str,
-    config: &Config,
-    model_catalog: &crate::model_catalog::ModelCatalog,
-) -> Result<(String, crate::schema::support::ModelRef)> {
-    let row: Option<(Option<String>, Option<String>)> = {
-        let conn = db.acquire().await?;
-        let mut stmt = conn
-            .prepare("SELECT agent, model FROM session_v2 WHERE id = ?1")
-            .await?;
-        crate::db::optional(&mut stmt, [session_id])
-            .await?
-            .map(|row| -> anyhow::Result<_> {
-                Ok((row.get::<Option<String>>(0)?, row.get::<Option<String>>(1)?))
-            })
-            .transpose()?
-    };
-    let Some((agent, model)) = row else {
-        anyhow::bail!("session `{session_id}` is not projected");
-    };
-    let model = match model.and_then(|raw| serde_json::from_str(&raw).ok()) {
-        Some(model) => model,
-        None => match model_catalog.default_entry(config) {
-            Some(configured) => crate::schema::support::ModelRef {
-                id: configured.id.clone(),
-                provider_id: configured.provider.clone(),
-                variant: None,
-            },
-            None => crate::schema::support::ModelRef {
-                id: "default".to_owned(),
-                provider_id: "opencode".to_owned(),
-                variant: None,
-            },
-        },
-    };
-    Ok((agent.unwrap_or_else(|| "build".to_owned()), model))
 }
 
 // ---------------------------------------------------------------------------

@@ -28,6 +28,7 @@ use crate::schema::message::CompactionReason;
 use crate::schema::support::SessionError;
 
 use super::drain::DrainCtx;
+use super::resolve_selection;
 use super::unknown_error;
 
 /// The compaction request's system prompt. Upstream routes the summarization
@@ -155,7 +156,7 @@ pub(crate) async fn compact(
     reason: CompactionReason,
     input_id: Option<String>,
 ) -> std::result::Result<String, SessionError> {
-    let (_, model) = crate::runner::drain::resolve_selection(
+    let (_, model) = resolve_selection(
         &ctx.db,
         &ctx.session_id,
         &ctx.config,

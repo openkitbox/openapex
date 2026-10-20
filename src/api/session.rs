@@ -24,6 +24,7 @@ use salvo::prelude::*;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::sync::Arc;
 use turso::Value as SqlValue;
 
 use crate::db::Db;
@@ -889,21 +890,27 @@ pub(crate) async fn update(req: &mut Request, depot: &mut Depot, res: &mut Respo
         }
     }
 
-    if let Some(title) = &body.title
-        && !title.is_empty()
-        && let Err(error) = app
-            .bus
-            .publish(SessionEventData::SessionRenamed {
-                session_id: session_id.clone(),
-                title: title.clone(),
-            })
-            .await
-    {
-        unknown_error(res, &error);
-        return;
+    if let Some(title) = &body.title {
+        if !title.is_empty() {
+            if let Err(error) = app
+                .bus
+                .publish(SessionEventData::SessionRenamed {
+                    session_id: session_id.clone(),
+                    title: title.clone(),
+                })
+                .await
+            {
+                unknown_error(res, &error);
+                return;
+            }
+        } else {
+            // An empty title asks for a generated one (upstream handlers/
+            // session.ts:234 → `title.generate`). Generation is background
+            // work: the request answers 204 and the title arrives as a
+            // `session.renamed` event, exactly as upstream does.
+            spawn_title_generation(app, session_id.clone());
+        }
     }
-    // TODO(title-generation): an empty title asks upstream to generate one from
-    // the session's history (a model-backed subsystem); skipped here.
 
     if let Some(metadata) = body.metadata
         && let Err(error) = app
@@ -932,6 +939,20 @@ pub(crate) async fn update(req: &mut Request, depot: &mut Depot, res: &mut Respo
     }
 
     no_content(res);
+}
+
+/// Spawn one background title generation for `session_id` (upstream
+/// `SessionTitle.generate`). Fire-and-forget: title generation is advisory, so
+/// a failure is logged inside the task and never reaches the response.
+fn spawn_title_generation(app: &crate::api::AppState, session_id: String) {
+    let db = app.db.clone();
+    let bus = app.bus.clone();
+    let chat = app.runner.chat();
+    let config = app.config.clone();
+    let catalog = Arc::clone(&app.model_catalog);
+    tokio::spawn(async move {
+        crate::runner::title::generate(db, bus, chat, config, catalog, session_id).await;
+    });
 }
 
 // ---------------------------------------------------------------------------

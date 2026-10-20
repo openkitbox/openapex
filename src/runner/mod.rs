@@ -29,6 +29,7 @@ pub mod drain;
 mod historian_trigger;
 pub(crate) mod provider_error;
 pub mod step;
+pub(crate) mod title;
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -579,4 +580,51 @@ pub(crate) fn unknown_error(message: impl Into<String>) -> SessionError {
         status: None,
         response: None,
     }
+}
+
+/// Resolve the session's agent + model (`context.resolveModel`): the projected
+/// selection when set, else the config's default model (`default_model`,
+/// falling back to the first `[[models]]` entry), else the cardinal
+/// placeholder id.
+///
+/// Shared state, shared reader: the turn loop, compaction and title
+/// generation all ask the same question, so the resolver lives here rather
+/// than in any one caller.
+pub(crate) async fn resolve_selection(
+    db: &Db,
+    session_id: &str,
+    config: &Config,
+    model_catalog: &crate::model_catalog::ModelCatalog,
+) -> Result<(String, crate::schema::support::ModelRef)> {
+    let row: Option<(Option<String>, Option<String>)> = {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare("SELECT agent, model FROM session_v2 WHERE id = ?1")
+            .await?;
+        crate::db::optional(&mut stmt, [session_id])
+            .await?
+            .map(|row| -> Result<_> {
+                Ok((row.get::<Option<String>>(0)?, row.get::<Option<String>>(1)?))
+            })
+            .transpose()?
+    };
+    let Some((agent, model)) = row else {
+        bail!("session `{session_id}` is not projected");
+    };
+    let model = match model.and_then(|raw| serde_json::from_str(&raw).ok()) {
+        Some(model) => model,
+        None => match model_catalog.default_entry(config) {
+            Some(configured) => crate::schema::support::ModelRef {
+                id: configured.id.clone(),
+                provider_id: configured.provider.clone(),
+                variant: None,
+            },
+            None => crate::schema::support::ModelRef {
+                id: "default".to_owned(),
+                provider_id: "opencode".to_owned(),
+                variant: None,
+            },
+        },
+    };
+    Ok((agent.unwrap_or_else(|| "build".to_owned()), model))
 }
