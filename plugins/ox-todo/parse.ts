@@ -64,8 +64,10 @@ export function parsePhases(value: unknown): TodoPhase[] {
  *
  * The two "nothing to show" cases are distinguished so a caller can page:
  * - `undefined` — this page holds no completed call, so older history may.
- * - `[]` — the newest completed call exists but has no `metadata` (recorded by
- *   an ox build from before the metadata channel), so stop looking.
+ * - `[]` — the newest completed call exists but has nothing to show: either it
+ *   was recorded by an ox build from before the metadata channel, or it is the
+ *   call that *finished* the list and ox cleared it (`metadata.cleared`). Both
+ *   stop the walk; there is nothing older that is still in force.
  */
 export function phasesFromDesc(messages: readonly unknown[], boundary?: string): TodoPhase[] | undefined {
   // Messages at and after the revert boundary are hidden, so skip them while
@@ -84,7 +86,13 @@ export function phasesFromDesc(messages: readonly unknown[], boundary?: string):
       if (!isRecord(part) || part.type !== "tool" || part.name !== TOOL) continue
       const state = part.state
       if (!isRecord(state) || state.status !== "completed") continue
-      return parsePhases(isRecord(state.metadata) ? state.metadata.phases : undefined)
+      const metadata = isRecord(state.metadata) ? state.metadata : undefined
+      // ox drops the stored list when its last task closes. The result still
+      // carries the finished tree (so the transcript shows the confirmation),
+      // but the session's list is empty from then on — a client panel must
+      // clear with it.
+      if (metadata?.cleared === true) return []
+      return parsePhases(metadata?.phases)
     }
   }
   return undefined

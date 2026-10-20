@@ -392,6 +392,50 @@ async fn store(db: &Db, session_id: &str, phases: &[TodoPhase]) -> anyhow::Resul
     Ok(())
 }
 
+/// Drop the session's row. Used when the list finishes: a completed list that
+/// lingers makes every later `view` and every client panel report stale work.
+async fn clear(db: &Db, session_id: &str) -> anyhow::Result<()> {
+    let conn = db.acquire().await?;
+    conn.execute("DELETE FROM kv WHERE key = ?1", [storage_key(session_id)])
+        .await?;
+    Ok(())
+}
+
+/// Open work for a session, as `(phase, task, status)`. The runner's completion
+/// reminder reads this; it is the same durable row the tool writes, so a
+/// reminder can never disagree with what the tool last reported.
+pub(crate) async fn open_tasks(
+    db: &Db,
+    session_id: &str,
+) -> anyhow::Result<Vec<(String, String, &'static str)>> {
+    Ok(load(db, session_id)
+        .await?
+        .into_iter()
+        .flat_map(|phase| {
+            phase
+                .tasks
+                .into_iter()
+                .filter(|task| task.status.is_open())
+                .map(move |task| (phase.name.clone(), task.content, task.status.as_str()))
+        })
+        .collect())
+}
+
+/// Whether every task is closed and there was work to begin with. An empty list
+/// is not "finished" — there is nothing to announce or clear.
+fn is_finished(phases: &[TodoPhase]) -> bool {
+    let mut any = false;
+    for phase in phases {
+        for task in &phase.tasks {
+            any = true;
+            if task.status.is_open() {
+                return false;
+            }
+        }
+    }
+    any
+}
+
 fn encode_phases(phases: &[TodoPhase]) -> Value {
     Value::Array(
         phases
@@ -467,7 +511,7 @@ async fn run_op(
     // `view` is a pure read: no normalization, no state write. It still
     // carries `metadata`, so a client can treat it as a refresh.
     if params.op == Some(Op::View) {
-        return render(&previous, &[], true);
+        return render(&previous, &[], true, false);
     }
 
     let (updated, errors) = match params.op {
@@ -491,16 +535,32 @@ async fn run_op(
     // make the natural retry hit "already exists" for the parts that landed.
     let failed = !errors.is_empty();
     let effective = if failed { previous } else { updated };
-    if !failed && let Err(error) = store(db, session_id, &effective).await {
-        tracing::error!(session = %session_id, error = %error, "save todo state failed");
-        return fail(format!("Failed to save the todo list: {error}"));
+    if !failed {
+        // A finished list is dropped rather than kept: leaving it behind makes
+        // every later `view` and every client panel report work that is done.
+        // The result still shows the completed tree (that is the useful
+        // confirmation), but the stored state — and the next `view` — is empty.
+        let finished = is_finished(&effective);
+        let stored = if finished {
+            clear(db, session_id).await
+        } else {
+            store(db, session_id, &effective).await
+        };
+        if let Err(error) = stored {
+            tracing::error!(session = %session_id, error = %error, "save todo state failed");
+            return fail(format!("Failed to save the todo list: {error}"));
+        }
+        // Any successful mutation re-arms the completion reminder budget
+        // (upstream `todo-tracker`: touching the list resets `reminderCount`).
+        crate::runner::reset_todo_reminder_budget(db, session_id).await;
+        return render(&effective, &[], false, finished);
     }
     // oh-my-pi reports op errors as a successful tool result whose content
     // starts with `Errors: …` (details carry `isError` instead); ox mirrors
     // that in the content and lets the rendered summary carry the failure.
     // `effective` is the pre-op list whenever anything failed, so both the text
     // and the metadata describe the state that actually persisted.
-    render(&effective, &errors, false)
+    render(&effective, &errors, false, false)
 }
 
 /// Build the tool result: the rendered summary the model reads plus the
@@ -509,10 +569,16 @@ async fn run_op(
 /// oh-my-pi's `details` carries `{ op, phases, storage, completedTasks }`; only
 /// the list is published, under `phases`, because ox's model is two-level. The
 /// wire type is a JSON *object* (`step::tool_metadata` drops anything else), so
-/// the array is wrapped.
-fn render(phases: &[TodoPhase], errors: &[String], read_only: bool) -> ToolOutput {
-    ok_text(format_summary(phases, errors, read_only))
-        .with_metadata(json!({ "phases": encode_phases(phases) }))
+/// the array is wrapped. `cleared` marks a list that finished and was dropped,
+/// so a client can tell "everything is done" from "there was never a list".
+fn render(phases: &[TodoPhase], errors: &[String], read_only: bool, cleared: bool) -> ToolOutput {
+    let mut metadata = json!({ "phases": encode_phases(phases) });
+    if let Some(object) = metadata.as_object_mut()
+        && cleared
+    {
+        object.insert("cleared".to_owned(), Value::Bool(true));
+    }
+    ok_text(format_summary(phases, errors, read_only)).with_metadata(metadata)
 }
 
 /// Apply one op to `phases` in place, recording recoverable errors.
@@ -1473,5 +1539,113 @@ mod tests {
         // An empty list is still a well-formed object: `{ "phases": [] }`.
         let output = run(&tool, "other", json!({"op": "view"})).await;
         assert!(phases_of_output(&output).is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // A finished list is cleared, and says so
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn completing_the_last_task_clears_the_stored_list() {
+        let db = Db::open_in_memory().await.unwrap();
+        let tool = TodoTool::new(db.clone());
+        run(&tool, "ses", json!({"op": "init", "items": ["a", "b"]})).await;
+
+        // Closing one of two leaves the list in place.
+        let output = run(&tool, "ses", json!({"op": "done", "task": "a"})).await;
+        assert!(output.error.is_none());
+        assert_eq!(phases_of_output(&output).len(), 1);
+        assert!(
+            output.metadata.as_ref().unwrap().get("cleared").is_none(),
+            "an unfinished list is not marked cleared"
+        );
+        assert!(
+            run(&tool, "ses", json!({"op": "view"})).await.content != json!("Todo list is empty.")
+        );
+
+        // Closing the last one reports the finished tree and drops the row.
+        let output = run(&tool, "ses", json!({"op": "done", "task": "b"})).await;
+        assert!(output.error.is_none());
+        assert_eq!(
+            output.metadata.as_ref().unwrap().get("cleared"),
+            Some(&Value::Bool(true)),
+            "the result announces the clear"
+        );
+        let text = output.content.as_str().unwrap();
+        assert!(text.contains("Overall: 2/2 done"), "{text}");
+
+        // The stored state is gone: `view` reports an empty list.
+        let output = run(&tool, "ses", json!({"op": "view"})).await;
+        assert_eq!(output.content, json!("Todo list is empty."));
+        assert!(phases_of_output(&output).is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_task_also_clears() {
+        let db = Db::open_in_memory().await.unwrap();
+        let tool = TodoTool::new(db);
+        run(&tool, "ses", json!({"op": "init", "items": ["a"]})).await;
+        let output = run(&tool, "ses", json!({"op": "drop", "task": "a"})).await;
+        assert!(output.error.is_none());
+        assert_eq!(
+            output.metadata.as_ref().unwrap().get("cleared"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            run(&tool, "ses", json!({"op": "view"})).await.content,
+            json!("Todo list is empty.")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_finished_list_is_not_reported_as_cleared_on_failure() {
+        // A failed op never reaches the clear path, even when the pre-op list
+        // happened to be finished (it is dropped, so this is the empty case).
+        let db = Db::open_in_memory().await.unwrap();
+        let tool = TodoTool::new(db);
+        let output = run(&tool, "ses", json!({"op": "done", "task": "ghost"})).await;
+        assert!(
+            output.metadata.as_ref().unwrap().get("cleared").is_none(),
+            "a rollback is not a clear"
+        );
+        assert!(output.content.as_str().unwrap().starts_with("Errors:"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Open tasks, as the completion reminder reads them
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn open_tasks_reports_only_unfinished_work() {
+        let db = Db::open_in_memory().await.unwrap();
+        let tool = TodoTool::new(db.clone());
+        run(
+            &tool,
+            "ses",
+            json!({"op": "init", "list": [
+                {"phase": "One", "items": ["a", "b"]},
+                {"phase": "Two", "items": ["c"]}
+            ]}),
+        )
+        .await;
+        run(&tool, "ses", json!({"op": "done", "task": "a"})).await;
+        run(&tool, "ses", json!({"op": "drop", "task": "c"})).await;
+
+        let open = super::open_tasks(&db, "ses").await.unwrap();
+        assert_eq!(
+            open,
+            vec![("One".to_owned(), "b".to_owned(), "in_progress")]
+        );
+    }
+
+    #[tokio::test]
+    async fn open_tasks_is_empty_once_everything_closes() {
+        let db = Db::open_in_memory().await.unwrap();
+        let tool = TodoTool::new(db.clone());
+        run(&tool, "ses", json!({"op": "init", "items": ["a"]})).await;
+        run(&tool, "ses", json!({"op": "done", "task": "a"})).await;
+
+        // The finished list was cleared, so there is nothing to report.
+        assert!(super::open_tasks(&db, "ses").await.unwrap().is_empty());
     }
 }

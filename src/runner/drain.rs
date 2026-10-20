@@ -269,6 +269,11 @@ async fn run_turn(ctx: &DrainCtx, token: &CancellationToken) -> Result<TurnOutco
                     continue;
                 }
                 if finish != FinishReason::Length {
+                    // A natural stop with open todo work gets one reminder; the
+                    // item is enqueued as a steer, so the drain loop picks it up
+                    // on its next scan (upstream `checkCompletion` →
+                    // `scheduleAgentContinue`).
+                    super::todo_reminder::on_turn_ended(&ctx.db, &ctx.bus, &ctx.session_id).await;
                     return Ok(TurnOutcome::Ended);
                 }
                 // Upstream Outcome.OutputLimit (llm.ts): a tool-call length

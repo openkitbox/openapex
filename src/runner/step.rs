@@ -1478,6 +1478,47 @@ pub(crate) async fn load_history(db: &crate::db::Db, session_id: &str) -> Result
     load_history_after(db, session_id, i64::MIN).await
 }
 
+/// The text of the newest assistant row, if the transcript has one. Used by the
+/// todo reminder to tell a stop from a hand-off to the user. Reads the tail
+/// only: the reminder runs once per turn end, and a full transcript scan there
+/// would be wasteful on long sessions.
+pub(crate) async fn last_assistant_text(
+    db: &crate::db::Db,
+    session_id: &str,
+) -> Result<Option<String>> {
+    let conn = db.acquire().await?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT data FROM session_message
+             WHERE session_id = ?1 AND type = 'assistant'
+             ORDER BY seq DESC LIMIT 1",
+        )
+        .await?;
+    let Some(row) = crate::db::optional(&mut stmt, [session_id]).await? else {
+        return Ok(None);
+    };
+    let raw: String = row.get(0)?;
+    let value: Value = serde_json::from_str(&raw).context("decode session_message.data")?;
+    let message = Message::from_row_data("", "assistant", value)
+        .context("decode assistant message row")?;
+    Ok(match message {
+        Message::Assistant(assistant) => Some(
+            assistant
+                .content
+                .iter()
+                .filter_map(|part| match part {
+                    crate::schema::message::AssistantContent::Text { text, .. } => {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => None,
+    })
+}
+
 /// Load a session transcript above `floor`: rows with a greater ordinal. The
 /// magic-context head stands in for everything at or below the floor it
 /// reports, so the request carries only the live tail.

@@ -30,6 +30,15 @@ mod historian_trigger;
 pub(crate) mod provider_error;
 pub mod step;
 pub(crate) mod title;
+pub(crate) mod todo_reminder;
+
+/// Reset the todo reminder budget after the todo tool mutates a list. Kept as a
+/// thin wrapper here so the tool does not depend on the reminder module's
+/// internals; failures never surface (a stalled budget is a lost reminder, not
+/// a failed tool call).
+pub(crate) async fn reset_todo_reminder_budget(db: &crate::db::Db, session_id: &str) {
+    todo_reminder::reset_budget(db, session_id).await;
+}
 
 use std::future::Future;
 use std::path::PathBuf;

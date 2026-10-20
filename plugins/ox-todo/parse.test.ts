@@ -115,6 +115,36 @@ test("phasesFromDesc distinguishes missing from empty", () => {
   expect(phasesFromDesc(noCalls)).toBeUndefined()
 })
 
+// ox clears a finished list. The result still carries the completed tree, and a
+// panel must not resurrect it from an older call.
+test("a cleared result ends the walk with an empty list", () => {
+  const cleared = [
+    {
+      id: "m3",
+      type: "assistant",
+      content: [
+        {
+          type: "tool",
+          id: "t3",
+          name: "todo",
+          state: {
+            status: "completed",
+            input: {},
+            metadata: {
+              cleared: true,
+              phases: [{ name: "P", tasks: [{ content: "done", status: "completed" }] }],
+            },
+          },
+        },
+      ],
+    },
+  ]
+  expect(phasesFromDesc(cleared)).toEqual([])
+  // Even with an older, still-open list behind it.
+  const older = tool("m1", "completed", [{ name: "A", tasks: [{ content: "a", status: "pending" }] }])
+  expect(phasesFromDesc([...cleared, older])).toEqual([])
+})
+
 test("the newest completed call wins even without metadata", () => {
   const messages = [
     tool("m1", "completed", [{ name: "A", tasks: [{ content: "a", status: "pending" }] }]),
