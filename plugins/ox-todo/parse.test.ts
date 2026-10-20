@@ -145,6 +145,43 @@ test("a cleared result ends the walk with an empty list", () => {
   expect(phasesFromDesc([...cleared, older])).toEqual([])
 })
 
+// The same session keeps working: a cleared list followed by a fresh `init`
+// shows the new list, not the old one and not an empty panel.
+test("a new list after a cleared one replaces the panel", () => {
+  const firstList = tool("m1", "completed", [
+    { name: "First", tasks: [{ content: "a", status: "completed" }] },
+  ])
+  const clearing = {
+    id: "m2",
+    type: "assistant",
+    content: [
+      {
+        type: "tool",
+        id: "t2",
+        name: "todo",
+        state: {
+          status: "completed",
+          input: {},
+          metadata: {
+            cleared: true,
+            phases: [{ name: "First", tasks: [{ content: "a", status: "completed" }] }],
+          },
+        },
+      },
+    ],
+  }
+  const secondList = tool("m3", "completed", [
+    { name: "Second", tasks: [{ content: "b", status: "in_progress" }] },
+  ])
+
+  // Newest-first, as `phasesFromDesc` expects.
+  expect(phasesFromDesc([secondList, clearing, firstList])).toEqual([
+    { name: "Second", tasks: [{ content: "b", status: "in_progress" }] },
+  ])
+  // Without the new list the panel is empty, not stale.
+  expect(phasesFromDesc([clearing, firstList])).toEqual([])
+})
+
 test("the newest completed call wins even without metadata", () => {
   const messages = [
     tool("m1", "completed", [{ name: "A", tasks: [{ content: "a", status: "pending" }] }]),

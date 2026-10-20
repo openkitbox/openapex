@@ -1615,6 +1615,56 @@ mod tests {
     // Open tasks, as the completion reminder reads them
     // -----------------------------------------------------------------------
 
+    // A cleared list must not swallow the next one: the same session keeps
+    // working, inits a fresh list, and the new list is what clients show.
+    #[tokio::test]
+    async fn a_new_list_after_a_cleared_one_is_stored_again() {
+        let db = Db::open_in_memory().await.unwrap();
+        let tool = TodoTool::new(db.clone());
+
+        // First list, finished -> cleared.
+        run(&tool, "ses", json!({"op": "init", "items": ["a"]})).await;
+        let output = run(&tool, "ses", json!({"op": "done", "task": "a"})).await;
+        assert_eq!(
+            output.metadata.as_ref().unwrap().get("cleared"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            run(&tool, "ses", json!({"op": "view"})).await.content,
+            json!("Todo list is empty.")
+        );
+
+        // A second list in the same session starts from nothing and is stored.
+        let output = run(
+            &tool,
+            "ses",
+            json!({"op": "init", "list": [{"phase": "Next", "items": ["x", "y"]}]}),
+        )
+        .await;
+        assert!(output.error.is_none(), "{:?}", output.error);
+        assert!(
+            output.metadata.as_ref().unwrap().get("cleared").is_none(),
+            "a fresh list is not marked cleared"
+        );
+        assert_eq!(
+            phases_of_output(&output),
+            &vec![json!({
+                "name": "Next",
+                "tasks": [
+                    {"content": "x", "status": "in_progress"},
+                    {"content": "y", "status": "pending"}
+                ]
+            })]
+        );
+
+        // And it is durable: a later call sees it.
+        let output = run(&tool, "ses", json!({"op": "done", "task": "x"})).await;
+        assert!(output.error.is_none());
+        let phases = phases_of_output(&output);
+        assert_eq!(phases[0]["tasks"][0]["status"], json!("completed"));
+        assert_eq!(phases[0]["tasks"][1]["status"], json!("in_progress"));
+    }
+
     #[tokio::test]
     async fn open_tasks_reports_only_unfinished_work() {
         let db = Db::open_in_memory().await.unwrap();
