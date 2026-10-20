@@ -100,9 +100,21 @@ async function loadPhases(
 
   // Otherwise page backwards. Each page carries its own cursor, so the walk does
   // not depend on how much the host happens to have loaded.
+  //
+  // `order` rides only on the first request: a cursor already encodes the order
+  // it was issued with, and ox rejects the combination outright
+  // ("Cursor cannot be combined with order", `session.message.list`).
   let cursor: string | undefined
   for (let page = 0; page < MAX_PAGES; page++) {
-    const response = await context.client.message.list({ sessionID, limit: PAGE, order: "desc", cursor })
+    // A read failure must not take the sidebar down: the plugin simply shows no
+    // list, and the next event retries.
+    const response = await context.client.message
+      .list(cursor ? { sessionID, limit: PAGE, cursor } : { sessionID, limit: PAGE, order: "desc" })
+      .catch((error) => {
+        console.error("ox-todo: failed to page message history", error)
+        return undefined
+      })
+    if (!response) return []
     const found = phasesFromDesc(response.data, boundary)
     if (found) return found
     // A short page means history is exhausted; a full one carries the cursor.
