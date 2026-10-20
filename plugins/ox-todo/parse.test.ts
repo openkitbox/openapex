@@ -4,6 +4,7 @@ import {
   closedCount,
   parsePhases,
   phaseCounts,
+  phasesFromDesc,
   remainingCount,
   sessionPhases,
   taskCount,
@@ -100,6 +101,18 @@ test("uses the latest completed todo, honouring the revert boundary", () => {
   // Reverting to m2 hides m2 onwards.
   expect(sessionPhases(messages, "m2")).toEqual([{ name: "A", tasks: [{ content: "a", status: "pending" }] }])
   expect(sessionPhases(messages, "m1")).toEqual([])
+})
+
+// The paging contract: `undefined` means "this page has no completed call, ask
+// for an older one"; `[]` means "found it, but there is nothing to show".
+test("phasesFromDesc distinguishes missing from empty", () => {
+  const withMetadata = [tool("m2", "completed", [{ name: "B", tasks: [{ content: "b", status: "pending" }] }])]
+  const withoutMetadata = [tool("m2", "completed")]
+  const noCalls = [{ id: "u1", type: "user", content: [] }]
+
+  expect(phasesFromDesc(withMetadata)).toHaveLength(1)
+  expect(phasesFromDesc(withoutMetadata)).toEqual([])
+  expect(phasesFromDesc(noCalls)).toBeUndefined()
 })
 
 test("the newest completed call wins even without metadata", () => {

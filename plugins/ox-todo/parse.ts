@@ -54,34 +54,49 @@ export function parsePhases(value: unknown): TodoPhase[] {
 }
 
 /**
- * The list in force for a session: the metadata of the latest **completed**
- * `todo` call before the revert boundary.
+ * Find the todo list in force inside a **newest-first** page.
  *
  * Same selection rule as opencode's own `sessionTodos`
  * (`packages/tui/src/util/todo.ts`): revert hides everything from the boundary
- * on, and only a completed call has a settled list to show.
+ * on, and only a completed call has a settled list to show. The newest
+ * completed call wins even when it carries no metadata — that is still the
+ * state the session is in, so an older list must not resurface.
+ *
+ * The two "nothing to show" cases are distinguished so a caller can page:
+ * - `undefined` — this page holds no completed call, so older history may.
+ * - `[]` — the newest completed call exists but has no `metadata` (recorded by
+ *   an ox build from before the metadata channel), so stop looking.
  */
-export function sessionPhases(messages: ReadonlyArray<unknown>, boundary?: string): TodoPhase[] {
-  const boundaryIndex = boundary ? messages.findIndex((message) => idOf(message) === boundary) : -1
-  const scoped = messages.slice(0, boundaryIndex === -1 ? messages.length : boundaryIndex)
-  for (let index = scoped.length - 1; index >= 0; index--) {
-    const message = scoped[index]
-    if (!isRecord(message) || message.type !== "assistant" || !Array.isArray(message.content)) continue
-    for (let part = message.content.length - 1; part >= 0; part--) {
-      const item = message.content[part]
-      if (!isRecord(item) || item.type !== "tool" || item.name !== TOOL) continue
-      const state = item.state
+export function phasesFromDesc(messages: readonly unknown[], boundary?: string): TodoPhase[] | undefined {
+  // Messages at and after the revert boundary are hidden, so skip them while
+  // the walk is still inside that region.
+  let skipping = boundary !== undefined
+  for (const message of messages) {
+    if (!isRecord(message)) continue
+    if (skipping) {
+      if (message.id === boundary) skipping = false
+      continue
+    }
+    if (message.type !== "assistant" || !Array.isArray(message.content)) continue
+    // Parts are in generation order; the last todo in a message is the latest.
+    for (let index = message.content.length - 1; index >= 0; index--) {
+      const part = message.content[index]
+      if (!isRecord(part) || part.type !== "tool" || part.name !== TOOL) continue
+      const state = part.state
       if (!isRecord(state) || state.status !== "completed") continue
-      // The newest completed call wins even when it carries no metadata: it is
-      // still the state the session is in, so an older list must not resurface.
       return parsePhases(isRecord(state.metadata) ? state.metadata.phases : undefined)
     }
   }
-  return []
+  return undefined
 }
 
-function idOf(message: unknown): string | undefined {
-  return isRecord(message) && typeof message.id === "string" ? message.id : undefined
+/**
+ * [`phasesFromDesc`] for an ascending list (what `data.session.message.list`
+ * returns): the newest completed call before the revert boundary, or `[]` when
+ * the window holds none.
+ */
+export function sessionPhases(messages: ReadonlyArray<unknown>, boundary?: string): TodoPhase[] {
+  return phasesFromDesc([...messages].reverse(), boundary) ?? []
 }
 
 /** Ox's `is_open`: what counts as remaining. */
