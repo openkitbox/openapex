@@ -375,11 +375,15 @@ impl Tool for EchoTool {
                 ToolOutput {
                     content: Value::Null,
                     error: Some("boom".to_owned()),
+                    metadata: None,
+                    attachments: None,
                 }
             } else {
                 ToolOutput {
                     content: json!({ "echo": input }),
                     error: None,
+                    metadata: Some(json!({ "echoed": true })),
+                    attachments: None,
                 }
             }
         })
@@ -630,10 +634,7 @@ async fn an_empty_title_update_generates_a_title() {
     // Empty title → generate.
     let response = harness
         .client
-        .patch(format!(
-            "{}/api/session/{session_id}",
-            harness.base
-        ))
+        .patch(format!("{}/api/session/{session_id}", harness.base))
         .json(&json!({ "title": "" }))
         .send()
         .await
@@ -650,7 +651,12 @@ async fn an_empty_title_update_generates_a_title() {
         .find(|request| {
             serde_json::to_value(&request.messages[0])
                 .ok()
-                .and_then(|value| value.get("content").and_then(Value::as_str).map(str::to_owned))
+                .and_then(|value| {
+                    value
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
                 .is_some_and(|content| content.starts_with("You are a title generator."))
         })
         .expect("a title-generation request");
@@ -707,10 +713,7 @@ async fn automatic_generation_skips_titled_and_child_sessions() {
 
     // A child session (parentID set) is skipped even when untitled.
     let child: Value = harness
-        .post(
-            "/api/session",
-            json!({ "parentID": session_id }),
-        )
+        .post("/api/session", json!({ "parentID": session_id }))
         .await
         .json()
         .await
@@ -724,7 +727,11 @@ async fn automatic_generation_skips_titled_and_child_sessions() {
         .await;
     harness.wait_event("session.execution.succeeded").await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(title_of(&harness, &child_id).await, None, "children stay untitled");
+    assert_eq!(
+        title_of(&harness, &child_id).await,
+        None,
+        "children stay untitled"
+    );
 }
 
 /// The session's stored title (None = untitled).
@@ -1227,6 +1234,7 @@ async fn mid_stream_failure_settles_partial_tool_with_stream_error() {
             ox::cardinal::wire::ChatMessage::User { .. } => "user",
             ox::cardinal::wire::ChatMessage::Assistant { .. } => "assistant",
             ox::cardinal::wire::ChatMessage::Tool { .. } => "tool",
+            ox::cardinal::wire::ChatMessage::UserMedia { .. } => "user",
         })
         .collect();
     assert_eq!(
@@ -1589,6 +1597,9 @@ async fn tool_flow_executes_and_continues_with_results() {
     assert_eq!(part["id"], "call_1");
     assert_eq!(part["state"]["status"], "completed");
     assert_eq!(part["state"]["input"]["q"], "hi");
+    // Client-facing metadata travels with the settled tool part, so a client
+    // can render a diff or a count without parsing the model text.
+    assert_eq!(part["state"]["metadata"]["echoed"], true);
     assert!(
         part["state"]["content"][0]["text"]
             .as_str()

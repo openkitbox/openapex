@@ -71,7 +71,7 @@ fn percent_decode(input: &str) -> String {
 }
 
 /// The `{ location: { directory }, data }` envelope catalog endpoints share.
-fn envelope(directory: &str, data: serde_json::Value) -> serde_json::Value {
+pub(crate) fn envelope(directory: &str, data: serde_json::Value) -> serde_json::Value {
     json!({ "location": { "directory": directory }, "data": data })
 }
 
@@ -90,7 +90,7 @@ pub(crate) async fn config_get(res: &mut Response) {
 }
 
 /// Empty catalog lists: command / mcp / reference / skill /
-/// shell / pending-forms / plugin / integration. (`provider` has a real
+/// pending-forms / plugin / integration. (`provider` has a real
 /// handler in the parent module — the configured model catalog.)
 macro_rules! empty_catalog {
     ($name:ident, $operation:literal) => {
@@ -106,7 +106,6 @@ empty_catalog!(command_list, "command.list");
 empty_catalog!(mcp_list, "mcp.list");
 empty_catalog!(reference_list, "reference.list");
 empty_catalog!(skill_list, "skill.list");
-empty_catalog!(shell_list, "shell.list");
 empty_catalog!(pending_form_list, "form.list");
 empty_catalog!(plugin_list, "plugin.list");
 empty_catalog!(integration_list, "integration.list");
@@ -263,7 +262,6 @@ pub(crate) fn mount(api: Router) -> Router {
             .push(Router::with_path("provider").get(super::provider_list))
             .push(Router::with_path("reference").get(reference_list))
             .push(Router::with_path("skill").get(skill_list))
-            .push(Router::with_path("shell").get(shell_list))
             .push(Router::with_path("form").get(pending_form_list))
             .push(Router::with_path("plugin").get(plugin_list))
             .push(Router::with_path("integration").get(integration_list))

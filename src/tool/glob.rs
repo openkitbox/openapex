@@ -7,7 +7,7 @@
 
 use globset::{Glob, GlobSetBuilder};
 use ignore::WalkBuilder;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::ffi::OsStr;
 use std::time::{Duration, Instant};
 
@@ -33,7 +33,11 @@ impl Tool for GlobTool {
     fn definition(&self) -> ToolDef {
         ToolDef::function(
             "glob",
-            "Search file paths using a glob pattern (examples: \"**/*.ts\", \"src/**/*.tsx\").",
+            "Search file paths using a glob pattern (examples: \"**/*.ts\", \"src/**/*.tsx\").\n\n\
+             When to use: locate files by name, extension, or directory pattern, including \
+             paths outside the workspace via an absolute or `~/` path.\n\
+             When NOT to use: search file contents (use grep), read a file you already have the \
+             path for, or run find or ls through shell.",
             object_param(
                 vec![
                     (
@@ -153,6 +157,7 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
     }
     let truncated = entries.len() > limit;
     entries.truncate(limit);
+    let count = entries.len();
     let mut lines: Vec<String> = if entries.is_empty() {
         vec!["No files found".to_owned()]
     } else {
@@ -165,7 +170,7 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
             limit
         ));
     }
-    ok_text(lines.join("\n"))
+    ok_text(lines.join("\n")).with_metadata(json!({ "count": count, "truncated": truncated }))
 }
 
 #[cfg(test)]

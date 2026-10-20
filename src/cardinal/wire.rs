@@ -140,6 +140,27 @@ pub enum ToolChoice {
     Required,
 }
 
+/// One part of a user message that is not plain text. Cardinal forwards
+/// `content` verbatim, so an image reaches the provider as the standard
+/// `image_url` part.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UserPart {
+    /// `{"type":"text","text":"..."}`
+    Text { text: String },
+    /// `{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}`
+    #[serde(rename = "image_url")]
+    Image {
+        image_url: ImageUrl,
+    },
+}
+
+/// The `image_url` object of a [`UserPart::Image`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageUrl {
+    pub url: String,
+}
+
 /// One message of the conversation history, tagged by `role` exactly like the
 /// OpenAI wire format.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -149,6 +170,11 @@ pub enum ChatMessage {
     System { content: String },
     /// User input.
     User { content: String },
+    /// A user turn carrying media beside its text. Providers take an image
+    /// next to a tool result only as user content, so a tool that attaches one
+    /// appends this message after its `tool` result. Kept last so the derived
+    /// `rename_all = "lowercase"` never shadows it.
+    UserMedia { content: Vec<UserPart> },
     /// Assistant turn: text and/or tool calls. `content` serializes as
     /// explicit `null` when absent.
     Assistant {

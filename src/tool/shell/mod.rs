@@ -2,18 +2,20 @@
 //! `shell.ts` service): run one shell command with combined stdout/stderr
 //! capture, timeout kill, and cancellation kill.
 //!
-//! Capture mirrors upstream's model: both streams write to one file whose
+//! Capture mirrors upstream's model: both streams write to one buffer whose
 //! shared file description interleaves the output, then the tail is
 //! truncated by the tool-output limits (last 2 000 lines / 50 KiB).
 //!
-//! MVP deviations: no background execution (the synthetic-notification
-//! plumbing is out of scope), no permission scanning, and the "full output
-//! saved to …" path is a per-call temp file instead of upstream's retained
-//! `tool-output` store.
+//! Session model (upstream `Shell` service): a command that is still running
+//! when its yield window closes becomes an owned session, addressed by
+//! `session_id` from `interact` (write stdin, observe) and `stop`. The table
+//! lives in [`sessions`], shared with the `/api/shell` endpoints.
+
+pub mod sessions;
 
 use crate::cardinal::wire::ToolDef;
 use crate::runner::{Tool, ToolContext, ToolOutput};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,6 +30,11 @@ use super::{
 /// Upstream `ShellTool.DEFAULT_TIMEOUT_MS`.
 pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 2 * 60 * 1_000;
 
+/// How long `run` observes before handing back an owned session.
+const DEFAULT_YIELD_MS: u64 = 30_000;
+/// How long `interact` observes when the caller does not say.
+const DEFAULT_INTERACT_YIELD_MS: u64 = 5_000;
+
 /// Upstream `ToolOutput.MAX_LINES` / `MAX_BYTES`.
 const MAX_LINES: usize = 2_000;
 const MAX_BYTES: usize = 50 * 1024;
@@ -38,6 +45,8 @@ pub struct ShellTool {
     /// Optional RTK rewrite seam: when an `rtk` binary is available, each
     /// command is passed through it before execution (path A integration).
     rtk: Arc<RtkRewriter>,
+    /// Live sessions started by `run`, shared with the `/api/shell` handlers.
+    sessions: Arc<sessions::ShellSessions>,
 }
 
 impl ShellTool {
@@ -63,6 +72,16 @@ impl ShellTool {
             shell,
             shell_name: name,
             rtk: Arc::new(RtkRewriter::new()),
+            sessions: sessions::shared(),
+        }
+    }
+
+    /// A shell tool over a caller-provided session table, so a test can
+    /// inspect the sessions it started.
+    pub fn with_sessions(shell: PathBuf, sessions: Arc<sessions::ShellSessions>) -> Self {
+        Self {
+            sessions,
+            ..Self::with_shell(shell)
         }
     }
 }
@@ -104,14 +123,6 @@ fn shell_candidates() -> Vec<PathBuf> {
         .collect()
 }
 
-/// How the process ended.
-enum Outcome {
-    Completed(std::process::ExitStatus),
-    /// The timeout fired; the kill happens after the select.
-    TimedOut,
-    Cancelled,
-}
-
 impl Tool for ShellTool {
     fn name(&self) -> &str {
         "shell"
@@ -141,14 +152,33 @@ impl Tool for ShellTool {
             "Background commands return immediately, and you will be notified when they complete."
                 .to_owned(),
         );
+        lines.push(
+            "When to use: run builds, tests, formatters, and version control, or any command no dedicated tool covers."
+                .to_owned(),
+        );
+        lines.push(
+            "When NOT to use: read, write, edit, glob, or grep a file (each has a dedicated tool), print a file with cat, or search text with grep or rg. Never detach with &, nohup, or setsid; use the background parameter instead."
+                .to_owned(),
+        );
         ToolDef::function(
             "shell",
             lines.join(" "),
             object_param(
                 vec![
                     (
+                        "action",
+                        json!({
+                            "type": "string",
+                            "enum": ["run", "interact", "stop"],
+                            "description": "run starts a command; interact observes or feeds an owned session; stop terminates one. Defaults to run.",
+                        }),
+                    ),
+                    (
                         "command",
-                        param("string", "Shell command string to execute"),
+                        param(
+                            "string",
+                            "Shell command string to execute. Required for action=run.",
+                        ),
                     ),
                     (
                         "workdir",
@@ -161,18 +191,46 @@ impl Tool for ShellTool {
                         "timeout",
                         super::int_param(
                             0,
-                            "Timeout in milliseconds. Set to 0 to disable the timeout. Defaults to 120000 for foreground commands. Background commands have no timeout by default.",
+                            "Timeout in milliseconds for the whole session. Set to 0 to disable the timeout. Defaults to 120000. A command that outlives its yield window keeps running under this deadline.",
                         ),
                     ),
                     (
-                        "background",
+                        "yield_time_ms",
+                        super::int_param(
+                            0,
+                            "How long to observe before returning. For run, defaults to 30000; 0 returns an owned session at once (background). For interact, defaults to 5000.",
+                        ),
+                    ),
+                    (
+                        "session_id",
+                        param(
+                            "string",
+                            "Owned session handle returned by an earlier run or interact. Required for action=interact and action=stop.",
+                        ),
+                    ),
+                    (
+                        "chars",
+                        param(
+                            "string",
+                            "Exact characters to send to the session's stdin before observing. Omit or leave empty to only observe. Use \\n for Enter and JSON escapes such as \\u0003 for control characters.",
+                        ),
+                    ),
+                    (
+                        "cursor",
+                        super::int_param(
+                            0,
+                            "Byte offset to read output from for action=interact. Defaults to 0, which returns the whole retained tail.",
+                        ),
+                    ),
+                    (
+                        "force",
                         param(
                             "boolean",
-                            "Run the command in the background and return immediately (useful for dev servers and long-running builds). You do not need to use '&' at the end of the command when using this parameter. You will be notified when it completes. DO NOT poll for completion.",
+                            "For action=stop, terminate immediately instead of asking the process to exit. Defaults to false.",
                         ),
                     ),
                 ],
-                &["command"],
+                &["action"],
             ),
         )
     }
@@ -198,7 +256,58 @@ fn os_name() -> &'static str {
     }
 }
 
+/// The `shell` action (upstream splits these across `shell` and
+/// `write_stdin`; one tool with a discriminator keeps the schema flat).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    Run,
+    Interact,
+    Stop,
+}
+
+fn action_of(input: &Value) -> Result<Action, ToolOutput> {
+    match input.get("action") {
+        None | Some(Value::Null) => Ok(Action::Run),
+        Some(Value::String(action)) => match action.as_str() {
+            "run" => Ok(Action::Run),
+            "interact" => Ok(Action::Interact),
+            "stop" => Ok(Action::Stop),
+            other => Err(super::invalid_arguments(
+                "shell",
+                &[(
+                    "action",
+                    format!("Expected one of \"run\" | \"interact\" | \"stop\", got \"{other}\""),
+                )],
+                input,
+            )),
+        },
+        Some(other) => Err(super::invalid_arguments(
+            "shell",
+            &[(
+                "action",
+                format!("Expected one of \"run\" | \"interact\" | \"stop\", got {other}"),
+            )],
+            input,
+        )),
+    }
+}
+
 async fn run(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> ToolOutput {
+    let action = match action_of(input) {
+        Ok(action) => action,
+        Err(output) => return output,
+    };
+    match action {
+        Action::Run => run_command(tool, ctx, input).await,
+        Action::Interact => interact(tool, input).await,
+        Action::Stop => stop(tool, input).await,
+    }
+}
+
+/// Start one command. Fast commands settle inside the yield window and return
+/// their whole output; a command still running when the window closes returns
+/// its `session_id` and keeps running for `interact`.
+async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> ToolOutput {
     let command = match required_str("shell", input, "command") {
         Ok(command) => command,
         Err(output) => return output,
@@ -211,16 +320,16 @@ async fn run(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> ToolOutput {
         Ok(value) => value.unwrap_or(DEFAULT_TIMEOUT_MS),
         Err(output) => return output,
     };
+    let yield_time_ms = match optional_nonneg_int("shell", input, "yield_time_ms") {
+        Ok(value) => value.unwrap_or(DEFAULT_YIELD_MS),
+        Err(output) => return output,
+    };
+    // `background` from the pre-session schema: keep it as "return at once",
+    // which the session model expresses as a zero yield window.
     let background = match optional_bool("shell", input, "background") {
         Ok(value) => value.unwrap_or(false),
         Err(output) => return output,
     };
-    if background {
-        // Upstream background shells need the synthetic-notification loop;
-        // ox's runner does not deliver those yet. Rejected before the RTK
-        // rewrite so the message names the command the model sent.
-        return fail(format!("Unable to execute command: {command}"));
-    }
     // RTK path A: rewrite the command before execution when an `rtk` binary is
     // available and capable. A missing/incapable/failing rtk returns the
     // command unchanged (fail-open), so this is transparent when RTK is absent.
@@ -253,131 +362,245 @@ async fn run(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> ToolOutput {
         }
         None => ctx.directory.clone(),
     };
-    let output_file = match capture_file(&ctx.call_id) {
-        Ok(file) => file,
-        Err(_) => return wrap("could not create the capture file".to_owned()),
-    };
-    let spawn = || -> std::io::Result<tokio::process::Child> {
-        use std::process::Stdio;
-        let stdout = std::fs::File::create(&output_file)?;
-        let stderr = stdout.try_clone()?;
-        let mut spawn = tokio::process::Command::new(&tool.shell);
-        spawn
-            .arg("-c")
-            .arg(&command)
-            .current_dir(&workdir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .kill_on_drop(true)
-            .env("AGENT", "1")
-            .env("OPENCODE", "1")
-            .env("OPENCODE_SESSION_ID", &ctx.session_id);
-        if std::env::var_os("AI_AGENT").is_none() {
-            spawn.env("AI_AGENT", "opencode");
-        }
-        spawn.spawn()
-    };
-    let mut child = match spawn() {
-        Ok(child) => child,
+    // A background request starts a session and returns at once; a foreground
+    // request waits out its yield window.
+    let yield_ms = if background { 0 } else { yield_time_ms };
+    let session = match tool.sessions.spawn(sessions::SpawnRequest {
+        command: command.clone(),
+        cwd: workdir,
+        shell: tool.shell.clone(),
+        timeout_ms: Some(timeout_ms).filter(|timeout| *timeout > 0),
+    }) {
+        Ok(session) => session,
         Err(_) => return wrap("spawn failed".to_owned()),
     };
-    // `child.wait()` pins a mutable borrow of the child; the kill + rewait
-    // for the timeout/cancel outcomes happens after the select releases it.
-    let outcome = {
-        let wait = child.wait();
-        tokio::pin!(wait);
-        let sleep = async {
-            if timeout_ms == 0 {
-                std::future::pending::<()>().await;
-            }
-            tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
-        };
+    // Wait for the yield window, an interruption, or a fast exit.
+    if yield_ms > 0 {
         tokio::select! {
-            status = &mut wait => match status {
-                Ok(status) => Outcome::Completed(status),
-                Err(_) => return wrap("wait failed".to_owned()),
-            },
-            () = sleep => Outcome::TimedOut,
-            () = ctx.cancellation.cancelled() => Outcome::Cancelled,
+            _ = session.wait_settled(Duration::from_millis(yield_ms)) => {}
+            () = ctx.cancellation.cancelled() => {}
         }
-    };
-    if let Outcome::TimedOut | Outcome::Cancelled = outcome {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
     }
-    if let Outcome::Cancelled = outcome {
+    if ctx.cancellation.is_cancelled() {
+        session.stop(true).await;
         return wrap("command cancelled".to_owned());
     }
-    let raw = match std::fs::read(&output_file) {
-        Ok(raw) => raw,
-        Err(_) => return wrap("capture failed".to_owned()),
+    let (page, exit) = session.poll(0, usize::MAX);
+    if exit
+        .status
+        .is_some_and(|status| status != sessions::Status::Running)
+    {
+        // Settled: this is the ordinary one-shot result.
+        return settled_output(&command, timeout_ms, &page, exit).with_metadata(json!({
+            "status": "completed",
+            "shellID": session.id,
+            "truncated": false,
+            "exit": exit.code,
+        }));
+    }
+    // Still running: hand the model an owned handle.
+    let tail = truncate_for_model(&page.output);
+    let mut text = if tail.is_empty() {
+        "(no output yet)".to_owned()
+    } else {
+        tail
     };
-    let raw_text = String::from_utf8_lossy(&raw);
-    let (text, truncated, total_lines, shown_lines) = truncate_output(&raw_text);
-    let notice = match outcome {
-        Outcome::TimedOut => Some("Timed out before completion".to_owned()),
-        Outcome::Completed(status) => exit_notice(&status),
-        Outcome::Cancelled => None,
-    };
-    assemble_output(
-        text,
-        truncated,
-        total_lines,
-        shown_lines,
-        timeout_ms,
-        notice,
-        &output_file,
-    )
+    text.push_str(&format!(
+        "\n\nCommand is still running as shell session {}. Call shell with \
+         action=\"interact\" and session_id={} to observe it, send input with the same \
+         action plus chars, or action=\"stop\" to terminate it. Do not start the same \
+         command again.",
+        session.id, session.id
+    ));
+    ok_text(text).with_metadata(json!({
+        "status": "running",
+        "shellID": session.id,
+    }))
 }
 
-/// Upstream `notice` (shell/result.ts).
-fn exit_notice(status: &std::process::ExitStatus) -> Option<String> {
-    if let Some(signal) = signal_name(status) {
+/// The model-facing text for a settled session.
+fn settled_output(
+    command: &str,
+    timeout_ms: u64,
+    page: &sessions::OutputPage,
+    exit: sessions::Exit,
+) -> ToolOutput {
+    let (text, truncated, total_lines, shown_lines) = truncate_output(&page.output);
+    let notice = match exit.status {
+        Some(sessions::Status::Timeout) => Some("Timed out before completion".to_owned()),
+        _ => exit_notice_parts(exit.code, exit.signal),
+    };
+    let mut output = if text.is_empty() {
+        "(no output)".to_owned()
+    } else {
+        text
+    };
+    if truncated {
+        output.push_str(&format!(
+            "\n\n[showing lines {}-{} of {total_lines}; full output is paged through \
+             GET /api/shell/{command_hash}/output]",
+            total_lines - shown_lines + 1,
+            total_lines,
+            command_hash = session_handle(command)
+        ));
+    }
+    if notice.as_deref() == Some("Timed out before completion") {
+        output.push_str(&format!(
+            "\n\nCommand exceeded timeout of {timeout_ms} ms. Retry with a larger timeout if the \
+             command is expected to take longer."
+        ));
+    }
+    let mut messages: Vec<String> = vec![output];
+    if let Some(notice) = notice {
+        messages.push(notice);
+    }
+    ok_text(messages.join("\n\n"))
+}
+
+/// A short stable token for the model-facing "full output" pointer.
+fn session_handle(command: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in command.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Observe or feed an owned session.
+async fn interact(tool: &ShellTool, input: &Value) -> ToolOutput {
+    let Some(session_id) = input.get("session_id").and_then(Value::as_str) else {
+        return super::invalid_arguments(
+            "shell",
+            &[(
+                "session_id",
+                "Missing required field for action=interact".to_owned(),
+            )],
+            input,
+        );
+    };
+    let Some(session) = tool.sessions.get(session_id) else {
+        return fail(format!("Unknown shell session: {session_id}"));
+    };
+    let chars = input
+        .get("chars")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let yield_time_ms = match optional_nonneg_int("shell", input, "yield_time_ms") {
+        Ok(value) => value.unwrap_or(DEFAULT_INTERACT_YIELD_MS),
+        Err(output) => return output,
+    };
+    let cursor = match optional_nonneg_int("shell", input, "cursor") {
+        Ok(value) => value.unwrap_or(0),
+        Err(output) => return output,
+    };
+    if !chars.is_empty()
+        && let Err(error) = session.write(chars.as_bytes(), false).await
+    {
+        return fail(format!(
+            "Unable to write to shell session {session_id}: {error}"
+        ));
+    }
+    // Wait for output to change (or for the process to settle) rather than
+    // sleeping a fixed poll interval.
+    let deadline = Duration::from_millis(yield_time_ms);
+    if session.settled() {
+        // Nothing to wait for; report what is already buffered.
+    } else {
+        tokio::select! {
+            () = session.wait_change(deadline) => {}
+            _ = session.wait_settled(deadline) => {}
+        }
+    }
+    let (page, exit) = session.poll(cursor, usize::MAX);
+    let settled = exit
+        .status
+        .is_some_and(|status| status != sessions::Status::Running);
+    let tail = truncate_for_model(&page.output);
+    let mut text = if tail.is_empty() {
+        "(no new output)".to_owned()
+    } else {
+        tail
+    };
+    if settled {
+        if let Some(notice) = exit_notice_parts(exit.code, exit.signal) {
+            text.push_str(&format!("\n\n{notice}"));
+        }
+    } else {
+        text.push_str(&format!(
+            "\n\nCommand is still running as shell session {session_id}. Interact again to \
+             observe, or stop it with action=\"stop\"."
+        ));
+    }
+    ok_text(text).with_metadata(json!({
+        "status": if settled { "completed" } else { "running" },
+        "shellID": session.id,
+        "cursor": page.cursor,
+        "truncated": page.truncated,
+    }))
+}
+
+/// Terminate an owned session.
+async fn stop(tool: &ShellTool, input: &Value) -> ToolOutput {
+    let Some(session_id) = input.get("session_id").and_then(Value::as_str) else {
+        return super::invalid_arguments(
+            "shell",
+            &[(
+                "session_id",
+                "Missing required field for action=stop".to_owned(),
+            )],
+            input,
+        );
+    };
+    let Some(session) = tool.sessions.get(session_id) else {
+        return fail(format!("Unknown shell session: {session_id}"));
+    };
+    let force = match optional_bool("shell", input, "force") {
+        Ok(value) => value.unwrap_or(false),
+        Err(output) => return output,
+    };
+    session.stop(force).await;
+    ok_text(format!("Stopped shell session {session_id}.")).with_metadata(json!({
+        "status": "completed",
+        "shellID": session.id,
+    }))
+}
+
+/// Upstream `notice` (shell/result.ts), from the recorded exit instead of a
+/// live `ExitStatus` (the watcher owns the child).
+fn exit_notice_parts(code: Option<i32>, signal: Option<i32>) -> Option<String> {
+    if let Some(signal) = signal.and_then(signal_name_of) {
         return Some(format!("Killed by {signal}"));
     }
-    match status.code() {
+    match code {
         Some(0) | None => None,
         Some(code) => Some(format!("Exited with code {code}")),
     }
 }
 
-fn signal_name(status: &std::process::ExitStatus) -> Option<String> {
-    use std::os::unix::process::ExitStatusExt;
-    let signal = status.signal()?;
+fn signal_name_of(signal: i32) -> Option<&'static str> {
     Some(match signal {
-        1 => "SIGHUP".to_owned(),
-        2 => "SIGINT".to_owned(),
-        3 => "SIGQUIT".to_owned(),
-        6 => "SIGABRT".to_owned(),
-        9 => "SIGKILL".to_owned(),
-        11 => "SIGSEGV".to_owned(),
-        13 => "SIGPIPE".to_owned(),
-        15 => "SIGTERM".to_owned(),
-        other => format!("signal {other}"),
+        2 => "SIGINT",
+        6 => "SIGABRT",
+        9 => "SIGKILL",
+        11 => "SIGSEGV",
+        13 => "SIGPIPE",
+        15 => "SIGTERM",
+        _ => return None,
     })
 }
 
-/// The capture file: a per-call temp file (upstream keeps a retained
-/// `tool-output` store; ox MVP uses the OS temp directory).
-fn capture_file(call_id: &str) -> std::io::Result<PathBuf> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let directory = std::env::temp_dir().join("ox-shell-output");
-    std::fs::create_dir_all(&directory)?;
-    let name: String = call_id
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .collect();
-    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    Ok(directory.join(format!("tool_{name}_{:x}_{unique}", std::process::id())))
+/// The tail the model reads from a session's capture: the same byte and line
+/// caps as a one-shot result, so a chatty server cannot flood the context.
+fn truncate_for_model(raw: &str) -> String {
+    truncate_output(raw).0
 }
 
 /// Upstream capture truncation (shell.ts `result`): the last `MAX_BYTES` of
-/// the file, then the last `MAX_LINES` lines. Returns the visible text, the
-/// truncation flag, the total line count (newlines across the WHOLE file,
-/// +1 when the captured page doesn't end with a newline), and the number of
-/// shown lines (page-relative, capped at `MAX_LINES`).
+/// the capture, then the last `MAX_LINES` lines. Returns the visible text, the
+/// truncation flag, the total line count (newlines across the WHOLE capture,
+/// +1 when the page doesn't end with a newline), and the number of shown
+/// lines (page-relative, capped at `MAX_LINES`).
 fn truncate_output(raw: &str) -> (String, bool, usize, usize) {
     let bytes = raw.as_bytes();
     let page = if bytes.len() > MAX_BYTES {
@@ -395,9 +618,7 @@ fn truncate_output(raw: &str) -> (String, bool, usize, usize) {
         lines.pop();
     }
     let truncated = truncated_bytes || lines.len() > MAX_LINES;
-    // Upstream: the store tracks cumulative newlines; `total` is file-wide,
-    // not page-relative.
-    let total = raw.matches('\n').count() + if page.ends_with('\n') { 0 } else { 1 };
+    let total = raw.matches('\n').count() + usize::from(!page.ends_with('\n'));
     let shown = lines.len().min(MAX_LINES);
     let text = if lines.len() > MAX_LINES {
         lines[lines.len() - MAX_LINES..].join("\n")
@@ -407,46 +628,9 @@ fn truncate_output(raw: &str) -> (String, bool, usize, usize) {
     (text, truncated, total, shown)
 }
 
-/// Upstream capture + `resultMessages`: the visible text (with truncation
-/// and timeout annotations) then the status notice, blank-line joined.
-fn assemble_output(
-    text: String,
-    truncated: bool,
-    total_lines: usize,
-    shown_lines: usize,
-    timeout_ms: u64,
-    notice: Option<String>,
-    output_file: &Path,
-) -> ToolOutput {
-    let mut output = if text.is_empty() {
-        "(no output)".to_owned()
-    } else {
-        text
-    };
-    if truncated {
-        output.push_str(&format!(
-            "\n\n[showing lines {}-{} of {total_lines}; full output saved to {}]",
-            total_lines - shown_lines + 1,
-            total_lines,
-            output_file.display()
-        ));
-    }
-    if notice.as_deref() == Some("Timed out before completion") {
-        output.push_str(&format!(
-            "\n\nCommand exceeded timeout of {timeout_ms} ms. Retry with a larger timeout if the command is expected to take longer."
-        ));
-    }
-    let mut messages: Vec<String> = vec![output];
-    if let Some(notice) = notice {
-        messages.push(notice);
-    }
-    ok_text(messages.join("\n\n"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
 
@@ -536,7 +720,7 @@ mod tests {
         .await;
         let text = output.content.as_str().unwrap();
         assert!(
-            text.contains("[showing lines 1001-3000 of 3000; full output saved to "),
+            text.contains("[showing lines 1001-3000 of 3000; full output is paged through "),
             "unexpected: {text}"
         );
         assert!(text.contains("\nline3000\n\n[showing lines"));
@@ -565,17 +749,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn background_is_rejected() {
+    async fn background_returns_an_owned_session() {
         let directory = tempdir().unwrap();
         let output = shell(
             directory.path(),
-            json!({"command": "echo hi", "background": true}),
+            json!({"command": "sleep 30", "background": true}),
         )
         .await;
-        assert_eq!(
-            output.error.as_deref(),
-            Some("Unable to execute command: echo hi")
-        );
+        assert_eq!(output.error, None);
+        let metadata = output.metadata.expect("session metadata");
+        assert_eq!(metadata["status"], "running");
+        let session_id = metadata["shellID"].as_str().expect("shellID");
+        // The handle the model was told to use is the one the table holds.
+        assert!(sessions::shared().get(session_id).is_some());
+        sessions::shared().get(session_id).unwrap().stop(true).await;
     }
 
     #[tokio::test]
@@ -593,7 +780,7 @@ mod tests {
         // say `of ~506`); `shown` stays page-relative (upstream
         // `shown = min(lines.length, maxLines)` on the maxBytes window).
         assert!(
-            text.contains(" of 4000; full output saved to "),
+            text.contains(" of 4000; full output is paged through "),
             "unexpected: {}",
             text.chars().rev().take(200).collect::<String>()
         );

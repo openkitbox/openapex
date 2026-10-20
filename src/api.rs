@@ -21,6 +21,7 @@ use crate::runner::Runner;
 pub mod compat;
 pub mod event;
 pub mod session;
+pub mod shell;
 
 /// Shared application state, injected via `salvo::affix_state`.
 #[derive(Clone)]
@@ -40,7 +41,7 @@ pub struct AppState {
 /// Fetch the injected app state; on failure logs the error and renders a
 /// 500, returning `None` so the handler can bail out without panicking
 /// (project rule: no expect/unwrap in request paths).
-fn state<'a>(depot: &'a Depot, res: &mut Response) -> Option<&'a AppState> {
+pub(crate) fn state<'a>(depot: &'a Depot, res: &mut Response) -> Option<&'a AppState> {
     match depot.get_typed::<AppState>() {
         Ok(state) => Some(state),
         Err(_) => {
@@ -478,6 +479,16 @@ pub fn build_router(state: AppState) -> Router {
                 .push(Router::with_path("agent").get(agent_list))
                 .push(Router::with_path("event").get(event::subscribe))
                 .push(compat::mount(Router::new()))
+                .push(
+                    Router::with_path("shell")
+                        .get(shell::list)
+                        .push(
+                            Router::with_path("{id}")
+                                .get(shell::get)
+                                .delete(shell::remove),
+                        )
+                        .push(Router::with_path("{id}/output").get(shell::output)),
+                )
                 .push(
                     Router::with_path("experimental/session/{sessionID}/wait")
                         .post(session::wait_idle),

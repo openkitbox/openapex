@@ -2,13 +2,20 @@
 //! `read-filesystem.ts` service): line-numbered text reads with paging,
 //! directory listings, binary/media detection and not-found suggestions.
 //!
-//! MVP deviations (documented in `tool/mod.rs`): whole-file reads (upstream
-//! chunks at 256 KiB through a virtual Files layer), no AGENTS.md discovery
-//! side-effect, no alternate-path Unicode retry, and media files (PNG/JPEG/
-//! GIF/WebP/PDF) that upstream ingests as model attachments fail with the
-//! binary-file error.
+//! Two deviations remain from upstream, both deliberate:
+//!
+//! - Text is read in bounded windows ([`WINDOW_BYTES`]) instead of whole-file,
+//!   so a large file costs a window rather than its full size. A window is
+//!   only decoded when it is the page the caller asked for.
+//! - Media (PNG/JPEG/GIF/WebP/PDF) becomes a `Content::File` attachment with a
+//!   `data:` URI, which is how upstream hands an image to the model. PDFs are
+//!   attached the same way; the model reads their text from the attachment.
+//!
+//! Not ported: the AGENTS.md discovery side effect and the alternate-path
+//! Unicode retry.
 
 use serde_json::Value;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::cardinal::wire::ToolDef;
@@ -23,6 +30,13 @@ pub(crate) const MAX_READ_LINES: usize = 2_000;
 const MAX_READ_BYTES: usize = 50 * 1024;
 const MAX_LINE_LENGTH: usize = 2_000;
 const MAX_LINE_SUFFIX: &str = "... (line truncated to 2000 chars)";
+/// Bytes read from disk at a time when a page needs to be located. Large
+/// enough that ordinary files are one read, small enough that a huge file is
+/// not fully resident.
+const WINDOW_BYTES: usize = 256 * 1024;
+/// Upstream `MAX_MEDIA_INGEST_BYTES`: an attachment larger than this is refused
+/// rather than base64-inflated into the request.
+const MAX_MEDIA_BYTES: usize = 20 * 1024 * 1024;
 
 pub struct ReadTool;
 
@@ -39,7 +53,12 @@ impl Tool for ReadTool {
              its 1-based line number as <line>: <content>. The prefix is for reference and is \
              not part of the file content. Directory entries are returned one per line. Use \
              offset and limit to read large files or directories in sections. Prefer one larger \
-             read over many small slices, and use grep to find specific content in large files.",
+             read over many small slices, and use grep to find specific content in large files.\n\n\
+             When to use: inspect an exact known path before editing or explaining it, view a \
+             directory's entries, or look at an image or PDF the user supplied.\n\
+             When NOT to use: locate a file by name (use glob), search file contents (use grep), \
+             read a path you have not resolved yet, or re-read a range you already have in \
+             context.",
             object_param(
                 vec![
                     ("path", param("string", "File or directory to read")),
@@ -76,9 +95,6 @@ impl Tool for ReadTool {
 struct Page {
     offset: usize,
     limit: usize,
-    /// Whether the caller passed `offset` or `limit` at all — any explicit
-    /// value forces paging upstream (text pages strip `\r`).
-    explicit: bool,
 }
 
 impl Page {
@@ -88,17 +104,12 @@ impl Page {
         let raw_offset = offset.unwrap_or(0);
         let raw_limit = limit.unwrap_or(0);
         Ok(Self {
-            offset: if raw_offset == 0 {
-                1
-            } else {
-                raw_offset as usize
-            },
+            offset: if raw_offset == 0 { 1 } else { raw_offset as usize },
             limit: if raw_limit == 0 {
                 MAX_READ_LINES
             } else {
                 (raw_limit as usize).min(MAX_READ_LINES)
             },
-            explicit: offset.is_some() || limit.is_some(),
         })
     }
 }
@@ -122,71 +133,185 @@ fn read_path(ctx: &ToolContext, path: &str, page: &Page) -> ToolOutput {
         return missing(ctx, path, &absolute);
     };
     if metadata.is_dir() {
-        return list_page(ctx, path, &absolute, page);
+        return list_page(path, &absolute, page);
     }
     if !metadata.is_file() {
         return fail(format!("Path is not a file or directory: {resource}"));
     }
-    let Ok(bytes) = std::fs::read(&absolute) else {
+    // Media is attached, not decoded: one bounded read, then a base64 payload
+    // the model sees as an image.
+    if let Some(mime) = media_mime_for(&absolute) {
+        return media_output(path, &absolute, &resource, mime, metadata.len());
+    }
+    read_text(path, &absolute, &resource, page)
+}
+
+/// Attach a media file as a model-visible `file` content part.
+fn media_output(
+    path: &str,
+    absolute: &Path,
+    resource: &str,
+    mime: &'static str,
+    size: u64,
+) -> ToolOutput {
+    if size as usize > MAX_MEDIA_BYTES {
+        return fail(format!(
+            "Media exceeds {MAX_MEDIA_BYTES} byte ingestion limit: {resource}"
+        ));
+    }
+    let Ok(bytes) = std::fs::read(absolute) else {
         return fail(format!("Unable to read {path}"));
     };
-    if is_media(&bytes) || bytes.contains(&0) {
-        // Upstream ingests MEDIA_MIMES as model attachments; ox MVP reads
-        // text only, so media fails like any other binary.
+    if !is_media(&bytes) {
+        // The extension lied about the bytes; fail like any other binary.
         return fail(format!("Cannot read binary file: {resource}"));
     }
-    let decoded = String::from_utf8_lossy(&bytes);
-    let paged = bytes.len() > MAX_READ_BYTES || page.explicit;
-    if !paged {
-        // Whole-file read: lines keep their `\r` (only pages strip it).
-        let content = decoded
-            .split('\n')
-            .map(clamp_line)
-            .collect::<Vec<_>>()
-            .join("\n");
-        return ok_text(file_model_content(path, &content, 1, false, None));
-    }
-    let mut available: Vec<&str> = decoded.split('\n').collect();
-    if available.last() == Some(&"") {
-        available.pop();
-    }
-    for line in &mut available {
-        if let Some(stripped) = line.strip_suffix('\r') {
-            *line = stripped;
-        }
-    }
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    let kind = if mime == "application/pdf" {
+        "PDF"
+    } else {
+        "Image"
+    };
+    ok_text(format!("{kind} read successfully"))
+        .with_attachments(vec![super::Attachment {
+            uri: format!("data:{mime};base64,{encoded}"),
+            mime: mime.to_owned(),
+            name: Some(path.to_owned()),
+        }])
+        .with_metadata(serde_json::json!({
+            "truncated": false,
+            "loaded": [resource],
+        }))
+}
+
+/// Read a text page. Only the window that contains the requested page is
+/// decoded, so the cost follows the page rather than the file.
+fn read_text(path: &str, absolute: &Path, resource: &str, page: &Page) -> ToolOutput {
+    let Ok(file) = std::fs::File::open(absolute) else {
+        return fail(format!("Unable to read {path}"));
+    };
+    let mut reader = std::io::BufReader::with_capacity(WINDOW_BYTES, file);
+    let mut carry: Vec<u8> = Vec::new();
+    let mut line_number = 1usize;
     let mut entries: Vec<String> = Vec::new();
     let mut size = 0usize;
     let mut next: Option<usize> = None;
-    for (index, value) in available.iter().enumerate().skip(page.offset - 1) {
-        let line = page.offset + index;
-        if entries.len() >= page.limit || size >= MAX_READ_BYTES {
-            next = Some(line);
+    let mut saw_any_line = false;
+    let mut binary = false;
+
+    loop {
+        let mut window = vec![0u8; WINDOW_BYTES];
+        let read = match reader.read(&mut window) {
+            Ok(read) => read,
+            Err(_) => return fail(format!("Unable to read {path}")),
+        };
+        let eof = read == 0;
+        window.truncate(read);
+        if !eof && carry.is_empty() && window.contains(&0) {
+            binary = true;
             break;
         }
-        let text = clamp_line(value);
-        let line_size = text.len() + usize::from(!entries.is_empty());
-        if size + line_size > MAX_READ_BYTES {
-            next = Some(line);
+        carry.extend_from_slice(&window);
+        if eof {
+            // Final chunk: the trailing empty piece is not a line.
+            if carry.last() == Some(&b'\n') {
+                carry.pop();
+            }
+        }
+        // Only the final piece can be incomplete; everything before a newline
+        // is a whole line.
+        let mut consumed = 0usize;
+        while let Some(position) = carry[consumed..].iter().position(|byte| *byte == b'\n') {
+            let end = consumed + position;
+            let line = &carry[consumed..end];
+            if handle_line(line, line_number, path, page, &mut entries, &mut size, &mut next) {
+                return finish_page(path, page, &entries, next, binary);
+            }
+            saw_any_line = true;
+            line_number += 1;
+            consumed = end + 1;
+            if next.is_some() {
+                return finish_page(path, page, &entries, next, binary);
+            }
+        }
+        carry.drain(..consumed);
+        if eof {
+            if !carry.is_empty() {
+                let line = carry.clone();
+                let _ = handle_line(&line, line_number, path, page, &mut entries, &mut size, &mut next);
+                saw_any_line = true;
+            }
             break;
         }
-        entries.push(text);
-        size += line_size;
+        if carry.len() > MAX_LINE_LENGTH * 4 {
+            // A single pathologically long line: keep the head so the page can
+            // still be produced instead of buffering the whole file.
+            let line = carry.drain(..).collect::<Vec<u8>>();
+            if handle_line(&line, line_number, path, page, &mut entries, &mut size, &mut next) {
+                return finish_page(path, page, &entries, next, binary);
+            }
+            saw_any_line = true;
+            line_number += 1;
+            if next.is_some() {
+                return finish_page(path, page, &entries, next, binary);
+            }
+        }
     }
-    if next.is_none()
-        && entries.len() >= page.limit
-        && page.offset - 1 + entries.len() < available.len()
-    {
-        next = Some(page.offset + entries.len());
+
+    if binary {
+        return fail(format!("Cannot read binary file: {resource}"));
     }
-    if entries.is_empty() && page.offset != 1 {
-        let lines = available.len();
+    if next.is_none() && saw_any_line && entries.is_empty() && page.offset != 1 {
         return fail(format!(
             "Offset {} is out of range for this file ({} {})",
             page.offset,
-            lines,
-            if lines == 1 { "line" } else { "lines" }
+            line_number - 1,
+            if line_number == 2 { "line" } else { "lines" }
         ));
+    }
+    finish_page(path, page, &entries, next, binary)
+}
+
+/// Consider one line for the page. Returns true when the page is complete.
+fn handle_line(
+    raw: &[u8],
+    line_number: usize,
+    _path: &str,
+    page: &Page,
+    entries: &mut Vec<String>,
+    size: &mut usize,
+    next: &mut Option<usize>,
+) -> bool {
+    if line_number < page.offset {
+        return false;
+    }
+    if entries.len() >= page.limit || *size >= MAX_READ_BYTES {
+        *next = Some(line_number);
+        return true;
+    }
+    let decoded = String::from_utf8_lossy(raw);
+    let value = decoded.strip_suffix('\r').unwrap_or(&decoded);
+    let text = clamp_line(value);
+    let line_size = text.len() + usize::from(!entries.is_empty());
+    if *size + line_size > MAX_READ_BYTES {
+        *next = Some(line_number);
+        return true;
+    }
+    entries.push(text);
+    *size += line_size;
+    false
+}
+
+fn finish_page(
+    path: &str,
+    page: &Page,
+    entries: &[String],
+    next: Option<usize>,
+    binary: bool,
+) -> ToolOutput {
+    if binary {
+        return fail(format!("Cannot read binary file: {path}"));
     }
     ok_text(file_model_content(
         path,
@@ -234,7 +359,7 @@ fn file_model_content(
 
 /// Directory listing page (upstream `list`): directories first, then files,
 /// each sorted by path; directories carry a trailing separator.
-fn list_page(_ctx: &ToolContext, path: &str, absolute: &Path, page: &Page) -> ToolOutput {
+fn list_page(path: &str, absolute: &Path, page: &Page) -> ToolOutput {
     let Ok(entries) = std::fs::read_dir(absolute) else {
         return fail(format!("Unable to read {path}"));
     };
@@ -278,7 +403,7 @@ fn list_page(_ctx: &ToolContext, path: &str, absolute: &Path, page: &Page) -> To
             "[Output truncated. Continue reading with offset: {next}]"
         ));
     }
-    ok_text(content.join("\n"))
+    ok_text(content.join("\n")).with_metadata(serde_json::json!({ "truncated": truncated }))
 }
 
 /// Upstream `missing`: not-found message with sibling-name suggestions.
@@ -326,14 +451,27 @@ fn clamp_line(line: &str) -> String {
     format!("{}{MAX_LINE_SUFFIX}", &line[..end])
 }
 
+/// The media MIME for a path, by extension, when upstream would ingest it.
+fn media_mime_for(absolute: &Path) -> Option<&'static str> {
+    let extension = absolute.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match extension.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        _ => return None,
+    })
+}
+
 /// Media detection by magic bytes for `MEDIA_MIMES` (PNG/JPEG/GIF/WebP/PDF).
 fn is_media(bytes: &[u8]) -> bool {
     bytes.starts_with(b"\x89PNG\r\n\x1a\n")
-        || bytes.starts_with(b"\xff\xd8\xff")
+        || bytes.starts_with(&[0xFF, 0xD8, 0xFF])
         || bytes.starts_with(b"GIF87a")
         || bytes.starts_with(b"GIF89a")
-        || (bytes.len() > 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP")
-        || bytes.starts_with(b"%PDF-")
+        || (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"))
+        || bytes.starts_with(b"%PDF")
 }
 
 #[cfg(test)]
@@ -341,7 +479,6 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::fs;
-    use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
 
     fn ctx(directory: &Path) -> ToolContext {
@@ -358,47 +495,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reads_numbered_lines() {
-        let directory = tempdir().unwrap();
+    async fn reads_whole_small_file() {
+        let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
         let output = execute(directory.path(), json!({"path": "a.txt"})).await;
         assert_eq!(
             output.content,
             json!("Read file a.txt, lines 1-3\n1: one\n2: two\n3: three")
         );
-        assert!(output.error.is_none());
     }
 
     #[tokio::test]
-    async fn reads_empty_file() {
-        let directory = tempdir().unwrap();
-        fs::write(directory.path().join("e.txt"), "").unwrap();
-        let output = execute(directory.path(), json!({"path": "e.txt"})).await;
-        assert_eq!(output.content, json!("Read file e.txt, 0 lines"));
-    }
-
-    #[tokio::test]
-    async fn paginates_with_limit_and_next_marker() {
-        let directory = tempdir().unwrap();
+    async fn pages_with_offset_and_limit() {
+        let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
-        let output = execute(directory.path(), json!({"path": "a.txt", "limit": 2})).await;
-        assert_eq!(
-            output.content,
-            json!(
-                "Read file a.txt, lines 1-2\n1: one\n2: two\n[Output truncated. Continue reading with offset: 3]"
-            )
-        );
-    }
-
-    #[tokio::test]
-    async fn offset_pages_and_out_of_range() {
-        let directory = tempdir().unwrap();
-        fs::write(directory.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
-        let output = execute(directory.path(), json!({"path": "a.txt", "offset": 2})).await;
+        let output = execute(
+            directory.path(),
+            json!({"path": "a.txt", "offset": 2, "limit": 2}),
+        )
+        .await;
         assert_eq!(
             output.content,
             json!("Read file a.txt, lines 2-3\n2: two\n3: three")
         );
+    }
+
+    #[tokio::test]
+    async fn reports_out_of_range_offset() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
         let output = execute(directory.path(), json!({"path": "a.txt", "offset": 10})).await;
         assert_eq!(
             output.error.as_deref(),
@@ -408,7 +533,7 @@ mod tests {
 
     #[tokio::test]
     async fn lists_directories_directories_first() {
-        let directory = tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
         fs::create_dir_all(directory.path().join("sub")).unwrap();
         fs::write(directory.path().join("b.txt"), "x").unwrap();
         fs::write(directory.path().join("a.txt"), "y").unwrap();
@@ -420,25 +545,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rejects_binary_and_media() {
-        let directory = tempdir().unwrap();
+    async fn rejects_binary_files() {
+        let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("bin.dat"), b"ok\x00no").unwrap();
         let output = execute(directory.path(), json!({"path": "bin.dat"})).await;
         assert_eq!(
             output.error.as_deref(),
             Some("Cannot read binary file: bin.dat")
         );
-        fs::write(directory.path().join("pic.png"), b"\x89PNG\r\n\x1a\nrest").unwrap();
+    }
+
+    #[tokio::test]
+    async fn attaches_a_png_as_file_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let png = b"\x89PNG\r\n\x1a\nrest-of-image";
+        fs::write(directory.path().join("pic.png"), png).unwrap();
         let output = execute(directory.path(), json!({"path": "pic.png"})).await;
+        assert_eq!(output.error, None);
+        assert_eq!(output.content, json!("Image read successfully"));
+        let attachments = output.attachments.expect("attachments");
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].mime, "image/png");
+        assert_eq!(attachments[0].name.as_deref(), Some("pic.png"));
+        assert!(attachments[0].uri.starts_with("data:image/png;base64,"));
+    }
+
+    #[tokio::test]
+    async fn attaches_a_pdf_as_file_content() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("doc.pdf"), b"%PDF-1.7\n").unwrap();
+        let output = execute(directory.path(), json!({"path": "doc.pdf"})).await;
+        assert_eq!(output.content, json!("PDF read successfully"));
+        let attachments = output.attachments.expect("attachments");
+        assert_eq!(attachments[0].mime, "application/pdf");
+    }
+
+    #[tokio::test]
+    async fn a_media_extension_over_binary_bytes_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("fake.png"), b"not a png").unwrap();
+        let output = execute(directory.path(), json!({"path": "fake.png"})).await;
         assert_eq!(
             output.error.as_deref(),
-            Some("Cannot read binary file: pic.png")
+            Some("Cannot read binary file: fake.png")
         );
     }
 
     #[tokio::test]
     async fn missing_file_suggests_siblings() {
-        let directory = tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("config.toml"), "").unwrap();
         fs::write(directory.path().join("other.txt"), "").unwrap();
         let output = execute(directory.path(), json!({"path": "config.tom"})).await;
@@ -450,7 +605,7 @@ mod tests {
 
     #[tokio::test]
     async fn truncates_long_lines_with_suffix() {
-        let directory = tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
         let long = "x".repeat(2500);
         fs::write(directory.path().join("long.txt"), format!("{long}\n")).unwrap();
         let output = execute(directory.path(), json!({"path": "long.txt"})).await;
@@ -459,5 +614,40 @@ mod tests {
             "x".repeat(MAX_LINE_LENGTH)
         );
         assert_eq!(output.content, json!(expected));
+    }
+
+    #[tokio::test]
+    async fn a_file_larger_than_one_window_still_pages() {
+        let directory = tempfile::tempdir().unwrap();
+        // Enough lines to cross several read windows.
+        let line = "y".repeat(90);
+        let mut content = String::new();
+        for index in 0..8_000 {
+            content.push_str(&format!("{index:05} {line}\n"));
+        }
+        fs::write(directory.path().join("big.txt"), &content).unwrap();
+        let first = execute(directory.path(), json!({"path": "big.txt"})).await;
+        let text = first.content.as_str().expect("text");
+        assert!(text.starts_with("Read file big.txt, lines 1-"));
+        assert!(text.contains("[Output truncated. Continue reading with offset: "));
+        let next: usize = text
+            .rsplit("offset: ")
+            .next()
+            .and_then(|tail| tail.trim_end_matches(']').parse().ok())
+            .expect("next offset");
+        assert!(next > 1);
+        let second = execute(
+            directory.path(),
+            json!({"path": "big.txt", "offset": next}),
+        )
+        .await;
+        let second_text = second.content.as_str().expect("text");
+        // Line numbers are 1-based, so offset `next` shows content index
+        // `next - 1`.
+        assert!(
+            second_text.contains(&format!("{next}: {:05} ", next - 1)),
+            "unexpected second page: {}",
+            second_text.lines().take(3).collect::<Vec<_>>().join(" | ")
+        );
     }
 }

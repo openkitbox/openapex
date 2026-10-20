@@ -74,6 +74,7 @@ const MAILBOX_CAPACITY: usize = 64;
 // ---------------------------------------------------------------------------
 
 /// Execution-scoped context handed to [`Tool::execute`].
+#[derive(Clone)]
 pub struct ToolContext {
     /// Owning session.
     pub session_id: String,
@@ -85,13 +86,45 @@ pub struct ToolContext {
     pub cancellation: CancellationToken,
 }
 
-/// A tool's terminal output (task 7 streams progress; 6b settles once).
+/// One attachment a tool result carries to the model (upstream
+/// `Content.File`): a `data:` URI plus the MIME type the client renders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub uri: String,
+    pub mime: String,
+    pub name: Option<String>,
+}
+
+/// A tool's terminal output.
 #[derive(Debug)]
 pub struct ToolOutput {
     /// Content for the model (JSON text or structured value).
     pub content: Value,
     /// `Some` marks the execution as failed with this message.
     pub error: Option<String>,
+    /// Client-facing detail the model never reads: the `metadata` field of the
+    /// `session.tool.success` / `session.tool.failed` events, which the
+    /// projector stores on the tool part. Upstream uses it for diffs, match
+    /// counts and shell status; ox fills it where it has something to say and
+    /// leaves it `None` otherwise.
+    pub metadata: Option<Value>,
+    /// Model-visible attachments (images, PDFs) emitted alongside the text.
+    /// Upstream hands these to the provider as `file` content parts.
+    pub attachments: Option<Vec<Attachment>>,
+}
+
+impl ToolOutput {
+    /// A successful output carrying client-facing `metadata`.
+    pub fn with_metadata(mut self, metadata: Value) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    /// A successful output carrying model-visible attachments.
+    pub fn with_attachments(mut self, attachments: Vec<Attachment>) -> Self {
+        self.attachments = Some(attachments);
+        self
+    }
 }
 
 /// A model-invocable unit of work. Task 7 registers real implementations;

@@ -20,10 +20,13 @@
 //!   is ~650 lines of htmlparser2 handling. Text extraction and all
 //!   guards (content-type, size, timeout) are exact.
 
+pub mod diff;
 pub mod edit;
+pub mod form;
 pub mod glob;
 pub mod grep;
 pub mod patch;
+pub mod question;
 pub mod read;
 pub(crate) mod rtk;
 pub mod shell;
@@ -37,6 +40,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use crate::db::Db;
+pub(crate) use crate::runner::Attachment;
 use crate::runner::{Tool, ToolOutput, ToolRegistry};
 
 /// The eight built-in tools, registered under their upstream names.
@@ -133,6 +137,8 @@ pub(crate) fn ok_text(text: impl Into<String>) -> ToolOutput {
     ToolOutput {
         content: Value::String(text.into()),
         error: None,
+        metadata: None,
+        attachments: None,
     }
 }
 
@@ -141,6 +147,8 @@ pub(crate) fn fail(message: impl Into<String>) -> ToolOutput {
     ToolOutput {
         content: Value::Null,
         error: Some(message.into()),
+        metadata: None,
+        attachments: None,
     }
 }
 

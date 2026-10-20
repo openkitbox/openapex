@@ -8,13 +8,14 @@
 //! MVP deviations: no formatter pass (ox has none) and no permission/
 //! file-diff metadata channel; the model-facing content is identical.
 
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::cardinal::wire::ToolDef;
 use crate::runner::{Tool, ToolContext, ToolOutput};
 
+use super::diff::{self as Diff, DiffStatus};
 use super::{fail, object_param, ok_text, param, required_str, resolve_path, resource_of};
 
 pub struct PatchTool;
@@ -39,7 +40,11 @@ impl Tool for PatchTool {
              src/app.py\n*** Move to: src/main.py\n@@ def greet():\n-print(\"Hi\")\n+print(\"Hello, \
              world!\")\n*** Delete File: obsolete.txt\n*** End Patch\n```\n\nIt is important to \
              remember:\n\n- You must include a header with your intended action (Add/Delete/Update)\n- You \
-             must prefix new lines with `+` even when creating a new file",
+             must prefix new lines with `+` even when creating a new file\\n\\n\
+             When to use: change several files or several separated regions of one file in a \
+             single call, or rename a file while editing it (Move to).\\n\
+             When NOT to use: one small change in one file (use edit), creating a file whose \
+             full contents you already know (use write), or text you have not read.",
             object_param(
                 vec![(
                     "patchText",
@@ -130,6 +135,26 @@ struct Prepared {
     content: Option<String>,
     /// `*** Move to:` destination: absolute path and resource name.
     move_to: Option<(PathBuf, String)>,
+    /// The text before the change, for the client-facing diff. `None` when the
+    /// file did not exist (an added file).
+    before: Option<String>,
+}
+
+impl Prepared {
+    /// The client-facing diff for this change: added, deleted, or modified.
+    fn diff(&self) -> Diff::FileDiff {
+        let (resource, after) = match (&self.move_to, self.content.as_deref()) {
+            (Some((_, moved)), Some(content)) => (moved.as_str(), content),
+            (_, Some(content)) => (self.resource.as_str(), content),
+            (_, None) => {
+                return Diff::deleted_file(&self.resource, self.before.as_deref().unwrap_or(""));
+            }
+        };
+        match &self.before {
+            Some(before) => Diff::file_diff(resource, before, after, DiffStatus::Modified),
+            None => Diff::file_diff(resource, "", after, DiffStatus::Added),
+        }
+    }
 }
 
 fn apply(ctx: &ToolContext, hunks: Vec<Hunk>) -> ToolOutput {
@@ -151,18 +176,20 @@ fn apply(ctx: &ToolContext, hunks: Vec<Hunk>) -> ToolOutput {
                     target,
                     content: Some(content),
                     move_to: None,
+                    before: None,
                 });
             }
             Hunk::Delete { path } => {
                 let target = resolve_path(&ctx.directory, path);
                 let resource = resource_of(&ctx.directory, &target);
                 match std::fs::read_to_string(&target) {
-                    Ok(_) => prepared.push(Prepared {
+                    Ok(before) => prepared.push(Prepared {
                         kind: "delete",
                         resource,
                         target,
                         content: None,
                         move_to: None,
+                        before: Some(before),
                     }),
                     Err(error) => {
                         return fail(format!(
@@ -212,6 +239,7 @@ fn apply(ctx: &ToolContext, hunks: Vec<Hunk>) -> ToolOutput {
                     target,
                     content: Some(content),
                     move_to,
+                    before: Some(original),
                 });
             }
         }
@@ -303,7 +331,10 @@ fn apply(ctx: &ToolContext, hunks: Vec<Hunk>) -> ToolOutput {
             }
         ));
     }
-    ok_text(content.join("\n"))
+    // Diffs come from the prepared changes, so the client sees the same
+    // before/after pair that was written.
+    let files: Vec<Diff::FileDiff> = prepared.iter().map(Prepared::diff).collect();
+    ok_text(content.join("\n")).with_metadata(json!({ "files": files }))
 }
 
 // ---------------------------------------------------------------------------

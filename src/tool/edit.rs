@@ -2,11 +2,12 @@
 //! replacement with three match tiers (exact → typographic-variant →
 //! line/trailing-whitespace), uniqueness enforcement, `replaceAll`, and
 //! CRLF-preserving region replacement.
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::cardinal::wire::ToolDef;
 use crate::runner::{Tool, ToolContext, ToolOutput};
 
+use super::diff::{self as Diff, DiffStatus};
 use super::{
     fail, normalize_typographic, object_param, ok_text, optional_bool, param, required_str,
     resolve_path, resource_of,
@@ -35,7 +36,11 @@ impl Tool for EditTool {
              not found. By default, oldString must identify a UNIQUE location. Multiple matches \
              FAIL unless replaceAll is true. Add more surrounding context to disambiguate, or \
              set replaceAll to true to replace every occurrence. Use replaceAll when the change \
-             should apply to every occurrence, such as renaming a variable.",
+             should apply to every occurrence, such as renaming a variable.\n\n\
+             When to use: make a focused change to an existing file after reading the exact \
+             text you are replacing.\n\
+             When NOT to use: create a file (use write), rewrite most of a file, or edit text \
+             you have not read; do not guess indentation or invent line-number prefixes.",
             object_param(
                 vec![
                     ("path", param("string", "File to edit")),
@@ -170,10 +175,13 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
         return fail(format!("Unable to edit {path}"));
     }
     let resource = resource_of(&ctx.directory, &absolute);
+    // The client renders this diff card; the model reads the text below.
+    let diff = Diff::file_diff(&resource, &text, &output_text, DiffStatus::Modified);
     ok_text(format!(
         "Edited {resource} ({replacements} replacement{})",
         if replacements == 1 { "" } else { "s" }
     ))
+    .with_metadata(json!({ "files": [diff] }))
 }
 
 fn strip_cr(value: impl Iterator<Item = char>) -> Chars {

@@ -18,7 +18,7 @@ use globset::{Glob, GlobSetBuilder};
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::WalkBuilder;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -28,12 +28,53 @@ use crate::runner::{Tool, ToolContext, ToolOutput};
 
 use super::glob::{DEFAULT_SEARCH_LIMIT, DEFAULT_SEARCH_TIMEOUT};
 use super::{
-    fail, int_param, object_param, ok_text, optional_bool, optional_positive_int, optional_str,
-    param, required_str, resolve_path,
+    fail, int_param, object_param, ok_text, optional_bool, optional_nonneg_int,
+    optional_positive_int, optional_str, param, required_str, resolve_path,
 };
 
 /// Upstream truncates ripgrep line text at 2 000 characters.
 const MAX_LINE_TEXT: usize = 2_000;
+/// Context is a reading aid, not a paging mechanism: cap it so one match
+/// cannot pull a whole file into the result.
+const MAX_CONTEXT_LINES: usize = 10;
+
+/// What the caller wants back (upstream `FileSystem.GrepInput.output_mode`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    /// Matching lines with line numbers.
+    Content,
+    /// One path per file that matched.
+    Files,
+    /// One `path:count` line per file that matched.
+    Count,
+}
+
+fn output_mode(input: &Value) -> Result<OutputMode, ToolOutput> {
+    match input.get("output_mode") {
+        None | Some(Value::Null) => Ok(OutputMode::Content),
+        Some(Value::String(mode)) => match mode.as_str() {
+            "content" => Ok(OutputMode::Content),
+            "files" => Ok(OutputMode::Files),
+            "count" => Ok(OutputMode::Count),
+            other => Err(super::invalid_arguments(
+                "grep",
+                &[(
+                    "output_mode",
+                    format!("Expected one of \"content\" | \"files\" | \"count\", got \"{other}\""),
+                )],
+                input,
+            )),
+        },
+        Some(other) => Err(super::invalid_arguments(
+            "grep",
+            &[(
+                "output_mode",
+                format!("Expected one of \"content\" | \"files\" | \"count\", got {other}"),
+            )],
+            input,
+        )),
+    }
+}
 
 struct GrepMatch {
     /// Absolute path, as the model content resolves against the session
@@ -42,6 +83,9 @@ struct GrepMatch {
     line: usize,
     /// Line text including the trailing newline (rg `lines.text`).
     text: String,
+    /// A context line (`before_context`/`after_context`), not a match. Only
+    /// counted separately so truncation and counts never include it.
+    is_context: bool,
 }
 
 pub struct GrepTool;
@@ -57,7 +101,12 @@ impl Tool for GrepTool {
             "Search file contents using ripgrep's regular expression syntax or literal text \
              matching. Use it to locate specific code, symbols, or text patterns, and narrow \
              searches with `path` or `include`. Returns matching file paths, line numbers, and \
-             line previews.",
+             line previews.\n\n\
+             When to use: find an exact symbol, string, TODO, or usage site.\n\
+             When NOT to use: regex is not supported with literal=true; avoid unknown-concept \
+             exploration, filename lookup (use glob), reading a known path (use read), and \
+             shell grep or rg. Do not repeat an equivalent search after one only found a \
+             definition: the callers may simply not exist, so report that instead.",
             object_param(
                 vec![
                     (
@@ -93,10 +142,32 @@ impl Tool for GrepTool {
                         param("boolean", "Use case-sensitive matching (default: true)."),
                     ),
                     (
+                        "output_mode",
+                        json!({
+                            "type": "string",
+                            "enum": ["content", "files", "count"],
+                            "description": "content shows matching lines (default); files lists only the matching paths; count reports matches per file.",
+                        }),
+                    ),
+                    (
+                        "context_lines",
+                        int_param(
+                            0,
+                            "Unchanged lines to show before and after each match, 0-10 (default: 0). Ignored unless output_mode=content.",
+                        ),
+                    ),
+                    (
                         "limit",
                         int_param(
                             1,
-                            "Maximum number of matching lines to return (default: 100)",
+                            "Maximum number of results to return (default: 100)",
+                        ),
+                    ),
+                    (
+                        "offset",
+                        int_param(
+                            0,
+                            "Results to skip before returning any, for paging (default: 0)",
                         ),
                     ),
                 ],
@@ -144,6 +215,18 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
     };
     let limit = match optional_positive_int("grep", input, "limit") {
         Ok(value) => value.unwrap_or(DEFAULT_SEARCH_LIMIT) as usize,
+        Err(output) => return output,
+    };
+    let offset = match optional_nonneg_int("grep", input, "offset") {
+        Ok(value) => value.unwrap_or(0) as usize,
+        Err(output) => return output,
+    };
+    let mode = match output_mode(input) {
+        Ok(mode) => mode,
+        Err(output) => return output,
+    };
+    let context_lines = match optional_nonneg_int("grep", input, "context_lines") {
+        Ok(value) => (value.unwrap_or(0) as usize).min(MAX_CONTEXT_LINES),
         Err(output) => return output,
     };
     let target = resolve_path(&ctx.directory, path.unwrap_or("."));
@@ -194,15 +277,21 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
     };
     // `grep-searcher` with line numbers on and binary detection that quits at
     // the first NUL — the same defaults rg uses for `--json` line matches.
+    // Context needs both a before/after width and line numbers to render.
     let mut searcher = SearcherBuilder::new()
         .line_number(true)
         .binary_detection(BinaryDetection::quit(0))
+        .before_context(if mode == OutputMode::Content { context_lines } else { 0 })
+        .after_context(if mode == OutputMode::Content { context_lines } else { 0 })
         .build();
     let mut matches: Vec<GrepMatch> = Vec::new();
     let mut timed_out = false;
     let started = Instant::now();
+    // Collect `offset + limit + 1` so the page can start at `offset` and the
+    // result still knows whether anything follows it.
+    let collect = offset.saturating_add(limit).saturating_add(1);
     if is_file {
-        grep_file(&mut searcher, &matcher, &target, &cwd, limit, &mut matches);
+        grep_file(&mut searcher, &matcher, &target, &cwd, collect, &mut matches);
     } else {
         // rg grep passes `--hidden` unconditionally; `.git` stays excluded.
         for entry in WalkBuilder::new(&target)
@@ -236,22 +325,90 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
                 &matcher,
                 entry.path(),
                 &cwd,
-                limit,
+                collect,
                 &mut matches,
             );
-            if matches.len() > limit {
+            if matches.len() > collect {
                 break;
             }
         }
     }
-    if timed_out && matches.len() <= limit {
+    if timed_out && matches.len() <= collect {
         return fail(
             "Search timed out after 30 seconds. Consider using a more specific path or pattern.",
         );
     }
-    let truncated = matches.len() > limit;
-    matches.truncate(limit);
-    ok_text(model_content(&matches, truncated))
+    let truncated = matches.len() > offset.saturating_add(limit);
+    matches.truncate(offset.saturating_add(limit).min(matches.len()));
+    let page: Vec<GrepMatch> = matches.into_iter().skip(offset).collect();
+    // `Grep`'s count is what makes the client title read "(N matches)".
+    let count = page.len();
+    let text = match mode {
+        OutputMode::Content => model_content(&page, truncated),
+        OutputMode::Files => files_content(&page, truncated),
+        OutputMode::Count => count_content(&page, truncated),
+    };
+    ok_text(text).with_metadata(json!({
+        "matches": count,
+        "truncated": truncated,
+        "mode": match mode {
+            OutputMode::Content => "content",
+            OutputMode::Files => "files",
+            OutputMode::Count => "count",
+        },
+    }))
+}
+
+/// `output_mode=files`: one path per matching file, in first-match order.
+fn files_content(matches: &[GrepMatch], truncated: bool) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for matcher in matches {
+        if current != matcher.path {
+            current = matcher.path.clone();
+            lines.push(matcher.path.clone());
+        }
+    }
+    if lines.is_empty() {
+        return "No matches found".to_owned();
+    }
+    if truncated {
+        lines.push(String::new());
+        lines.push(
+            "(Results are truncated. Consider using a more specific path or pattern.)".to_owned(),
+        );
+    }
+    lines.join("\n")
+}
+
+/// `output_mode=count`: `path:count` per matching file.
+fn count_content(matches: &[GrepMatch], truncated: bool) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current: Option<(&str, usize)> = None;
+    for matcher in matches {
+        match current.as_mut() {
+            Some((path, count)) if *path == matcher.path.as_str() => *count += 1,
+            _ => {
+                if let Some((path, count)) = current.take() {
+                    lines.push(format!("{path}:{count}"));
+                }
+                current = Some((matcher.path.as_str(), 1));
+            }
+        }
+    }
+    if let Some((path, count)) = current {
+        lines.push(format!("{path}:{count}"));
+    }
+    if lines.is_empty() {
+        return "No matches found".to_owned();
+    }
+    if truncated {
+        lines.push(String::new());
+        lines.push(
+            "(Results are truncated. Consider using a more specific path or pattern.)".to_owned(),
+        );
+    }
+    lines.join("\n")
 }
 
 /// Collects one file's matching lines through ripgrep's searcher.
@@ -273,10 +430,28 @@ impl Sink for CollectSink<'_> {
             path: self.absolute.clone(),
             line,
             text: render_line(mat.bytes()),
+            is_context: false,
         });
         // Keep searching while at or below the limit; stop after the first
         // match past it (so `truncated` can be reported).
         Ok(self.matches.len() <= self.limit)
+    }
+
+    /// One context line the searcher decided to include. It never counts as a
+    /// match, so the limit is unaffected.
+    fn context(
+        &mut self,
+        _searcher: &Searcher,
+        context: &grep_searcher::SinkContext<'_>,
+    ) -> Result<bool, Self::Error> {
+        let line = context.line_number().unwrap_or(0) as usize;
+        self.matches.push(GrepMatch {
+            path: self.absolute.clone(),
+            line,
+            text: render_line(context.bytes()),
+            is_context: true,
+        });
+        Ok(true)
     }
 }
 
@@ -312,8 +487,9 @@ fn render_line(bytes: &[u8]) -> String {
     }
 }
 
-/// Upstream `toModelContent`: file-grouped, line-numbered previews. The
-/// line text keeps rg's trailing newline (hence the blank line after each).
+/// Upstream `toModelContent`: file-grouped, line-numbered previews. Context
+/// lines are already interleaved by the searcher (they arrive as their own
+/// matches with `is_context` set), so this only chooses the prefix.
 fn model_content(matches: &[GrepMatch], truncated: bool) -> String {
     let mut lines: Vec<String> = if matches.is_empty() {
         vec!["No matches found".to_owned()]
@@ -329,7 +505,13 @@ fn model_content(matches: &[GrepMatch], truncated: bool) -> String {
             current = matcher.path.clone();
             lines.push(format!("{}:", matcher.path));
         }
-        lines.push(format!("  Line {}: {}", matcher.line, matcher.text));
+        // Match lines keep upstream's exact prefix; context lines add a `-`
+        // so a reader can tell them apart from matches.
+        if matcher.is_context {
+            lines.push(format!("  Line {}: -{}", matcher.line, matcher.text));
+        } else {
+            lines.push(format!("  Line {}: {}", matcher.line, matcher.text));
+        }
     }
     if truncated {
         lines.push(String::new());
@@ -447,6 +629,96 @@ mod tests {
                 .error
                 .as_deref()
                 .is_some_and(|error| error.starts_with("Invalid arguments for tool \"grep\":"))
+        );
+    }
+
+    #[tokio::test]
+    async fn output_mode_files_lists_paths_once() {
+        let directory = tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("src")).unwrap();
+        fs::write(directory.path().join("src/a.rs"), "hit\nhit\n").unwrap();
+        fs::write(directory.path().join("src/b.rs"), "hit\n").unwrap();
+        fs::write(directory.path().join("src/c.rs"), "none\n").unwrap();
+        let output = grep_tool(
+            &directory,
+            json!({"pattern": "hit", "output_mode": "files"}),
+        )
+        .await;
+        let text = output.content.as_str().unwrap();
+        assert_eq!(text.lines().count(), 2, "one row per file: {text}");
+        assert!(text.contains("a.rs"));
+        assert!(text.contains("b.rs"));
+        assert!(!text.contains("c.rs"));
+        assert_eq!(output.metadata.as_ref().unwrap()["mode"], "files");
+    }
+
+    #[tokio::test]
+    async fn output_mode_count_reports_per_file() {
+        let directory = tempdir().unwrap();
+        fs::create_dir_all(directory.path().join("src")).unwrap();
+        fs::write(directory.path().join("src/a.rs"), "hit\nhit\n").unwrap();
+        fs::write(directory.path().join("src/b.rs"), "hit\n").unwrap();
+        let output = grep_tool(
+            &directory,
+            json!({"pattern": "hit", "output_mode": "count"}),
+        )
+        .await;
+        let text = output.content.as_str().unwrap();
+        assert!(text.ends_with("a.rs:2") || text.contains("a.rs:2"), "{text}");
+        assert!(text.contains("b.rs:1"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn context_lines_are_included_and_marked() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("a.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        let output = grep_tool(
+            &directory,
+            json!({"pattern": "three", "context_lines": 1}),
+        )
+        .await;
+        let text = output.content.as_str().unwrap();
+        assert!(text.contains("Line 3: three"), "match: {text}");
+        assert!(text.contains("Line 2: -two"), "before context: {text}");
+        assert!(text.contains("Line 4: -four"), "after context: {text}");
+        // `five` is two lines away, outside the window.
+        assert!(!text.contains("five"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn offset_pages_through_matches() {
+        let directory = tempdir().unwrap();
+        let body: String = (0..5).map(|index| format!("hit{index}\n")).collect();
+        fs::write(directory.path().join("a.txt"), body).unwrap();
+        let first = grep_tool(&directory, json!({"pattern": "hit", "limit": 2})).await;
+        let first_text = first.content.as_str().unwrap().to_owned();
+        assert!(first_text.contains("Line 1: hit0"));
+        assert!(first_text.contains("Line 2: hit1"));
+        assert!(!first_text.contains("hit2"));
+
+        let second = grep_tool(
+            &directory,
+            json!({"pattern": "hit", "limit": 2, "offset": 2}),
+        )
+        .await;
+        let second_text = second.content.as_str().unwrap();
+        assert!(second_text.contains("Line 3: hit2"), "{second_text}");
+        assert!(second_text.contains("Line 4: hit3"), "{second_text}");
+        assert!(!second_text.contains("hit0"), "{second_text}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_output_mode_is_an_input_error() {
+        let directory = tempdir().unwrap();
+        fs::write(directory.path().join("a.txt"), "x\n").unwrap();
+        let output = grep_tool(&directory, json!({"pattern": "x", "output_mode": "json"})).await;
+        assert!(
+            output
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Expected one of \"content\" | \"files\" | \"count\""),
+            "unexpected: {output:?}"
         );
     }
 }

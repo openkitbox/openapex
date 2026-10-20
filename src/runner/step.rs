@@ -60,7 +60,7 @@ use crate::cardinal::CardinalError;
 use crate::cardinal::chat::BoxChatStream;
 use crate::cardinal::stream::StreamEvent;
 use crate::cardinal::wire::{
-    ChatMessage, ChatRequest, FunctionCall, FunctionType, ToolCall, Usage,
+    ChatMessage, ChatRequest, FunctionCall, FunctionType, ImageUrl, ToolCall, Usage, UserPart,
 };
 use crate::id;
 use crate::prompt;
@@ -937,10 +937,22 @@ fn spawn_tool_task(
                 session_id,
                 assistant_message_id: message_id,
                 id: call_id,
-                content: vec![Content::Text {
-                    text: tool_output_text(output.content),
-                }],
-                metadata: None,
+                content: {
+                    let mut content = vec![Content::Text {
+                        text: tool_output_text(output.content),
+                    }];
+                    // Attachments (images, PDFs) travel as `file` content parts,
+                    // which is how the model receives them.
+                    for attachment in output.attachments.unwrap_or_default() {
+                        content.push(Content::File {
+                            uri: attachment.uri,
+                            mime: attachment.mime,
+                            name: attachment.name,
+                        });
+                    }
+                    content
+                },
+                metadata: tool_metadata(output.metadata),
                 executed: false,
                 result_state: None,
             },
@@ -955,7 +967,7 @@ fn spawn_tool_task(
                     response: None,
                 },
                 content: None,
-                metadata: None,
+                metadata: tool_metadata(output.metadata),
                 executed: false,
                 result_state: None,
             },
@@ -972,6 +984,16 @@ fn tool_output_text(value: Value) -> String {
     match value {
         Value::String(text) => text,
         other => other.to_string(),
+    }
+}
+
+/// Client-facing `metadata` for a tool event. A JSON object becomes the
+/// event's record; anything else (or nothing) is omitted, because the wire
+/// type is an object map.
+fn tool_metadata(value: Option<Value>) -> Option<crate::schema::support::Record> {
+    match value {
+        Some(Value::Object(map)) => Some(map.into_iter().collect()),
+        _ => None,
     }
 }
 
@@ -1332,9 +1354,15 @@ pub(crate) fn build_chat_messages(
                             // provider-executed ones don't (upstream
                             // `executed !== true`).
                             if *executed != Some(true)
-                                && let Some(result) = tool_result_message(id, state)
+                                && let Some((result, media)) = tool_result_message(id, state)
                             {
                                 tool_results.push(result);
+                                if !media.is_empty() {
+                                    // A provider accepts an image only as user
+                                    // content, so it follows the tool result as
+                                    // its own turn.
+                                    tool_results.push(ChatMessage::UserMedia { content: media });
+                                }
                             }
                         }
                     }
@@ -1389,21 +1417,31 @@ pub(crate) fn tool_input(state: &ToolState) -> Record {
     }
 }
 
-/// The `{role: "tool"}` result message for a settled tool part
-/// (upstream `toolResult`): joined text content for completed calls,
-/// `{error: …}` for failed ones. A `streaming`/`running` part yields
-/// `None` — its own row's result lands in the next request.
-fn tool_result_message(id: &str, state: &ToolState) -> Option<ChatMessage> {
+/// The `{role: "tool"}` result for a settled tool part (upstream
+/// `toolResult`): joined text content for completed calls, `{error: …}` for
+/// failed ones. A `streaming`/`running` part yields `None` — its own row's
+/// result lands in the next request.
+///
+/// Attachments cannot ride inside a `tool` message: providers accept an image
+/// only as user content. They are returned separately so the caller can append
+/// one follow-up user message directly after the result.
+fn tool_result_message(id: &str, state: &ToolState) -> Option<(ChatMessage, Vec<UserPart>)> {
+    let mut media: Vec<UserPart> = Vec::new();
     let content = match state {
         ToolState::Completed { content, .. } => {
             let text = content
                 .iter()
                 .map(|content| match content {
                     Content::Text { text } => text.clone(),
-                    Content::File { uri, mime, name } => format!(
-                        "[file {} ({mime}) {uri}]",
-                        name.clone().unwrap_or_else(|| "file".to_owned())
-                    ),
+                    Content::File { uri, mime, name } => {
+                        media.push(UserPart::Image {
+                            image_url: ImageUrl { url: uri.clone() },
+                        });
+                        format!(
+                            "[attached {} ({mime})]",
+                            name.clone().unwrap_or_else(|| "file".to_owned())
+                        )
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join("");
@@ -1412,10 +1450,13 @@ fn tool_result_message(id: &str, state: &ToolState) -> Option<ChatMessage> {
         ToolState::Error { error, .. } => serde_json::to_string(&json!({ "error": error })).ok()?,
         ToolState::Streaming { .. } | ToolState::Running { .. } => return None,
     };
-    Some(ChatMessage::Tool {
-        tool_call_id: id.to_owned(),
-        content,
-    })
+    Some((
+        ChatMessage::Tool {
+            tool_call_id: id.to_owned(),
+            content,
+        },
+        media,
+    ))
 }
 
 /// A user prompt's wire text: the typed text plus attachment markers.
