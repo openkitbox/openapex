@@ -248,17 +248,16 @@ async fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
     let outcome = tokio::select! {
         outcome = pending.wait(WAIT) => outcome,
         () = ctx.cancellation.cancelled() => {
-            // Cancelling settles the waiter, but the turn is over, so the form
-            // must not stay visible to clients either.
-            form::shared().cancel(&ctx.session_id, &form_id, Some("interrupted".to_owned()));
-            form::shared().remove(&ctx.session_id, &form_id);
+            // Cancelling settles the waiter, and the `form.cancelled` broadcast
+            // plus the pending-only listing keep the form invisible to clients.
+            let _ = form::shared().cancel(&ctx.session_id, &form_id, Some("interrupted".to_owned()));
             return fail(CANCELLED_SENTINEL);
         }
     };
     // Every client answers through the HTTP endpoints, which read the same
     // registry, so the count of unanswered fields is enough to decide.
     let Some(outcome) = outcome else {
-        form::shared().cancel(
+        let _ = form::shared().cancel(
             &ctx.session_id,
             &form_id,
             Some("nobody answered".to_owned()),
@@ -267,11 +266,12 @@ async fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
     };
     match outcome {
         Outcome::Answered(answer) => {
-            form::shared().remove(&ctx.session_id, &form_id);
+            // The settled form stays in the registry (upstream keeps it for a
+            // retention window): a duplicate reply must find it and conflict
+            // with `FormAlreadySettledError`, not 404.
             ok_text(to_model_content(&questions, &answer))
         }
         Outcome::Cancelled(message) => {
-            form::shared().remove(&ctx.session_id, &form_id);
             match message {
                 // A dismissal with a message is ordinary model-facing feedback
                 // (upstream: the model continues instead of the step ending).
@@ -366,7 +366,7 @@ mod tests {
         };
         let mut answer = Answer::new();
         answer.insert("q0".to_owned(), FormValue::String("API".to_owned()));
-        assert!(form::shared().reply(&session, &form_id, answer));
+        assert!(form::shared().reply(&session, &form_id, answer).is_ok());
         let output = task.await.expect("join");
         assert_eq!(output.error, None);
         assert_eq!(
@@ -391,7 +391,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
-        assert!(form::shared().cancel(&session, &form_id, Some("pick for me".to_owned())));
+        assert!(form::shared().cancel(&session, &form_id, Some("pick for me".to_owned())).is_ok());
         let output = task.await.expect("join");
         assert_eq!(output.error.as_deref(), Some("pick for me"));
     }
@@ -410,7 +410,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
-        assert!(form::shared().cancel(&session, &form_id, None));
+        assert!(form::shared().cancel(&session, &form_id, None).is_ok());
         let output = task.await.expect("join");
         assert_eq!(output.error.as_deref(), Some(CANCELLED_SENTINEL));
     }

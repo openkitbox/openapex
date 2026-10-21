@@ -15,6 +15,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+use crate::event_bus::EventBus;
 
 /// A reply value (upstream `Form.Value`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -150,15 +153,54 @@ impl Pending {
     }
 }
 
+/// Why a reply or a cancel could not settle a form — the model for the HTTP
+/// error tags upstream declares (`FormNotFoundError` / `FormAlreadySettledError`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettleError {
+    /// No form with that id belongs to the session.
+    NotFound,
+    /// The form already has an outcome.
+    AlreadySettled,
+}
+
 /// The process-wide form registry.
 #[derive(Default)]
 pub struct Forms {
     pending: Mutex<HashMap<String, Arc<Pending>>>,
+    /// The event bus the `form.*` transitions are broadcast on. The TUI
+    /// renders its question dialog purely from the SSE `form.created` /
+    /// `form.replied` / `form.cancelled` frames (upstream `Form.Event.*`),
+    /// so a registry that never publishes strands the dialog — the exact
+    /// "Asked 1 question but no picker, then it hung" failure. Set by the
+    /// composition root; a registry built directly (unit tests) can run
+    /// bus-less.
+    bus: Mutex<Option<EventBus>>,
 }
 
 impl Forms {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A registry that broadcasts every transition on `bus`.
+    pub fn with_bus(bus: EventBus) -> Self {
+        let forms = Self::new();
+        forms.set_bus(bus);
+        forms
+    }
+
+    /// Point the registry at `bus` (the composition root wires this once).
+    pub fn set_bus(&self, bus: EventBus) {
+        if let Ok(mut slot) = self.bus.lock() {
+            *slot = Some(bus);
+        }
+    }
+
+    /// Broadcast one transition in the upstream `Form.Event.*` wire shape.
+    fn publish(&self, kind: &str, data: Value) {
+        if let Some(bus) = self.bus.lock().ok().and_then(|slot| slot.clone()) {
+            bus.broadcast_ephemeral(kind, data);
+        }
     }
 
     /// Register a form and return the handle the tool awaits.
@@ -176,13 +218,17 @@ impl Forms {
         if let Ok(mut table) = self.pending.lock() {
             table.insert(pending.info.id.clone(), Arc::clone(&pending));
         }
+        // Publish only once the form is listable: a client reacting to the
+        // event must find it through the HTTP surface.
+        self.publish("form.created", json!({ "form": pending.info() }));
         pending
     }
 
     /// Every form owned by `session_id` that has not settled yet. Upstream
-    /// filters its in-memory cache by session without checking existence, so
-    /// an unknown session (including the TUI's `"global"` bootstrap) answers an
-    /// empty list rather than an error.
+    /// filters its in-memory cache by session and pending state, so an
+    /// unknown session (including the TUI's `"global"` bootstrap) answers an
+    /// empty list rather than an error, and a timed-out form stops being
+    /// offered to clients.
     pub fn list(&self, session_id: &str) -> Vec<FormInfo> {
         let table = match self.pending.lock() {
             Ok(table) => table,
@@ -191,6 +237,7 @@ impl Forms {
         let mut infos: Vec<FormInfo> = table
             .values()
             .filter(|pending| pending.info.session_id == session_id)
+            .filter(|pending| matches!(pending.state(), FormState::Pending))
             .map(|pending| pending.info.clone())
             .collect();
         infos.sort_by(|left, right| left.id.cmp(&right.id));
@@ -203,7 +250,11 @@ impl Forms {
             Ok(table) => table,
             Err(_) => return Vec::new(),
         };
-        let mut infos: Vec<FormInfo> = table.values().map(|pending| pending.info.clone()).collect();
+        let mut infos: Vec<FormInfo> = table
+            .values()
+            .filter(|pending| matches!(pending.state(), FormState::Pending))
+            .map(|pending| pending.info.clone())
+            .collect();
         infos.sort_by(|left, right| left.id.cmp(&right.id));
         infos
     }
@@ -216,20 +267,36 @@ impl Forms {
             .filter(|pending| pending.info.session_id == session_id)
     }
 
-    /// Answer a form. Returns false when it is unknown or already settled.
-    pub fn reply(&self, session_id: &str, form_id: &str, answer: Answer) -> bool {
+    /// Answer a form. Fails with [`SettleError::NotFound`] when no form with
+    /// that id belongs to the session and [`SettleError::AlreadySettled`] when
+    /// it already has an outcome.
+    pub fn reply(&self, session_id: &str, form_id: &str, answer: Answer) -> Result<(), SettleError> {
         let Some(pending) = self.get(session_id, form_id) else {
-            return false;
+            return Err(SettleError::NotFound);
         };
-        pending.settle(Outcome::Answered(answer))
+        if !pending.settle(Outcome::Answered(answer.clone())) {
+            return Err(SettleError::AlreadySettled);
+        }
+        self.publish(
+            "form.replied",
+            json!({ "id": form_id, "sessionID": session_id, "answer": answer }),
+        );
+        Ok(())
     }
 
-    /// Cancel a form. Returns false when it is unknown or already settled.
-    pub fn cancel(&self, session_id: &str, form_id: &str, message: Option<String>) -> bool {
+    /// Cancel a form. Fails like [`Forms::reply`].
+    pub fn cancel(&self, session_id: &str, form_id: &str, message: Option<String>) -> Result<(), SettleError> {
         let Some(pending) = self.get(session_id, form_id) else {
-            return false;
+            return Err(SettleError::NotFound);
         };
-        pending.settle(Outcome::Cancelled(message))
+        if !pending.settle(Outcome::Cancelled(message)) {
+            return Err(SettleError::AlreadySettled);
+        }
+        self.publish(
+            "form.cancelled",
+            json!({ "id": form_id, "sessionID": session_id }),
+        );
+        Ok(())
     }
 
     /// Forget a settled form; a pending one stays so it can still be answered.
@@ -292,6 +359,14 @@ pub fn shared() -> Arc<Forms> {
     TABLE.get_or_init(|| Arc::new(Forms::new())).clone()
 }
 
+/// Wire the process-wide registry to the event bus. The composition root
+/// calls this once, so every form transition reaches the SSE feed the TUI
+/// builds its question dialog from. A registry first materialized by
+/// [`shared`] (tests without a bus) simply picks the bus up here.
+pub fn init(bus: EventBus) {
+    shared().set_bus(bus);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,29 +397,88 @@ mod tests {
         };
         let mut answer = Answer::new();
         answer.insert("q0".to_owned(), FormValue::String("api".to_owned()));
-        assert!(forms.reply("ses_1", &id, answer.clone()));
+        assert!(forms.reply("ses_1", &id, answer.clone()).is_ok());
         let outcome = waiter.await.expect("join").expect("outcome");
         match outcome {
             Outcome::Answered(got) => assert_eq!(got, answer),
             Outcome::Cancelled(_) => panic!("unexpected cancellation"),
         }
         // A second reply loses: the form already settled.
-        assert!(!forms.reply("ses_1", &id, Answer::new()));
+        assert_eq!(
+            forms.reply("ses_1", &id, Answer::new()),
+            Err(SettleError::AlreadySettled)
+        );
     }
 
     #[tokio::test]
     async fn a_cancel_carries_its_message() {
         let forms = Forms::new();
         let pending = forms.create("ses_1", "Questions", question_fields());
-        assert!(forms.cancel(
-            "ses_1",
-            &pending.info().id,
-            Some("not interactive".to_owned())
-        ));
+        assert!(forms
+            .cancel(
+                "ses_1",
+                &pending.info().id,
+                Some("not interactive".to_owned())
+            )
+            .is_ok());
         match pending.wait(std::time::Duration::from_millis(10)).await {
             Some(Outcome::Cancelled(Some(message))) => assert_eq!(message, "not interactive"),
             other => panic!("unexpected outcome: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn every_transition_broadcasts_the_upstream_form_events() {
+        let bus = crate::db::Db::open_in_memory()
+            .await
+            .map(EventBus::new)
+            .expect("db");
+        let mut events = bus.subscribe();
+        let forms = Forms::with_bus(bus);
+
+        // created → the Form.Info the TUI renders its dialog from.
+        let pending = forms.create("ses_evt", "Questions", question_fields());
+        let created = events.try_recv().expect("created event");
+        assert_eq!(created.kind, "form.created");
+        assert!(created.durable.is_none(), "ephemeral: never persisted");
+        assert_eq!(created.data["form"]["id"], pending.info().id);
+        assert_eq!(created.data["form"]["sessionID"], "ses_evt");
+        assert_eq!(created.data["form"]["title"], "Questions");
+
+        // replied → the answer keyed by form id.
+        let mut answer = Answer::new();
+        answer.insert("q0".to_owned(), FormValue::String("api".to_owned()));
+        assert!(forms.reply("ses_evt", &pending.info().id, answer).is_ok());
+        let replied = events.try_recv().expect("replied event");
+        assert_eq!(replied.kind, "form.replied");
+        assert_eq!(replied.data["id"], pending.info().id);
+        assert_eq!(replied.data["sessionID"], "ses_evt");
+        assert_eq!(replied.data["answer"]["q0"], "api");
+
+        // cancelled → identifying payload only (upstream carries no message).
+        let pending = forms.create("ses_evt", "Questions", question_fields());
+        let recreated = events.try_recv().expect("created event");
+        assert_eq!(recreated.kind, "form.created");
+        assert!(forms.cancel("ses_evt", &pending.info().id, None).is_ok());
+        let cancelled = events.try_recv().expect("cancelled event");
+        assert_eq!(cancelled.kind, "form.cancelled");
+        assert_eq!(cancelled.data["id"], pending.info().id);
+        assert_eq!(cancelled.data["sessionID"], "ses_evt");
+    }
+
+    #[test]
+    fn only_pending_forms_are_listed() {
+        let forms = Forms::new();
+        let settled = forms.create("ses_list", "Questions", question_fields());
+        let live = forms.create("ses_list", "Questions", question_fields());
+        assert!(forms.cancel("ses_list", &settled.info().id, None).is_ok());
+        let ids: Vec<String> = forms
+            .list("ses_list")
+            .into_iter()
+            .map(|info| info.id)
+            .collect();
+        assert_eq!(ids, vec![live.info().id]);
+        assert!(forms.list_all().iter().all(|info| info.id == live.info().id));
     }
 
     #[tokio::test]
@@ -369,7 +503,7 @@ mod tests {
                 .is_none()
         );
         // Still answerable after the caller gave up.
-        assert!(forms.reply("ses_1", &pending.info().id, Answer::new()));
+        assert!(forms.reply("ses_1", &pending.info().id, Answer::new()).is_ok());
     }
 
     #[test]
@@ -377,7 +511,7 @@ mod tests {
         let forms = Forms::new();
         let pending = forms.create("ses_1", "Questions", question_fields());
         assert!(matches!(pending.state(), FormState::Pending));
-        forms.cancel("ses_1", &pending.info().id, None);
+        assert!(forms.cancel("ses_1", &pending.info().id, None).is_ok());
         assert!(matches!(pending.state(), FormState::Cancelled { .. }));
     }
 }

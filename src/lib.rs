@@ -116,6 +116,11 @@ async fn build_state_on_with_bus(
     let cwd = std::env::current_dir()?;
     let directory = cwd.canonicalize().unwrap_or(cwd);
     let model_catalog = model_catalog::ModelCatalog::new(&config);
+    // The TUI renders its question dialog purely from the ephemeral
+    // `form.created` / `form.replied` / `form.cancelled` frames, so the
+    // process-wide form registry must broadcast on this same bus (the one
+    // `GET /api/event` serves).
+    crate::tool::form::init(bus.clone());
     // One read-only config behind an `Arc`: every actor and spawned task clones
     // the handle, never the struct.
     let config = std::sync::Arc::new(config);

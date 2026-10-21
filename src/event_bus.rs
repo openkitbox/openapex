@@ -94,6 +94,24 @@ impl EventBus {
         self.tx.subscribe()
     }
 
+    /// Broadcast an ephemeral event outside the typed session-event union —
+    /// upstream's `ephemeral()` events (`form.created`, `form.replied`,
+    /// `form.cancelled`). Like the session deltas they are never persisted and
+    /// never sequenced: only live subscribers see them.
+    pub fn broadcast_ephemeral(&self, kind: &str, data: Value) {
+        let env = EventEnvelope {
+            id: self.next_evt_id(),
+            created: now_millis(),
+            kind: kind.to_owned(),
+            data,
+            durable: None,
+            location: None,
+            metadata: None,
+        };
+        // Ignore SendError: no subscribers is fine.
+        let _ = self.tx.send(env);
+    }
+
     /// Publish an event. Durable events commit via in-transaction projection;
     /// ephemeral events only broadcast. Returns the constructed (typed)
     /// envelope.

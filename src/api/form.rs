@@ -48,14 +48,37 @@ pub async fn get(req: &mut Request, res: &mut Response) {
                 }
             })));
         }
-        None => {
-            res.status_code(StatusCode::NOT_FOUND);
-            res.render(Json(json!({
-                "_tag": "FormNotFoundError",
-                "message": format!("Form not found: {form_id}"),
-            })));
-        }
+        None => not_found(res, &form_id),
     }
+}
+
+/// 404 `FormNotFoundError` — the wire shape the TUI client's error matcher
+/// (`isFormNotFoundError`) swallows after a lost race.
+fn not_found(res: &mut Response, form_id: &str) {
+    res.status_code(StatusCode::NOT_FOUND);
+    res.render(Json(json!({
+        "_tag": "FormNotFoundError",
+        "id": form_id,
+        "message": format!("Form not found: {form_id}"),
+    })));
+}
+
+/// 409 `FormAlreadySettledError` — answered twice or answered after a cancel.
+/// The TUI's reply path treats exactly this tag as benign, so the tag must be
+/// the settled one, not `FormNotFoundError`.
+fn already_settled(res: &mut Response, form_id: &str) {
+    res.status_code(StatusCode::CONFLICT);
+    res.render(Json(json!({
+        "_tag": "FormAlreadySettledError",
+        "id": form_id,
+        "message": format!("Form already settled: {form_id}"),
+    })));
+}
+
+/// 204 for a settled transition — upstream `HttpApiSchema.NoContent`, and the
+/// TUI client hard-codes `successStatus: 204` on both reply and cancel.
+fn no_content(res: &mut Response) {
+    res.status_code(StatusCode::NO_CONTENT);
 }
 
 /// The body of a reply: `{"answer": {"q0": "API"}}`.
@@ -80,17 +103,11 @@ pub async fn reply(req: &mut Request, res: &mut Response) {
             return;
         }
     };
-    if form::shared().reply(&session_id, &form_id, body.answer) {
-        res.status_code(StatusCode::OK);
-        return;
+    match form::shared().reply(&session_id, &form_id, body.answer) {
+        Ok(()) => no_content(res),
+        Err(form::SettleError::NotFound) => not_found(res, &form_id),
+        Err(form::SettleError::AlreadySettled) => already_settled(res, &form_id),
     }
-    // Either the form is gone or it already settled — both mean this reply
-    // cannot be applied.
-    res.status_code(StatusCode::CONFLICT);
-    res.render(Json(json!({
-        "_tag": "FormNotFoundError",
-        "message": format!("Form not found or already answered: {form_id}"),
-    })));
 }
 
 /// `DELETE /api/session/{sessionID}/form/{formID}?message=…`
@@ -101,14 +118,9 @@ pub async fn cancel(req: &mut Request, res: &mut Response) {
     let message = req
         .query::<String>("message")
         .filter(|message| !message.is_empty());
-    if form::shared().cancel(&session_id, &form_id, message) {
-        form::shared().remove(&session_id, &form_id);
-        res.status_code(StatusCode::OK);
-        return;
+    match form::shared().cancel(&session_id, &form_id, message) {
+        Ok(()) => no_content(res),
+        Err(form::SettleError::NotFound) => not_found(res, &form_id),
+        Err(form::SettleError::AlreadySettled) => already_settled(res, &form_id),
     }
-    res.status_code(StatusCode::NOT_FOUND);
-    res.render(Json(json!({
-        "_tag": "FormNotFoundError",
-        "message": format!("Form not found: {form_id}"),
-    })));
 }
