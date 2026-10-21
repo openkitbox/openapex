@@ -1,5 +1,6 @@
 //! Configuration loaded from `~/.ox/ox.toml` with environment-variable overrides.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -50,6 +51,124 @@ pub struct ModelEntry {
     pub output: Option<i64>,
 }
 
+/// MCP integration (`[mcp]` section). Servers are keyed by name; the name is
+/// only used for display and as the tool-name prefix, never as a filesystem
+/// path.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct McpConfig {
+    #[serde(default)]
+    pub servers: BTreeMap<String, McpServerConfig>,
+}
+
+/// One MCP server. The wire shape mirrors upstream `Mcp.ServerConfig`
+/// (`reference/opencode/packages/schema/src/mcp.ts`): a `type` tag plus the
+/// transport-specific fields.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum McpServerConfig {
+    Local(McpLocalConfig),
+    Remote(McpRemoteConfig),
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct McpLocalConfig {
+    /// argv, not a shell string: no quoting rules, no injection surface.
+    pub command: Vec<String>,
+    /// Relative paths resolve from the server's workspace directory.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub environment: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
+    pub timeout: McpTimeout,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct McpRemoteConfig {
+    pub url: String,
+    #[serde(default)]
+    pub headers: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
+    pub timeout: McpTimeout,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct McpTimeout {
+    /// Whole startup budget: spawn + initialize + discovery.
+    #[serde(default = "default_mcp_startup_ms")]
+    pub startup: u64,
+    /// Per `tools/list` / `resources/*` request.
+    #[serde(default = "default_mcp_catalog_ms")]
+    pub catalog: u64,
+    /// Per `tools/call`. `None` means no wall clock — only turn cancellation.
+    #[serde(default)]
+    pub execution: Option<u64>,
+}
+
+fn default_mcp_startup_ms() -> u64 {
+    30_000
+}
+
+fn default_mcp_catalog_ms() -> u64 {
+    30_000
+}
+
+impl Default for McpTimeout {
+    fn default() -> Self {
+        Self {
+            startup: default_mcp_startup_ms(),
+            catalog: default_mcp_catalog_ms(),
+            execution: None,
+        }
+    }
+}
+
+impl McpServerConfig {
+    pub fn disabled(&self) -> bool {
+        match self {
+            Self::Local(local) => local.disabled,
+            Self::Remote(remote) => remote.disabled,
+        }
+    }
+
+    pub fn timeout(&self) -> &McpTimeout {
+        match self {
+            Self::Local(local) => &local.timeout,
+            Self::Remote(remote) => &remote.timeout,
+        }
+    }
+}
+
+impl McpConfig {
+    /// Reject configurations that can never connect. Server-side failures
+    /// (missing binary, unreachable URL) are runtime statuses, not config
+    /// errors; these are the shapes that are wrong before any I/O happens.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (name, server) in &self.servers {
+            if name.trim().is_empty() {
+                anyhow::bail!("mcp server names must not be empty");
+            }
+            match server {
+                McpServerConfig::Local(local) if local.command.is_empty() => {
+                    anyhow::bail!("mcp server `{name}`: `command` must not be empty");
+                }
+                McpServerConfig::Remote(remote)
+                    if !(remote.url.starts_with("http://")
+                        || remote.url.starts_with("https://")) =>
+                {
+                    anyhow::bail!("mcp server `{name}`: `url` must start with http:// or https://");
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     /// Base URL of the cardinal LLM gateway (cardinal's `listen`, e.g.
@@ -85,6 +204,10 @@ pub struct Config {
     /// not exist.
     #[serde(default)]
     pub magic_context: MctxConfig,
+    /// MCP servers (`[mcp]` section). Empty by default: an ox without MCP
+    /// configuration advertises the same toolset as before.
+    #[serde(default)]
+    pub mcp: McpConfig,
 }
 
 fn default_event_heartbeat_ms() -> u64 {
@@ -101,6 +224,7 @@ impl Default for Config {
             default_model: None,
             event_heartbeat_ms: default_event_heartbeat_ms(),
             magic_context: MctxConfig::default(),
+            mcp: McpConfig::default(),
         }
     }
 }
@@ -153,6 +277,7 @@ impl Config {
         }
 
         config.magic_context = config.magic_context.validated();
+        config.mcp.validate()?;
         Ok(config)
     }
 }
@@ -278,5 +403,63 @@ hard_threshold = 0.9
 soft_threshold = "high"
 "#;
         assert!(toml::from_str::<Config>(raw).is_err());
+    }
+
+    #[test]
+    fn mcp_section_parses_local_and_remote() {
+        let raw = r#"
+[mcp.servers.filesystem]
+type = "local"
+command = ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+cwd = "sub"
+environment = { FOO = "bar" }
+
+[mcp.servers.filesystem.timeout]
+startup = 5000
+execution = 120000
+
+[mcp.servers.remote]
+type = "remote"
+url = "https://example.com/mcp"
+headers = { Authorization = "Bearer x" }
+disabled = true
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.mcp.servers.len(), 2);
+        let local = match cfg.mcp.servers.get("filesystem").unwrap() {
+            McpServerConfig::Local(local) => local,
+            other => panic!("expected local, got {other:?}"),
+        };
+        assert_eq!(local.command[0], "npx");
+        assert_eq!(local.cwd.as_deref(), Some("sub"));
+        assert_eq!(local.environment.as_ref().unwrap()["FOO"], "bar");
+        assert_eq!(local.timeout.startup, 5_000);
+        assert_eq!(local.timeout.catalog, 30_000);
+        assert_eq!(local.timeout.execution, Some(120_000));
+
+        let remote = match cfg.mcp.servers.get("remote").unwrap() {
+            McpServerConfig::Remote(remote) => remote,
+            other => panic!("expected remote, got {other:?}"),
+        };
+        assert!(remote.disabled);
+        assert_eq!(remote.url, "https://example.com/mcp");
+    }
+
+    #[test]
+    fn mcp_defaults_when_section_missing() {
+        let cfg: Config = toml::from_str("listen = \"127.0.0.1:9999\"").unwrap();
+        assert!(cfg.mcp.servers.is_empty());
+    }
+
+    #[test]
+    fn mcp_rejects_empty_command_and_bad_url() {
+        let empty: Config =
+            toml::from_str("[mcp.servers.empty]\ntype = \"local\"\ncommand = []\n").unwrap();
+        assert!(empty.mcp.validate().is_err());
+
+        let bad: Config =
+            toml::from_str("[mcp.servers.web]\ntype = \"remote\"\nurl = \"ftp://example.com\"\n")
+                .unwrap();
+        assert!(bad.mcp.validate().is_err());
     }
 }
