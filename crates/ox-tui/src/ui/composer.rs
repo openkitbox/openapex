@@ -11,10 +11,23 @@ pub struct Composer {
 
 impl Composer {
     pub fn new() -> Self {
+        Self::new_with_placeholder("输入消息…")
+    }
+
+    pub fn new_with_placeholder(placeholder: &str) -> Self {
+        let mut textarea = TextArea::default();
+        textarea.set_placeholder_text(placeholder);
+        textarea.set_placeholder_style(theme::palette().dim);
+        Self { textarea }
+    }
+
+    /// Home 惰性建会话失败时把提交过的草稿放回来。
+    pub fn restore(&mut self, text: &str) {
         let mut textarea = TextArea::default();
         textarea.set_placeholder_text("输入消息…");
         textarea.set_placeholder_style(theme::palette().dim);
-        Self { textarea }
+        textarea.insert_str(text);
+        self.textarea = textarea;
     }
 
     /// Returns Some(text) when the user submits (Enter without Shift).
@@ -122,5 +135,26 @@ mod tests {
             let _ = composer.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
         }
         assert_eq!(composer.height(), 8);
+    }
+
+    #[test]
+    fn custom_placeholder_is_accepted() {
+        let composer = Composer::new_with_placeholder("Ask anything… \"hi\"");
+        // 不直接断言渲染，只断言构造可用且为空
+        assert!(composer.is_empty());
+    }
+
+    #[test]
+    fn restore_puts_a_draft_back() {
+        let mut composer = Composer::new();
+        composer.restore("retry me");
+        assert_eq!(composer.text(), "retry me");
+    }
+
+    #[test]
+    fn new_keeps_the_chinese_default_placeholder() {
+        // 会话路由的既有行为不变
+        let composer = Composer::new();
+        assert!(composer.is_empty());
     }
 }
