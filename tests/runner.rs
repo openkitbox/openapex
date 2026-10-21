@@ -1624,7 +1624,7 @@ async fn todowrite_state_reaches_the_client_on_the_tool_part() {
             MockChat::tool_turn(
                 "call_1",
                 "todowrite",
-                r#"{"todos":[{"content":"read","status":"completed"},{"content":"write","status":"in_progress"},{"content":"test","status":"pending"}]}"#,
+                r#"{"todos":[{"content":"read","status":"completed"},{"content":"write","status":"cancelled"},{"content":"test","status":"completed"}]}"#,
             ),
             MockChat::text("done"),
         ],
@@ -1655,10 +1655,13 @@ async fn todowrite_state_reaches_the_client_on_the_tool_part() {
         .clone();
     assert_eq!(part["state"]["status"], "completed");
 
+    // No `pending`/`in_progress` items above: an open list would re-arm the
+    // completion reminder, whose synthetic steer would consume another mock
+    // turn inside this execution (covered by the todo_reminder suite).
     let todos = json!([
         { "content": "read", "status": "completed" },
-        { "content": "write", "status": "in_progress" },
-        { "content": "test", "status": "pending" }
+        { "content": "write", "status": "cancelled" },
+        { "content": "test", "status": "completed" }
     ]);
     // The TUI dependency surface: input echoed verbatim on the settled part.
     assert_eq!(part["state"]["input"]["todos"], todos);
@@ -1666,10 +1669,7 @@ async fn todowrite_state_reaches_the_client_on_the_tool_part() {
     let text = part["state"]["content"][0]["text"]
         .as_str()
         .expect("output text");
-    assert_eq!(
-        text,
-        "Todos updated: 1/3 completed, 1 in progress, 1 pending. In progress: \"write\""
-    );
+    assert_eq!(text, "Todos updated: 2/3 completed, 1 cancelled");
 }
 
 #[tokio::test]
