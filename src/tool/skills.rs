@@ -62,7 +62,7 @@ pub(crate) fn discover_in(roots: &[PathBuf]) -> Vec<Skill> {
     let mut skills: Vec<Skill> = Vec::new();
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for root in roots {
-        let Ok(entries) = std::fs::read_dir(&root) else {
+        let Ok(entries) = std::fs::read_dir(root) else {
             continue;
         };
         for entry in entries.flatten() {

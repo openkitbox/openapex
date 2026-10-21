@@ -274,10 +274,10 @@ async fn transcript(tool: &SubagentTool, child_id: &str) -> Result<String, Strin
     for message in rows {
         if let crate::schema::message::Message::Assistant(assistant) = message {
             for content in &assistant.content {
-                if let crate::schema::message::AssistantContent::Text { text, .. } = content {
-                    if !text.trim().is_empty() {
-                        parts.push(preview(text));
-                    }
+                if let crate::schema::message::AssistantContent::Text { text, .. } = content
+                    && !text.trim().is_empty()
+                {
+                    parts.push(preview(text));
                 }
             }
         }
