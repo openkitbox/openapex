@@ -34,6 +34,28 @@ fn sanitize(text: &str) -> String {
         .collect()
 }
 
+/// Media ox can hand to the model. Every attachment becomes an `image_url`
+/// part, so anything else (audio, video, arbitrary binary) must stay text:
+/// upstream gates on the same set for the same reason — an unsupported part
+/// fails request lowering on every later turn.
+const INLINE_MEDIA: [&str; 5] = [
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "application/pdf",
+];
+
+fn is_inline_media(mime: &str) -> bool {
+    let base = mime
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    INLINE_MEDIA.contains(&base.as_str())
+}
+
 pub(crate) struct McpTool {
     server: String,
     remote_name: String,
@@ -146,11 +168,17 @@ fn render_result(value: Value, output_schema: Option<&Value>) -> ToolOutput {
                     .get("mimeType")
                     .and_then(Value::as_str)
                     .unwrap_or("application/octet-stream");
-                attachments.push(Attachment {
-                    uri: format!("data:{mime};base64,{data}"),
-                    mime: mime.to_owned(),
-                    name: None,
-                });
+                if is_inline_media(mime) {
+                    attachments.push(Attachment {
+                        uri: format!("data:{mime};base64,{data}"),
+                        mime: mime.to_owned(),
+                        name: None,
+                    });
+                } else {
+                    texts.push(format!(
+                        "[Binary content ({mime}) omitted: unsupported inline media]"
+                    ));
+                }
             }
             Some("resource") => {
                 let resource = part.get("resource").unwrap_or(&Value::Null);
@@ -160,14 +188,20 @@ fn render_result(value: Value, output_schema: Option<&Value>) -> ToolOutput {
                     resource.get("blob").and_then(Value::as_str),
                     resource.get("mimeType").and_then(Value::as_str),
                 ) {
-                    attachments.push(Attachment {
-                        uri: format!("data:{mime};base64,{blob}"),
-                        mime: mime.to_owned(),
-                        name: resource
-                            .get("uri")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                    });
+                    if is_inline_media(mime) {
+                        attachments.push(Attachment {
+                            uri: format!("data:{mime};base64,{blob}"),
+                            mime: mime.to_owned(),
+                            name: resource
+                                .get("uri")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                        });
+                    } else {
+                        texts.push(format!(
+                            "[Binary resource ({mime}) omitted: unsupported inline media]"
+                        ));
+                    }
                 }
             }
             Some("resource_link") => {
@@ -369,6 +403,23 @@ mod tests {
         assert_eq!(attachments.len(), 1);
         assert_eq!(attachments[0].uri, "data:image/png;base64,aGk=");
         assert_eq!(attachments[0].mime, "image/png");
+    }
+
+    #[tokio::test]
+    async fn unsupported_media_stays_text() {
+        let output = tool(
+            Ok(json!({"content": [
+                {"type": "audio", "data": "aGk=", "mimeType": "audio/wav"}
+            ]})),
+            None,
+        )
+        .execute(context(), json!({}))
+        .await;
+        assert!(output.attachments.is_none());
+        assert_eq!(
+            output.content,
+            json!("[Binary content (audio/wav) omitted: unsupported inline media]")
+        );
     }
 
     #[tokio::test]
