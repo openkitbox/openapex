@@ -111,6 +111,8 @@ pub struct FormInfo {
     #[serde(rename = "sessionID")]
     pub session_id: String,
     pub title: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
     pub fields: Vec<Field>,
 }
 
@@ -138,6 +140,8 @@ pub enum FormState {
 
 pub struct Pending {
     info: FormInfo,
+    /// The owning project directory, stamped as `location` on `form.*` frames.
+    directory: String,
     outcome: Mutex<Option<Outcome>>,
     /// Fires once the outcome lands, so the waiting tool wakes immediately.
     ready: tokio::sync::Notify,
@@ -161,6 +165,13 @@ pub enum SettleError {
     NotFound,
     /// The form already has an outcome.
     AlreadySettled,
+}
+
+/// Why [`Forms::create_with`] refused a caller-supplied form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreateError {
+    /// A form with that id already exists (upstream `FormAlreadyExistsError`).
+    AlreadyExists,
 }
 
 /// The process-wide form registry.
@@ -196,32 +207,65 @@ impl Forms {
         }
     }
 
-    /// Broadcast one transition in the upstream `Form.Event.*` wire shape.
-    fn publish(&self, kind: &str, data: Value) {
+    /// Broadcast one transition in the upstream `Form.Event.*` wire shape,
+    /// stamped with the owning session's directory (v2.1.x TUI clients drop
+    /// `form.*` frames without a `location`).
+    fn publish(&self, kind: &str, data: Value, directory: &str) {
         if let Some(bus) = self.bus.lock().ok().and_then(|slot| slot.clone()) {
-            bus.broadcast_ephemeral(kind, data);
+            bus.broadcast_ephemeral(kind, data, Some(directory));
         }
     }
 
-    /// Register a form and return the handle the tool awaits.
-    pub fn create(&self, session_id: &str, title: &str, fields: Vec<Field>) -> Arc<Pending> {
+    /// Register a form and return the handle the tool awaits. `directory` is
+    /// the owning project directory, stamped onto the `form.*` events.
+    pub fn create(
+        &self,
+        session_id: &str,
+        directory: &str,
+        title: &str,
+        fields: Vec<Field>,
+    ) -> Arc<Pending> {
+        self.create_with(session_id, None, directory, title, fields, None)
+            .expect("generated form ids never collide")
+    }
+
+    /// Register a form with a caller-supplied id and metadata — the
+    /// `session.form.create` HTTP surface. Upstream rejects a duplicate id
+    /// with `FormAlreadyExistsError`.
+    pub fn create_with(
+        &self,
+        session_id: &str,
+        id: Option<String>,
+        directory: &str,
+        title: &str,
+        fields: Vec<Field>,
+        metadata: Option<Value>,
+    ) -> Result<Arc<Pending>, CreateError> {
         let pending = Arc::new(Pending {
             info: FormInfo {
-                id: crate::id::id("frm"),
+                id: id.unwrap_or_else(|| crate::id::id("frm")),
                 session_id: session_id.to_owned(),
                 title: title.to_owned(),
+                metadata,
                 fields,
             },
+            directory: directory.to_owned(),
             outcome: Mutex::new(None),
             ready: tokio::sync::Notify::new(),
         });
-        if let Ok(mut table) = self.pending.lock() {
-            table.insert(pending.info.id.clone(), Arc::clone(&pending));
+        let mut table = self
+            .pending
+            .lock()
+            .map_err(|_| CreateError::AlreadyExists)?;
+        if table.contains_key(&pending.info.id) {
+            return Err(CreateError::AlreadyExists);
         }
+        table.insert(pending.info.id.clone(), Arc::clone(&pending));
+        drop(table);
         // Publish only once the form is listable: a client reacting to the
         // event must find it through the HTTP surface.
-        self.publish("form.created", json!({ "form": pending.info() }));
-        pending
+        self.publish("form.created", json!({ "form": pending.info() }), directory);
+        Ok(pending)
     }
 
     /// Every form owned by `session_id` that has not settled yet. Upstream
@@ -280,6 +324,7 @@ impl Forms {
         self.publish(
             "form.replied",
             json!({ "id": form_id, "sessionID": session_id, "answer": answer }),
+            &pending.directory,
         );
         Ok(())
     }
@@ -295,6 +340,7 @@ impl Forms {
         self.publish(
             "form.cancelled",
             json!({ "id": form_id, "sessionID": session_id }),
+            &pending.directory,
         );
         Ok(())
     }
@@ -389,7 +435,7 @@ mod tests {
     #[tokio::test]
     async fn a_reply_settles_the_waiter() {
         let forms = Forms::new();
-        let pending = forms.create("ses_1", "Questions", question_fields());
+        let pending = forms.create("ses_1", "/tmp", "Questions", question_fields());
         let id = pending.info().id.clone();
         let waiter = {
             let pending = Arc::clone(&pending);
@@ -413,7 +459,7 @@ mod tests {
     #[tokio::test]
     async fn a_cancel_carries_its_message() {
         let forms = Forms::new();
-        let pending = forms.create("ses_1", "Questions", question_fields());
+        let pending = forms.create("ses_1", "/tmp", "Questions", question_fields());
         assert!(forms
             .cancel(
                 "ses_1",
@@ -437,7 +483,7 @@ mod tests {
         let forms = Forms::with_bus(bus);
 
         // created → the Form.Info the TUI renders its dialog from.
-        let pending = forms.create("ses_evt", "Questions", question_fields());
+        let pending = forms.create("ses_evt", "/tmp", "Questions", question_fields());
         let created = events.try_recv().expect("created event");
         assert_eq!(created.kind, "form.created");
         assert!(created.durable.is_none(), "ephemeral: never persisted");
@@ -456,7 +502,7 @@ mod tests {
         assert_eq!(replied.data["answer"]["q0"], "api");
 
         // cancelled → identifying payload only (upstream carries no message).
-        let pending = forms.create("ses_evt", "Questions", question_fields());
+        let pending = forms.create("ses_evt", "/tmp", "Questions", question_fields());
         let recreated = events.try_recv().expect("created event");
         assert_eq!(recreated.kind, "form.created");
         assert!(forms.cancel("ses_evt", &pending.info().id, None).is_ok());
@@ -469,8 +515,8 @@ mod tests {
     #[test]
     fn only_pending_forms_are_listed() {
         let forms = Forms::new();
-        let settled = forms.create("ses_list", "Questions", question_fields());
-        let live = forms.create("ses_list", "Questions", question_fields());
+        let settled = forms.create("ses_list", "/tmp", "Questions", question_fields());
+        let live = forms.create("ses_list", "/tmp", "Questions", question_fields());
         assert!(forms.cancel("ses_list", &settled.info().id, None).is_ok());
         let ids: Vec<String> = forms
             .list("ses_list")
@@ -484,8 +530,8 @@ mod tests {
     #[tokio::test]
     async fn a_form_is_only_visible_to_its_session() {
         let forms = Forms::new();
-        let a = forms.create("ses_a", "Questions", question_fields());
-        let _b = forms.create("ses_b", "Questions", question_fields());
+        let a = forms.create("ses_a", "/tmp", "Questions", question_fields());
+        let _b = forms.create("ses_b", "/tmp", "Questions", question_fields());
         assert_eq!(forms.list("ses_a").len(), 1);
         assert_eq!(forms.list("ses_a")[0].id, a.info().id);
         assert!(forms.list("global").is_empty());
@@ -495,7 +541,7 @@ mod tests {
     #[tokio::test]
     async fn an_unanswered_wait_times_out_and_stays_pending() {
         let forms = Forms::new();
-        let pending = forms.create("ses_1", "Questions", question_fields());
+        let pending = forms.create("ses_1", "/tmp", "Questions", question_fields());
         assert!(
             pending
                 .wait(std::time::Duration::from_millis(10))
@@ -509,7 +555,7 @@ mod tests {
     #[test]
     fn detail_state_tracks_the_outcome() {
         let forms = Forms::new();
-        let pending = forms.create("ses_1", "Questions", question_fields());
+        let pending = forms.create("ses_1", "/tmp", "Questions", question_fields());
         assert!(matches!(pending.state(), FormState::Pending));
         assert!(forms.cancel("ses_1", &pending.info().id, None).is_ok());
         assert!(matches!(pending.state(), FormState::Cancelled { .. }));

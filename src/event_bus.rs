@@ -22,7 +22,7 @@ use crate::db::Db;
 use crate::id;
 use crate::projector::{PostCommit, project};
 use crate::schema::event::{DurableEnvelope, EventEnvelope, SessionEventData};
-use crate::schema::support::{Finite, TokenUsage};
+use crate::schema::support::{Finite, LocationRef, TokenUsage};
 
 /// Broadcast capacity. Subscribers that fall behind get `Lagged`.
 const BROADCAST_CAPACITY: usize = 1024;
@@ -98,14 +98,20 @@ impl EventBus {
     /// upstream's `ephemeral()` events (`form.created`, `form.replied`,
     /// `form.cancelled`). Like the session deltas they are never persisted and
     /// never sequenced: only live subscribers see them.
-    pub fn broadcast_ephemeral(&self, kind: &str, data: Value) {
+    ///
+    /// `directory` mirrors upstream's `location` stamp (v2.1.x TUI clients
+    /// drop `form.*` frames that carry no location).
+    pub fn broadcast_ephemeral(&self, kind: &str, data: Value, directory: Option<&str>) {
         let env = EventEnvelope {
             id: self.next_evt_id(),
             created: now_millis(),
             kind: kind.to_owned(),
             data,
             durable: None,
-            location: None,
+            location: directory.map(|directory| LocationRef {
+                directory: directory.to_owned(),
+                workspace_id: None,
+            }),
             metadata: None,
         };
         // Ignore SendError: no subscribers is fine.

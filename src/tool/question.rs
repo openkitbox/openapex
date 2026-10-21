@@ -241,7 +241,7 @@ async fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
         .enumerate()
         .map(|(index, question)| to_field(question, index))
         .collect();
-    let pending = form::shared().create(&ctx.session_id, "Questions", fields);
+    let pending = form::shared().create(&ctx.session_id, &ctx.directory.to_string_lossy(), "Questions", fields);
     let form_id = pending.info().id.clone();
 
     // An interrupt ends the wait without answering.

@@ -30,10 +30,58 @@ pub async fn session_list(req: &mut Request, res: &mut Response) {
     res.render(Json(json!({ "data": form::shared().list(&session_id) })));
 }
 
+/// The body of `POST /api/session/{sessionID}/form` — upstream
+/// `FormCreatePayload` (`packages/schema/src/form.ts`): an optional id, a
+/// title and the fields to render.
+#[derive(Debug, Deserialize)]
+pub struct CreateBody {
+    pub id: Option<String>,
+    pub title: String,
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    pub fields: Vec<crate::tool::form::Field>,
+}
+
+/// `POST /api/session/{sessionID}/form` — upstream `session.form.create`.
+/// Creates a form in the registry, publishes `form.created`, and answers
+/// `{data: Form.Info}`; a duplicate id conflicts.
+#[handler]
+pub async fn create(req: &mut Request, res: &mut Response) {
+    let session_id = req.param::<String>("sessionID").unwrap_or_default();
+    let Ok(body) = req.parse_json::<CreateBody>().await else {
+        res.status_code(StatusCode::BAD_REQUEST);
+        res.render(Json(json!({
+            "_tag": "InvalidRequestError",
+            "message": "Invalid form payload",
+            "field": "fields",
+        })));
+        return;
+    };
+    match form::shared().create_with(
+        &session_id,
+        body.id,
+        &directory_of(req),
+        &body.title,
+        body.fields,
+        body.metadata,
+    ) {
+        Ok(pending) => {
+            res.render(Json(json!({ "data": pending.info() })));
+        }
+        Err(form::CreateError::AlreadyExists) => {
+            res.status_code(StatusCode::CONFLICT);
+            res.render(Json(json!({
+                "_tag": "ConflictError",
+                "message": "Form already exists",
+            })));
+        }
+    }
+}
+
 /// `GET /api/session/{sessionID}/form/{formID}`
 #[handler]
-pub async fn get(req: &mut Request, res: &mut Response) {
-    let session_id = req.param::<String>("sessionID").unwrap_or_default();
+pub async fn get(req: &mut Request, res: &mut Response) {    let session_id = req.param::<String>("sessionID").unwrap_or_default();
     let form_id = req.param::<String>("formID").unwrap_or_default();
     match form::shared().get(&session_id, &form_id) {
         Some(pending) => {
