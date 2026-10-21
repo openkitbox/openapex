@@ -13,7 +13,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::schema::support::{LocationRef, Prompt, Record};
+use crate::support::{LocationRef, Prompt, Record};
 
 /// Upstream `SessionInbox.Delivery` literal union.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

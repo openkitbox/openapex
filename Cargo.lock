@@ -2572,6 +2572,7 @@ dependencies = [
  "grep-searcher",
  "ignore",
  "mimalloc",
+ "ox-schema",
  "rand 0.9.5",
  "regex",
  "reqwest",
@@ -2587,6 +2588,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "turso",
+]
+
+[[package]]
+name = "ox-schema"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -25,9 +25,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::schema::inbox::{Delivery, Item, MovePayload};
-use crate::schema::message::{AssistantContent, ProviderState};
-use crate::schema::support::{
+use crate::inbox::{Delivery, Item, MovePayload};
+use crate::message::{AssistantContent, ProviderState};
+use crate::support::{
     Content, FinishReason, ForkBoundary, LocationRef, ModelRef, MoneyUsd, ProviderContext, Record,
     Rule, SessionError, SessionMetadata, SnapshotId, TokenUsage,
 };
@@ -118,7 +118,7 @@ pub enum InterruptReason {
 
 /// Upstream compaction reason literal: auto | manual (shared with the
 /// message schema).
-pub use crate::schema::message::CompactionReason;
+pub use crate::message::CompactionReason;
 
 /// Upstream `Step.Failed` `finish` literal (currently only content-filter).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
