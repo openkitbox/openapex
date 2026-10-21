@@ -174,16 +174,16 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
              get_architecture. Install it on the server's PATH to enable them"
         ),
     }
-    // The session todo list needs the DB (it stores state in the `kv` table),
-    // so it joins here at the composition root rather than in
-    // `with_builtins` — the same seam the CBM tools use. Tests that inject
-    // their own registry keep a deterministic toolset. `subagent` joins the
-    // same way below: it needs the runner, which only exists after
-    // `build_state_on`, so `run` registers it through the runner's handle
-    // slot and the registry here.
+    // The todowrite tool needs the DB (it resets the todo reminder budget and
+    // the reminder scans the transcript), so it joins here at the composition
+    // root rather than in `with_builtins` — the same seam the CBM tools use.
+    // Tests that inject their own registry keep a deterministic toolset.
+    // `subagent` joins the same way below: it needs the runner, which only
+    // exists after `build_state_on`, so `run` registers it through the
+    // runner's handle slot and the registry here.
     let db = Db::open(&config.db_path).await?;
     let bus = EventBus::new(db.clone());
-    tools.register_todo(db.clone());
+    tools.register_todowrite(db.clone());
     tools.register_subagent(db.clone(), bus.clone());
     let chat = cardinal_chat(&config)?;
     let state = build_state_on_with_bus(config, chat, tools, db, bus).await?;
