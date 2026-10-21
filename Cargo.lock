@@ -2759,6 +2759,7 @@ dependencies = [
  "serde_json",
  "textwrap",
  "tokio",
+ "tracing",
  "tui-textarea",
  "unicode-width 0.2.0",
 ]

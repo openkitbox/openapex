@@ -13,8 +13,10 @@ pub enum Block {
         id: String,
         /// Store-owned version. Equality is `(id, version)`, never text.
         version: u64,
-        text: std::sync::Arc<str>,
-        reasoning: std::sync::Arc<str>,
+        /// `Arc<String>` mirrors `AssistantItem` so the store→block projection
+        /// is a pointer clone — no per-delta deep copy of the growing text.
+        text: std::sync::Arc<String>,
+        reasoning: std::sync::Arc<String>,
         done: bool,
     },
     System {
@@ -32,8 +34,8 @@ impl Block {
         Block::Assistant {
             id: id.to_owned(),
             version,
-            text: std::sync::Arc::from(text),
-            reasoning: std::sync::Arc::from(""),
+            text: std::sync::Arc::new(text.to_owned()),
+            reasoning: std::sync::Arc::new(String::new()),
             done: false,
         }
     }
