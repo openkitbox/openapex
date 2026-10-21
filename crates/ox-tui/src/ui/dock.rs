@@ -61,7 +61,10 @@ mod tests {
     fn wide_layout_includes_model_and_ctx() {
         let mut store = DataStore::default();
         store.model = Some("p/m".into());
-        store.ctx = Some(ox_client::store::Usage { input: 12_400, cache_read: 0 });
+        store.ctx = Some(ox_client::store::Usage {
+            input: 12_400,
+            cache_read: 0,
+        });
         let wide = chips(&store, 1_000, 60);
         assert!(wide.contains("p/m"));
         assert!(wide.contains("ctx 12.4k"));

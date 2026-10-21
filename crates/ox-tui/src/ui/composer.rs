@@ -1,6 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use ratatui::layout::Rect;
 use ratatui::Frame;
+use ratatui::layout::Rect;
 use tui_textarea::TextArea;
 
 pub struct Composer {
@@ -49,8 +49,8 @@ impl Composer {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use super::Composer;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     #[test]
     fn enter_submits_and_shift_enter_inserts_newline() {
@@ -58,11 +58,17 @@ mod tests {
         for ch in "hi".chars() {
             let _ = composer.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
-        assert_eq!(composer.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)), Some("hi".to_string()));
+        assert_eq!(
+            composer.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Some("hi".to_string())
+        );
         assert!(composer.is_empty());
 
         composer.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-        assert_eq!(composer.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)), None);
+        assert_eq!(
+            composer.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+            None
+        );
         assert!(composer.text().contains('\n'));
     }
 

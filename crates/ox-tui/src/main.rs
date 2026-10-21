@@ -27,15 +27,17 @@ async fn main() -> anyhow::Result<()> {
     // 事件线程：阻塞 read 放独立线程。
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let key_tx = event_tx.clone();
-    std::thread::spawn(move || loop {
-        match crossterm::event::read() {
-            Ok(crossterm::event::Event::Key(key)) => {
-                if key_tx.send(app::event::AppEvent::Key(key)).is_err() {
-                    break;
+    std::thread::spawn(move || {
+        loop {
+            match crossterm::event::read() {
+                Ok(crossterm::event::Event::Key(key)) => {
+                    if key_tx.send(app::event::AppEvent::Key(key)).is_err() {
+                        break;
+                    }
                 }
+                Ok(_) => {}
+                Err(_) => break,
             }
-            Ok(_) => {}
-            Err(_) => break,
         }
     });
 
@@ -94,10 +96,8 @@ async fn main() -> anyhow::Result<()> {
                                     let mut messages = page.data;
                                     messages.reverse(); // desc → chronological
                                     let items = ox_client::history::parse_messages(&messages);
-                                    let _ = tx.send(app::event::AppEvent::History {
-                                        request_id,
-                                        items,
-                                    });
+                                    let _ = tx
+                                        .send(app::event::AppEvent::History { request_id, items });
                                 }
                                 Err(err) => tracing::warn!(%err, "history reload failed"),
                             }
