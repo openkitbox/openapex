@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::terminal::TerminalGuard;
+use crate::ui::composer::Composer;
 use command::AppCommand;
 use event::AppEvent;
 use state::ViewState;
@@ -16,6 +17,7 @@ pub const RENDER_TICK: Duration = Duration::from_millis(33);
 pub struct App {
     pub view: ViewState,
     pub commands: mpsc::UnboundedSender<AppCommand>,
+    pub composer: Composer,
 }
 
 impl App {
@@ -23,6 +25,7 @@ impl App {
         Self {
             view: ViewState::new(),
             commands,
+            composer: Composer::new(),
         }
     }
 
@@ -38,8 +41,11 @@ impl App {
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         use crossterm::event::{KeyCode, KeyModifiers};
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            // Task 12 turns this into: interrupt when running, quit when idle.
             self.view.should_quit = true;
+            return;
+        }
+        if let Some(text) = self.composer.handle_key(key) {
+            let _ = self.commands.send(AppCommand::Prompt(text));
         }
     }
 
