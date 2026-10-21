@@ -11,6 +11,7 @@ pub mod config;
 pub mod db;
 pub mod event_bus;
 pub mod id;
+pub mod mcp;
 pub mod mctx;
 pub mod model_catalog;
 pub mod projector;
