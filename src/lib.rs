@@ -124,6 +124,12 @@ async fn build_state_on_with_bus(
     let mcp = Arc::new(crate::mcp::Hub::empty());
     for tool in mcp.connect_all(&config.mcp, &directory).await {
         let name = tool.name().to_owned();
+        // `ToolRegistry::register` replaces before it reports the duplicate,
+        // so check first: a server must never shadow a builtin.
+        if tools.get(&name).is_some() {
+            tracing::warn!(tool = %name, "MCP tool collides with an existing tool; skipped");
+            continue;
+        }
         if let Err(error) = tools.register(tool) {
             tracing::warn!(tool = %name, %error, "MCP tool skipped");
         }
