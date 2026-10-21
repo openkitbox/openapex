@@ -7,21 +7,11 @@
 //! registry (see the plan's decision log for why ACP per-session servers are
 //! not supported).
 
-// The wire types are consumed by transport/client/stdio in later tasks of the
-// ox-mcp plan; until then they are only exercised by their own tests.
-#[allow(dead_code)]
 pub(crate) mod client;
-#[allow(dead_code)]
 pub(crate) mod http;
-#[allow(dead_code)]
 pub(crate) mod jsonrpc;
-// stdio is wired into the tool adapter in later tasks of the ox-mcp plan;
-// until then it is only exercised by its own tests.
-#[allow(dead_code)]
 pub(crate) mod stdio;
-#[allow(dead_code)]
 pub(crate) mod tool;
-#[allow(dead_code)]
 pub(crate) mod transport;
 
 use std::collections::{BTreeMap, HashSet};
@@ -39,12 +29,8 @@ use crate::runner::Tool;
 use client::Client;
 use transport::{CallError, Rpc};
 
-// Task 8 wires these into the runner and the HTTP layer and removes the
-// `allow(dead_code)` markers.
-
 /// Server status, serialized exactly as upstream `Mcp.Status` (a tagged
 /// object: `{"status":"connected"}`, `{"status":"failed","error":"..."}`).
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Status {
@@ -55,7 +41,6 @@ pub enum Status {
 }
 
 /// One entry of `GET /api/mcp`.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ServerView {
     pub name: String,
@@ -63,7 +48,6 @@ pub struct ServerView {
 }
 
 /// One entry of `GET /api/mcp/resource`'s `resources` array.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ResourceInfo {
     pub server: String,
@@ -76,7 +60,6 @@ pub struct ResourceInfo {
 }
 
 /// One entry of `GET /api/mcp/resource`'s `templates` array.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TemplateInfo {
     pub server: String,
@@ -89,7 +72,6 @@ pub struct TemplateInfo {
     pub mime_type: Option<String>,
 }
 
-#[allow(dead_code)]
 pub struct Hub {
     servers: RwLock<BTreeMap<String, Status>>,
     /// Live connections, kept alive independently of their tools: a server
@@ -101,7 +83,6 @@ pub struct Hub {
     templates: RwLock<Vec<TemplateInfo>>,
 }
 
-#[allow(dead_code)]
 impl Hub {
     /// A hub with no servers. `Runner::new` uses this so tests that build a
     /// runner directly get the pre-MCP behavior.
@@ -204,14 +185,12 @@ impl Hub {
     }
 }
 
-#[allow(dead_code)]
 fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
 
-#[allow(dead_code)]
 struct Connected {
     name: String,
     status: Status,
@@ -222,7 +201,6 @@ struct Connected {
     templates: Vec<TemplateInfo>,
 }
 
-#[allow(dead_code)]
 impl Connected {
     fn disabled(name: &str) -> Self {
         Self {
@@ -299,7 +277,6 @@ impl Connected {
     }
 }
 
-#[allow(dead_code)]
 async fn connect_one(name: &str, server: &McpServerConfig, directory: &Path) -> Connected {
     if server.disabled() {
         return Connected::disabled(name);
@@ -331,7 +308,6 @@ async fn connect_one(name: &str, server: &McpServerConfig, directory: &Path) -> 
     }
 }
 
-#[allow(dead_code)]
 async fn handshake(name: &str, rpc: Arc<dyn Rpc>, timeout: &McpTimeout) -> Connected {
     let cancel = CancellationToken::new();
     let catalog = Duration::from_millis(timeout.catalog);
@@ -354,7 +330,6 @@ async fn handshake(name: &str, rpc: Arc<dyn Rpc>, timeout: &McpTimeout) -> Conne
     }
 }
 
-#[allow(dead_code)]
 fn friendly(name: &str, error: &CallError) -> String {
     match error {
         CallError::Closed => format!("MCP server `{name}` is not available"),

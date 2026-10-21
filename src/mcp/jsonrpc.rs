@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub(crate) const METHOD_NOT_FOUND: i64 = -32601;
-pub(crate) const INVALID_REQUEST: i64 = -32600;
 
 /// A client → server request.
 #[derive(Debug, Serialize)]
