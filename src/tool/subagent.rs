@@ -17,10 +17,6 @@ use crate::schema::support::{LocationRef, SessionMetadata};
 
 use super::{fail, object_param, ok_text, param};
 
-/// How long a child may run before the parent stops waiting. Long enough for
-/// a real delegation; short enough that a wedged child cannot park a turn
-/// indefinitely.
-const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 /// The child's transcript is folded into the parent with this much text per
 /// message, matching the compaction preview budget.
 const MESSAGE_PREVIEW_CHARS: usize = 400;
@@ -208,8 +204,12 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         return fail(format!("Unable to start child session: {error}"));
     }
 
-    // Wait for the child to settle (or its parent's turn to be interrupted —
-    // the child is cancelled with it, so nothing keeps running).
+    // Wait for the child to settle (or the parent's turn to be interrupted —
+    // the child is cancelled with it, so nothing keeps running). Upstream has
+    // no timeout here: a foreground subagent waits indefinitely and only the
+    // user can stop it. A wedged child is visible to the user, who can
+    // interrupt the turn; killing healthy work on a wall clock is the worse
+    // failure mode.
     let wait = async {
         while runner.is_active(&child_id) {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -220,13 +220,6 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         () = ctx.cancellation.cancelled() => {
             runner.interrupt(&child_id);
             return fail(CANCELLED_SENTINEL);
-        }
-        _ = tokio::time::sleep(TIMEOUT) => {
-            runner.interrupt(&child_id);
-            return fail(
-                "Subagent timed out after 600 seconds; its partial transcript is on the child \
-                 session.",
-            );
         }
     }
 
