@@ -18,6 +18,10 @@ use crate::config::McpRemoteConfig;
 
 use super::transport::{CallError, Rpc};
 
+/// A response larger than this is refused instead of buffered. MCP tool
+/// results are model input, so an unbounded body is a memory hazard.
+const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+
 pub(crate) struct HttpRpc {
     client: reqwest::Client,
     url: String,
@@ -129,6 +133,11 @@ async fn read_sse(
             return Err(CallError::Closed);
         };
         buffer.push_str(&String::from_utf8_lossy(&chunk));
+        if buffer.len() > MAX_BODY_BYTES {
+            return Err(CallError::Transport(format!(
+                "MCP SSE response exceeds {MAX_BODY_BYTES} bytes"
+            )));
+        }
         while let Some((index, separator)) = next_event_boundary(&buffer) {
             let event = buffer[..index].to_owned();
             buffer.drain(..index + separator);
@@ -195,10 +204,18 @@ impl Rpc for HttpRpc {
             if content_type.contains("text/event-stream") {
                 read_sse(response, id, deadline, cancel).await
             } else {
-                let value: Value = response
-                    .json()
+                let bytes = response
+                    .bytes()
                     .await
                     .map_err(|error| CallError::Transport(error.to_string()))?;
+                if bytes.len() > MAX_BODY_BYTES {
+                    return Err(CallError::Transport(format!(
+                        "MCP HTTP response exceeds {MAX_BODY_BYTES} bytes"
+                    )));
+                }
+                let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+                    CallError::Transport(format!("malformed MCP response: {error}"))
+                })?;
                 parse_response(value)
             }
         })
