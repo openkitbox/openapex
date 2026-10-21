@@ -3,3 +3,4 @@ target/
 reference/
 Taskfile.yml
 node_modules/
+.worktrees/
