@@ -11,8 +11,8 @@ use tokio::sync::{mpsc, watch};
 
 use crate::pipeline;
 use crate::terminal::TerminalGuard;
-use crate::ui::composer::Composer;
-use crate::ui::dock;
+use crate::ui::composer::{Composer, SearchAction, SearchBox};
+use crate::ui::dock::{self, StatusMode};
 use crate::ui::layout;
 use crate::ui::timeline::Transcript;
 use command::AppCommand;
@@ -21,6 +21,16 @@ use state::ViewState;
 
 pub const RENDER_TICK: Duration = Duration::from_millis(33);
 const SCROLL_PAGE: usize = 10;
+
+/// Three modes, no cursor: `Compose` types into the composer, `SearchInput`
+/// edits the `/` query, `Browse` navigates the finished search (n/N, j/k, g/G).
+/// Letter keys are global only in `Browse`, so typing a message is never
+/// hijacked.
+pub enum Mode {
+    Compose,
+    SearchInput(SearchBox),
+    Browse,
+}
 
 pub struct App {
     pub view: ViewState,
@@ -33,6 +43,8 @@ pub struct App {
     next_reload_id: u64,
     pending_reload: Option<u64>,
     dirty: bool,
+    mode: Mode,
+    show_help: bool,
 }
 
 impl App {
@@ -56,6 +68,8 @@ impl App {
             next_reload_id: 0,
             pending_reload: None,
             dirty: true,
+            mode: Mode::Compose,
+            show_help: false,
         }
     }
 
@@ -95,6 +109,86 @@ impl App {
             }
             return;
         }
+
+        // The `/` prompt owns the keyboard while it is open.
+        let search_action = match &mut self.mode {
+            Mode::SearchInput(boxed) => Some(boxed.handle_key(key)),
+            _ => None,
+        };
+        if let Some(action) = search_action {
+            match action {
+                SearchAction::Cancel => {
+                    self.transcript.clear_search();
+                    self.mode = Mode::Compose;
+                }
+                SearchAction::Confirm => self.mode = Mode::Browse,
+                SearchAction::Edited => {
+                    let query = match &self.mode {
+                        Mode::SearchInput(boxed) => boxed.text(),
+                        _ => String::new(),
+                    };
+                    self.transcript.set_query(&query);
+                }
+            }
+            self.dirty = true;
+            return;
+        }
+
+        // Browse mode: single-letter navigation is safe here because the
+        // composer is not receiving keys.
+        if matches!(self.mode, Mode::Browse) {
+            match key.code {
+                KeyCode::Esc => {
+                    self.transcript.clear_search();
+                    self.show_help = false;
+                    self.mode = Mode::Compose;
+                }
+                KeyCode::Char('n') => {
+                    self.transcript.next_match(true);
+                }
+                KeyCode::Char('N') => {
+                    self.transcript.next_match(false);
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.transcript.scroll_down(1);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.transcript.scroll_up(1);
+                }
+                KeyCode::Char('g') => {
+                    self.transcript.scroll_to_top();
+                }
+                KeyCode::Char('G') => {
+                    self.transcript.scroll_to_bottom();
+                }
+                KeyCode::Char('?') => self.show_help = !self.show_help,
+                _ => {
+                    // Any other key leaves browse mode; the query stays active
+                    // so n/N still work from the composer side? No — without
+                    // browse mode the letters are text again, so drop it.
+                    self.transcript.clear_search();
+                    self.show_help = false;
+                    self.mode = Mode::Compose;
+                    self.handle_compose_key(key);
+                    return;
+                }
+            }
+            self.dirty = true;
+            return;
+        }
+
+        self.handle_compose_key(key);
+    }
+
+    fn handle_compose_key(&mut self, key: crossterm::event::KeyEvent) {
+        // `/` opens search only on an empty draft: inside a message a slash is
+        // an ordinary character (paths, dates).
+        if key.code == KeyCode::Char('/') && self.composer.is_empty() {
+            self.transcript.clear_search();
+            self.mode = Mode::SearchInput(SearchBox::new());
+            self.dirty = true;
+            return;
+        }
         match key.code {
             KeyCode::PageUp => {
                 self.transcript.scroll_up(SCROLL_PAGE);
@@ -113,7 +207,11 @@ impl App {
             }
             _ => {}
         }
-        if let Some(text) = self.composer.handle_key(key) {
+        let submitted = self.composer.handle_key(key);
+        // Every key handed to the composer may have typed, deleted or moved the
+        // caret — the frame must repaint even when nothing was submitted.
+        self.dirty = true;
+        if let Some(text) = submitted {
             // 本地乐观显示：随后一帧就有用户消息；服务端确认后由历史重拉覆盖。
             self.store.push_user(&text);
             self.refresh();
@@ -148,6 +246,23 @@ impl App {
         self.dirty = true;
     }
 
+    fn status_mode(&self) -> StatusMode<'_> {
+        if self.show_help {
+            return StatusMode::Help;
+        }
+        match self.mode {
+            Mode::SearchInput(_) | Mode::Browse => {
+                let search = self.transcript.search();
+                StatusMode::Search {
+                    query: &search.query,
+                    matches: search.matches.len(),
+                    current: search.current,
+                }
+            }
+            Mode::Compose => StatusMode::Normal,
+        }
+    }
+
     pub async fn run(
         &mut self,
         terminal: &mut TerminalGuard,
@@ -180,16 +295,27 @@ impl App {
                     if self.dirty {
                         self.dirty = false;
                         terminal.terminal.draw(|frame| {
-                            let composer_height = self.composer.height();
+                            let composer_height = match &self.mode {
+                                Mode::SearchInput(_) => 1,
+                                _ => self.composer.height(),
+                            };
                             let (timeline_area, composer_area, dock_area) =
                                 layout::split(frame.area(), composer_height);
-                            self.composer.render(frame, composer_area);
+                            match &mut self.mode {
+                                Mode::SearchInput(boxed) => boxed.render(frame, composer_area),
+                                _ => self.composer.render(frame, composer_area),
+                            }
                             self.transcript.render(frame, timeline_area);
                             let now_ms = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
                                 .map(|d| d.as_millis() as i64)
                                 .unwrap_or(0);
-                            let line = dock::chips(&self.store, now_ms, dock_area.width);
+                            let line = dock::status_line(
+                                &self.store,
+                                now_ms,
+                                dock_area.width,
+                                self.status_mode(),
+                            );
                             frame.render_widget(ratatui::widgets::Paragraph::new(line), dock_area);
                         })?;
                     }
@@ -202,5 +328,29 @@ impl App {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::App;
+    use crate::app::event::AppEvent;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn app() -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (seq_tx, _seq_rx) = tokio::sync::watch::channel(None);
+        App::new("ses_test".into(), tx, seq_tx)
+    }
+
+    #[test]
+    fn typing_marks_the_frame_dirty() {
+        let mut app = app();
+        app.dirty = false; // last frame drawn; a key must schedule the next one
+        app.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.dirty, "a typed character must schedule a redraw");
     }
 }

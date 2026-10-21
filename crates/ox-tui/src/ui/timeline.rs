@@ -4,6 +4,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::theme;
+
 #[derive(Debug, Clone)]
 pub enum Block {
     User {
@@ -104,6 +106,17 @@ pub struct Transcript {
     pub sticky_bottom: bool,
     width: u16,
     height: u16,
+    search: SearchState,
+}
+
+/// fx-style search: no cursor row — the viewport jumps to the current match and
+/// the line is highlighted for as long as it is the current one.
+#[derive(Default, Debug, Clone)]
+pub struct SearchState {
+    pub query: String,
+    /// Absolute line indices into the flattened, wrapped transcript.
+    pub matches: Vec<usize>,
+    pub current: Option<usize>,
 }
 
 impl Transcript {
@@ -114,6 +127,7 @@ impl Transcript {
             sticky_bottom: true,
             width,
             height,
+            search: SearchState::default(),
         }
     }
 
@@ -139,7 +153,86 @@ impl Transcript {
         }
 
         self.entries.truncate(blocks.len());
+        if !self.search.query.is_empty() {
+            self.recompute_search();
+        }
         self.clamp();
+    }
+
+    /// Re-run the query over the wrapped lines and jump to the first hit.
+    /// Returns the number of matches.
+    pub fn set_query(&mut self, query: &str) -> usize {
+        self.search.query = query.to_owned();
+        self.recompute_search();
+        self.search.current = (!self.search.matches.is_empty()).then_some(0);
+        if let Some(&line) = self.search.matches.first() {
+            self.jump_to(line);
+        }
+        self.search.matches.len()
+    }
+
+    pub fn clear_search(&mut self) {
+        self.search = SearchState::default();
+        self.sticky_bottom = true;
+        self.scroll = self.max_scroll();
+    }
+
+    pub fn search(&self) -> &SearchState {
+        &self.search
+    }
+
+    /// Move to the next/previous match; wraps around. Returns whether the
+    /// viewport moved.
+    pub fn next_match(&mut self, forward: bool) -> bool {
+        let count = self.search.matches.len();
+        if count == 0 {
+            return false;
+        }
+        let index = self.search.current.unwrap_or(0);
+        let next = if forward {
+            (index + 1) % count
+        } else {
+            (index + count - 1) % count
+        };
+        self.search.current = Some(next);
+        self.jump_to(self.search.matches[next]);
+        true
+    }
+
+    /// The absolute line index currently highlighted, if any.
+    fn current_line(&self) -> Option<usize> {
+        self.search
+            .current
+            .and_then(|ordinal| self.search.matches.get(ordinal))
+            .copied()
+    }
+
+    fn recompute_search(&mut self) {
+        let needle = self.search.query.to_lowercase();
+        let mut matches = Vec::new();
+        let mut base = 0;
+        for entry in &self.entries {
+            for (offset, line) in entry.lines.iter().enumerate() {
+                if line_text(line).to_lowercase().contains(&needle) {
+                    matches.push(base + offset);
+                }
+            }
+            base += entry.lines.len();
+        }
+        // Keep the ordinal pointing at a real match; a stale one would panic the
+        // render path or silently highlight the wrong line.
+        self.search.current = match (matches.len(), self.search.current) {
+            (0, _) => None,
+            (len, Some(ordinal)) => Some(ordinal.min(len - 1)),
+            (_, None) => Some(0),
+        };
+        self.search.matches = matches;
+    }
+
+    fn jump_to(&mut self, line: usize) {
+        self.sticky_bottom = false;
+        let centered = line.saturating_sub(self.height as usize / 2);
+        self.scroll = centered.min(self.max_scroll());
     }
 
     pub fn entry_generation(&self, index: usize) -> u64 {
@@ -172,6 +265,11 @@ impl Transcript {
         self.scroll = self.max_scroll();
     }
 
+    pub fn scroll_to_top(&mut self) {
+        self.sticky_bottom = false;
+        self.scroll = 0;
+    }
+
     fn max_scroll(&self) -> usize {
         self.total_lines().saturating_sub(self.height as usize)
     }
@@ -190,6 +288,8 @@ impl Transcript {
 
         let mut remaining_skip = self.scroll;
         let mut y = area.y;
+        let mut base = 0usize;
+        let current_match = self.current_line();
 
         for entry in &mut self.entries {
             let lines = entry.lines_for(area.width);
@@ -197,11 +297,13 @@ impl Transcript {
 
             if remaining_skip >= count {
                 remaining_skip -= count;
+                base += count;
                 continue;
             }
 
             let end = (area.y + area.height).saturating_sub(y) as usize;
-            let visible = &lines[remaining_skip..lines.len().min(remaining_skip + end)];
+            let skip = remaining_skip;
+            let visible = &lines[skip..lines.len().min(skip + end)];
             remaining_skip = 0;
             if visible.is_empty() {
                 break;
@@ -216,8 +318,17 @@ impl Transcript {
             };
             // ratatui 0.29's `Into<Text<'a>>` has no impl for `&[Line]`, so this clones
             // only the visible window's lines (≤ viewport height) each frame.
-            frame.render_widget(Paragraph::new(visible.to_vec()), rect);
+            let mut visible = visible.to_vec();
+            if let Some(matched) = current_match {
+                let first = base + skip;
+                if matched >= first && matched < first + visible.len() {
+                    let index = matched - first;
+                    visible[index] = highlight(&visible[index]);
+                }
+            }
+            frame.render_widget(Paragraph::new(visible), rect);
             y += height;
+            base += count;
             if y >= area.y + area.height {
                 break;
             }
@@ -225,13 +336,39 @@ impl Transcript {
     }
 }
 
+/// Paint a whole line with the search highlight: the palette decides the style,
+/// so `NO_COLOR` degrades it to reverse video.
+fn highlight(line: &Line<'static>) -> Line<'static> {
+    let style = theme::palette().highlight;
+    let spans: Vec<Span<'static>> = line
+        .spans
+        .iter()
+        .map(|span| Span::styled(span.content.clone(), span.style.patch(style)))
+        .collect();
+    Line {
+        spans,
+        style: line.style,
+        alignment: line.alignment,
+    }
+}
+
+fn line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
 fn render_block(block: &Block, width: u16) -> Vec<Line<'static>> {
+    let palette = theme::palette();
     match block {
         Block::User { text } => prefix_lines(
             "▌ you",
             text,
             width,
-            Style::default().add_modifier(Modifier::BOLD),
+            palette
+                .accent
+                .add_modifier(Modifier::BOLD),
         ),
         Block::Assistant {
             text,
@@ -245,18 +382,21 @@ fn render_block(block: &Block, width: u16) -> Vec<Line<'static>> {
                 } else {
                     "✻ assistant …"
                 },
-                Style::default().add_modifier(Modifier::BOLD),
+                palette.dim.add_modifier(Modifier::BOLD),
             ))];
             if !reasoning.is_empty() {
-                lines.push(Line::from(format!(
-                    "  ▸ reasoning · {} chars 已折叠",
-                    reasoning.chars().count()
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "  ▸ reasoning · {} chars 已折叠",
+                        reasoning.chars().count()
+                    ),
+                    palette.dim,
                 )));
             }
             lines.extend(indent_wrapped(text, width));
             lines
         }
-        Block::System { text } => prefix_lines("⤷", text, width, Style::default()),
+        Block::System { text } => prefix_lines("⤷", text, width, palette.dim),
     }
 }
 
@@ -281,8 +421,61 @@ fn indent_wrapped(text: &str, width: u16) -> Vec<Line<'static>> {
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::style::Modifier;
 
     use super::{Block, Transcript};
+
+    #[test]
+    fn search_finds_matches_across_blocks_and_wraps() {
+        let mut t = Transcript::new(40, 4);
+        t.sync(
+            &[
+                Block::user("alpha"),
+                Block::assistant("msg_1", 0, "beta ALPHA gamma"),
+                Block::user("end"),
+            ],
+            0,
+        );
+        assert_eq!(t.set_query("alpha"), 2, "case-insensitive across blocks");
+        assert!(t.next_match(true), "advance to the second match");
+        assert!(t.next_match(true), "wrap around to the first");
+        assert!(t.next_match(false), "wrap backwards to the last");
+        t.clear_search();
+        assert_eq!(t.search().matches.len(), 0);
+        assert!(!t.next_match(true), "no query, no navigation");
+    }
+
+    #[test]
+    fn set_query_jumps_the_viewport_to_the_first_match() {
+        let mut t = Transcript::new(20, 3);
+        let blocks: Vec<_> = (0..30).map(|i| Block::user(&format!("row {i} needle"))).collect();
+        t.sync(&blocks, 0);
+        t.set_query("needle");
+        // sticky was on (tail); a search must take the viewport to the match.
+        assert!(!t.sticky_bottom);
+        assert!(t.scroll <= 30 * 1 - 3, "scroll clamped to the tail");
+        t.next_match(true);
+        assert!(t.search().current == Some(1));
+    }
+
+    #[test]
+    fn current_match_line_is_highlighted_in_the_buffer() {
+        let mut t = Transcript::new(20, 4);
+        t.sync(&[Block::user("hit here"), Block::user("after")], 0);
+        t.set_query("hit");
+        let backend = TestBackend::new(20, 4);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| t.render(frame, frame.area())).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let hit = (0..4)
+            .flat_map(|y| (0..20).map(move |x| (x, y)))
+            .find(|(x, y)| buffer[( *x, *y)].symbol() == "h")
+            .expect("the hit line is on screen");
+        assert!(
+            buffer[hit].bg.is_some() || buffer[hit].modifier.contains(Modifier::REVERSED),
+            "the current match line must be highlighted (palette-dependent)",
+        );
+    }
 
     #[test]
     fn sync_preserves_unchanged_prefix_generations() {

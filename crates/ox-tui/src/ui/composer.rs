@@ -3,6 +3,8 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use tui_textarea::TextArea;
 
+use crate::theme;
+
 pub struct Composer {
     textarea: TextArea<'static>,
 }
@@ -11,6 +13,7 @@ impl Composer {
     pub fn new() -> Self {
         let mut textarea = TextArea::default();
         textarea.set_placeholder_text("输入消息…");
+        textarea.set_placeholder_style(theme::palette().dim);
         Self { textarea }
     }
 
@@ -40,6 +43,46 @@ impl Composer {
 
     pub fn height(&self) -> u16 {
         (self.textarea.lines().len() as u16).clamp(1, 8)
+    }
+
+    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+        frame.render_widget(&self.textarea, area);
+    }
+}
+
+/// The `/` prompt. Lives beside the composer (which keeps its draft) and only
+/// exists while the search is being typed.
+pub enum SearchAction {
+    Edited,
+    Cancel,
+    Confirm,
+}
+
+pub struct SearchBox {
+    textarea: TextArea<'static>,
+}
+
+impl SearchBox {
+    pub fn new() -> Self {
+        let mut textarea = TextArea::default();
+        textarea.set_placeholder_text("搜索…");
+        textarea.set_placeholder_style(theme::palette().dim);
+        Self { textarea }
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent) -> SearchAction {
+        match key.code {
+            KeyCode::Esc => SearchAction::Cancel,
+            KeyCode::Enter => SearchAction::Confirm,
+            _ => {
+                self.textarea.input(key);
+                SearchAction::Edited
+            }
+        }
+    }
+
+    pub fn text(&self) -> String {
+        self.textarea.lines().join("\n")
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
