@@ -10,11 +10,11 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol as acp;
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, ContentBlock, EmbeddedResourceResource, Implementation, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest,
-    NewSessionResponse, PromptCapabilities, PromptRequest, SessionId, SessionMode, SessionModeId,
-    SessionModeState, SessionNotification, SetSessionModeRequest, SetSessionModeResponse,
-    StopReason,
+    AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, ContentBlock,
+    EmbeddedResourceResource, Implementation, InitializeRequest, InitializeResponse,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
+    PromptCapabilities, PromptRequest, SessionId, SessionMode, SessionModeId, SessionModeState,
+    SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason,
 };
 use serde_json::{Value, json};
 
@@ -32,6 +32,12 @@ struct SessionLink {
     directory: String,
     /// The agent ox currently runs for this session (`session/set_mode`).
     current_mode: SessionModeId,
+}
+
+/// How a turn ended: a stop reason for the editor, or ox's error verbatim.
+enum TurnEnd {
+    Settle(StopReason),
+    Failed(String),
 }
 
 /// Shared bridge state: cheap to clone into every ACP handler.
@@ -115,13 +121,15 @@ impl Bridge {
         Ok(NewSessionResponse::new(id).modes(SessionModeState::new(current, modes)))
     }
 
-    /// `session/load` — the editor reopened a thread: verify the session
-    /// exists in ox and advertise the same modes as `session/new`.
-    /// (Transcript replay lands with the M4 milestone.)
+    /// `session/load` — the editor reopened a thread: verify the session,
+    /// replay its transcript as ACP updates, then answer with the mode state.
+    /// The replay reads through `message.list`, which applies the mctx
+    /// dropped-content overlay, so the editor sees the same transcript the
+    /// model saw.
     pub async fn load_session(
         &self,
         request: LoadSessionRequest,
-        _connection: &acp::ConnectionTo<acp::Client>,
+        connection: &acp::ConnectionTo<acp::Client>,
     ) -> Result<LoadSessionResponse, acp::Error> {
         let session = request.session_id.to_string();
         let directory = request.cwd.to_string_lossy().to_string();
@@ -137,6 +145,42 @@ impl Bridge {
         if !status.is_success() {
             return Err(wire_error(status.as_u16(), &body));
         }
+
+        // Walk every page (the cursor embeds the order, so later pages send
+        // only `limit` + `cursor` — src/api/session.rs rejects the pair).
+        let mut cursor: Option<String> = None;
+        let mut first_page = true;
+        loop {
+            let mut url = format!("{}/api/session/{}/message?limit=100", self.base, session);
+            if let Some(cursor) = &cursor {
+                url.push_str(&format!("&cursor={cursor}"));
+            } else if first_page {
+                url.push_str("&order=asc");
+            }
+            let page = self.get_json(&url, &directory).await?;
+            first_page = false;
+            let messages = page
+                .get("data")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for message in &messages {
+                for update in translate::replay_message(message) {
+                    let notification = SessionNotification::new(request.session_id.clone(), update);
+                    if let Err(error) = connection.send_notification(notification) {
+                        tracing::warn!(error = %error.message, "replay send failed");
+                    }
+                }
+            }
+            cursor = page
+                .pointer("/cursor/next")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if cursor.is_none() || messages.is_empty() {
+                break;
+            }
+        }
+
         let (modes, current) = self.modes().await;
         self.sessions
             .lock()
@@ -148,7 +192,71 @@ impl Bridge {
                     current_mode: current.clone(),
                 },
             );
+        self.send_available_commands(&request.session_id, connection)
+            .await;
         Ok(LoadSessionResponse::new().modes(SessionModeState::new(current, modes)))
+    }
+
+    /// GET + JSON decode with the session's directory header.
+    async fn get_json(&self, url: &str, directory: &str) -> Result<Value, acp::Error> {
+        let response = self
+            .http
+            .get(url)
+            .header("x-opencode-directory", directory)
+            .send()
+            .await
+            .map_err(internal)?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(wire_error(status.as_u16(), &body));
+        }
+        response
+            .json::<Value>()
+            .await
+            .map_err(|error| internal(format!("decode `{url}` failed: {error}")))
+    }
+
+    /// `available_commands_update`: push ox's command catalogue (currently
+    /// empty — emitted anyway so slash-command support lights up when ox
+    /// grows one).
+    pub(crate) async fn send_available_commands(
+        &self,
+        session: &SessionId,
+        connection: &acp::ConnectionTo<acp::Client>,
+    ) {
+        let mut commands = Vec::new();
+        match self
+            .http
+            .get(format!("{}/api/command", self.base))
+            .send()
+            .await
+        {
+            Ok(response) => match response.json::<Value>().await {
+                Ok(value) => {
+                    for command in value
+                        .get("data")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let (Some(name), Some(description)) = (
+                            command.get("name").and_then(Value::as_str),
+                            command.get("description").and_then(Value::as_str),
+                        ) {
+                            commands.push(AvailableCommand::new(name, description));
+                        }
+                    }
+                }
+                Err(error) => tracing::debug!(error = %error, "command list decode failed"),
+            },
+            Err(error) => tracing::debug!(error = %error, "command list request failed"),
+        }
+        let update = SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(commands));
+        let notification = SessionNotification::new(session.clone(), update);
+        if let Err(error) = connection.send_notification(notification) {
+            tracing::warn!(error = %error.message, "available_commands_update send failed");
+        }
     }
 
     /// `session/set_mode` — switch ox agent, remember the new mode.
@@ -271,10 +379,12 @@ impl Bridge {
                         {
                             continue;
                         }
-                        if let Some(stop) =
-                            self.consume(&frame, &mut tool_names, request, connection)
-                        {
-                            return Ok(stop);
+                        match self.consume(&frame, &mut tool_names, request, connection) {
+                            Some(TurnEnd::Settle(stop)) => return Ok(stop),
+                            Some(TurnEnd::Failed(message)) => {
+                                return Err(acp::Error::internal_error().data(message));
+                            }
+                            None => {}
                         }
                     }
                 }
@@ -282,14 +392,14 @@ impl Bridge {
         }
     }
 
-    /// Translate one frame; returns `Some(stop)` on a turn terminator.
+    /// Translate one frame; returns `Some(end)` on a turn terminator.
     fn consume(
         &self,
         frame: &Frame,
         tool_names: &mut translate::ToolNames,
         request: &PromptRequest,
         connection: &acp::ConnectionTo<acp::Client>,
-    ) -> Option<StopReason> {
+    ) -> Option<TurnEnd> {
         if frame.kind == "session.tool.input.started" {
             translate::learn_tool_name(tool_names, &frame.data);
         }
@@ -300,11 +410,18 @@ impl Bridge {
             }
         }
         match frame.kind.as_str() {
-            "session.execution.succeeded" => Some(StopReason::EndTurn),
-            // ox's turn-level failure: the error detail already streamed; the
-            // editor sees a non-success stop (refusal is ACP's "agent gave up").
-            "session.execution.failed" => Some(StopReason::Refusal),
-            "session.execution.interrupted" => Some(StopReason::Cancelled),
+            "session.execution.succeeded" => Some(TurnEnd::Settle(StopReason::EndTurn)),
+            // ox's turn-level failure carries the provider/tool error; it goes
+            // back to the editor verbatim as a JSON-RPC error.
+            "session.execution.failed" => Some(TurnEnd::Failed(
+                frame
+                    .data
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("ox turn failed")
+                    .to_owned(),
+            )),
+            "session.execution.interrupted" => Some(TurnEnd::Settle(StopReason::Cancelled)),
             _ => None,
         }
     }

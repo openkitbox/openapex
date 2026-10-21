@@ -116,11 +116,12 @@ fn chunk(update: SessionUpdate) -> Vec<SessionUpdate> {
 /// `read src/main.rs`), the kind is mapped from ox's tool vocabulary, and the
 /// ox input object moves into `rawInput` verbatim.
 fn tool_called(id: String, name: &str, data: &Value) -> ToolCall {
-    let mut call = ToolCall::new(id, title(name, data))
+    let input = data.get("input");
+    let mut call = ToolCall::new(id, title(name, input))
         .name(name.to_owned())
         .kind(tool_kind(name))
         .status(ToolCallStatus::InProgress);
-    if let Some(input) = data.get("input") {
+    if let Some(input) = input {
         call = call.raw_input(input.clone());
     }
     call
@@ -162,9 +163,8 @@ fn tool_settled(id: String, data: &Value, status: ToolCallStatus) -> ToolCallUpd
 }
 
 /// One-line title: `name` plus the most identifying input field.
-fn title(name: &str, data: &Value) -> String {
-    let detail = data
-        .obj("input")
+fn title(name: &str, input: Option<&Value>) -> String {
+    let detail = input
         .and_then(|input| {
             [
                 "filePath",
@@ -216,4 +216,90 @@ impl ValueExt for Value {
     fn array(&self, key: &str) -> Option<&Vec<Value>> {
         self.get(key).and_then(Value::as_array)
     }
+}
+
+/// Replay one history message (`GET /api/session/{id}/message`) as ACP
+/// updates, mirroring upstream `replay.ts`:
+/// - user text → `UserMessageChunk`;
+/// - assistant `text` / `reasoning` parts → `AgentMessageChunk` /
+///   `AgentThoughtChunk`;
+/// - assistant `tool` parts → one settled `ToolCall` in its final state
+///   (`state.status` completed/error/running/streaming);
+/// - everything else (idle markers, compaction, synthetic records) is
+///   display-only and skipped.
+pub fn replay_message(message: &Value) -> Vec<SessionUpdate> {
+    match message.string("type") {
+        Some("user") => message
+            .string("text")
+            .map(|text| {
+                vec![SessionUpdate::UserMessageChunk(ContentChunk::new(
+                    ContentBlock::Text(TextContent::new(text.to_owned())),
+                ))]
+            })
+            .unwrap_or_default(),
+        Some("assistant") => message
+            .array("content")
+            .map(|parts| parts.iter().filter_map(replay_part).collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn replay_part(part: &Value) -> Option<SessionUpdate> {
+    match part.string("type")? {
+        "text" => Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new(part.string("text")?.to_owned())),
+        ))),
+        "reasoning" => Some(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new(part.string("text")?.to_owned())),
+        ))),
+        "tool" => replay_tool(part),
+        _ => None,
+    }
+}
+
+/// A settled tool card from a stored assistant `tool` part.
+fn replay_tool(part: &Value) -> Option<SessionUpdate> {
+    let id = part.string("id")?.to_owned();
+    let name = part.string("name")?;
+    let state = part.obj("state")?;
+    let status = match state.string("status") {
+        Some("completed") => ToolCallStatus::Completed,
+        Some("error") => ToolCallStatus::Failed,
+        Some("running") => ToolCallStatus::InProgress,
+        _ => ToolCallStatus::Pending,
+    };
+    let input = state.get("input").filter(|input| input.is_object());
+    let mut call = ToolCall::new(id, title(name, input))
+        .name(name.to_owned())
+        .kind(tool_kind(name))
+        .status(status);
+    if let Some(input) = input {
+        call = call.raw_input(input.clone());
+    }
+    if let Some(content) = content_blocks(state.get("content")) {
+        call = call.content(content);
+    } else if status == ToolCallStatus::Failed
+        && let Some(message) = state.obj("error").and_then(|error| error.string("message"))
+    {
+        call = call.content(vec![ToolCallContent::Content(Content::new(
+            ContentBlock::Text(TextContent::new(message.to_owned())),
+        ))]);
+    }
+    Some(SessionUpdate::ToolCall(call))
+}
+
+/// ox `Content[]` (text parts) → ACP tool-call content.
+fn content_blocks(content: Option<&Value>) -> Option<Vec<ToolCallContent>> {
+    let content = content?.as_array()?;
+    let blocks = content
+        .iter()
+        .filter_map(|item| {
+            let text = item.get("text")?.as_str()?;
+            Some(ToolCallContent::Content(Content::new(ContentBlock::Text(
+                TextContent::new(text.to_owned()),
+            ))))
+        })
+        .collect::<Vec<_>>();
+    (!blocks.is_empty()).then_some(blocks)
 }

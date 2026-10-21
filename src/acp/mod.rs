@@ -97,9 +97,16 @@ async fn serve_stdio(base: String) -> anyhow::Result<()> {
                 let bridge = bridge.clone();
                 async move |request: NewSessionRequest,
                             responder: acp::Responder<NewSessionResponse>,
-                            _connection: acp::ConnectionTo<acp::Client>| {
+                            connection: acp::ConnectionTo<acp::Client>| {
                     match bridge.new_session(request).await {
-                        Ok(response) => responder.respond(response),
+                        Ok(response) => {
+                            let session = response.session_id.clone();
+                            responder.respond(response)?;
+                            // Slash-command support lights up from the
+                            // catalogue push, even while ox's list is empty.
+                            bridge.send_available_commands(&session, &connection).await;
+                            Ok(())
+                        }
                         Err(error) => responder.respond_with_error(error),
                     }
                 }

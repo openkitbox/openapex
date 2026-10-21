@@ -30,6 +30,21 @@ fn receive(frames: &Receiver<String>) -> Value {
     receive_timeout(frames, Duration::from_secs(30)).expect("timed out waiting for an ACP frame")
 }
 
+/// Read frames until the response with `id` arrives (notifications in
+/// between — e.g. `available_commands_update` — are consumed and dropped).
+fn response(frames: &Receiver<String>, id: i64) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        let Some(frame) = receive_timeout(frames, Duration::from_secs(10)) else {
+            panic!("timed out waiting for response id {id}");
+        };
+        if frame["id"] == id {
+            return frame;
+        }
+    }
+    panic!("timed out waiting for response id {id}");
+}
+
 /// Read one NDJSON frame with a custom timeout; `None` on timeout/close.
 fn receive_timeout(frames: &Receiver<String>, timeout: Duration) -> Option<Value> {
     let line = frames.recv_timeout(timeout).ok()?;
@@ -88,17 +103,32 @@ fn temp_db() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
 }
 
-/// A stub gateway: `/v1/models` serves `models_body`; `/v1/chat/completions`
-/// answers a minimal streaming reply (one content delta, a usage-carrying
-/// finish chunk, `[DONE]`).
-async fn spawn_mock_cardinal(models_body: &'static str) -> String {
+/// What the mock gateway does on a chat completion request.
+enum ChatMode {
+    /// One content delta, a usage-carrying finish chunk, `[DONE]`.
+    Text,
+    /// The first tool-bearing request gets a `read` tool call; every other
+    /// request (title generation included) gets final text. Exercises ox's
+    /// tool execution and the ACP tool-card lifecycle.
+    ToolCall,
+    /// Hold the connection open (the turn stays in flight; used to cancel).
+    Slow,
+}
+
+/// A stub gateway: `/v1/models` serves the model list; `/v1/chat/completions`
+/// follows `mode`.
+async fn spawn_mock_cardinal(models_body: &'static str, mode: ChatMode) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let mode = std::sync::Arc::new(mode);
+    let requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     tokio::spawn(async move {
         loop {
             let Ok((mut socket, _)) = listener.accept().await else {
                 return;
             };
+            let mode = std::sync::Arc::clone(&mode);
+            let requests = std::sync::Arc::clone(&requests);
             tokio::spawn(async move {
                 use tokio::io::{AsyncReadExt, AsyncWriteExt};
                 // Read request head, then content-length body.
@@ -135,11 +165,27 @@ async fn spawn_mock_cardinal(models_body: &'static str) -> String {
                     socket.write_all(response.as_bytes()).await.ok();
                     return;
                 }
-                let sse = concat!(
-                    "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"好的\"},\"finish_reason\":null}]}\n\n",
-                    "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2}}\n\n",
-                    "data: [DONE]\n\n"
-                );
+                // Only the main chat request carries `tools`; title
+                // generation shares this gateway with a tool-free request,
+                // so key the tool-call reply on the toolset, not the count.
+                let carries_tools = std::str::from_utf8(&body)
+                    .map(|body| body.contains("\"tools\""))
+                    .unwrap_or(false);
+                let first = carries_tools
+                    && requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                let sse = match (&*mode, first) {
+                    (ChatMode::Slow, _) => {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        text_sse("好的")
+                    }
+                    (ChatMode::ToolCall, true) => concat!(
+                        "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"/tmp/acp-tool-test.txt\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+                        "data: {\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2}}\n\n",
+                        "data: [DONE]\n\n"
+                    )
+                    .to_owned(),
+                    _ => text_sse("好的"),
+                };
                 let response = format!(
                     "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{sse}"
                 );
@@ -148,6 +194,13 @@ async fn spawn_mock_cardinal(models_body: &'static str) -> String {
         }
     });
     format!("http://{addr}")
+}
+
+/// The canonical one-delta streaming reply.
+fn text_sse(text: &str) -> String {
+    format!(
+        "data: {{\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":null}}]}}\n\ndata: {{\"id\":\"1\",\"object\":\"chat.completion.chunk\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}],\"usage\":{{\"prompt_tokens\":9,\"completion_tokens\":2}}}}\n\ndata: [DONE]\n\n"
+    )
 }
 
 /// Spawn a real ox server on `listen` with an isolated database.
@@ -235,6 +288,7 @@ async fn scripted_session_streams_chunks_and_settles_end_turn() {
     let db = dir.path().join("ox.db").display().to_string();
     let cardinal = spawn_mock_cardinal(
         r#"{"data":[{"id":"k3-256k","owned_by":"cardinal","context_length":262144}]}"#,
+        ChatMode::Text,
     )
     .await;
     let listen = format!("127.0.0.1:{}", free_port().await);
@@ -250,7 +304,7 @@ async fn scripted_session_streams_chunks_and_settles_end_turn() {
         &mut child,
         r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#,
     );
-    let new_session = receive(&frames);
+    let new_session = response(&frames, 1);
     let session_id = new_session["result"]["sessionId"]
         .as_str()
         .unwrap_or_else(|| panic!("no sessionId in {new_session}"))
@@ -302,6 +356,221 @@ async fn scripted_session_streams_chunks_and_settles_end_turn() {
         Some(session_id.as_str()),
         "{listed}"
     );
+
+    // session/load replays the transcript (user + assistant) and answers
+    // with the mode state.
+    send(
+        &mut child,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":3,"method":"session/load","params":{{"sessionId":"{session_id}","cwd":"/tmp","mcpServers":[]}}}}"#
+        ),
+    );
+    let (mut replayed_user, mut replayed_agent, mut loaded) = (false, false, false);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && !loaded {
+        let Some(frame) = receive_timeout(&frames, Duration::from_secs(5)) else {
+            break;
+        };
+        if frame["method"] == "session/update" {
+            match frame["params"]["update"]["sessionUpdate"].as_str() {
+                Some("user_message_chunk") => replayed_user = true,
+                Some("agent_message_chunk") => replayed_agent = true,
+                _ => {}
+            }
+        }
+        if frame["id"] == 3 {
+            loaded = true;
+            assert_eq!(
+                frame["result"]["modes"]["currentModeId"], "build",
+                "load response: {frame}"
+            );
+        }
+    }
+    assert!(loaded, "session/load never answered");
+    assert!(
+        replayed_user && replayed_agent,
+        "transcript not replayed (user={replayed_user}, agent={replayed_agent})"
+    );
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+    stop(server);
+}
+
+/// Tool calls render as ACP cards: `tool_call` (in_progress) from
+/// `session.tool.called`, then a `tool_call_update` with status `completed`
+/// from `session.tool.success`, then the final text and `end_turn`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_call_streams_card_and_completes() {
+    let dir = temp_db();
+    let db = dir.path().join("ox.db").display().to_string();
+    let cardinal = spawn_mock_cardinal(
+        r#"{"data":[{"id":"k3-256k","owned_by":"cardinal","context_length":262144}]}"#,
+        ChatMode::ToolCall,
+    )
+    .await;
+    let listen = format!("127.0.0.1:{}", free_port().await);
+    let server = spawn_ox(&listen, &db, Some(&cardinal));
+    wait_ready(&format!("http://{listen}")).await;
+    std::fs::write("/tmp/acp-tool-test.txt", "tool fixture\n").expect("fixture");
+
+    let (mut child, frames) =
+        spawn_acp(&[("OX_LISTEN", listen.as_str()), ("OX_DB_PATH", db.as_str())]);
+    initialize(&mut child, &frames);
+    send(
+        &mut child,
+        r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#,
+    );
+    let session = response(&frames, 1)["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_owned();
+    send(
+        &mut child,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{{"sessionId":"{session}","prompt":[{{"type":"text","text":"read the fixture"}}]}}}}"#
+        ),
+    );
+
+    let mut called = None;
+    let mut completed = false;
+    let mut settled = false;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && !settled {
+        let Some(frame) = receive_timeout(&frames, Duration::from_secs(5)) else {
+            break;
+        };
+        if frame["method"] == "session/update" {
+            let update = &frame["params"]["update"];
+            match update["sessionUpdate"].as_str() {
+                Some("tool_call") => called = Some(update.clone()),
+                Some("tool_call_update") if update["status"] == "completed" => completed = true,
+                _ => {}
+            }
+        }
+        if frame["id"] == 2 {
+            settled = true;
+            assert_eq!(frame["result"]["stopReason"], "end_turn", "{frame}");
+        }
+    }
+    let card = called.unwrap_or_else(|| panic!("no tool_call card streamed"));
+    assert_eq!(card["status"], "in_progress", "{card}");
+    assert_eq!(card["name"], "read", "{card}");
+    assert!(
+        card["title"]
+            .as_str()
+            .is_some_and(|title| title.starts_with("read")),
+        "{card}"
+    );
+    assert_eq!(card["rawInput"]["path"], "/tmp/acp-tool-test.txt", "{card}");
+    assert!(completed, "no completed tool_call_update streamed");
+    assert!(settled, "session/prompt never settled");
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+    stop(server);
+}
+
+/// `session/cancel` interrupts the in-flight turn and settles the prompt with
+/// `stopReason: cancelled`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancel_interrupts_a_running_turn() {
+    let dir = temp_db();
+    let db = dir.path().join("ox.db").display().to_string();
+    let cardinal = spawn_mock_cardinal(
+        r#"{"data":[{"id":"k3-256k","owned_by":"cardinal","context_length":262144}]}"#,
+        ChatMode::Slow,
+    )
+    .await;
+    let listen = format!("127.0.0.1:{}", free_port().await);
+    let server = spawn_ox(&listen, &db, Some(&cardinal));
+    wait_ready(&format!("http://{listen}")).await;
+
+    let (mut child, frames) =
+        spawn_acp(&[("OX_LISTEN", listen.as_str()), ("OX_DB_PATH", db.as_str())]);
+    initialize(&mut child, &frames);
+    send(
+        &mut child,
+        r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#,
+    );
+    let session = response(&frames, 1)["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_owned();
+    send(
+        &mut child,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{{"sessionId":"{session}","prompt":[{{"type":"text","text":"start a slow turn"}}]}}}}"#
+        ),
+    );
+    // Give the turn a moment to reach the provider, then cancel it.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    send(
+        &mut child,
+        &format!(
+            r#"{{"jsonrpc":"2.0","method":"session/cancel","params":{{"sessionId":"{session}"}}}}"#
+        ),
+    );
+
+    let mut settled = false;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && !settled {
+        let Some(frame) = receive_timeout(&frames, Duration::from_secs(5)) else {
+            break;
+        };
+        if frame["id"] == 2 {
+            settled = true;
+            assert_eq!(frame["result"]["stopReason"], "cancelled", "{frame}");
+        }
+    }
+    assert!(settled, "cancelled prompt never settled");
+
+    drop(child.stdin.take());
+    let _ = child.wait();
+    stop(server);
+}
+
+/// `session/set_mode` switches the ox agent and answers with a bare result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_mode_switches_the_ox_agent() {
+    let dir = temp_db();
+    let db = dir.path().join("ox.db").display().to_string();
+    let listen = format!("127.0.0.1:{}", free_port().await);
+    let server = spawn_ox(&listen, &db, None);
+    wait_ready(&format!("http://{listen}")).await;
+
+    let (mut child, frames) =
+        spawn_acp(&[("OX_LISTEN", listen.as_str()), ("OX_DB_PATH", db.as_str())]);
+    initialize(&mut child, &frames);
+    send(
+        &mut child,
+        r#"{"jsonrpc":"2.0","id":1,"method":"session/new","params":{"cwd":"/tmp","mcpServers":[]}}"#,
+    );
+    let session = response(&frames, 1)["result"]["sessionId"]
+        .as_str()
+        .expect("sessionId")
+        .to_owned();
+    send(
+        &mut child,
+        &format!(
+            r#"{{"jsonrpc":"2.0","id":2,"method":"session/set_mode","params":{{"sessionId":"{session}","modeId":"plan"}}}}"#
+        ),
+    );
+    let mode_response = response(&frames, 2);
+    assert!(mode_response["result"].is_object(), "{mode_response}");
+
+    // ox recorded the switch.
+    let client = reqwest::Client::new();
+    let listed: Value = client
+        .get(format!("http://{listen}/api/session/{}", session))
+        .header("x-opencode-directory", "/tmp")
+        .send()
+        .await
+        .expect("fetch session")
+        .json()
+        .await
+        .expect("session json");
+    assert_eq!(listed["data"]["agent"].as_str(), Some("plan"), "{listed}");
 
     drop(child.stdin.take());
     let _ = child.wait();
