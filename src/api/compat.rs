@@ -1,8 +1,9 @@
 //! Catalog endpoints the clients probe at startup that ox answers with
 //! empty or trivially-derived data. Shapes follow upstream's protocol
 //! (`packages/protocol/openapi.json`); semantics are the ox MVP subset —
-//! no plugins, commands, MCP, skills, forms, or integrations exist, and
-//! config is not yet modeled. Unlike upstream, these endpoints answer 200
+//! no plugins, commands, skills, forms, or integrations exist; MCP is real
+//! (src/mcp), and config is not yet modeled. Unlike upstream, these endpoints
+//! answer 200
 //! with empty data for unknown locations instead of 404
 //! `LocationNotFoundError` — an ox server owns its directory model, so
 //! keep that divergence here rather than "fixing" endpoints piecemeal.
@@ -89,9 +90,9 @@ pub(crate) async fn config_get(res: &mut Response) {
     res.render(Json(json!([])));
 }
 
-/// Empty catalog lists: command / mcp / reference /
-/// plugin / integration. (`provider` has a real
-/// handler in the parent module — the configured model catalog.)
+/// Empty catalog lists: command / reference / plugin / integration.
+/// (`provider` has a real handler in the parent module — the configured
+/// model catalog.)
 macro_rules! empty_catalog {
     ($name:ident, $operation:literal) => {
         #[handler] // operation_id: $operation
@@ -103,19 +104,36 @@ macro_rules! empty_catalog {
 }
 
 empty_catalog!(command_list, "command.list");
-empty_catalog!(mcp_list, "mcp.list");
 empty_catalog!(reference_list, "reference.list");
 empty_catalog!(plugin_list, "plugin.list");
 empty_catalog!(integration_list, "integration.list");
 
-/// `GET /api/mcp/resource` — upstream `mcp.resource.catalog`. ox has no MCP
-/// client, so the catalog is empty.
-#[handler] // operation_id: mcp.resource.catalog
-pub(crate) async fn mcp_resource_catalog(req: &mut Request, res: &mut Response) {
+/// `GET /api/mcp` — upstream `mcp.list`: every configured server with its
+/// live status. The shape is `Mcp.Server[]`; `status` is a tagged object
+/// (`{"status":"connected"}` / `{"status":"failed","error":"..."}`).
+#[handler] // operation_id: mcp.list
+pub(crate) async fn mcp_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(state) = super::state(depot, res) else {
+        return;
+    };
     let directory = directory_of(req);
+    let data = serde_json::to_value(state.mcp.servers()).unwrap_or_else(|_| json!([]));
+    res.render(Json(envelope(&directory, data)));
+}
+
+/// `GET /api/mcp/resource` — upstream `mcp.resource.catalog`: the resources
+/// and templates discovered from connected servers. Servers without the
+/// `resources` capability contribute nothing.
+#[handler] // operation_id: mcp.resource.catalog
+pub(crate) async fn mcp_resource_catalog(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(state) = super::state(depot, res) else {
+        return;
+    };
+    let directory = directory_of(req);
+    let (resources, templates) = state.mcp.resources();
     res.render(Json(envelope(
         &directory,
-        json!({ "resources": [], "templates": [] }),
+        json!({ "resources": resources, "templates": templates }),
     )));
 }
 
