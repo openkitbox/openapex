@@ -1,4 +1,5 @@
 pub mod error;
+pub mod history;
 pub mod rest;
 pub mod sse;
 pub mod store;

@@ -127,6 +127,9 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
             let Item::Assistant(item) = &mut store.items[index] else {
                 return;
             };
+            if item.done {
+                return; // history is authoritative; replayed deltas must not append
+            }
             if item.last_ordinal.is_some_and(|last| *ordinal <= last) {
                 return;
             }
@@ -155,6 +158,9 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
         } => {
             let index = store.ensure_assistant(assistant_message_id);
             if let Item::Assistant(item) = &mut store.items[index] {
+                if item.done {
+                    return; // history is authoritative; replayed deltas must not append
+                }
                 Arc::make_mut(&mut item.reasoning).push_str(delta);
                 item.version += 1;
             }
@@ -361,5 +367,33 @@ mod tests {
         .unwrap();
         reduce(&mut store, &envelope.parse_typed());
         assert_eq!(store.last_seq, Some(41));
+    }
+
+    #[test]
+    fn done_messages_ignore_replayed_deltas() {
+        let mut store = DataStore::default();
+        store.replace_items(vec![Item::Assistant(super::AssistantItem {
+            id: "msg_1".into(),
+            text: std::sync::Arc::new("final".to_string()),
+            reasoning: std::sync::Arc::new(String::new()),
+            done: true,
+            version: 0,
+            last_ordinal: None,
+        })]);
+        apply(
+            &mut store,
+            "session.text.delta",
+            json!({"sessionID":"ses_1","assistantMessageID":"msg_1","ordinal":0,"delta":"dup"}),
+        );
+        apply(
+            &mut store,
+            "session.reasoning.delta",
+            json!({"sessionID":"ses_1","assistantMessageID":"msg_1","delta":"dup"}),
+        );
+        let Item::Assistant(item) = &store.items[0] else {
+            panic!()
+        };
+        assert_eq!(item.text.as_str(), "final");
+        assert_eq!(item.version, 0, "skipped mutations do not bump version");
     }
 }
