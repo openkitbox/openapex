@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol as acp;
+use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, ContentBlock,
     EmbeddedResourceResource, Implementation, InitializeRequest, InitializeResponse,
@@ -63,8 +64,10 @@ impl Bridge {
 
     /// `initialize` — echo the negotiated protocol version and advertise the
     /// v1 surface (load + image prompts; no embedded context, no MCP).
-    pub fn initialize(&self, request: InitializeRequest) -> InitializeResponse {
-        InitializeResponse::new(request.protocol_version)
+    pub fn initialize(&self, _request: InitializeRequest) -> InitializeResponse {
+        // Only ACP v1 is implemented; answering V1 (never echoing a draft v2)
+        // tells a newer client to fall back.
+        InitializeResponse::new(ProtocolVersion::V1)
             .agent_info(Implementation::new("ox", env!("CARGO_PKG_VERSION")))
             .agent_capabilities(
                 AgentCapabilities::new()
@@ -150,7 +153,12 @@ impl Bridge {
         // only `limit` + `cursor` — src/api/session.rs rejects the pair).
         let mut cursor: Option<String> = None;
         let mut first_page = true;
+        let mut pages = 0usize;
         loop {
+            pages += 1;
+            if pages > 500 {
+                return Err(internal("message history exceeds 500 pages"));
+            }
             let mut url = format!("{}/api/session/{}/message?limit=100", self.base, session);
             if let Some(cursor) = &cursor {
                 url.push_str(&format!("&cursor={cursor}"));
@@ -294,7 +302,7 @@ impl Bridge {
         if let Ok(cancels) = self.cancels.lock()
             && let Some(notify) = cancels.get(session.as_str())
         {
-            notify.notify_waiters();
+            notify.notify_one();
         }
         // Fire-and-forget: the interrupt frame on the stream is the truth;
         // an error here only means the turn already settled.
@@ -535,7 +543,8 @@ fn prompt_body(request: &PromptRequest) -> Result<Value, acp::Error> {
                 files.push(json!({
                     "data": format!("data:{};base64,{}", image.mime_type, image.data),
                     "mime": image.mime_type,
-                    "source": { "type": "file", "path": "" },
+                    // ox `FileSource` is a tagged union: inline | uri.
+                    "source": { "type": "inline" },
                 }));
             }
             ContentBlock::ResourceLink(link) => {

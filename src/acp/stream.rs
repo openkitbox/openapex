@@ -69,7 +69,7 @@ pub async fn open(
     let stream = EventStream {
         inner: FrameDecoder {
             inner: Box::pin(response.bytes_stream()),
-            buffer: String::new(),
+            buffer: Vec::new(),
             done: false,
         },
     };
@@ -95,6 +95,11 @@ impl EventStream {
     }
 }
 
+/// Index of the `\n\n` event separator, if a complete frame is buffered.
+fn find_boundary(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(2).position(|pair| pair == b"\n\n")
+}
+
 /// Parse one framed SSE event body (`data:` lines joined by newlines).
 fn decode(body: &str) -> Option<Frame> {
     let value: Value = serde_json::from_str(body).ok()?;
@@ -106,9 +111,13 @@ fn decode(body: &str) -> Option<Frame> {
 
 /// SSE framing: events are separated by blank lines; `data:` lines carry the
 /// JSON payload; comments (`: heartbeat`) and other fields are ignored.
+///
+/// The buffer is bytes, not `String`: a transport chunk can split a multibyte
+/// UTF-8 sequence, and only a complete framed event is guaranteed valid UTF-8
+/// (`data: {json}` is ASCII framing around UTF-8 payload bytes).
 struct FrameDecoder {
     inner: std::pin::Pin<Box<dyn Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
-    buffer: String,
+    buffer: Vec<u8>,
     done: bool,
 }
 
@@ -121,11 +130,20 @@ impl Stream for FrameDecoder {
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = self.get_mut();
         loop {
-            if let Some(boundary) = this.buffer.find("\n\n") {
-                let event: String = this.buffer.drain(..boundary + 2).collect();
+            if let Some(boundary) = find_boundary(&this.buffer) {
+                let event: Vec<u8> = this.buffer.drain(..boundary + 2).collect();
+                let Ok(event) = std::str::from_utf8(&event) else {
+                    // A complete frame must be valid UTF-8; junk frames are
+                    // skipped like comments (the server only writes JSON).
+                    continue;
+                };
                 let body = event
                     .lines()
-                    .filter_map(|line| line.strip_prefix("data: "))
+                    // Tolerate both `data: x` and `data:x`.
+                    .filter_map(|line| {
+                        line.strip_prefix("data: ")
+                            .or_else(|| line.strip_prefix("data:"))
+                    })
                     .collect::<Vec<_>>()
                     .join("\n");
                 return match decode(&body) {
@@ -140,15 +158,7 @@ impl Stream for FrameDecoder {
             match this.inner.as_mut().poll_next(cx) {
                 std::task::Poll::Pending => return std::task::Poll::Pending,
                 std::task::Poll::Ready(None) => this.done = true,
-                std::task::Poll::Ready(Some(Ok(chunk))) => {
-                    match std::str::from_utf8(&chunk) {
-                        Ok(text) => this.buffer.push_str(text),
-                        Err(error) => {
-                            this.done = true;
-                            return std::task::Poll::Ready(Some(Err(error.into())));
-                        }
-                    };
-                }
+                std::task::Poll::Ready(Some(Ok(chunk))) => this.buffer.extend_from_slice(&chunk),
                 std::task::Poll::Ready(Some(Err(error))) => {
                     this.done = true;
                     return std::task::Poll::Ready(Some(Err(error.into())));
