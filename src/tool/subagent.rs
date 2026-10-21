@@ -151,6 +151,21 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         Ok(description) => description,
         Err(output) => return output,
     };
+    // Optional `sessionID`: continue that child conversation instead of
+    // spawning a new one. Parsed before the depth guard; validated before
+    // any child is touched.
+    let resume_id = match input.get("sessionID") {
+        Some(Value::String(id)) if !id.trim().is_empty() => Some(id.clone()),
+        Some(Value::String(_)) | None => None,
+        Some(other) => {
+            return super::invalid_arguments(
+                "subagent",
+                &[("sessionID", format!("Expected a string, got {other}"))],
+                input,
+            );
+        }
+    };
+    let resumed = resume_id.is_some();
 
     // Nesting guard first, mirroring upstream's order: the parent's ancestor
     // count decides whether another delegation is allowed at all.
@@ -165,47 +180,69 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         ));
     }
 
-    // The child session inherits the parent's directory through the create
-    // event, exactly like `POST /api/session {parentID}`.
-    let (child_id, project_id, directory, workspace_id, subpath) =
-        match load_parent(&tool.handle.db, &ctx.session_id).await {
-            Ok(Some(parent)) => (crate::id::id("ses"), parent.0, parent.1, parent.2, parent.3),
-            Ok(None) => {
-                return fail(format!("Unknown parent session: {}", ctx.session_id));
+    // The child session: a provided `sessionID` continues that conversation
+    // (validated to exist AND be a child of the current session before it is
+    // touched); otherwise a new child is created through the same event as
+    // `POST /api/session {parentID}`, inheriting the parent's directory.
+    let child_id = if let Some(id) = resume_id {
+        match load_child_parent(&tool.handle.db, &id).await {
+            Ok(None) => return fail(format!("Subagent session not found: {id}")),
+            Ok(Some(parent)) if parent.as_deref() != Some(ctx.session_id.as_str()) => {
+                return fail(format!(
+                    "Session {id} is not a child of the current session"
+                ));
             }
-            Err(error) => return fail(format!("Unable to load parent session: {error}")),
-        };
+            Ok(Some(_)) => id,
+            Err(error) => return fail(format!("Unable to load subagent session: {error}")),
+        }
+    } else {
+        let (child_id, project_id, directory, workspace_id, subpath) =
+            match load_parent(&tool.handle.db, &ctx.session_id).await {
+                Ok(Some(parent)) => (crate::id::id("ses"), parent.0, parent.1, parent.2, parent.3),
+                Ok(None) => {
+                    return fail(format!("Unknown parent session: {}", ctx.session_id));
+                }
+                Err(error) => return fail(format!("Unable to load parent session: {error}")),
+            };
 
-    // Delegation facts ride the title and the parent link; `metadata` stays
-    // empty (upstream keeps it host-owned).
-    let created = SessionEventData::SessionCreated {
-        session_id: child_id.clone(),
-        project_id,
-        location: LocationRef {
-            directory,
-            workspace_id,
-        },
-        subpath,
-        parent_id: Some(ctx.session_id.clone()),
-        slug: crate::slug::create(),
-        title: Some(description.clone()),
-        agent: None,
-        model: None,
-        metadata: Some(SessionMetadata::default()),
-        permissions: None,
-        version: env!("CARGO_PKG_VERSION").to_owned(),
+        // Delegation facts ride the title and the parent link; `metadata`
+        // stays empty (upstream keeps it host-owned).
+        let created = SessionEventData::SessionCreated {
+            session_id: child_id.clone(),
+            project_id,
+            location: LocationRef {
+                directory,
+                workspace_id,
+            },
+            subpath,
+            parent_id: Some(ctx.session_id.clone()),
+            slug: crate::slug::create(),
+            title: Some(description.clone()),
+            agent: None,
+            model: None,
+            metadata: Some(SessionMetadata::default()),
+            permissions: None,
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        };
+        if let Err(error) = tool.handle.bus.publish(created).await {
+            return fail(format!("Unable to create child session: {error}"));
+        }
+        child_id
     };
-    if let Err(error) = tool.handle.bus.publish(created).await {
-        return fail(format!("Unable to create child session: {error}"));
-    }
 
     // Enqueue the prompt, then wake the child through the same dispatch path
     // an HTTP prompt uses.
     let message_id = crate::id::id("msg");
+    // A resumed conversation already carries the spawn context; only NEW
+    // children get the fresh-context notice.
+    let text = if resumed {
+        prompt
+    } else {
+        format!("You are a subagent spawned by another session.\n{prompt}")
+    };
     let payload = crate::schema::inbox::UserPayload {
         prompt: crate::schema::support::Prompt {
-            // Fresh-context notice: the child knows nothing about the parent.
-            text: format!("You are a subagent spawned by another session.\n{prompt}"),
+            text,
             files: None,
             agents: None,
             skills: None,
@@ -270,9 +307,7 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
             // Keep the sessionID visible: the model can resume the child.
             fail(format!("Subagent failed (sessionID: {child_id}): {error}"))
         }
-        ChildOutcome::Interrupted => {
-            fail(format!("Subagent cancelled (sessionID: {child_id})"))
-        }
+        ChildOutcome::Interrupted => fail(format!("Subagent cancelled (sessionID: {child_id})")),
     }
 }
 
@@ -339,6 +374,31 @@ async fn load_parent(db: &crate::db::Db, session_id: &str) -> Result<Option<Pare
         row.get::<Option<String>>(3)
             .map_err(|error| error.to_string())?,
     )))
+}
+
+/// The `parent_id` of a session row: the outer `None` means the session is
+/// unknown, the inner `None` that the row has no parent (a root session).
+/// A root must read as "known but parentless" so a resume target that is a
+/// root is rejected as not-a-child, not as not-found.
+async fn load_child_parent(
+    db: &crate::db::Db,
+    session_id: &str,
+) -> Result<Option<Option<String>>, String> {
+    let conn = db.acquire().await.map_err(|error| error.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT parent_id FROM session_v2 WHERE id = ?1")
+        .await
+        .map_err(|error| error.to_string())?;
+    let row = crate::db::optional(&mut stmt, (session_id,))
+        .await
+        .map_err(|error| error.to_string())?;
+    match row {
+        Some(row) => Ok(Some(
+            row.get::<Option<String>>(0)
+                .map_err(|error| error.to_string())?,
+        )),
+        None => Ok(None),
+    }
 }
 
 /// The child's settle state, decided from persisted traces only — no new

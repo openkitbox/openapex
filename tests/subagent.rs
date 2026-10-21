@@ -1,16 +1,18 @@
 //! `subagent` end to end: a parent session delegates through the tool, a
 //! child session runs its own turn against the same chat transport, and the
 //! parent's tool result folds the child's reply. A second scenario checks
-//! that a zero depth limit rejects every delegation.
+//! that a zero depth limit rejects every delegation. Two more scenarios
+//! cover `sessionID` resume: continuing the same child (no new row, no
+//! spawn prefix) and rejecting a target that is not this session's child.
 //!
-//! This binary deliberately holds ONE `#[tokio::test]` covering both
+//! This binary deliberately holds ONE `#[tokio::test]` covering all
 //! scenarios in sequence: `register_subagent` binds the process-global
 //! `runner::SUBAGENT_HANDLE` (`OnceLock`, first setter wins, and an
 //! immutable static cannot be reset), so a second test in this process
 //! would silently drive the first test's db/runner no matter how the tests
 //! were locked. The delegation scenario registers first and owns the slot;
-//! the depth-limit scenario shares that first db (the global handle points
-//! at it) and only varies the tool's own depth limit.
+//! every later scenario shares that first db (the global handle points at
+//! it) and only varies the tool's own configuration or inputs.
 
 use std::sync::{Arc, Mutex};
 
@@ -95,8 +97,9 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
         )])),
     });
     // The runner must exist so the tool can dispatch the child. Its registry
-    // needs no tools — the child replies in one turn.
-    let _state = ox::build_state_with(config.clone(), chat, ToolRegistry::new())
+    // needs no tools — the child replies in one turn. (The Arc itself stays
+    // with the test so later scenarios can queue more scripts.)
+    let _state = ox::build_state_with(config.clone(), chat.clone(), ToolRegistry::new())
         .await
         .expect("build state");
 
@@ -162,6 +165,113 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
         .unwrap()
         .expect("child row");
     assert_eq!(row.get::<String>(0).unwrap(), parent_id);
+
+    // --- resume: `sessionID` continues the same child conversation --------
+    // The resumed child needs a script for its second turn; queue it before
+    // executing so the transport hands it to that turn.
+    {
+        let mut scripts = chat.scripts.lock().expect("scripts");
+        scripts.push_back(child_reply("Resumed: continued."));
+    }
+    let ctx_resume = ox::runner::ToolContext {
+        session_id: parent_id.clone(),
+        directory: dir.path().to_path_buf(),
+        call_id: "call_sub_resume".to_owned(),
+        cancellation: tokio_util::sync::CancellationToken::new(),
+    };
+    let output_resume = tool
+        .execute(
+            ctx_resume,
+            json!({
+                "description": "follow-up",
+                "prompt": "Second question.",
+                "sessionID": child_id,
+            }),
+        )
+        .await;
+
+    assert_eq!(output_resume.error, None, "{output_resume:?}");
+    let resume_text = output_resume.content.as_str().expect("resume text");
+    assert!(
+        resume_text.contains("Resumed: continued.") && resume_text.contains("state=\"completed\""),
+        "{resume_text}"
+    );
+    let resume_metadata = output_resume.metadata.expect("resume metadata");
+    assert_eq!(resume_metadata["sessionID"].as_str(), Some(child_id));
+
+    // The resume did NOT create another child row under the parent.
+    let conn = db.acquire().await.unwrap();
+    let mut stmt = conn
+        .prepare("SELECT COUNT(*) FROM session_v2 WHERE parent_id = ?1")
+        .await
+        .unwrap();
+    let row = ox::db::optional(&mut stmt, (parent_id.clone(),))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 1);
+
+    // The resumed prompt reached the SAME child transcript.
+    let mut stmt = conn
+        .prepare(
+            "SELECT COUNT(*) FROM session_message \
+             WHERE session_id = ?1 AND data LIKE '%Second question.%'",
+        )
+        .await
+        .unwrap();
+    let row = ox::db::optional(&mut stmt, (child_id,))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.get::<i64>(0).unwrap() >= 1, "resumed prompt missing");
+    drop(stmt);
+    drop(conn);
+
+    // --- resume rejects a session that is not this session's child --------
+    // An unrelated root session in the same db: known, but parentless, so
+    // it can never pass the child-of-current-session check.
+    let other = "ses_other".to_owned();
+    bus.publish(ox::schema::event::SessionEventData::SessionCreated {
+        session_id: other.clone(),
+        project_id: "proj_test".to_owned(),
+        location: ox::schema::support::LocationRef {
+            directory: dir.path().to_string_lossy().to_string(),
+            workspace_id: None,
+        },
+        subpath: None,
+        parent_id: None,
+        slug: ox::slug::create(),
+        title: Some("unrelated".to_owned()),
+        agent: None,
+        model: None,
+        metadata: None,
+        permissions: None,
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+    })
+    .await
+    .unwrap();
+
+    let ctx_other = ox::runner::ToolContext {
+        session_id: parent_id.clone(),
+        directory: dir.path().to_path_buf(),
+        call_id: "call_sub_other".to_owned(),
+        cancellation: tokio_util::sync::CancellationToken::new(),
+    };
+    let output_other = tool
+        .execute(
+            ctx_other,
+            json!({
+                "description": "x",
+                "prompt": "y",
+                "sessionID": other,
+            }),
+        )
+        .await;
+    let error = output_other.error.expect("rejected");
+    assert!(
+        error.contains("is not a child of the current session"),
+        "{error}"
+    );
 
     // --- depth limit: a zero limit rejects every delegation ---------------
     // This scenario runs second in the SAME process, so `register_subagent`
