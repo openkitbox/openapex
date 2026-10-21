@@ -49,9 +49,7 @@ impl Palette {
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
                 warn: Style::default().fg(Color::Red),
-                highlight: Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan),
+                highlight: Style::default().fg(Color::Black).bg(Color::Cyan),
             },
             Deck::NoColor => Self {
                 text: Style::default(),

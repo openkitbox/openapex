@@ -126,7 +126,14 @@ fn display_width(line: &Line<'_>) -> usize {
 }
 
 fn short_session(session: &str) -> String {
-    let tail: String = session.chars().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: String = session
+        .chars()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     tail
 }
 

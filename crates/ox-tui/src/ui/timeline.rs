@@ -366,9 +366,7 @@ fn render_block(block: &Block, width: u16) -> Vec<Line<'static>> {
             "▌ you",
             text,
             width,
-            palette
-                .accent
-                .add_modifier(Modifier::BOLD),
+            palette.accent.add_modifier(Modifier::BOLD),
         ),
         Block::Assistant {
             text,
@@ -386,10 +384,7 @@ fn render_block(block: &Block, width: u16) -> Vec<Line<'static>> {
             ))];
             if !reasoning.is_empty() {
                 lines.push(Line::from(Span::styled(
-                    format!(
-                        "  ▸ reasoning · {} chars 已折叠",
-                        reasoning.chars().count()
-                    ),
+                    format!("  ▸ reasoning · {} chars 已折叠", reasoning.chars().count()),
                     palette.dim,
                 )));
             }
@@ -448,7 +443,9 @@ mod tests {
     #[test]
     fn set_query_jumps_the_viewport_to_the_first_match() {
         let mut t = Transcript::new(20, 3);
-        let blocks: Vec<_> = (0..30).map(|i| Block::user(&format!("row {i} needle"))).collect();
+        let blocks: Vec<_> = (0..30)
+            .map(|i| Block::user(&format!("row {i} needle")))
+            .collect();
         t.sync(&blocks, 0);
         t.set_query("needle");
         // sticky was on (tail); a search must take the viewport to the match.
@@ -465,11 +462,13 @@ mod tests {
         t.set_query("hit");
         let backend = TestBackend::new(20, 4);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| t.render(frame, frame.area())).unwrap();
+        terminal
+            .draw(|frame| t.render(frame, frame.area()))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         let hit = (0..4)
             .flat_map(|y| (0..20).map(move |x| (x, y)))
-            .find(|(x, y)| buffer[( *x, *y)].symbol() == "h")
+            .find(|(x, y)| buffer[(*x, *y)].symbol() == "h")
             .expect("the hit line is on screen");
         assert!(
             buffer[hit].bg.is_some() || buffer[hit].modifier.contains(Modifier::REVERSED),
