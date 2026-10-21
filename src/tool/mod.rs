@@ -34,7 +34,7 @@ pub mod shell;
 pub mod skill;
 pub mod skills;
 pub mod subagent;
-pub mod todo;
+pub mod todowrite;
 pub mod web_search;
 pub mod webfetch;
 pub mod write;
@@ -71,16 +71,16 @@ impl ToolRegistry {
     }
 }
 
-/// The `todo` tool, registered ON TOP of `with_builtins` at app-wiring time.
+/// The `todowrite` tool, registered ON TOP of `with_builtins` at app-wiring time.
 impl ToolRegistry {
-    /// Register the session todo tool. Separate from
-    /// [`ToolRegistry::with_builtins`] for the same reason as the
-    /// magic-context tools: it stores its state in the `kv` table, which only
-    /// exists once the database is open. Unlike those tools it is always
-    /// advertised — tracking a task list needs no configuration.
-    pub fn register_todo(&mut self, db: Db) {
+    /// Register the session todowrite tool. Separate from
+    /// [`ToolRegistry::with_builtins`] because it holds a [`Db`] handle (the
+    /// reminder budget reset and the reminder's transcript scan), which only
+    /// exists once the database is open. Always advertised: upstream gates it
+    /// behind `experimental.todo`, a config surface ox does not have.
+    pub fn register_todowrite(&mut self, db: Db) {
         self.register_all(vec![
-            Arc::new(crate::tool::todo::TodoTool::new(db)) as Arc<dyn Tool>
+            Arc::new(crate::tool::todowrite::TodoWriteTool::new(db)) as Arc<dyn Tool>,
         ]);
     }
 }

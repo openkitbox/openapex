@@ -1609,21 +1609,22 @@ async fn tool_flow_executes_and_continues_with_results() {
 }
 
 #[tokio::test]
-async fn todo_metadata_reaches_the_client_on_the_tool_part() {
-    // The todo tool keeps its state in its own `kv` row, so a throwaway DB is
-    // enough: what this asserts is the *transport* — metadata set by the tool
-    // survives `session.tool.success`, the projector and the message endpoint.
+async fn todowrite_state_reaches_the_client_on_the_tool_part() {
+    // What the stock TUI renders with no plugin: the inline `# Todos` block
+    // and the built-in sidebar both read `state.input.todos` of the newest
+    // completed todowrite call (packages/tui `sessionTodos`); metadata carries
+    // the same list for other clients.
     let db = ox::db::Db::open_in_memory().await.expect("todo db");
     let mut registry = ToolRegistry::new();
     registry
-        .register(Arc::new(ox::tool::todo::TodoTool::new(db)))
-        .expect("register todo");
+        .register(Arc::new(ox::tool::todowrite::TodoWriteTool::new(db)))
+        .expect("register todowrite");
     let harness = Harness::spawn_with(
         vec![
             MockChat::tool_turn(
                 "call_1",
-                "todo",
-                r#"{"op":"init","list":[{"phase":"Investigate","items":["read","grep"]},{"phase":"Fix","items":["edit"]}]}"#,
+                "todowrite",
+                r#"{"todos":[{"content":"read","status":"completed"},{"content":"write","status":"cancelled"},{"content":"test","status":"completed"}]}"#,
             ),
             MockChat::text("done"),
         ],
@@ -1649,36 +1650,26 @@ async fn todo_metadata_reaches_the_client_on_the_tool_part() {
         .as_array()
         .expect("parts")
         .iter()
-        .find(|p| p["type"] == "tool" && p["name"] == "todo")
-        .expect("todo tool part")
+        .find(|p| p["type"] == "tool" && p["name"] == "todowrite")
+        .expect("todowrite tool part")
         .clone();
     assert_eq!(part["state"]["status"], "completed");
 
-    // The structured list a TUI plugin renders (plugins/ox-todo reads exactly
-    // this): phases → tasks with the full ox status set and blocker notes.
-    let phases = part["state"]["metadata"]["phases"]
-        .as_array()
-        .expect("metadata.phases");
-    assert_eq!(phases.len(), 2, "{phases:?}");
-    assert_eq!(phases[0]["name"], "Investigate");
-    assert_eq!(
-        phases[0]["tasks"],
-        json!([
-            { "content": "read", "status": "in_progress" },
-            { "content": "grep", "status": "pending" }
-        ])
-    );
-    assert_eq!(
-        phases[1]["tasks"],
-        json!([{ "content": "edit", "status": "pending" }])
-    );
-
-    // The rendered text the model reads carries the same list.
+    // No `pending`/`in_progress` items above: an open list would re-arm the
+    // completion reminder, whose synthetic steer would consume another mock
+    // turn inside this execution (covered by the todo_reminder suite).
+    let todos = json!([
+        { "content": "read", "status": "completed" },
+        { "content": "write", "status": "cancelled" },
+        { "content": "test", "status": "completed" }
+    ]);
+    // The TUI dependency surface: input echoed verbatim on the settled part.
+    assert_eq!(part["state"]["input"]["todos"], todos);
+    assert_eq!(part["state"]["metadata"]["todos"], todos);
     let text = part["state"]["content"][0]["text"]
         .as_str()
         .expect("output text");
-    assert!(text.contains("  Investigate:"), "{text}");
-    assert!(text.contains("Overall: 0/3 done, 3 open."), "{text}");
+    assert_eq!(text, "Todos updated: 2/3 completed, 1 cancelled");
 }
 
 #[tokio::test]
