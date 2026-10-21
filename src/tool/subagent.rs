@@ -85,15 +85,10 @@ impl Tool for SubagentTool {
     fn definition(&self) -> ToolDef {
         ToolDef::function(
             "subagent",
-            "Spawn a child session, delegate a prompt to it, and wait for its final reply. The \
-             child has its own context window and transcript; only its final message returns to \
-             this conversation.\n\n\
-             When to use: an isolated research or exploration burst whose intermediate steps \
-             would flood this context (read a broad area, then summarize), or an independent \
-             subtask that needs the full toolkit but not this conversation's history.\n\
-             When NOT to use: a question a single read or grep answers (do it directly), work \
-             that needs the parent's context, or several rounds of back-and-forth — the child \
-             gets one prompt and answers once.",
+            "Spawn a child session, delegate a prompt to it, and wait for its final reply. The child has its own context window and transcript; only its final message returns to this conversation. The output includes a sessionID you can pass back later to continue that specific conversation with the subagent. New child sessions start with fresh context, so include all relevant context and instructions when you don't pass a sessionID.\n\n\
+             Foreground (default) runs the subagent to completion and returns its result. Background mode (background=true) launches it asynchronously and returns immediately; ox notifies you in this conversation when it finishes. Use background only for independent work that can run while you continue elsewhere.\n\n\
+             When to use: an isolated research or exploration burst whose intermediate steps would flood this context (read a broad area, then summarize), or an independent subtask that needs the full toolkit but not this conversation's history.\n\
+             When NOT to use: a question a single read or grep answers (do it directly), work that needs the parent's context, or several rounds of back-and-forth — the child gets one prompt and answers once.",
             object_param(
                 vec![
                     (
@@ -108,6 +103,20 @@ impl Tool for SubagentTool {
                         param(
                             "string",
                             "Short label for this delegation, shown in the transcript.",
+                        ),
+                    ),
+                    (
+                        "sessionID",
+                        param(
+                            "string",
+                            "Continue a specific previous subagent conversation by passing its sessionID. Calls without a sessionID start a new conversation.",
+                        ),
+                    ),
+                    (
+                        "background",
+                        param(
+                            "boolean",
+                            "Run the subagent in the background and return immediately. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress.",
                         ),
                     ),
                 ],
@@ -166,6 +175,7 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         }
     };
     let resumed = resume_id.is_some();
+    let background = matches!(input.get("background"), Some(Value::Bool(true)));
 
     // Nesting guard first, mirroring upstream's order: the parent's ancestor
     // count decides whether another delegation is allowed at all.
@@ -264,6 +274,30 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         return fail(format!("Unable to start child session: {error}"));
     }
 
+    if background {
+        // The watcher outlives this turn by design: the child keeps working
+        // and the parent is woken when it settles.
+        spawn_completion_watcher(
+            tool.handle.clone(),
+            ctx.session_id.clone(),
+            child_id.clone(),
+            description.clone(),
+        );
+        return ok_text(format!(
+            "The subagent is working in the background (sessionID: {child_id}). \
+             You will be notified automatically when it finishes.\n\
+             DO NOT sleep, poll for progress, ask the subagent for status, or duplicate \
+             this subagent's work; avoid working with the same files or topics it is using.\n\
+             Work on non-overlapping tasks, or briefly tell the user what you launched and \
+             end your response."
+        ))
+        .with_metadata(json!({
+            "sessionID": child_id,
+            "status": "running",
+            "description": description,
+        }));
+    }
+
     // Wait for the child to settle (or the parent's turn to be interrupted —
     // the child is cancelled with it, so nothing keeps running). Upstream has
     // no timeout here: a foreground subagent waits indefinitely and only the
@@ -313,6 +347,97 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
 
 /// `(project_id, directory, workspace_id, subpath)` of a session row.
 type ParentTuple = (String, String, Option<String>, Option<String>);
+
+/// Watch a background child and, when it settles, hand its result to the
+/// parent as a synthetic message — which also wakes the parent for a new turn
+/// (or steers it if it is already busy; `Runner::dispatch` coalesces).
+///
+/// Detached on purpose: the parent's turn is over, the child keeps working.
+/// Nothing here is persisted, so a server restart loses the notification
+/// (crash recovery is out of scope).
+fn spawn_completion_watcher(
+    handle: std::sync::Arc<SubagentHandle>,
+    parent_id: String,
+    child_id: String,
+    description: String,
+) {
+    tokio::spawn(async move {
+        let runner = handle.runner();
+        // Poll only the process-local active set — the DB is not touched
+        // until the child has settled.
+        while runner.is_active(&child_id) {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let Ok(history) = crate::runner::step::load_history(&handle.db, &child_id).await else {
+            tracing::warn!(child = %child_id, "subagent finished but its transcript is unreadable; dropping notification");
+            return;
+        };
+        let outcome = child_outcome(&history);
+        let state = match outcome {
+            ChildOutcome::Completed => "completed",
+            ChildOutcome::Failed(_) => "error",
+            ChildOutcome::Interrupted => "cancelled",
+        };
+        // The parent may have been deleted while the child ran; the check
+        // must precede the publish (a dead parent cannot receive).
+        match load_parent(&handle.db, &parent_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                tracing::warn!(parent = %parent_id, child = %child_id, "parent session gone; dropping subagent completion");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(parent = %parent_id, error = %error, "unable to check parent session; dropping subagent completion");
+                return;
+            }
+        }
+        let text = match outcome {
+            ChildOutcome::Completed => final_text(&history)
+                .unwrap_or_else(|| "Subagent completed without a text response.".to_owned()),
+            ChildOutcome::Failed(error) => format!("Subagent failed: {error}"),
+            ChildOutcome::Interrupted => "Subagent cancelled".to_owned(),
+        };
+        let wrapper = format!(
+            "<subagent sessionID=\"{child_id}\" state=\"{state}\" description=\"{description}\">\n{text}\n</subagent>"
+        );
+        let inbox_id = crate::id::id("msg");
+        let item = crate::schema::inbox::Item::Synthetic {
+            payload: crate::schema::inbox::SyntheticPayload {
+                text: wrapper,
+                description: Some(description),
+                metadata: Some(record(&[
+                    ("source", json!("subagent")),
+                    ("childID", json!(child_id)),
+                    ("state", json!(state)),
+                ])),
+            },
+            delivery: crate::schema::inbox::Delivery::Steer,
+        };
+        if let Err(error) = handle
+            .bus
+            .publish(SessionEventData::InboxEnqueued {
+                session_id: parent_id.clone(),
+                inbox_id: inbox_id.clone(),
+                item,
+            })
+            .await
+        {
+            tracing::warn!(parent = %parent_id, child = %child_id, error = %error, "unable to enqueue subagent completion");
+            return;
+        }
+        if let Err(error) = runner.dispatch(&parent_id, &inbox_id).await {
+            tracing::warn!(parent = %parent_id, child = %child_id, error = %error, "unable to wake parent for subagent completion");
+        }
+    });
+}
+
+/// A `Record` from literal pairs (the schema's metadata map).
+fn record(pairs: &[(&str, serde_json::Value)]) -> crate::schema::support::Record {
+    pairs
+        .iter()
+        .map(|(key, value)| ((*key).to_owned(), value.clone()))
+        .collect()
+}
 
 /// Ancestor hops from `session_id` up the `parent_id` chain. A root session is
 /// `0`; an unknown session is also `0` (nothing to nest under). A chain that
@@ -430,6 +555,28 @@ fn child_outcome(messages: &[crate::schema::message::Message]) -> ChildOutcome {
                 .unwrap_or_else(|| "unknown error".to_owned()),
         ),
     }
+}
+
+/// The newest completed assistant text, whole (no preview) — the notification
+/// body for background completions, matching upstream's completion text.
+fn final_text(messages: &[crate::schema::message::Message]) -> Option<String> {
+    use crate::schema::message::{AssistantContent, Message};
+    messages.iter().rev().find_map(|message| match message {
+        Message::Assistant(assistant) if assistant.error.is_none() => {
+            let parts: Vec<&str> = assistant
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    AssistantContent::Text { text, .. } if !text.trim().is_empty() => {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            (!parts.is_empty()).then(|| parts.join("\n\n"))
+        }
+        _ => None,
+    })
 }
 
 /// The child's reply for the parent: every assistant text message joined
@@ -560,6 +707,13 @@ mod tests {
             super::child_outcome(&failed),
             super::ChildOutcome::Failed("boom".to_owned())
         );
+    }
+
+    #[test]
+    fn final_text_takes_the_newest_nonempty_assistant_text() {
+        let history = vec![assistant_text("old"), assistant_text("newest")];
+        assert_eq!(super::final_text(&history).as_deref(), Some("newest"));
+        assert_eq!(super::final_text(&[]).as_deref(), None);
     }
 
     #[test]
