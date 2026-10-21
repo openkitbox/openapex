@@ -63,6 +63,12 @@ impl Composer {
     }
 }
 
+impl Default for Composer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// The `/` prompt. Lives beside the composer (which keeps its draft) and only
 /// exists while the search is being typed.
 pub enum SearchAction {
@@ -100,6 +106,12 @@ impl SearchBox {
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
         frame.render_widget(&self.textarea, area);
+    }
+}
+
+impl Default for SearchBox {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

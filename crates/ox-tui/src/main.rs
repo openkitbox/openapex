@@ -118,9 +118,8 @@ async fn main() -> anyhow::Result<()> {
                                     });
                                 }
                                 Err(err) => {
-                                    let _ = tx.send(app::event::AppEvent::SessionFailed(
-                                        err.to_string(),
-                                    ));
+                                    let _ = tx
+                                        .send(app::event::AppEvent::SessionFailed(err.to_string()));
                                 }
                             }
                         }
@@ -142,10 +141,8 @@ async fn main() -> anyhow::Result<()> {
                                     let mut messages = page.data;
                                     messages.reverse(); // desc → chronological
                                     let items = ox_client::history::parse_messages(&messages);
-                                    let _ = tx.send(app::event::AppEvent::History {
-                                        request_id,
-                                        items,
-                                    });
+                                    let _ = tx
+                                        .send(app::event::AppEvent::History { request_id, items });
                                 }
                                 Err(err) => tracing::warn!(%err, "history reload failed"),
                             }

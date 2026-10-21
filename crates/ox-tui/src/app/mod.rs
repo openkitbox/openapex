@@ -139,9 +139,10 @@ impl App {
         let request_id = self.next_reload_id;
         self.next_reload_id += 1;
         self.pending_reload = Some(request_id);
-        let _ = self
-            .commands
-            .send(AppCommand::ReloadHistory { session, request_id });
+        let _ = self.commands.send(AppCommand::ReloadHistory {
+            session,
+            request_id,
+        });
     }
 
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
@@ -354,13 +355,11 @@ impl App {
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    if let Some(frames) = script.as_mut() {
-                        if let Some(raw) = frames.next() {
-                            if let Ok(envelope) = serde_json::from_value::<ox_schema::event::EventEnvelope<serde_json::Value>>(raw) {
+                    if let Some(frames) = script.as_mut()
+                        && let Some(raw) = frames.next()
+                            && let Ok(envelope) = serde_json::from_value::<ox_schema::event::EventEnvelope<serde_json::Value>>(raw) {
                                 self.handle_stream(StreamMsg::Event(Box::new(envelope)));
                             }
-                        }
-                    }
                     if self.dirty {
                         self.dirty = false;
                         match self.route {
@@ -462,7 +461,10 @@ mod tests {
             other => panic!("unexpected command: {other:?}"),
         }
         assert_eq!(app.route, Route::Home);
-        assert!(app.composer.is_empty(), "the draft moves to the pending prompt");
+        assert!(
+            app.composer.is_empty(),
+            "the draft moves to the pending prompt"
+        );
         assert_eq!(app.pending_home_prompt.as_deref(), Some("hi"));
     }
 

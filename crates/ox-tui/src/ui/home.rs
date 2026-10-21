@@ -137,7 +137,12 @@ fn clamp_to(area: Rect, rect: Rect) -> Option<Rect> {
 }
 
 /// 整屏渲染：logo 块 + 1 行空 + composer，垂直居中于内容列。
-pub fn render(frame: &mut ratatui::Frame, area: Rect, composer: &mut Composer, error: Option<&str>) {
+pub fn render(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    composer: &mut Composer,
+    error: Option<&str>,
+) {
     let pal = theme::palette();
     let col = column_rect(area);
     let logo = logo_lines(area.width, area.height, *pal);
