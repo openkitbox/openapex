@@ -133,10 +133,7 @@ mod tests {
     #[test]
     fn text_without_a_section_sign_is_borrowed_and_byte_identical() {
         let text = "99 files  Actually executing now. Running fmt:";
-        assert!(matches!(
-            strip_copied_tag_notation(text),
-            Cow::Borrowed(_)
-        ));
+        assert!(matches!(strip_copied_tag_notation(text), Cow::Borrowed(_)));
         assert_eq!(strip_copied_tag_notation(text), text);
     }
 
@@ -145,10 +142,7 @@ mod tests {
         // The fast path must never change bytes: upstream's guarded wrapper
         // behaves the same (its raw function would trim, its wrapper does not).
         assert_eq!(strip_copied_tag_notation("   "), "   ");
-        assert!(matches!(
-            strip_copied_tag_notation("   "),
-            Cow::Borrowed(_)
-        ));
+        assert!(matches!(strip_copied_tag_notation("   "), Cow::Borrowed(_)));
     }
 
     #[test]
@@ -211,10 +205,7 @@ mod tests {
     #[test]
     fn degree_sign_is_not_a_section_sign() {
         let text = "2030  2030  2030° Run clippy";
-        assert!(matches!(
-            strip_copied_tag_notation(text),
-            Cow::Borrowed(_)
-        ));
+        assert!(matches!(strip_copied_tag_notation(text), Cow::Borrowed(_)));
         assert_eq!(strip(text), text);
     }
 
