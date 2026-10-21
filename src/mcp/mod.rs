@@ -4,3 +4,5 @@
 // ox-mcp plan; until then they are only exercised by their own tests.
 #[allow(dead_code)]
 pub(crate) mod jsonrpc;
+#[allow(dead_code)]
+pub(crate) mod transport;
