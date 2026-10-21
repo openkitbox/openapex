@@ -31,9 +31,9 @@ use crate::tool::todowrite;
 /// The reference's `todo.remindersMax` default (`settings.ts:387`).
 const MAX_REMINDERS: u32 = 3;
 
-/// `kv` key for the per-session reminder counter. Distinct from the list's own
-/// `todo:{sessionID}` row so clearing the list and resetting the budget stay
-/// independent writes.
+/// `kv` key for the per-session reminder counter. The list itself is not
+/// stored server-side — `todowrite` echoes and the TUI reads the transcript —
+/// so this counter is the only todo-related kv row left.
 fn count_key(session_id: &str) -> String {
     format!("todo:reminders:{session_id}")
 }
