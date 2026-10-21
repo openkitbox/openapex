@@ -25,6 +25,11 @@ const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 /// message, matching the compaction preview budget.
 const MESSAGE_PREVIEW_CHARS: usize = 400;
 
+/// Model-facing text when the parent's turn is interrupted while it waits.
+/// Deliberately NOT `question`'s sentinel: no question was cancelled here, and
+/// borrowing its text whitewashed the trajectory.
+const CANCELLED_SENTINEL: &str = "(subagent cancelled by user interrupt)";
+
 /// The pieces of the runner the tool drives a child session through. The
 /// runner installs itself here at startup ([`Runner::register_subagent`]), so
 /// the tool never holds the runner that holds the tool.
@@ -214,7 +219,7 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         () = wait => {}
         () = ctx.cancellation.cancelled() => {
             runner.interrupt(&child_id);
-            return fail(crate::tool::question::CANCELLED_SENTINEL);
+            return fail(CANCELLED_SENTINEL);
         }
         _ = tokio::time::sleep(TIMEOUT) => {
             runner.interrupt(&child_id);
@@ -300,4 +305,19 @@ fn preview(text: &str) -> String {
         return format!("{}…", &text[..end]);
     }
     text.to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn cancelled_sentinel_is_not_the_question_one() {
+        assert_ne!(
+            super::CANCELLED_SENTINEL,
+            crate::tool::question::CANCELLED_SENTINEL
+        );
+        assert_eq!(
+            super::CANCELLED_SENTINEL,
+            "(subagent cancelled by user interrupt)"
+        );
+    }
 }
