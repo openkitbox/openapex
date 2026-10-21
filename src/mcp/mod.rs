@@ -7,4 +7,6 @@ pub(crate) mod client;
 #[allow(dead_code)]
 pub(crate) mod jsonrpc;
 #[allow(dead_code)]
+pub(crate) mod tool;
+#[allow(dead_code)]
 pub(crate) mod transport;
