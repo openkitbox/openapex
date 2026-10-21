@@ -226,10 +226,12 @@ fn stop(mut child: Child) {
     let _ = child.wait();
 }
 
-/// Wait until `GET /api/info` answers on `base`.
+/// Wait until `GET /api/info` answers on `base`. Booting an ox server runs the
+/// migrations and builds the FTS indexes, which can take several seconds under
+/// a parallel `cargo test` load — hence the generous window.
 async fn wait_ready(base: &str) {
     let client = reqwest::Client::new();
-    for _ in 0..60 {
+    for _ in 0..600 {
         if client.get(format!("{base}/api/info")).send().await.is_ok() {
             return;
         }
@@ -241,6 +243,20 @@ async fn wait_ready(base: &str) {
 async fn free_port() -> u16 {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     listener.local_addr().unwrap().port()
+}
+
+/// Port allocation plus boot must be serialized: `free_port` releases the
+/// listener, so two tests running in parallel can otherwise be handed the same
+/// port and the second server dies on bind (symptom: `never became ready`).
+static BOOT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Boot a real ox server on a freshly allocated port and wait until it answers.
+async fn boot_ox(db: &str, cardinal: Option<&str>) -> (String, Child) {
+    let _guard = BOOT.lock().await;
+    let listen = format!("127.0.0.1:{}", free_port().await);
+    let server = spawn_ox(&listen, db, cardinal);
+    wait_ready(&format!("http://{listen}")).await;
+    (listen, server)
 }
 
 #[tokio::test]
@@ -267,9 +283,7 @@ async fn initialize_answers_in_own_mode_and_logs_off_stdout() {
 async fn initialize_attaches_to_a_running_server_without_binding() {
     let dir = temp_db();
     let db = dir.path().join("ox.db").display().to_string();
-    let listen = format!("127.0.0.1:{}", free_port().await);
-    let server = spawn_ox(&listen, &db, None);
-    wait_ready(&format!("http://{listen}")).await;
+    let (listen, server) = boot_ox(&db, None).await;
 
     let (mut child, frames) =
         spawn_acp(&[("OX_LISTEN", listen.as_str()), ("OX_DB_PATH", db.as_str())]);
@@ -291,9 +305,7 @@ async fn scripted_session_streams_chunks_and_settles_end_turn() {
         ChatMode::Text,
     )
     .await;
-    let listen = format!("127.0.0.1:{}", free_port().await);
-    let server = spawn_ox(&listen, &db, Some(&cardinal));
-    wait_ready(&format!("http://{listen}")).await;
+    let (listen, server) = boot_ox(&db, Some(&cardinal)).await;
 
     let (mut child, frames) =
         spawn_acp(&[("OX_LISTEN", listen.as_str()), ("OX_DB_PATH", db.as_str())]);
@@ -409,9 +421,7 @@ async fn tool_call_streams_card_and_completes() {
         ChatMode::ToolCall,
     )
     .await;
-    let listen = format!("127.0.0.1:{}", free_port().await);
-    let server = spawn_ox(&listen, &db, Some(&cardinal));
-    wait_ready(&format!("http://{listen}")).await;
+    let (listen, server) = boot_ox(&db, Some(&cardinal)).await;
     std::fs::write("/tmp/acp-tool-test.txt", "tool fixture\n").expect("fixture");
 
     let (mut child, frames) =
@@ -482,9 +492,7 @@ async fn cancel_interrupts_a_running_turn() {
         ChatMode::Slow,
     )
     .await;
-    let listen = format!("127.0.0.1:{}", free_port().await);
-    let server = spawn_ox(&listen, &db, Some(&cardinal));
-    wait_ready(&format!("http://{listen}")).await;
+    let (listen, server) = boot_ox(&db, Some(&cardinal)).await;
 
     let (mut child, frames) =
         spawn_acp(&[("OX_LISTEN", listen.as_str()), ("OX_DB_PATH", db.as_str())]);
@@ -535,9 +543,7 @@ async fn cancel_interrupts_a_running_turn() {
 async fn set_mode_switches_the_ox_agent() {
     let dir = temp_db();
     let db = dir.path().join("ox.db").display().to_string();
-    let listen = format!("127.0.0.1:{}", free_port().await);
-    let server = spawn_ox(&listen, &db, None);
-    wait_ready(&format!("http://{listen}")).await;
+    let (listen, server) = boot_ox(&db, None).await;
 
     let (mut child, frames) =
         spawn_acp(&[("OX_LISTEN", listen.as_str()), ("OX_DB_PATH", db.as_str())]);
