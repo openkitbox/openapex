@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ox-schema"]
+members = ["crates/ox-schema", "crates/ox-client"]
 resolver = "2"
 
 [package]

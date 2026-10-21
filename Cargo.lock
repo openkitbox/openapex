@@ -2591,6 +2591,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ox-client"
+version = "0.1.0"
+dependencies = [
+ "ox-schema",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "ox-schema"
 version = "0.1.0"
 dependencies = [
