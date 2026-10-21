@@ -179,6 +179,12 @@ pub enum ChatMessage {
         content: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_calls: Option<Vec<ToolCall>>,
+        /// Reasoning text replayed from the row's reasoning parts. Thinking
+        /// vendors (GLM/Z.ai `reasoningField: "reasoning_content"`, Kimi)
+        /// reject follow-up turns that omit it; absent when the turn carries
+        /// none — plain-chat providers must not see the key at all.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_content: Option<String>,
     },
     /// A tool result for a prior [`ToolCall::id`].
     Tool {
@@ -207,6 +213,7 @@ impl ChatMessage {
         Self::Assistant {
             content: Some(content.into()),
             tool_calls: None,
+            reasoning_content: None,
         }
     }
 
@@ -215,6 +222,7 @@ impl ChatMessage {
         Self::Assistant {
             content: None,
             tool_calls: Some(tool_calls),
+            reasoning_content: None,
         }
     }
 
@@ -401,6 +409,21 @@ mod tests {
             value,
             json!({"role": "assistant", "content": "done"}),
             "tool_calls must be absent, not null, for plain assistant turns"
+        );
+    }
+
+    #[test]
+    fn assistant_reasoning_content_replays_only_when_present() {
+        let message = ChatMessage::Assistant {
+            content: None,
+            tool_calls: None,
+            reasoning_content: Some("thought hard".to_owned()),
+        };
+        let value = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            value,
+            json!({"role": "assistant", "content": null, "reasoning_content": "thought hard"}),
+            "thinking vendors 400 without reasoning_content; tool_calls stays absent"
         );
     }
 

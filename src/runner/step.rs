@@ -1267,7 +1267,9 @@ async fn latest_seq(db: &crate::db::Db, session_id: &str) -> Result<i64> {
 /// - `synthetic`/`skill` → user-role text.
 /// - `system`   → `{role: "system", content}` (to-llm-message.ts:291).
 /// - `assistant` → `{role: "assistant", content: text parts joined,
-///   tool_calls: the row's tool parts}`; reasoning content is dropped.
+///   tool_calls: the row's tool parts, reasoning_content: reasoning parts
+///   joined}`; `reasoning_content` is omitted when the row has no reasoning
+///   (upstream `lowerAssistantMessage`).
 /// - A settled assistant tool part (`completed`/`error`, `executed: false`)
 ///   additionally becomes `{role: "tool", tool_call_id, content}` — joined
 ///   JSON content for completed calls, `{error: …}` for failed ones
@@ -1332,13 +1334,22 @@ pub(crate) fn build_chat_messages(
             }),
             Message::Assistant(assistant) => {
                 let mut parts: Vec<String> = Vec::new();
+                let mut reasoning: Vec<String> = Vec::new();
                 let mut tool_calls: Vec<ToolCall> = Vec::new();
                 let mut tool_results: Vec<ChatMessage> = Vec::new();
                 for content in &assistant.content {
                     match content {
                         AssistantContent::Text { text, .. } => parts.push(text.clone()),
-                        // Reasoning is dropped (upstream's provider-bound
-                        // state replay has no ox wire counterpart yet).
+                        // Replayed verbatim as `reasoning_content`: thinking
+                        // vendors (GLM/Z.ai, Kimi) 400 follow-up turns without
+                        // it (upstream `lowerAssistantMessage` replays the same
+                        // joined text). Replayed regardless of the row's model
+                        // — upstream degrades cross-model reasoning to text
+                        // (to-llm-message.ts `sameModel`); ox has no
+                        // per-provider gate, cardinal owns dialects.
+                        AssistantContent::Reasoning { text, .. } if !text.is_empty() => {
+                            reasoning.push(text.clone())
+                        }
                         AssistantContent::Reasoning { .. } => {}
                         AssistantContent::Tool {
                             id,
@@ -1373,7 +1384,10 @@ pub(crate) fn build_chat_messages(
                         }
                     }
                 }
-                if parts.is_empty() && tool_calls.is_empty() {
+                // A reasoning-only row still carries its reasoning_content on
+                // the wire (upstream `meaningful` keeps it) — dropping the row
+                // would 400 thinking vendors on the next turn.
+                if parts.is_empty() && tool_calls.is_empty() && reasoning.is_empty() {
                     continue;
                 }
                 out.push(ChatMessage::Assistant {
@@ -1386,6 +1400,11 @@ pub(crate) fn build_chat_messages(
                         None
                     } else {
                         Some(tool_calls)
+                    },
+                    reasoning_content: if reasoning.is_empty() {
+                        None
+                    } else {
+                        Some(reasoning.join(""))
                     },
                 });
                 out.extend(tool_results);
@@ -1711,6 +1730,110 @@ mod tests {
                 skills: None,
             },
         }
+    }
+
+    fn assistant_row(id: &str, content: Vec<AssistantContent>) -> Message {
+        Message::Assistant(Box::new(AssistantMessage {
+            id: id.to_owned(),
+            metadata: None,
+            time: AssistantTime {
+                created: 2,
+                streamed: None,
+                completed: Some(3),
+            },
+            agent: "build".to_owned(),
+            model: ModelRef {
+                id: "m".to_owned(),
+                provider_id: "p".to_owned(),
+                variant: None,
+            },
+            content,
+            snapshot: None,
+            finish: None,
+            tokens: None,
+            error: None,
+            cost: None,
+            raw_finish: None,
+            provider_state: None,
+            retry: None,
+        }))
+    }
+
+    // Thinking vendors (GLM/Z.ai, Kimi) reject replayed assistant turns
+    // without `reasoning_content`; rows without reasoning must not carry it.
+    #[test]
+    fn assistant_reasoning_parts_replay_as_reasoning_content() {
+        let with_reasoning = assistant_row(
+            "msg_a1",
+            vec![
+                AssistantContent::Reasoning {
+                    text: "think ".to_owned(),
+                    state: None,
+                    time: None,
+                },
+                AssistantContent::Reasoning {
+                    text: "deep".to_owned(),
+                    state: None,
+                    time: None,
+                },
+                AssistantContent::Text {
+                    text: "answer".to_owned(),
+                    state: None,
+                },
+            ],
+        );
+        let without_reasoning = assistant_row(
+            "msg_a2",
+            vec![AssistantContent::Text {
+                text: "plain".to_owned(),
+                state: None,
+            }],
+        );
+        // A reasoning-only row must survive the emit guard: its
+        // reasoning_content is what keeps thinking vendors from 400-ing.
+        let reasoning_only = assistant_row(
+            "msg_a3",
+            vec![AssistantContent::Reasoning {
+                text: "only thought".to_owned(),
+                state: None,
+                time: None,
+            }],
+        );
+        let built = build_chat_messages(
+            "sys",
+            &[],
+            &[with_reasoning, without_reasoning, reasoning_only],
+        );
+        assert!(matches!(
+            &built[1],
+            ChatMessage::Assistant {
+                content: Some(text),
+                reasoning_content: Some(reasoning),
+                ..
+            } if text == "answer" && reasoning == "think deep"
+        ));
+        assert!(
+            matches!(
+                &built[2],
+                ChatMessage::Assistant {
+                    reasoning_content: None,
+                    ..
+                },
+            ),
+            "no reasoning parts → no reasoning_content key on the wire"
+        );
+        assert!(
+            matches!(
+                &built[3],
+                ChatMessage::Assistant {
+                    content: None,
+                    tool_calls: None,
+                    reasoning_content: Some(reasoning),
+                    ..
+                } if reasoning == "only thought"
+            ),
+            "reasoning-only row survives with content: null"
+        );
     }
 
     #[test]
