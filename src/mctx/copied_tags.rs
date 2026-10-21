@@ -31,8 +31,24 @@ static COMPLETE_TAG_PAIR: LazyLock<Regex> =
 
 /// Malformed tag/XML hybrids anywhere (`§15298">§15298§`): token-level
 /// confusion between the tag format and quoted attribute syntax.
+///
+/// Note: the `[0-9]+§` tail inside the optional group is unreachable at this
+/// chain position (complete pairs are removed by the preceding pass) and kept
+/// as an exact port of upstream's regex.
 static MALFORMED_TAG: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"§[0-9]+">(?:§(?:[0-9]+§)?)?"#).expect("malformed tag regex"));
+
+/// Dangling tags: `§` + digits and an optional decimal tail, optionally closed
+/// by one non-word closer. Upstream uses a `(?!\\.\d)` lookahead to leave
+/// `§5.1`-style section citations for the stray-`§` pass; the `regex` crate has
+/// no lookaround, so the decimal tail is captured and handled branch-wise.
+/// Digits are pinned to ASCII (`[0-9]`, matching upstream JS `\d`) and the
+/// closer class spells out ASCII word chars instead of `\w` — Rust `\w` is
+/// Unicode-aware, which would exclude closers like the Cyrillic `ҩ` and break
+/// the `§11865ҩ done` case.
+static DANGLING_TAG: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"§([0-9]+)(\.[0-9]+)?([^\s§A-Za-z0-9_.])?").expect("dangling tag regex")
+});
 
 /// Lone section signs left after pair/malformed/dangling removal.
 static STRAY_SECTION_SIGN: LazyLock<Regex> =
@@ -51,6 +67,7 @@ pub fn strip_copied_tag_notation(text: &str) -> Cow<'_, str> {
     let out = replace_pass(out, &LEADING_TAG_RUN);
     let out = replace_pass(out, &COMPLETE_TAG_PAIR);
     let out = replace_pass(out, &MALFORMED_TAG);
+    let out = strip_dangling(out);
     let out = replace_pass(out, &STRAY_SECTION_SIGN);
     trim_cow(out)
 }
@@ -63,6 +80,27 @@ fn replace_pass<'a>(value: Cow<'a, str>, regex: &Regex) -> Cow<'a, str> {
     } else {
         value
     }
+}
+
+/// Remove dangling tags, keeping section-citation digits (`§5.1` → `5.1`) and
+/// eating at most one non-word closer (`§103012$` → ``, `§42 files` → ` files`).
+fn strip_dangling(value: Cow<'_, str>) -> Cow<'_, str> {
+    if !DANGLING_TAG.is_match(&value) {
+        return value;
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut last = 0;
+    for caps in DANGLING_TAG.captures_iter(&value) {
+        let m = caps.get(0).expect("whole-match capture");
+        out.push_str(&value[last..m.start()]);
+        if caps.get(2).is_some() {
+            // `§N.M…`: a section citation — drop only the `§`.
+            out.push_str(&value[m.start() + '§'.len_utf8()..m.end()]);
+        }
+        last = m.end();
+    }
+    out.push_str(&value[last..]);
+    Cow::Owned(out)
 }
 
 /// Trim without reallocating an owned buffer: trim the borrowed view, or cut
@@ -178,5 +216,30 @@ mod tests {
             Cow::Borrowed(_)
         ));
         assert_eq!(strip(text), text);
+    }
+
+    #[test]
+    fn dangling_tag_with_improvised_closer_is_removed() {
+        assert_eq!(strip("§103012$ Fixed it"), "Fixed it");
+        assert_eq!(strip("§11865ҩ done"), "done");
+    }
+
+    #[test]
+    fn dangling_tag_does_not_eat_following_text() {
+        assert_eq!(strip("§42 files changed"), "files changed");
+        assert_eq!(strip("§42important"), "important");
+    }
+
+    #[test]
+    fn section_citation_keeps_its_digits() {
+        assert_eq!(strip("§5.1"), "5.1");
+        assert_eq!(strip("§42.5x"), "42.5x");
+        assert_eq!(strip("§5.1.2"), "5.1.2");
+    }
+
+    #[test]
+    fn multiple_dangling_tags_are_all_removed() {
+        assert_eq!(strip("§1§ §2§ §3§ done"), "done");
+        assert_eq!(strip("before §7$ after"), "before  after");
     }
 }
