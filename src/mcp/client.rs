@@ -175,11 +175,15 @@ async fn list_resources(
 ) -> Vec<ResourceEntry> {
     // A server that advertises resources but fails the list is degraded, not
     // fatal: the toolset is the point of the connection.
-    let Ok(page) = rpc
+    let page = match rpc
         .request("resources/list", None, Some(catalog), cancel)
         .await
-    else {
-        return Vec::new();
+    {
+        Ok(page) => page,
+        Err(error) => {
+            tracing::debug!(%error, "MCP resources/list failed; no resources listed");
+            return Vec::new();
+        }
     };
     page.get("resources")
         .and_then(Value::as_array)
@@ -209,11 +213,18 @@ async fn list_templates(
 ) -> Vec<TemplateEntry> {
     // Some servers declare resources without implementing template listing
     // (upstream does `orElseSucceed(() => [])` for the same reason).
-    let Ok(page) = rpc
+    let page = match rpc
         .request("resources/templates/list", None, Some(catalog), cancel)
         .await
-    else {
-        return Vec::new();
+    {
+        Ok(page) => page,
+        Err(error) => {
+            tracing::debug!(
+                %error,
+                "MCP resources/templates/list failed; no templates listed"
+            );
+            return Vec::new();
+        }
     };
     page.get("resourceTemplates")
         .and_then(Value::as_array)
