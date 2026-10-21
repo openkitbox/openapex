@@ -11,3 +11,11 @@ impl ViewState {
         Self::default()
     }
 }
+
+/// Which screen the app is showing. `Home` exists before any session is
+/// created; `--session`/demo start directly in `Session`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Route {
+    Home,
+    Session,
+}

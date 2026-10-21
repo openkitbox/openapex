@@ -12,6 +12,14 @@ pub enum AppEvent {
         request_id: u64,
         items: Vec<Item>,
     },
+    /// A lazily created session is ready; `prompt` is the text that triggered
+    /// the creation (the app shows it optimistically and sends it).
+    SessionReady {
+        session: String,
+        prompt: String,
+    },
+    /// Lazy session creation failed; the draft must be restored.
+    SessionFailed(String),
     Quit,
 }
 

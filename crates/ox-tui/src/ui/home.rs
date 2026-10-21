@@ -1,10 +1,13 @@
 //! Home 落地页：居中 logo + 居中输入框（首次提交前无 session）。
 //! 视觉规格见 .opencode/opencode-tui-components/16-home-splash.md。
 
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
 
 use crate::theme;
+use crate::ui::composer::Composer;
 
 pub const LOGO_LEFT: [&str; 4] = [
     "                   ",
@@ -115,6 +118,50 @@ pub fn column_rect(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
         y: area.y,
         width,
         height: area.height,
+    }
+}
+
+/// 整屏渲染：logo 块 + 1 行空 + composer，垂直居中于内容列。
+pub fn render(frame: &mut ratatui::Frame, area: Rect, composer: &mut Composer, error: Option<&str>) {
+    let pal = theme::palette();
+    let col = column_rect(area);
+    let logo = logo_lines(area.width, area.height, *pal);
+    let logo_h = logo.len() as u16;
+    let composer_h = composer.height().max(1);
+    let error_h = u16::from(error.is_some());
+    let total = logo_h + 1 + composer_h + error_h;
+    let top = area.y + area.height.saturating_sub(total) / 2;
+    let mut y = top;
+    for line in logo {
+        if y >= area.bottom() {
+            break;
+        }
+        let rect = Rect {
+            x: col.x,
+            y,
+            width: col.width,
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(line), rect);
+        y += 1;
+    }
+    y += 1; // logo 与输入框之间的空行
+    let composer_area = Rect {
+        x: col.x,
+        y,
+        width: col.width,
+        height: composer_h,
+    };
+    composer.render(frame, composer_area);
+    if let Some(err) = error {
+        let rect = Rect {
+            x: col.x,
+            y: y + composer_h,
+            width: col.width,
+            height: 1,
+        };
+        let line = Line::styled(err.to_string(), pal.warn);
+        frame.render_widget(Paragraph::new(line), rect);
     }
 }
 
