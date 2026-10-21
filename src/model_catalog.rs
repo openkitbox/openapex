@@ -128,6 +128,8 @@ impl ModelCatalog {
                 name: None,
                 context: None,
                 output: None,
+                reasoning: false,
+                supported_reasoning_levels: Vec::new(),
             });
         }
         entries.first().cloned()
@@ -198,6 +200,12 @@ struct ModelRow {
     context_window: Option<i64>,
     #[serde(default)]
     max_input_tokens: Option<i64>,
+    /// Reasoning metadata, present only on rows whose upstream members
+    /// advertise effort levels (cardinal `models.rs`).
+    #[serde(default)]
+    reasoning: bool,
+    #[serde(default)]
+    supported_reasoning_levels: Vec<crate::config::ReasoningLevel>,
 }
 
 impl ModelRow {
@@ -213,6 +221,8 @@ impl ModelRow {
                 .or(self.max_input_tokens),
             output: None,
             id: self.id,
+            reasoning: self.reasoning,
+            supported_reasoning_levels: self.supported_reasoning_levels,
         }
     }
 }
@@ -280,6 +290,40 @@ mod tests {
             "context_window counts too"
         );
         assert_eq!(entries[0].provider, FALLBACK_PROVIDER, "owned_by defaults");
+    }
+
+    #[tokio::test]
+    async fn reasoning_metadata_survives_the_gateway_fetch() {
+        // The row shape cardinal emits for models whose upstream members
+        // advertise effort levels — levels must reach `entries()` intact,
+        // and a level-less row must default cleanly.
+        let url = spawn_gateway(
+            r#"{"data":[
+                {"id":"k3-256k","owned_by":"cardinal","context_length":262144,
+                 "reasoning":true,"supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}]},
+                {"id":"deepseek-flash","owned_by":"cardinal","context_length":1048576}
+            ]}"#,
+        )
+        .await;
+        let catalog = ModelCatalog::new(&Config {
+            cardinal_url: url,
+            ..Config::default()
+        });
+        let entries = catalog.entries().await;
+        let k3 = entries.iter().find(|e| e.id == "k3-256k").expect("k3 row");
+        assert!(k3.reasoning);
+        let levels: Vec<_> = k3
+            .supported_reasoning_levels
+            .iter()
+            .map(|level| level.effort.as_str())
+            .collect();
+        assert_eq!(levels, ["low", "high"], "catalog order through the wire");
+        let flash = entries
+            .iter()
+            .find(|e| e.id == "deepseek-flash")
+            .expect("flash row");
+        assert!(!flash.reasoning);
+        assert!(flash.supported_reasoning_levels.is_empty());
     }
 
     #[tokio::test]

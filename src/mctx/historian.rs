@@ -2376,6 +2376,8 @@ default_model = "cardinal/k3-256k"
             name: None,
             context: None,
             output: None,
+            reasoning: false,
+            supported_reasoning_levels: Vec::new(),
         }])
     }
 

@@ -602,6 +602,55 @@ impl Harness {
 }
 
 // ---------------------------------------------------------------------------
+// Model variant → reasoning_effort on the chat wire
+// ---------------------------------------------------------------------------
+
+/// The session's selected reasoning level rides every chat turn as
+/// `reasoning_effort`, and an unselected session stays field-free (the
+/// wire-regression promise, asserted at the step level).
+#[tokio::test]
+async fn model_variant_reaches_the_chat_request_as_reasoning_effort() {
+    let harness = Harness::spawn(vec![MockChat::text("ok"), MockChat::text("ok")]).await;
+
+    // A session created with an explicit `high` variant…
+    let response = harness
+        .post(
+            "/api/session",
+            json!({
+                "title": "variant test",
+                "model": {"id": "k3-256k", "providerID": "cardinal", "variant": "high"},
+            }),
+        )
+        .await;
+    assert_eq!(response.status(), 200, "session create with model");
+    let body: Value = response.json().await.unwrap();
+    let high_session = body["data"]["id"].as_str().unwrap().to_owned();
+
+    // …and one left on the default model without any variant.
+    let plain_session = harness.create_session().await;
+
+    for (session_id, expected) in [(high_session, Some("high")), (plain_session, None)] {
+        harness
+            .post(
+                &format!("/api/session/{session_id}/prompt"),
+                json!({ "text": "ping" }),
+            )
+            .await;
+        harness.wait_event("session.execution.succeeded").await;
+        let request = harness
+            .chat
+            .requests()
+            .pop()
+            .expect("the turn's chat request");
+        assert_eq!(
+            request.reasoning_effort.as_deref(),
+            expected,
+            "variant must map onto the chat wire exactly once per turn"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Session title generation
 // ---------------------------------------------------------------------------
 

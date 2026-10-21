@@ -2006,6 +2006,8 @@ mod tests {
                 name: None,
                 context: None,
                 output: None,
+                reasoning: false,
+                supported_reasoning_levels: Vec::new(),
             },
         ]))
     }

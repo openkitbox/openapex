@@ -312,7 +312,10 @@ async fn model_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
 /// fields; limits default to zero — cardinal owns the real routing). `id`
 /// and `modelID` are both the bare model id, matching upstream's
 /// `Model.Info.default` — clients use `id` as the model identifier when
-/// selecting, so a qualified value would leak into requests.
+/// selecting, so a qualified value would leak into requests. The reasoning
+/// levels cardinal advertises become `{id}` variants in catalog order
+/// (upstream `Model.Variant` is `{id}` on the wire); a model without
+/// advertised levels gets none.
 fn model_info(m: &crate::config::ModelEntry) -> ModelInfo {
     ModelInfo {
         id: m.id.clone(),
@@ -324,7 +327,16 @@ fn model_info(m: &crate::config::ModelEntry) -> ModelInfo {
             input: vec!["text"],
             output: vec!["text"],
         },
-        variants: Vec::new(),
+        variants: if m.reasoning {
+            m.supported_reasoning_levels
+                .iter()
+                .map(|level| ModelVariant {
+                    id: level.effort.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        },
         time: ModelTime { released: 0 },
         cost: Vec::new(),
         status: "active",
@@ -562,4 +574,50 @@ async fn unmatched(req: &mut Request, res: &mut Response) {
         "_tag": "NotFoundError",
         "message": format!("No route for {} {}", req.method(), req.uri().path()),
     })));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{ModelEntry, ReasoningLevel};
+
+    fn entry(reasoning: bool, levels: &[&str]) -> ModelEntry {
+        ModelEntry {
+            provider: "cardinal".to_owned(),
+            id: "k3-256k".to_owned(),
+            name: None,
+            context: Some(262144),
+            output: None,
+            reasoning,
+            supported_reasoning_levels: levels
+                .iter()
+                .map(|effort| ReasoningLevel {
+                    effort: (*effort).to_owned(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn model_info_projects_levels_as_id_variants_in_catalog_order() {
+        let info = model_info(&entry(true, &["low", "high", "max"]));
+        let ids: Vec<_> = info.variants.iter().map(|v| v.id.as_str()).collect();
+        assert_eq!(ids, ["low", "high", "max"], "catalog order, no synthesis");
+
+        // And the wire shape is upstream's `Model.Variant`: `{id}` only.
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(
+            value["variants"],
+            serde_json::json!([{"id": "low"}, {"id": "high"}, {"id": "max"}])
+        );
+    }
+
+    #[test]
+    fn model_info_projects_no_variants_without_advertised_levels() {
+        // No levels at all — today's level-less rows.
+        assert!(model_info(&entry(false, &[])).variants.is_empty());
+        // Levels present but the flag off: the flag is the gate, matching
+        // cardinal's emission (levels only ride a reasoning row).
+        assert!(model_info(&entry(false, &["low"])).variants.is_empty());
+    }
 }
