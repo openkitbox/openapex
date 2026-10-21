@@ -298,6 +298,9 @@ pub mod cache;
 /// §N§ part tagging, `[dropped §N§]` placeholders and `ctx_expand` recovery.
 pub mod tagger;
 
+/// Stripping of `§N§` tag notation that models copy into their own text.
+pub mod copied_tags;
+
 /// Project memories (`ctx_memory`) and scratch notes (`ctx_note`): tools,
 /// storage and prompt rendering.
 pub mod memory;
