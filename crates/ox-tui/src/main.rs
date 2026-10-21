@@ -1,5 +1,6 @@
 mod app;
 mod terminal;
+mod ui;
 
 use tokio::sync::mpsc;
 
