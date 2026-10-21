@@ -241,7 +241,12 @@ async fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
         .enumerate()
         .map(|(index, question)| to_field(question, index))
         .collect();
-    let pending = form::shared().create(&ctx.session_id, &ctx.directory.to_string_lossy(), "Questions", fields);
+    let pending = form::shared().create(
+        &ctx.session_id,
+        &ctx.directory.to_string_lossy(),
+        "Questions",
+        fields,
+    );
     let form_id = pending.info().id.clone();
 
     // An interrupt ends the wait without answering.
@@ -391,7 +396,11 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         };
-        assert!(form::shared().cancel(&session, &form_id, Some("pick for me".to_owned())).is_ok());
+        assert!(
+            form::shared()
+                .cancel(&session, &form_id, Some("pick for me".to_owned()))
+                .is_ok()
+        );
         let output = task.await.expect("join");
         assert_eq!(output.error.as_deref(), Some("pick for me"));
     }

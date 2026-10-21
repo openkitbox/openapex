@@ -364,7 +364,8 @@ async fn a_form_reaches_the_sse_event_stream() {
         buffer.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(boundary) = buffer.find("\n\n") {
             let frame = buffer.drain(..boundary + 2).collect::<String>();
-            let Ok(event) = serde_json::from_str::<Value>(frame.trim_start_matches("data: ")) else {
+            let Ok(event) = serde_json::from_str::<Value>(frame.trim_start_matches("data: "))
+            else {
                 continue;
             };
             if event["type"] == "form.created" && event["data"]["form"]["sessionID"] == session_id {
@@ -374,10 +375,16 @@ async fn a_form_reaches_the_sse_event_stream() {
         }
     }
     let created = saw_created.expect("form.created on the SSE stream");
-    let form_id = created["data"]["form"]["id"].as_str().expect("id").to_owned();
+    let form_id = created["data"]["form"]["id"]
+        .as_str()
+        .expect("id")
+        .to_owned();
     assert_eq!(created["data"]["form"]["title"], "Questions");
     assert_eq!(created["data"]["form"]["fields"][0]["type"], "string");
-    assert_eq!(created["data"]["form"]["fields"][0]["options"][0]["label"], "API");
+    assert_eq!(
+        created["data"]["form"]["fields"][0]["options"][0]["label"],
+        "API"
+    );
 
     // Answer it and expect the replied event through the same stream.
     let replied_http = client
@@ -399,7 +406,8 @@ async fn a_form_reaches_the_sse_event_stream() {
         buffer.push_str(&String::from_utf8_lossy(&chunk));
         while let Some(boundary) = buffer.find("\n\n") {
             let frame = buffer.drain(..boundary + 2).collect::<String>();
-            let Ok(event) = serde_json::from_str::<Value>(frame.trim_start_matches("data: ")) else {
+            let Ok(event) = serde_json::from_str::<Value>(frame.trim_start_matches("data: "))
+            else {
                 continue;
             };
             if event["type"] == "form.replied" && event["data"]["id"] == form_id {

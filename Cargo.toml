@@ -17,16 +17,18 @@ dirs = "7.0.0"
 globset = "0.4.16"
 ignore = "0.4.23"
 futures-core = "0.3"
+futures-util = "0.3"
 rand = "0.9"
 regex = "1"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "stream"] }
+agent-client-protocol = { version = "=3.4.0", features = ["stdio"] }
 salvo = { version = "1.0.1", features = ["server", "http1", "http2", "sse", "affix-state", "logging"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha1 = "0.11.0"
 thiserror = "2"
 tokio = { version = "1.53.3", features = ["full"] }
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["compat"] }
 toml = "1.1.8"
 turso = "=0.9.0-pre.1"
 tracing = "0.1.44"
@@ -41,3 +43,11 @@ grep-regex = "0.1.14"
 [dev-dependencies]
 tempfile = "3"
 futures-core = "0.3"
+
+# `ToolOutput` — the engine-wide tool-error type — is 192 bytes, which trips
+# `clippy::result_large_err` on every `Result<_, ToolOutput>` helper under the
+# 1.99 toolchain (a pre-existing pattern, unrelated to ACP). Boxing it is a
+# deliberate engine refactor; until then the lint is allowed project-wide
+# rather than sprinkled as `#[allow]` attributes.
+[lints.clippy]
+result_large_err = "allow"

@@ -314,7 +314,12 @@ impl Forms {
     /// Answer a form. Fails with [`SettleError::NotFound`] when no form with
     /// that id belongs to the session and [`SettleError::AlreadySettled`] when
     /// it already has an outcome.
-    pub fn reply(&self, session_id: &str, form_id: &str, answer: Answer) -> Result<(), SettleError> {
+    pub fn reply(
+        &self,
+        session_id: &str,
+        form_id: &str,
+        answer: Answer,
+    ) -> Result<(), SettleError> {
         let Some(pending) = self.get(session_id, form_id) else {
             return Err(SettleError::NotFound);
         };
@@ -330,7 +335,12 @@ impl Forms {
     }
 
     /// Cancel a form. Fails like [`Forms::reply`].
-    pub fn cancel(&self, session_id: &str, form_id: &str, message: Option<String>) -> Result<(), SettleError> {
+    pub fn cancel(
+        &self,
+        session_id: &str,
+        form_id: &str,
+        message: Option<String>,
+    ) -> Result<(), SettleError> {
         let Some(pending) = self.get(session_id, form_id) else {
             return Err(SettleError::NotFound);
         };
@@ -460,13 +470,15 @@ mod tests {
     async fn a_cancel_carries_its_message() {
         let forms = Forms::new();
         let pending = forms.create("ses_1", "/tmp", "Questions", question_fields());
-        assert!(forms
-            .cancel(
-                "ses_1",
-                &pending.info().id,
-                Some("not interactive".to_owned())
-            )
-            .is_ok());
+        assert!(
+            forms
+                .cancel(
+                    "ses_1",
+                    &pending.info().id,
+                    Some("not interactive".to_owned())
+                )
+                .is_ok()
+        );
         match pending.wait(std::time::Duration::from_millis(10)).await {
             Some(Outcome::Cancelled(Some(message))) => assert_eq!(message, "not interactive"),
             other => panic!("unexpected outcome: {other:?}"),
@@ -524,7 +536,12 @@ mod tests {
             .map(|info| info.id)
             .collect();
         assert_eq!(ids, vec![live.info().id]);
-        assert!(forms.list_all().iter().all(|info| info.id == live.info().id));
+        assert!(
+            forms
+                .list_all()
+                .iter()
+                .all(|info| info.id == live.info().id)
+        );
     }
 
     #[tokio::test]
@@ -549,7 +566,11 @@ mod tests {
                 .is_none()
         );
         // Still answerable after the caller gave up.
-        assert!(forms.reply("ses_1", &pending.info().id, Answer::new()).is_ok());
+        assert!(
+            forms
+                .reply("ses_1", &pending.info().id, Answer::new())
+                .is_ok()
+        );
     }
 
     #[test]

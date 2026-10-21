@@ -81,7 +81,8 @@ pub async fn create(req: &mut Request, res: &mut Response) {
 
 /// `GET /api/session/{sessionID}/form/{formID}`
 #[handler]
-pub async fn get(req: &mut Request, res: &mut Response) {    let session_id = req.param::<String>("sessionID").unwrap_or_default();
+pub async fn get(req: &mut Request, res: &mut Response) {
+    let session_id = req.param::<String>("sessionID").unwrap_or_default();
     let form_id = req.param::<String>("formID").unwrap_or_default();
     match form::shared().get(&session_id, &form_id) {
         Some(pending) => {
