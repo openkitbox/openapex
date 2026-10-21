@@ -648,7 +648,7 @@ pub async fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Resu
                     matches!(c, AssistantContent::Reasoning { time, .. } if time.as_ref().map(|t| t.completed.is_none()).unwrap_or(true))
                 }) && let AssistantContent::Reasoning { text: t, state: s, time } = content
                 {
-                    *t = text.clone();
+                    *t = strip_copied_tag_notation(text).into_owned();
                     let prior_created = time.as_ref().map(|x| x.created).unwrap_or(created);
                     *time = Some(crate::schema::message::ShellTime {
                         created: prior_created,
