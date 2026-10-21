@@ -26,8 +26,9 @@ const MESSAGE_PREVIEW_CHARS: usize = 400;
 /// borrowing its text whitewashed the trajectory.
 const CANCELLED_SENTINEL: &str = "(subagent cancelled by user interrupt)";
 
-/// Safety fuse for the ancestor walk: a corrupt `parent_id` cycle just makes
-/// the depth count saturate (and therefore fail the limit) instead of hanging.
+/// Safety fuse for the ancestor walk: a `parent_id` chain that does not
+/// terminate within this many hops is corrupt (a cycle), so the walk fails
+/// with an error instead of hanging or saturating below a higher limit.
 const MAX_DEPTH_WALK: usize = 32;
 
 /// The pieces of the runner the tool drives a child session through. The
@@ -259,7 +260,10 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
 type ParentTuple = (String, String, Option<String>, Option<String>);
 
 /// Ancestor hops from `session_id` up the `parent_id` chain. A root session is
-/// `0`; an unknown session is also `0` (nothing to nest under).
+/// `0`; an unknown session is also `0` (nothing to nest under). A chain that
+/// does not terminate within [`MAX_DEPTH_WALK`] hops is an error (a corrupt
+/// cycle), not a saturating count — the fuse must fail closed for any
+/// configured depth limit.
 async fn nesting_depth(db: &crate::db::Db, session_id: &str) -> Result<usize, String> {
     let conn = db.acquire().await.map_err(|error| error.to_string())?;
     let mut stmt = conn
@@ -283,6 +287,11 @@ async fn nesting_depth(db: &crate::db::Db, session_id: &str) -> Result<usize, St
         };
         depth += 1;
         current = parent;
+    }
+    if depth >= MAX_DEPTH_WALK {
+        return Err(format!(
+            "session parent chain does not terminate within {MAX_DEPTH_WALK} hops (corrupt cycle?)"
+        ));
     }
     Ok(depth)
 }
@@ -409,7 +418,8 @@ mod tests {
         assert_eq!(super::nesting_depth(&db, "ses_grand").await.unwrap(), 2);
         assert_eq!(super::nesting_depth(&db, "ses_missing").await.unwrap(), 0);
 
-        // A corrupt self-cycle must not hang: the 32-hop fuse reports the cap.
+        // A corrupt self-cycle is an error, not a saturating count: the fuse
+        // must fail closed for any configured depth limit.
         let conn = db.acquire().await.unwrap();
         conn.execute(
             "UPDATE session_v2 SET parent_id = id WHERE id = 'ses_root'",
@@ -418,6 +428,6 @@ mod tests {
         .await
         .unwrap();
         drop(conn);
-        assert_eq!(super::nesting_depth(&db, "ses_root").await.unwrap(), 32);
+        assert!(super::nesting_depth(&db, "ses_root").await.is_err());
     }
 }

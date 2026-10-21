@@ -9,8 +9,8 @@
 //! immutable static cannot be reset), so a second test in this process
 //! would silently drive the first test's db/runner no matter how the tests
 //! were locked. The delegation scenario registers first and owns the slot;
-//! the depth-limit scenario never touches the handle (its check rejects
-//! before any db/runner access), so the stale binding is harmless there.
+//! the depth-limit scenario shares that first db (the global handle points
+//! at it) and only varies the tool's own depth limit.
 
 use std::sync::{Arc, Mutex};
 
@@ -162,38 +162,29 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
 
     // --- depth limit: a zero limit rejects every delegation ---------------
     // This scenario runs second in the SAME process, so `register_subagent`
-    // cannot install another global handle (the slot keeps the one bound
-    // above) and this tool carries the first scenario's handle. That is
-    // harmless here: the depth check rejects before any db/runner access,
-    // which the assertions against this scenario's own fresh db confirm.
-    let dir2 = tempfile::tempdir().unwrap();
-    let config2 = Config {
-        db_path: dir2.path().join("ox.db"),
-        listen: "127.0.0.1:0".to_owned(),
-        ..Config::default()
-    };
-    let db2 = ox::db::Db::open(&config2.db_path).await.unwrap();
-    let bus2 = ox::event_bus::EventBus::new(db2.clone());
+    // cannot install another global handle: the slot keeps the one bound
+    // above, and every registry's subagent tool drives THAT db. The scenario
+    // therefore registers against the FIRST db on purpose — a fresh db would
+    // leave the assertions counting a database the tool never touches. The
+    // depth walk reads the parent chain from the DB, but no child session is
+    // created.
     let mut tools2 = ToolRegistry::new();
-    tools2.register_subagent(db2.clone(), bus2.clone(), 0);
-    let chat2 = Arc::new(ScriptedChat {
-        scripts: Mutex::new(std::collections::VecDeque::new()),
-    });
-    let _state2 = ox::build_state_with(config2.clone(), chat2, ToolRegistry::new())
-        .await
-        .expect("build state");
+    tools2.register_subagent(db.clone(), bus.clone(), 0);
 
-    bus2.publish(ox::schema::event::SessionEventData::SessionCreated {
-        session_id: parent_id.clone(),
+    // A dedicated parent row in the db the tool's handle points at, so the
+    // depth walk really finds it and the zero-child count below is meaningful.
+    let depth_parent = "ses_parent_depth".to_owned();
+    bus.publish(ox::schema::event::SessionEventData::SessionCreated {
+        session_id: depth_parent.clone(),
         project_id: "proj_test".to_owned(),
         location: ox::schema::support::LocationRef {
-            directory: dir2.path().to_string_lossy().to_string(),
+            directory: dir.path().to_string_lossy().to_string(),
             workspace_id: None,
         },
         subpath: None,
         parent_id: None,
         slug: ox::slug::create(),
-        title: Some("parent".to_owned()),
+        title: Some("depth parent".to_owned()),
         agent: None,
         model: None,
         metadata: None,
@@ -204,8 +195,8 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
     .unwrap();
 
     let ctx2 = ox::runner::ToolContext {
-        session_id: parent_id.clone(),
-        directory: dir2.path().to_path_buf(),
+        session_id: depth_parent.clone(),
+        directory: dir.path().to_path_buf(),
         call_id: "call_sub_depth".to_owned(),
         cancellation: tokio_util::sync::CancellationToken::new(),
     };
@@ -222,13 +213,13 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
         error.contains("Subagent depth limit reached (0)"),
         "{error}"
     );
-    // No child session was created in this scenario's db.
-    let conn = db2.acquire().await.unwrap();
+    // No child session was created in the db the tool's handle drives.
+    let conn = db.acquire().await.unwrap();
     let mut stmt = conn
         .prepare("SELECT COUNT(*) FROM session_v2 WHERE parent_id = ?1")
         .await
         .unwrap();
-    let row = ox::db::optional(&mut stmt, (parent_id,))
+    let row = ox::db::optional(&mut stmt, (depth_parent,))
         .await
         .unwrap()
         .unwrap();
