@@ -229,6 +229,14 @@ impl App {
     fn handle_compose_key(&mut self, key: crossterm::event::KeyEvent) {
         // Home：只有 composer 在收键，没有会话可搜索/滚动；首次提交惰性建会话。
         if self.route == Route::Home {
+            let is_submit =
+                key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT);
+            if is_submit && self.pending_home_prompt.is_some() {
+                // A creation is already in flight; ignore extra submits but
+                // keep whatever is being typed.
+                self.dirty = true;
+                return;
+            }
             let submitted = self.composer.handle_key(key);
             self.dirty = true;
             if let Some(text) = submitted {
@@ -502,6 +510,34 @@ mod tests {
             KeyModifiers::CONTROL,
         )));
         assert!(app.view.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_while_running_interrupts_instead_of_quitting() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_live"));
+        app.store.running_since = Some(0); // a turn is in flight
+        app.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(!app.view.should_quit);
+        match rx.try_recv().expect("interrupt must be sent") {
+            AppCommand::Interrupt { session } => assert_eq!(session, "ses_live"),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn home_submit_is_suppressed_while_a_creation_is_in_flight() {
+        let (mut app, mut rx) = app(Route::Home, None);
+        type_text(&mut app, "first");
+        key(&mut app, KeyCode::Enter);
+        let _ = rx.try_recv(); // CreateSessionAndPrompt("first")
+        key(&mut app, KeyCode::Char('x')); // typing continues
+        key(&mut app, KeyCode::Enter); // suppressed
+        assert!(rx.try_recv().is_err(), "no second creation command");
+        assert_eq!(app.pending_home_prompt.as_deref(), Some("first"));
+        assert_eq!(app.composer.text(), "x");
     }
 
     #[test]

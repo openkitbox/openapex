@@ -121,6 +121,21 @@ pub fn column_rect(area: ratatui::layout::Rect) -> ratatui::layout::Rect {
     }
 }
 
+/// ratatui panics on out-of-bounds renders; clamp into the frame area and
+/// drop pieces that no longer fit.
+fn clamp_to(area: Rect, rect: Rect) -> Option<Rect> {
+    let bottom = area.bottom().min(rect.bottom());
+    if rect.y >= bottom || rect.x >= area.right() {
+        return None;
+    }
+    Some(Rect {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width.min(area.right() - rect.x),
+        height: bottom - rect.y,
+    })
+}
+
 /// 整屏渲染：logo 块 + 1 行空 + composer，垂直居中于内容列。
 pub fn render(frame: &mut ratatui::Frame, area: Rect, composer: &mut Composer, error: Option<&str>) {
     let pal = theme::palette();
@@ -133,14 +148,14 @@ pub fn render(frame: &mut ratatui::Frame, area: Rect, composer: &mut Composer, e
     let top = area.y + area.height.saturating_sub(total) / 2;
     let mut y = top;
     for line in logo {
-        if y >= area.bottom() {
-            break;
-        }
         let rect = Rect {
             x: col.x,
             y,
             width: col.width,
             height: 1,
+        };
+        let Some(rect) = clamp_to(area, rect) else {
+            break;
         };
         frame.render_widget(Paragraph::new(line), rect);
         y += 1;
@@ -152,16 +167,20 @@ pub fn render(frame: &mut ratatui::Frame, area: Rect, composer: &mut Composer, e
         width: col.width,
         height: composer_h,
     };
-    composer.render(frame, composer_area);
+    if let Some(rect) = clamp_to(area, composer_area) {
+        composer.render(frame, rect);
+    }
     if let Some(err) = error {
-        let rect = Rect {
+        let candidate = Rect {
             x: col.x,
             y: y + composer_h,
             width: col.width,
             height: 1,
         };
-        let line = Line::styled(err.to_string(), pal.warn);
-        frame.render_widget(Paragraph::new(line), rect);
+        if let Some(rect) = clamp_to(area, candidate) {
+            let line = Line::styled(err.to_string(), pal.warn);
+            frame.render_widget(Paragraph::new(line), rect);
+        }
     }
 }
 
