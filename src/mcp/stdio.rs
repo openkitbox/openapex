@@ -32,7 +32,7 @@ pub(crate) struct StdioRpc {
     reader: JoinHandle<()>,
     writer_task: JoinHandle<()>,
     stderr: JoinHandle<()>,
-    closed: AtomicBool,
+    closed: Arc<AtomicBool>,
 }
 
 impl StdioRpc {
@@ -78,6 +78,7 @@ impl StdioRpc {
 
         let (writer, writer_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let pending: Arc<Mutex<Pending>> = Arc::new(Mutex::new(HashMap::new()));
+        let closed = Arc::new(AtomicBool::new(false));
 
         let writer_task = tokio::spawn(async move {
             let mut stdin = stdin;
@@ -98,6 +99,7 @@ impl StdioRpc {
 
         let reader_bus = writer.clone();
         let reader_pending = Arc::clone(&pending);
+        let reader_closed = Arc::clone(&closed);
         let reader = tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -152,7 +154,12 @@ impl StdioRpc {
                     (None, None) => {}
                 }
             }
-            for (_, sender) in reader_pending.lock().unwrap().drain() {
+            // EOF means the server is gone: mark the transport closed under
+            // the pending lock so a request cannot slip in between the flag
+            // and the drain and then wait forever for an answer.
+            let mut pending = reader_pending.lock().unwrap();
+            reader_closed.store(true, Ordering::SeqCst);
+            for (_, sender) in pending.drain() {
                 let _ = sender.send(Err(CallError::Closed));
             }
         });
@@ -165,7 +172,7 @@ impl StdioRpc {
             reader,
             writer_task,
             stderr: stderr_task,
-            closed: AtomicBool::new(false),
+            closed,
         })
     }
 
@@ -202,12 +209,18 @@ impl Rpc for StdioRpc {
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<Value, CallError>> {
         Box::pin(async move {
-            if self.closed.load(Ordering::SeqCst) {
-                return Err(CallError::Closed);
-            }
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             let (sender, receiver) = oneshot::channel();
-            self.pending.lock().unwrap().insert(id, sender);
+            {
+                let mut pending = self.pending.lock().unwrap();
+                // Checked while holding the lock the reader takes before it
+                // marks the transport closed, so a dead server can never
+                // leave a call waiting for a reply that cannot arrive.
+                if self.closed.load(Ordering::SeqCst) {
+                    return Err(CallError::Closed);
+                }
+                pending.insert(id, sender);
+            }
             let frame = jsonrpc::encode(&Request {
                 jsonrpc: "2.0",
                 id,
@@ -247,6 +260,9 @@ impl Rpc for StdioRpc {
         params: Option<Value>,
     ) -> BoxFuture<'a, Result<(), CallError>> {
         Box::pin(async move {
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(CallError::Closed);
+            }
             let frame = jsonrpc::encode(&Notification {
                 jsonrpc: "2.0",
                 method: method.to_owned(),
@@ -403,6 +419,30 @@ done
                 &cancel,
             )
             .await;
+        assert!(matches!(result, Err(CallError::Closed)));
+        rpc.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn requests_after_the_server_exits_fail_instead_of_hanging() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dead.sh");
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let rpc = StdioRpc::spawn(&[path.display().to_string()], &BTreeMap::new(), None).unwrap();
+        for _ in 0..100 {
+            if rpc.closed.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let cancel = CancellationToken::new();
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            rpc.request("initialize", None, None, &cancel),
+        )
+        .await
+        .expect("a request after EOF must not hang");
         assert!(matches!(result, Err(CallError::Closed)));
         rpc.shutdown().await;
     }
