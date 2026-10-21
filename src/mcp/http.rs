@@ -99,6 +99,17 @@ fn parse_response(value: Value) -> Result<Value, CallError> {
     Ok(value.get("result").cloned().unwrap_or(Value::Null))
 }
 
+/// Offset and byte length of the blank line that ends the next SSE event.
+/// Servers may use either LF or CRLF; a CRLF stream never contains `\n\n`.
+fn next_event_boundary(buffer: &str) -> Option<(usize, usize)> {
+    match (buffer.find("\n\n"), buffer.find("\r\n\r\n")) {
+        (Some(lf), Some(crlf)) if crlf <= lf => Some((crlf, 4)),
+        (Some(lf), _) => Some((lf, 2)),
+        (None, Some(crlf)) => Some((crlf, 4)),
+        (None, None) => None,
+    }
+}
+
 async fn read_sse(
     mut response: reqwest::Response,
     id: u64,
@@ -118,9 +129,9 @@ async fn read_sse(
             return Err(CallError::Closed);
         };
         buffer.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(index) = buffer.find("\n\n") {
+        while let Some((index, separator)) = next_event_boundary(&buffer) {
             let event = buffer[..index].to_owned();
-            buffer.drain(..index + 2);
+            buffer.drain(..index + separator);
             let data = event
                 .lines()
                 .filter_map(|line| line.strip_prefix("data:"))
@@ -353,6 +364,40 @@ mod tests {
     #[tokio::test]
     async fn sse_response_is_parsed_until_the_matching_id() {
         let router = Router::new().push(Router::with_path("mcp").post(sse_endpoint));
+        let (url, server) = serve(router).await;
+        let rpc = HttpRpc::new(&remote(url)).unwrap();
+        let cancel = CancellationToken::new();
+        let value = rpc
+            .request(
+                "initialize",
+                Some(json!({})),
+                Some(Duration::from_secs(5)),
+                &cancel,
+            )
+            .await
+            .unwrap();
+        assert_eq!(value, json!({"ok": true}));
+        server.abort();
+    }
+
+    #[handler]
+    async fn crlf_sse_endpoint(req: &mut Request, res: &mut Response) {
+        let body: Value = req.parse_json().await.unwrap();
+        res.render(Text::Plain(format!(
+            "event: message\r\ndata: {}\r\n\r\n",
+            json!({
+                "jsonrpc": "2.0",
+                "id": body["id"].clone(),
+                "result": { "ok": true }
+            })
+        )));
+        res.headers_mut()
+            .insert("content-type", "text/event-stream".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn crlf_sse_response_is_parsed() {
+        let router = Router::new().push(Router::with_path("mcp").post(crlf_sse_endpoint));
         let (url, server) = serve(router).await;
         let rpc = HttpRpc::new(&remote(url)).unwrap();
         let cancel = CancellationToken::new();
