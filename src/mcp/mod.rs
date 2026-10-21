@@ -12,6 +12,8 @@
 #[allow(dead_code)]
 pub(crate) mod client;
 #[allow(dead_code)]
+pub(crate) mod http;
+#[allow(dead_code)]
 pub(crate) mod jsonrpc;
 // stdio is wired into the tool adapter in later tasks of the ox-mcp plan;
 // until then it is only exercised by its own tests.
@@ -322,13 +324,10 @@ async fn connect_one(name: &str, server: &McpServerConfig, directory: &Path) -> 
                 ),
             }
         }
-        McpServerConfig::Remote(remote) => Connected::failed(
-            name,
-            format!(
-                "remote MCP server `{name}` ({}): HTTP transport lands in Task 10",
-                remote.url
-            ),
-        ),
+        McpServerConfig::Remote(remote) => match http::HttpRpc::new(remote) {
+            Ok(rpc) => handshake(name, Arc::new(rpc), timeout).await,
+            Err(error) => Connected::failed(name, error),
+        },
     }
 }
 
