@@ -142,11 +142,14 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
     assert_eq!(output.error, None, "{output:?}");
     let text = output.content.as_str().expect("text");
     assert!(
-        text.contains("Subagent report:") && text.contains("Child report: done."),
+        text.starts_with("<subagent sessionID=\"ses_")
+            && text.contains("state=\"completed\"")
+            && text.contains("Child report: done."),
         "{text}"
     );
     let metadata = output.metadata.expect("metadata");
-    let child_id = metadata["sessionId"].as_str().expect("child id");
+    let child_id = metadata["sessionID"].as_str().expect("child id");
+    assert_eq!(metadata["status"], "completed");
 
     // The child session row exists with parent_id = parent.
     let conn = db.acquire().await.unwrap();

@@ -204,7 +204,8 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
     let message_id = crate::id::id("msg");
     let payload = crate::schema::inbox::UserPayload {
         prompt: crate::schema::support::Prompt {
-            text: prompt,
+            // Fresh-context notice: the child knows nothing about the parent.
+            text: format!("You are a subagent spawned by another session.\n{prompt}"),
             files: None,
             agents: None,
             skills: None,
@@ -245,14 +246,33 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         }
     }
 
-    match transcript(tool, &child_id).await {
-        Ok(summary) => ok_text(summary).with_metadata(json!({
-            "sessionId": child_id,
-            "description": description,
-        })),
-        Err(error) => fail(format!(
-            "Child session finished but its transcript is unreadable: {error}"
-        )),
+    let history = match crate::runner::step::load_history(&tool.handle.db, &child_id).await {
+        Ok(history) => history,
+        Err(error) => {
+            return fail(format!(
+                "Child session finished but its transcript is unreadable: {error}"
+            ));
+        }
+    };
+    match child_outcome(&history) {
+        ChildOutcome::Completed => {
+            let fold = transcript_fold(&history, &child_id);
+            ok_text(format!(
+                "<subagent sessionID=\"{child_id}\" state=\"completed\">\n{fold}\n</subagent>"
+            ))
+            .with_metadata(json!({
+                "sessionID": child_id,
+                "status": "completed",
+                "description": description,
+            }))
+        }
+        ChildOutcome::Failed(error) => {
+            // Keep the sessionID visible: the model can resume the child.
+            fail(format!("Subagent failed (sessionID: {child_id}): {error}"))
+        }
+        ChildOutcome::Interrupted => {
+            fail(format!("Subagent cancelled (sessionID: {child_id})"))
+        }
     }
 }
 
@@ -321,17 +341,71 @@ async fn load_parent(db: &crate::db::Db, session_id: &str) -> Result<Option<Pare
     )))
 }
 
-/// The child's reply for the parent: every assistant text message joined,
-/// or a fallback when the child produced nothing.
-async fn transcript(tool: &SubagentTool, child_id: &str) -> Result<String, String> {
-    let rows = crate::runner::step::load_history(&tool.handle.db, child_id)
-        .await
-        .map_err(|error| error.to_string())?;
+/// The child's settle state, decided from persisted traces only — no new
+/// state is invented for it.
+#[derive(Debug, PartialEq, Eq)]
+enum ChildOutcome {
+    /// Turn ended clean: fold the transcript.
+    Completed,
+    /// Turn failed: keep the child's sessionID visible so the model can resume.
+    Failed(String),
+    /// Child was interrupted (e.g. directly through the API).
+    Interrupted,
+}
+
+/// Read the settle state off the transcript's trailing `idle` row. A
+/// transcript with no idle row reads as completed.
+fn child_outcome(messages: &[crate::schema::message::Message]) -> ChildOutcome {
+    use crate::schema::message::{IdleOutcome, Message};
+    match messages.iter().rev().find_map(|message| match message {
+        Message::Idle { outcome, error, .. } => Some((*outcome, error)),
+        _ => None,
+    }) {
+        Some((IdleOutcome::Succeeded, _)) | None => ChildOutcome::Completed,
+        Some((IdleOutcome::Interrupted, _)) => ChildOutcome::Interrupted,
+        Some((IdleOutcome::Failed, error)) => ChildOutcome::Failed(
+            error
+                .as_ref()
+                .map(|error| error.message.clone())
+                .unwrap_or_else(|| "unknown error".to_owned()),
+        ),
+    }
+}
+
+/// The newest completed assistant text, whole (no preview) — the notification
+/// body for background completions, matching upstream's completion text.
+/// Consumed by the background-completion task; unused until then.
+#[allow(dead_code)]
+fn final_text(messages: &[crate::schema::message::Message]) -> Option<String> {
+    use crate::schema::message::{AssistantContent, Message};
+    messages.iter().rev().find_map(|message| match message {
+        Message::Assistant(assistant) if assistant.error.is_none() => {
+            let parts: Vec<&str> = assistant
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    AssistantContent::Text { text, .. } if !text.trim().is_empty() => {
+                        Some(text.as_str())
+                    }
+                    _ => None,
+                })
+                .collect();
+            (!parts.is_empty()).then(|| parts.join("\n\n"))
+        }
+        _ => None,
+    })
+}
+
+/// The child's reply for the parent: every assistant text message joined
+/// (previewed), or a fallback when the child produced nothing. Pure over an
+/// already-loaded transcript so the caller loads history once.
+fn transcript_fold(messages: &[crate::schema::message::Message], child_id: &str) -> String {
+    use crate::schema::message::{AssistantContent, Message};
     let mut parts: Vec<String> = Vec::new();
-    for message in rows {
-        if let crate::schema::message::Message::Assistant(assistant) = message {
+    for message in messages {
+        if let Message::Assistant(assistant) = message {
             for content in &assistant.content {
-                if let crate::schema::message::AssistantContent::Text { text, .. } = content
+                if let AssistantContent::Text { text, .. } = content
                     && !text.trim().is_empty()
                 {
                     parts.push(preview(text));
@@ -340,11 +414,11 @@ async fn transcript(tool: &SubagentTool, child_id: &str) -> Result<String, Strin
         }
     }
     if parts.is_empty() {
-        return Ok(format!(
+        return format!(
             "Subagent finished without a final reply. Its transcript is on session {child_id}."
-        ));
+        );
     }
-    Ok(format!("Subagent report:\n\n{}", parts.join("\n\n")))
+    format!("Subagent report:\n\n{}", parts.join("\n\n"))
 }
 
 /// Keep the parent's context small: the head of each message only.
@@ -363,6 +437,101 @@ fn preview(text: &str) -> String {
 mod tests {
     use crate::schema::event::SessionEventData;
     use crate::schema::support::LocationRef;
+
+    fn assistant_text(text: &str) -> crate::schema::message::Message {
+        crate::schema::message::Message::Assistant(Box::new(
+            crate::schema::message::AssistantMessage {
+                id: "msg_a".to_owned(),
+                metadata: None,
+                time: crate::schema::message::AssistantTime {
+                    created: 0,
+                    streamed: None,
+                    completed: Some(1),
+                },
+                agent: "build".to_owned(),
+                model: crate::schema::support::ModelRef {
+                    id: "k3".to_owned(),
+                    provider_id: "cardinal".to_owned(),
+                    variant: None,
+                },
+                content: vec![crate::schema::message::AssistantContent::Text {
+                    text: text.to_owned(),
+                    state: None,
+                }],
+                snapshot: None,
+                finish: None,
+                raw_finish: None,
+                provider_state: None,
+                cost: None,
+                tokens: None,
+                error: None,
+                retry: None,
+            },
+        ))
+    }
+
+    fn idle(outcome: crate::schema::message::IdleOutcome) -> crate::schema::message::Message {
+        crate::schema::message::Message::Idle {
+            id: "msg_i".to_owned(),
+            metadata: None,
+            time: crate::schema::message::TimeCreated { created: 2 },
+            outcome,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn child_outcome_reads_the_trailing_idle_row() {
+        use crate::schema::message::IdleOutcome;
+        let completed = vec![assistant_text("done"), idle(IdleOutcome::Succeeded)];
+        assert!(matches!(
+            super::child_outcome(&completed),
+            super::ChildOutcome::Completed
+        ));
+
+        let interrupted = vec![assistant_text("partial"), idle(IdleOutcome::Interrupted)];
+        assert!(matches!(
+            super::child_outcome(&interrupted),
+            super::ChildOutcome::Interrupted
+        ));
+
+        let bare = vec![assistant_text("done")];
+        assert!(matches!(
+            super::child_outcome(&bare),
+            super::ChildOutcome::Completed
+        ));
+    }
+
+    #[test]
+    fn child_outcome_failed_carries_the_session_error_message() {
+        use crate::schema::message::IdleOutcome;
+        let failed = vec![
+            assistant_text("trying"),
+            crate::schema::message::Message::Idle {
+                id: "msg_i".to_owned(),
+                metadata: None,
+                time: crate::schema::message::TimeCreated { created: 2 },
+                outcome: IdleOutcome::Failed,
+                error: Some(crate::schema::support::SessionError {
+                    kind: "provider".to_owned(),
+                    message: "boom".to_owned(),
+                    status: None,
+                    response: None,
+                }),
+            },
+        ];
+        assert_eq!(
+            super::child_outcome(&failed),
+            super::ChildOutcome::Failed("boom".to_owned())
+        );
+    }
+
+    #[test]
+    fn final_text_takes_the_newest_nonempty_assistant_text() {
+        let history = vec![assistant_text("old"), assistant_text("newest")];
+        assert_eq!(super::final_text(&history).as_deref(), Some("newest"));
+        assert_eq!(super::final_text(&[]).as_deref(), None);
+    }
 
     #[test]
     fn cancelled_sentinel_is_not_the_question_one() {
