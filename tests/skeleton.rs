@@ -350,6 +350,7 @@ async fn project_list_reads_upstream_project_table() {
         directory: std::env::current_dir().unwrap(),
         runner,
         model_catalog,
+        mcp: std::sync::Arc::new(ox::mcp::Hub::empty()),
     };
     let router = ox::build_router(state);
     let handle = tokio::spawn(async move {

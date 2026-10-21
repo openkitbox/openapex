@@ -39,6 +39,10 @@ pub struct AppState {
     pub runner: Runner,
     /// The model catalogue the client lists (`GET /v1/models` on the gateway).
     pub model_catalog: Arc<crate::model_catalog::ModelCatalog>,
+    /// Connected MCP servers: status, resources and prompt instructions.
+    /// Shared with `Runner` so the system prompt and the API read the same
+    /// snapshot.
+    pub mcp: Arc<crate::mcp::Hub>,
 }
 
 /// Fetch the injected app state; on failure logs the error and renders a

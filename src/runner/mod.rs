@@ -237,6 +237,9 @@ struct Inner {
     tools: Arc<ToolRegistry>,
     /// The model catalogue (default-model resolution); shared with the API.
     model_catalog: Arc<crate::model_catalog::ModelCatalog>,
+    /// Connected MCP servers: tools (registered before the runner was built)
+    /// plus the instruction block the system prompt carries.
+    mcp: Arc<crate::mcp::Hub>,
     sessions: DashMap<String, SessionHandle>,
 }
 
@@ -265,6 +268,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 impl Runner {
     /// A runner over the given bus/db/config rooted at `directory`, with the
     /// given chat transport and (initially empty or test-populated) tools.
+    /// No MCP servers: direct construction in tests keeps the pre-MCP prompt.
     pub fn new(
         config: std::sync::Arc<Config>,
         directory: PathBuf,
@@ -274,6 +278,32 @@ impl Runner {
         tools: Arc<ToolRegistry>,
         model_catalog: Arc<crate::model_catalog::ModelCatalog>,
     ) -> Self {
+        Self::new_with_mcp(
+            config,
+            directory,
+            db,
+            bus,
+            chat,
+            tools,
+            model_catalog,
+            Arc::new(crate::mcp::Hub::empty()),
+        )
+    }
+
+    /// [`Runner::new`] over the process-wide MCP hub the composition root
+    /// connected, so the system prompt reads the same server snapshot the
+    /// HTTP layer serves.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_mcp(
+        config: std::sync::Arc<Config>,
+        directory: PathBuf,
+        db: Db,
+        bus: EventBus,
+        chat: Arc<dyn Chat>,
+        tools: Arc<ToolRegistry>,
+        model_catalog: Arc<crate::model_catalog::ModelCatalog>,
+        mcp: Arc<crate::mcp::Hub>,
+    ) -> Self {
         let inner = Arc::new(Inner {
             config,
             directory,
@@ -282,6 +312,7 @@ impl Runner {
             chat,
             tools,
             model_catalog,
+            mcp,
             sessions: DashMap::new(),
         });
         if let Some(handle) = SUBAGENT_HANDLE.get() {
@@ -475,6 +506,7 @@ impl ActorTask {
                 chat: self.inner.chat.clone(),
                 tools: self.inner.tools.clone(),
                 model_catalog: Arc::clone(&self.inner.model_catalog),
+                mcp: self.inner.mcp.clone(),
             };
             let mut scope = drain::Promotable::Input;
             loop {

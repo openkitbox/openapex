@@ -212,7 +212,8 @@ pub(crate) async fn run(
         } else {
             load_history_after(&ctx.db, &ctx.session_id, floor).await?
         };
-        let system = prompt::build(&ctx.directory);
+        let system =
+            prompt::build_with_mcp(&ctx.directory, ctx.mcp.instructions_block().as_deref());
         let mut request = ChatRequest::new(
             // cardinal routes on the bare model id; the providerID/modelID
             // qualified form is upstream's provider-adapter vocabulary and

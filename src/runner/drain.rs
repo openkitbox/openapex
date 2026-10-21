@@ -101,6 +101,8 @@ pub(crate) struct DrainCtx {
     pub chat: Arc<dyn Chat>,
     pub tools: Arc<ToolRegistry>,
     pub model_catalog: Arc<crate::model_catalog::ModelCatalog>,
+    /// MCP servers whose instructions join the system prompt.
+    pub mcp: Arc<crate::mcp::Hub>,
 }
 
 /// Run drains until the inbox is quiet, a control interrupts, or a turn
@@ -786,6 +788,7 @@ mod tests {
                 model_catalog: Arc::new(crate::model_catalog::ModelCatalog::from_entries(
                     Vec::new(),
                 )),
+                mcp: Arc::new(crate::mcp::Hub::empty()),
             }
         }
     }

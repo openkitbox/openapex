@@ -117,6 +117,17 @@ async fn build_state_on_with_bus(
     }
     let cwd = std::env::current_dir()?;
     let directory = cwd.canonicalize().unwrap_or(cwd);
+    // MCP servers connect before the runner exists: their tools must be in
+    // the registry the runner snapshots, and the same hub is shared with the
+    // HTTP layer. A server that fails to connect is a status, never a
+    // startup error.
+    let mcp = Arc::new(crate::mcp::Hub::empty());
+    for tool in mcp.connect_all(&config.mcp, &directory).await {
+        let name = tool.name().to_owned();
+        if let Err(error) = tools.register(tool) {
+            tracing::warn!(tool = %name, %error, "MCP tool skipped");
+        }
+    }
     let model_catalog = model_catalog::ModelCatalog::new(&config);
     // The TUI renders its question dialog purely from the ephemeral
     // `form.created` / `form.replied` / `form.cancelled` frames, so the
@@ -129,7 +140,7 @@ async fn build_state_on_with_bus(
     let tools = Arc::new(tools);
     let db_handle = db.clone();
     let bus_handle = bus.clone();
-    let runner = Runner::new(
+    let runner = Runner::new_with_mcp(
         std::sync::Arc::clone(&config),
         directory.clone(),
         db,
@@ -137,6 +148,7 @@ async fn build_state_on_with_bus(
         chat,
         tools,
         Arc::clone(&model_catalog),
+        Arc::clone(&mcp),
     );
     Ok(AppState {
         config,
@@ -145,6 +157,7 @@ async fn build_state_on_with_bus(
         directory,
         runner,
         model_catalog,
+        mcp,
     })
 }
 

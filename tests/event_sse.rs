@@ -70,6 +70,7 @@ async fn spawn_server(heartbeat_ms: u64) -> TestServer {
         directory: std::env::current_dir().unwrap(),
         runner,
         model_catalog,
+        mcp: std::sync::Arc::new(ox::mcp::Hub::empty()),
     };
     let router = ox::build_router(state);
     let listen = format!("127.0.0.1:{port}");

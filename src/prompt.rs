@@ -10,7 +10,16 @@ use std::path::Path;
 /// Build the system prompt for a step: an environment block (working
 /// directory, platform, today's UTC date) plus `AGENTS.md` contents read
 /// from `directory` when present (read fresh each step — small files only).
+///
+/// [`build_with_mcp`] without MCP instructions.
 pub fn build(directory: &Path) -> String {
+    build_with_mcp(directory, None)
+}
+
+/// [`build`] plus the MCP instruction block (upstream
+/// `mcp/instructions.ts`). `None` preserves the pre-MCP prompt byte for
+/// byte, which is what the zero-server configuration must keep doing.
+pub fn build_with_mcp(directory: &Path, mcp_instructions: Option<&str>) -> String {
     let mut prompt = format!(
         "You are a coding agent running in ox, an opencode-compatible server.\n\n\
          <env>\n\
@@ -51,6 +60,10 @@ pub fn build(directory: &Path) -> String {
             prompt.push_str("  </skill>\n");
         }
         prompt.push_str("</available_skills>");
+    }
+    if let Some(block) = mcp_instructions {
+        prompt.push_str("\n\n");
+        prompt.push_str(block);
     }
     prompt
 }
@@ -102,6 +115,14 @@ mod tests {
         let prompt = build(&dir);
         assert!(prompt.contains("Working directory: "));
         assert!(prompt.contains("Today's date: "));
+    }
+
+    #[test]
+    fn mcp_instructions_are_appended_when_present() {
+        let dir = std::env::temp_dir();
+        let with = build_with_mcp(&dir, Some("<mcp_instructions>\n</mcp_instructions>"));
+        assert!(with.contains("<mcp_instructions>"));
+        assert!(!build(&dir).contains("<mcp_instructions>"));
     }
 
     #[test]
