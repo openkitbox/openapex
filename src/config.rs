@@ -49,6 +49,20 @@ pub struct ModelEntry {
     /// Maximum output tokens, when the provider states one.
     #[serde(default)]
     pub output: Option<i64>,
+    /// Whether the gateway advertises reasoning effort levels for this model.
+    #[serde(default)]
+    pub reasoning: bool,
+    /// Advertised levels, each as `{ "effort": "<name>" }` in catalog order
+    /// (cardinal `models.rs` row shape). Empty unless [`ModelEntry::reasoning`].
+    #[serde(default)]
+    pub supported_reasoning_levels: Vec<ReasoningLevel>,
+}
+
+/// One entry of cardinal's `supported_reasoning_levels` (`{effort}` only).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ReasoningLevel {
+    /// The level name as the chat wire accepts it (`low`, `high`, …).
+    pub effort: String,
 }
 
 /// MCP integration (`[mcp]` section). Servers are keyed by name; the name is
@@ -285,6 +299,46 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_entry_keeps_cardinal_reasoning_metadata() {
+        // The exact row shape cardinal's /v1/models emits (models.rs).
+        let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+            "provider": "cardinal",
+            "id": "k3-256k",
+            "name": "kimi k3 (256k)",
+            "context": 262144,
+            "output": 8192,
+            "reasoning": true,
+            "supported_reasoning_levels": [
+                {"effort": "low"},
+                {"effort": "high"},
+                {"effort": "max"},
+            ],
+        }))
+        .unwrap();
+        assert!(entry.reasoning);
+        let levels: Vec<_> = entry
+            .supported_reasoning_levels
+            .iter()
+            .map(|level| level.effort.as_str())
+            .collect();
+        assert_eq!(levels, ["low", "high", "max"], "catalog order kept");
+    }
+
+    #[test]
+    fn model_entry_defaults_without_reasoning_metadata() {
+        // Today's level-less rows (deepseek-flash, k4-1m) must deserialize
+        // unchanged — the fields silently defaulted to false/empty before
+        // this plan and keep doing so.
+        let entry: ModelEntry = serde_json::from_value(serde_json::json!({
+            "provider": "cardinal",
+            "id": "k4-1m",
+        }))
+        .unwrap();
+        assert!(!entry.reasoning);
+        assert!(entry.supported_reasoning_levels.is_empty());
+    }
 
     #[test]
     fn defaults_are_applied_when_file_missing() {

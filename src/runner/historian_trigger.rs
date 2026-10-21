@@ -406,6 +406,8 @@ mod tests {
             name: Some("m".to_owned()),
             context: None,
             output: None,
+            reasoning: false,
+            supported_reasoning_levels: Vec::new(),
         }])
     }
 
