@@ -1,9 +1,10 @@
 //! Gateway to the third-party `codebase-memory-mcp` binary.
 //!
-//! ox deliberately has **no MCP client**; this module adapts the binary's
-//! one-shot `cli` mode instead: `<binary> cli --quiet <tool>`, with the tool
-//! arguments as a single JSON object on stdin (the binary reads stdin to EOF,
-//! so the writer must close it).
+//! ox's generic MCP client lives in `src/mcp`; this module deliberately
+//! bypasses the protocol and adapts the binary's one-shot `cli` mode
+//! instead: `<binary> cli --quiet <tool>`, with the tool arguments as a
+//! single JSON object on stdin (the binary reads stdin to EOF, so the writer
+//! must close it).
 //!
 //! The five registered tool names (`index_repository`, `search_graph`,
 //! `trace_path`, `get_code_snippet`, `get_architecture`) are BARE names

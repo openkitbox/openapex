@@ -1,7 +1,8 @@
 //! `capability_search`: find a skill by describing what is needed.
 //!
-//! fx's tool of the same name searches installed skills and MCP tools; ox has
-//! no MCP layer yet, so this covers skills only. Matching is a simple scored
+//! fx's tool of the same name searches installed skills and MCP tools; ox's
+//! MCP tools are registered by the MCP hub but are not indexed here yet, so
+//! this covers skills only. Matching is a simple scored
 //! token overlap over id/name/description — the catalog is small enough that
 //! no index is warranted.
 

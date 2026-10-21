@@ -81,6 +81,17 @@ impl Bridge {
         &self,
         request: NewSessionRequest,
     ) -> Result<NewSessionResponse, acp::Error> {
+        if !request.mcp_servers.is_empty() {
+            // ox's ToolRegistry is process-global: a server started for one
+            // ACP session would leak into every session. Servers come from
+            // `~/.ox/ox.toml` instead; say so rather than silently dropping
+            // the editor's request.
+            tracing::warn!(
+                count = request.mcp_servers.len(),
+                cwd = %request.cwd.display(),
+                "ACP mcpServers ignored; configure [mcp.servers] in ~/.ox/ox.toml"
+            );
+        }
         let directory = request.cwd.to_string_lossy().to_string();
         // ox resolves the create directory from the request itself the same
         // way the opencode client carries it (`location[directory]` query,
