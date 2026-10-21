@@ -332,8 +332,9 @@ async fn project_list_reads_upstream_project_table() {
     )
     .unwrap();
     let model_catalog = ox::model_catalog::ModelCatalog::new(&config);
+    let config = std::sync::Arc::new(config);
     let runner = ox::runner::Runner::new(
-        config.clone(),
+        std::sync::Arc::clone(&config),
         std::env::current_dir().unwrap(),
         db.clone(),
         bus.clone(),
@@ -341,8 +342,9 @@ async fn project_list_reads_upstream_project_table() {
         std::sync::Arc::new(ox::runner::ToolRegistry::new()),
         std::sync::Arc::clone(&model_catalog),
     );
+    let listen: String = config.listen.clone();
     let state = AppState {
-        config: config.clone(),
+        config,
         bus,
         db,
         directory: std::env::current_dir().unwrap(),
@@ -350,7 +352,6 @@ async fn project_list_reads_upstream_project_table() {
         model_catalog,
     };
     let router = ox::build_router(state);
-    let listen: String = config.listen.clone();
     let handle = tokio::spawn(async move {
         let acceptor = TcpListener::new(listen).bind().await;
         Server::new(acceptor).serve(router).await;

@@ -104,7 +104,11 @@ impl Page {
         let raw_offset = offset.unwrap_or(0);
         let raw_limit = limit.unwrap_or(0);
         Ok(Self {
-            offset: if raw_offset == 0 { 1 } else { raw_offset as usize },
+            offset: if raw_offset == 0 {
+                1
+            } else {
+                raw_offset as usize
+            },
             limit: if raw_limit == 0 {
                 MAX_READ_LINES
             } else {
@@ -225,7 +229,15 @@ fn read_text(path: &str, absolute: &Path, resource: &str, page: &Page) -> ToolOu
         while let Some(position) = carry[consumed..].iter().position(|byte| *byte == b'\n') {
             let end = consumed + position;
             let line = &carry[consumed..end];
-            if handle_line(line, line_number, path, page, &mut entries, &mut size, &mut next) {
+            if handle_line(
+                line,
+                line_number,
+                path,
+                page,
+                &mut entries,
+                &mut size,
+                &mut next,
+            ) {
                 return finish_page(path, page, &entries, next, binary);
             }
             saw_any_line = true;
@@ -239,7 +251,15 @@ fn read_text(path: &str, absolute: &Path, resource: &str, page: &Page) -> ToolOu
         if eof {
             if !carry.is_empty() {
                 let line = carry.clone();
-                let _ = handle_line(&line, line_number, path, page, &mut entries, &mut size, &mut next);
+                let _ = handle_line(
+                    &line,
+                    line_number,
+                    path,
+                    page,
+                    &mut entries,
+                    &mut size,
+                    &mut next,
+                );
                 saw_any_line = true;
             }
             break;
@@ -247,8 +267,16 @@ fn read_text(path: &str, absolute: &Path, resource: &str, page: &Page) -> ToolOu
         if carry.len() > MAX_LINE_LENGTH * 4 {
             // A single pathologically long line: keep the head so the page can
             // still be produced instead of buffering the whole file.
-            let line = carry.drain(..).collect::<Vec<u8>>();
-            if handle_line(&line, line_number, path, page, &mut entries, &mut size, &mut next) {
+            let line = std::mem::take(&mut carry);
+            if handle_line(
+                &line,
+                line_number,
+                path,
+                page,
+                &mut entries,
+                &mut size,
+                &mut next,
+            ) {
                 return finish_page(path, page, &entries, next, binary);
             }
             saw_any_line = true;
@@ -636,11 +664,7 @@ mod tests {
             .and_then(|tail| tail.trim_end_matches(']').parse().ok())
             .expect("next offset");
         assert!(next > 1);
-        let second = execute(
-            directory.path(),
-            json!({"path": "big.txt", "offset": next}),
-        )
-        .await;
+        let second = execute(directory.path(), json!({"path": "big.txt", "offset": next})).await;
         let second_text = second.content.as_str().expect("text");
         // Line numbers are 1-based, so offset `next` shows content index
         // `next - 1`.

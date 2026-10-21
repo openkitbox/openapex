@@ -89,8 +89,11 @@ async fn build_state_on(
     let directory = cwd.canonicalize().unwrap_or(cwd);
     let bus = EventBus::new(db.clone());
     let model_catalog = model_catalog::ModelCatalog::new(&config);
+    // One read-only config behind an `Arc`: every actor and spawned task clones
+    // the handle, never the struct.
+    let config = std::sync::Arc::new(config);
     let runner = Runner::new(
-        config.clone(),
+        std::sync::Arc::clone(&config),
         directory.clone(),
         db.clone(),
         bus.clone(),
@@ -141,13 +144,24 @@ pub async fn run(config: Config) -> Result<()> {
     // it, and deliberately not part of `build_state_with`: tests must not
     // acquire a background loop that writes to their database.
     if state.config.magic_context.enabled && state.config.magic_context.dreamer_enabled {
-        Arc::new(mctx::dreamer::Dreamer::new(
+        mctx::dreamer::Dreamer::new(
             state.db.clone(),
             state.config.clone(),
             state.runner.chat(),
             Arc::clone(&state.model_catalog),
-        ))
+        )
         .spawn();
+    }
+    // A fold that was in flight when the previous process died left its
+    // `mc_historian_run` row `running`, and "one pending run per session" reads
+    // that row as a claim: without settling it here, every session that was
+    // folding at exit would never fold again.
+    match mctx::historian::settle_running_runs(&state.db).await {
+        Ok(0) => {}
+        Ok(settled) => tracing::info!(settled, "settled interrupted historian runs"),
+        Err(error) => {
+            tracing::warn!(error = %error, "settle interrupted historian runs failed");
+        }
     }
     let router = build_router(state);
     let acceptor = TcpListener::new(listen).bind().await;

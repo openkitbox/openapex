@@ -198,10 +198,12 @@ pub(crate) async fn run(
         // The magic-context head replaces everything it covers: the pass mints
         // the frozen bytes and reports the ordinal floor, so the transcript
         // starts after the covered range.
-        let (head_m0, head_m1, floor) = mctx_head(ctx).await;
+        let budget = crate::mctx::budget_for(&ctx.config, &ctx.model_catalog, &params.model.id);
+        let (head_m0, head_m1, floor) = mctx_head(ctx, budget).await;
         // Pressure is checked after the pass: the floor it reports is what the
-        // live tail is measured above.
-        super::historian_trigger::mctx_historian(ctx, floor);
+        // live tail is measured above. Both windows were resolved once, when
+        // the budget was derived.
+        super::historian_trigger::mctx_historian(ctx, budget, floor);
         let rows = if ctx.config.magic_context.enabled {
             // The §N§ overlay (tag prefixes + drop placeholders) is part of the
             // integration: with it off the request must stay byte-identical to
@@ -1203,7 +1205,10 @@ fn to_session_error(error: &CardinalError) -> SessionError {
 /// the transcript floor they cover, or `(None, None, 0)` when the integration
 /// is off or the pass failed (the prompt then stays byte-identical to the
 /// integration-off one — a broken head must never fail the turn).
-async fn mctx_head(ctx: &DrainCtx) -> (Option<String>, Option<String>, i64) {
+async fn mctx_head(
+    ctx: &DrainCtx,
+    budget: crate::mctx::budget::Budget,
+) -> (Option<String>, Option<String>, i64) {
     if !ctx.config.magic_context.enabled {
         return (None, None, 0);
     }
@@ -1220,6 +1225,7 @@ async fn mctx_head(ctx: &DrainCtx) -> (Option<String>, Option<String>, i64) {
         session_id: &ctx.session_id,
         project: &project,
         last_seq,
+        budget,
         forced: false,
         run_started: false,
     };
@@ -1499,8 +1505,8 @@ pub(crate) async fn last_assistant_text(
     };
     let raw: String = row.get(0)?;
     let value: Value = serde_json::from_str(&raw).context("decode session_message.data")?;
-    let message = Message::from_row_data("", "assistant", value)
-        .context("decode assistant message row")?;
+    let message =
+        Message::from_row_data("", "assistant", value).context("decode assistant message row")?;
     Ok(match message {
         Message::Assistant(assistant) => Some(
             assistant
@@ -1550,7 +1556,12 @@ pub(crate) async fn load_overlaid_tail(
     let drops = crate::mctx::tagger::drops(db, session_id)
         .await
         .context("load drops")?;
-    crate::mctx::tagger::apply_overlay(&mut rows, &tags, &drops);
+    crate::mctx::tagger::apply_overlay(
+        &mut rows,
+        &tags,
+        &drops,
+        crate::mctx::tagger::OverlayMode::Request,
+    );
     rows.into_iter().map(|row| decode_row(&row)).collect()
 }
 
@@ -1598,10 +1609,7 @@ pub(crate) async fn rows_after_with_seq(
     raw.into_iter()
         .map(|(id, kind, data, seq)| {
             let mut value: serde_json::Value = serde_json::from_str(&data)?;
-            if let serde_json::Value::Object(map) = &mut value {
-                map.insert("id".to_owned(), serde_json::Value::String(id));
-                map.insert("type".to_owned(), serde_json::Value::String(kind));
-            }
+            Message::merge_row_columns(&id, &kind, &mut value);
             Ok((seq, value))
         })
         .collect()

@@ -6,10 +6,10 @@
 //! coordinator and Rust module. It owns the three things the kernel cannot
 //! know:
 //!
-//! - **What the head is made of** — m[0] (baseline: compartment history +
-//!   memory pinboard) and m[1] (delta: compartments folded in since the
-//!   baseline), rendered by [`crate::mctx::render`]. The kernel treats both as
-//!   opaque bytes.
+//! - **What the head is made of** — m[0] (baseline: the compartment history
+//!   at the session's decay budget) and m[1] (delta: the memory pinboard),
+//!   rendered by [`crate::mctx::render`]. The kernel treats both as opaque
+//!   bytes.
 //! - **Classification** — m[0] bytes changed ⇒ `Hard`; only m[1] changed ⇒
 //!   `Soft`; nothing changed ⇒ `SoftPlus` defer (see [`Signals`]).
 //! - **The coverage anchor and the floor** — the boundary id carries the
@@ -18,9 +18,18 @@
 //!   transcript floor for request assembly — everything at or below it is
 //!   represented by the head and dropped from the tail.
 //!
-//! The baseline's own coverage is a *separate*, ox-owned fact (a session `kv`
-//! row): a `Soft` folds new coverage into the delta while the baseline stays
-//! frozen at the ordinal it was built at, so the two only coincide on a `Hard`.
+//! ## Why the baseline is rebuilt by every fold
+//!
+//! A fold changes the compartment set, so it changes the history block, so it
+//! busts the cache. There is deliberately no "delta carries the new
+//! compartments" half: an earlier ox kept one (a frozen baseline at its own
+//! coverage plus a `<new-compartments>` delta), and the extra state was a
+//! standing source of bugs — a session whose baseline froze while folds went to
+//! the delta renders a *lossy* head (decay never sees the delta, so folds
+//! accumulate at full fidelity and older, larger compartments are never
+//! demoted), which is the opposite of what folding is for. One rule instead:
+//! the head is a function of the current compartment set and the session's
+//! history budget, and a fold busts.
 //!
 //! ## The drop contract, both halves
 //!
@@ -43,12 +52,11 @@ use cortexkit_cache_core::{CoreState, DurabilityClass, FrozenUnit};
 
 use crate::db::{Db, optional};
 use crate::id::now_millis;
+use crate::mctx::budget::Budget;
 use crate::mctx::cache::{HeadRenderer, McCache, PassOutcome, RenderedPass, Signals, run_pass};
 use crate::mctx::compartments::{self, Compartment};
 use crate::mctx::memory::{MemoryRow, active_memories};
-use crate::mctx::render::{
-    DEFAULT_HISTORY_BUDGET_TOKENS, assemble_m1, render_m0, render_new_compartments,
-};
+use crate::mctx::render::{M0Inputs, assemble_m1, render_m0, render_memory_block};
 use crate::mctx::tagger::{mark_drops_applied, peek_queued_drops};
 
 /// What one pass produced for the request builder.
@@ -79,6 +87,9 @@ pub struct PassRequest<'a> {
     pub project: &'a str,
     /// Highest transcript ordinal currently live (boundary-presence check).
     pub last_seq: i64,
+    /// The session's budgets, derived from the model catalogue at the step
+    /// boundary (the history block is rendered at [`Budget::history`]).
+    pub budget: Budget,
     /// An explicit refresh/compaction request forces a `Hard` rebuild.
     pub forced: bool,
     /// A new run/episode started.
@@ -92,6 +103,7 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
         session_id,
         project,
         last_seq,
+        budget,
         forced,
         run_started,
     } = request;
@@ -102,27 +114,25 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
     let state = cache.load().await?;
 
     // The materialized coverage: the highest ordinal the head represents, and
-    // therefore the transcript floor. Clamped to the live tail so a revert that
-    // removed rows can never leave the head claiming coverage of rows that no
-    // longer exist (which would strand a stale head under a live anchor).
-    let coverage = compartments::coverage_end(&compartments)
-        .unwrap_or(0)
-        .min(last_seq);
-    // The ordinal the frozen baseline (`m[0]`) covers. It is not the same thing
-    // as the coverage: a `Soft` folds new coverage into the delta while the
-    // baseline stays put. It is ox-owned state (the kernel's anchor is the
-    // coverage token), so it lives in the session's kv row.
-    let m0_coverage = materialized_m0_coverage(db, session_id).await?;
-    let rebuild_m0 =
-        state.is_none() || forced || baseline_changed(state.as_ref(), &compartments, m0_coverage);
-    let m0_coverage_after = if rebuild_m0 { coverage } else { m0_coverage };
+    // therefore the transcript floor. It is the highest compartment end that is
+    // still inside the live tail — *not* simply the newest compartment's end: a
+    // revert can leave a compartment claiming rows that no longer exist, and
+    // the head must stop at the live boundary instead of covering a range it
+    // cannot render.
+    let claimed = compartments::coverage_end(&compartments).unwrap_or(0);
+    let coverage = compartments
+        .iter()
+        .filter_map(Compartment::end_ordinal)
+        .filter(|end| *end <= last_seq)
+        .max()
+        .unwrap_or(0);
+    // A revert removed rows the head already claims to represent: the stored
+    // floor and the frozen bytes both describe a range that is gone, and the
+    // new rows sit *below* the old floor, so they would be invisible to the
+    // model. This is upstream's "reconcile" case: rebuild and re-anchor.
+    let stale = claimed > last_seq;
 
-    let plan = plan_units(PlanInputs {
-        compartments: &compartments,
-        memories: &memories,
-        m0_coverage: m0_coverage_after,
-        coverage,
-    });
+    let plan = plan_units(&compartments, &memories, coverage, budget.history);
 
     // Queued drops ride the planned units, not the kernel's defer queue: our
     // durable `mc_drop` rows are the carrier ("queued, not immediate" — the
@@ -132,7 +142,7 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
 
     let (frozen_m0, frozen_m1) = frozen_halves(state.as_ref());
     let signals = Signals {
-        boundary_present: boundary_present(state.as_ref(), coverage, last_seq),
+        boundary_present: boundary_present(state.as_ref(), stale),
         forced,
         run_started,
         // A queued drop makes the head itself stale (its placeholder has to
@@ -140,7 +150,11 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
         // would replay the frozen bytes and the mark would never take effect.
         // The signal converges — the bust applies the drops, so the next pass
         // sees an empty queue.
-        head_changed: state.is_none() || forced || !drops.is_empty() || plan.m0 != frozen_m0,
+        head_changed: state.is_none()
+            || forced
+            || stale
+            || !drops.is_empty()
+            || plan.m0 != frozen_m0,
         delta_changed: plan.m1 != frozen_m1,
     };
 
@@ -175,7 +189,6 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
                 mark_drops_applied(db, session_id, &tags).await?;
             }
             save_materialized_floor(db, session_id, coverage).await?;
-            save_materialized_m0_coverage(db, session_id, m0_coverage_after).await?;
             (
                 prefix,
                 coverage,
@@ -205,6 +218,9 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
             (lkg.unwrap_or_default(), floor, PassOutcome::ModulePanicked)
         }
     };
+    // A served floor above the live tail would hide every live row from the
+    // model. The pass re-anchors on the next bust; until then the tail wins.
+    let floor = floor.min(last_seq);
 
     // The prefix is the two halves in order; `split_prefix` recovers them (both
     // are non-empty by construction — the baseline always carries the history
@@ -264,76 +280,34 @@ impl Plan {
     }
 }
 
-struct PlanInputs<'a> {
-    compartments: &'a [Compartment],
-    memories: &'a [MemoryRow],
-    /// The ordinal the baseline half covers.
-    m0_coverage: i64,
-    /// The ordinal the whole head covers (the floor). The kernel's boundary
-    /// anchor is minted from THIS, not from the baseline's own coverage: a
-    /// delta extends coverage past the baseline, and a revert of those rows
-    /// must invalidate the head.
+/// Render the two head halves: m[0] over every compartment the head covers,
+/// m[1] over the pinboard.
+fn plan_units(
+    compartments: &[Compartment],
+    memories: &[MemoryRow],
     coverage: i64,
-}
-
-/// Render the two head halves: m[0] over the compartments m[0] covers,
-/// m[1] over the ones beyond it.
-fn plan_units(inputs: PlanInputs<'_>) -> Plan {
-    let m0_compartments: Vec<_> = inputs
-        .compartments
+    history_budget_tokens: u32,
+) -> Plan {
+    let covered: Vec<_> = compartments
         .iter()
-        .filter(|c| c.end_ordinal().is_some_and(|end| end <= inputs.m0_coverage))
+        .filter(|c| c.end_ordinal().is_some_and(|end| end <= coverage))
         .map(Compartment::render_input)
         .collect();
-    let delta: Vec<_> = inputs
-        .compartments
-        .iter()
-        .filter(|c| c.end_ordinal().is_some_and(|end| end > inputs.m0_coverage))
-        .map(Compartment::render_input)
-        .collect();
-    let delta_refs: Vec<_> = delta.iter().collect();
 
-    let m0 = render_m0(&crate::mctx::render::M0Inputs {
-        compartments: &m0_compartments,
-        history_budget_tokens: DEFAULT_HISTORY_BUDGET_TOKENS,
+    let m0 = render_m0(&M0Inputs {
+        compartments: &covered,
+        history_budget_tokens: f64::from(history_budget_tokens),
     });
-    let new_compartments = render_new_compartments(&delta_refs);
     // The pinboard rides the volatile half: a memory write must not rebuild the
     // provider's cache anchor.
-    let memories = crate::mctx::render::render_memory_block(inputs.memories);
-    let m1_body = assemble_m1(&memories, &new_compartments);
+    let m1_body = assemble_m1(&render_memory_block(memories));
     Plan {
         m0,
         // The unit payload carries the blank line that separates it from m[0]:
         // the kernel concatenates frozen payloads verbatim.
         m1: format!("\n\n{m1_body}"),
-        boundary_id: anchor_id(inputs.coverage),
+        boundary_id: anchor_id(coverage),
     }
-}
-
-/// Whether the frozen m[0] is stale against the rows it is a function of.
-/// m[0] covers the compartments at or below `m0_coverage` plus the active
-/// memories, so re-rendering it and comparing bytes answers "must the
-/// baseline rebuild" without enumerating causes.
-fn baseline_changed(
-    state: Option<&CoreState>,
-    compartments: &[Compartment],
-    m0_coverage: i64,
-) -> bool {
-    let Some(state) = state else {
-        return true;
-    };
-    let plan = plan_units(PlanInputs {
-        compartments,
-        // Memories are not an m[0] input any more (they ride m[1]), so the
-        // baseline diff cannot see a memory write.
-        memories: &[],
-        m0_coverage,
-        // Only m[0] is compared here; the anchor is irrelevant to the diff.
-        coverage: m0_coverage,
-    });
-    let (frozen_m0, _) = frozen_halves(Some(state));
-    plan.m0 != frozen_m0
 }
 
 /// The boundary id for a given m[0] coverage ordinal.
@@ -359,16 +333,17 @@ fn frozen_halves(state: Option<&CoreState>) -> (String, String) {
     )
 }
 
-/// Boundary-presence token: the anchor when the range it covers (everything at
-/// or below the coverage, i.e. the floor) is still in the live transcript, else
-/// the absent sentinel the kernel expects.
+/// Boundary-presence token: the anchor when the range it covers is still in
+/// the live transcript, else the absent sentinel the kernel expects (which
+/// makes it reconcile instead of replaying a head it cannot anchor).
 ///
-/// The anchor token is the *coverage*, not the baseline's own coverage: the
-/// prefix covers m[0] AND m[1], so a delta that extends coverage past the
-/// baseline must still be invalidated by a revert of those rows.
-fn boundary_present(state: Option<&CoreState>, coverage: i64, last_seq: i64) -> Option<String> {
+/// `stale` is the pass's own verdict — the head claims coverage past the live
+/// tail, i.e. a revert removed rows it represents — not a re-derivation here:
+/// the coverage was already clamped against `last_seq`, so comparing them again
+/// could never detect it.
+fn boundary_present(state: Option<&CoreState>, stale: bool) -> Option<String> {
     let state = state?;
-    (coverage <= last_seq).then(|| state.boundary_id.clone())
+    (!stale).then(|| state.boundary_id.clone())
 }
 
 /// One queued drop's frozen unit: the placeholder the model sees in place of
@@ -390,25 +365,6 @@ fn drop_units(drops: &[(u64, String)]) -> Vec<FrozenUnit> {
 
 fn materialized_key(session_id: &str) -> String {
     format!("mctx_seq:{session_id}")
-}
-
-fn materialized_m0_key(session_id: &str) -> String {
-    format!("mctx_m0_cov:{session_id}")
-}
-
-/// The ordinal the frozen baseline (`m[0]`) covers; 0 before the first pass.
-async fn materialized_m0_coverage(db: &Db, session_id: &str) -> Result<i64> {
-    read_kv_int(db, &materialized_m0_key(session_id), "mctx m0 coverage").await
-}
-
-async fn save_materialized_m0_coverage(db: &Db, session_id: &str, coverage: i64) -> Result<()> {
-    write_kv_int(
-        db,
-        &materialized_m0_key(session_id),
-        coverage,
-        "mctx m0 coverage",
-    )
-    .await
 }
 
 /// The transcript floor to pair with a last-known-good head.
@@ -545,6 +501,9 @@ mod tests {
             session_id: SESSION,
             project: PROJECT,
             last_seq,
+            // A 256k model with the default shares: the test content is far
+            // below the history budget, so decay never demotes it.
+            budget: Budget::derive(&crate::mctx::MctxConfig::default(), Some(262_144), None),
             forced: false,
             run_started: false,
         }
@@ -599,8 +558,13 @@ mod tests {
         assert_eq!(first.head_m1, second.head_m1, "both halves stay frozen");
     }
 
+    /// A fold rebuilds the baseline: the head is a pure function of the
+    /// current compartment set, so the new compartment is part of m[0] — and,
+    /// because the rendering now runs through the decay budget, the *older*
+    /// compartment is demoted when the set outgrows it instead of being frozen
+    /// at full fidelity forever.
     #[tokio::test]
-    async fn a_new_compartment_rides_the_delta_as_a_soft_bust() {
+    async fn a_new_compartment_rebuilds_the_baseline() {
         let db = db().await;
         add_compartment(&db, "mc_1", 1, 9, "Alpha").await;
         let first = run(request(&db, 9)).await.unwrap();
@@ -614,26 +578,21 @@ mod tests {
             "new coverage is a bust: {:?}",
             second.outcome
         );
-        // The baseline half is untouched — that is the whole point of a Soft: the
-        // provider's cached anchor survives while the delta moves.
-        assert_eq!(second.head_m0, first.head_m0, "m0 stays frozen");
-        let delta = second.head_m1.unwrap();
-        assert!(delta.contains("## 10-20 · Beta"), "delta body: {delta}");
+        assert_ne!(second.head_m0, first.head_m0, "the baseline moved");
+        let m0 = second.head_m0.unwrap();
+        assert!(m0.contains("## 1-9 · Alpha"), "old history kept: {m0}");
+        assert!(m0.contains("## 10-20 · Beta"), "new history: {m0}");
         assert!(
-            delta.contains("<new-compartments>"),
-            "delta wrapper: {delta}"
+            !m0.contains("<new-compartments>"),
+            "there is no delta half any more: {m0}"
         );
-        assert_eq!(second.floor, 20, "the floor advances with the delta");
-        // The kernel anchor is the HEAD's coverage, not the baseline's: a revert
-        // of the rows the delta covers must invalidate the head.
+        assert_eq!(second.floor, 20, "the floor advances with the coverage");
         let state = McCache::new(db.clone(), SESSION).load().await.unwrap();
         assert_eq!(
-            state.expect("state after the delta").boundary_id,
+            state.expect("state after the fold").boundary_id,
             anchor_id(20),
-            "the anchor advances with the delta"
+            "the anchor advances with the coverage"
         );
-        // ... and the baseline's own coverage stays where it was frozen.
-        assert_eq!(materialized_m0_coverage(&db, SESSION).await.unwrap(), 9);
     }
 
     /// A memory write must NOT rebuild the baseline: the pinboard rides the
@@ -734,7 +693,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_revert_beyond_the_anchor_reports_the_boundary_absent() {
+    async fn a_head_whose_coverage_outlives_the_tail_is_reported_absent() {
         let db = db().await;
         add_compartment(&db, "mc_1", 1, 9, "Alpha").await;
         run(request(&db, 9)).await.unwrap();
@@ -743,9 +702,35 @@ mod tests {
         let state = state.expect("state after the first pass");
         assert_eq!(state.boundary_id, anchor_id(9));
         // The covered range is still live: the anchor is present.
-        assert!(boundary_present(Some(&state), 9, 20).is_some());
+        assert!(boundary_present(Some(&state), false).is_some());
         // A revert that removed covered rows reports it absent → the kernel
         // flags a reconcile, and the next pass rebuilds against the live tail.
-        assert!(boundary_present(Some(&state), 9, 5).is_none());
+        assert!(boundary_present(Some(&state), true).is_none());
+    }
+
+    /// A revert shrinks the tail under the head's coverage. The stored floor
+    /// (20) is then larger than the live tail (12), which used to hide every
+    /// live row from the model; the pass must re-anchor below the live boundary
+    /// instead of serving a head that covers a range it cannot render.
+    #[tokio::test]
+    async fn a_revert_below_the_floor_keeps_the_live_tail_visible() {
+        let db = db().await;
+        add_compartment(&db, "mc_1", 1, 20, "Alpha").await;
+        let folded = run(request(&db, 20)).await.unwrap();
+        assert_eq!(folded.floor, 20);
+
+        // The transcript now ends at 12: the compartment no longer fits inside
+        // it, so nothing is covered and the floor falls back to 0.
+        let reverted = run(request(&db, 12)).await.unwrap();
+        assert!(
+            matches!(reverted.outcome, PassOutcome::BustApplied { .. }),
+            "a stale head must be rebuilt: {:?}",
+            reverted.outcome
+        );
+        assert_eq!(reverted.floor, 0, "the live tail is not hidden");
+        assert!(
+            !reverted.head_m0.unwrap().contains("## 1-20"),
+            "the head stops claiming rows that are gone"
+        );
     }
 }

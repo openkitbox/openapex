@@ -459,6 +459,26 @@ impl Message {
         value
     }
 
+    /// Merge the two `session_message` columns back into the `data` payload:
+    /// `decode({ ...row.data, id: row.id, type: row.type })`. The result is the
+    /// row shape the tagger addresses (it keys on `id` and switches on `type`),
+    /// so a caller that overlays before decoding merges here first.
+    pub fn merge_row_columns(id: &str, kind: &str, data: &mut serde_json::Value) {
+        if let serde_json::Value::Object(map) = data {
+            map.insert("id".to_owned(), serde_json::Value::String(id.to_owned()));
+            map.insert(
+                "type".to_owned(),
+                serde_json::Value::String(kind.to_owned()),
+            );
+        }
+    }
+
+    /// Decode a payload that already carries `id`/`type` (the output of
+    /// [`Self::merge_row_columns`]).
+    pub fn from_merged_row(data: serde_json::Value) -> Result<Self, serde_json::Error> {
+        serde_json::from_value(data)
+    }
+
     /// Decode a `session_message` row, merging the column values back into
     /// the `data` JSON exactly like upstream
     /// (`decode({ ...row.data, id: row.id, type: row.type })`).
@@ -468,13 +488,7 @@ impl Message {
         data: serde_json::Value,
     ) -> Result<Self, serde_json::Error> {
         let mut merged = data;
-        if let serde_json::Value::Object(map) = &mut merged {
-            map.insert("id".to_string(), serde_json::Value::String(id.to_string()));
-            map.insert(
-                "type".to_string(),
-                serde_json::Value::String(kind.to_string()),
-            );
-        }
-        serde_json::from_value(merged)
+        Self::merge_row_columns(id, kind, &mut merged);
+        Self::from_merged_row(merged)
     }
 }

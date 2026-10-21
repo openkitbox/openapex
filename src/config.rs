@@ -197,8 +197,8 @@ default_model = "anthropic/claude-sonnet-4-5"
         // `enabled = false` is the pass-through escape.
         assert!(cfg.magic_context.enabled);
         assert!(cfg.magic_context.historian_model.is_none());
-        assert_eq!(cfg.magic_context.soft_threshold, 0.70);
-        assert_eq!(cfg.magic_context.hard_threshold, 0.85);
+        assert_eq!(cfg.magic_context.execute_threshold_percentage, 65.0);
+        assert_eq!(cfg.magic_context.history_budget_percentage, 0.15);
         assert!(cfg.magic_context.dreamer_enabled);
         assert_eq!(cfg.magic_context.dreamer_interval_minutes, 15);
     }
@@ -226,8 +226,8 @@ default_model = "anthropic/claude-sonnet-4-5"
 [magic_context]
 enabled = true
 historian_model = "cardinal/k3-256k"
-soft_threshold = 0.6
-hard_threshold = 0.9
+execute_threshold_percentage = 70.0
+history_budget_percentage = 0.25
 dreamer_enabled = true
 dreamer_interval_minutes = 1
 "#;
@@ -237,8 +237,8 @@ dreamer_interval_minutes = 1
             cfg.magic_context.historian_model.as_deref(),
             Some("cardinal/k3-256k")
         );
-        assert_eq!(cfg.magic_context.soft_threshold, 0.6);
-        assert_eq!(cfg.magic_context.hard_threshold, 0.9);
+        assert_eq!(cfg.magic_context.execute_threshold_percentage, 70.0);
+        assert_eq!(cfg.magic_context.history_budget_percentage, 0.25);
         assert!(cfg.magic_context.dreamer_enabled);
         assert_eq!(cfg.magic_context.dreamer_interval_minutes, 1);
     }
@@ -252,8 +252,23 @@ enabled = true
         let cfg: Config = toml::from_str(raw).unwrap();
         assert!(cfg.magic_context.enabled);
         assert!(cfg.magic_context.historian_model.is_none());
-        assert_eq!(cfg.magic_context.soft_threshold, 0.70);
-        assert_eq!(cfg.magic_context.hard_threshold, 0.85);
+        assert_eq!(cfg.magic_context.execute_threshold_percentage, 65.0);
+        assert_eq!(cfg.magic_context.history_budget_percentage, 0.15);
+    }
+
+    /// The old threshold pair must still parse — an existing `ox.toml` is not
+    /// an error — but it no longer decides anything.
+    #[test]
+    fn magic_context_accepts_the_deprecated_threshold_pair() {
+        let raw = r#"
+[magic_context]
+soft_threshold = 0.6
+hard_threshold = 0.9
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        assert_eq!(cfg.magic_context.soft_threshold, 0.6);
+        assert_eq!(cfg.magic_context.hard_threshold, 0.9);
+        assert_eq!(cfg.magic_context.execute_threshold_percentage, 65.0);
     }
 
     #[test]

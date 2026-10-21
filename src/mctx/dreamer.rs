@@ -414,7 +414,9 @@ pub struct TickReport {
 /// [`Dreamer::spawn`] the interval loop.
 pub struct Dreamer {
     db: Db,
-    config: Config,
+    /// Shared with the server: the dreamer outlives no config reload, so a
+    /// handle is all it needs.
+    config: Arc<Config>,
     chat: Arc<dyn Chat>,
     /// Default-model resolution for the hidden completion.
     catalog: Arc<crate::model_catalog::ModelCatalog>,
@@ -447,19 +449,22 @@ impl Drop for TaskGuard<'_> {
 impl Dreamer {
     /// A dreamer over `db`, configured by `config.magic_context`, issuing its
     /// hidden completions through `chat`.
+    ///
+    /// Returns `Arc<Self>`: the tick loop outlives its spawner and holds the
+    /// object weakly, so nobody may own a bare `Dreamer`.
     pub fn new(
         db: Db,
-        config: Config,
+        config: Arc<Config>,
         chat: Arc<dyn Chat>,
         catalog: Arc<crate::model_catalog::ModelCatalog>,
-    ) -> Self {
-        Self {
+    ) -> Arc<Self> {
+        Arc::new(Self {
             db,
             config,
             chat,
             catalog,
             in_flight: Mutex::new(HashSet::new()),
-        }
+        })
     }
 
     /// The dreamer tick interval in milliseconds. Floored at one minute, so a
@@ -2005,8 +2010,8 @@ mod tests {
         ]))
     }
 
-    fn dreamer(db: &Db, chat: Arc<dyn Chat>) -> Dreamer {
-        Dreamer::new(db.clone(), test_config(), chat, catalog())
+    fn dreamer(db: &Db, chat: Arc<dyn Chat>) -> Arc<Dreamer> {
+        Dreamer::new(db.clone(), Arc::new(test_config()), chat, catalog())
     }
 
     fn entry(report: &TickReport, task: DreamTask) -> Option<&TickStatus> {
@@ -2158,7 +2163,7 @@ mod tests {
         let chat = Arc::new(ScriptedChat::text("<verify></verify>"));
         let mut config = test_config();
         config.magic_context.dreamer_enabled = false;
-        let dreamer = Dreamer::new(db.clone(), config, chat.clone(), catalog());
+        let dreamer = Dreamer::new(db.clone(), Arc::new(config), chat.clone(), catalog());
 
         let report = dreamer.tick(NOW).await.unwrap();
         assert!(report.entries.is_empty());

@@ -139,7 +139,7 @@ fn myers(before: &[&str], after: &[&str]) -> Option<Vec<Op>> {
     let m = after.len() as isize;
     let bound = ((n + m) as usize).min(MAX_EDIT_DISTANCE);
     let offset = bound as isize + 1;
-    let mut furthest = vec![0isize; (2 * bound + 3) as usize];
+    let mut furthest = vec![0isize; 2 * bound + 3];
     // trace[d] is the `furthest` state before distance `d` ran, which is what
     // backtracking needs. Its size is bounded by `MAX_EDIT_DISTANCE`.
     let mut trace: Vec<Vec<isize>> = Vec::with_capacity(bound + 1);

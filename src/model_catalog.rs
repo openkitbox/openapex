@@ -133,6 +133,19 @@ impl ModelCatalog {
         entries.first().cloned()
     }
 
+    /// The context window the gateway reports for `id` (the bare model id, as
+    /// cardinal reports it), or `None` when the catalogue does not know the
+    /// model or was never fetched. Never refreshes: callers on a step boundary
+    /// must not wait on the network.
+    pub fn window_of(&self, id: &str) -> Option<u32> {
+        self.cached()
+            .iter()
+            .find(|entry| entry.id == id)?
+            .context
+            .and_then(|context| u32::try_from(context).ok())
+            .filter(|window| *window > 0)
+    }
+
     /// Fetch `GET /v1/models` and replace the snapshot.
     async fn refresh(&self) -> Result<()> {
         let mut request = self.client.get(format!("{}{MODELS_PATH}", self.base_url));

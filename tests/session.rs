@@ -1362,3 +1362,98 @@ async fn message_cursors_embed_concrete_order() {
     let next = page["cursor"]["next"].as_str().expect("next").to_owned();
     assert_eq!(decoded_cursor(&next)["order"], json!("desc"));
 }
+
+/// The stored transcript as the tagger reads it: `data` decoded with the row's
+/// id and type injected, in seq order.
+async fn stored_values(db: &Db, session_id: &str) -> Vec<Value> {
+    let rows = query_all(
+        db,
+        "SELECT id, type, data FROM session_message WHERE session_id = ?1 ORDER BY seq",
+        vec![turso::Value::Text(session_id.to_owned())],
+        |row| {
+            Ok((
+                row.get::<String>(0)?,
+                row.get::<String>(1)?,
+                row.get::<String>(2)?,
+            ))
+        },
+    )
+    .await;
+    rows.into_iter()
+        .map(|(id, kind, data)| {
+            let mut value: Value = serde_json::from_str(&data).expect("message json");
+            value["id"] = json!(id);
+            value["type"] = json!(kind);
+            value
+        })
+        .collect()
+}
+
+/// A drop is a view, not a delete: once applied, the transcript the client
+/// reads shows the same `[dropped §N§]` placeholder the model was given, and
+/// the content is still in the row for `ctx_expand` to recover.
+#[tokio::test]
+async fn an_applied_drop_reads_back_as_the_placeholder_the_model_saw() {
+    let h = Harness::spawn().await;
+    let session_id = h.create(json!({ "title": "drops" })).await;
+    let message_id = push_user_message(&h.bus, &session_id, "a detail nobody needs").await;
+
+    // Mint tags exactly as a pass does, then queue one drop and apply it.
+    let values = stored_values(&h.db, &session_id).await;
+    let tags = ox::mctx::tagger::Tagger
+        .assign(&h.db, &session_id, &values)
+        .await
+        .expect("assign tags");
+    let tag = tags
+        .iter()
+        .find(|item| item.message_id == message_id)
+        .expect("the user text is taggable")
+        .tag;
+    assert!(
+        ox::mctx::tagger::queue_drop(&h.db, &session_id, tag, "stale")
+            .await
+            .expect("queue the drop")
+    );
+    ox::mctx::tagger::mark_drops_applied(&h.db, &session_id, &[tag])
+        .await
+        .expect("apply the drop");
+
+    let placeholder = format!("[dropped §{tag}§]");
+    let page: Value = h
+        .get(&format!("/api/session/{session_id}/message"))
+        .await
+        .json()
+        .await
+        .expect("messages json");
+    let listed = page["data"].to_string();
+    assert!(
+        listed.contains(&placeholder),
+        "the read path shows the placeholder: {listed}"
+    );
+    assert!(
+        !listed.contains("a detail nobody needs"),
+        "and not the dropped text: {listed}"
+    );
+
+    // The single-message endpoint (what a TUI row fetch hits) agrees.
+    let one: Value = h
+        .get(&format!("/api/session/{session_id}/message/{message_id}"))
+        .await
+        .json()
+        .await
+        .expect("message json");
+    assert!(
+        one["data"].to_string().contains(&placeholder),
+        "one message reads the same: {}",
+        one["data"]
+    );
+
+    // Nothing was deleted: the row still holds what `ctx_expand` returns.
+    let stored = stored_values(&h.db, &session_id).await;
+    assert!(
+        stored
+            .iter()
+            .any(|value| value.to_string().contains("a detail nobody needs")),
+        "the content is still stored"
+    );
+}

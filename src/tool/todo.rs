@@ -247,7 +247,10 @@ impl Tool for TodoTool {
                                             flat init.",
                         }),
                     ),
-                    ("reason", param("string", "Optional blocker note for block.")),
+                    (
+                        "reason",
+                        param("string", "Optional blocker note for block."),
+                    ),
                 ],
                 &["op"],
             ),
@@ -502,12 +505,7 @@ fn decode_phases(raw: &str) -> Vec<TodoPhase> {
 // The op itself
 // ---------------------------------------------------------------------------
 
-async fn run_op(
-    db: &Db,
-    session_id: &str,
-    previous: Vec<TodoPhase>,
-    params: Params,
-) -> ToolOutput {
+async fn run_op(db: &Db, session_id: &str, previous: Vec<TodoPhase>, params: Params) -> ToolOutput {
     // `view` is a pure read: no normalization, no state write. It still
     // carries `metadata`, so a client can treat it as a refresh.
     if params.op == Some(Op::View) {
@@ -631,7 +629,8 @@ fn apply_entry(op: Op, params: &Params, phases: &mut Vec<TodoPhase>, errors: &mu
         }
 
         Op::Start => {
-            let Some((phase_index, task_index)) = resolve_task(phases, params.task.as_deref(), errors)
+            let Some((phase_index, task_index)) =
+                resolve_task(phases, params.task.as_deref(), errors)
             else {
                 return;
             };
@@ -700,7 +699,9 @@ fn apply_entry(op: Op, params: &Params, phases: &mut Vec<TodoPhase>, errors: &mu
 
         Op::Rm => {
             if params.task.is_some() {
-                if let Some((phase_index, task_index)) = resolve_task(phases, params.task.as_deref(), errors) {
+                if let Some((phase_index, task_index)) =
+                    resolve_task(phases, params.task.as_deref(), errors)
+                {
                     phases[phase_index].tasks.remove(task_index);
                 }
                 return;
@@ -950,9 +951,10 @@ fn format_summary(phases: &[TodoPhase], errors: &[String], read_only: bool) -> S
     // task reverting.
     let worked_ahead = phases.iter().enumerate().any(|(index, phase)| {
         index > current_index
-            && phase.tasks.iter().any(|task| {
-                matches!(task.status, TodoStatus::Completed | TodoStatus::Abandoned)
-            })
+            && phase
+                .tasks
+                .iter()
+                .any(|task| matches!(task.status, TodoStatus::Completed | TodoStatus::Abandoned))
     });
     lines.push(format!(
         "Overall: {closed}/{} done, {} open{}.",
@@ -1074,10 +1076,7 @@ mod tests {
         assert!(errors.is_empty());
         assert_eq!(
             statuses(&phases),
-            vec![
-                ("a", TodoStatus::InProgress),
-                ("b", TodoStatus::Pending)
-            ],
+            vec![("a", TodoStatus::InProgress), ("b", TodoStatus::Pending)],
             "normalization promotes the first pending task"
         );
     }
@@ -1111,10 +1110,7 @@ mod tests {
         assert!(errors.is_empty());
         assert_eq!(
             statuses(&phases),
-            vec![
-                ("a", TodoStatus::Pending),
-                ("b", TodoStatus::InProgress)
-            ]
+            vec![("a", TodoStatus::Pending), ("b", TodoStatus::InProgress)]
         );
     }
 
@@ -1133,10 +1129,7 @@ mod tests {
         assert!(errors.is_empty());
         assert_eq!(
             statuses(&phases),
-            vec![
-                ("a", TodoStatus::Completed),
-                ("b", TodoStatus::InProgress)
-            ],
+            vec![("a", TodoStatus::Completed), ("b", TodoStatus::InProgress)],
             "finishing P1 promotes P2's task"
         );
     }
@@ -1239,7 +1232,9 @@ mod tests {
         let errors = apply(&mut phases, target(Op::Done, "ghost"));
         assert_eq!(
             errors,
-            vec!["Task \"ghost\" not found (todo list is empty — was it replaced or not yet created?)"]
+            vec![
+                "Task \"ghost\" not found (todo list is empty — was it replaced or not yet created?)"
+            ]
         );
 
         let errors = apply(
@@ -1289,7 +1284,10 @@ mod tests {
             },
         );
         let summary = format_summary(&phases, &[], false);
-        assert!(summary.contains("Remaining items (1):"), "summary: {summary}");
+        assert!(
+            summary.contains("Remaining items (1):"),
+            "summary: {summary}"
+        );
         assert!(summary.contains("  - b [in_progress] (P1)"));
         assert!(
             !summary.contains("  - c [blocked]"),
@@ -1360,7 +1358,12 @@ mod tests {
         assert!(text.contains("read the code"), "{text}");
 
         // A fresh call sees the stored list: `start` resolves by content.
-        let output = run(&tool, "ses_a", json!({"op": "start", "task": "write the fix"})).await;
+        let output = run(
+            &tool,
+            "ses_a",
+            json!({"op": "start", "task": "write the fix"}),
+        )
+        .await;
         assert!(output.error.is_none());
         let text = output.content.as_str().unwrap();
         assert!(text.contains("write the fix [in_progress]"), "{text}");
@@ -1379,12 +1382,21 @@ mod tests {
         // `done` on an unknown task leaves the list untouched.
         let output = run(&tool, "ses", json!({"op": "done", "task": "ghost"})).await;
         let text = output.content.as_str().unwrap();
-        assert!(text.starts_with("Errors: Task \"ghost\" not found"), "{text}");
+        assert!(
+            text.starts_with("Errors: Task \"ghost\" not found"),
+            "{text}"
+        );
         assert!(text.contains("    - [ ] a (in progress)"), "{text}");
 
         // The stored row is unchanged, not the failed op's working copy.
         let output = run(&tool, "ses", json!({"op": "view"})).await;
-        assert!(output.content.as_str().unwrap().contains("    - [ ] a (in progress)"));
+        assert!(
+            output
+                .content
+                .as_str()
+                .unwrap()
+                .contains("    - [ ] a (in progress)")
+        );
     }
 
     #[tokio::test]
@@ -1398,13 +1410,24 @@ mod tests {
             output.error.as_deref(),
             Some("Invalid todo arguments: Unknown op `explode`")
         );
-        let output = run(&tool, "ses", json!({"op": "init", "list": [{"phase": "P"}]})).await;
+        let output = run(
+            &tool,
+            "ses",
+            json!({"op": "init", "list": [{"phase": "P"}]}),
+        )
+        .await;
         assert_eq!(
             output.error.as_deref(),
             Some("Invalid todo arguments: `list` entries need an `items` array")
         );
         let output = run(&tool, "ses", json!({"op": "view"})).await;
-        assert!(output.content.as_str().unwrap().contains("    - [ ] a (in progress)"));
+        assert!(
+            output
+                .content
+                .as_str()
+                .unwrap()
+                .contains("    - [ ] a (in progress)")
+        );
     }
 
     #[tokio::test]

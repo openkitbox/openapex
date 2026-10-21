@@ -12,8 +12,9 @@ no dreamer).
 | `ctx_memory` / `ctx_note` | Durable facts (`#N` handles) and pending notes, stored in ox's own `mc_*` tables. |
 | Pinboard | The project's active memories, rendered into the request as `<project-memory>` inside **m[1]** (the volatile half), so a memory write never moves the provider's cache anchor. |
 | `§N§` overlay | Every transcript item is tagged in the request; the model can address items with `ctx_reduce` (drop) and recall them with `ctx_expand`. |
-| Frozen head | `m[0]` = `<session-history>` (compartment set), `m[1]` = pinboard + new compartments + the anchoring placeholder. The head replaces the transcript range it covers; the live tail follows. |
-| Historian | At a step boundary, when the live tail passes a pressure band, ox folds the oldest part of the tail into compartments with a hidden completion through cardinal. |
+| Frozen head | `m[0]` = `<session-history>` (compartment set, decay-rendered at the session's history budget), `m[1]` = pinboard + the anchoring placeholder. The head replaces the transcript range it covers; the live tail follows. A fold rebuilds m[0] — the head is always a function of the current compartment set, never a frozen baseline plus a delta. |
+| Historian | At a step boundary, when the live tail passes a pressure band (or exceeds its trigger budget) and still has content outside the protected tail, ox folds the oldest part of the tail into compartments with a hidden completion through cardinal. |
+| Drops | A `ctx_reduce` stamp is applied by the next head rebuild *and* by the read path: the session API renders an applied drop's content as `[dropped §N§]`, the same placeholder the model sees. |
 | Dreamer | Every `dreamer_interval_minutes`, per project with memories: `verify` (do cited files still back the claims?) and `curate` (merge duplicates, archive redundancy). |
 | `ctx_search` | Memories, notes, compartments (turso FTS indexes) and a transcript scan. With `[magic_context.embedding]` configured, the **memory lane** ranks by cosine similarity instead. |
 
@@ -26,11 +27,15 @@ enabled = true
 # Model for hidden completions (historian + dreamer), as provider/id.
 # Unset = ox's default model.
 historian_model = "cardinal/k3-256k"
-# Pressure bands over the 60k-token history budget: at `soft` a run may start
-# pre-emptively, at `hard` it must. Violated pairs fall back to these with a
-# warning.
-soft_threshold = 0.70
-hard_threshold = 0.85
+# Context usage (percent of the model window) at which folding is due. Every
+# other number is derived from it: the proactive floor is `execute - 2`, the
+# force band is `max(85, execute + 2)`, the trigger budget is 5% of the usable
+# window (floor 5k tokens), the historian's chunk budget is 25% of ITS OWN
+# window, and the protected tail is 30% of the usable window. Range 20-90.
+execute_threshold_percentage = 65.0
+# Share of the usable window the m[0] history block may carry before the decay
+# ladder demotes older compartments. Range 0.05-0.5.
+history_budget_percentage = 0.15
 # Scheduled memory maintenance (default true) and its cadence.
 dreamer_enabled = true
 dreamer_interval_minutes = 15
@@ -81,11 +86,13 @@ text (`turso`, `ox.db`, `Tantivy`, `fts` all absent) — returned that memory as
 
 ## Operator signals
 
-- `historian pressure tail_tokens=… trigger=Forced|Speculative|No` (debug) — the
-  measurement behind each firing decision.
+- `historian pressure tail_tokens=… usage_pct=… trigger_budget=… trigger=…`
+  (debug) — the measurement behind each firing decision. `usage_pct` is empty
+  until the session's first completion reports token counts.
 - `historian chunk chunk_start=… chunk_end=… chunk_tokens=…` (debug) — what the
-  run will cover. The chunk budget (75% of the history budget) is also the
-  fence: the newest part of the tail always stays verbatim.
+  run will cover. The chunk budget is 25% of the *historian's own* window,
+  further capped so the protected tail (30% of this session's usable window)
+  stays verbatim.
 - `historian published run=hrun_… covered=… compartments=N` — one folded range.
 - `dreamer task is due` / `dreamer task skipped detail=…` (debug) — why a
   maintenance task did or did not spend a completion.
@@ -104,7 +111,7 @@ text (`turso`, `ox.db`, `Tantivy`, `fts` all absent) — returned that memory as
   "USING": syntax error`. A pre-migration copy lives at `~/.ox/ox.db.pre-turso`,
   but it stops at the moment of the switch.
 - **Hidden completions are real completions.** A historian run summarizes up to
-  75% of the history budget; the dreamer only fires when a project holds
+  25% of its own model's window; the dreamer only fires when a project holds
   memories whose cited files changed (or two memories share a category).
 - **The dreamer's verify gate is confined to the project**: a memory may only
   cite files inside the session's directory (no `~`, no `..` escape, no symlink

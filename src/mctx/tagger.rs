@@ -80,6 +80,17 @@ pub enum DropState {
     Unknown,
 }
 
+/// Which half of the overlay a caller wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverlayMode {
+    /// The request side: prepend every tag and replace applied drops, so the
+    /// model can address what it reads.
+    Request,
+    /// The read side (session API): replace applied drops only. A human reads
+    /// the same transcript the model does, without `§N§` on every part.
+    Transcript,
+}
+
 /// What a tag's drop row says, or `None` when nothing is queued on it.
 fn drop_state_of(raw: Option<String>) -> Option<DropState> {
     match raw.as_deref() {
@@ -280,6 +291,63 @@ fn digest_hex(content: &str) -> String {
     format!("{hash:016x}")
 }
 
+/// Every tag a session has *applied a drop on*, with the tag's addressing.
+///
+/// [`Tagger::assign`]'s read half without the minting: a consumer that must not
+/// write (the session read API) still needs the `part_path` addressing to find
+/// what an applied drop covers. The join is what keeps the read path off the
+/// full tag table — a long session mints thousands of tags per poll interval,
+/// and only the dropped handful is ever rendered. Rows for messages that no
+/// longer exist are harmless — [`apply_overlay`] walks the live messages and
+/// skips unknown ids.
+async fn applied_tags(db: &Db, session_id: &str) -> Result<Vec<TaggedItem>> {
+    let result: Result<Vec<TaggedItem>> = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT t.tag, t.message_id, t.part_path FROM mc_tag t
+                   JOIN mc_drop d ON d.session_id = t.session_id AND d.tag = t.tag
+                  WHERE t.session_id = ?1 AND d.state = 'applied'",
+            )
+            .await?;
+        let mut rows = stmt.query([session_id]).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(TaggedItem {
+                tag: row.get::<i64>(0)? as u64,
+                message_id: row.get::<String>(1)?,
+                part_path: row.get::<String>(2)?,
+            });
+        }
+        Ok(out)
+    }
+    .await;
+    result.context("load applied mctx tags")
+}
+
+/// Replace the content of every *applied* drop with its placeholder, leaving
+/// tags alone: the transcript a human reads then matches the transcript the
+/// model gets.
+///
+/// Read-only (no minting, no writes), so it is safe on the session API's read
+/// path. A session with nothing dropped costs one indexed join and no walk.
+pub async fn apply_transcript_overlay(
+    db: &Db,
+    session_id: &str,
+    messages: &mut [Value],
+) -> Result<()> {
+    let tags = applied_tags(db, session_id).await?;
+    if tags.is_empty() {
+        return Ok(());
+    }
+    let drops: HashMap<u64, DropState> = tags
+        .iter()
+        .map(|item| (item.tag, DropState::Applied))
+        .collect();
+    apply_overlay(messages, &tags, &drops, OverlayMode::Transcript);
+    Ok(())
+}
+
 /// Every drop row for a session: tag → lifecycle state.
 pub async fn drops(db: &Db, session_id: &str) -> Result<HashMap<u64, DropState>> {
     let result: Result<HashMap<u64, DropState>> = async {
@@ -330,7 +398,12 @@ fn dropped_placeholder(tag: u64) -> String {
 ///   `{"dropped": …}`. ox keeps the call's real arguments and reduces only the
 ///   result — the same shape as the reference's recency window (`SkeletonReal`),
 ///   which is also what keeps the tool chain readable.
-pub fn apply_overlay(messages: &mut [Value], tags: &[TaggedItem], drops: &HashMap<u64, DropState>) {
+pub fn apply_overlay(
+    messages: &mut [Value],
+    tags: &[TaggedItem],
+    drops: &HashMap<u64, DropState>,
+    mode: OverlayMode,
+) {
     // Group by message so each row is walked once.
     let mut by_message: HashMap<&str, Vec<&TaggedItem>> = HashMap::new();
     for item in tags {
@@ -348,6 +421,9 @@ pub fn apply_overlay(messages: &mut [Value], tags: &[TaggedItem], drops: &HashMa
         };
         for item in items {
             let dropped = matches!(drops.get(&item.tag), Some(DropState::Applied));
+            if !dropped && mode == OverlayMode::Transcript {
+                continue;
+            }
             let placeholder = dropped.then(|| dropped_placeholder(item.tag));
             let Some(part) = resolve_part(message, &item.part_path) else {
                 continue;
@@ -362,14 +438,26 @@ pub fn apply_overlay(messages: &mut [Value], tags: &[TaggedItem], drops: &HashMa
                 Addressed::ToolState(state) => {
                     if let Some(placeholder) = placeholder {
                         // Keep the call's arguments (the reference keeps the call
-                        // with real arguments and reduces only the result) and
-                        // replace what the result carried.
-                        let input = state.get("input").cloned().unwrap_or(Value::Null);
-                        *state = serde_json::json!({
-                            "status": "completed",
-                            "input": input,
+                        // with real arguments and reduces only the result), and
+                        // keep the outcome: a failed tool did not succeed merely
+                        // because its result was dropped, and the human reading
+                        // the transcript must see the same failure the model did.
+                        let errored = state.get("status").and_then(Value::as_str) == Some("error");
+                        let mut reduced = serde_json::json!({
+                            "status": if errored { "error" } else { "completed" },
+                            "input": state.get("input").cloned().unwrap_or(Value::Null),
                             "content": [ { "type": "text", "text": placeholder } ],
                         });
+                        if errored {
+                            reduced["error"] = state.get("error").cloned().unwrap_or(Value::Null);
+                        }
+                        // Whatever the provider attached (timing, exit code) does
+                        // not describe the result any more, but it is not ours to
+                        // throw away when it costs nothing to keep.
+                        if let Some(metadata) = state.get("metadata") {
+                            reduced["metadata"] = metadata.clone();
+                        }
+                        *state = reduced;
                         continue;
                     }
                     // Tools are tagged on their serialized state; a readable
@@ -1100,7 +1188,7 @@ mod tests {
         ];
         // A queued (not applied) drop changes nothing: stamping only queues.
         let queued = HashMap::from([(1u64, DropState::Queued)]);
-        apply_overlay(&mut messages, &tags, &queued);
+        apply_overlay(&mut messages, &tags, &queued, OverlayMode::Request);
         assert_eq!(messages[0]["text"], json!("§1§ hello world"));
         assert_eq!(
             messages[1]["content"][0]["text"],
@@ -1129,7 +1217,7 @@ mod tests {
             },
         ];
         let applied = HashMap::from([(1u64, DropState::Applied), (3u64, DropState::Applied)]);
-        apply_overlay(&mut messages, &tags, &applied);
+        apply_overlay(&mut messages, &tags, &applied, OverlayMode::Request);
 
         assert_eq!(
             messages[0]["text"],
@@ -1145,10 +1233,46 @@ mod tests {
         );
     }
 
+    /// A failed tool must not read as a success once its result is dropped: the
+    /// transcript is the model's view, and the model saw a failure.
+    #[test]
+    fn a_dropped_tool_result_keeps_the_failed_outcome() {
+        let mut messages = sample_messages();
+        messages[1]["content"][2]["state"] = json!({
+            "status": "error",
+            "input": { "path": "a.txt" },
+            "error": "no such file",
+            "metadata": { "exit": 1 },
+            "content": [ { "type": "text", "text": "ENOENT" } ],
+        });
+        let tags = vec![TaggedItem {
+            tag: 3,
+            message_id: "msg_a1".into(),
+            part_path: "tool:call_1".into(),
+        }];
+        let applied = HashMap::from([(3u64, DropState::Applied)]);
+
+        // Both sides of the lifecycle render the same reduced state.
+        for mode in [OverlayMode::Request, OverlayMode::Transcript] {
+            let mut messages = messages.clone();
+            apply_overlay(&mut messages, &tags, &applied, mode);
+            let state = &messages[1]["content"][2]["state"];
+            assert_eq!(state["status"], json!("error"), "{mode:?}");
+            assert_eq!(state["error"], json!("no such file"), "{mode:?}");
+            assert_eq!(
+                state["content"][0]["text"],
+                json!("[dropped §3§]"),
+                "{mode:?}"
+            );
+            assert_eq!(state["input"], json!({ "path": "a.txt" }), "{mode:?}");
+            assert_eq!(state["metadata"], json!({ "exit": 1 }), "{mode:?}");
+        }
+    }
+
     #[test]
     fn overlay_leaves_untagged_rows_alone() {
         let mut messages = sample_messages();
-        apply_overlay(&mut messages, &[], &HashMap::new());
+        apply_overlay(&mut messages, &[], &HashMap::new(), OverlayMode::Request);
         assert_eq!(messages[0]["text"], json!("hello world"));
         assert_eq!(
             messages[1]["content"][0]["text"],

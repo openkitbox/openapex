@@ -2,11 +2,14 @@
 //!
 //! The request head is two blocks the model sees before the live transcript:
 //!
-//! - **m[0]** — the frozen baseline: `<session-history>` (the decay-rendered
-//!   compartment set).
-//! - **m[1]** — the volatile half: the `<project-memory>` pinboard, then
-//!   `<new-compartments>` for compartments folded in since the baseline froze,
-//!   then the placeholder when nothing else is new.
+//! - **m[0]** — the frozen baseline: `<session-history>`, the decay-rendered
+//!   compartment set, measured against the session's history budget.
+//! - **m[1]** — the volatile half: the `<project-memory>` pinboard, then the
+//!   placeholder that keeps the block non-empty.
+//!
+//! Everything that folds — and only folding — changes m[0]: it is a pure
+//! function of the compartment rows and the budget, so a fold and nothing else
+//! moves the cache anchor.
 //!
 //! The pinboard lives in m[1], not m[0], and that placement is a cache
 //! decision: m[0] is the provider's cache anchor, so anything that changes with
@@ -16,10 +19,9 @@
 //! every session of the project — including the dreamer's background writes.
 //!
 //! Faithful port of the reference `mc-module/src/memory_render.rs` composition
-//! (`render_m0` / `assemble_m1` / `render_memory_block` /
-//! `render_new_compartments`). Pure functions over already-loaded rows — the
-//! caller decides what is selected and trimmed; these only assemble bytes, so
-//! the same inputs always produce the same bytes.
+//! (`render_m0` / `assemble_m1` / `render_memory_block`). Pure functions over
+//! already-loaded rows — the caller decides what is selected and trimmed; these
+//! only assemble bytes, so the same inputs always produce the same bytes.
 //!
 //! The `<session-history>` block is ALWAYS present, even for empty history
 //! ([`M0_EMPTY_BODY`]). That is load-bearing, not cosmetic: the provider prompt
@@ -45,8 +47,7 @@
 //!   (see that module's docs).
 
 use crate::mctx::decay_render::{
-    DecayRenderCompartment, estimate_tokens, render_compartment_at_tier,
-    render_decayed_compartments,
+    DecayRenderCompartment, estimate_tokens, render_decayed_compartments,
 };
 use crate::mctx::memory::MemoryRow;
 
@@ -54,13 +55,11 @@ use crate::mctx::memory::MemoryRow;
 /// always present (never omitted) so the provider prompt cache has a stable
 /// breakpoint to anchor on — see the module docs.
 pub const M0_EMPTY_BODY: &str = "<session-history></session-history>";
-/// The non-empty placeholder for the m1 delta block when nothing is new. m1 is
-/// the volatile half of the cached prefix and must never be fully empty for the
-/// same cache-anchoring reason.
+/// The non-empty placeholder for the m1 delta block when there is no pinboard.
+/// m1 is the volatile half of the cached prefix and must never be fully empty
+/// for the same cache-anchoring reason.
 pub const M1_PLACEHOLDER: &str =
     "<session-history-since>(no new content since last materialization)</session-history-since>";
-/// Default history budget when a caller doesn't supply one.
-pub const DEFAULT_HISTORY_BUDGET_TOKENS: f64 = 60_000.0;
 
 /// The five canonical memory categories, in render order.
 const MEMORY_CATEGORY_ORDER: [&str; 5] = [
@@ -158,43 +157,15 @@ pub(crate) fn render_memory_block(memories: &[MemoryRow]) -> String {
     lines.join("\n")
 }
 
-/// The `<new-compartments>` block: every folded-in compartment at full-fidelity
-/// P1 (no decay applies to a brand-new compartment until it folds into the
-/// baseline). Empty when there are none.
+/// Assemble the m1 body: the pinboard, or the placeholder when there is none.
 ///
-/// Row purity is load-bearing: the bytes here are a pure function of the
-/// compartment ROW fields — no clock, age or pressure input — so the m1 delta
-/// can only change when a new row appears (or a row mutates, which routes to a
-/// full rebuild).
-pub(crate) fn render_new_compartments(compartments: &[&DecayRenderCompartment]) -> String {
-    let bodies: Vec<String> = compartments
-        .iter()
-        .map(|c| render_compartment_at_tier(c, 1))
-        .filter(|body| !body.is_empty())
-        .collect();
-    if bodies.is_empty() {
-        return String::new();
-    }
-    format!(
-        "<new-compartments>\n{}\n</new-compartments>",
-        bodies.join("\n\n")
-    )
-}
-
-/// Assemble the m1 body: the pinboard, then the `<new-compartments>` delta.
-///
-/// The placeholder is always present last, even when both blocks are empty:
-/// the m1 half must never vanish, or every byte after it shifts.
-pub(crate) fn assemble_m1(memories: &str, new_compartments: &str) -> String {
-    let delta = if new_compartments.is_empty() {
-        M1_PLACEHOLDER.to_string()
-    } else {
-        format!("<session-history-since>\n{new_compartments}\n</session-history-since>")
-    };
+/// The placeholder is always present when the pinboard is empty: the m1 half
+/// must never vanish, or every byte after it shifts.
+pub(crate) fn assemble_m1(memories: &str) -> String {
     if memories.is_empty() {
-        return delta;
+        return M1_PLACEHOLDER.to_string();
     }
-    format!("{memories}\n{delta}")
+    format!("{memories}\n{M1_PLACEHOLDER}")
 }
 
 /// Inputs to [`render_m0`], after the caller has loaded the rows it means to
@@ -333,19 +304,9 @@ mod tests {
         // The pinboard must NOT be part of the cache anchor.
         assert!(!m0.contains("<project-memory>"), "{m0}");
 
-        let m1 = assemble_m1(&render_memory_block(&memories), "");
+        let m1 = assemble_m1(&render_memory_block(&memories));
         assert!(m1.starts_with("<project-memory>"), "{m1}");
         assert!(m1.contains("#1: spine"), "memory rendered: {m1}");
-    }
-
-    #[test]
-    fn new_compartments_render_at_p1_and_omit_when_empty() {
-        assert_eq!(render_new_compartments(&[]), "");
-        let c = comp(1, 9, "New", "FULL P1");
-        let block = render_new_compartments(&[&c]);
-        assert!(block.starts_with("<new-compartments>\n"));
-        assert!(block.ends_with("\n</new-compartments>"));
-        assert!(block.contains("## 1-9 · New\nFULL P1"), "{block}");
     }
 
     #[test]
@@ -354,14 +315,10 @@ mod tests {
             M1_PLACEHOLDER,
             "<session-history-since>(no new content since last materialization)</session-history-since>"
         );
-        assert_eq!(assemble_m1("", ""), M1_PLACEHOLDER);
+        assert_eq!(assemble_m1(""), M1_PLACEHOLDER);
+        // A pinboard keeps the anchoring placeholder after it.
         assert_eq!(
-            assemble_m1("", "<new-compartments>\nX\n</new-compartments>"),
-            "<session-history-since>\n<new-compartments>\nX\n</new-compartments>\n</session-history-since>"
-        );
-        // A pinboard with nothing new keeps the anchoring placeholder after it.
-        assert_eq!(
-            assemble_m1("<project-memory>\n#1: x\n</project-memory>", ""),
+            assemble_m1("<project-memory>\n#1: x\n</project-memory>"),
             format!("<project-memory>\n#1: x\n</project-memory>\n{M1_PLACEHOLDER}")
         );
     }

@@ -49,12 +49,12 @@
 //!
 //! ## Documented deviations from the reference
 //!
-//! - **Thresholds are explicit, not derived.** The reference derives its
-//!   proactive floor (`execute_threshold - 2`) and its force band
-//!   (`max(85, execute_threshold + 2)`) from one `execute_threshold` knob. ox's
-//!   [`MctxConfig`](crate::mctx::MctxConfig) carries the two bands directly
-//!   (`soft_threshold` = the proactive floor, `hard_threshold` = the force
-//!   band), which is the same two-band shape with one knob fewer.
+//! - **The bands are derived from one knob, the reference's way.** The
+//!   proactive floor (`execute − 2`) and the force band (`max(85, execute + 2)`)
+//!   come from [`MctxConfig::execute_threshold_percentage`](crate::mctx::MctxConfig)
+//!   through [`Budget`](crate::mctx::budget::Budget), so an operator tunes one
+//!   number and every budget follows. A `soft_threshold`/`hard_threshold` pair
+//!   from an older `ox.toml` is warned about and ignored.
 //! - **The run row is a state, not a phase machine.** The reference's
 //!   `mc_historian_pending_run` is a queue for a *separate* claimant process:
 //!   `pending/claimed/reported/parked` plus lease, heartbeat and deadline
@@ -77,14 +77,13 @@
 //!   (`with_content_language_directive`, line ~142); ox has no language
 //!   resolver, so there is nothing to append. The reference's repair prompt
 //!   (`build_historian_repair_prompt`) is validation, i.e. Task 6b.
-//! - **The trigger implements the ratio bands only.** The reference's
-//!   `TriggerReason` also carries `TailSize` (an absolute tail-size floor) and a
-//!   commit-cluster reason, plus reclaim-ride suppression when tail reducers
-//!   would already satisfy the target. ox measures pressure against
-//!   [`DEFAULT_HISTORY_BUDGET_TOKENS`](crate::mctx::render::DEFAULT_HISTORY_BUDGET_TOKENS),
-//!   which is the same budget the chunk is cut to, so an absolute `TailSize`
-//!   floor is subsumed; the suppression gates have nothing to suppress until ox
-//!   has a reclaim ride.
+//! - **The trigger implements the bands and the tail budget.** The reference's
+//!   `TriggerReason` also carries a commit-cluster reason and reclaim-ride
+//!   suppression when tail reducers would already satisfy the target. ox fires
+//!   on the derived usage bands *or* on the tail alone exceeding
+//!   [`Budget::trigger`](crate::mctx::budget::Budget) (the `TailSize` floor),
+//!   and the suppression gates have nothing to suppress until ox has a reclaim
+//!   ride.
 //! - **Synthetic rows are skipped, as the reference skips `meta.synthetic`.**
 //! - **No completion timeout.** The reference leases a run to a separate
 //!   claimant with a lease deadline, so a hung claimant expires. ox runs the
@@ -137,16 +136,21 @@ use crate::cardinal::stream::StreamEvent;
 use crate::cardinal::wire::{ChatMessage, ChatRequest};
 use crate::config::Config;
 use crate::id::{id, now_millis};
+use crate::mctx::budget::Budget;
 use crate::mctx::compartments::{self, NewCompartment, Tiers};
 use crate::mctx::decay_render::estimate_tokens;
 use crate::mctx::historian_validate::{self, ValidateOptions};
 use crate::mctx::memory::MemoryRow;
-use crate::schema::message::{AssistantContent, Message};
-use crate::schema::support::Record;
+use crate::schema::message::{AssistantContent, Message, ToolState};
+use crate::schema::support::{Content, Record};
 
 // ---------------------------------------------------------------------------
 // Trigger
 // ---------------------------------------------------------------------------
+
+/// `TAIL_SIZE_TRIGGER_MULTIPLIER`: the tail must be this many times its budget
+/// before its size alone starts a run.
+const TAIL_SIZE_MULTIPLIER: f64 = 3.0;
 
 /// Pressure band the session tail has reached.
 ///
@@ -154,19 +158,20 @@ use crate::schema::support::Record;
 /// `boundary.rs::check_compartment_trigger_with_index` (the force band is
 /// tested first, the proactive floor last):
 ///
-/// - [`Trigger::Forced`] — `TriggerReason::ForceBand`: usage is at or above
-///   `escalation_bands(threshold).force_materialize_percentage`
-///   (`max(85, threshold + 2)`, i.e. ox's 0.85 `hard_threshold`). The pass must
-///   run and may not be deferred.
+/// - [`Trigger::Forced`] — `TriggerReason::ForceBand`: usage is at or above the
+///   force band (`max(85, execute + 2)`, derived in [`Budget`]).
 /// - [`Trigger::Speculative`] — `TriggerReason::ProjectedHeadroom` /
 ///   `TriggerReason::TailSize`: usage is at or above the proactive floor
-///   (`get_proactive_compartment_trigger_percentage`, i.e. ox's 0.70
-///   `soft_threshold`) but below the force band. A run may start pre-emptively.
+///   (`execute − 2`), **or** the unfolded tail alone has reached three times
+///   its budget (a fresh session on a huge window can overflow inside one long
+///   step before any usage number exists).
 /// - [`Trigger::No`] — `HistorianNoFireCause::BelowProactiveFloor` (also
 ///   `BelowMinimumEligibleContent`): nothing is large enough to be worth a run.
+///
+/// [`Budget`]: crate::mctx::budget::Budget
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
-    /// Below the proactive floor: do not start a run.
+    /// Below both the floor and the tail budget: do not start a run.
     No,
     /// In the proactive band: a run may start before pressure forces one.
     Speculative,
@@ -174,27 +179,39 @@ pub enum Trigger {
     Forced,
 }
 
-/// Decide whether a historian run should start from the current tail pressure.
+/// Decide whether a historian run should start.
 ///
-/// `tail_tokens` is the session's live tail token estimate and `budget` the
-/// history budget those tokens are measured against
-/// ([`DEFAULT_HISTORY_BUDGET_TOKENS`](crate::mctx::render::DEFAULT_HISTORY_BUDGET_TOKENS));
-/// the ratio is the pressure the thresholds are expressed in. A missing or
-/// non-positive budget means "no pressure of any kind" — a run is never forced
-/// by a budget that was never set.
-pub fn trigger(tail_tokens: f64, budget: f64, soft: f32, hard: f32) -> Trigger {
-    if !budget.is_finite() || budget <= 0.0 || !tail_tokens.is_finite() {
+/// Two measurements, because one is not always available: `usage_pct` is what
+/// the provider reported for the newest turn as a share of the model window
+/// (`None` when the catalogue does not know the window), `tail_tokens` the
+/// live tail's own estimate. The tail comparison is what makes the trigger
+/// work on the first step of a session, before any completion has reported a
+/// usage number; the usage comparison is what catches a window that is filling
+/// up with head+tail together rather than with tail alone.
+pub fn trigger(
+    usage_pct: Option<f64>,
+    tail_tokens: f64,
+    tail_budget: u32,
+    band: &Budget,
+) -> Trigger {
+    if !tail_tokens.is_finite() {
         return Trigger::No;
     }
-    // The comparison happens at the thresholds' own precision (`f32`): widening
-    // them to `f64` would put an exactly-at-threshold pressure such as
-    // `85_000/100_000` on the wrong side of `0.85_f32`.
-    let pressure = (tail_tokens / budget) as f32;
-    // The force band is checked first: a misconfigured `hard < soft` can then
-    // never downgrade a forced run into a speculative one.
-    if pressure >= hard {
-        Trigger::Forced
-    } else if pressure >= soft {
+    // The force band is checked first: a tail that is merely large must never
+    // downgrade a forced run into a speculative one.
+    if let Some(usage) = usage_pct {
+        if usage >= band.hard_pct {
+            return Trigger::Forced;
+        }
+        if usage >= band.soft_pct {
+            return Trigger::Speculative;
+        }
+    }
+    // Below the floor by usage, or no usage number at all: the tail alone can
+    // still be over budget — but by `TAIL_SIZE_MULTIPLIER` times, not once
+    // (`TAIL_SIZE_TRIGGER_MULTIPLIER`): usage is the primary signal, and a tail
+    // merely at its nominal budget is not yet grounds for a run.
+    if tail_budget > 0 && tail_tokens >= f64::from(tail_budget) * TAIL_SIZE_MULTIPLIER {
         Trigger::Speculative
     } else {
         Trigger::No
@@ -222,15 +239,43 @@ pub struct Chunk {
     pub text: String,
     /// Token estimate of [`Chunk::text`], measured the same way as `budget`.
     pub token_estimate: usize,
-    /// True when the eligible range held more content than the budget: a later
-    /// run must continue from `end_ordinal + 1`.
-    pub has_more: bool,
+    /// What this region cost the conversation, in the provider's units: the
+    /// rendered text plus the tool-result bodies the transcript collapses into
+    /// `TC:` lines. Pressure and the protected tail are measured in these
+    /// tokens; the chunker's `budget` is measured in [`Chunk::token_estimate`].
+    pub context_tokens: usize,
     /// Every ordinal the transcript shows, ascending — the ordinals validation
     /// chunks against. It is the union of the emitted blocks' `[start-end]`
     /// ranges, because a block's range is what the model reads; an ordinal that
     /// rendered no line (a system note, a skipped row) is part of a block's
     /// range and may therefore be a compartment boundary.
     pub present_ordinals: Vec<i64>,
+}
+
+/// The two ceilings a chunk is cut against.
+///
+/// They are deliberately different units — [`Self::request`] counts the rendered
+/// transcript the historian is sent, [`Self::context`] counts what the region
+/// cost the conversation (a tool result is one `TC:` line but was read in full) —
+/// so they are named at the boundary instead of passed as two bare `usize`s a
+/// caller could swap without the compiler noticing.
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkLimits {
+    /// Rendered tokens the request may hold: [`Chunk::token_estimate`].
+    pub request: usize,
+    /// Tokens the region may cost the conversation: [`Chunk::context_tokens`].
+    /// Absolute — a block that would cross it is never admitted.
+    pub context: usize,
+}
+
+impl ChunkLimits {
+    /// No ceiling at all: for measuring a whole tail, and for tests.
+    pub const fn unbounded() -> Self {
+        Self {
+            request: usize::MAX,
+            context: usize::MAX,
+        }
+    }
 }
 
 /// Pick the chunk a run would cover.
@@ -242,15 +287,18 @@ pub struct Chunk {
 ///
 /// Ported from `historian_chunk.rs::Builder`: messages are grouped into blocks
 /// of consecutive same-role messages, a block is emitted whole or not at all,
-/// and the run stops at the first block that would cross `budget` (unless
-/// nothing has been emitted yet, in which case a single oversize block is
-/// admitted so the run is never empty). Returning `None` means the eligible
+/// and the run stops at the first block that would cross the request budget
+/// (unless nothing has been emitted yet, in which case a single oversize block
+/// is admitted so the run is never empty). Returning `None` means the eligible
 /// range held nothing worth a run.
+///
+/// See [`ChunkLimits`] for the two ceilings. The context one is absolute: a
+/// block that would cross it is never admitted, not even as the first one.
 pub fn chunk(
     rows: &[(i64, serde_json::Value)],
     start_ordinal: i64,
     eligible_end_ordinal: i64,
-    budget: usize,
+    limits: ChunkLimits,
 ) -> Option<Chunk> {
     // The reference sorts before building (`ordered.sort_by_key`); the query
     // already orders by `seq`, so this only guards against a caller that did
@@ -258,7 +306,7 @@ pub fn chunk(
     let mut ordered: Vec<&(i64, serde_json::Value)> = rows.iter().collect();
     ordered.sort_by_key(|(ordinal, _)| *ordinal);
 
-    let mut builder = Builder::new(budget);
+    let mut builder = Builder::new(limits);
     for (ordinal, row) in ordered {
         if *ordinal < start_ordinal {
             continue;
@@ -301,6 +349,9 @@ struct Block {
     parts: Vec<String>,
     /// Commit hashes harvested from this block's assistant text.
     commit_hashes: Vec<String>,
+    /// Tool-result body tokens the block's messages carry (see
+    /// [`tool_result_tokens`]): not rendered, but spent.
+    result_tokens: usize,
     /// Message id of the last message absorbed into the block.
     last_message_id: String,
 }
@@ -310,8 +361,11 @@ struct Block {
 /// identity, and the `tool_expansions` map — which has no producer anywhere in
 /// the tree this was ported from, so ox always renders the call summary).
 struct Builder {
-    budget: usize,
+    limits: ChunkLimits,
     total_tokens: usize,
+    /// Tool-result body tokens over the emitted blocks, kept apart from
+    /// `total_tokens` because only that one is what the request costs.
+    total_result_tokens: usize,
     lines: Vec<String>,
     current: Option<Block>,
     /// Ordinals of messages that render nothing (system/noise) or have not been
@@ -327,10 +381,11 @@ struct Builder {
 }
 
 impl Builder {
-    fn new(budget: usize) -> Self {
+    fn new(limits: ChunkLimits) -> Self {
         Self {
-            budget,
+            limits,
             total_tokens: 0,
+            total_result_tokens: 0,
             lines: Vec::new(),
             current: None,
             pending_noise: Vec::new(),
@@ -346,6 +401,7 @@ impl Builder {
     fn push(&mut self, ordinal: i64, message: &Message) -> bool {
         let role = role_of(message);
         let (parts, commit_hashes) = render_parts(role, message);
+        let result_tokens = tool_result_tokens(message);
         let compact_role = compact_role(role);
         // A message with nothing to render (a system note, a switch marker)
         // carries no content for the model but still occupies an ordinal, so it
@@ -363,6 +419,7 @@ impl Builder {
             block.end_ordinal = ordinal;
             block.parts.extend(parts);
             block.commit_hashes = merge_commit_hashes(&block.commit_hashes, commit_hashes);
+            block.result_tokens += result_tokens;
             block.last_message_id = message.id().to_owned();
             // Any noise between the two messages falls inside the block's
             // range, so it is absorbed rather than held for the next block.
@@ -384,6 +441,7 @@ impl Builder {
             end_ordinal: ordinal,
             parts,
             commit_hashes,
+            result_tokens,
             last_message_id: message.id().to_owned(),
         });
         true
@@ -402,7 +460,15 @@ impl Builder {
             estimate_tokens("\n")
         };
         let block_tokens = estimate_tokens(&text) + separator_tokens;
-        if self.total_tokens + block_tokens > self.budget && self.total_tokens > 0 {
+        let block_context = block_tokens + block.result_tokens;
+        // The fence is absolute — it is what the model working on the tail keeps
+        // verbatim — so it is tested before the oversize-first-block allowance
+        // below, which exists only so one huge message cannot stall the fold.
+        if self.context_tokens() + block_context > self.limits.context {
+            self.current = Some(block);
+            return false;
+        }
+        if self.total_tokens + block_tokens > self.limits.request && self.total_tokens > 0 {
             self.current = Some(block);
             return false;
         }
@@ -410,24 +476,32 @@ impl Builder {
         self.end_ordinal = block.end_ordinal;
         self.end_message_id.clone_from(&block.last_message_id);
         self.total_tokens += block_tokens;
+        self.total_result_tokens += block.result_tokens;
         self.present_ordinals
             .extend(block.start_ordinal..=block.end_ordinal);
         self.lines.push(text);
         true
     }
 
+    /// What the emitted blocks cost the conversation: the rendered text plus the
+    /// tool bodies it collapsed.
+    fn context_tokens(&self) -> usize {
+        self.total_tokens + self.total_result_tokens
+    }
+
     fn finish(mut self) -> Option<Chunk> {
-        let flushed = self.flush();
+        self.flush();
         if self.lines.is_empty() {
             return None;
         }
+        let context_tokens = self.context_tokens();
         Some(Chunk {
             start_ordinal: self.start_ordinal.unwrap_or(self.end_ordinal),
             end_ordinal: self.end_ordinal,
             end_message_id: self.end_message_id,
             text: self.lines.join("\n"),
             token_estimate: self.total_tokens,
-            has_more: !flushed,
+            context_tokens,
             present_ordinals: self.present_ordinals,
         })
     }
@@ -506,6 +580,50 @@ fn render_parts(role: &str, message: &Message) -> (Vec<String>, Vec<String>) {
         }
         _ => (Vec::new(), Vec::new()),
     }
+}
+
+/// The tool-result body tokens one message carries.
+///
+/// The transcript renders a settled call as a single `TC:` line, but the
+/// conversation that produced the tail read the body in full — so a tail of
+/// tool-heavy turns is far larger than its rendering claims. This is the
+/// missing half of [`Chunk::context_tokens`]: the historian request pays only
+/// [`Chunk::token_estimate`], the conversation paid this too. Ported from the
+/// reference's `tool_result_body_tokens` (its consumer there is the result
+/// boundary; ox's is the pressure reading).
+fn tool_result_tokens(message: &Message) -> usize {
+    let Message::Assistant(message) = message else {
+        return 0;
+    };
+    message
+        .content
+        .iter()
+        .map(|part| match part {
+            AssistantContent::Tool { state, .. } => tool_state_tokens(state),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// [`ToolState`]'s settled bodies, in tokens. A call that is still streaming or
+/// running has no body yet (its result lands in a later row).
+fn tool_state_tokens(state: &ToolState) -> usize {
+    let content = match state {
+        ToolState::Completed { content, .. } => Some(content.as_slice()),
+        ToolState::Error { content, .. } => content.as_deref(),
+        ToolState::Streaming { .. } | ToolState::Running { .. } => None,
+    };
+    content.map_or(0, |content| {
+        content
+            .iter()
+            .map(|part| match part {
+                Content::Text { text } => estimate_tokens(text),
+                // A file part rides the next request as a user message, not as
+                // this message's text: counting its uri would be noise.
+                Content::File { .. } => 0,
+            })
+            .sum()
+    })
 }
 
 /// `historian_chunk.rs::compact_text_for_summary`: assistant prose that mentions
@@ -1377,14 +1495,25 @@ impl std::error::Error for ValidationFailure {}
 /// have been made, then the row settles `failed` and the error is returned. A
 /// transport failure settles the row `failed` at once — retrying it is the
 /// caller's decision, not this run's.
-pub async fn run(ctx: &RunCtx<'_>, plan: &RunPlan<'_>) -> Result<RunOutcome> {
+///
+/// `None` means the session already has a run in flight and this one did not
+/// claim the slot: it has done nothing at all, and the winner's compartments are
+/// what the next pass picks up.
+pub async fn run(ctx: &RunCtx<'_>, plan: &RunPlan<'_>) -> Result<Option<RunOutcome>> {
     let model = historian_model(ctx.config, ctx.catalog)?;
     // The stored ranges are read before the run is claimed: a store failure must
     // leave no row behind for a run that never started.
     let prior = stored_ranges(ctx.db, plan.session_id).await?;
     let request_prompt = build_compartment_agent_prompt(&plan.prompt);
     let chunk_ref = format!("{}..{}", plan.chunk.start_ordinal, plan.chunk.end_ordinal);
-    let run_id = insert_run(ctx.db, plan.session_id, &chunk_ref, plan.attempt).await?;
+    let Some(run_id) = claim_run(ctx.db, plan.session_id, &chunk_ref, plan.attempt).await? else {
+        tracing::debug!(
+            session = %plan.session_id,
+            chunk = %chunk_ref,
+            "historian claim lost to a run already in flight"
+        );
+        return Ok(None);
+    };
 
     let last_attempt = plan.attempt + HISTORIAN_MAX_ATTEMPTS - 1;
     let mut attempt = plan.attempt;
@@ -1430,13 +1559,13 @@ pub async fn run(ctx: &RunCtx<'_>, plan: &RunPlan<'_>) -> Result<RunOutcome> {
                     Some(&side_channels),
                 )
                 .await?;
-                return Ok(RunOutcome {
+                return Ok(Some(RunOutcome {
                     run_id,
                     text,
                     attempt,
                     compartment_ids,
                     side_channels,
-                });
+                }));
             }
             Err(failure) => {
                 if attempt >= last_attempt {
@@ -1612,26 +1741,56 @@ pub async fn settle_running_runs(db: &crate::db::Db) -> Result<usize> {
     Ok(settled as usize)
 }
 
-/// Claim a run row. The id is minted here, not by the database, so the same
-/// claim can be logged before the completion starts.
-async fn insert_run(
+/// The one predicate saying a session's run slot is taken. Shared by the
+/// pre-check and the claim so the two cannot drift apart.
+const RUNNING_RUN_SQL: &str =
+    "SELECT count(*) FROM mc_historian_run WHERE session_id = ?1 AND state = 'running'";
+
+/// Whether `session_id` already has a run in flight, without touching the store
+/// otherwise: the trigger's cheap early exit before it loads the tail. A row is
+/// `running` from before its completion starts until it settles.
+pub async fn has_running_run(db: &crate::db::Db, session_id: &str) -> Result<bool> {
+    let conn = db.acquire().await?;
+    let mut stmt = conn.prepare(RUNNING_RUN_SQL).await?;
+    let mut rows = stmt.query([session_id]).await?;
+    Ok(match rows.next().await? {
+        Some(row) => row.get::<i64>(0)? > 0,
+        None => false,
+    })
+}
+
+/// Claim the session's run slot: write the `running` row and hand back its id,
+/// or `None` when another run already holds it.
+///
+/// One statement, because the rule lives in the schema: `mc_historian_run_running_idx`
+/// is unique over the running rows, so the losing insert matches that conflict,
+/// inserts nothing and returns no row. There is no read-then-write window to
+/// lose, in this process or in another one over the same file.
+async fn claim_run(
     db: &crate::db::Db,
     session_id: &str,
     chunk_ref: &str,
     attempt: i64,
-) -> Result<String> {
+) -> Result<Option<String>> {
     let run_id = id("hrun");
     let now = now_millis();
     let conn = db.acquire().await?;
-    conn.execute(
-        "INSERT INTO mc_historian_run
+    let mut stmt = conn
+        .prepare(
+            "INSERT INTO mc_historian_run
                  (id, session_id, state, chunk_ref, attempt, created_at, updated_at)
-             VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?5)",
-        (run_id.as_str(), session_id, chunk_ref, attempt, now),
-    )
-    .await
-    .with_context(|| format!("insert mc_historian_run row {run_id}"))?;
-    Ok(run_id)
+             VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?5)
+             ON CONFLICT (session_id) WHERE state = 'running' DO NOTHING
+             RETURNING id",
+        )
+        .await?;
+    let mut rows = stmt
+        .query((run_id.as_str(), session_id, chunk_ref, attempt, now))
+        .await?;
+    Ok(match rows.next().await? {
+        Some(row) => Some(row.get::<String>(0)?),
+        None => None,
+    })
 }
 
 /// Move a run row to its terminal state.
@@ -1772,6 +1931,14 @@ mod tests {
     // -- fixtures -----------------------------------------------------------
 
     /// A `session_message` row in the shape `decode_row` expects.
+    /// A request ceiling with no context fence: what most chunk tests want.
+    fn limits(request: usize) -> ChunkLimits {
+        ChunkLimits {
+            request,
+            ..ChunkLimits::unbounded()
+        }
+    }
+
     fn user_row(ordinal: i64, id: &str, text: &str) -> (i64, serde_json::Value) {
         (
             ordinal,
@@ -1818,26 +1985,59 @@ mod tests {
         )
     }
 
+    /// [`tool_row`] with a settled result body: the transcript shows one `TC:`
+    /// line, the body is what the conversation read.
+    fn tool_row_with_body(
+        ordinal: i64,
+        id: &str,
+        name: &str,
+        body: &str,
+    ) -> (i64, serde_json::Value) {
+        let (ordinal, mut row) = tool_row(ordinal, id, name, json!({ "filePath": "src/x.rs" }));
+        row["content"][0]["state"]["content"] = json!([{ "type": "text", "text": body }]);
+        (ordinal, row)
+    }
+
     // -- trigger ------------------------------------------------------------
 
     #[test]
     fn trigger_bands_follow_the_reference_escalation_order() {
-        let budget = 100_000.0;
-        // Below the proactive floor (0.70): no run.
-        assert_eq!(trigger(69_999.0, budget, 0.70, 0.85), Trigger::No);
-        // Between the soft and hard thresholds: speculative.
-        assert_eq!(trigger(70_000.0, budget, 0.70, 0.85), Trigger::Speculative);
-        assert_eq!(trigger(84_999.0, budget, 0.70, 0.85), Trigger::Speculative);
-        // At or over the force band (0.85): forced.
-        assert_eq!(trigger(85_000.0, budget, 0.70, 0.85), Trigger::Forced);
-        assert_eq!(trigger(120_000.0, budget, 0.70, 0.85), Trigger::Forced);
+        let band = Budget::derive(&crate::mctx::MctxConfig::default(), Some(100_000), None);
+        // The default execute threshold puts the floor at 63% and the force
+        // band at 85% of the window; the tail is far below its own budget.
+        assert_eq!(trigger(Some(62.9), 0.0, 10_000, &band), Trigger::No);
+        assert_eq!(
+            trigger(Some(63.0), 0.0, 10_000, &band),
+            Trigger::Speculative
+        );
+        assert_eq!(
+            trigger(Some(84.9), 0.0, 10_000, &band),
+            Trigger::Speculative
+        );
+        assert_eq!(trigger(Some(85.0), 0.0, 10_000, &band), Trigger::Forced);
+        assert_eq!(trigger(Some(132.0), 0.0, 10_000, &band), Trigger::Forced);
+    }
+
+    /// A fresh session has no usage number yet: the tail's own size is then the
+    /// only pressure signal, and ignoring it let a 192k tail ride on a 1M
+    /// window until it overflowed.
+    #[test]
+    fn trigger_fires_on_tail_size_without_a_usage_number() {
+        let band = Budget::derive(&crate::mctx::MctxConfig::default(), Some(1_048_576), None);
+        assert_eq!(trigger(None, 95_999.0, 32_000, &band), Trigger::No);
+        assert_eq!(trigger(None, 96_000.0, 32_000, &band), Trigger::Speculative);
+        // A known usage below the floor does not suppress the tail check.
+        assert_eq!(
+            trigger(Some(1.0), 96_000.0, 32_000, &band),
+            Trigger::Speculative
+        );
     }
 
     #[test]
-    fn trigger_never_fires_without_a_usable_budget() {
-        assert_eq!(trigger(1.0, 0.0, 0.70, 0.85), Trigger::No);
-        assert_eq!(trigger(1.0, -1.0, 0.70, 0.85), Trigger::No);
-        assert_eq!(trigger(f64::NAN, 100.0, 0.70, 0.85), Trigger::No);
+    fn trigger_never_fires_without_a_usable_measurement() {
+        let band = Budget::derive(&crate::mctx::MctxConfig::default(), Some(100_000), None);
+        assert_eq!(trigger(Some(50.0), f64::NAN, 10_000, &band), Trigger::No);
+        assert_eq!(trigger(None, 1.0, 0, &band), Trigger::No);
     }
 
     // -- chunk --------------------------------------------------------------
@@ -1850,12 +2050,11 @@ mod tests {
             user_row(3, "msg_3", "in the protected tail"),
         ];
         // The protected tail starts at ordinal 3: it must not be covered.
-        let chunk = chunk(&rows, 1, 3, 10_000).expect("a chunk");
+        let chunk = chunk(&rows, 1, 3, limits(10_000)).expect("a chunk");
         assert_eq!(chunk.start_ordinal, 1);
         assert_eq!(chunk.end_ordinal, 2);
         assert_eq!(chunk.end_message_id, "msg_2");
         assert_eq!(chunk.text, "[1] U: hello\n[2] A: hi there");
-        assert!(!chunk.has_more);
     }
 
     #[test]
@@ -1865,7 +2064,7 @@ mod tests {
             user_row(2, "msg_2", "two"),
             assistant_row(3, "msg_3", "three"),
         ];
-        let chunk = chunk(&rows, 1, 4, 10_000).expect("a chunk");
+        let chunk = chunk(&rows, 1, 4, limits(10_000)).expect("a chunk");
         assert_eq!(chunk.text, "[1-2] U: one / two\n[3] A: three");
         assert_eq!(chunk.end_message_id, "msg_3");
     }
@@ -1882,21 +2081,23 @@ mod tests {
             assistant_row(2, "msg_2", "uuuuuuuu"),
             user_row(3, "msg_3", "cccccccc"),
         ];
-        let chunk = chunk(&rows, 1, 4, budget).expect("a chunk");
+        let chunk = chunk(&rows, 1, 4, limits(budget)).expect("a chunk");
         assert_eq!(chunk.start_ordinal, 1);
-        assert_eq!(chunk.end_ordinal, 2);
-        assert!(chunk.has_more);
+        assert_eq!(
+            chunk.end_ordinal, 2,
+            "the budget stopped the run before the third block"
+        );
         assert_eq!(chunk.text, "[1] U: aaaaaaaa\n[2] A: uuuuuuuu");
     }
 
     #[test]
     fn chunk_admits_one_oversize_block_rather_than_returning_nothing() {
         let rows = vec![user_row(1, "msg_1", "a very long first message indeed")];
-        let chunk = chunk(&rows, 1, 2, 1).expect("a single oversize block is admitted");
+        let chunk = chunk(&rows, 1, 2, limits(1)).expect("a single oversize block is admitted");
         assert_eq!(chunk.end_ordinal, 1);
+        // The block was admitted whole, not truncated.
         assert!(chunk.token_estimate > 1);
-        // The block was admitted whole, not truncated, so nothing was left over.
-        assert!(!chunk.has_more);
+        assert_eq!(chunk.end_ordinal, 1);
     }
 
     #[test]
@@ -1907,7 +2108,7 @@ mod tests {
             user_row(1, "msg_1", "read the file"),
             tool_row(2, "msg_2", "read", json!({ "filePath": "/tmp/x.rs" })),
         ];
-        let chunk = chunk(&rows, 1, 3, 10_000).expect("a chunk");
+        let chunk = chunk(&rows, 1, 3, limits(10_000)).expect("a chunk");
         assert_eq!(
             chunk.text,
             "[1] U: read the file\n[2] A: TC: read(/tmp/x.rs)"
@@ -1924,7 +2125,7 @@ mod tests {
             assistant_row(1, "msg_1", "committed a1b2c3d4 and pushed"),
             assistant_row(2, "msg_2", "deadbeef is just hex, not a hash"),
         ];
-        let chunk = chunk(&rows, 1, 3, 10_000).expect("a chunk");
+        let chunk = chunk(&rows, 1, 3, limits(10_000)).expect("a chunk");
         assert_eq!(
             chunk.text,
             "[1-2] A: commits: a1b2c3d4, deadbeef committed and pushed / deadbeef is just hex, not a hash",
@@ -1935,8 +2136,8 @@ mod tests {
     #[test]
     fn chunk_returns_none_when_the_eligible_range_is_empty() {
         let rows = vec![user_row(1, "msg_1", "hello")];
-        assert!(chunk(&rows, 1, 1, 10_000).is_none());
-        assert!(chunk(&rows, 5, 9, 10_000).is_none());
+        assert!(chunk(&rows, 1, 1, limits(10_000)).is_none());
+        assert!(chunk(&rows, 5, 9, limits(10_000)).is_none());
     }
 
     #[test]
@@ -1946,8 +2147,47 @@ mod tests {
             "msg_1",
             "<system-reminder>ignore me</system-reminder>  real\n  text",
         )];
-        let chunk = chunk(&rows, 1, 2, 10_000).expect("a chunk");
+        let chunk = chunk(&rows, 1, 2, limits(10_000)).expect("a chunk");
         assert_eq!(chunk.text, "[1] U: real text");
+    }
+
+    /// A tail of tool-heavy turns is far larger than its rendering claims: the
+    /// historian sees one `TC:` line, the conversation read the body. The fence
+    /// is measured in what was read, so it stops a chunk the rendered budget
+    /// would have admitted whole.
+    #[test]
+    fn a_tool_result_counts_by_its_body_not_by_its_line() {
+        let rows = vec![
+            user_row(1, "msg_1", "read the file"),
+            tool_row_with_body(2, "msg_2", "read", &"x".repeat(4_000)),
+            user_row(3, "msg_3", "thanks"),
+        ];
+        let folded = chunk(&rows, 1, 4, limits(10_000)).expect("a chunk");
+        assert!(
+            folded.token_estimate < 100,
+            "the transcript is one TC: line per call: {:?}",
+            folded.text
+        );
+        assert_eq!(
+            folded.context_tokens,
+            folded.token_estimate + 1_000,
+            "4_000 bytes of body are 1_000 tokens the tail paid"
+        );
+        let fenced = chunk(
+            &rows,
+            1,
+            4,
+            ChunkLimits {
+                request: 10_000,
+                context: 500,
+            },
+        )
+        .expect("the oldest block still fits");
+        assert_eq!(
+            (fenced.start_ordinal, fenced.end_ordinal),
+            (1, 1),
+            "the fence is spent in body tokens, so it stops the chunk before the body"
+        );
     }
 
     // -- prompt -------------------------------------------------------------
@@ -2244,11 +2484,12 @@ default_model = "cardinal/k3-256k"
             user_row(3, "msg_3", "hello"),
             assistant_row(4, "msg_4", "hi there"),
         ];
-        let chunk = chunk(&rows, 3, 5, 10_000).expect("a chunk");
+        let chunk = chunk(&rows, 3, 5, limits(10_000)).expect("a chunk");
         assert_eq!(chunk.present_ordinals, vec![3, 4]);
 
         let outcome = run(&ctx, &plan_for(&chunk, 1))
             .await
+            .expect("no run in flight")
             .expect("a completed run");
 
         assert_eq!(outcome.text, valid_output_text(3, 4));
@@ -2313,6 +2554,66 @@ default_model = "cardinal/k3-256k"
         assert_eq!(requests[0].model, "k3-256k");
     }
 
+    /// One run per session, enforced by the database rather than by this
+    /// process: two handles on one file — independent pools and write gates,
+    /// as two ox processes would be — and one write transaction each, still
+    /// produce exactly one winner.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_claim_per_session_across_connections() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("ox.db");
+        let first = Db::open(&path).await.expect("first handle");
+        let second = Db::open(&path).await.expect("second handle");
+
+        // Eight attempts at once, four per handle, each on its own worker: the
+        // pools and write gates are independent, so only the database's own
+        // write transaction can rule the extras out.
+        let mut attempts = Vec::new();
+        for handle in [first.clone(), second.clone()] {
+            for _ in 0..4 {
+                let handle = handle.clone();
+                attempts.push(tokio::spawn(async move {
+                    claim_run(&handle, "ses_1", "1..2", 1).await
+                }));
+            }
+        }
+        let mut won = Vec::new();
+        for attempt in attempts {
+            if let Some(id) = attempt.await.expect("join").expect("no error") {
+                won.push(id);
+            }
+        }
+        assert_eq!(won.len(), 1, "exactly one claim per session");
+
+        let conn = first.acquire().await.expect("conn");
+        let mut stmt = conn
+            .prepare("SELECT count(*) FROM mc_historian_run WHERE state = 'running'")
+            .await
+            .expect("prepare");
+        let mut rows = stmt.query(()).await.expect("query");
+        let row = rows.next().await.expect("row").expect("count row");
+        assert_eq!(row.get::<i64>(0).expect("count"), 1, "one running row");
+
+        assert!(
+            claim_run(&second, "ses_2", "1..2", 1)
+                .await
+                .expect("no error")
+                .is_some(),
+            "another session's slot is independent"
+        );
+
+        settle_run(&first, &won[0], RunState::Aborted, None, None)
+            .await
+            .expect("settle");
+        assert!(
+            claim_run(&second, "ses_1", "3..4", 1)
+                .await
+                .expect("no error")
+                .is_some(),
+            "a settled run frees the slot for the next firing"
+        );
+    }
+
     #[tokio::test]
     async fn run_repairs_an_invalid_completion_then_publishes_the_second_attempt() {
         let db = Db::open_in_memory().await.unwrap();
@@ -2335,10 +2636,11 @@ default_model = "cardinal/k3-256k"
             user_row(1, "msg_1", "hello"),
             assistant_row(2, "msg_2", "hi"),
         ];
-        let chunk = chunk(&rows, 1, 3, 10_000).expect("a chunk");
+        let chunk = chunk(&rows, 1, 3, limits(10_000)).expect("a chunk");
 
         let outcome = run(&ctx, &plan_for(&chunk, 1))
             .await
+            .expect("no run in flight")
             .expect("a repaired run");
 
         assert_eq!(outcome.attempt, 2, "the retry is the second attempt");
@@ -2393,7 +2695,7 @@ default_model = "cardinal/k3-256k"
             assistant_row(2, "msg_2", "hi"),
             user_row(3, "msg_3", "again"),
         ];
-        let chunk = chunk(&rows, 1, 4, 10_000).expect("a chunk");
+        let chunk = chunk(&rows, 1, 4, limits(10_000)).expect("a chunk");
         assert_eq!(chunk.present_ordinals, vec![1, 2, 3]);
 
         let error = run(&ctx, &plan_for(&chunk, 1))
@@ -2445,7 +2747,7 @@ default_model = "cardinal/k3-256k"
             catalog: &catalog,
         };
         let rows = vec![user_row(1, "msg_1", "hello")];
-        let chunk = chunk(&rows, 1, 2, 10_000).expect("a chunk");
+        let chunk = chunk(&rows, 1, 2, limits(10_000)).expect("a chunk");
 
         let error = run(&ctx, &plan_for(&chunk, 1))
             .await
@@ -2489,7 +2791,7 @@ default_model = "cardinal/k3-256k"
             catalog: &catalog,
         };
         let rows = vec![user_row(1, "msg_1", "hello")];
-        let chunk = chunk(&rows, 1, 2, 10_000).expect("a chunk");
+        let chunk = chunk(&rows, 1, 2, limits(10_000)).expect("a chunk");
 
         let error = run(&ctx, &plan_for(&chunk, 1)).await.expect_err("no model");
 

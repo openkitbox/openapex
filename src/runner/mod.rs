@@ -212,7 +212,9 @@ pub struct Runner {
 }
 
 struct Inner {
-    config: Config,
+    /// The loaded config, shared by reference: nothing reads it mutably, and
+    /// every drain/step boundary clones the handle rather than the struct.
+    config: std::sync::Arc<Config>,
     /// Canonical project working directory (system prompt + tool roots).
     directory: PathBuf,
     db: Db,
@@ -250,7 +252,7 @@ impl Runner {
     /// A runner over the given bus/db/config rooted at `directory`, with the
     /// given chat transport and (initially empty or test-populated) tools.
     pub fn new(
-        config: Config,
+        config: std::sync::Arc<Config>,
         directory: PathBuf,
         db: Db,
         bus: EventBus,

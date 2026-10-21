@@ -238,7 +238,9 @@ impl Forms {
             return false;
         };
         match table.get(form_id) {
-            Some(pending) if pending.info.session_id == session_id => table.remove(form_id).is_some(),
+            Some(pending) if pending.info.session_id == session_id => {
+                table.remove(form_id).is_some()
+            }
             _ => false,
         }
     }
@@ -334,7 +336,11 @@ mod tests {
     async fn a_cancel_carries_its_message() {
         let forms = Forms::new();
         let pending = forms.create("ses_1", "Questions", question_fields());
-        assert!(forms.cancel("ses_1", &pending.info().id, Some("not interactive".to_owned())));
+        assert!(forms.cancel(
+            "ses_1",
+            &pending.info().id,
+            Some("not interactive".to_owned())
+        ));
         match pending.wait(std::time::Duration::from_millis(10)).await {
             Some(Outcome::Cancelled(Some(message))) => assert_eq!(message, "not interactive"),
             other => panic!("unexpected outcome: {other:?}"),
@@ -356,7 +362,12 @@ mod tests {
     async fn an_unanswered_wait_times_out_and_stays_pending() {
         let forms = Forms::new();
         let pending = forms.create("ses_1", "Questions", question_fields());
-        assert!(pending.wait(std::time::Duration::from_millis(10)).await.is_none());
+        assert!(
+            pending
+                .wait(std::time::Duration::from_millis(10))
+                .await
+                .is_none()
+        );
         // Still answerable after the caller gave up.
         assert!(forms.reply("ses_1", &pending.info().id, Answer::new()));
     }

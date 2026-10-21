@@ -45,59 +45,57 @@ impl Tool for QuestionTool {
              free-form option. If you recommend an option, put it first and mark its label with \
              \"(Recommended)\".",
             object_param(
-                vec![
-                    (
-                        "questions",
-                        json!({
-                            "type": "array",
-                            "minItems": 1,
-                            "maxItems": 4,
-                            "description": "Questions to ask, in order.",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "question": {
-                                        "type": "string",
-                                        "minLength": 1,
-                                        "description": "The specific decision to resolve.",
-                                    },
-                                    "header": {
-                                        "type": "string",
-                                        "description": "Short label shown as the field title, at most 30 characters.",
-                                    },
-                                    "multiple": {
-                                        "type": "boolean",
-                                        "description": "Allow selecting more than one option. Defaults to false.",
-                                    },
-                                    "options": {
-                                        "type": "array",
-                                        "minItems": MIN_OPTIONS,
-                                        "maxItems": MAX_OPTIONS,
-                                        "description": "Choices offered to the user.",
-                                        "items": {
-                                            "type": "object",
-                                            "properties": {
-                                                "label": {
-                                                    "type": "string",
-                                                    "minLength": 1,
-                                                    "description": "Option text shown to the user.",
-                                                },
-                                                "description": {
-                                                    "type": "string",
-                                                    "description": "Optional detail explaining the option.",
-                                                },
+                vec![(
+                    "questions",
+                    json!({
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 4,
+                        "description": "Questions to ask, in order.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": {
+                                    "type": "string",
+                                    "minLength": 1,
+                                    "description": "The specific decision to resolve.",
+                                },
+                                "header": {
+                                    "type": "string",
+                                    "description": "Short label shown as the field title, at most 30 characters.",
+                                },
+                                "multiple": {
+                                    "type": "boolean",
+                                    "description": "Allow selecting more than one option. Defaults to false.",
+                                },
+                                "options": {
+                                    "type": "array",
+                                    "minItems": MIN_OPTIONS,
+                                    "maxItems": MAX_OPTIONS,
+                                    "description": "Choices offered to the user.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": {
+                                                "type": "string",
+                                                "minLength": 1,
+                                                "description": "Option text shown to the user.",
                                             },
-                                            "required": ["label"],
-                                            "additionalProperties": false,
+                                            "description": {
+                                                "type": "string",
+                                                "description": "Optional detail explaining the option.",
+                                            },
                                         },
+                                        "required": ["label"],
+                                        "additionalProperties": false,
                                     },
                                 },
-                                "required": ["question", "options"],
-                                "additionalProperties": false,
                             },
-                        }),
-                    ),
-                ],
+                            "required": ["question", "options"],
+                            "additionalProperties": false,
+                        },
+                    }),
+                )],
                 &["questions"],
             ),
         )
@@ -257,7 +255,11 @@ async fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
     // Every client answers through the HTTP endpoints, which read the same
     // registry, so the count of unanswered fields is enough to decide.
     let Some(outcome) = outcome else {
-        form::shared().cancel(&ctx.session_id, &form_id, Some("nobody answered".to_owned()));
+        form::shared().cancel(
+            &ctx.session_id,
+            &form_id,
+            Some("nobody answered".to_owned()),
+        );
         return fail(NOT_AVAILABLE_SENTINEL);
     };
     match outcome {
@@ -361,7 +363,9 @@ mod tests {
         assert_eq!(output.error, None);
         assert_eq!(
             output.content,
-            json!("User has answered your questions: \"Which layer should change?\"=\"API\". You can now continue with the user's answers in mind.")
+            json!(
+                "User has answered your questions: \"Which layer should change?\"=\"API\". You can now continue with the user's answers in mind."
+            )
         );
     }
 

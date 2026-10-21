@@ -22,10 +22,22 @@ pub struct MctxConfig {
     /// model resolution applies.
     #[serde(default)]
     pub historian_model: Option<String>,
-    /// Pressure fraction (0.0–1.0) at which pre-emptive work may start.
+    /// Context usage (percent of the model window) at which folding is due.
+    /// Everything else — the proactive floor, the force band, the protected
+    /// tail, the trigger and history budgets — is derived from it, so this is
+    /// the single knob the numbers hang off.
+    #[serde(default = "default_execute_threshold_percentage")]
+    pub execute_threshold_percentage: f64,
+    /// Share of the usable window the `m[0]` history block may carry. Upstream
+    /// default 0.15, range 0.05–0.5.
+    #[serde(default = "default_history_budget_percentage")]
+    pub history_budget_percentage: f64,
+    /// **Deprecated, ignored** (kept only so an old `ox.toml` is warned about
+    /// instead of silently misread): the bands now come from
+    /// [`Self::execute_threshold_percentage`].
     #[serde(default = "default_soft_threshold")]
     pub soft_threshold: f32,
-    /// Pressure fraction at which a historian pass is forced.
+    /// **Deprecated, ignored** — see [`Self::soft_threshold`].
     #[serde(default = "default_hard_threshold")]
     pub hard_threshold: f32,
     /// Whether the dreamer (the scheduled memory-maintenance loop) runs. On by
@@ -45,27 +57,68 @@ pub struct MctxConfig {
 }
 
 impl MctxConfig {
-    /// The config with its threshold invariant enforced: both bands are
-    /// fractions in `(0, 1]` and `soft_threshold < hard_threshold`. A violated
-    /// invariant falls back to the default pair with a warning — a misconfigured
-    /// pair would otherwise silently collapse the bands (equal bands make
-    /// [`crate::mctx::historian::Trigger::Speculative`] unreachable; an inverted
-    /// pair makes the proactive band dead) and change when the historian runs
-    /// without any error surfacing.
+    /// The config with its invariants enforced: the new budget numbers are
+    /// clamped into their documented ranges, the deprecated threshold pair is
+    /// warned about and dropped, and a dreamer requested while the module is
+    /// off is turned back off.
+    ///
+    /// Clamping (not rejecting) is the established treatment for a
+    /// `[magic_context]` number: a bad value must not stop the server, and a
+    /// degenerate one (a zero window share) must not change when the historian
+    /// runs.
     pub fn validated(mut self) -> Self {
-        let bad = |name: &str, value: f32| {
+        // The bands are derived from the execute threshold, so an out-of-range
+        // value would silently move every budget with it.
+        // The ranges are owned by `budget`: they are the ranges its arithmetic
+        // is written against.
+        if !(budget::MIN_EXECUTE_PCT..=budget::MAX_EXECUTE_PCT)
+            .contains(&self.execute_threshold_percentage)
+        {
             tracing::warn!(
-                setting = name,
-                value,
-                "invalid [magic_context] threshold (expected a fraction in (0, 1], \
-                 soft < hard); using the default pair"
+                setting = "execute_threshold_percentage",
+                value = self.execute_threshold_percentage,
+                "invalid [magic_context] execute threshold (expected {}..={}); using the default",
+                budget::MIN_EXECUTE_PCT,
+                budget::MAX_EXECUTE_PCT
             );
-        };
-        let in_range = |value: f32| value.is_finite() && value > 0.0 && value <= 1.0;
-        // The interval is enforced apart from the pair: a zero interval would
-        // make every task due on every tick, i.e. a hot loop of hidden
-        // completions at the tick loop's (immediate) cadence. One minute is
-        // the smallest sane cadence, so anything below it falls back too.
+            self.execute_threshold_percentage = default_execute_threshold_percentage();
+        }
+        if !(budget::MIN_HISTORY_SHARE..=budget::MAX_HISTORY_SHARE)
+            .contains(&self.history_budget_percentage)
+        {
+            tracing::warn!(
+                setting = "history_budget_percentage",
+                value = self.history_budget_percentage,
+                "invalid [magic_context] history budget share (expected {}..={}); using the default",
+                budget::MIN_HISTORY_SHARE,
+                budget::MAX_HISTORY_SHARE
+            );
+            self.history_budget_percentage = default_history_budget_percentage();
+        }
+        // A deprecated key that was actually set is a real misconfiguration:
+        // the operator believes they tuned the bands and nothing reads them.
+        for (name, set) in [
+            (
+                "soft_threshold",
+                self.soft_threshold != default_soft_threshold(),
+            ),
+            (
+                "hard_threshold",
+                self.hard_threshold != default_hard_threshold(),
+            ),
+        ] {
+            if set {
+                tracing::warn!(
+                    setting = name,
+                    "deprecated [magic_context] key ignored; the pressure bands now follow \
+                     execute_threshold_percentage"
+                );
+            }
+        }
+        // The interval is enforced apart from everything else: a zero interval
+        // would make every dreamer task due on every tick, i.e. a hot loop of
+        // hidden completions at the tick loop's (immediate) cadence. One minute
+        // is the smallest sane cadence, so anything below it falls back too.
         if self.dreamer_interval_minutes < 1 {
             tracing::warn!(
                 setting = "dreamer_interval_minutes",
@@ -86,19 +139,15 @@ impl MctxConfig {
             );
             self.dreamer_enabled = false;
         }
-        if !in_range(self.soft_threshold) {
-            bad("soft_threshold", self.soft_threshold);
-        } else if !in_range(self.hard_threshold) {
-            bad("hard_threshold", self.hard_threshold);
-        } else if self.soft_threshold >= self.hard_threshold {
-            bad("soft_threshold", self.soft_threshold);
-        } else {
-            return self;
-        }
-        self.soft_threshold = default_soft_threshold();
-        self.hard_threshold = default_hard_threshold();
         self
     }
+}
+
+fn default_execute_threshold_percentage() -> f64 {
+    65.0
+}
+fn default_history_budget_percentage() -> f64 {
+    0.15
 }
 
 fn default_soft_threshold() -> f32 {
@@ -118,6 +167,8 @@ impl Default for MctxConfig {
         Self {
             enabled: default_enabled(),
             historian_model: None,
+            execute_threshold_percentage: default_execute_threshold_percentage(),
+            history_budget_percentage: default_history_budget_percentage(),
             soft_threshold: default_soft_threshold(),
             hard_threshold: default_hard_threshold(),
             dreamer_enabled: default_enabled(),
@@ -130,6 +181,32 @@ impl Default for MctxConfig {
 /// The module's default state: on.
 fn default_enabled() -> bool {
     true
+}
+
+/// The budgets for a session step running `model_id`.
+///
+/// The session model's window comes from the catalogue; the fold's window from
+/// whichever model [`historian::historian_model`] resolves — the same route the
+/// run itself takes, so the chunk budget can never be anchored to a model the
+/// completion does not use. A model the catalogue does not know leaves its
+/// window unknown, which [`Budget::derive`] answers with the reference's
+/// assumed default.
+///
+/// Lives in `mctx` because it is the one place that knows both models; the
+/// runner passes what it has and reads the [`Budget`] fields.
+pub(crate) fn budget_for(
+    config: &crate::config::Config,
+    catalog: &crate::model_catalog::ModelCatalog,
+    model_id: &str,
+) -> budget::Budget {
+    let historian = historian::historian_model(config, catalog)
+        .ok()
+        .and_then(|id| catalog.window_of(&id));
+    budget::Budget::derive(
+        &config.magic_context,
+        catalog.window_of(model_id),
+        historian,
+    )
 }
 
 /// `[magic_context.embedding]`: where memory vectors come from.
@@ -238,6 +315,10 @@ pub mod decay_render;
 /// Decay rendering and `m[0]`/`m[1]` synthetic-message composition.
 pub mod render;
 
+/// Model-window geometry: the pressure bands and the three token budgets every
+/// consumer measures against.
+pub mod budget;
+
 /// The per-session transform pass: plan → classify → step the cache kernel →
 /// CAS write-back (the `m[0]`/`m[1]` head producer).
 pub mod pass;
@@ -264,30 +345,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validated_thresholds_keep_a_sane_pair() {
+    fn validated_budget_numbers_are_clamped_into_range() {
         let ok = MctxConfig {
-            soft_threshold: 0.6,
-            hard_threshold: 0.9,
+            execute_threshold_percentage: 80.0,
+            history_budget_percentage: 0.3,
             ..MctxConfig::default()
-        };
-        assert_eq!(ok.validated().soft_threshold, 0.6);
+        }
+        .validated();
+        assert_eq!(ok.execute_threshold_percentage, 80.0);
+        assert_eq!(ok.history_budget_percentage, 0.3);
 
-        // Out of range, inverted, and equal pairs all fall back to the default
-        // pair: any of them would change when a historian run starts without
-        // surfacing an error.
-        for (soft, hard) in [(0.0_f32, 0.9_f32), (1.5, 2.0), (0.9, 0.7), (0.8, 0.8)] {
+        // Out of range values fall back to the default: a zero share would make
+        // the head carry no history at all, and a 100% threshold would never
+        // fold before the window overflows.
+        for (execute, history) in [(0.0_f64, 0.15_f64), (100.0, 0.15), (65.0, 0.0), (65.0, 0.9)] {
             let cfg = MctxConfig {
-                soft_threshold: soft,
-                hard_threshold: hard,
+                execute_threshold_percentage: execute,
+                history_budget_percentage: history,
                 ..MctxConfig::default()
             }
             .validated();
             assert_eq!(
-                (cfg.soft_threshold, cfg.hard_threshold),
-                (default_soft_threshold(), default_hard_threshold()),
-                "soft={soft} hard={hard}"
+                (
+                    cfg.execute_threshold_percentage,
+                    cfg.history_budget_percentage
+                ),
+                (
+                    default_execute_threshold_percentage(),
+                    default_history_budget_percentage()
+                ),
+                "execute={execute} history={history}"
             );
         }
+    }
+
+    /// The old threshold pair is kept only to be warned about: it must not be
+    /// silently read as if it still tuned the bands.
+    #[test]
+    fn deprecated_thresholds_do_not_change_the_derived_bands() {
+        let cfg = MctxConfig {
+            soft_threshold: 0.6,
+            hard_threshold: 0.9,
+            ..MctxConfig::default()
+        };
+        let validated = cfg.validated();
+        assert_eq!(
+            validated.execute_threshold_percentage,
+            default_execute_threshold_percentage()
+        );
+        let band = budget::Budget::derive(&validated, Some(100_000), None);
+        assert_eq!(band.soft_pct, 63.0, "derived, not 60");
+        assert_eq!(band.hard_pct, 85.0, "derived, not 90");
     }
 
     #[test]

@@ -139,7 +139,7 @@ async fn lists_and_pages_a_live_session() {
         .await
         .expect("json");
     assert_eq!(next["data"]["output"], "");
-    assert_eq!(next["data"]["cursor"].as_u64().unwrap() >= cursor, true);
+    assert!(next["data"]["cursor"].as_u64().unwrap() >= cursor);
 
     // A running session is not deletable.
     let refused = client

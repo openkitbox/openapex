@@ -1397,7 +1397,7 @@ async fn query_messages(db: &Db, page: MessagesPage) -> Result<Vec<Message>> {
     } = page;
 
     let mut sql = String::from("SELECT id, type, data FROM session_message WHERE session_id = ?1");
-    let mut params: Vec<SqlValue> = vec![SqlValue::Text(session_id)];
+    let mut params: Vec<SqlValue> = vec![SqlValue::Text(session_id.clone())];
     if let Some(kind) = kind {
         params.push(SqlValue::Text(kind));
         sql.push_str(&format!(" AND type = ?{}", params.len()));
@@ -1420,21 +1420,36 @@ async fn query_messages(db: &Db, page: MessagesPage) -> Result<Vec<Message>> {
     let conn = db.acquire().await?;
     let mut stmt = conn.prepare(&sql).await?;
     let mut rows = stmt.query(params).await?;
-    let mut out = Vec::new();
+    let mut values: Vec<Value> = Vec::new();
     while let Some(row) = rows.next().await? {
         let message_id = row.get::<String>(0)?;
         let kind = row.get::<String>(1)?;
         let data = row.get::<String>(2)?;
-        let value: Value = serde_json::from_str(&data).context("decode session_message.data")?;
-        out.push(
-            Message::from_row_data(&message_id, &kind, value)
-                .context("decode session message row")?,
-        );
+        let mut value: Value =
+            serde_json::from_str(&data).context("decode session_message.data")?;
+        // The overlay addresses a row by its id and type, which live in the
+        // columns: merge them in the shape the request side decodes.
+        Message::merge_row_columns(&message_id, &kind, &mut value);
+        values.push(value);
+    }
+    drop(stmt);
+    // A dropped item shows its placeholder here too: the transcript a human
+    // reads must be the transcript the model was given, or `ctx_reduce` looks
+    // like it did nothing. Cosmetic, so it never fails the read — the rows still
+    // hold the original bytes and the model's own path treats this layer the
+    // same way.
+    if let Err(error) =
+        crate::mctx::tagger::apply_transcript_overlay(db, &session_id, &mut values).await
+    {
+        tracing::warn!(session = %session_id, error = %error, "drop overlay failed; serving the raw transcript");
     }
     if reverse {
-        out.reverse();
+        values.reverse();
     }
-    Ok(out)
+    values
+        .into_iter()
+        .map(|value| Message::from_merged_row(value).context("decode session message row"))
+        .collect()
 }
 
 async fn message_seq(db: &Db, session_id: &str, message_id: &str) -> Result<Option<i64>> {
@@ -1631,14 +1646,23 @@ pub(crate) async fn message_get(req: &mut Request, depot: &mut Depot, res: &mut 
         message_not_found(res, &session_id, &message_id);
         return;
     };
-    let value: Value = match serde_json::from_str(&data) {
+    let mut value: Value = match serde_json::from_str(&data) {
         Ok(value) => value,
         Err(error) => {
             unknown_error(res, &anyhow::Error::from(error));
             return;
         }
     };
-    match Message::from_row_data(&message_id, &kind, value) {
+    // The overlay addresses a row by its id and type (see `query_messages`).
+    Message::merge_row_columns(&message_id, &kind, &mut value);
+    let mut values = [value];
+    if let Err(error) =
+        crate::mctx::tagger::apply_transcript_overlay(&app.db, &session_id, &mut values).await
+    {
+        tracing::warn!(session = %session_id, error = %error, "drop overlay failed; serving the raw message");
+    }
+    let [value] = values;
+    match Message::from_merged_row(value) {
         Ok(message) => res.render(Json(json!({ "data": message }))),
         Err(error) => unknown_error(res, &anyhow::Error::from(error)),
     }

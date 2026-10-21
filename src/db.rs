@@ -350,6 +350,25 @@ ALTER TABLE mc_memory ADD COLUMN embedding_model TEXT;
 /// on that.
 const MIGRATION_V11: &str = r#""#;
 
+/// One historian run per session, enforced by the database (context-budget
+/// follow-up).
+///
+/// `claim_run` can then be a single `INSERT … ON CONFLICT DO NOTHING RETURNING
+/// id`: no read-then-write window exists to lose, so two firings — in one
+/// process or two over the same file — cannot both claim, and the constraint
+/// survives any future caller that forgets the protocol.
+///
+/// The `UPDATE` comes first because the index cannot be built over duplicates,
+/// and because a `running` row at migration time can only be a leftover: this
+/// runs before the process serves anything, so no live run owns it.
+const MIGRATION_V12: &str = r#"
+UPDATE mc_historian_run
+   SET state = 'aborted', error = 'superseded when the schema gained the claim index'
+ WHERE state = 'running';
+CREATE UNIQUE INDEX IF NOT EXISTS mc_historian_run_running_idx
+    ON mc_historian_run (session_id) WHERE state = 'running';
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
@@ -365,6 +384,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (9, MIGRATION_V9),
     (10, MIGRATION_V10),
     (11, MIGRATION_V11),
+    (12, MIGRATION_V12),
 ];
 
 /// All indexes the migration creates: V1's verbatim from upstream
@@ -391,6 +411,7 @@ const EXPECTED_INDEXES: &[&str] = &[
     "mc_compartments_session_idx",
     "mc_memory_project_idx",
     "mc_note_session_idx",
+    "mc_historian_run_running_idx",
     "mc_historian_run_session_idx",
     "mc_tag_session_message_idx",
     // The FTS indexes (turso indexes an expression-free column list, and the
@@ -595,11 +616,8 @@ impl Db {
             )
             .await?;
         } else {
-            tx.execute(
-                "UPDATE session_v2 SET path = '' WHERE path IS NULL",
-                (),
-            )
-            .await?;
+            tx.execute("UPDATE session_v2 SET path = '' WHERE path IS NULL", ())
+                .await?;
         }
         tx.commit().await?;
         Ok(())
@@ -839,14 +857,20 @@ mod tests {
         );
     }
 
+    /// The version this build migrates to, so a new migration does not have to
+    /// be chased through every upgrade test.
+    fn latest_version() -> u32 {
+        MIGRATIONS.last().expect("at least one migration").0
+    }
+
     #[tokio::test]
     async fn migration_tracks_user_version_and_is_idempotent() {
         let db = Db::open_in_memory().await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 11);
+        assert_eq!(db.user_version().await.unwrap(), latest_version());
         // Re-running must be a no-op: version stays, no error.
         db.migrate().await.unwrap();
         db.migrate().await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 11);
+        assert_eq!(db.user_version().await.unwrap(), latest_version());
     }
 
     /// The pragmas [`Db::connect`] sets are the ones the storage layer relies
@@ -895,27 +919,16 @@ mod tests {
         while let Some(row) = rows.next().await.unwrap() {
             names.push(row.get::<String>(0).unwrap());
         }
-        assert_eq!(
-            names,
-            vec![
-                "mc_compartments",
-                "mc_compartments_fts",
-                "mc_compartments_session_idx",
-                "mc_dream_state",
-                "mc_drop",
-                "mc_frozen_state",
-                "mc_historian_run",
-                "mc_historian_run_session_idx",
-                "mc_memory",
-                "mc_memory_fts",
-                "mc_memory_project_idx",
-                "mc_note",
-                "mc_note_fts",
-                "mc_note_session_idx",
-                "mc_tag",
-                "mc_tag_session_message_idx",
-            ]
-        );
+        // Built from the two schema inventories rather than a second copy of
+        // them: a new mc_* table or index is one edit, not two.
+        let mut expected: Vec<&str> = EXPECTED_TABLES
+            .iter()
+            .chain(EXPECTED_INDEXES.iter())
+            .copied()
+            .filter(|name| name.starts_with("mc"))
+            .collect();
+        expected.sort_unstable();
+        assert_eq!(names, expected);
     }
 
     #[tokio::test]
@@ -924,7 +937,7 @@ mod tests {
         let path = dir.path().join("upgrade.db");
         build_upto(&path, 1).await;
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 11);
+        assert_eq!(db.user_version().await.unwrap(), latest_version());
         for table in [
             "mc_frozen_state",
             "mc_compartments",
@@ -945,7 +958,7 @@ mod tests {
         let path = dir.path().join("upgrade3.db");
         build_upto(&path, 2).await;
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 11);
+        assert_eq!(db.user_version().await.unwrap(), latest_version());
         for table in ["mc_tag", "mc_drop"] {
             assert!(
                 db.table_exists(table).await.unwrap(),
@@ -998,7 +1011,7 @@ mod tests {
             .unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 11);
+        assert_eq!(db.user_version().await.unwrap(), latest_version());
         // The pre-existing row reads back with the 'active' default and no
         // archive reason — the additive columns converge both DB histories.
         let row = query_row(
@@ -1040,15 +1053,18 @@ mod tests {
         {
             let conn = raw(&path).await;
             conn.execute(
+                // A terminal state on purpose: a `running` row would be settled
+                // by a later migration and stop being the "defaults preserved"
+                // case this test is about.
                 "INSERT INTO mc_historian_run (id, session_id, state, chunk_ref, attempt, created_at)
-                 VALUES ('hr_old', 'ses_1', 'running', '0..3', 1, 1)",
+                 VALUES ('hr_old', 'ses_1', 'completed', '0..3', 1, 1)",
                 (),
             )
             .await
             .unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 11);
+        assert_eq!(db.user_version().await.unwrap(), latest_version());
         let row = query_row(
             &db,
             "SELECT updated_at, error FROM mc_historian_run WHERE id = 'hr_old'",
@@ -1056,6 +1072,83 @@ mod tests {
         .await;
         assert_eq!(row.get::<i64>(0).unwrap(), 0);
         assert_eq!(row.get::<Option<String>>(1).unwrap(), None);
+    }
+
+    /// V12 makes "one running run per session" a database constraint. The rows
+    /// it settles first are the reason the index can be built at all: a crashed
+    /// database may hold two.
+    #[tokio::test]
+    async fn migration_v12_settles_running_rows_and_unique_indexes_the_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upgrade12.db");
+        build_upto(&path, 11).await;
+        {
+            let conn = raw(&path).await;
+            // Two running rows for one session: legal before V12, forbidden after.
+            conn.execute(
+                "INSERT INTO mc_historian_run (id, session_id, state, chunk_ref, attempt, created_at)
+                 VALUES ('hr_a', 'ses_1', 'running', '0..3', 1, 1)",
+                (),
+            )
+            .await
+            .unwrap();
+            conn.execute(
+                "INSERT INTO mc_historian_run (id, session_id, state, chunk_ref, attempt, created_at)
+                 VALUES ('hr_b', 'ses_1', 'running', '0..3', 2, 2)",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+
+        let db = Db::open(&path).await.unwrap();
+        assert_eq!(db.user_version().await.unwrap(), latest_version());
+        let row = query_row(
+            &db,
+            "SELECT count(*) FROM mc_historian_run WHERE state = 'running'",
+        )
+        .await;
+        assert_eq!(
+            row.get::<i64>(0).unwrap(),
+            0,
+            "both leftovers are settled so the unique index can be built"
+        );
+
+        let conn = db.acquire().await.unwrap();
+        conn.execute(
+            "UPDATE mc_historian_run SET state = 'running' WHERE id = 'hr_a'",
+            (),
+        )
+        .await
+        .unwrap();
+        let duplicate = conn
+            .execute(
+                "INSERT INTO mc_historian_run
+                     (id, session_id, state, chunk_ref, attempt, created_at, updated_at)
+                 VALUES ('hr_c', 'ses_1', 'running', '4..6', 1, 3, 3)",
+                (),
+            )
+            .await;
+        assert!(
+            duplicate.is_err(),
+            "a second running row for one session is refused by the schema"
+        );
+
+        // A settled run frees the slot, which is what makes the next fold claimable.
+        conn.execute(
+            "UPDATE mc_historian_run SET state = 'completed' WHERE id = 'hr_a'",
+            (),
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "INSERT INTO mc_historian_run
+                 (id, session_id, state, chunk_ref, attempt, created_at, updated_at)
+             VALUES ('hr_c', 'ses_1', 'running', '4..6', 1, 3, 3)",
+            (),
+        )
+        .await
+        .expect("the slot is free again");
     }
 
     #[tokio::test]
@@ -1076,7 +1169,7 @@ mod tests {
             .unwrap();
         }
         let db = Db::open(&path).await.unwrap();
-        assert_eq!(db.user_version().await.unwrap(), 11);
+        assert_eq!(db.user_version().await.unwrap(), latest_version());
         let compartments = columns(&db, "mc_compartments").await;
         let runs = columns(&db, "mc_historian_run").await;
         assert!(!compartments.iter().any(|c| c == "facts"));
@@ -1133,7 +1226,7 @@ mod tests {
         }
         let upgraded = Db::open(&path).await.unwrap();
         let fresh = Db::open_in_memory().await.unwrap();
-        assert_eq!(upgraded.user_version().await.unwrap(), 11);
+        assert_eq!(upgraded.user_version().await.unwrap(), latest_version());
         // Both histories must create exactly the same objects, SQL included.
         assert_eq!(
             schema_objects(&upgraded).await,
@@ -1223,7 +1316,7 @@ mod tests {
         build_upto(&path, 7).await;
         let upgraded = Db::open(&path).await.unwrap();
         let fresh = Db::open_in_memory().await.unwrap();
-        assert_eq!(upgraded.user_version().await.unwrap(), 11);
+        assert_eq!(upgraded.user_version().await.unwrap(), latest_version());
         assert_eq!(
             schema_objects(&upgraded).await,
             schema_objects(&fresh).await,
@@ -1277,7 +1370,7 @@ mod tests {
         }
         let upgraded = Db::open(&path).await.unwrap();
         let fresh = Db::open_in_memory().await.unwrap();
-        assert_eq!(upgraded.user_version().await.unwrap(), 11);
+        assert_eq!(upgraded.user_version().await.unwrap(), latest_version());
         assert_eq!(
             schema_objects(&upgraded).await,
             schema_objects(&fresh).await,
@@ -1315,7 +1408,7 @@ mod tests {
         }
         let upgraded = Db::open(&path).await.unwrap();
         let fresh = Db::open_in_memory().await.unwrap();
-        assert_eq!(upgraded.user_version().await.unwrap(), 11);
+        assert_eq!(upgraded.user_version().await.unwrap(), latest_version());
         assert_eq!(
             schema_objects(&upgraded).await,
             schema_objects(&fresh).await,

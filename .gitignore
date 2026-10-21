@@ -2,3 +2,4 @@ target/
 .DS_Store
 reference/
 Taskfile.yml
+node_modules/

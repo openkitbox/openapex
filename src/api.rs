@@ -26,7 +26,8 @@ pub mod shell;
 /// Shared application state, injected via `salvo::affix_state`.
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Config,
+    /// The loaded config, shared by reference; nothing mutates it after startup.
+    pub config: Arc<Config>,
     pub db: Db,
     /// In-process event bus; every session mutation is published through it.
     pub bus: EventBus,

@@ -158,10 +158,7 @@ impl Tool for GrepTool {
                     ),
                     (
                         "limit",
-                        int_param(
-                            1,
-                            "Maximum number of results to return (default: 100)",
-                        ),
+                        int_param(1, "Maximum number of results to return (default: 100)"),
                     ),
                     (
                         "offset",
@@ -281,8 +278,16 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
     let mut searcher = SearcherBuilder::new()
         .line_number(true)
         .binary_detection(BinaryDetection::quit(0))
-        .before_context(if mode == OutputMode::Content { context_lines } else { 0 })
-        .after_context(if mode == OutputMode::Content { context_lines } else { 0 })
+        .before_context(if mode == OutputMode::Content {
+            context_lines
+        } else {
+            0
+        })
+        .after_context(if mode == OutputMode::Content {
+            context_lines
+        } else {
+            0
+        })
         .build();
     let mut matches: Vec<GrepMatch> = Vec::new();
     let mut timed_out = false;
@@ -291,7 +296,14 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
     // result still knows whether anything follows it.
     let collect = offset.saturating_add(limit).saturating_add(1);
     if is_file {
-        grep_file(&mut searcher, &matcher, &target, &cwd, collect, &mut matches);
+        grep_file(
+            &mut searcher,
+            &matcher,
+            &target,
+            &cwd,
+            collect,
+            &mut matches,
+        );
     } else {
         // rg grep passes `--hidden` unconditionally; `.git` stays excluded.
         for entry in WalkBuilder::new(&target)
@@ -664,19 +676,22 @@ mod tests {
         )
         .await;
         let text = output.content.as_str().unwrap();
-        assert!(text.ends_with("a.rs:2") || text.contains("a.rs:2"), "{text}");
+        assert!(
+            text.ends_with("a.rs:2") || text.contains("a.rs:2"),
+            "{text}"
+        );
         assert!(text.contains("b.rs:1"), "{text}");
     }
 
     #[tokio::test]
     async fn context_lines_are_included_and_marked() {
         let directory = tempdir().unwrap();
-        fs::write(directory.path().join("a.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
-        let output = grep_tool(
-            &directory,
-            json!({"pattern": "three", "context_lines": 1}),
+        fs::write(
+            directory.path().join("a.txt"),
+            "one\ntwo\nthree\nfour\nfive\n",
         )
-        .await;
+        .unwrap();
+        let output = grep_tool(&directory, json!({"pattern": "three", "context_lines": 1})).await;
         let text = output.content.as_str().unwrap();
         assert!(text.contains("Line 3: three"), "match: {text}");
         assert!(text.contains("Line 2: -two"), "before context: {text}");

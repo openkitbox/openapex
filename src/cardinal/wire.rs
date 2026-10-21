@@ -150,9 +150,7 @@ pub enum UserPart {
     Text { text: String },
     /// `{"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}`
     #[serde(rename = "image_url")]
-    Image {
-        image_url: ImageUrl,
-    },
+    Image { image_url: ImageUrl },
 }
 
 /// The `image_url` object of a [`UserPart::Image`].

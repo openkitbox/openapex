@@ -53,8 +53,9 @@ async fn spawn_server(heartbeat_ms: u64) -> TestServer {
     )
     .unwrap();
     let model_catalog = ox::model_catalog::ModelCatalog::new(&config);
+    let config = std::sync::Arc::new(config);
     let runner = ox::runner::Runner::new(
-        config.clone(),
+        std::sync::Arc::clone(&config),
         std::env::current_dir().unwrap(),
         db.clone(),
         bus.clone(),

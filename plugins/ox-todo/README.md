@@ -40,13 +40,22 @@ Requires the ox server (this repository) to be running: the plugin reads
 - Collapse state persists via `context.storage.store("view")`, same as the
   built-in sidebar blocks.
 
+## Typecheck
+
+`bun install && bun run typecheck` (inside this directory). The `devDependencies`
+exist only for that — the TUI resolves `@opencode/plugin`, `solid-js` and
+`@opentui/*` to its own runtime instances, so a local `node_modules` is never
+loaded by the host. Bump `@opencode/plugin` / `@opencode/theme` alongside the
+installed opencode TUI release (`opencode --version`); the pins here are 2.1.1.
+
 ## Files
 
 | File | Purpose |
 | --- | --- |
 | `tui.tsx` | Plugin definition + Solid components (header, phases, tasks) |
 | `parse.ts` | `sessionPhases` (selection), `parsePhases` (decoding), counters |
-| `parse.test.ts` | 7 cases: decoding tolerance, selection, revert boundary (`bun test`) |
+| `parse.test.ts` | 10 cases: decoding tolerance, selection, revert boundary (`bun test`) |
+| `tsconfig.json` | `jsxImportSource: "@opentui/solid"` — editor/tsc type resolution |
 
 ## Notes
 

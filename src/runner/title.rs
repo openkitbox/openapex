@@ -121,7 +121,10 @@ async fn load_title(db: &Db, session_id: &str) -> Result<Option<String>> {
         .prepare("SELECT title FROM session_v2 WHERE id = ?1")
         .await?;
     let row = crate::db::optional(&mut stmt, [session_id]).await?;
-    Ok(row.map(|row| row.get::<Option<String>>(0)).transpose()?.flatten())
+    Ok(row
+        .map(|row| row.get::<Option<String>>(0))
+        .transpose()?
+        .flatten())
 }
 
 /// The session's root status: title generation is root-only upstream
@@ -164,11 +167,16 @@ async fn title_input(db: &Db, session_id: &str, untitled: bool) -> Result<Option
         return Ok(None);
     };
     if untitled {
-        return Ok(Some(first_text.chars().take(MAX_FIRST_MESSAGE_LENGTH).collect()));
+        return Ok(Some(
+            first_text.chars().take(MAX_FIRST_MESSAGE_LENGTH).collect(),
+        ));
     }
     let original: String = format!(
         "Original request:\n{}",
-        first_text.chars().take(MAX_FIRST_MESSAGE_LENGTH).collect::<String>()
+        first_text
+            .chars()
+            .take(MAX_FIRST_MESSAGE_LENGTH)
+            .collect::<String>()
     );
     // `load_history_after` reads the tail above the magic-context floor; the
     // title input wants the whole visible conversation, so the floor is 0.
@@ -176,7 +184,9 @@ async fn title_input(db: &Db, session_id: &str, untitled: bool) -> Result<Option
     let mut recent = String::new();
     for message in messages {
         match message {
-            Message::User { ref id, ref prompt, .. } if *id != first_id => {
+            Message::User {
+                ref id, ref prompt, ..
+            } if *id != first_id => {
                 let text = prompt.text.trim();
                 if !text.is_empty() {
                     push_line(&mut recent, &format!("User: {text}"));
@@ -208,7 +218,14 @@ async fn title_input(db: &Db, session_id: &str, untitled: bool) -> Result<Option
     let prefix = format!("{original}\n\nRecent conversation:\n");
     // Tail-keep: the newest exchanges matter most to a re-generation.
     let keep = MAX_CONTEXT_LENGTH.saturating_sub(prefix.chars().count());
-    let recent: String = recent.chars().rev().take(keep).collect::<String>().chars().rev().collect();
+    let recent: String = recent
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
     Ok(Some(format!("{prefix}{recent}")))
 }
 
@@ -221,33 +238,36 @@ fn push_line(out: &mut String, line: &str) {
     out.push_str(line);
 }
 
-    /// The earliest user message in the session (`SessionHistory.firstUserMessage`).
-    /// The row's `data` column omits `id`/`type` (they live in their own
-    /// columns), so both are reattached before decoding.
-    async fn first_user_message(db: &Db, session_id: &str) -> Result<Option<(String, String)>> {
-        let conn = db.acquire().await?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, data FROM session_message WHERE session_id = ?1 AND type = 'user'
+/// The earliest user message in the session (`SessionHistory.firstUserMessage`).
+/// The row's `data` column omits `id`/`type` (they live in their own
+/// columns), so both are reattached before decoding.
+async fn first_user_message(db: &Db, session_id: &str) -> Result<Option<(String, String)>> {
+    let conn = db.acquire().await?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, data FROM session_message WHERE session_id = ?1 AND type = 'user'
                  ORDER BY seq ASC LIMIT 1",
-            )
-            .await?;
-        let row = crate::db::optional(&mut stmt, [session_id]).await?;
-        let Some(row) = row else { return Ok(None) };
-        let id: String = row.get(0)?;
-        let data: String = row.get(1)?;
-        let mut value: serde_json::Value = serde_json::from_str(&data)?;
-        if let serde_json::Value::Object(map) = &mut value {
-            map.insert("id".to_owned(), serde_json::Value::String(id.clone()));
-            map.insert("type".to_owned(), serde_json::Value::String("user".to_owned()));
-        }
-        let text = value
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        Ok(Some((id, text)))
+        )
+        .await?;
+    let row = crate::db::optional(&mut stmt, [session_id]).await?;
+    let Some(row) = row else { return Ok(None) };
+    let id: String = row.get(0)?;
+    let data: String = row.get(1)?;
+    let mut value: serde_json::Value = serde_json::from_str(&data)?;
+    if let serde_json::Value::Object(map) = &mut value {
+        map.insert("id".to_owned(), serde_json::Value::String(id.clone()));
+        map.insert(
+            "type".to_owned(),
+            serde_json::Value::String("user".to_owned()),
+        );
     }
+    let text = value
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Ok(Some((id, text)))
+}
 
 /// Upstream `attempt`'s extraction: the first non-blank trimmed line of the
 /// completion.
@@ -267,7 +287,7 @@ pub(crate) async fn generate(
     db: Db,
     bus: EventBus,
     chat: Arc<dyn Chat>,
-    config: crate::config::Config,
+    config: Arc<crate::config::Config>,
     catalog: Arc<crate::model_catalog::ModelCatalog>,
     session_id: String,
 ) {
@@ -494,7 +514,10 @@ mod tests {
     }
 
     impl crate::runner::Chat for StubChat {
-        fn stream_chat<'a>(&'a self, request: &'a ChatRequest) -> crate::cardinal::chat::ChatFuture<'a> {
+        fn stream_chat<'a>(
+            &'a self,
+            request: &'a ChatRequest,
+        ) -> crate::cardinal::chat::ChatFuture<'a> {
             self.requests.lock().unwrap().push(request.clone());
             let hook = self.on_request.clone();
             let delta = self.answer.clone();
@@ -518,8 +541,7 @@ mod tests {
     }
 
     impl futures_core::Stream for StubStream {
-        type Item =
-            Result<crate::cardinal::stream::StreamEvent, crate::cardinal::CardinalError>;
+        type Item = Result<crate::cardinal::stream::StreamEvent, crate::cardinal::CardinalError>;
 
         fn poll_next(
             self: std::pin::Pin<&mut Self>,
@@ -588,7 +610,15 @@ mod tests {
 
         let chat = StubChat::new("\nDebugging production 500 errors\n");
         let catalog = crate::model_catalog::ModelCatalog::new(&test_config(dir.path()));
-        generate(db.clone(), bus.clone(), chat.clone(), test_config(dir.path()), catalog, session_id.clone()).await;
+        generate(
+            db.clone(),
+            bus.clone(),
+            chat.clone(),
+            Arc::new(test_config(dir.path())),
+            catalog,
+            session_id.clone(),
+        )
+        .await;
 
         // The row carries the extracted title...
         assert_eq!(
@@ -678,7 +708,15 @@ mod tests {
             }),
         );
         let catalog = crate::model_catalog::ModelCatalog::new(&test_config(dir.path()));
-        generate(db.clone(), bus.clone(), chat, test_config(dir.path()), catalog, session_id.clone()).await;
+        generate(
+            db.clone(),
+            bus.clone(),
+            chat,
+            Arc::new(test_config(dir.path())),
+            catalog,
+            session_id.clone(),
+        )
+        .await;
         assert_eq!(
             load_title(&db, &session_id).await.unwrap().as_deref(),
             Some("Manual rename"),
