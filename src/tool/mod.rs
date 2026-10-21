@@ -34,7 +34,6 @@ pub mod shell;
 pub mod skill;
 pub mod skills;
 pub mod subagent;
-pub mod todo;
 pub mod todowrite;
 pub mod web_search;
 pub mod webfetch;

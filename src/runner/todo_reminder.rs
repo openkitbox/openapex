@@ -8,9 +8,10 @@
 //! drain promotes at the next turn boundary — but the guards are the same:
 //!
 //! - **Budget**: at most [`MAX_REMINDERS`] reminders per list (the reference's
-//!   `todo.remindersMax`, default 3). The count lives in the same `kv` row
-//!   family as the list itself and resets whenever the list is touched, so a
-//!   fresh `init` starts a fresh budget.
+//!   `todo.remindersMax`, default 3). The open items come from the transcript's
+//!   newest completed `todowrite` call (`tool::todowrite::open_tasks`); only the
+//!   reminder counter lives in `kv`, and it resets whenever the list is touched,
+//!   so a fresh `todowrite` call starts a fresh budget.
 //! - **No progress, no re-ask**: a reminder that did not move the list suppresses
 //!   further reminders until the model touches `todo` again (the reference's
 //!   `reminderAwaitingProgress`).
@@ -25,7 +26,7 @@ use serde_json::json;
 
 use crate::db::Db;
 use crate::schema::event::SessionEventData;
-use crate::tool::todo;
+use crate::tool::todowrite;
 
 /// The reference's `todo.remindersMax` default (`settings.ts:387`).
 const MAX_REMINDERS: u32 = 3;
@@ -78,25 +79,19 @@ fn awaits_user_answer(text: &str) -> bool {
     text.trim_end().ends_with('?') || text.trim_end().ends_with('？')
 }
 
-/// Build the reminder text. The shape mirrors the reference's
-/// `<system-reminder>` block: the open items, the ask, and the budget state.
-fn reminder_text(open: &[(String, String, &'static str)], attempt: u32) -> String {
+/// Build the reminder text: the open items, the ask, and the budget state.
+fn reminder_text(open: &[(String, String)], attempt: u32) -> String {
     let mut lines = Vec::with_capacity(open.len() + 4);
     lines.push("<system-reminder>".to_owned());
     lines.push(format!(
         "You stopped with {} incomplete todo item(s):",
         open.len()
     ));
-    let mut current_phase: Option<&str> = None;
-    for (phase, task, status) in open {
-        if current_phase != Some(phase.as_str()) {
-            lines.push(format!("- {phase}"));
-            current_phase = Some(phase.as_str());
-        }
-        lines.push(format!("  - {task} [{status}]"));
+    for (content, status) in open {
+        lines.push(format!("  - {content} [{status}]"));
     }
     lines.push(
-        "Continue working on these tasks, or mark them complete/abandoned if they are \
+        "Continue working on these tasks, or mark them completed/cancelled if they are \
          actually finished. Do not leave the list behind."
             .to_owned(),
     );
@@ -110,7 +105,7 @@ fn reminder_text(open: &[(String, String, &'static str)], attempt: u32) -> Strin
 /// finished or empty list starts the next list fresh). Every failure is logged
 /// and swallowed: a reminder is advisory and must never fail the turn.
 pub(crate) async fn on_turn_ended(db: &Db, bus: &crate::event_bus::EventBus, session_id: &str) {
-    let open = match todo::open_tasks(db, session_id).await {
+    let open = match todowrite::open_tasks(db, session_id).await {
         Ok(open) => open,
         Err(error) => {
             tracing::debug!(session = %session_id, error = %error, "todo reminder: read failed");
@@ -202,11 +197,12 @@ mod tests {
     use crate::db::Db;
     use crate::event_bus::EventBus;
 
-    /// Seed a session's todo row directly (the tool's own path is covered in
-    /// `tool::todo`); this suite is about the reminder's guards. The session
-    /// row is required: `session_inbox` has a foreign key to it, and the
-    /// inbox's durable projection is what materializes the steer.
-    async fn seed(db: &Db, session_id: &str, phases: &str) {
+    /// Seed a session with one assistant row holding a completed todowrite
+    /// call. The session row is required: `session_inbox` has a foreign key
+    /// to it, and the inbox's durable projection is what materializes the
+    /// steer. The seq is far above the runtime range — projected messages
+    /// reuse the event ordinal, which starts at 1 for a fresh session.
+    async fn seed(db: &Db, session_id: &str, todos: serde_json::Value) {
         let conn = db.acquire().await.unwrap();
         conn.execute(
             "INSERT OR IGNORE INTO session_v2
@@ -216,23 +212,43 @@ mod tests {
         )
         .await
         .unwrap();
+        let data = serde_json::json!({
+            "id": format!("msg_{session_id}_1"),
+            "type": "assistant",
+            "time": { "created": 0 },
+            "agent": "build",
+            "model": { "id": "m", "providerID": "p" },
+            "content": [{
+                "type": "tool",
+                "id": "call_1",
+                "name": "todowrite",
+                "state": { "status": "completed", "input": { "todos": todos }, "content": [] },
+                "time": { "created": 0 },
+            }],
+        });
         conn.execute(
-            "INSERT INTO kv (key, value, time_created, time_updated) VALUES (?1, ?2, 0, 0)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (format!("todo:{session_id}"), phases),
+            "INSERT INTO session_message
+               (id, session_id, type, seq, time_created, time_updated, data)
+             VALUES (?1, ?2, 'assistant', 1000000, 0, 0, ?3)",
+            (
+                format!("msg_{session_id}_1"),
+                session_id.to_owned(),
+                data.to_string(),
+            ),
         )
         .await
         .unwrap();
     }
 
-    fn one_open_one_done() -> &'static str {
-        r#"[{"name":"P","tasks":[
-             {"content":"open","status":"pending"},
-             {"content":"closed","status":"completed"}]}]"#
+    fn one_open_one_done() -> serde_json::Value {
+        serde_json::json!([
+            {"content": "open", "status": "pending"},
+            {"content": "closed", "status": "completed"}
+        ])
     }
 
-    fn all_done() -> &'static str {
-        r#"[{"name":"P","tasks":[{"content":"closed","status":"completed"}]}]"#
+    fn all_done() -> serde_json::Value {
+        serde_json::json!([{"content": "closed", "status": "completed"}])
     }
 
     #[tokio::test]
@@ -369,19 +385,17 @@ mod tests {
     }
 
     #[test]
-    fn the_reminder_names_each_phase_once() {
+    fn the_reminder_lists_open_items_flat() {
         let open = vec![
-            ("Alpha".to_owned(), "one".to_owned(), "pending"),
-            ("Alpha".to_owned(), "two".to_owned(), "in_progress"),
-            ("Beta".to_owned(), "three".to_owned(), "pending"),
+            ("one".to_owned(), "pending".to_owned()),
+            ("two".to_owned(), "in_progress".to_owned()),
         ];
         let text = reminder_text(&open, 2);
-        assert_eq!(text.matches("- Alpha").count(), 1, "{text}");
-        assert_eq!(text.matches("- Beta").count(), 1, "{text}");
         assert!(text.contains("  - one [pending]"), "{text}");
         assert!(text.contains("  - two [in_progress]"), "{text}");
         assert!(text.contains("(Reminder 2/3)"), "{text}");
         assert!(text.starts_with("<system-reminder>"), "{text}");
         assert!(text.ends_with("</system-reminder>"), "{text}");
+        assert!(text.contains("completed/cancelled"), "{text}");
     }
 }

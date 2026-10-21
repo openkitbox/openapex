@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 use crate::cardinal::wire::ToolDef;
 use crate::db::Db;
 use crate::runner::{Tool, ToolContext, ToolOutput};
+use crate::schema::message::{AssistantContent, Message, ToolState};
 use crate::tool::{fail, object_param, ok_text, param};
 
 /// Upstream `TodoTool.Info` status literals, in display order.
@@ -96,6 +97,85 @@ impl Tool for TodoWriteTool {
             ok_text(summarize(&todos)).with_metadata(json!({ "todos": todos }))
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reminder data source
+// ---------------------------------------------------------------------------
+
+/// Open todo items for the completion reminder: the `pending`/`in_progress`
+/// entries of the session's newest COMPLETED `todowrite` call, as
+/// `(content, status)`. This is the same selection rule the TUI's
+/// `sessionTodos` applies (newest completed call wins; a newer running or
+/// errored call does not shadow it), minus the revert boundary, which is a
+/// TUI display concept. An empty newest list — or no call at all — means no
+/// open work.
+///
+/// Reads the transcript tail streaming, newest first: the common case hits
+/// within the first few rows, and only a session that never called todowrite
+/// scans to the end.
+pub(crate) async fn open_tasks(db: &Db, session_id: &str) -> anyhow::Result<Vec<(String, String)>> {
+    let conn = db.acquire().await?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT data FROM session_message
+             WHERE session_id = ?1 AND type = 'assistant'
+             ORDER BY seq DESC",
+        )
+        .await?;
+    let mut rows = stmt.query([session_id]).await?;
+    let mut found: Option<Vec<(String, String)>> = None;
+    while let Some(row) = rows.next().await? {
+        let raw: String = row.get(0)?;
+        if let Some(open) = open_from_assistant_row(&raw) {
+            found = Some(open);
+            break;
+        }
+    }
+    drop(rows);
+    drop(stmt);
+    drop(conn);
+    Ok(found.unwrap_or_default())
+}
+
+/// `Some` when this assistant row holds at least one completed `todowrite`
+/// part — the value is that call's open items (possibly empty). `None` keeps
+/// the scan walking older rows. A malformed row is skipped, not fatal: the
+/// reminder is advisory.
+fn open_from_assistant_row(raw: &str) -> Option<Vec<(String, String)>> {
+    let value = serde_json::from_str::<Value>(raw).ok()?;
+    let Ok(Message::Assistant(assistant)) = Message::from_row_data("", "assistant", value) else {
+        return None;
+    };
+    // Parts are in generation order; the last todowrite in a message is the
+    // latest call.
+    for part in assistant.content.iter().rev() {
+        let AssistantContent::Tool { name, state, .. } = part else {
+            continue;
+        };
+        if name != "todowrite" {
+            continue;
+        }
+        let ToolState::Completed { input, .. } = &**state else {
+            continue;
+        };
+        let Some(todos) = input.get("todos").and_then(Value::as_array) else {
+            return Some(Vec::new());
+        };
+        return Some(
+            todos
+                .iter()
+                .filter_map(|item| {
+                    let status = item.get("status")?.as_str()?;
+                    if !matches!(status, "pending" | "in_progress") {
+                        return None;
+                    }
+                    Some((item.get("content")?.as_str()?.to_owned(), status.to_owned()))
+                })
+                .collect(),
+        );
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -290,5 +370,140 @@ mod tests {
             .expect("row");
         let value: String = row.get(0).unwrap();
         assert_eq!(value, "0", "a touched list re-arms the budget");
+    }
+
+    /// Seed one assistant message row holding a single completed todowrite
+    /// part. `seq` orders the rows; the newest wins.
+    async fn seed_todowrite_row(db: &Db, session_id: &str, seq: i64, todos: Value) {
+        let conn = db.acquire().await.unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO session_v2
+               (id, project_id, slug, directory, version, time_created, time_updated)
+             VALUES (?1, 'default', 't', '/tmp', '1', 0, 0)",
+            [session_id],
+        )
+        .await
+        .unwrap();
+        let data = json!({
+            "id": format!("msg_{session_id}_{seq}"),
+            "type": "assistant",
+            "time": { "created": 0 },
+            "agent": "build",
+            "model": { "id": "m", "providerID": "p" },
+            "content": [{
+                "type": "tool",
+                "id": "call_1",
+                "name": "todowrite",
+                "state": { "status": "completed", "input": { "todos": todos }, "content": [] },
+                "time": { "created": 0 },
+            }],
+        });
+        conn.execute(
+            "INSERT INTO session_message
+               (id, session_id, type, seq, time_created, time_updated, data)
+             VALUES (?1, ?2, 'assistant', ?3, 0, 0, ?4)",
+            (
+                format!("msg_{session_id}_{seq}"),
+                session_id.to_owned(),
+                seq,
+                data.to_string(),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_tasks_reads_the_newest_completed_call() {
+        let db = Db::open_in_memory().await.unwrap();
+        seed_todowrite_row(
+            &db,
+            "ses_a",
+            1,
+            json!([{ "content": "old", "status": "pending" }]),
+        )
+        .await;
+        seed_todowrite_row(
+            &db,
+            "ses_a",
+            2,
+            json!([
+                { "content": "done", "status": "completed" },
+                { "content": "gone", "status": "cancelled" },
+                { "content": "wip", "status": "in_progress" },
+                { "content": "later", "status": "pending" }
+            ]),
+        )
+        .await;
+        let open = open_tasks(&db, "ses_a").await.unwrap();
+        assert_eq!(
+            open,
+            vec![
+                ("wip".to_owned(), "in_progress".to_owned()),
+                ("later".to_owned(), "pending".to_owned())
+            ],
+            "only pending/in_progress of the NEWEST call"
+        );
+
+        // A session that never called todowrite has no open work.
+        assert!(open_tasks(&db, "ses_b").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_tasks_empty_latest_list_means_nothing_open() {
+        let db = Db::open_in_memory().await.unwrap();
+        seed_todowrite_row(
+            &db,
+            "ses_a",
+            1,
+            json!([{ "content": "old", "status": "pending" }]),
+        )
+        .await;
+        seed_todowrite_row(&db, "ses_a", 2, json!([])).await;
+        assert!(
+            open_tasks(&db, "ses_a").await.unwrap().is_empty(),
+            "the newest call cleared the list; older state must not resurface"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_tasks_skips_non_completed_calls() {
+        let db = Db::open_in_memory().await.unwrap();
+        seed_todowrite_row(
+            &db,
+            "ses_a",
+            1,
+            json!([{ "content": "a", "status": "pending" }]),
+        )
+        .await;
+        // A newer row whose todowrite part is still running does not count.
+        let conn = db.acquire().await.unwrap();
+        let data = json!({
+            "id": "msg_ses_a_2",
+            "type": "assistant",
+            "time": { "created": 0 },
+            "agent": "build",
+            "model": { "id": "m", "providerID": "p" },
+            "content": [{
+                "type": "tool",
+                "id": "call_2",
+                "name": "todowrite",
+                "state": { "status": "running", "input": { "todos": [] }, "metadata": {} },
+                "time": { "created": 0 },
+            }],
+        });
+        conn.execute(
+            "INSERT INTO session_message
+               (id, session_id, type, seq, time_created, time_updated, data)
+             VALUES ('msg_ses_a_2', 'ses_a', 'assistant', 2, 0, 0, ?1)",
+            [data.to_string()],
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        assert_eq!(
+            open_tasks(&db, "ses_a").await.unwrap(),
+            vec![("a".to_owned(), "pending".to_owned())]
+        );
     }
 }
