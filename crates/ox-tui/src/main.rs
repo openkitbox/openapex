@@ -1,8 +1,4 @@
-mod app;
-mod bootstrap;
-mod pipeline;
-mod terminal;
-mod ui;
+use ox_tui::{app, bootstrap, terminal};
 
 use tokio::sync::{mpsc, watch};
 

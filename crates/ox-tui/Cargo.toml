@@ -7,6 +7,10 @@ edition = "2024"
 name = "ox-tui"
 path = "src/main.rs"
 
+[lib]
+name = "ox_tui"
+path = "src/lib.rs"
+
 [dependencies]
 ox-client = { path = "../ox-client" }
 ox-schema = { path = "../ox-schema" }
