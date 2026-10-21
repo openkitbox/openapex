@@ -46,6 +46,100 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+use std::time::Duration;
+
+use futures_util::StreamExt;
+use ox_schema::event::EventEnvelope;
+use serde_json::Value;
+use tokio::sync::{mpsc, watch};
+
+use crate::Client;
+
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
+const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
+#[derive(Debug)]
+pub enum StreamMsg {
+    /// A (re)connection attempt finished; the caller should refetch history.
+    Reconnected,
+    Event(Box<EventEnvelope<Value>>),
+}
+
+/// Spawn the reconnect loop. `seq_rx` carries the focused session's last
+/// durable seq (updated by the store as events arrive; per-session only).
+pub fn spawn_events(
+    client: Client,
+    session: String,
+    seq_rx: watch::Receiver<Option<i64>>,
+    tx: mpsc::UnboundedSender<StreamMsg>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let attempt = {
+                let seq = *seq_rx.borrow();
+                stream_once(&client, &session, seq, &tx).await
+            };
+            if let Err(err) = attempt {
+                tracing::warn!(%err, "event stream dropped");
+            } else {
+                tracing::info!("event stream closed, reconnecting");
+            }
+            if tx.send(StreamMsg::Reconnected).is_err() {
+                break; // receiver gone
+            }
+            tokio::time::sleep(RECONNECT_DELAY).await;
+        }
+    })
+}
+
+async fn stream_once(
+    client: &Client,
+    session: &str,
+    replay_after: Option<i64>,
+    tx: &mpsc::UnboundedSender<StreamMsg>,
+) -> crate::Result<()> {
+    let url = match replay_after {
+        Some(after) => format!("{}/api/event?session={session}&after={after}", client.base),
+        None => format!("{}/api/event", client.base),
+    };
+
+    let resp = client
+        .http
+        .get(url)
+        .header("x-opencode-directory", &client.directory)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(crate::Error::Status(resp.status()));
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut parser = FrameParser::new();
+
+    loop {
+        let next = tokio::time::timeout(HEARTBEAT_TIMEOUT, stream.next()).await;
+        match next {
+            Err(_) => return Err(crate::Error::HeartbeatTimeout),
+            Ok(None) => return Err(crate::Error::StreamClosed),
+            Ok(Some(Err(err))) => return Err(crate::Error::Http(err)),
+            Ok(Some(Ok(bytes))) => {
+                for data in parser.feed(&bytes) {
+                    match serde_json::from_str::<EventEnvelope<Value>>(&data) {
+                        Ok(envelope) => {
+                            if tx.send(StreamMsg::Event(Box::new(envelope))).is_err() {
+                                return Ok(());
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, data = %&data[..data.len().min(200)], "skipping malformed event frame");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::FrameParser;

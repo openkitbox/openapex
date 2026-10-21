@@ -51,12 +51,13 @@ async fn prompt_posts_text_and_interrupt_uses_session_path() {
 
     let requests = mock.requests();
     assert!(requests.iter().any(|request| {
-        request.starts_with("POST /api/session/ses_1/prompt")
-            && request.contains(r#""text":"hi""#)
+        request.starts_with("POST /api/session/ses_1/prompt") && request.contains(r#""text":"hi""#)
     }));
-    assert!(requests
-        .iter()
-        .any(|request| request.starts_with("POST /api/session/ses_1/interrupt")));
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.starts_with("POST /api/session/ses_1/interrupt"))
+    );
 }
 
 #[tokio::test]

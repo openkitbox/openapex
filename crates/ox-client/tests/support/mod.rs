@@ -28,6 +28,16 @@ impl MockOx {
             .push((prefix.into(), http_response(200, "OK", json_body)));
     }
 
+    /// Register a raw HTTP response verbatim for paths starting with `prefix`.
+    /// Used by SSE tests, which must serve `text/event-stream` without the
+    /// content-type/content-length recomputation [`MockOx::reply`] performs.
+    pub fn reply_raw(&self, prefix: impl Into<String>, raw_http_response: &str) {
+        self.responses
+            .lock()
+            .unwrap()
+            .push((prefix.into(), raw_http_response.to_owned()));
+    }
+
     pub fn requests(&self) -> Vec<String> {
         self.requests.lock().unwrap().clone()
     }
