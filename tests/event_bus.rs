@@ -811,3 +811,111 @@ async fn usage_updated_broadcast_after_commit() {
     .unwrap();
     assert_eq!(n, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Copied §N§ tag notation
+// ---------------------------------------------------------------------------
+
+/// A model that learned the overlay's `§N§ ` prefix echoes it at the start of
+/// its own reply (and stutters the same number). The projector must strip it
+/// before the text part is persisted — the stored transcript is what later
+/// requests and the TUI read back.
+#[tokio::test]
+async fn copied_tags_are_stripped_from_persisted_text() {
+    let bus = bus().await;
+    create(&bus, "s1").await;
+
+    bus.publish(SessionEventData::StepStarted {
+        session_id: "s1".to_string(),
+        assistant_message_id: "am1".to_string(),
+        agent: "build".to_string(),
+        model: model(),
+        snapshot: None,
+        started: 1000,
+    })
+    .await
+    .unwrap();
+    bus.publish(SessionEventData::TextStarted {
+        session_id: "s1".to_string(),
+        assistant_message_id: "am1".to_string(),
+        ordinal: 0,
+    })
+    .await
+    .unwrap();
+    bus.publish(SessionEventData::TextEnded {
+        session_id: "s1".to_string(),
+        assistant_message_id: "am1".to_string(),
+        ordinal: 0,
+        text: "§194§ §194§ §194§ Task 2 实现完成".to_string(),
+        state: None,
+    })
+    .await
+    .unwrap();
+
+    let conn = bus.db().acquire().await.unwrap();
+    let data = one_row(
+        &conn,
+        "SELECT data FROM session_message WHERE id = 'am1'",
+        (),
+    )
+    .await
+    .get::<String>(0)
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(
+        value["content"][0]["text"].as_str().unwrap(),
+        "Task 2 实现完成",
+        "the copied tag run never reaches the store"
+    );
+}
+
+/// Reasoning parts stutter too (observed: `§73§ §73§ §73§ §73§ Let me look
+/// at …`); the reference only guards text, ox guards both persistence points.
+#[tokio::test]
+async fn copied_tags_are_stripped_from_persisted_reasoning() {
+    let bus = bus().await;
+    create(&bus, "s1").await;
+
+    bus.publish(SessionEventData::StepStarted {
+        session_id: "s1".to_string(),
+        assistant_message_id: "am1".to_string(),
+        agent: "build".to_string(),
+        model: model(),
+        snapshot: None,
+        started: 1000,
+    })
+    .await
+    .unwrap();
+    bus.publish(SessionEventData::ReasoningStarted {
+        session_id: "s1".to_string(),
+        assistant_message_id: "am1".to_string(),
+        ordinal: 0,
+        state: None,
+    })
+    .await
+    .unwrap();
+    bus.publish(SessionEventData::ReasoningEnded {
+        session_id: "s1".to_string(),
+        assistant_message_id: "am1".to_string(),
+        ordinal: 0,
+        text: "§73§ §73§ §73§ §73§ Let me look at the drop order".to_string(),
+        state: None,
+    })
+    .await
+    .unwrap();
+
+    let conn = bus.db().acquire().await.unwrap();
+    let data = one_row(
+        &conn,
+        "SELECT data FROM session_message WHERE id = 'am1'",
+        (),
+    )
+    .await
+    .get::<String>(0)
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(
+        value["content"][0]["text"].as_str().unwrap(),
+        "Let me look at the drop order"
+    );
+}

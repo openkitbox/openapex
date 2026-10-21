@@ -391,9 +391,11 @@ fn dropped_placeholder(tag: u64) -> String {
 ///
 /// - The reference strips line-leading `§N§` imitations from an assistant
 ///   completion before prepending the official tag (models echo the notation).
-///   ox does not: a stray imitation would render as `§5§ §1§ …`, which is
-///   confusing but harmless, and the stripper is code-fence-aware machinery
-///   whose only job is cosmetic.
+///   ox strips at the persistence boundary instead: the projector's
+///   `TextEnded` / `ReasoningEnded` handlers run
+///   [`crate::mctx::copied_tags::strip_copied_tag_notation`] before a part is
+///   written, so stored transcripts never carry the copies. Only legacy rows
+///   written before that change can still render as `§5§ §1§ …`.
 /// - The reference reduces a dropped tool CALL to a skeleton carrying
 ///   `{"dropped": …}`. ox keeps the call's real arguments and reduces only the
 ///   result — the same shape as the reference's recency window (`SkeletonReal`),
