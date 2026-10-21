@@ -23,7 +23,20 @@ use regex::Regex;
 /// Leading well-formed tag runs: `§N§` tokens (optionally whitespace-separated)
 /// at the start of the text — the stutter case.
 static LEADING_TAG_RUN: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(?:§\d+§\s*)+").expect("leading tag regex"));
+    LazyLock::new(|| Regex::new(r"^(?:§[0-9]+§\s*)+").expect("leading tag regex"));
+
+/// Complete `§[0-9]+§` pairs anywhere: cargo-cult copies mid-text.
+static COMPLETE_TAG_PAIR: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"§[0-9]+§").expect("complete tag pair regex"));
+
+/// Malformed tag/XML hybrids anywhere (`§15298">§15298§`): token-level
+/// confusion between the tag format and quoted attribute syntax.
+static MALFORMED_TAG: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"§[0-9]+">(?:§(?:[0-9]+§)?)?"#).expect("malformed tag regex"));
+
+/// Lone section signs left after pair/malformed/dangling removal.
+static STRAY_SECTION_SIGN: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new("§").expect("section sign regex"));
 
 /// Strip copied MC tag notation from assistant text at the persistence boundary.
 ///
@@ -36,6 +49,9 @@ pub fn strip_copied_tag_notation(text: &str) -> Cow<'_, str> {
     }
     let out = Cow::Borrowed(text);
     let out = replace_pass(out, &LEADING_TAG_RUN);
+    let out = replace_pass(out, &COMPLETE_TAG_PAIR);
+    let out = replace_pass(out, &MALFORMED_TAG);
+    let out = replace_pass(out, &STRAY_SECTION_SIGN);
     trim_cow(out)
 }
 
@@ -115,5 +131,52 @@ mod tests {
         // Worst case observed in production: §183§ repeated 48 times.
         let text = format!("{}构建完成（1m26s，268 crates）", "§183§ ".repeat(48));
         assert_eq!(strip(&text), "构建完成（1m26s，268 crates）");
+    }
+
+    #[test]
+    fn mid_text_pair_is_removed_and_surrounding_spaces_kept() {
+        // Upstream expects the double space: only the pair itself is eaten.
+        assert_eq!(
+            strip("Looking at §40827§ the result is X"),
+            "Looking at  the result is X"
+        );
+    }
+
+    #[test]
+    fn pair_after_bare_digits_is_removed() {
+        assert_eq!(strip("2030  §42§ Hello"), "2030   Hello");
+    }
+
+    #[test]
+    fn malformed_hybrid_is_removed() {
+        assert_eq!(
+            strip("Hello §40827\">Oracle confirmed"),
+            "Hello Oracle confirmed"
+        );
+    }
+
+    #[test]
+    fn malformed_leading_hybrid_is_emptied() {
+        assert_eq!(strip("§15298\">§15298§ "), "");
+    }
+
+    #[test]
+    fn tag_only_text_is_emptied() {
+        assert_eq!(strip("§42§ "), "");
+    }
+
+    #[test]
+    fn stray_section_sign_is_removed() {
+        assert_eq!(strip("a § b"), "a  b");
+    }
+
+    #[test]
+    fn degree_sign_is_not_a_section_sign() {
+        let text = "2030  2030  2030° Run clippy";
+        assert!(matches!(
+            strip_copied_tag_notation(text),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(strip(text), text);
     }
 }
