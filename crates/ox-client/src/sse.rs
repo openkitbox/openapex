@@ -1,0 +1,168 @@
+//! Minimal SSE parser. ox's stream is `data: {json}\n\n` plus `: heartbeat`
+//! comments; we deliberately avoid an eventsource dependency (~40 lines).
+
+#[derive(Default)]
+pub struct FrameParser {
+    buf: Vec<u8>,
+}
+
+impl FrameParser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feed raw bytes; returns every complete `data:` payload decoded in order.
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
+        // Normalize CRLF so frame detection only has to look for `\n\n`.
+        for byte in chunk {
+            match *byte {
+                b'\r' => {}
+                b => self.buf.push(b),
+            }
+        }
+
+        let mut out = Vec::new();
+        while let Some(pos) = find(&self.buf, b"\n\n") {
+            let frame = String::from_utf8_lossy(&self.buf[..pos]).to_string();
+            self.buf.drain(..pos + 2);
+
+            let mut data_lines = Vec::new();
+            for line in frame.lines() {
+                if let Some(rest) = line.strip_prefix("data:") {
+                    data_lines.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+                }
+                // `:` comments (heartbeats), `event:`, `id:`, `retry:` are ignored:
+                // the envelope JSON already carries id/type.
+            }
+            if !data_lines.is_empty() {
+                out.push(data_lines.join("\n"));
+            }
+        }
+        out
+    }
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+use std::time::Duration;
+
+use futures_util::StreamExt;
+use ox_schema::event::EventEnvelope;
+use serde_json::Value;
+use tokio::sync::{mpsc, watch};
+
+use crate::Client;
+
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
+const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+
+#[derive(Debug)]
+pub enum StreamMsg {
+    /// A (re)connection attempt finished; the caller should refetch history.
+    Reconnected,
+    Event(Box<EventEnvelope<Value>>),
+}
+
+/// Spawn the reconnect loop. `seq_rx` carries the focused session's last
+/// durable seq (updated by the store as events arrive; per-session only).
+pub fn spawn_events(
+    client: Client,
+    session: String,
+    seq_rx: watch::Receiver<Option<i64>>,
+    tx: mpsc::UnboundedSender<StreamMsg>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let attempt = {
+                let seq = *seq_rx.borrow();
+                stream_once(&client, &session, seq, &tx).await
+            };
+            if let Err(err) = attempt {
+                tracing::warn!(%err, "event stream dropped");
+            } else {
+                tracing::info!("event stream closed, reconnecting");
+            }
+            if tx.send(StreamMsg::Reconnected).is_err() {
+                break; // receiver gone
+            }
+            tokio::time::sleep(RECONNECT_DELAY).await;
+        }
+    })
+}
+
+async fn stream_once(
+    client: &Client,
+    session: &str,
+    replay_after: Option<i64>,
+    tx: &mpsc::UnboundedSender<StreamMsg>,
+) -> crate::Result<()> {
+    let url = match replay_after {
+        Some(after) => format!("{}/api/event?session={session}&after={after}", client.base),
+        None => format!("{}/api/event", client.base),
+    };
+
+    let resp = client
+        .http
+        .get(url)
+        .header("x-opencode-directory", &client.directory)
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Err(crate::Error::Status(resp.status()));
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut parser = FrameParser::new();
+
+    loop {
+        let next = tokio::time::timeout(HEARTBEAT_TIMEOUT, stream.next()).await;
+        match next {
+            Err(_) => return Err(crate::Error::HeartbeatTimeout),
+            Ok(None) => return Err(crate::Error::StreamClosed),
+            Ok(Some(Err(err))) => return Err(crate::Error::Http(err)),
+            Ok(Some(Ok(bytes))) => {
+                for data in parser.feed(&bytes) {
+                    match serde_json::from_str::<EventEnvelope<Value>>(&data) {
+                        Ok(envelope) => {
+                            if tx.send(StreamMsg::Event(Box::new(envelope))).is_err() {
+                                return Ok(());
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, data = %&data[..data.len().min(200)], "skipping malformed event frame");
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FrameParser;
+
+    #[test]
+    fn parses_one_frame_across_split_chunks() {
+        let mut p = FrameParser::new();
+        assert!(p.feed(b"data: {\"a\":").is_empty());
+        let frames = p.feed(b"1}\n\n");
+        assert_eq!(frames, vec![r#"{"a":1}"#.to_string()]);
+    }
+
+    #[test]
+    fn ignores_heartbeat_comments_and_joins_multiline_data() {
+        let mut p = FrameParser::new();
+        let frames = p.feed(b": heartbeat\n\ndata: line1\ndata: line2\n\n");
+        assert_eq!(frames, vec!["line1\nline2".to_string()]);
+    }
+
+    #[test]
+    fn handles_crlf_and_multiple_frames_in_one_chunk() {
+        let mut p = FrameParser::new();
+        let frames = p.feed(b"data: a\r\n\r\ndata: b\r\n\r\n");
+        assert_eq!(frames, vec!["a".to_string(), "b".to_string()]);
+    }
+}

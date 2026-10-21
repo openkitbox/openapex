@@ -22,7 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::schema::support::{
+use crate::support::{
     Content, FinishReason, LocationRef, ModelRef, MoneyUsd, Prompt, ProviderContext, Record,
     SessionError, ShellOutput, ShellStatus, SnapshotId, TokenUsage,
 };

@@ -25,9 +25,9 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::schema::inbox::{Delivery, Item, MovePayload};
-use crate::schema::message::{AssistantContent, ProviderState};
-use crate::schema::support::{
+use crate::inbox::{Delivery, Item, MovePayload};
+use crate::message::{AssistantContent, ProviderState};
+use crate::support::{
     Content, FinishReason, ForkBoundary, LocationRef, ModelRef, MoneyUsd, ProviderContext, Record,
     Rule, SessionError, SessionMetadata, SnapshotId, TokenUsage,
 };
@@ -118,7 +118,7 @@ pub enum InterruptReason {
 
 /// Upstream compaction reason literal: auto | manual (shared with the
 /// message schema).
-pub use crate::schema::message::CompactionReason;
+pub use crate::message::CompactionReason;
 
 /// Upstream `Step.Failed` `finish` literal (currently only content-filter).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -680,5 +680,56 @@ impl SessionEventData {
         }
         let adapter = serde_json::to_value(&self).unwrap_or(Value::Null);
         adapter.get("data").cloned().unwrap_or(Value::Null)
+    }
+
+    /// The session this event belongs to, when the variant carries it.
+    pub fn session_id(&self) -> Option<&str> {
+        match self {
+            SessionEventData::SessionCreated { session_id, .. }
+            | SessionEventData::SessionRenamed { session_id, .. }
+            | SessionEventData::SessionDeleted { session_id, .. }
+            | SessionEventData::SessionForked { session_id, .. }
+            | SessionEventData::SessionUsageRecorded { session_id, .. }
+            | SessionEventData::SessionUsageUpdated { session_id, .. }
+            | SessionEventData::SessionSynthetic { session_id, .. }
+            | SessionEventData::SessionRetryScheduled { session_id, .. }
+            | SessionEventData::SessionMessageContentUpdated { session_id, .. }
+            | SessionEventData::SessionMoved { session_id, .. }
+            | SessionEventData::SessionAgentSelected { session_id, .. }
+            | SessionEventData::SessionModelSelected { session_id, .. }
+            | SessionEventData::SessionMetadataUpdated { session_id, .. }
+            | SessionEventData::SessionPermissions { session_id, .. }
+            | SessionEventData::SessionViewed { session_id, .. }
+            | SessionEventData::ExecutionStarted { session_id, .. }
+            | SessionEventData::ExecutionSucceeded { session_id, .. }
+            | SessionEventData::ExecutionFailed { session_id, .. }
+            | SessionEventData::ExecutionInterrupted { session_id, .. }
+            | SessionEventData::InboxEnqueued { session_id, .. }
+            | SessionEventData::InboxDelivered { session_id, .. }
+            | SessionEventData::InboxCancelled { session_id, .. }
+            | SessionEventData::InboxDeliveryChanged { session_id, .. }
+            | SessionEventData::StepStarted { session_id, .. }
+            | SessionEventData::StepStreamed { session_id, .. }
+            | SessionEventData::StepEnded { session_id, .. }
+            | SessionEventData::StepFailed { session_id, .. }
+            | SessionEventData::TextStarted { session_id, .. }
+            | SessionEventData::TextDelta { session_id, .. }
+            | SessionEventData::TextEnded { session_id, .. }
+            | SessionEventData::ReasoningStarted { session_id, .. }
+            | SessionEventData::ReasoningDelta { session_id, .. }
+            | SessionEventData::ReasoningEnded { session_id, .. }
+            | SessionEventData::ToolInputStarted { session_id, .. }
+            | SessionEventData::ToolInputDelta { session_id, .. }
+            | SessionEventData::ToolInputEnded { session_id, .. }
+            | SessionEventData::ToolCalled { session_id, .. }
+            | SessionEventData::ToolProgress { session_id, .. }
+            | SessionEventData::ToolSuccess { session_id, .. }
+            | SessionEventData::ToolFailed { session_id, .. }
+            | SessionEventData::CompactionStarted { session_id, .. }
+            | SessionEventData::CompactionDelta { session_id, .. }
+            | SessionEventData::CompactionEnded { session_id, .. }
+            | SessionEventData::CompactionFailed { session_id, .. } => Some(session_id),
+            SessionEventData::Unknown { .. } => None,
+        }
     }
 }
