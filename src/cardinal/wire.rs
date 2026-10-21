@@ -37,6 +37,12 @@ pub struct ChatRequest {
     /// Completion token cap; omitted when unset (cardinal requires > 0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
+    /// Reasoning effort for the turn; cardinal parses it from the body and
+    /// re-emits it per provider dialect. Derived from the session's model
+    /// variant at [`reasoning_effort_of`] — omitted when there is no
+    /// selection, so unselected turns stay byte-identical to before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// Always `true` — this client speaks streaming Chat only.
     #[serde(default)]
     pub stream: StreamEnabled,
@@ -55,6 +61,7 @@ impl ChatRequest {
             tool_choice: ToolChoice::default(),
             temperature: None,
             max_tokens: None,
+            reasoning_effort: None,
             stream: StreamEnabled,
             stream_options: IncludeUsage,
         }
@@ -66,7 +73,7 @@ impl Serialize for ChatRequest {
     /// tools are offered, and the optional sampling fields only when set.
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut state = serializer.serialize_struct("ChatRequest", 8)?;
+        let mut state = serializer.serialize_struct("ChatRequest", 9)?;
         state.serialize_field("model", &self.model)?;
         state.serialize_field("messages", &self.messages)?;
         if !self.tools.is_empty() {
@@ -79,10 +86,42 @@ impl Serialize for ChatRequest {
         if let Some(max_tokens) = &self.max_tokens {
             state.serialize_field("max_tokens", max_tokens)?;
         }
+        if let Some(reasoning_effort) = &self.reasoning_effort {
+            state.serialize_field("reasoning_effort", reasoning_effort)?;
+        }
         state.serialize_field("stream", &self.stream)?;
         state.serialize_field("stream_options", &self.stream_options)?;
         state.end()
     }
+}
+
+/// The chat-wire `reasoning_effort` for a session's model variant.
+/// `None`/`""`/`"default"` mean "no selection" — the field is omitted and the
+/// gateway applies its own default. The accepted wire names are
+/// `off|low|medium|high|xhigh|max` (measured against the live gateway); the
+/// OpenAI-style `"none"` maps to `"off"` (an explicit client off, distinct
+/// from omitting the field). Anything else is dropped (with a debug log)
+/// rather than forwarded: the gateway relays invalid names to the provider,
+/// which answers HTTP 400 and would kill the turn.
+pub(crate) fn reasoning_effort_of(variant: Option<&str>) -> Option<String> {
+    /// The names the live gateway accepts on the chat wire (2026-10-21
+    /// probe: anything else is `upstream HTTP 400`).
+    const ACCEPTED: [&str; 6] = ["off", "low", "medium", "high", "xhigh", "max"];
+    let variant = variant
+        .map(str::trim)
+        .filter(|name| !name.is_empty() && *name != "default")?;
+    if variant == "none" {
+        return Some("off".to_owned());
+    }
+    if ACCEPTED.contains(&variant) {
+        return Some(variant.to_owned());
+    }
+    tracing::debug!(
+        variant,
+        "unknown model variant; not forwarding as reasoning_effort \
+         (the gateway would answer 400)"
+    );
+    None
 }
 
 /// Literal `true` on the wire: this client only streams.
@@ -433,6 +472,57 @@ mod tests {
         let bytes = serde_json::to_vec(&request).unwrap();
         let parsed: ChatRequest = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed, request);
+    }
+
+    #[test]
+    fn reasoning_effort_of_maps_variant_names() {
+        // No selection in every flavor: the field stays off the wire.
+        assert_eq!(reasoning_effort_of(None), None);
+        assert_eq!(reasoning_effort_of(Some("")), None);
+        assert_eq!(reasoning_effort_of(Some("  ")), None);
+        assert_eq!(reasoning_effort_of(Some("default")), None);
+        // The OpenAI-style explicit off: distinct from omitting the field.
+        assert_eq!(reasoning_effort_of(Some("none")), Some("off".to_owned()));
+        // Every advertised level passes through (trimmed).
+        for name in ["off", "low", "medium", "high", "xhigh", "max"] {
+            assert_eq!(
+                reasoning_effort_of(Some(name)),
+                Some(name.to_owned()),
+                "{name} must pass through"
+            );
+        }
+        assert_eq!(reasoning_effort_of(Some(" high ")), Some("high".to_owned()));
+        // Unknown names are dropped, never forwarded (gateway answers 400).
+        assert_eq!(reasoning_effort_of(Some("ultra")), None);
+        assert_eq!(reasoning_effort_of(Some("minimal")), None);
+        assert_eq!(reasoning_effort_of(Some("bogus")), None);
+    }
+
+    #[test]
+    fn reasoning_effort_is_absent_without_a_selection() {
+        let request = ChatRequest::new("k3-256k", vec![ChatMessage::user("hi")]);
+        let value = serde_json::to_value(&request).unwrap();
+        assert!(
+            value.get("reasoning_effort").is_none(),
+            "no variant selected → no reasoning_effort key: {value}"
+        );
+    }
+
+    #[test]
+    fn reasoning_effort_serializes_between_max_tokens_and_stream() {
+        let mut request = ChatRequest::new("k3-256k", vec![ChatMessage::user("hi")]);
+        request.max_tokens = Some(64);
+        request.reasoning_effort = Some("high".to_owned());
+        let text = serde_json::to_string(&request).unwrap();
+        let max_tokens = text.find("\"max_tokens\"").expect("max_tokens present");
+        let effort = text.find("\"reasoning_effort\"").expect("effort present");
+        let stream = text.find("\"stream\"").expect("stream present");
+        assert!(
+            max_tokens < effort && effort < stream,
+            "field order: {text}"
+        );
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["reasoning_effort"], json!("high"));
     }
 
     #[test]

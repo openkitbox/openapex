@@ -61,6 +61,7 @@ use crate::cardinal::chat::BoxChatStream;
 use crate::cardinal::stream::StreamEvent;
 use crate::cardinal::wire::{
     ChatMessage, ChatRequest, FunctionCall, FunctionType, ImageUrl, ToolCall, Usage, UserPart,
+    reasoning_effort_of,
 };
 use crate::id;
 use crate::prompt;
@@ -222,6 +223,9 @@ pub(crate) async fn run(
             build_chat_messages(&system, &[head_m0.as_deref(), head_m1.as_deref()], &rows),
         );
         request.tools = ctx.tools.definitions();
+        // The session's selected reasoning level (model variant) rides every
+        // chat turn; no selection leaves the field off the wire.
+        request.reasoning_effort = reasoning_effort_of(params.model.variant.as_deref());
 
         let stream = match ctx.chat.stream_chat(&request).await {
             Ok(stream) => stream,
