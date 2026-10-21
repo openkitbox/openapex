@@ -1,6 +1,7 @@
 pub mod error;
 pub mod rest;
 pub mod sse;
+pub mod store;
 
 pub use error::{Error, Result};
 
