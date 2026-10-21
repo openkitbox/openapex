@@ -372,30 +372,6 @@ fn child_outcome(messages: &[crate::schema::message::Message]) -> ChildOutcome {
     }
 }
 
-/// The newest completed assistant text, whole (no preview) — the notification
-/// body for background completions, matching upstream's completion text.
-/// Consumed by the background-completion task; unused until then.
-#[allow(dead_code)]
-fn final_text(messages: &[crate::schema::message::Message]) -> Option<String> {
-    use crate::schema::message::{AssistantContent, Message};
-    messages.iter().rev().find_map(|message| match message {
-        Message::Assistant(assistant) if assistant.error.is_none() => {
-            let parts: Vec<&str> = assistant
-                .content
-                .iter()
-                .filter_map(|content| match content {
-                    AssistantContent::Text { text, .. } if !text.trim().is_empty() => {
-                        Some(text.as_str())
-                    }
-                    _ => None,
-                })
-                .collect();
-            (!parts.is_empty()).then(|| parts.join("\n\n"))
-        }
-        _ => None,
-    })
-}
-
 /// The child's reply for the parent: every assistant text message joined
 /// (previewed), or a fallback when the child produced nothing. Pure over an
 /// already-loaded transcript so the caller loads history once.
@@ -524,13 +500,6 @@ mod tests {
             super::child_outcome(&failed),
             super::ChildOutcome::Failed("boom".to_owned())
         );
-    }
-
-    #[test]
-    fn final_text_takes_the_newest_nonempty_assistant_text() {
-        let history = vec![assistant_text("old"), assistant_text("newest")];
-        assert_eq!(super::final_text(&history).as_deref(), Some("newest"));
-        assert_eq!(super::final_text(&[]).as_deref(), None);
     }
 
     #[test]
