@@ -20,8 +20,10 @@ use crate::runner::Runner;
 
 pub mod compat;
 pub mod event;
+pub mod form;
 pub mod session;
 pub mod shell;
+pub mod skill;
 
 /// Shared application state, injected via `salvo::affix_state`.
 #[derive(Clone)]
@@ -480,6 +482,8 @@ pub fn build_router(state: AppState) -> Router {
                 .push(Router::with_path("agent").get(agent_list))
                 .push(Router::with_path("event").get(event::subscribe))
                 .push(compat::mount(Router::new()))
+                .push(Router::with_path("form").get(form::list))
+                .push(Router::with_path("skill").get(skill::list))
                 .push(
                     Router::with_path("shell")
                         .get(shell::list)
@@ -526,7 +530,14 @@ pub fn build_router(state: AppState) -> Router {
                                 )
                                 .push(Router::with_path("interrupt").post(session::interrupt))
                                 .push(Router::with_path("permission").get(session::permission_list))
-                                .push(Router::with_path("form").get(session::form_list)),
+                                .push(
+                                    Router::with_path("form").get(form::session_list).push(
+                                        Router::with_path("{formID}")
+                                            .get(form::get)
+                                            .delete(form::cancel)
+                                            .push(Router::with_path("reply").post(form::reply)),
+                                    ),
+                                ),
                         ),
                 ),
         )

@@ -89,8 +89,8 @@ pub(crate) async fn config_get(res: &mut Response) {
     res.render(Json(json!([])));
 }
 
-/// Empty catalog lists: command / mcp / reference / skill /
-/// pending-forms / plugin / integration. (`provider` has a real
+/// Empty catalog lists: command / mcp / reference /
+/// plugin / integration. (`provider` has a real
 /// handler in the parent module — the configured model catalog.)
 macro_rules! empty_catalog {
     ($name:ident, $operation:literal) => {
@@ -105,8 +105,6 @@ macro_rules! empty_catalog {
 empty_catalog!(command_list, "command.list");
 empty_catalog!(mcp_list, "mcp.list");
 empty_catalog!(reference_list, "reference.list");
-empty_catalog!(skill_list, "skill.list");
-empty_catalog!(pending_form_list, "form.list");
 empty_catalog!(plugin_list, "plugin.list");
 empty_catalog!(integration_list, "integration.list");
 
@@ -261,8 +259,6 @@ pub(crate) fn mount(api: Router) -> Router {
             .push(Router::with_path("mcp/resource").get(mcp_resource_catalog))
             .push(Router::with_path("provider").get(super::provider_list))
             .push(Router::with_path("reference").get(reference_list))
-            .push(Router::with_path("skill").get(skill_list))
-            .push(Router::with_path("form").get(pending_form_list))
             .push(Router::with_path("plugin").get(plugin_list))
             .push(Router::with_path("integration").get(integration_list))
             .push(Router::with_path("fs/list").get(fs_list))

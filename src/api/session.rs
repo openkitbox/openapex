@@ -2083,26 +2083,6 @@ pub(crate) async fn permission_list(req: &mut Request, depot: &mut Depot, res: &
     }
 }
 
-/// `GET /api/session/{sessionID}/form` — upstream `session.form.list`.
-/// ox has no form channel; the list is always empty.
-///
-/// Upstream's form service filters its in-memory cache by `sessionID`
-/// (`form.ts:168-174`) without checking the session exists, and the protocol
-/// types `sessionID` as a plain string — so the TUI's `session.form.sync`
-/// bootstrap call with the literal id `"global"` gets `200 []`, not a 404.
-/// Mirror that: unknown sessions (including `"global"`) answer an empty list.
-#[handler]
-pub(crate) async fn form_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let Some(_app) = state(depot, res) else {
-        return;
-    };
-    if req.param::<String>("sessionID").is_none() {
-        invalid_request(res, "Missing sessionID");
-        return;
-    }
-    res.render(Json(json!({ "data": [] })));
-}
-
 /// `POST /api/experimental/session/{sessionID}/wait` — upstream
 /// `experimental.session.wait`: long-poll until the session's agent loop is
 /// idle, then answer 204. Unknown sessions answer 404.

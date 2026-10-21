@@ -248,7 +248,10 @@ async fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
     let outcome = tokio::select! {
         outcome = pending.wait(WAIT) => outcome,
         () = ctx.cancellation.cancelled() => {
+            // Cancelling settles the waiter, but the turn is over, so the form
+            // must not stay visible to clients either.
             form::shared().cancel(&ctx.session_id, &form_id, Some("interrupted".to_owned()));
+            form::shared().remove(&ctx.session_id, &form_id);
             return fail(CANCELLED_SENTINEL);
         }
     };
@@ -319,9 +322,14 @@ mod tests {
     use super::*;
     use tokio_util::sync::CancellationToken;
 
+    /// Each test needs its own session id: `form::shared()` is process-wide
+    /// and tests run in parallel, so a shared id lets one test answer another's
+    /// form.
     fn ctx() -> ToolContext {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         ToolContext {
-            session_id: "ses_question".to_owned(),
+            session_id: format!("ses_question_{id}"),
             directory: std::env::temp_dir(),
             call_id: "call_q".to_owned(),
             cancellation: CancellationToken::new(),

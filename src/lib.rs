@@ -71,13 +71,13 @@ pub async fn build_state(config: Config) -> Result<AppState> {
 
 /// [`build_state`] with an injected chat transport and tool registry —
 /// the seam tests (and later, alternate providers) use. The registry is
-/// passed unwrapped so the wiring can attach the Db-holding magic-context
-/// tools (`register_mctx`) after the DB opens; they are advertised only
-/// when `magic_context.enabled`.
+/// passed unwrapped so the wiring can attach the wiring-dependent tools
+/// (`register_mctx`, `register_subagent`) after the DB opens. A caller that
+/// must not carry a tool removes it by name; `ToolRegistry::remove` exists
+/// for exactly that.
 ///
 /// Callers may pre-populate `tools` before handing it over (as [`run`] does
-/// with the CBM and todo tools); this function only adds the magic-context
-/// tools.
+/// with the CBM and todo tools).
 pub async fn build_state_with(
     config: Config,
     chat: std::sync::Arc<dyn runner::Chat>,
@@ -93,34 +93,48 @@ pub async fn build_state_with(
 async fn build_state_on(
     config: Config,
     chat: std::sync::Arc<dyn runner::Chat>,
+    tools: runner::ToolRegistry,
+    db: Db,
+) -> Result<AppState> {
+    let bus = EventBus::new(db.clone());
+    build_state_on_with_bus(config, chat, tools, db, bus).await
+}
+
+/// [`build_state_on`] over a caller-supplied event bus, so the composition
+/// root can publish to the same bus it registers tools against.
+async fn build_state_on_with_bus(
+    config: Config,
+    chat: std::sync::Arc<dyn runner::Chat>,
     mut tools: runner::ToolRegistry,
     db: Db,
+    bus: EventBus,
 ) -> Result<AppState> {
     if config.magic_context.enabled {
         let embedder = mctx::embed::Embedder::from_config(&config.magic_context.embedding);
         tools.register_mctx(db.clone(), embedder);
     }
-    let tools = Arc::new(tools);
     let cwd = std::env::current_dir()?;
     let directory = cwd.canonicalize().unwrap_or(cwd);
-    let bus = EventBus::new(db.clone());
     let model_catalog = model_catalog::ModelCatalog::new(&config);
     // One read-only config behind an `Arc`: every actor and spawned task clones
     // the handle, never the struct.
     let config = std::sync::Arc::new(config);
+    let tools = Arc::new(tools);
+    let db_handle = db.clone();
+    let bus_handle = bus.clone();
     let runner = Runner::new(
         std::sync::Arc::clone(&config),
         directory.clone(),
-        db.clone(),
-        bus.clone(),
+        db,
+        bus,
         chat,
         tools,
         Arc::clone(&model_catalog),
     );
     Ok(AppState {
         config,
-        db,
-        bus,
+        db: db_handle,
+        bus: bus_handle,
         directory,
         runner,
         model_catalog,
@@ -147,11 +161,16 @@ pub async fn run(config: Config) -> Result<()> {
     // The session todo list needs the DB (it stores state in the `kv` table),
     // so it joins here at the composition root rather than in
     // `with_builtins` — the same seam the CBM tools use. Tests that inject
-    // their own registry keep a deterministic toolset.
+    // their own registry keep a deterministic toolset. `subagent` joins the
+    // same way below: it needs the runner, which only exists after
+    // `build_state_on`, so `run` registers it through the runner's handle
+    // slot and the registry here.
     let db = Db::open(&config.db_path).await?;
+    let bus = EventBus::new(db.clone());
     tools.register_todo(db.clone());
+    tools.register_subagent(db.clone(), bus.clone());
     let chat = cardinal_chat(&config)?;
-    let state = build_state_on(config, chat, tools, db).await?;
+    let state = build_state_on_with_bus(config, chat, tools, db, bus).await?;
     // Fetch the model list before serving, so the first client that asks
     // (`/api/model` at TUI startup) gets models instead of an empty list. A
     // failure only warns: the request path retries on its own TTL.

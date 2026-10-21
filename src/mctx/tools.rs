@@ -819,7 +819,7 @@ mod tests {
             .iter()
             .map(|def| def.function.name.clone())
             .collect();
-        assert_eq!(names.len(), 13, "8 builtins + 5 ctx tools: {names:?}");
+        assert_eq!(names.len(), 17, "12 builtins + 5 ctx tools: {names:?}");
         for definition in registry.definitions() {
             assert!(!definition.function.description.is_empty());
         }

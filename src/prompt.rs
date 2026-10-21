@@ -28,7 +28,39 @@ pub fn build(directory: &Path) -> String {
         prompt.push_str("\n</project_instructions>");
         // No AGENTS.md (or unreadable): the env block alone is the prompt.
     }
+    // The available-skills block (upstream `skill/instructions.ts`): the model
+    // sees id/name/description and loads the body with the `skill` tool. The
+    // block is omitted when nothing is discovered so the prompt stays small.
+    let skills = crate::tool::skills::discover(directory);
+    if !skills.is_empty() {
+        prompt.push_str(
+            "\n\nSkills provide specialized instructions and workflows for specific tasks.\n\
+             Use the skill tool to load a skill when a task matches its description.\n\
+             <available_skills>\n",
+        );
+        for skill in &skills {
+            prompt.push_str("  <skill>\n");
+            prompt.push_str(&format!("    <id>{}</id>\n", escape(&skill.id)));
+            prompt.push_str(&format!("    <name>{}</name>\n", escape(&skill.name)));
+            if let Some(description) = &skill.description {
+                prompt.push_str(&format!(
+                    "    <description>{}</description>\n",
+                    escape(description)
+                ));
+            }
+            prompt.push_str("  </skill>\n");
+        }
+        prompt.push_str("</available_skills>");
+    }
     prompt
+}
+
+/// The skills block embeds user-controlled text in an XML-ish envelope; a raw
+/// `<` would let a skill description break the block out early.
+fn escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Today's UTC date as `YYYY-MM-DD` (civil-from-days; no chrono dependency).

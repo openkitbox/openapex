@@ -178,6 +178,13 @@ impl ToolRegistry {
         self.tools.get(name).cloned()
     }
 
+    /// Drop a tool by name (`true` when it was there). Exists so tests can
+    /// pin a toolset after `build_state_with` attaches the wiring-dependent
+    /// ones (`subagent`).
+    pub fn remove(&mut self, name: &str) -> bool {
+        self.tools.remove(name).is_some()
+    }
+
     /// Bulk-register pre-built tools. Names must be unique; a duplicate is a
     /// programming error caught by debug builds (built-ins have fixed names).
     pub(crate) fn register_all(&mut self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) {
@@ -210,6 +217,13 @@ impl ToolRegistry {
 pub struct Runner {
     inner: Arc<Inner>,
 }
+
+/// The handle the `subagent` tool uses to drive child sessions. `Runner::new`
+/// attaches itself; the tool reads it through this process-wide slot so the
+/// registry can be built before the runner exists.
+pub static SUBAGENT_HANDLE: std::sync::OnceLock<
+    std::sync::Arc<crate::tool::subagent::SubagentHandle>,
+> = std::sync::OnceLock::new();
 
 struct Inner {
     /// The loaded config, shared by reference: nothing reads it mutably, and
@@ -260,18 +274,22 @@ impl Runner {
         tools: Arc<ToolRegistry>,
         model_catalog: Arc<crate::model_catalog::ModelCatalog>,
     ) -> Self {
-        Self {
-            inner: Arc::new(Inner {
-                config,
-                directory,
-                db,
-                bus,
-                chat,
-                tools,
-                model_catalog,
-                sessions: DashMap::new(),
-            }),
+        let inner = Arc::new(Inner {
+            config,
+            directory,
+            db,
+            bus,
+            chat,
+            tools,
+            model_catalog,
+            sessions: DashMap::new(),
+        });
+        if let Some(handle) = SUBAGENT_HANDLE.get() {
+            handle.attach(Self {
+                inner: Arc::clone(&inner),
+            });
         }
+        Self { inner }
     }
 
     /// Whether work is scheduled or a busy period is currently in flight

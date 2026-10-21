@@ -20,6 +20,7 @@
 //!   is ~650 lines of htmlparser2 handling. Text extraction and all
 //!   guards (content-type, size, timeout) are exact.
 
+pub mod capability_search;
 pub mod diff;
 pub mod edit;
 pub mod form;
@@ -30,7 +31,11 @@ pub mod question;
 pub mod read;
 pub(crate) mod rtk;
 pub mod shell;
+pub mod skill;
+pub mod skills;
+pub mod subagent;
 pub mod todo;
+pub mod web_search;
 pub mod webfetch;
 pub mod write;
 
@@ -53,6 +58,10 @@ impl ToolRegistry {
             Arc::new(glob::GlobTool),
             Arc::new(grep::GrepTool),
             Arc::new(patch::PatchTool),
+            Arc::new(question::QuestionTool),
+            Arc::new(skill::SkillTool),
+            Arc::new(capability_search::CapabilitySearchTool),
+            Arc::new(web_search::WebSearchTool::new()),
             Arc::new(read::ReadTool),
             Arc::new(shell::ShellTool::new()),
             Arc::new(webfetch::WebFetchTool::new()),
@@ -72,6 +81,25 @@ impl ToolRegistry {
     pub fn register_todo(&mut self, db: Db) {
         self.register_all(vec![
             Arc::new(crate::tool::todo::TodoTool::new(db)) as Arc<dyn Tool>
+        ]);
+    }
+}
+
+/// The `subagent` tool, registered at app-wiring time (it drives child
+/// sessions through the runner, which does not exist at `with_builtins`).
+impl ToolRegistry {
+    /// Register `subagent` over a fresh handle. The runner attaches itself to
+    /// the handle in `Runner::new`, completing the cycle tool → runner → tool
+    /// without either side owning the other's construction.
+    pub fn register_subagent(&mut self, db: crate::db::Db, bus: crate::event_bus::EventBus) {
+        let handle = std::sync::Arc::new(subagent::SubagentHandle::new(db, bus));
+        let _ = crate::runner::SUBAGENT_HANDLE.set(handle);
+        let handle = crate::runner::SUBAGENT_HANDLE
+            .get()
+            .expect("just set")
+            .clone();
+        self.register_all(vec![
+            Arc::new(subagent::SubagentTool::new(handle)) as Arc<dyn Tool>
         ]);
     }
 }
@@ -477,12 +505,16 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "capability_search".to_owned(),
                 "edit".to_owned(),
                 "glob".to_owned(),
                 "grep".to_owned(),
                 "patch".to_owned(),
+                "question".to_owned(),
                 "read".to_owned(),
                 "shell".to_owned(),
+                "skill".to_owned(),
+                "web_search".to_owned(),
                 "webfetch".to_owned(),
                 "write".to_owned(),
             ]

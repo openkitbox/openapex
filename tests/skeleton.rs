@@ -532,6 +532,49 @@ async fn catalog_envelopes_echo_the_requested_directory() {
 }
 
 #[tokio::test]
+async fn skill_catalog_echoes_the_requested_directory() {
+    // A project-local skill discovered from the requested directory, answered
+    // under that directory's location (project-memory #5).
+    let (base, handle, dir) = spawn_server().await;
+    let client = reqwest::Client::new();
+    let project = dir.path().join("proj");
+    std::fs::create_dir_all(project.join("skills/review")).unwrap();
+    std::fs::write(
+        project.join("skills/review/SKILL.md"),
+        "---\nname: Review\ndescription: code review\n---\nBe thorough.\n",
+    )
+    .unwrap();
+
+    // The catalog canonicalizes the requested directory (`directory_of`), so
+    // resolve the expected form the same way.
+    let expected = project
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let body: serde_json::Value = client
+        .get(format!(
+            "{base}/api/skill?location%5Bdirectory%5D={}",
+            urlencoding_encode(&expected)
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["location"]["directory"], serde_json::json!(expected));
+    let data = body["data"].as_array().unwrap();
+    let review = data
+        .iter()
+        .find(|skill| skill["id"] == "review")
+        .unwrap_or_else(|| panic!("review skill in {data:?}"));
+    assert_eq!(review["name"], "Review");
+    assert_eq!(review["content"], serde_json::json!("Be thorough.\n"));
+    handle.abort();
+}
+
+#[tokio::test]
 async fn catalog_envelope_shape_is_pinned() {
     let (base, handle, _dir) = spawn_server().await;
     let client = reqwest::Client::new();

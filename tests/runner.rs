@@ -2160,7 +2160,15 @@ async fn length_truncation_continues_then_exhausts() {
 
 #[tokio::test]
 async fn no_tools_session_omits_tools_key() {
-    let harness = Harness::spawn(vec![MockChat::text("hi")]).await;
+    // `build_state_with` attaches `subagent` (wiring-dependent); this test
+    // pins the no-tools contract, so it strips the tool again. The handle's
+    // db/bus are throwaway instances — the registry owns no session state.
+    let db = ox::db::Db::open_in_memory().await.expect("in-memory db");
+    let bus = ox::event_bus::EventBus::new(db.clone());
+    let mut registry = ToolRegistry::new();
+    registry.register_subagent(db, bus);
+    assert!(registry.remove("subagent"));
+    let harness = Harness::spawn_with(vec![MockChat::text("hi")], registry).await;
     let session_id = harness.create_session().await;
     let response = harness
         .post(
@@ -2173,7 +2181,15 @@ async fn no_tools_session_omits_tools_key() {
 
     let requests = harness.chat.requests();
     assert_eq!(requests.len(), 1);
-    assert!(requests[0].tools.is_empty());
+    assert!(
+        requests[0].tools.is_empty(),
+        "tools present: {:?}",
+        requests[0]
+            .tools
+            .iter()
+            .map(|tool| tool.function.name.clone())
+            .collect::<Vec<_>>()
+    );
     let wire = serde_json::to_value(&requests[0]).expect("wire");
     assert!(wire.get("tools").is_none(), "no tools key on the wire");
     assert!(wire.get("tool_choice").is_none());
