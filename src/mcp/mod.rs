@@ -90,6 +90,10 @@ pub struct TemplateInfo {
 #[allow(dead_code)]
 pub struct Hub {
     servers: RwLock<BTreeMap<String, Status>>,
+    /// Live connections, kept alive independently of their tools: a server
+    /// that exposes no tools must not be torn down (its resources and
+    /// instructions are still part of the session).
+    connections: RwLock<BTreeMap<String, Arc<dyn Rpc>>>,
     instructions: RwLock<Vec<(String, String)>>,
     resources: RwLock<Vec<ResourceInfo>>,
     templates: RwLock<Vec<TemplateInfo>>,
@@ -102,6 +106,7 @@ impl Hub {
     pub fn empty() -> Self {
         Self {
             servers: RwLock::new(BTreeMap::new()),
+            connections: RwLock::new(BTreeMap::new()),
             instructions: RwLock::new(Vec::new()),
             resources: RwLock::new(Vec::new()),
             templates: RwLock::new(Vec::new()),
@@ -137,6 +142,9 @@ impl Hub {
                 .insert(name.clone(), outcome.status);
             self.resources.write().unwrap().extend(outcome.resources);
             self.templates.write().unwrap().extend(outcome.templates);
+            if let Some(rpc) = outcome.rpc {
+                self.connections.write().unwrap().insert(name.clone(), rpc);
+            }
             for tool in outcome.tools {
                 let tool_name = tool.name().to_owned();
                 if seen.insert(tool_name.clone()) {
@@ -205,6 +213,7 @@ fn escape(text: &str) -> String {
 struct Connected {
     name: String,
     status: Status,
+    rpc: Option<Arc<dyn Rpc>>,
     instructions: Option<String>,
     tools: Vec<Arc<dyn Tool>>,
     resources: Vec<ResourceInfo>,
@@ -217,6 +226,7 @@ impl Connected {
         Self {
             name: name.to_owned(),
             status: Status::Disabled,
+            rpc: None,
             instructions: None,
             tools: Vec::new(),
             resources: Vec::new(),
@@ -228,6 +238,7 @@ impl Connected {
         Self {
             name: name.to_owned(),
             status: Status::Failed { error },
+            rpc: None,
             instructions: None,
             tools: Vec::new(),
             resources: Vec::new(),
@@ -277,6 +288,7 @@ impl Connected {
         Self {
             name: name.to_owned(),
             status: Status::Connected,
+            rpc: Some(rpc),
             instructions,
             tools,
             resources,
@@ -464,5 +476,35 @@ done
                 .is_empty()
         );
         assert_eq!(hub.servers()[0].status, Status::Disabled);
+    }
+
+    #[test]
+    fn instructions_are_absent_without_servers() {
+        assert!(Hub::empty().instructions_block().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_hung_server_times_out_instead_of_blocking_startup() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hung.sh");
+        std::fs::write(&path, "#!/bin/sh\nwhile IFS= read -r line; do :; done\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let McpServerConfig::Local(mut hung) = local(vec![path.display().to_string()]) else {
+            unreachable!()
+        };
+        hung.timeout.startup = 300;
+        let mut servers = BTreeMap::new();
+        servers.insert("hung".to_owned(), McpServerConfig::Local(hung));
+        let hub = Hub::empty();
+        let started = std::time::Instant::now();
+        let tools = hub
+            .connect_all(&McpConfig { servers }, directory.path())
+            .await;
+        assert!(tools.is_empty());
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        match &hub.servers()[0].status {
+            Status::Failed { error } => assert!(error.contains("startup timed out"), "{error}"),
+            other => panic!("expected failed, got {other:?}"),
+        }
     }
 }
