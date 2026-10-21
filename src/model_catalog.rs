@@ -50,7 +50,7 @@ impl ModelCatalog {
     /// A catalogue for `config`'s gateway. Nothing is fetched yet: [`Self::warm`]
     /// does that, so building state never blocks on the network.
     pub fn new(config: &Config) -> Arc<Self> {
-        let client = reqwest::Client::builder()
+        let client = crate::http_client()
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_default();
@@ -66,7 +66,7 @@ impl ModelCatalog {
     /// pin a model list without a gateway.
     pub fn from_entries(entries: Vec<ModelEntry>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::http_client().build().unwrap_or_default(),
             base_url: String::new(),
             api_key: None,
             cache: RwLock::new(Snapshot {

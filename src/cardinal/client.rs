@@ -53,7 +53,7 @@ impl CardinalClient {
         base_url: impl Into<String>,
         api_key: Option<String>,
     ) -> Result<Self, CardinalError> {
-        let http = reqwest::Client::builder()
+        let http = crate::http_client()
             // Long-lived streams must never hit an idle/read timeout, but a
             // dead gateway should fail fast instead of hanging the runner.
             .connect_timeout(Duration::from_secs(10))

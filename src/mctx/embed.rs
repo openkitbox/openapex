@@ -43,7 +43,7 @@ impl Embedder {
         if !config.is_enabled() {
             return None;
         }
-        let client = reqwest::Client::builder()
+        let client = crate::http_client()
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .ok()?;
