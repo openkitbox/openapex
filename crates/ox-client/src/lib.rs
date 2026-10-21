@@ -1,4 +1,5 @@
 pub mod error;
+pub mod rest;
 
 pub use error::{Error, Result};
 
