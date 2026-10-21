@@ -10,6 +10,7 @@ use serde_json::Value;
 use turso::Connection;
 
 use crate::id;
+use crate::mctx::copied_tags::strip_copied_tag_notation;
 use crate::schema::event::{EventEnvelope, SessionEventData, StepFailedFinish};
 use crate::schema::message::{
     AssistantContent, AssistantMessage, AssistantRetry, AssistantSnapshot, AssistantTime,
@@ -607,7 +608,7 @@ pub async fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Resu
                     .find(|c| matches!(c, AssistantContent::Text { .. }))
                     && let AssistantContent::Text { text: t, state: s } = content
                 {
-                    *t = text.clone();
+                    *t = strip_copied_tag_notation(text).into_owned();
                     *s = state.clone();
                 }
             })
