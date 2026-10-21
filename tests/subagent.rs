@@ -8,6 +8,13 @@ use ox::config::Config;
 use ox::runner::ToolRegistry;
 use serde_json::json;
 
+/// `register_subagent` binds a process-wide `OnceLock` slot (`runner::
+/// SUBAGENT_HANDLE`): the first registrant wins and every later tool silently
+/// reuses that handle's db/runner. Tests in this binary each build their own
+/// db + runner, so they must not overlap — same remedy as `config`'s
+/// `ENV_LOCK`.
+static SUBAGENT_SLOT: Mutex<()> = Mutex::new(());
+
 /// A scripted chat transport handing out event lists in order.
 struct ScriptedChat {
     scripts: Mutex<std::collections::VecDeque<Vec<ox::cardinal::stream::StreamEvent>>>,
@@ -69,6 +76,7 @@ fn child_reply(text: &'static str) -> Vec<ox::cardinal::stream::StreamEvent> {
 
 #[tokio::test]
 async fn a_parent_delegation_runs_a_child_and_folds_its_reply() {
+    let _slot = SUBAGENT_SLOT.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         db_path: dir.path().join("ox.db"),
@@ -78,7 +86,7 @@ async fn a_parent_delegation_runs_a_child_and_folds_its_reply() {
     let db = ox::db::Db::open(&config.db_path).await.unwrap();
     let bus = ox::event_bus::EventBus::new(db.clone());
     let mut tools = ToolRegistry::new();
-    tools.register_subagent(db.clone(), bus.clone());
+    tools.register_subagent(db.clone(), bus.clone(), 1);
     let chat = Arc::new(ScriptedChat {
         scripts: Mutex::new(std::collections::VecDeque::from(vec![child_reply(
             "Child report: done.",
@@ -149,4 +157,77 @@ async fn a_parent_delegation_runs_a_child_and_folds_its_reply() {
         .unwrap()
         .expect("child row");
     assert_eq!(row.get::<String>(0).unwrap(), parent_id);
+}
+
+#[tokio::test]
+async fn a_depth_limit_of_zero_rejects_every_delegation() {
+    let _slot = SUBAGENT_SLOT.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let config = Config {
+        db_path: dir.path().join("ox.db"),
+        listen: "127.0.0.1:0".to_owned(),
+        ..Config::default()
+    };
+    let db = ox::db::Db::open(&config.db_path).await.unwrap();
+    let bus = ox::event_bus::EventBus::new(db.clone());
+    let mut tools = ToolRegistry::new();
+    tools.register_subagent(db.clone(), bus.clone(), 0);
+    let chat = Arc::new(ScriptedChat {
+        scripts: Mutex::new(std::collections::VecDeque::new()),
+    });
+    let _state = ox::build_state_with(config.clone(), chat, ToolRegistry::new())
+        .await
+        .expect("build state");
+
+    let parent_id = "ses_parent".to_owned();
+    bus.publish(ox::schema::event::SessionEventData::SessionCreated {
+        session_id: parent_id.clone(),
+        project_id: "proj_test".to_owned(),
+        location: ox::schema::support::LocationRef {
+            directory: dir.path().to_string_lossy().to_string(),
+            workspace_id: None,
+        },
+        subpath: None,
+        parent_id: None,
+        slug: ox::slug::create(),
+        title: Some("parent".to_owned()),
+        agent: None,
+        model: None,
+        metadata: None,
+        permissions: None,
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+    })
+    .await
+    .unwrap();
+
+    let ctx = ox::runner::ToolContext {
+        session_id: parent_id.clone(),
+        directory: dir.path().to_path_buf(),
+        call_id: "call_sub".to_owned(),
+        cancellation: tokio_util::sync::CancellationToken::new(),
+    };
+    let tool = tools.get("subagent").expect("subagent registered");
+    let output = tool
+        .execute(
+            ctx,
+            json!({ "description": "research", "prompt": "Find the answer." }),
+        )
+        .await;
+
+    let error = output.error.expect("rejected");
+    assert!(
+        error.contains("Subagent depth limit reached (0)"),
+        "{error}"
+    );
+    // No child session was created.
+    let conn = db.acquire().await.unwrap();
+    let mut stmt = conn
+        .prepare("SELECT COUNT(*) FROM session_v2 WHERE parent_id = ?1")
+        .await
+        .unwrap();
+    let row = ox::db::optional(&mut stmt, (parent_id,))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 0);
 }

@@ -91,7 +91,12 @@ impl ToolRegistry {
     /// Register `subagent` over a fresh handle. The runner attaches itself to
     /// the handle in `Runner::new`, completing the cycle tool → runner → tool
     /// without either side owning the other's construction.
-    pub fn register_subagent(&mut self, db: crate::db::Db, bus: crate::event_bus::EventBus) {
+    pub fn register_subagent(
+        &mut self,
+        db: crate::db::Db,
+        bus: crate::event_bus::EventBus,
+        depth_limit: usize,
+    ) {
         let handle = std::sync::Arc::new(subagent::SubagentHandle::new(db, bus));
         let _ = crate::runner::SUBAGENT_HANDLE.set(handle);
         let handle = crate::runner::SUBAGENT_HANDLE
@@ -99,7 +104,7 @@ impl ToolRegistry {
             .expect("just set")
             .clone();
         self.register_all(vec![
-            Arc::new(subagent::SubagentTool::new(handle)) as Arc<dyn Tool>
+            Arc::new(subagent::SubagentTool::new(handle, depth_limit)) as Arc<dyn Tool>,
         ]);
     }
 }

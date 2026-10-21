@@ -26,6 +26,10 @@ const MESSAGE_PREVIEW_CHARS: usize = 400;
 /// borrowing its text whitewashed the trajectory.
 const CANCELLED_SENTINEL: &str = "(subagent cancelled by user interrupt)";
 
+/// Safety fuse for the ancestor walk: a corrupt `parent_id` cycle just makes
+/// the depth count saturate (and therefore fail the limit) instead of hanging.
+const MAX_DEPTH_WALK: usize = 32;
+
 /// The pieces of the runner the tool drives a child session through. The
 /// runner installs itself here at startup ([`Runner::register_subagent`]), so
 /// the tool never holds the runner that holds the tool.
@@ -60,11 +64,15 @@ impl SubagentHandle {
 
 pub struct SubagentTool {
     handle: std::sync::Arc<SubagentHandle>,
+    depth_limit: usize,
 }
 
 impl SubagentTool {
-    pub fn new(handle: std::sync::Arc<SubagentHandle>) -> Self {
-        Self { handle }
+    pub fn new(handle: std::sync::Arc<SubagentHandle>, depth_limit: usize) -> Self {
+        Self {
+            handle,
+            depth_limit,
+        }
     }
 }
 
@@ -142,6 +150,19 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         Ok(description) => description,
         Err(output) => return output,
     };
+
+    // Nesting guard first, mirroring upstream's order: the parent's ancestor
+    // count decides whether another delegation is allowed at all.
+    let depth = match nesting_depth(&tool.handle.db, &ctx.session_id).await {
+        Ok(depth) => depth,
+        Err(error) => return fail(format!("Unable to inspect session nesting: {error}")),
+    };
+    if depth >= tool.depth_limit {
+        return fail(format!(
+            "Subagent depth limit reached ({}). Increase the subagent depth limit to allow nested subagents.",
+            tool.depth_limit
+        ));
+    }
 
     // The child session inherits the parent's directory through the create
     // event, exactly like `POST /api/session {parentID}`.
@@ -237,6 +258,35 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
 /// `(project_id, directory, workspace_id, subpath)` of a session row.
 type ParentTuple = (String, String, Option<String>, Option<String>);
 
+/// Ancestor hops from `session_id` up the `parent_id` chain. A root session is
+/// `0`; an unknown session is also `0` (nothing to nest under).
+async fn nesting_depth(db: &crate::db::Db, session_id: &str) -> Result<usize, String> {
+    let conn = db.acquire().await.map_err(|error| error.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT parent_id FROM session_v2 WHERE id = ?1")
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut current = session_id.to_owned();
+    let mut depth = 0usize;
+    while depth < MAX_DEPTH_WALK {
+        let Some(row) = crate::db::optional(&mut stmt, (current.clone(),))
+            .await
+            .map_err(|error| error.to_string())?
+        else {
+            break;
+        };
+        let Some(parent) = row
+            .get::<Option<String>>(0)
+            .map_err(|error| error.to_string())?
+        else {
+            break;
+        };
+        depth += 1;
+        current = parent;
+    }
+    Ok(depth)
+}
+
 async fn load_parent(db: &crate::db::Db, session_id: &str) -> Result<Option<ParentTuple>, String> {
     let conn = db.acquire().await.map_err(|error| error.to_string())?;
     let mut stmt = conn
@@ -302,6 +352,9 @@ fn preview(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::schema::event::SessionEventData;
+    use crate::schema::support::LocationRef;
+
     #[test]
     fn cancelled_sentinel_is_not_the_question_one() {
         assert_ne!(
@@ -312,5 +365,59 @@ mod tests {
             super::CANCELLED_SENTINEL,
             "(subagent cancelled by user interrupt)"
         );
+    }
+
+    async fn seeded_db() -> (crate::db::Db, crate::event_bus::EventBus) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Db::open(&dir.path().join("ox.db"))
+            .await
+            .unwrap();
+        let bus = crate::event_bus::EventBus::new(db.clone());
+        for (id, parent) in [
+            ("ses_root", None),
+            ("ses_child", Some("ses_root")),
+            ("ses_grand", Some("ses_child")),
+        ] {
+            bus.publish(SessionEventData::SessionCreated {
+                session_id: id.to_owned(),
+                project_id: "proj_test".to_owned(),
+                location: LocationRef {
+                    directory: "/tmp".to_owned(),
+                    workspace_id: None,
+                },
+                subpath: None,
+                parent_id: parent.map(str::to_owned),
+                slug: crate::slug::create(),
+                title: None,
+                agent: None,
+                model: None,
+                metadata: None,
+                permissions: None,
+                version: env!("CARGO_PKG_VERSION").to_owned(),
+            })
+            .await
+            .unwrap();
+        }
+        (db, bus)
+    }
+
+    #[tokio::test]
+    async fn nesting_depth_counts_ancestors_and_survives_cycles() {
+        let (db, _bus) = seeded_db().await;
+        assert_eq!(super::nesting_depth(&db, "ses_root").await.unwrap(), 0);
+        assert_eq!(super::nesting_depth(&db, "ses_child").await.unwrap(), 1);
+        assert_eq!(super::nesting_depth(&db, "ses_grand").await.unwrap(), 2);
+        assert_eq!(super::nesting_depth(&db, "ses_missing").await.unwrap(), 0);
+
+        // A corrupt self-cycle must not hang: the 32-hop fuse reports the cap.
+        let conn = db.acquire().await.unwrap();
+        conn.execute(
+            "UPDATE session_v2 SET parent_id = id WHERE id = 'ses_root'",
+            (),
+        )
+        .await
+        .unwrap();
+        drop(conn);
+        assert_eq!(super::nesting_depth(&db, "ses_root").await.unwrap(), 32);
     }
 }
