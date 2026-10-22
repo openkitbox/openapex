@@ -54,6 +54,7 @@ use serde_json::Value;
 
 use crate::db::{Db, optional};
 use crate::id::now_millis;
+use crate::mctx::copied_tags::strip_copied_tag_notation;
 
 /// One tagged item: the tag handle plus where the content lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -427,11 +428,23 @@ pub fn apply_overlay(
                 continue;
             }
             let placeholder = dropped.then(|| dropped_placeholder(item.tag));
+            let is_assistant_text = mode == OverlayMode::Request
+                && message.get("type").and_then(Value::as_str) == Some("assistant");
             let Some(part) = resolve_part(message, &item.part_path) else {
                 continue;
             };
             match part {
                 Addressed::Text(text) => {
+                    // Request-side strip (upstream OC2's hook point): copied
+                    // §N§ runs in assistant text — including rows persisted
+                    // before the storage-side strip — must not keep flowing
+                    // back into the model's context, where they reinforce the
+                    // copying loop. Runs BEFORE the official prefix is
+                    // prepended, so the addressing notation itself survives;
+                    // user and tool content stay verbatim.
+                    if is_assistant_text {
+                        *text = strip_copied_tag_notation(text).into_owned();
+                    }
                     *text = match placeholder {
                         Some(placeholder) => placeholder,
                         None => format!("§{}§ {text}", item.tag),
@@ -1200,6 +1213,41 @@ mod tests {
             messages[1]["content"][2]["state"]["content"][0]["text"],
             json!("§3§ file body"),
             "tool results carry their tag on the result text"
+        );
+    }
+
+    #[test]
+    fn request_mode_strips_copied_tags_from_assistant_text_before_the_prefix() {
+        let mut messages = sample_messages();
+        messages[1]["content"][0]["text"] = json!("§194§ §194§ Task 2 done");
+        let tags = vec![TaggedItem {
+            tag: 7,
+            message_id: "msg_a1".into(),
+            part_path: "content[0]".into(),
+        }];
+        apply_overlay(&mut messages, &tags, &HashMap::new(), OverlayMode::Request);
+        assert_eq!(
+            messages[1]["content"][0]["text"],
+            json!("§7§ Task 2 done"),
+            "the copied run is stripped before the official prefix is prepended, \
+             so the addressing notation itself survives"
+        );
+    }
+
+    #[test]
+    fn request_mode_keeps_copied_tags_in_user_text() {
+        let mut messages = sample_messages();
+        messages[0]["text"] = json!("§9§ user quoted §9§");
+        let tags = vec![TaggedItem {
+            tag: 8,
+            message_id: "msg_u1".into(),
+            part_path: "text".into(),
+        }];
+        apply_overlay(&mut messages, &tags, &HashMap::new(), OverlayMode::Request);
+        assert_eq!(
+            messages[0]["text"],
+            json!("§8§ §9§ user quoted §9§"),
+            "user text is handed to the model verbatim"
         );
     }
 
