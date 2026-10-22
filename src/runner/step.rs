@@ -64,6 +64,7 @@ use crate::cardinal::wire::{
     reasoning_effort_of,
 };
 use crate::id;
+use crate::mctx::copied_tags::strip_copied_tag_notation;
 use crate::prompt;
 use crate::schema::event::SessionEventData;
 use crate::schema::message::{
@@ -1113,7 +1114,10 @@ async fn flush_blocks(
                 session_id: ctx.session_id.clone(),
                 assistant_message_id: params.assistant_message_id.clone(),
                 ordinal,
-                text: text.to_owned(),
+                // Same strip as the persistence boundary: the ended payload is
+                // what live clients render as the part's final text, so a
+                // copied tag run must not survive here either.
+                text: strip_copied_tag_notation(text).into_owned(),
                 state: None,
             })
             .await?;
@@ -1124,7 +1128,7 @@ async fn flush_blocks(
                 session_id: ctx.session_id.clone(),
                 assistant_message_id: params.assistant_message_id.clone(),
                 ordinal,
-                text: reasoning.to_owned(),
+                text: strip_copied_tag_notation(reasoning).into_owned(),
                 state: None,
             })
             .await?;
