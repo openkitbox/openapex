@@ -122,15 +122,12 @@ pub(crate) fn diff(
             continue;
         }
         let (text, hash) = match &current {
-            None => {
-                let previous = state
-                    .and_then(|s| s.delivered_value.as_ref())
-                    .or_else(|| state.and_then(|s| s.initial_value.as_ref()));
-                match previous.and_then(prompt::removed_text) {
-                    Some(text) => (text, None),
-                    None => continue, // date/env cannot be removed
-                }
-            }
+            None => match prompt::removed_text(source.key) {
+                // Removal text depends only on the source kind — deliverable even when
+                // the baseline never held content (a restart after the file vanished).
+                Some(text) => (text, None),
+                None => continue, // date/env cannot be removed
+            },
             Some(value) => {
                 // Best-known previous content for the diff form: only a
                 // surviving row that matches what we delivered tells us what
@@ -321,6 +318,24 @@ mod tests {
         assert_eq!(
             deltas[0].text,
             "Instructions from: /repo/AGENTS.md\nrule three"
+        );
+    }
+
+    #[test]
+    fn stale_wire_row_for_a_vanished_source_emits_removal() {
+        // 重启且源在停机期间被删除：baseline 的 initial/delivered 都是 None，
+        // wire 还留着旧 delta 行 → 必须补一条 removed 文案。
+        let baseline = baseline(&[]);
+        let wire: BTreeMap<String, Option<String>> =
+            [(KEY_INSTRUCTIONS.to_owned(), Some("stale-hash".to_owned()))]
+                .into_iter()
+                .collect();
+        let deltas = diff(&[absent(KEY_INSTRUCTIONS)], &wire, &baseline);
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].hash, None);
+        assert_eq!(
+            deltas[0].text,
+            "Previously loaded instructions no longer apply."
         );
     }
 

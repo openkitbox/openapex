@@ -300,21 +300,17 @@ pub(crate) fn changed_text(value: &SourceValue, previous: Option<&SourceValue>) 
     }
 }
 
-/// Upstream per-source `removed` renderers; `None` = not deliverable
-/// (date/env are always present).
-pub(crate) fn removed_text(previous: &SourceValue) -> Option<String> {
-    match previous {
-        SourceValue::Mcp { .. } => {
-            Some("MCP server instructions are no longer available.".to_owned())
-        }
-        SourceValue::Skills { .. } => Some(
+/// Upstream per-source `removed` renderers keyed by source kind; `None` =
+/// not deliverable (date/env are always present).
+pub(crate) fn removed_text(key: &str) -> Option<String> {
+    match key {
+        KEY_MCP => Some("MCP server instructions are no longer available.".to_owned()),
+        KEY_SKILLS => Some(
             "Skill guidance is no longer available. Do not use any previously listed skill."
                 .to_owned(),
         ),
-        SourceValue::File { .. } => {
-            Some("Previously loaded instructions no longer apply.".to_owned())
-        }
-        SourceValue::Date { .. } | SourceValue::Environment { .. } => None,
+        KEY_INSTRUCTIONS => Some("Previously loaded instructions no longer apply.".to_owned()),
+        _ => None,
     }
 }
 
@@ -652,10 +648,10 @@ mod tests {
             "The environment you are running in is now:\n<env>x</env>"
         );
         assert_eq!(
-            removed_text(&before).as_deref(),
+            removed_text(KEY_INSTRUCTIONS).as_deref(),
             Some("Previously loaded instructions no longer apply.")
         );
-        assert!(removed_text(&date).is_none());
+        assert!(removed_text(KEY_DATE).is_none());
     }
 
     #[test]
