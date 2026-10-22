@@ -19,8 +19,8 @@
 //!
 //! Scope: the event groups the chat path actually emits (Session lifecycle,
 //! Execution, Inbox, Step, Text, Reasoning, Tool, RetryScheduled, Synthetic,
-//! MessageContentUpdated). Skill/Shell event groups, `session.instructions.updated`,
-//! and the revert group are NOT ported and fall back to `Unknown`.
+//! InstructionsUpdated, MessageContentUpdated). Skill/Shell event groups and
+//! the revert group are NOT ported and fall back to `Unknown`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -136,9 +136,9 @@ pub enum StepFailedFinish {
 /// adapter shape used by [`SessionEventData::from_parts`] /
 /// [`SessionEventData::into_parts`]; it never appears on the wire as-is.
 ///
-/// Unknown event types (including the un-ported groups: skill/shell events,
-/// `session.instructions.updated`, `session.revert.*`, `session.moved`,
-/// compaction events) deserialize losslessly as [`SessionEventData::Unknown`].
+/// Unknown event types (including the un-ported groups: skill/shell events
+/// and `session.revert.*`) deserialize losslessly as
+/// [`SessionEventData::Unknown`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "data")]
 pub enum SessionEventData {
