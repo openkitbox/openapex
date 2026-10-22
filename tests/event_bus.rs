@@ -51,10 +51,10 @@ async fn bus() -> EventBus {
 
 /// Run a query expected to return exactly one row.
 async fn one_row(
-    conn: &turso::Connection,
+    conn: &ox_db::turso::Connection,
     sql: &str,
-    params: impl turso::IntoParams,
-) -> turso::Row {
+    params: impl ox_db::turso::IntoParams,
+) -> ox_db::turso::Row {
     let mut stmt = conn.prepare(sql).await.expect("prepare");
     let mut rows = stmt.query(params).await.expect("query");
     rows.next().await.expect("next").expect("one row")
@@ -1076,7 +1076,7 @@ async fn session_deleted_purges_magic_context_rows() {
     }
 }
 
-async fn exec(conn: &turso::Connection, sql: &str) {
+async fn exec(conn: &ox_db::turso::Connection, sql: &str) {
     conn.execute(sql, ()).await.expect("exec");
 }
 

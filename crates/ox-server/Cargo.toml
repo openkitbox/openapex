@@ -1,0 +1,29 @@
+[package]
+name = "ox-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+dirs.workspace = true
+futures-core.workspace = true
+ox-cbm.workspace = true
+ox-core.workspace = true
+ox-db.workspace = true
+ox-engine.workspace = true
+ox-mcp.workspace = true
+ox-schema.workspace = true
+ox-tools.workspace = true
+salvo = { workspace = true, features = ["server", "http1", "http2", "sse", "affix-state", "logging"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true, features = ["compat"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

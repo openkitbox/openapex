@@ -4,6 +4,9 @@
 //! crate share one definition of the protocol.
 
 pub mod event;
+pub mod id;
 pub mod inbox;
 pub mod message;
+pub mod slug;
 pub mod support;
+pub mod wire;

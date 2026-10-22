@@ -2,58 +2,106 @@
 members = ["crates/ox-schema", "crates/ox-client", "crates/ox-tui"]
 resolver = "2"
 
-[package]
-name = "ox"
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
+
+# Single source of truth for third-party versions. Members inherit with
+# `dependency.workspace = true` and add only their own features, so a version
+# bump touches exactly one file.
+[workspace.dependencies]
+anyhow = "1.0.104"
+agent-client-protocol = { version = "=3.4.0" }
+base64 = "0.23.1"
+bytes = "1.12"
+cortexkit-cache-core = { git = "https://github.com/cortexkit/commons", rev = "067701f1ab61cd2c81aa58fb66b0cb65fbaef9e7" }
+crossterm = "0.28"
+dashmap = "6.2.1"
+dirs = "7.0.0"
+futures-core = "0.3"
+futures-util = "0.3"
+globset = "0.4.16"
+grep-regex = "0.1.14"
+grep-searcher = "0.1.17"
+ignore = "0.4.23"
+# ox declares the global allocator itself (src/main.rs), so turso's default
+# "mimalloc" feature — which would install its own — stays disabled. The
+# no_thp feature rides on the same libmimalloc-sys build.
+mimalloc = { version = "0.1.52", features = ["no_thp"] }
+ox-client = { path = "crates/ox-client" }
+ox-acp = { path = "crates/ox-acp" }
+ox-cbm = { path = "crates/ox-cbm" }
+ox-core = { path = "crates/ox-core" }
+ox-db = { path = "crates/ox-db" }
+ox-engine = { path = "crates/ox-engine" }
+ox-mcp = { path = "crates/ox-mcp" }
+ox-schema = { path = "crates/ox-schema" }
+ox-server = { path = "crates/ox-server" }
+ox-tools = { path = "crates/ox-tools" }
+ox-tui = { path = "crates/ox-tui" }
+rand = "0.9"
+ratatui = "0.29"
+regex = "1"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "stream"] }
+salvo = "1.0.1"
+serde = "1.0.229"
+serde_json = "1.0.154"
+sha1 = "0.11.0"
+sha2 = "0.10"
+tempfile = "3"
+textwrap = "0.16"
+thiserror = "2"
+tokio = "1.53.3"
+tokio-util = "0.7"
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+tui-textarea = { version = "0.7", default-features = false }
+turso = { version = "=0.9.0-pre.1", default-features = false }
+unicode-width = "0.2"
+
+[package]
+name = "ox"
+version.workspace = true
+edition.workspace = true
 
 [[bin]]
 name = "opencode-rs"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1.0.104"
-base64 = "0.23.1"
-bytes = "1.12"
-cortexkit-cache-core = { git = "https://github.com/cortexkit/commons", rev = "067701f1ab61cd2c81aa58fb66b0cb65fbaef9e7" }
-dashmap = "6.2.1"
-dirs = "7.0.0"
-globset = "0.4.16"
-ignore = "0.4.23"
-futures-core = "0.3"
-futures-util = "0.3"
-ox-schema = { path = "crates/ox-schema" }
-rand = "0.9"
-regex = "1"
-reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "stream"] }
-agent-client-protocol = { version = "=3.4.0", features = ["stdio"] }
-salvo = { version = "1.0.1", features = ["server", "http1", "http2", "sse", "affix-state", "logging"] }
-serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.154"
-sha1 = "0.11.0"
-sha2 = "0.10"
-thiserror = "2"
-tokio = { version = "1.53.3", features = ["full"] }
-tokio-util = { version = "0.7", features = ["compat"] }
-toml = "1.1.8"
-turso = { version = "=0.9.0-pre.1", default-features = false, features = ["fts"] }
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter", "time"] }
-# ox declares the global allocator itself (src/main.rs), so turso's default
-# "mimalloc" feature — which would install its own — stays disabled. The
-# no_thp feature rides on the same libmimalloc-sys build.
-mimalloc = { version = "0.1.52", features = ["no_thp"] }
-grep-searcher = "0.1.17"
-grep-regex = "0.1.14"
+anyhow.workspace = true
+# The façade re-exports every crate so `ox::…` stays one import path for
+# tests and the binary; the binary itself needs only a few of these.
+ox-acp.workspace = true
+ox-cbm.workspace = true
+ox-core.workspace = true
+ox-db.workspace = true
+ox-engine.workspace = true
+ox-mcp.workspace = true
+ox-schema.workspace = true
+ox-server.workspace = true
+ox-tools.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["fmt", "env-filter", "time"] }
+mimalloc.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
-futures-core = "0.3"
+base64.workspace = true
+bytes.workspace = true
+serde = { workspace = true, features = ["derive"] }
+futures-core.workspace = true
+reqwest.workspace = true
+ox-db.workspace = true
+salvo = { workspace = true, features = ["server", "http1", "http2", "sse", "affix-state", "logging"] }
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tokio-util.workspace = true
 
-# `ToolOutput` — the engine-wide tool-error type — is 192 bytes, which trips
-# `clippy::result_large_err` on every `Result<_, ToolOutput>` helper under the
-# 1.99 toolchain (a pre-existing pattern, unrelated to ACP). Boxing it is a
-# deliberate engine refactor; until then the lint is allowed project-wide
-# rather than sprinkled as `#[allow]` attributes.
-[lints.clippy]
+[workspace.lints.clippy]
 result_large_err = "allow"
+
+[lints]
+workspace = true

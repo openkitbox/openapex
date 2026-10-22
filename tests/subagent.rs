@@ -9,13 +9,11 @@
 //! whose parent was deleted meanwhile is dropped without panicking.
 //!
 //! This binary deliberately holds ONE `#[tokio::test]` covering all
-//! scenarios in sequence: `register_subagent` binds the process-global
-//! `runner::SUBAGENT_HANDLE` (`OnceLock`, first setter wins, and an
-//! immutable static cannot be reset), so a second test in this process
-//! would silently drive the first test's db/runner no matter how the tests
-//! were locked. The delegation scenario registers first and owns the slot;
-//! every later scenario shares that first db (the global handle points at
-//! it) and only varies the tool's own configuration or inputs.
+//! scenarios in sequence: they share one database and one state (the runner
+//! that dispatches child turns), which is the shape a sequential walk needs.
+//! The subagent handle is per-registry now, so each registry attaches to the
+//! runner it is handed; scenario 2 (depth zero) needs no runner because the
+//! depth guard rejects before any dispatch.
 
 use std::sync::{Arc, Mutex};
 
@@ -110,10 +108,11 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
         )])),
         gate: gate_rx,
     });
-    // The runner must exist so the tool can dispatch the child. Its registry
-    // needs no tools — the child replies in one turn. (The Arc itself stays
-    // with the test so later scenarios can queue more scripts.)
-    let _state = ox::build_state_with(config.clone(), chat.clone(), ToolRegistry::new())
+    // The runner must exist so the tool can dispatch the child, and it must
+    // see the SAME registry: `Runner::new` attaches itself to the subagent
+    // handle the registry holds (no process-global slot any more).
+    let tool = tools.get("subagent").expect("subagent registered");
+    let _state = ox::build_state_with(config.clone(), chat.clone(), tools)
         .await
         .expect("build state");
 
@@ -145,7 +144,6 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
         call_id: "call_sub".to_owned(),
         cancellation: tokio_util::sync::CancellationToken::new(),
     };
-    let tool = tools.get("subagent").expect("subagent registered");
     let output = tool
         .execute(
             ctx,
@@ -288,13 +286,9 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
     );
 
     // --- depth limit: a zero limit rejects every delegation ---------------
-    // This scenario runs second in the SAME process, so `register_subagent`
-    // cannot install another global handle: the slot keeps the one bound
-    // above, and every registry's subagent tool drives THAT db. The scenario
-    // therefore registers against the FIRST db on purpose — a fresh db would
-    // leave the assertions counting a database the tool never touches. The
-    // depth walk reads the parent chain from the DB, but no child session is
-    // created.
+    // The depth guard runs before any dispatch, so this registry needs no
+    // runner attached: the zero limit rejects every delegation. It shares the
+    // scenario's db so the parent chain the depth walk reads is real.
     let mut tools2 = ToolRegistry::new();
     tools2.register_subagent(db.clone(), bus.clone(), 0);
 

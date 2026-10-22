@@ -1,0 +1,32 @@
+[package]
+name = "ox-engine"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+cortexkit-cache-core.workspace = true
+dashmap.workspace = true
+futures-core.workspace = true
+ox-cbm.workspace = true
+ox-core.workspace = true
+ox-db.workspace = true
+ox-mcp.workspace = true
+ox-schema.workspace = true
+ox-tools.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true, features = ["compat", "rt"] }
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
