@@ -2118,7 +2118,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(!rendered.iter().any(|c| *c == "before"));
+        assert!(!rendered.contains(&"before"));
         assert!(rendered.iter().any(|c| c.contains("after")));
     }
 }
