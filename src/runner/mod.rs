@@ -226,7 +226,6 @@ pub static SUBAGENT_HANDLE: std::sync::OnceLock<
     std::sync::Arc<crate::tool::subagent::SubagentHandle>,
 > = std::sync::OnceLock::new();
 
-#[derive(Clone)]
 struct Inner {
     /// The loaded config, shared by reference: nothing reads it mutably, and
     /// every drain/step boundary clones the handle rather than the struct.
@@ -313,10 +312,39 @@ impl Runner {
         model_catalog: Arc<crate::model_catalog::ModelCatalog>,
         mcp: Arc<crate::mcp::Hub>,
     ) -> Self {
+        Self::new_with_mcp_and_home(
+            config,
+            directory,
+            db,
+            bus,
+            chat,
+            tools,
+            model_catalog,
+            mcp,
+            crate::config::ox_home(),
+        )
+    }
+
+    /// Same as [`Runner::new_with_mcp`], with an explicit global home for the
+    /// global instruction file (tests embed a temp home so a developer's
+    /// `~/.ox/AGENTS.md` never leaks in). The home must be set at
+    /// construction: the inner state attaches to the subagent registry here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_mcp_and_home(
+        config: std::sync::Arc<Config>,
+        directory: PathBuf,
+        db: Db,
+        bus: EventBus,
+        chat: Arc<dyn Chat>,
+        tools: Arc<ToolRegistry>,
+        model_catalog: Arc<crate::model_catalog::ModelCatalog>,
+        mcp: Arc<crate::mcp::Hub>,
+        home: PathBuf,
+    ) -> Self {
         let inner = Arc::new(Inner {
             config,
             directory,
-            home: crate::config::ox_home(),
+            home,
             db,
             bus,
             chat,
@@ -332,18 +360,6 @@ impl Runner {
             });
         }
         Self { inner }
-    }
-
-    /// Override the global home used for global instructions (tests embed a
-    /// temp home so a developer's `~/.ox/AGENTS.md` never leaks in). The
-    /// subagent handle keeps its first binding (a [`Runner::new_with_mcp`]
-    /// attach is first-write-wins), so call this before any dispatch cares.
-    pub fn with_home(mut self, home: PathBuf) -> Self {
-        self.inner = Arc::new(Inner {
-            home,
-            ..(*self.inner).clone()
-        });
-        self
     }
 
     /// Whether work is scheduled or a busy period is currently in flight

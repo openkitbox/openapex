@@ -492,10 +492,9 @@ impl Harness {
         };
         config.magic_context.enabled = magic_context;
         let chat = Arc::new(MockChat::new(scripts));
-        let mut state = ox::build_state_with(config.clone(), chat.clone(), tools)
+        let state = ox::build_state_with_home(config.clone(), chat.clone(), tools, home.clone())
             .await
             .expect("build state");
-        state.runner = state.runner.with_home(home.clone());
         let db = state.db.clone();
         let bus = state.bus.clone();
         let mut events = bus.subscribe();
