@@ -1309,7 +1309,7 @@ pub(crate) fn build_chat_messages(
     // anchored bytes on every delta.
     for half in head.iter().flatten() {
         out.push(ChatMessage::User {
-            content: (*half).to_owned(),
+            content: (*half).to_owned().into(),
         });
     }
     for message in messages.iter().skip(boundary.unwrap_or(0)) {
@@ -1321,7 +1321,7 @@ pub(crate) fn build_chat_messages(
                     // omitted from the transcript.
                     continue;
                 }
-                out.push(ChatMessage::User { content });
+                out.push(ChatMessage::User { content: content.into() });
             }
             Message::Synthetic { text, .. } | Message::Skill { text, .. } => {
                 // A synthetic row with no text is display-only (a background
@@ -1331,7 +1331,7 @@ pub(crate) fn build_chat_messages(
                     continue;
                 }
                 out.push(ChatMessage::User {
-                    content: text.clone(),
+                    content: text.clone().into(),
                 })
             }
             Message::System { text, .. } => out.push(ChatMessage::System {
@@ -1382,8 +1382,10 @@ pub(crate) fn build_chat_messages(
                                 if !media.is_empty() {
                                     // A provider accepts an image only as user
                                     // content, so it follows the tool result as
-                                    // its own turn.
-                                    tool_results.push(ChatMessage::UserMedia { content: media });
+                                    // its own turn — a parts-list user turn.
+                                    tool_results.push(ChatMessage::User {
+                                        content: media.into(),
+                                    });
                                 }
                             }
                         }
@@ -1422,7 +1424,7 @@ pub(crate) fn build_chat_messages(
                     summary, recent, ..
                 } = &**completed;
                 out.push(ChatMessage::User {
-                    content: compaction::checkpoint_message(summary, recent),
+                    content: compaction::checkpoint_message(summary, recent).into(),
                 });
             }
             Message::Compaction(_) => {}
@@ -1683,7 +1685,7 @@ mod tests {
         assert_eq!(built.len(), 2, "system + the one with text: {built:?}");
         assert!(matches!(
             &built[1],
-            ChatMessage::User { content } if content == "real guidance"
+            ChatMessage::User { content } if content.as_str() == "real guidance"
         ));
     }
 

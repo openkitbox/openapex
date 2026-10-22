@@ -1326,7 +1326,7 @@ pub fn historian_request_with_prompt(model: &str, user_prompt: &str) -> ChatRequ
                 content: HISTORIAN_SYSTEM_PROMPT.to_owned(),
             },
             ChatMessage::User {
-                content: user_prompt.to_owned(),
+                content: user_prompt.to_owned().into(),
             },
         ],
     )
@@ -2461,7 +2461,7 @@ default_model = "cardinal/k3-256k"
     /// The user half of a recorded request.
     fn user_content(request: &ChatRequest) -> &str {
         match &request.messages[1] {
-            ChatMessage::User { content } => content,
+            ChatMessage::User { content } => content.as_str(),
             other => panic!("expected a user message, got {other:?}"),
         }
     }

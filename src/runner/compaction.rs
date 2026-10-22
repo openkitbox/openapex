@@ -74,7 +74,7 @@ pub(crate) fn summarization_request(model: &str, transcript: &[ChatMessage]) -> 
         .collect();
     messages.extend(body);
     messages.push(ChatMessage::User {
-        content: SUMMARY_PROMPT.to_owned(),
+        content: SUMMARY_PROMPT.to_owned().into(),
     });
     // `tools` stays empty → omitted from the wire; upstream disables tools
     // for compaction (`input.tools` defaults to a rejecting definition set).
@@ -197,7 +197,7 @@ pub(crate) async fn compact(
         // refitted smaller here.)
         if !filled(&summary) {
             request.messages.push(ChatMessage::User {
-                content: NUDGE.to_owned(),
+                content: NUDGE.to_owned().into(),
             });
             summary = stream_summary(ctx, &request).await?;
             if !filled(&summary) {
@@ -274,7 +274,7 @@ mod tests {
                 content: "working system".to_owned(),
             },
             ChatMessage::User {
-                content: "hello".to_owned(),
+                content: "hello".into(),
             },
         ];
         let request = summarization_request("p", &transcript);
@@ -295,7 +295,7 @@ mod tests {
             "the working system prompt is replaced"
         );
         assert!(
-            matches!(request.messages.last(), Some(ChatMessage::User { content }) if content.contains("You MUST summarize")),
+            matches!(request.messages.last(), Some(ChatMessage::User { content }) if content.as_str().contains("You MUST summarize")),
             "summary instruction is the final user turn"
         );
     }

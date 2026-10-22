@@ -678,7 +678,7 @@ impl Dreamer {
                     content: system.to_owned(),
                 },
                 ChatMessage::User {
-                    content: user_prompt.to_owned(),
+                    content: user_prompt.to_owned().into(),
                 },
             ],
         );

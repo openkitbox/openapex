@@ -1000,7 +1000,9 @@ async fn steers_promote_in_order_before_queue() {
         .messages
         .iter()
         .filter_map(|m| match m {
-            ox::cardinal::wire::ChatMessage::User { content } => Some(content.clone()),
+            ox::cardinal::wire::ChatMessage::User { content } => {
+                Some(content.as_str().to_owned())
+            }
             _ => None,
         })
         .collect();
@@ -1283,7 +1285,6 @@ async fn mid_stream_failure_settles_partial_tool_with_stream_error() {
             ox::cardinal::wire::ChatMessage::User { .. } => "user",
             ox::cardinal::wire::ChatMessage::Assistant { .. } => "assistant",
             ox::cardinal::wire::ChatMessage::Tool { .. } => "tool",
-            ox::cardinal::wire::ChatMessage::UserMedia { .. } => "user",
         })
         .collect();
     assert_eq!(
@@ -1926,7 +1927,7 @@ async fn overflow_compacts_and_retries_once() {
     ));
     assert!(matches!(
         summary.messages.last(),
-        Some(ox::cardinal::wire::ChatMessage::User { content }) if content.contains("You MUST summarize")
+        Some(ox::cardinal::wire::ChatMessage::User { content }) if content.as_str().contains("You MUST summarize")
     ));
     let wire = serde_json::to_value(summary).expect("wire");
     assert!(wire.get("tools").is_none(), "compaction never sends tools");
@@ -1938,7 +1939,8 @@ async fn overflow_compacts_and_retries_once() {
     assert!(matches!(
         &retry.messages[1],
         ox::cardinal::wire::ChatMessage::User { content }
-            if content.contains("<conversation-checkpoint>") && content.contains("S2 summary")
+            if content.as_str().contains("<conversation-checkpoint>")
+                && content.as_str().contains("S2 summary")
     ));
 
     // The compaction row landed completed with the summary.
@@ -2028,14 +2030,15 @@ async fn compaction_item_summarizes_and_checkpoints_context() {
     assert!(wire.get("tools").is_none(), "compaction sends no tools");
     assert!(matches!(
         summary.messages.last(),
-        Some(ox::cardinal::wire::ChatMessage::User { content }) if content.contains("You MUST summarize")
+        Some(ox::cardinal::wire::ChatMessage::User { content }) if content.as_str().contains("You MUST summarize")
     ));
 
     // The wake turn's context opens with the checkpoint summary.
     assert!(requests[1].messages.iter().any(|m| matches!(
         m,
         ox::cardinal::wire::ChatMessage::User { content }
-            if content.contains("<conversation-checkpoint>") && content.contains("S2 summary")
+            if content.as_str().contains("<conversation-checkpoint>")
+                && content.as_str().contains("S2 summary")
     )));
 
     // The compaction row is durable.
@@ -2175,7 +2178,7 @@ async fn length_truncation_continues_then_exhausts() {
     // The requests between truncations carry the synthetic as a user turn.
     assert!(requests[1].messages.iter().any(|m| matches!(
         m,
-        ox::cardinal::wire::ChatMessage::User { content } if content.contains("hit the output token limit")
+        ox::cardinal::wire::ChatMessage::User { content } if content.as_str().contains("hit the output token limit")
     )));
 
     // Upstream raises StepFailedError from OutputLimit exhaustion with only
@@ -2391,11 +2394,11 @@ async fn compaction_nudges_off_template_reply_once() {
     assert_eq!(requests.len(), 3, "off-template ask + nudge + wake turn");
     // The nudge appended the reminder after the summary prompt.
     let nudged = &requests[1];
-    let users: Vec<&String> = nudged
+    let users: Vec<&str> = nudged
         .messages
         .iter()
         .filter_map(|m| match m {
-            ox::cardinal::wire::ChatMessage::User { content } => Some(content),
+            ox::cardinal::wire::ChatMessage::User { content } => Some(content.as_str()),
             _ => None,
         })
         .collect();
@@ -2791,7 +2794,7 @@ fn recorded_head(harness: &Harness) -> Option<String> {
         let mut messages = request.messages.iter();
         assert!(matches!(messages.next(), Some(ChatMessage::System { .. })));
         match messages.next() {
-            Some(ChatMessage::User { content }) => Some(content.clone()),
+            Some(ChatMessage::User { content }) => Some(content.as_str().to_owned()),
             _ => None,
         }
     })
@@ -2804,11 +2807,11 @@ fn recorded_halves(harness: &Harness) -> Option<(String, String)> {
         let mut messages = request.messages.iter();
         assert!(matches!(messages.next(), Some(ChatMessage::System { .. })));
         let m0 = match messages.next() {
-            Some(ChatMessage::User { content }) => content.clone(),
+            Some(ChatMessage::User { content }) => content.as_str().to_owned(),
             _ => return None,
         };
         let m1 = match messages.next() {
-            Some(ChatMessage::User { content }) => content.clone(),
+            Some(ChatMessage::User { content }) => content.as_str().to_owned(),
             _ => return None,
         };
         Some((m0, m1))
@@ -2902,7 +2905,7 @@ fn last_user_text(harness: &Harness) -> String {
         .iter()
         .rev()
         .find_map(|message| match message {
-            ChatMessage::User { content } => Some(content.clone()),
+            ChatMessage::User { content } => Some(content.as_str().to_owned()),
             _ => None,
         })
         .expect("a user message")
@@ -2994,7 +2997,7 @@ async fn tags_are_visible_and_an_applied_drop_leaves_the_request() {
         .messages
         .iter()
         .filter_map(|message| match message {
-            ChatMessage::User { content } => Some(content.clone()),
+            ChatMessage::User { content } => Some(content.as_str().to_owned()),
             _ => None,
         })
         .collect();

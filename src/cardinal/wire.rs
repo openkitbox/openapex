@@ -198,20 +198,59 @@ pub struct ImageUrl {
     pub url: String,
 }
 
+/// The content of a user turn: plain text, or a parts list carrying media
+/// beside its text (a tool that attaches an image appends such a turn after
+/// its `tool` result — providers accept an image only as user content). The
+/// wire form is the OpenAI one: a JSON string, or an array of typed parts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum UserContent {
+    Text(String),
+    Parts(Vec<UserPart>),
+}
+
+impl From<String> for UserContent {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
+}
+
+impl From<&str> for UserContent {
+    fn from(text: &str) -> Self {
+        Self::Text(text.to_owned())
+    }
+}
+
+impl From<Vec<UserPart>> for UserContent {
+    fn from(parts: Vec<UserPart>) -> Self {
+        Self::Parts(parts)
+    }
+}
+
+impl UserContent {
+    /// The plain-text view: the text itself; a parts list has none, and reads
+    /// as empty.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Text(text) => text,
+            Self::Parts(_) => "",
+        }
+    }
+}
+
 /// One message of the conversation history, tagged by `role` exactly like the
-/// OpenAI wire format.
+/// OpenAI wire format: one variant per role. The split once cost a production
+/// incident — a dedicated media variant serialized as `role: "usermedia"`
+/// (the derived tag of its name), and GLM 400'd every image send with
+/// 1214「角色信息不正确」. Media now rides [`ChatMessage::User`] as
+/// [`UserContent::Parts`], so no variant name can ever leak onto the wire.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase")]
 pub enum ChatMessage {
     /// System / developer instructions.
     System { content: String },
-    /// User input.
-    User { content: String },
-    /// A user turn carrying media beside its text. Providers take an image
-    /// next to a tool result only as user content, so a tool that attaches one
-    /// appends this message after its `tool` result. Kept last so the derived
-    /// `rename_all = "lowercase"` never shadows it.
-    UserMedia { content: Vec<UserPart> },
+    /// User input: plain text or a parts list with media (see [`UserContent`]).
+    User { content: UserContent },
     /// Assistant turn: text and/or tool calls. `content` serializes as
     /// explicit `null` when absent.
     Assistant {
@@ -243,7 +282,7 @@ impl ChatMessage {
     /// `{"role": "user", "content": ...}`
     pub fn user(content: impl Into<String>) -> Self {
         Self::User {
-            content: content.into(),
+            content: UserContent::from(content.into()),
         }
     }
 
@@ -376,6 +415,43 @@ mod tests {
             }),
             "no tools → no tools/tool_choice on the wire"
         );
+    }
+
+    /// A media user turn rides `role: "user"` with a parts-list content —
+    /// what the OpenAI format means by a multimodal user message. The removed
+    /// `UserMedia` variant serialized as `role: "usermedia"`, which thinking
+    /// vendors reject (GLM: 400 1214「角色信息不正确」— every image send
+    /// through cardinal 400'd).
+    #[test]
+    fn media_user_turn_carries_user_role() {
+        let request = ChatRequest::new(
+            "k3-256k",
+            vec![ChatMessage::User {
+                content: UserContent::Parts(vec![UserPart::Image {
+                    image_url: ImageUrl {
+                        url: "data:image/png;base64,iVBOR".to_owned(),
+                    },
+                }]),
+            }],
+        );
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value["messages"][0]["role"],
+            json!("user"),
+            "a media user turn is role \"user\" with array content"
+        );
+        assert_eq!(
+            value["messages"][0]["content"][0]["type"],
+            json!("image_url")
+        );
+        // Untagged `UserContent` round-trips: the array parses back as parts.
+        let parsed: ChatRequest = serde_json::from_value(value).unwrap();
+        assert!(matches!(
+            &parsed.messages[0],
+            ChatMessage::User {
+                content: UserContent::Parts(_)
+            }
+        ));
     }
 
     #[test]
