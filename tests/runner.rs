@@ -3048,31 +3048,23 @@ async fn tags_are_visible_and_an_applied_drop_leaves_the_request() {
 // Keyed instruction sync (dual system layers)
 // ---------------------------------------------------------------------------
 
-/// Byte-stable request prefix for one session: the dual system messages plus
-/// the first transcript row (the magic-context `m[0]` when enabled, the first
-/// user prompt otherwise — both are frozen once written).
+/// Byte-stable request prefix: the dual system layers plus m[0] (the frozen
+/// magic-context baseline, when present — it always opens with
+/// `<session-history>`, src/mctx/render.rs `render_m0`). Stops at the first
+/// other row: plain history rows (including a compaction checkpoint, which
+/// legitimately replaces the head it covers) are not part of the prefix.
 fn prefix_of(messages: &[ChatMessage]) -> String {
-    messages[..3]
-        .iter()
-        .map(|m| match m {
-            ChatMessage::System { content } => content.as_str(),
-            ChatMessage::User { content } => content.as_str(),
-            other => panic!("unexpected prefix message: {other:?}"),
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// The dual system layers alone (the provider's cache anchor proper).
-fn system_layers(messages: &[ChatMessage]) -> String {
-    messages[..2]
-        .iter()
-        .map(|m| match m {
-            ChatMessage::System { content } => content.as_str(),
-            other => panic!("unexpected system layer: {other:?}"),
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut parts = Vec::new();
+    for message in messages {
+        match message {
+            ChatMessage::System { content } => parts.push(content.as_str()),
+            ChatMessage::User { content } if content.as_str().starts_with("<session-history>") => {
+                parts.push(content.as_str())
+            }
+            _ => break,
+        }
+    }
+    parts.join("\n")
 }
 
 /// The session's persisted instruction-delta rows (oldest first).
@@ -3150,7 +3142,6 @@ async fn instruction_sync_across_edit_swallow_and_restart() {
         "no instruction delta on the first turn: {first:?}"
     );
     let prefix = prefix_of(first);
-    let layers = system_layers(first);
     let static_layer = match &first[0] {
         ChatMessage::System { content } => content.clone(),
         other => panic!("unexpected: {other:?}"),
@@ -3247,11 +3238,11 @@ async fn instruction_sync_across_edit_swallow_and_restart() {
         "the swallowed delta is re-delivered: {third:?}"
     );
     // The checkpoint replaces everything it covers — including the first user
-    // row that used to lead the transcript. The dual system layers are the
-    // part that must keep their bytes.
+    // row that used to lead the transcript — so it is not part of the prefix.
+    // The dual system layers must keep their bytes.
     assert_eq!(
-        system_layers(third),
-        layers,
+        prefix_of(third),
+        prefix,
         "system layers stable across the swallow"
     );
     let checkpoint = match &third[2] {
@@ -3300,6 +3291,11 @@ async fn instruction_sync_across_edit_swallow_and_restart() {
     );
     match &fourth[1] {
         ChatMessage::System { content } => {
+            // Documented one-time re-baseline bust: the baseline is process
+            // memory, re-created from the CURRENT sources at restart, so the
+            // instruction layer now renders "rule two". Byte identity against
+            // the pre-restart prefix holds only when no source changed while
+            // the process was down (covered by the companion test below).
             assert!(
                 content.contains("rule two"),
                 "re-baselined from the current file: {content}"
@@ -3339,4 +3335,48 @@ async fn instruction_sync_across_edit_swallow_and_restart() {
         2,
         "no re-delivery flap on the next turn: {rows:?}"
     );
+}
+
+/// The flip side of the documented re-baseline: a restart with UNTOUCHED
+/// files re-creates the baseline from the same sources, so the whole prefix
+/// is byte-identical and no delta is emitted.
+#[tokio::test]
+async fn restart_with_unchanged_files_keeps_the_request_prefix() {
+    // Both harnesses share the project directory and the database file: only
+    // the process memory (the instruction baseline) is fresh.
+    let project_dir = tempfile::tempdir().expect("project dir");
+    std::fs::write(project_dir.path().join("AGENTS.md"), "rule one\n").expect("seed");
+    let project = project_dir
+        .path()
+        .canonicalize()
+        .expect("canonical project dir")
+        .display()
+        .to_string();
+    let store = tempfile::tempdir().expect("store dir");
+    let db_path = store.path().join("ox.db");
+
+    let harness = Harness::spawn_on(vec![MockChat::text("one")], &db_path).await;
+    let session_id = harness.create_session_in(&project).await;
+    prompt_turn(&harness, &session_id, &project, "first", 1).await;
+    let requests = harness.chat.requests();
+    assert_eq!(requests.len(), 1, "one model call for the turn");
+    let prefix = prefix_of(&requests[0].messages);
+
+    drop(harness);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let restarted = Harness::spawn_on(vec![MockChat::text("two")], &db_path).await;
+    prompt_turn(&restarted, &session_id, &project, "second", 2).await;
+    let requests = restarted.chat.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the restart makes exactly one model call"
+    );
+    assert_eq!(
+        prefix_of(&requests[0].messages),
+        prefix,
+        "a restart with unchanged files keeps the request prefix"
+    );
+    let rows = system_rows(&restarted.db, &session_id).await;
+    assert!(rows.is_empty(), "no delta after a clean restart: {rows:?}");
 }
