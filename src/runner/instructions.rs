@@ -337,6 +337,18 @@ mod tests {
     }
 
     #[test]
+    fn source_appearing_mid_session_renders_its_initial_text() {
+        // baseline 里没有该源（例如 MCP 中途连上 / skills 中途出现）
+        let baseline = baseline(&[]);
+        let deltas = diff(&[agents("rule one")], &BTreeMap::new(), &baseline);
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(
+            deltas[0].text,
+            "Instructions from: /repo/AGENTS.md\nrule one"
+        );
+    }
+
+    #[test]
     fn date_rollover_yields_is_now_text() {
         let baseline = baseline(&[date("Thu Oct 22 2026")]);
         let deltas = diff(&[date("Fri Oct 23 2026")], &BTreeMap::new(), &baseline);
