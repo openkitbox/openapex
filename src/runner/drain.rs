@@ -95,6 +95,8 @@ impl InboxRow {
 pub(crate) struct DrainCtx {
     pub session_id: String,
     pub directory: std::path::PathBuf,
+    /// The ox home directory (`~/.ox`) the global AGENTS.md lives in.
+    pub home: std::path::PathBuf,
     pub config: Arc<Config>,
     pub db: Db,
     pub bus: EventBus,
@@ -785,6 +787,7 @@ mod tests {
             DrainCtx {
                 session_id: self.session_id.clone(),
                 directory: self._dir.path().to_path_buf(),
+                home: crate::config::ox_home(),
                 config: Arc::new(Config::default()),
                 db: self.db.clone(),
                 bus: self.bus.clone(),

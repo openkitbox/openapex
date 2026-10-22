@@ -215,7 +215,11 @@ pub(crate) async fn run(
         } else {
             load_history_after(&ctx.db, &ctx.session_id, floor).await?
         };
-        let observed = prompt::gather(&ctx.directory, ctx.mcp.instructions_block().as_deref());
+        let observed = prompt::gather(
+            &ctx.directory,
+            &ctx.home,
+            ctx.mcp.instructions_block().as_deref(),
+        );
         let instruction_update = sync_instructions(ctx, &observed, &rows).await;
         let system_static = {
             let names: Vec<String> = ctx

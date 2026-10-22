@@ -225,9 +225,11 @@ mod tests {
     fn agents(content: &str) -> Observed {
         Observed {
             key: KEY_INSTRUCTIONS,
-            value: ObservedValue::Present(SourceValue::File {
-                path: "/repo/AGENTS.md".to_owned(),
-                content: content.to_owned(),
+            value: ObservedValue::Present(SourceValue::Files {
+                files: vec![crate::prompt::InstructionFile {
+                    path: "/repo/AGENTS.md".to_owned(),
+                    content: content.to_owned(),
+                }],
             }),
         }
     }

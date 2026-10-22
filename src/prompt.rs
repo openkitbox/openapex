@@ -72,10 +72,10 @@ pub(crate) const KEY_ENVIRONMENT: &str = "core/environment";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum SourceValue {
-    /// `<directory>/AGENTS.md` (upstream discovery file list; ox is single-file).
-    File {
-        path: String,
-        content: String,
+    /// The instruction file list (global first, then project), upstream
+    /// `instruction-discovery.ts`.
+    Files {
+        files: Vec<InstructionFile>,
     },
     Skills {
         skills: Vec<SkillSummary>,
@@ -90,6 +90,14 @@ pub(crate) enum SourceValue {
     Environment {
         value: String,
     },
+}
+
+/// One instruction file in the `core/instructions` list (upstream
+/// `InstructionDiscovery.File`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct InstructionFile {
+    pub path: String,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -120,7 +128,11 @@ pub(crate) struct Observed {
 
 /// Gather this step's sources in upstream combine order
 /// (`session/context.ts:155`): MCP, skills, AGENTS.md, date, environment.
-pub(crate) fn gather(directory: &Path, mcp_instructions: Option<&str>) -> Vec<Observed> {
+pub(crate) fn gather(
+    directory: &Path,
+    home: &Path,
+    mcp_instructions: Option<&str>,
+) -> Vec<Observed> {
     let skills: Vec<SkillSummary> = crate::tool::skills::discover(directory)
         .iter()
         .map(|s| SkillSummary {
@@ -129,22 +141,7 @@ pub(crate) fn gather(directory: &Path, mcp_instructions: Option<&str>) -> Vec<Ob
             description: s.description.clone(),
         })
         .collect();
-    let agents_path = directory.join("AGENTS.md");
-    let agents = match std::fs::read_to_string(&agents_path) {
-        Ok(content) => ObservedValue::Present(SourceValue::File {
-            path: agents_path.display().to_string(),
-            content: content.trim_end().to_owned(),
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ObservedValue::Removed,
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                path = %agents_path.display(),
-                "AGENTS.md unreadable; keeping the previously loaded instructions"
-            );
-            ObservedValue::Unavailable
-        }
-    };
+    let agents = observed_instructions(directory, home);
     vec![
         Observed {
             key: KEY_MCP,
@@ -182,6 +179,44 @@ pub(crate) fn gather(directory: &Path, mcp_instructions: Option<&str>) -> Vec<Ob
     ]
 }
 
+/// The `core/instructions` file list: the global `<home>/AGENTS.md` first,
+/// then the project's `<directory>/AGENTS.md`, deduped by path. A missing
+/// file is normal; any other read failure makes the whole source
+/// `Unavailable` (the model keeps what it already has), and an empty list is
+/// `Removed`.
+fn observed_instructions(directory: &Path, home: &Path) -> ObservedValue {
+    let mut files = Vec::new();
+    let mut unavailable = false;
+    for path in [home.join("AGENTS.md"), directory.join("AGENTS.md")] {
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                let path = path.display().to_string();
+                if !files.iter().any(|file: &InstructionFile| file.path == path) {
+                    files.push(InstructionFile {
+                        path,
+                        content: content.trim_end().to_owned(),
+                    });
+                }
+            }
+            // Missing is normal: the file may not exist yet.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // A transient read failure says nothing about the source: keep
+            // whatever the model already has (upstream `Unavailable`).
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "instruction file unavailable");
+                unavailable = true;
+            }
+        }
+    }
+    if unavailable {
+        ObservedValue::Unavailable
+    } else if files.is_empty() {
+        ObservedValue::Removed
+    } else {
+        ObservedValue::Present(SourceValue::Files { files })
+    }
+}
+
 /// system[1] body: present sources in order, joined by "\n\n" (upstream
 /// `instructions/index.ts:render`). `Removed` and `Unavailable` contribute
 /// nothing; a removal notice is only ever a delta against a baseline.
@@ -201,7 +236,7 @@ pub(crate) fn initial_text(value: &SourceValue) -> String {
     match value {
         SourceValue::Mcp { block } => block.clone(),
         SourceValue::Skills { skills } => render_skills(skills),
-        SourceValue::File { path, content } => format!("Instructions from: {path}\n{content}"),
+        SourceValue::Files { files } => render_instruction_files(files),
         SourceValue::Date { value } => format!("Today's date: {value}"),
         SourceValue::Environment { value } => format!(
             "Here is some useful information about the environment you are running in:\n{value}"
@@ -217,12 +252,9 @@ pub(crate) fn changed_text(value: &SourceValue, previous: Option<&SourceValue>) 
         (SourceValue::Environment { value }, _) => {
             format!("The environment you are running in is now:\n{value}")
         }
-        (
-            SourceValue::File { path, content },
-            Some(SourceValue::File {
-                content: before, ..
-            }),
-        ) => instructions_changed_or_diff(path, before, content),
+        (SourceValue::Files { files: after }, Some(SourceValue::Files { files: before })) => {
+            instruction_files_update(before, after)
+        }
         (SourceValue::Skills { skills: after }, Some(SourceValue::Skills { skills: before })) => {
             skills_update(before, after)
         }
@@ -247,18 +279,72 @@ pub(crate) fn removed_text(key: &str) -> Option<String> {
     }
 }
 
+/// Upstream `instruction-discovery.ts:122-124`: one file renders as
+/// `Instructions from: {path}\n{content}`, files joined by "\n\n".
+fn render_file(file: &InstructionFile) -> String {
+    format!("Instructions from: {}\n{}", file.path, file.content)
+}
+
+fn render_instruction_files(files: &[InstructionFile]) -> String {
+    files
+        .iter()
+        .map(render_file)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Upstream `instruction-discovery.ts:renderUpdate`: a per-path three-way
+/// diff of the file list — removals, additions, then per-file content
+/// changes — joined by "\n\n".
+fn instruction_files_update(before: &[InstructionFile], after: &[InstructionFile]) -> String {
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
+    let mut changed = Vec::new();
+    for file in before {
+        if !after.iter().any(|next| next.path == file.path) {
+            removed.push(format!(
+                "The instructions from {} no longer apply.",
+                file.path
+            ));
+        }
+    }
+    for file in after {
+        match before.iter().find(|previous| previous.path == file.path) {
+            None => added.push(format!(
+                "New instructions apply from:\n{}",
+                render_file(file)
+            )),
+            Some(previous) if previous.content != file.content => {
+                changed.push(instruction_file_changed(previous, file));
+            }
+            Some(_) => {}
+        }
+    }
+    [removed, added, changed]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 /// Upstream `instruction-discovery.ts:137-147`: the diff form wins when shorter.
-fn instructions_changed_or_diff(path: &str, before: &str, after: &str) -> String {
-    let patch =
-        crate::tool::diff::file_diff(path, before, after, crate::tool::diff::DiffStatus::Modified)
-            .patch;
+fn instruction_file_changed(previous: &InstructionFile, current: &InstructionFile) -> String {
+    let patch = crate::tool::diff::file_diff(
+        &current.path,
+        &previous.content,
+        &current.content,
+        crate::tool::diff::DiffStatus::Modified,
+    )
+    .patch;
     let hunks = match patch.find("@@") {
         Some(at) => patch[at..].trim_end().to_owned(),
         None => patch.trim_end().to_owned(),
     };
-    let diff =
-        format!("The instructions from {path} changed. Here's the diff:\n```diff\n{hunks}\n```");
-    let replacement = format!("The instructions changed:\nInstructions from: {path}\n{after}");
+    let diff = format!(
+        "The instructions from {} changed. Here's the diff:\n```diff\n{hunks}\n```",
+        current.path
+    );
+    let replacement = format!("The instructions changed:\n{}", render_file(current));
     if diff.len() < replacement.len() {
         diff
     } else {
@@ -467,7 +553,12 @@ mod tests {
     fn gather_orders_sources_upstream_style() {
         with_isolated_home(|dir| {
             std::fs::write(dir.join("AGENTS.md"), "rule one\n").unwrap();
-            let observed = gather(dir, Some("<mcp_instructions>\n</mcp_instructions>"));
+            let home = tempfile::tempdir().unwrap();
+            let observed = gather(
+                dir,
+                home.path(),
+                Some("<mcp_instructions>\n</mcp_instructions>"),
+            );
             let keys: Vec<&str> = observed.iter().map(|s| s.key).collect();
             assert_eq!(
                 keys,
@@ -486,16 +577,122 @@ mod tests {
             assert!(matches!(observed[1].value, ObservedValue::Removed));
             assert!(matches!(
                 observed[2].value,
-                ObservedValue::Present(SourceValue::File { .. })
+                ObservedValue::Present(SourceValue::Files { .. })
             ));
         });
+    }
+
+    #[test]
+    fn gather_reads_global_then_project_instructions() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("AGENTS.md"), "global rule\n").unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "project rule\n").unwrap();
+        let observed = gather(dir.path(), home.path(), None);
+        let Some(ObservedValue::Present(SourceValue::Files { files })) = observed
+            .iter()
+            .find(|s| s.key == KEY_INSTRUCTIONS)
+            .map(|s| &s.value)
+        else {
+            panic!("instructions source must be present");
+        };
+        assert_eq!(files.len(), 2);
+        assert!(files[0].path.ends_with("AGENTS.md") && files[0].content == "global rule");
+        assert!(files[0].path.starts_with(home.path().to_str().unwrap()));
+        assert!(files[1].path.starts_with(dir.path().to_str().unwrap()));
+        let render = render_initial(&observed);
+        let global_at = render.find("global rule").unwrap();
+        let project_at = render.find("project rule").unwrap();
+        assert!(global_at < project_at, "global instructions render first");
+    }
+
+    #[test]
+    fn gather_dedupes_a_shared_instruction_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "only rule\n").unwrap();
+        // home == directory：同一文件只出现一次
+        let observed = gather(dir.path(), dir.path(), None);
+        let Some(ObservedValue::Present(SourceValue::Files { files })) = observed
+            .iter()
+            .find(|s| s.key == KEY_INSTRUCTIONS)
+            .map(|s| &s.value)
+        else {
+            panic!("present");
+        };
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn instruction_file_set_updates_render_added_and_removed_files() {
+        let global = InstructionFile {
+            path: "/home/.ox/AGENTS.md".into(),
+            content: "global rule".into(),
+        };
+        let project = InstructionFile {
+            path: "/repo/AGENTS.md".into(),
+            content: "project rule".into(),
+        };
+        // 全局文件中途出现（baseline 只有项目文件）
+        let added = changed_text(
+            &SourceValue::Files {
+                files: vec![global.clone(), project.clone()],
+            },
+            Some(&SourceValue::Files {
+                files: vec![project.clone()],
+            }),
+        );
+        assert!(
+            added.starts_with(
+                "New instructions apply from:\nInstructions from: /home/.ox/AGENTS.md\nglobal rule"
+            ),
+            "{added}"
+        );
+        // 全局文件被删
+        let removed = changed_text(
+            &SourceValue::Files {
+                files: vec![project.clone()],
+            },
+            Some(&SourceValue::Files {
+                files: vec![global.clone(), project.clone()],
+            }),
+        );
+        assert_eq!(
+            removed,
+            "The instructions from /home/.ox/AGENTS.md no longer apply."
+        );
+        // 单文件内容变化：diff 或替换形式（每文件独立）
+        let changed = changed_text(
+            &SourceValue::Files {
+                files: vec![InstructionFile {
+                    path: "/repo/AGENTS.md".into(),
+                    content: "new project rule".into(),
+                }],
+            },
+            Some(&SourceValue::Files {
+                files: vec![project],
+            }),
+        );
+        assert!(changed.contains("The instructions"), "{changed}");
+        assert!(changed.contains("new project rule"), "{changed}");
+    }
+
+    #[test]
+    fn unreadable_global_instructions_make_the_source_unavailable() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("AGENTS.md"), "project rule\n").unwrap();
+        std::fs::create_dir(home.path().join("AGENTS.md")).unwrap(); // 目录 → IsADirectory
+        let observed = gather(dir.path(), home.path(), None);
+        let source = observed.iter().find(|s| s.key == KEY_INSTRUCTIONS).unwrap();
+        assert!(matches!(source.value, ObservedValue::Unavailable));
     }
 
     #[test]
     fn initial_render_joins_blocks_in_order() {
         with_isolated_home(|dir| {
             std::fs::write(dir.join("AGENTS.md"), "rule one\n").unwrap();
-            let observed = gather(dir, None);
+            let home = tempfile::tempdir().unwrap();
+            let observed = gather(dir, home.path(), None);
             let render = render_initial(&observed);
             let date_pos = render.find("Today's date: ").unwrap();
             let env_pos = render
@@ -515,26 +712,34 @@ mod tests {
         // would have to restate the whole file.
         let before_body: String = (1..=40).map(|i| format!("rule number {i}\n")).collect();
         let after_body = before_body.replacen("rule number 10\n", "rule number ten\n", 1);
-        let before = SourceValue::File {
-            path: path.into(),
-            content: before_body,
+        let before = SourceValue::Files {
+            files: vec![InstructionFile {
+                path: path.into(),
+                content: before_body,
+            }],
         };
-        let after = SourceValue::File {
-            path: path.into(),
-            content: after_body,
+        let after = SourceValue::Files {
+            files: vec![InstructionFile {
+                path: path.into(),
+                content: after_body,
+            }],
         };
         let text = changed_text(&after, Some(&before));
         assert!(
             text.starts_with("The instructions from /repo/AGENTS.md changed. Here's the diff:"),
             "{text}"
         );
-        let big_after = SourceValue::File {
-            path: path.into(),
-            content: "x".repeat(5000),
+        let big_after = SourceValue::Files {
+            files: vec![InstructionFile {
+                path: path.into(),
+                content: "x".repeat(5000),
+            }],
         };
-        let small_before = SourceValue::File {
-            path: path.into(),
-            content: "old rule".into(),
+        let small_before = SourceValue::Files {
+            files: vec![InstructionFile {
+                path: path.into(),
+                content: "old rule".into(),
+            }],
         };
         let text = changed_text(&big_after, Some(&small_before));
         assert!(
@@ -574,9 +779,11 @@ mod tests {
     #[test]
     fn source_values_serialize_deterministically() {
         let values = [
-            SourceValue::File {
-                path: "/a".into(),
-                content: "x".into(),
+            SourceValue::Files {
+                files: vec![InstructionFile {
+                    path: "/a".into(),
+                    content: "x".into(),
+                }],
             },
             SourceValue::Skills {
                 skills: vec![SkillSummary {
@@ -609,21 +816,23 @@ mod tests {
     #[test]
     fn unreadable_agents_md_is_unavailable_not_removed() {
         let dir = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
         // A directory where the file should be: read_to_string fails with
         // IsADirectory, which is not NotFound.
         std::fs::create_dir(dir.path().join("AGENTS.md")).unwrap();
-        let observed = gather(dir.path(), None);
+        let observed = gather(dir.path(), home.path(), None);
         assert!(matches!(observed[2].value, ObservedValue::Unavailable));
         // Truly absent → Removed.
         std::fs::remove_dir(dir.path().join("AGENTS.md")).unwrap();
-        let observed = gather(dir.path(), None);
+        let observed = gather(dir.path(), home.path(), None);
         assert!(matches!(observed[2].value, ObservedValue::Removed));
     }
 
     #[test]
     fn render_initial_skips_non_present_sources() {
         let dir = tempfile::tempdir().unwrap();
-        let observed = gather(dir.path(), None); // no AGENTS.md / skills / mcp
+        let home = tempfile::tempdir().unwrap();
+        let observed = gather(dir.path(), home.path(), None); // no AGENTS.md / skills / mcp
         let render = render_initial(&observed);
         assert!(!render.contains("Instructions from:"));
         assert!(render.contains("Today's date: "));

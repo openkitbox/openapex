@@ -418,6 +418,9 @@ struct Harness {
     events: Arc<AsyncMutex<Vec<(String, Value)>>>,
     handle: JoinHandle<()>,
     collector: JoinHandle<()>,
+    /// Isolated runner home (`~/.ox` stand-in): write `AGENTS.md` here to
+    /// stage global instructions. Never the developer's real home.
+    home: std::path::PathBuf,
     _dir: TempDir,
 }
 
@@ -478,6 +481,10 @@ impl Harness {
     ) -> Self {
         let port = free_port();
         let dir = tempfile::tempdir().expect("tempdir");
+        // The runner's home is isolated per harness so a developer's
+        // `~/.ox/AGENTS.md` can never leak into a test's system prompt.
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(&home).expect("home dir");
         let mut config = Config {
             db_path: db_path.unwrap_or_else(|| dir.path().join("ox.db")),
             listen: format!("127.0.0.1:{port}"),
@@ -485,9 +492,10 @@ impl Harness {
         };
         config.magic_context.enabled = magic_context;
         let chat = Arc::new(MockChat::new(scripts));
-        let state = ox::build_state_with(config.clone(), chat.clone(), tools)
+        let mut state = ox::build_state_with(config.clone(), chat.clone(), tools)
             .await
             .expect("build state");
+        state.runner = state.runner.with_home(home.clone());
         let db = state.db.clone();
         let bus = state.bus.clone();
         let mut events = bus.subscribe();
@@ -527,6 +535,7 @@ impl Harness {
             events: collected,
             handle,
             collector,
+            home,
             _dir: dir,
         }
     }
@@ -3397,4 +3406,36 @@ async fn restart_with_unchanged_files_keeps_the_request_prefix() {
     );
     let rows = system_rows(&restarted.db, &session_id).await;
     assert!(rows.is_empty(), "no delta after a clean restart: {rows:?}");
+}
+
+/// The global `~/.ox/AGENTS.md` (the harness's isolated home) and the
+/// project's `AGENTS.md` both ride system[1], global first, under the single
+/// `core/instructions` key.
+#[tokio::test]
+async fn global_instructions_render_before_project_instructions() {
+    let harness = Harness::spawn(vec![MockChat::text("hi")]).await;
+    std::fs::write(harness.home.join("AGENTS.md"), "global rule\n").expect("global instructions");
+    let project_dir = tempfile::tempdir().expect("project dir");
+    std::fs::write(project_dir.path().join("AGENTS.md"), "project rule\n").expect("seed");
+    let project = project_dir
+        .path()
+        .canonicalize()
+        .expect("canonical project dir")
+        .display()
+        .to_string();
+    let session_id = harness.create_session_in(&project).await;
+    prompt_turn(&harness, &session_id, &project, "hello", 1).await;
+    let requests = harness.chat.requests();
+    let first = &requests[0].messages;
+    let layer = match &first[1] {
+        ChatMessage::System { content } => content.clone(),
+        other => panic!("unexpected: {other:?}"),
+    };
+    let global = layer.find("global rule").expect("global rule present");
+    let project = layer.find("project rule").expect("project rule present");
+    assert!(global < project, "global renders before project: {layer}");
+    assert!(
+        layer.contains("Instructions from: "),
+        "the layer carries the upstream file header: {layer}"
+    );
 }

@@ -226,12 +226,15 @@ pub static SUBAGENT_HANDLE: std::sync::OnceLock<
     std::sync::Arc<crate::tool::subagent::SubagentHandle>,
 > = std::sync::OnceLock::new();
 
+#[derive(Clone)]
 struct Inner {
     /// The loaded config, shared by reference: nothing reads it mutably, and
     /// every drain/step boundary clones the handle rather than the struct.
     config: std::sync::Arc<Config>,
     /// Canonical project working directory (system prompt + tool roots).
     directory: PathBuf,
+    /// The ox home directory (`~/.ox`) the global AGENTS.md lives in.
+    home: PathBuf,
     db: Db,
     bus: EventBus,
     chat: Arc<dyn Chat>,
@@ -313,6 +316,7 @@ impl Runner {
         let inner = Arc::new(Inner {
             config,
             directory,
+            home: crate::config::ox_home(),
             db,
             bus,
             chat,
@@ -328,6 +332,18 @@ impl Runner {
             });
         }
         Self { inner }
+    }
+
+    /// Override the global home used for global instructions (tests embed a
+    /// temp home so a developer's `~/.ox/AGENTS.md` never leaks in). The
+    /// subagent handle keeps its first binding (a [`Runner::new_with_mcp`]
+    /// attach is first-write-wins), so call this before any dispatch cares.
+    pub fn with_home(mut self, home: PathBuf) -> Self {
+        self.inner = Arc::new(Inner {
+            home,
+            ..(*self.inner).clone()
+        });
+        self
     }
 
     /// Whether work is scheduled or a busy period is currently in flight
@@ -507,6 +523,7 @@ impl ActorTask {
             let ctx = drain::DrainCtx {
                 session_id: self.session_id.clone(),
                 directory: self.session_directory().await,
+                home: self.inner.home.clone(),
                 config: self.inner.config.clone(),
                 db: self.inner.db.clone(),
                 bus: self.inner.bus.clone(),
