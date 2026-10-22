@@ -1321,7 +1321,9 @@ pub(crate) fn build_chat_messages(
                     // omitted from the transcript.
                     continue;
                 }
-                out.push(ChatMessage::User { content: content.into() });
+                out.push(ChatMessage::User {
+                    content: content.into(),
+                });
             }
             Message::Synthetic { text, .. } | Message::Skill { text, .. } => {
                 // A synthetic row with no text is display-only (a background

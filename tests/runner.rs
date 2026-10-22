@@ -1000,9 +1000,7 @@ async fn steers_promote_in_order_before_queue() {
         .messages
         .iter()
         .filter_map(|m| match m {
-            ox::cardinal::wire::ChatMessage::User { content } => {
-                Some(content.as_str().to_owned())
-            }
+            ox::cardinal::wire::ChatMessage::User { content } => Some(content.as_str().to_owned()),
             _ => None,
         })
         .collect();
