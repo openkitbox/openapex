@@ -356,6 +356,55 @@ pub async fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Resu
             insert_message(tx, session_id, seq, &msg).await?;
         }
 
+        E::SessionInstructionsUpdated {
+            session_id,
+            delta,
+            text,
+        } => {
+            // Upstream message-updater.ts:152: an update without text is
+            // bookkeeping only — no transcript row.
+            if let Some(text) = text
+                && !text.is_empty()
+            {
+                let mut metadata = crate::schema::support::Record::new();
+                metadata.insert(
+                    "notice".to_owned(),
+                    serde_json::Value::String("instructions".to_owned()),
+                );
+                metadata.insert(
+                    "instructionSources".to_owned(),
+                    serde_json::Value::Array(
+                        delta
+                            .keys()
+                            .map(|key| serde_json::Value::String(key.clone()))
+                            .collect(),
+                    ),
+                );
+                // ox keeps the delta itself on the row: the wire fold reads it
+                // back (upstream stores hashes in InstructionStateTable instead).
+                metadata.insert(
+                    "instructions".to_owned(),
+                    serde_json::Value::Object(
+                        delta
+                            .iter()
+                            .map(|(key, value)| (key.clone(), value.clone()))
+                            .collect(),
+                    ),
+                );
+                let msg = Message::System {
+                    id: id::from_event(&env.id),
+                    metadata: Some(metadata),
+                    time: TimeCreated { created },
+                    text: text.clone(),
+                    description: Some(format!(
+                        "Instructions updated: {}",
+                        delta.keys().cloned().collect::<Vec<_>>().join(", ")
+                    )),
+                };
+                insert_message(tx, session_id, seq, &msg).await?;
+            }
+        }
+
         E::SessionSynthetic {
             session_id,
             text,

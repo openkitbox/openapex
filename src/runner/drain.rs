@@ -95,6 +95,8 @@ impl InboxRow {
 pub(crate) struct DrainCtx {
     pub session_id: String,
     pub directory: std::path::PathBuf,
+    /// The ox home directory (`~/.ox`) the global AGENTS.md lives in.
+    pub home: std::path::PathBuf,
     pub config: Arc<Config>,
     pub db: Db,
     pub bus: EventBus,
@@ -103,6 +105,11 @@ pub(crate) struct DrainCtx {
     pub model_catalog: Arc<crate::model_catalog::ModelCatalog>,
     /// MCP servers whose instructions join the system prompt.
     pub mcp: Arc<crate::mcp::Hub>,
+    /// Per-session keyed-instruction baselines, shared by every actor of the
+    /// process (the instruction layer's frozen initial render rides system[1]).
+    pub instruction_baselines: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, super::instructions::Baseline>>,
+    >,
 }
 
 /// Run drains until the inbox is quiet, a control interrupts, or a turn
@@ -780,6 +787,7 @@ mod tests {
             DrainCtx {
                 session_id: self.session_id.clone(),
                 directory: self._dir.path().to_path_buf(),
+                home: crate::config::ox_home(),
                 config: Arc::new(Config::default()),
                 db: self.db.clone(),
                 bus: self.bus.clone(),
@@ -789,6 +797,7 @@ mod tests {
                     Vec::new(),
                 )),
                 mcp: Arc::new(crate::mcp::Hub::empty()),
+                instruction_baselines: Default::default(),
             }
         }
     }

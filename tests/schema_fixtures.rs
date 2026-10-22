@@ -525,6 +525,42 @@ fn event_session_usage_updated() {
 }
 
 #[test]
+fn event_session_instructions_updated() {
+    round_trip_event(
+        "session.instructions.updated",
+        json!({
+            "sessionID": "ses_01",
+            "delta": { "core/date": "abc123", "core/env": null },
+            "text": "Today's date is now: Fri Oct 23 2026"
+        }),
+    );
+    // `text` is optional: absent marks a bookkeeping-only delta.
+    round_trip_event(
+        "session.instructions.updated",
+        json!({ "sessionID": "ses_01", "delta": {} }),
+    );
+
+    // The minimal wire shape must decode into the typed variant, not Unknown.
+    let parsed: EventEnvelope = serde_json::from_value(envelope(
+        "session.instructions.updated",
+        json!({ "sessionID": "ses_01", "delta": { "core/date": "abc123" } }),
+    ))
+    .unwrap();
+    match parsed.parse_typed().data {
+        SessionEventData::SessionInstructionsUpdated {
+            session_id,
+            delta,
+            text,
+        } => {
+            assert_eq!(session_id, "ses_01");
+            assert_eq!(delta["core/date"], json!("abc123"));
+            assert_eq!(text, None);
+        }
+        other => panic!("expected SessionInstructionsUpdated, got {other:?}"),
+    }
+}
+
+#[test]
 fn event_session_synthetic() {
     round_trip_event(
         "session.synthetic",
@@ -569,6 +605,14 @@ fn event_session_message_content_updated() {
                 }
             ]
         }),
+    );
+}
+
+#[test]
+fn event_session_viewed() {
+    round_trip_event(
+        "session.viewed",
+        json!({ "sessionID": "ses_01", "idle": 1700000000000_i64 }),
     );
 }
 
@@ -886,9 +930,7 @@ fn unknown_event_round_trips_losslessly() {
     for kind in [
         "session.skill.started",
         "session.shell.started",
-        "session.instructions.updated",
         "session.revert.committed",
-        "session.viewed",
         "session.archived",
         "session.idle",
         "some.future.event",

@@ -27,6 +27,7 @@ pub use crate::cardinal::chat::Chat;
 pub(crate) mod compaction;
 pub mod drain;
 mod historian_trigger;
+pub(crate) mod instructions;
 pub(crate) mod provider_error;
 pub mod step;
 pub(crate) mod title;
@@ -231,6 +232,8 @@ struct Inner {
     config: std::sync::Arc<Config>,
     /// Canonical project working directory (system prompt + tool roots).
     directory: PathBuf,
+    /// The ox home directory (`~/.ox`) the global AGENTS.md lives in.
+    home: PathBuf,
     db: Db,
     bus: EventBus,
     chat: Arc<dyn Chat>,
@@ -240,6 +243,11 @@ struct Inner {
     /// Connected MCP servers: tools (registered before the runner was built)
     /// plus the instruction block the system prompt carries.
     mcp: Arc<crate::mcp::Hub>,
+    /// Per-session keyed-instruction baselines (process memory only; a restart
+    /// re-baselines from current sources and the wire fold corrects stale
+    /// delta rows).
+    instruction_baselines:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, instructions::Baseline>>>,
     sessions: DashMap<String, SessionHandle>,
 }
 
@@ -304,7 +312,7 @@ impl Runner {
         model_catalog: Arc<crate::model_catalog::ModelCatalog>,
         mcp: Arc<crate::mcp::Hub>,
     ) -> Self {
-        let inner = Arc::new(Inner {
+        Self::new_with_mcp_and_home(
             config,
             directory,
             db,
@@ -313,6 +321,37 @@ impl Runner {
             tools,
             model_catalog,
             mcp,
+            crate::config::ox_home(),
+        )
+    }
+
+    /// Same as [`Runner::new_with_mcp`], with an explicit global home for the
+    /// global instruction file (tests embed a temp home so a developer's
+    /// `~/.ox/AGENTS.md` never leaks in). The home must be set at
+    /// construction: the inner state attaches to the subagent registry here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_mcp_and_home(
+        config: std::sync::Arc<Config>,
+        directory: PathBuf,
+        db: Db,
+        bus: EventBus,
+        chat: Arc<dyn Chat>,
+        tools: Arc<ToolRegistry>,
+        model_catalog: Arc<crate::model_catalog::ModelCatalog>,
+        mcp: Arc<crate::mcp::Hub>,
+        home: PathBuf,
+    ) -> Self {
+        let inner = Arc::new(Inner {
+            config,
+            directory,
+            home,
+            db,
+            bus,
+            chat,
+            tools,
+            model_catalog,
+            mcp,
+            instruction_baselines: Default::default(),
             sessions: DashMap::new(),
         });
         if let Some(handle) = SUBAGENT_HANDLE.get() {
@@ -500,6 +539,7 @@ impl ActorTask {
             let ctx = drain::DrainCtx {
                 session_id: self.session_id.clone(),
                 directory: self.session_directory().await,
+                home: self.inner.home.clone(),
                 config: self.inner.config.clone(),
                 db: self.inner.db.clone(),
                 bus: self.inner.bus.clone(),
@@ -507,6 +547,7 @@ impl ActorTask {
                 tools: self.inner.tools.clone(),
                 model_catalog: Arc::clone(&self.inner.model_catalog),
                 mcp: self.inner.mcp.clone(),
+                instruction_baselines: self.inner.instruction_baselines.clone(),
             };
             let mut scope = drain::Promotable::Input;
             loop {
@@ -589,6 +630,10 @@ impl ActorTask {
         // The actor is done for good; drop the registry entry so a later
         // dispatch builds a fresh handle instead of messaging a dead mailbox.
         self.inner.sessions.remove(&self.session_id);
+        // Same for the keyed-instruction baseline: its frozen initial render
+        // would otherwise live (and grow) with every session the process
+        // ever saw. A later dispatch simply re-baselines from the sources.
+        lock(&self.inner.instruction_baselines).remove(&self.session_id);
     }
 
     /// The session's project directory: the `directory` recorded on the

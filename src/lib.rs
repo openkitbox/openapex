@@ -85,8 +85,24 @@ pub async fn build_state_with(
     chat: std::sync::Arc<dyn runner::Chat>,
     tools: runner::ToolRegistry,
 ) -> Result<AppState> {
+    build_state_with_home(config, chat, tools, crate::config::ox_home()).await
+}
+
+/// [`build_state_with`] with an explicit global home for the runner's global
+/// instruction file, set at runner construction (before the subagent handle
+/// attach): tests embed a temp home so a developer's `~/.ox/AGENTS.md` never
+/// leaks into a test's system prompt.
+pub async fn build_state_with_home(
+    config: Config,
+    chat: std::sync::Arc<dyn runner::Chat>,
+    tools: runner::ToolRegistry,
+    home: std::path::PathBuf,
+) -> Result<AppState> {
     let db = Db::open(&config.db_path).await?;
-    build_state_on(config, chat, tools, db).await
+    // The env block advertises <ox_home>/tmp as the preferred scratch space
+    // (upstream `global.tmp`); create it once at boot.
+    let _ = std::fs::create_dir_all(crate::config::ox_home().join("tmp"));
+    build_state_on(config, chat, tools, db, home).await
 }
 
 /// The shared tail of [`build_state_with`]: state over an already-open
@@ -97,9 +113,10 @@ async fn build_state_on(
     chat: std::sync::Arc<dyn runner::Chat>,
     tools: runner::ToolRegistry,
     db: Db,
+    home: std::path::PathBuf,
 ) -> Result<AppState> {
     let bus = EventBus::new(db.clone());
-    build_state_on_with_bus(config, chat, tools, db, bus).await
+    build_state_on_with_bus(config, chat, tools, db, bus, home).await
 }
 
 /// [`build_state_on`] over a caller-supplied event bus, so the composition
@@ -110,6 +127,7 @@ async fn build_state_on_with_bus(
     mut tools: runner::ToolRegistry,
     db: Db,
     bus: EventBus,
+    home: std::path::PathBuf,
 ) -> Result<AppState> {
     if config.magic_context.enabled {
         let embedder = mctx::embed::Embedder::from_config(&config.magic_context.embedding);
@@ -146,7 +164,7 @@ async fn build_state_on_with_bus(
     let tools = Arc::new(tools);
     let db_handle = db.clone();
     let bus_handle = bus.clone();
-    let runner = Runner::new_with_mcp(
+    let runner = Runner::new_with_mcp_and_home(
         std::sync::Arc::clone(&config),
         directory.clone(),
         db,
@@ -155,6 +173,7 @@ async fn build_state_on_with_bus(
         tools,
         Arc::clone(&model_catalog),
         Arc::clone(&mcp),
+        home,
     );
     Ok(AppState {
         config,
@@ -206,7 +225,8 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
     tools.register_todowrite(db.clone());
     tools.register_subagent(db.clone(), bus.clone(), config.subagent.depth);
     let chat = cardinal_chat(&config)?;
-    let state = build_state_on_with_bus(config, chat, tools, db, bus).await?;
+    let state =
+        build_state_on_with_bus(config, chat, tools, db, bus, crate::config::ox_home()).await?;
     // Fetch the model list before serving, so the first client that asks
     // (`/api/model` at TUI startup) gets models instead of an empty list. A
     // failure only warns: the request path retries on its own TTL.

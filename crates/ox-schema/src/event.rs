@@ -19,8 +19,8 @@
 //!
 //! Scope: the event groups the chat path actually emits (Session lifecycle,
 //! Execution, Inbox, Step, Text, Reasoning, Tool, RetryScheduled, Synthetic,
-//! MessageContentUpdated). Skill/Shell event groups, `session.instructions.updated`,
-//! and the revert group are NOT ported and fall back to `Unknown`.
+//! InstructionsUpdated, MessageContentUpdated). Skill/Shell event groups and
+//! the revert group are NOT ported and fall back to `Unknown`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -136,9 +136,9 @@ pub enum StepFailedFinish {
 /// adapter shape used by [`SessionEventData::from_parts`] /
 /// [`SessionEventData::into_parts`]; it never appears on the wire as-is.
 ///
-/// Unknown event types (including the un-ported groups: skill/shell events,
-/// `session.instructions.updated`, `session.revert.*`, `session.moved`,
-/// compaction events) deserialize losslessly as [`SessionEventData::Unknown`].
+/// Unknown event types (including the un-ported groups: skill/shell events
+/// and `session.revert.*`) deserialize losslessly as
+/// [`SessionEventData::Unknown`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "data")]
 pub enum SessionEventData {
@@ -206,6 +206,19 @@ pub enum SessionEventData {
         session_id: String,
         cost: MoneyUsd,
         tokens: TokenUsage,
+    },
+    /// Upstream `SessionEvent.InstructionsUpdated`: a keyed-instruction delta.
+    /// `text` absent = bookkeeping only (no transcript row, mirroring the
+    /// upstream updater). `delta` maps source key → hash (`"removed"` =
+    /// removed, upstream `Instruction.removed`). Metadata rides on the
+    /// envelope only; the projector builds the row metadata from `delta`.
+    #[serde(rename = "session.instructions.updated")]
+    SessionInstructionsUpdated {
+        #[serde(rename = "sessionID")]
+        session_id: String,
+        delta: Record,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
     },
     #[serde(rename = "session.synthetic")]
     SessionSynthetic {
@@ -629,6 +642,7 @@ impl SessionEventData {
             SessionEventData::SessionForked { .. } => "session.forked",
             SessionEventData::SessionUsageRecorded { .. } => "session.usage.recorded",
             SessionEventData::SessionUsageUpdated { .. } => "session.usage.updated",
+            SessionEventData::SessionInstructionsUpdated { .. } => "session.instructions.updated",
             SessionEventData::SessionSynthetic { .. } => "session.synthetic",
             SessionEventData::SessionRetryScheduled { .. } => "session.retry.scheduled",
             SessionEventData::SessionMessageContentUpdated { .. } => {
@@ -691,6 +705,7 @@ impl SessionEventData {
             | SessionEventData::SessionForked { session_id, .. }
             | SessionEventData::SessionUsageRecorded { session_id, .. }
             | SessionEventData::SessionUsageUpdated { session_id, .. }
+            | SessionEventData::SessionInstructionsUpdated { session_id, .. }
             | SessionEventData::SessionSynthetic { session_id, .. }
             | SessionEventData::SessionRetryScheduled { session_id, .. }
             | SessionEventData::SessionMessageContentUpdated { session_id, .. }

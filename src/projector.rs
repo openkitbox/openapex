@@ -232,7 +232,8 @@ pub async fn project(
         E::SessionForked { .. } => project_fork(tx, env).await?,
 
         // Message-updater events.
-        E::SessionSynthetic { .. }
+        E::SessionInstructionsUpdated { .. }
+        | E::SessionSynthetic { .. }
         | E::SessionRetryScheduled { .. }
         | E::SessionMessageContentUpdated { .. }
         | E::StepStarted { .. }
