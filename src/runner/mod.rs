@@ -597,6 +597,10 @@ impl ActorTask {
         // The actor is done for good; drop the registry entry so a later
         // dispatch builds a fresh handle instead of messaging a dead mailbox.
         self.inner.sessions.remove(&self.session_id);
+        // Same for the keyed-instruction baseline: its frozen initial render
+        // would otherwise live (and grow) with every session the process
+        // ever saw. A later dispatch simply re-baselines from the sources.
+        lock(&self.inner.instruction_baselines).remove(&self.session_id);
     }
 
     /// The session's project directory: the `directory` recorded on the

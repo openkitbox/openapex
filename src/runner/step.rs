@@ -241,9 +241,20 @@ pub(crate) async fn run(
         );
         // The delta row is durable for future steps; this step's already-loaded
         // rows predate it, so the text rides this request in memory (upstream
-        // `generate.ts:55` appends `Message.system(instructionUpdate)`).
+        // `generate.ts:55` places `Message.system(instructionUpdate)` after the
+        // transcript and BEFORE the current prompt).
         if let Some(text) = instruction_update {
-            chat_messages.push(ChatMessage::System { content: text });
+            let delta = ChatMessage::System { content: text };
+            // Upstream `generate.ts:55` places the update before the current
+            // prompt (the transcript's trailing user row on the first
+            // attempt); later attempts end with tool output and tail-append.
+            match chat_messages.last() {
+                Some(ChatMessage::User { .. }) => {
+                    let at = chat_messages.len() - 1;
+                    chat_messages.insert(at, delta);
+                }
+                _ => chat_messages.push(delta),
+            }
         }
         let mut request = ChatRequest::new(
             // cardinal routes on the bare model id; the providerID/modelID
