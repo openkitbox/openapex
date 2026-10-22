@@ -551,12 +551,10 @@ fn event_session_instructions_updated() {
             session_id,
             delta,
             text,
-            metadata,
         } => {
             assert_eq!(session_id, "ses_01");
             assert_eq!(delta["core/date"], json!("abc123"));
             assert_eq!(text, None);
-            assert_eq!(metadata, None);
         }
         other => panic!("expected SessionInstructionsUpdated, got {other:?}"),
     }

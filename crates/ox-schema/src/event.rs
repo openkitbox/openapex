@@ -210,7 +210,8 @@ pub enum SessionEventData {
     /// Upstream `SessionEvent.InstructionsUpdated`: a keyed-instruction delta.
     /// `text` absent = bookkeeping only (no transcript row, mirroring the
     /// upstream updater). `delta` maps source key → hash (`"removed"` =
-    /// removed, upstream `Instruction.removed`).
+    /// removed, upstream `Instruction.removed`). Metadata rides on the
+    /// envelope only; the projector builds the row metadata from `delta`.
     #[serde(rename = "session.instructions.updated")]
     SessionInstructionsUpdated {
         #[serde(rename = "sessionID")]
@@ -218,8 +219,6 @@ pub enum SessionEventData {
         delta: Record,
         #[serde(skip_serializing_if = "Option::is_none")]
         text: Option<String>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        metadata: Option<Record>,
     },
     #[serde(rename = "session.synthetic")]
     SessionSynthetic {

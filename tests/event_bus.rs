@@ -927,17 +927,11 @@ async fn instructions_updated_projects_a_system_row() {
     create(&bus, "s1").await;
     let delta: Record =
         serde_json::from_value(serde_json::json!({"core/date": "abc123"})).expect("delta record");
-    let metadata: Record = serde_json::from_value(serde_json::json!({
-        "notice": "instructions",
-        "instructionSources": ["core/date"],
-        "instructions": {"core/date": "abc123"},
-    }))
-    .expect("metadata record");
+    // The event data carries no `metadata`: the row metadata is projector-built.
     bus.publish(SessionEventData::SessionInstructionsUpdated {
         session_id: "s1".to_string(),
         delta,
         text: Some("Today's date is now: Fri Oct 23 2026".to_string()),
-        metadata: Some(metadata),
     })
     .await
     .unwrap();
@@ -946,7 +940,6 @@ async fn instructions_updated_projects_a_system_row() {
         session_id: "s1".to_string(),
         delta: Default::default(),
         text: None,
-        metadata: None,
     })
     .await
     .unwrap();
@@ -961,6 +954,11 @@ async fn instructions_updated_projects_a_system_row() {
         serde_json::from_str(&row.get::<String>(0).expect("data")).expect("json");
     assert_eq!(data["text"], "Today's date is now: Fri Oct 23 2026");
     assert_eq!(data["description"], "Instructions updated: core/date");
+    assert_eq!(data["metadata"]["notice"], "instructions");
+    assert_eq!(
+        data["metadata"]["instructionSources"],
+        serde_json::json!(["core/date"])
+    );
     assert_eq!(data["metadata"]["instructions"]["core/date"], "abc123");
     let mut stmt = conn
         .prepare("SELECT COUNT(*) FROM session_message WHERE session_id = ?1 AND type = 'system'")
