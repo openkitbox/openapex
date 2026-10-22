@@ -1,12 +1,16 @@
 //! Skills: user-authored instruction files the model can load on demand.
 //!
 //! The discovery contract mirrors upstream opencode
-//! (`packages/core/src/config/plugin/skill-scan.ts`): every `skill`/`skills`
-//! directory in the configured config directories is scanned, a directory with
-//! a `SKILL.md` is a skill whose id is the directory name, and a top-level
+//! (`packages/core/src/config/plugin/skill-scan.ts`): a directory with a
+//! `SKILL.md` is a skill whose id is the directory name, and a top-level
 //! `*.md` file is a skill whose id is the file stem. Frontmatter carries the
 //! display `name` and `description`; everything after it is the body the
 //! `skill` tool loads into the conversation.
+//!
+//! Deliberate deviation from upstream: the roots are ox-native `.ox` paths
+//! (project `.ox/skill(s)` + global `~/.ox/skill(s)`) instead of upstream's
+//! bare `skill(s)` dirs and opencode-branded config paths, so ox owns its
+//! skills namespace and never reads another tool's config directory.
 
 use std::path::{Path, PathBuf};
 
@@ -25,20 +29,16 @@ pub struct Skill {
 }
 
 /// The directories skills are discovered under, in precedence order: the
-/// project-local skill dirs, then the global config ones. Each is scanned
-/// shallowly (a skill directory does not contain skills).
+/// project-local `.ox` skill dirs, then the global `~/.ox` ones. Each is
+/// scanned shallowly (a skill directory does not contain skills).
 fn roots(directory: &Path) -> Vec<PathBuf> {
     let mut roots = vec![
-        directory.join("skill"),
-        directory.join("skills"),
-        directory.join(".opencode").join("skill"),
-        directory.join(".opencode").join("skills"),
+        directory.join(".ox").join("skill"),
+        directory.join(".ox").join("skills"),
     ];
     if let Some(home) = dirs_home() {
-        roots.push(home.join(".config").join("opencode").join("skill"));
-        roots.push(home.join(".config").join("opencode").join("skills"));
-        roots.push(home.join(".opencode").join("skill"));
-        roots.push(home.join(".opencode").join("skills"));
+        roots.push(home.join(".ox").join("skill"));
+        roots.push(home.join(".ox").join("skills"));
     }
     roots
 }
@@ -159,6 +159,34 @@ fn value(frontmatter: &str, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn roots_are_ox_native_project_and_global_paths() {
+        // Serialize HOME redirection: cargo runs tests on parallel threads and
+        // `std::env::set_var` is process-global.
+        static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home.path()) };
+        let dir = tempfile::tempdir().unwrap();
+        let roots = roots(dir.path());
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert_eq!(
+            roots,
+            vec![
+                dir.path().join(".ox").join("skill"),
+                dir.path().join(".ox").join("skills"),
+                home.path().join(".ox").join("skill"),
+                home.path().join(".ox").join("skills"),
+            ]
+        );
+    }
 
     #[test]
     fn directory_and_file_skills_are_discovered_with_ids() {

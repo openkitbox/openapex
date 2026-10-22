@@ -529,7 +529,7 @@ mod tests {
     static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Run `f` with HOME pointed at an empty tempdir so the host's global
-    /// skill roots (`~/.config/opencode/skills`) cannot leak into discovery.
+    /// skill roots (`~/.ox/skills`) cannot leak into discovery.
     fn with_isolated_home<R>(f: impl FnOnce(&Path) -> R) -> R {
         let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = tempfile::tempdir().unwrap();
