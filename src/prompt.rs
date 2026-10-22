@@ -7,6 +7,8 @@
 
 use std::path::Path;
 
+use serde::Serialize;
+
 /// Build the system prompt for a step: an environment block (working
 /// directory, platform, today's UTC date) plus `AGENTS.md` contents read
 /// from `directory` when present (read fresh each step — small files only).
@@ -125,6 +127,290 @@ fn tool_guidance(tool_names: &[&str]) -> String {
     instructions.join("\n")
 }
 
+pub(crate) const KEY_MCP: &str = "core/mcp-guidance";
+pub(crate) const KEY_SKILLS: &str = "core/skill-guidance";
+pub(crate) const KEY_INSTRUCTIONS: &str = "core/instructions";
+pub(crate) const KEY_DATE: &str = "core/date";
+pub(crate) const KEY_ENVIRONMENT: &str = "core/environment";
+
+/// One keyed source's observed value; `None` = the source is currently absent
+/// (upstream `Instructions.removed`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum SourceValue {
+    /// `<directory>/AGENTS.md` (upstream discovery file list; ox is single-file).
+    File {
+        path: String,
+        content: String,
+    },
+    Skills(Vec<SkillSummary>),
+    /// Pre-rendered `<mcp_instructions>` block from the MCP hub.
+    Mcp(String),
+    Date(String),
+    Environment(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SkillSummary {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+pub(crate) struct Observed {
+    pub key: &'static str,
+    pub value: Option<SourceValue>,
+}
+
+/// Gather this step's sources in upstream combine order
+/// (`session/context.ts:155`): MCP, skills, AGENTS.md, date, environment.
+pub(crate) fn gather(directory: &Path, mcp_instructions: Option<&str>) -> Vec<Observed> {
+    let skills: Vec<SkillSummary> = crate::tool::skills::discover(directory)
+        .iter()
+        .map(|s| SkillSummary {
+            id: s.id.clone(),
+            name: s.name.clone(),
+            description: s.description.clone(),
+        })
+        .collect();
+    let agents = std::fs::read_to_string(directory.join("AGENTS.md"))
+        .ok()
+        .map(|content| SourceValue::File {
+            path: directory.join("AGENTS.md").display().to_string(),
+            content: content.trim_end().to_owned(),
+        });
+    vec![
+        Observed {
+            key: KEY_MCP,
+            value: mcp_instructions.map(|b| SourceValue::Mcp(b.to_owned())),
+        },
+        Observed {
+            key: KEY_SKILLS,
+            value: (!skills.is_empty()).then_some(SourceValue::Skills(skills)),
+        },
+        Observed {
+            key: KEY_INSTRUCTIONS,
+            value: agents,
+        },
+        Observed {
+            key: KEY_DATE,
+            value: Some(SourceValue::Date(date_string())),
+        },
+        Observed {
+            key: KEY_ENVIRONMENT,
+            value: Some(SourceValue::Environment(env_block(directory))),
+        },
+    ]
+}
+
+/// system[1] body: present sources in order, joined by "\n\n" (upstream
+/// `instructions/index.ts:render`).
+pub(crate) fn render_initial(sources: &[Observed]) -> String {
+    sources
+        .iter()
+        .filter_map(|s| s.value.as_ref().map(initial_text))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Upstream per-source `initial` renderers.
+pub(crate) fn initial_text(value: &SourceValue) -> String {
+    match value {
+        SourceValue::Mcp(block) => block.clone(),
+        SourceValue::Skills(skills) => render_skills(skills),
+        SourceValue::File { path, content } => format!("Instructions from: {path}\n{content}"),
+        SourceValue::Date(date) => format!("Today's date: {date}"),
+        SourceValue::Environment(env) => format!(
+            "Here is some useful information about the environment you are running in:\n{env}"
+        ),
+    }
+}
+
+/// Upstream per-source `changed` renderers; `previous: None` falls back to
+/// the initial render (upstream `instructions/index.ts:111`).
+pub(crate) fn changed_text(value: &SourceValue, previous: Option<&SourceValue>) -> String {
+    match (value, previous) {
+        (SourceValue::Date(date), _) => format!("Today's date is now: {date}"),
+        (SourceValue::Environment(env), _) => {
+            format!("The environment you are running in is now:\n{env}")
+        }
+        (
+            SourceValue::File { path, content },
+            Some(SourceValue::File {
+                content: before, ..
+            }),
+        ) => instructions_changed_or_diff(path, before, content),
+        (SourceValue::Skills(after), Some(SourceValue::Skills(before))) => {
+            skills_update(before, after)
+        }
+        (SourceValue::Mcp(block), Some(_)) => format!(
+            "The available MCP server instructions have changed. This list supersedes the previous one.\n{block}"
+        ),
+        (v, _) => initial_text(v),
+    }
+}
+
+/// Upstream per-source `removed` renderers; `None` = not deliverable
+/// (date/env are always present).
+pub(crate) fn removed_text(previous: &SourceValue) -> Option<String> {
+    match previous {
+        SourceValue::Mcp(_) => Some("MCP server instructions are no longer available.".to_owned()),
+        SourceValue::Skills(_) => Some(
+            "Skill guidance is no longer available. Do not use any previously listed skill."
+                .to_owned(),
+        ),
+        SourceValue::File { .. } => {
+            Some("Previously loaded instructions no longer apply.".to_owned())
+        }
+        SourceValue::Date(_) | SourceValue::Environment(_) => None,
+    }
+}
+
+/// Upstream `instruction-discovery.ts:137-147`: the diff form wins when shorter.
+fn instructions_changed_or_diff(path: &str, before: &str, after: &str) -> String {
+    let patch =
+        crate::tool::diff::file_diff(path, before, after, crate::tool::diff::DiffStatus::Modified)
+            .patch;
+    let hunks = match patch.find("@@") {
+        Some(at) => patch[at..].trim_end().to_owned(),
+        None => patch.trim_end().to_owned(),
+    };
+    let diff =
+        format!("The instructions from {path} changed. Here's the diff:\n```diff\n{hunks}\n```");
+    let replacement = format!("The instructions changed:\nInstructions from: {path}\n{after}");
+    if diff.len() < replacement.len() {
+        diff
+    } else {
+        replacement
+    }
+}
+
+/// Upstream `skill/instructions.ts:render`, plus ox's escaping and optional
+/// description (documented deviation: upstream assumes a description).
+fn render_skills(skills: &[SkillSummary]) -> String {
+    let mut out = String::from(
+        "Skills provide specialized instructions and workflows for specific tasks.\n\
+         Use the skill tool to load a skill when a task matches its description.\n\
+         The user may also invoke a skill directly. When that happens, its instructions appear in the conversation as a <skill_content> block, the same shape the skill tool returns. A skill that is already present this way does not need to be invoked again.\n",
+    );
+    if skills.is_empty() {
+        out.push_str("No skills are currently available.");
+        return out;
+    }
+    out.push_str("<available_skills>\n");
+    push_skill_entries(&mut out, skills);
+    out.push_str("</available_skills>");
+    out
+}
+
+fn push_skill_entries(out: &mut String, skills: &[SkillSummary]) {
+    for skill in skills {
+        out.push_str("  <skill>\n");
+        out.push_str(&format!("    <id>{}</id>\n", escape(&skill.id)));
+        out.push_str(&format!("    <name>{}</name>\n", escape(&skill.name)));
+        if let Some(description) = &skill.description {
+            out.push_str(&format!(
+                "    <description>{}</description>\n",
+                escape(description)
+            ));
+        }
+        out.push_str("  </skill>\n");
+    }
+}
+
+/// Upstream `skill/instructions.ts:update` — per-id added/changed/removed,
+/// full restatement only when no entry differs.
+fn skills_update(before: &[SkillSummary], after: &[SkillSummary]) -> String {
+    let added: Vec<&SkillSummary> = after
+        .iter()
+        .filter(|s| !before.iter().any(|b| b.id == s.id))
+        .collect();
+    let changed: Vec<&SkillSummary> = after
+        .iter()
+        .filter(|s| {
+            before
+                .iter()
+                .any(|b| b.id == s.id && (b.name != s.name || b.description != s.description))
+        })
+        .collect();
+    let removed: Vec<&str> = before
+        .iter()
+        .filter(|b| !after.iter().any(|s| s.id == b.id))
+        .map(|b| b.id.as_str())
+        .collect();
+    if added.is_empty() && changed.is_empty() && removed.is_empty() {
+        return format!(
+            "The available skills have changed. This list supersedes the previous available skills list.\n{}",
+            render_skills(after)
+        );
+    }
+    let mut sections: Vec<String> = Vec::new();
+    if !added.is_empty() {
+        let mut s =
+            String::from("New skills are available in addition to those previously listed:\n");
+        push_skill_entries(
+            &mut s,
+            &added.iter().map(|s| (*s).clone()).collect::<Vec<_>>(),
+        );
+        sections.push(s.trim_end().to_owned());
+    }
+    if !changed.is_empty() {
+        let mut s = String::from(
+            "The following skills have changed. Each entry replaces the previously listed skill with the same ID:\n",
+        );
+        push_skill_entries(
+            &mut s,
+            &changed.iter().map(|s| (*s).clone()).collect::<Vec<_>>(),
+        );
+        sections.push(s.trim_end().to_owned());
+    }
+    if !removed.is_empty() {
+        sections.push(format!(
+            "The following skill IDs are no longer available and must not be used: {}.",
+            removed.join(", ")
+        ));
+    }
+    sections.join("\n")
+}
+
+/// Upstream env block (`instructions/builtins.ts:36-46`). ox has no workspace
+/// concept: workspace root == working directory; `global.tmp` → `<ox_home>/tmp`.
+fn env_block(directory: &Path) -> String {
+    let tmp = crate::config::ox_home().join("tmp");
+    format!(
+        "<env>\n  Working directory: {}\n  Workspace root folder: {}\n  Is directory a git repo: {}\n  Platform: {}\n  Prefer {} over generic system temporary directories such as /tmp; it is pre-created and approved for external access.\n</env>",
+        directory.display(),
+        directory.display(),
+        if directory.join(".git").exists() {
+            "yes"
+        } else {
+            "no"
+        },
+        std::env::consts::OS,
+        tmp.display(),
+    )
+}
+
+/// JS `Date#toDateString` format ("Thu Oct 22 2026"), UTC.
+fn date_string() -> String {
+    date_string_from_days(crate::id::now_millis().div_euclid(86_400_000))
+}
+
+fn date_string_from_days(days: i64) -> String {
+    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let iso = days_to_iso(days); // "YYYY-MM-DD"
+    let year = &iso[0..4];
+    let month: usize = iso[5..7].parse().expect("days_to_iso month");
+    let day = &iso[8..10];
+    // 1970-01-01 (day 0) was a Thursday.
+    let weekday = WEEKDAYS[((days + 4).rem_euclid(7)) as usize];
+    format!("{weekday} {month} {day} {year}", month = MONTHS[month - 1])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +481,128 @@ mod tests {
         assert!(!none.contains("- Prefer dedicated tools over shell commands;"));
         let edit = system_static(&["edit"]);
         assert!(edit.contains("- Use the edit tool for targeted changes to existing text files."));
+    }
+
+    /// Serializes the tests that redirect HOME: cargo runs tests on parallel
+    /// threads and `std::env::set_var` is process-global.
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Run `f` with HOME pointed at an empty tempdir so the host's global
+    /// skill roots (`~/.config/opencode/skills`) cannot leak into discovery.
+    fn with_isolated_home<R>(f: impl FnOnce(&Path) -> R) -> R {
+        let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        // SAFETY: serialized by HOME_LOCK; the other prompt tests that may
+        // run concurrently do not assert on HOME-derived content, so a
+        // momentarily redirected HOME cannot change their outcome.
+        let previous = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home.path()) };
+        let result = f(home.path());
+        // SAFETY: same serialization as above.
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn gather_orders_sources_upstream_style() {
+        with_isolated_home(|dir| {
+            std::fs::write(dir.join("AGENTS.md"), "rule one\n").unwrap();
+            let observed = gather(dir, Some("<mcp_instructions>\n</mcp_instructions>"));
+            let keys: Vec<&str> = observed.iter().map(|s| s.key).collect();
+            assert_eq!(
+                keys,
+                [
+                    KEY_MCP,
+                    KEY_SKILLS,
+                    KEY_INSTRUCTIONS,
+                    KEY_DATE,
+                    KEY_ENVIRONMENT
+                ]
+            );
+            assert!(matches!(observed[0].value, Some(SourceValue::Mcp(_))));
+            assert!(observed[1].value.is_none());
+            assert!(matches!(observed[2].value, Some(SourceValue::File { .. })));
+        });
+    }
+
+    #[test]
+    fn initial_render_joins_blocks_in_order() {
+        with_isolated_home(|dir| {
+            std::fs::write(dir.join("AGENTS.md"), "rule one\n").unwrap();
+            let observed = gather(dir, None);
+            let render = render_initial(&observed);
+            let date_pos = render.find("Today's date: ").unwrap();
+            let env_pos = render
+                .find("Here is some useful information about the environment")
+                .unwrap();
+            let agents_pos = render.find("Instructions from: ").unwrap();
+            assert!(agents_pos < date_pos && date_pos < env_pos);
+            assert!(!render.contains("<mcp_instructions>"));
+        });
+    }
+
+    #[test]
+    fn changed_renderings_match_upstream() {
+        let path = "/repo/AGENTS.md";
+        // One-line change in a long file: upstream picks whichever rendering
+        // is shorter, so the diff form only wins when the replacement form
+        // would have to restate the whole file.
+        let before_body: String = (1..=40).map(|i| format!("rule number {i}\n")).collect();
+        let after_body = before_body.replacen("rule number 10\n", "rule number ten\n", 1);
+        let before = SourceValue::File {
+            path: path.into(),
+            content: before_body,
+        };
+        let after = SourceValue::File {
+            path: path.into(),
+            content: after_body,
+        };
+        let text = changed_text(&after, Some(&before));
+        assert!(
+            text.starts_with("The instructions from /repo/AGENTS.md changed. Here's the diff:"),
+            "{text}"
+        );
+        let big_after = SourceValue::File {
+            path: path.into(),
+            content: "x".repeat(5000),
+        };
+        let small_before = SourceValue::File {
+            path: path.into(),
+            content: "old rule".into(),
+        };
+        let text = changed_text(&big_after, Some(&small_before));
+        assert!(
+            text.starts_with("The instructions changed:\nInstructions from: /repo/AGENTS.md"),
+            "{text}"
+        );
+        let date = SourceValue::Date("Thu Oct 22 2026".into());
+        assert_eq!(
+            changed_text(&date, None),
+            "Today's date is now: Thu Oct 22 2026"
+        );
+        let env = SourceValue::Environment("<env>x</env>".into());
+        assert_eq!(
+            changed_text(&env, None),
+            "The environment you are running in is now:\n<env>x</env>"
+        );
+        assert_eq!(
+            removed_text(&before).as_deref(),
+            Some("Previously loaded instructions no longer apply.")
+        );
+        assert!(removed_text(&date).is_none());
+    }
+
+    #[test]
+    fn date_string_matches_js_todatestring_format() {
+        // Anchor: day 20_748 is 2026-10-22, a Thursday. (The plan's 20_726
+        // was mis-anchored — it is 2026-09-30.)
+        assert_eq!(days_to_iso(20_748), "2026-10-22");
+        assert_eq!(date_string_from_days(20_748), "Thu Oct 22 2026");
+        assert_eq!(date_string_from_days(0), "Thu Jan 01 1970");
     }
 }
