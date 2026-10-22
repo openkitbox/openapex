@@ -133,8 +133,9 @@ pub(crate) const KEY_INSTRUCTIONS: &str = "core/instructions";
 pub(crate) const KEY_DATE: &str = "core/date";
 pub(crate) const KEY_ENVIRONMENT: &str = "core/environment";
 
-/// One keyed source's observed value; `None` = the source is currently absent
-/// (upstream `Instructions.removed`).
+/// One keyed source's value. Struct variants throughout: serde's internally
+/// tagged representation (`tag = "kind"`) cannot serialize newtype variants
+/// holding a `String`/`Vec`, and later steps hash this JSON.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum SourceValue {
@@ -143,11 +144,19 @@ pub(crate) enum SourceValue {
         path: String,
         content: String,
     },
-    Skills(Vec<SkillSummary>),
+    Skills {
+        skills: Vec<SkillSummary>,
+    },
     /// Pre-rendered `<mcp_instructions>` block from the MCP hub.
-    Mcp(String),
-    Date(String),
-    Environment(String),
+    Mcp {
+        block: String,
+    },
+    Date {
+        value: String,
+    },
+    Environment {
+        value: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -158,9 +167,22 @@ pub(crate) struct SkillSummary {
     pub description: Option<String>,
 }
 
+/// Three-state observation: upstream distinguishes "the source is gone"
+/// (render a removal notice) from "the read failed transiently" (keep what
+/// the model already has). Collapsing the two would tell the model its
+/// instructions no longer apply whenever AGENTS.md is being atomically
+/// replaced or is momentarily unreadable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ObservedValue {
+    Present(SourceValue),
+    Removed,
+    /// Read failed transiently: keep whatever the model already has.
+    Unavailable,
+}
+
 pub(crate) struct Observed {
     pub key: &'static str,
-    pub value: Option<SourceValue>,
+    pub value: ObservedValue,
 }
 
 /// Gather this step's sources in upstream combine order
@@ -174,20 +196,39 @@ pub(crate) fn gather(directory: &Path, mcp_instructions: Option<&str>) -> Vec<Ob
             description: s.description.clone(),
         })
         .collect();
-    let agents = std::fs::read_to_string(directory.join("AGENTS.md"))
-        .ok()
-        .map(|content| SourceValue::File {
-            path: directory.join("AGENTS.md").display().to_string(),
+    let agents_path = directory.join("AGENTS.md");
+    let agents = match std::fs::read_to_string(&agents_path) {
+        Ok(content) => ObservedValue::Present(SourceValue::File {
+            path: agents_path.display().to_string(),
             content: content.trim_end().to_owned(),
-        });
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ObservedValue::Removed,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %agents_path.display(),
+                "AGENTS.md unreadable; keeping the previously loaded instructions"
+            );
+            ObservedValue::Unavailable
+        }
+    };
     vec![
         Observed {
             key: KEY_MCP,
-            value: mcp_instructions.map(|b| SourceValue::Mcp(b.to_owned())),
+            value: match mcp_instructions {
+                Some(block) => ObservedValue::Present(SourceValue::Mcp {
+                    block: block.to_owned(),
+                }),
+                None => ObservedValue::Removed,
+            },
         },
         Observed {
             key: KEY_SKILLS,
-            value: (!skills.is_empty()).then_some(SourceValue::Skills(skills)),
+            value: if skills.is_empty() {
+                ObservedValue::Removed
+            } else {
+                ObservedValue::Present(SourceValue::Skills { skills })
+            },
         },
         Observed {
             key: KEY_INSTRUCTIONS,
@@ -195,21 +236,29 @@ pub(crate) fn gather(directory: &Path, mcp_instructions: Option<&str>) -> Vec<Ob
         },
         Observed {
             key: KEY_DATE,
-            value: Some(SourceValue::Date(date_string())),
+            value: ObservedValue::Present(SourceValue::Date {
+                value: date_string(),
+            }),
         },
         Observed {
             key: KEY_ENVIRONMENT,
-            value: Some(SourceValue::Environment(env_block(directory))),
+            value: ObservedValue::Present(SourceValue::Environment {
+                value: env_block(directory),
+            }),
         },
     ]
 }
 
 /// system[1] body: present sources in order, joined by "\n\n" (upstream
-/// `instructions/index.ts:render`).
+/// `instructions/index.ts:render`). `Removed` and `Unavailable` contribute
+/// nothing; a removal notice is only ever a delta against a baseline.
 pub(crate) fn render_initial(sources: &[Observed]) -> String {
     sources
         .iter()
-        .filter_map(|s| s.value.as_ref().map(initial_text))
+        .filter_map(|s| match &s.value {
+            ObservedValue::Present(value) => Some(initial_text(value)),
+            ObservedValue::Removed | ObservedValue::Unavailable => None,
+        })
         .collect::<Vec<_>>()
         .join("\n\n")
 }
@@ -217,12 +266,12 @@ pub(crate) fn render_initial(sources: &[Observed]) -> String {
 /// Upstream per-source `initial` renderers.
 pub(crate) fn initial_text(value: &SourceValue) -> String {
     match value {
-        SourceValue::Mcp(block) => block.clone(),
-        SourceValue::Skills(skills) => render_skills(skills),
+        SourceValue::Mcp { block } => block.clone(),
+        SourceValue::Skills { skills } => render_skills(skills),
         SourceValue::File { path, content } => format!("Instructions from: {path}\n{content}"),
-        SourceValue::Date(date) => format!("Today's date: {date}"),
-        SourceValue::Environment(env) => format!(
-            "Here is some useful information about the environment you are running in:\n{env}"
+        SourceValue::Date { value } => format!("Today's date: {value}"),
+        SourceValue::Environment { value } => format!(
+            "Here is some useful information about the environment you are running in:\n{value}"
         ),
     }
 }
@@ -231,9 +280,9 @@ pub(crate) fn initial_text(value: &SourceValue) -> String {
 /// the initial render (upstream `instructions/index.ts:111`).
 pub(crate) fn changed_text(value: &SourceValue, previous: Option<&SourceValue>) -> String {
     match (value, previous) {
-        (SourceValue::Date(date), _) => format!("Today's date is now: {date}"),
-        (SourceValue::Environment(env), _) => {
-            format!("The environment you are running in is now:\n{env}")
+        (SourceValue::Date { value }, _) => format!("Today's date is now: {value}"),
+        (SourceValue::Environment { value }, _) => {
+            format!("The environment you are running in is now:\n{value}")
         }
         (
             SourceValue::File { path, content },
@@ -241,10 +290,10 @@ pub(crate) fn changed_text(value: &SourceValue, previous: Option<&SourceValue>) 
                 content: before, ..
             }),
         ) => instructions_changed_or_diff(path, before, content),
-        (SourceValue::Skills(after), Some(SourceValue::Skills(before))) => {
+        (SourceValue::Skills { skills: after }, Some(SourceValue::Skills { skills: before })) => {
             skills_update(before, after)
         }
-        (SourceValue::Mcp(block), Some(_)) => format!(
+        (SourceValue::Mcp { block }, Some(_)) => format!(
             "The available MCP server instructions have changed. This list supersedes the previous one.\n{block}"
         ),
         (v, _) => initial_text(v),
@@ -255,15 +304,17 @@ pub(crate) fn changed_text(value: &SourceValue, previous: Option<&SourceValue>) 
 /// (date/env are always present).
 pub(crate) fn removed_text(previous: &SourceValue) -> Option<String> {
     match previous {
-        SourceValue::Mcp(_) => Some("MCP server instructions are no longer available.".to_owned()),
-        SourceValue::Skills(_) => Some(
+        SourceValue::Mcp { .. } => {
+            Some("MCP server instructions are no longer available.".to_owned())
+        }
+        SourceValue::Skills { .. } => Some(
             "Skill guidance is no longer available. Do not use any previously listed skill."
                 .to_owned(),
         ),
         SourceValue::File { .. } => {
             Some("Previously loaded instructions no longer apply.".to_owned())
         }
-        SourceValue::Date(_) | SourceValue::Environment(_) => None,
+        SourceValue::Date { .. } | SourceValue::Environment { .. } => None,
     }
 }
 
@@ -524,9 +575,15 @@ mod tests {
                     KEY_ENVIRONMENT
                 ]
             );
-            assert!(matches!(observed[0].value, Some(SourceValue::Mcp(_))));
-            assert!(observed[1].value.is_none());
-            assert!(matches!(observed[2].value, Some(SourceValue::File { .. })));
+            assert!(matches!(
+                observed[0].value,
+                ObservedValue::Present(SourceValue::Mcp { .. })
+            ));
+            assert!(matches!(observed[1].value, ObservedValue::Removed));
+            assert!(matches!(
+                observed[2].value,
+                ObservedValue::Present(SourceValue::File { .. })
+            ));
         });
     }
 
@@ -580,12 +637,16 @@ mod tests {
             text.starts_with("The instructions changed:\nInstructions from: /repo/AGENTS.md"),
             "{text}"
         );
-        let date = SourceValue::Date("Thu Oct 22 2026".into());
+        let date = SourceValue::Date {
+            value: "Thu Oct 22 2026".into(),
+        };
         assert_eq!(
             changed_text(&date, None),
             "Today's date is now: Thu Oct 22 2026"
         );
-        let env = SourceValue::Environment("<env>x</env>".into());
+        let env = SourceValue::Environment {
+            value: "<env>x</env>".into(),
+        };
         assert_eq!(
             changed_text(&env, None),
             "The environment you are running in is now:\n<env>x</env>"
@@ -604,5 +665,63 @@ mod tests {
         assert_eq!(days_to_iso(20_748), "2026-10-22");
         assert_eq!(date_string_from_days(20_748), "Thu Oct 22 2026");
         assert_eq!(date_string_from_days(0), "Thu Jan 01 1970");
+    }
+
+    #[test]
+    fn source_values_serialize_deterministically() {
+        let values = [
+            SourceValue::File {
+                path: "/a".into(),
+                content: "x".into(),
+            },
+            SourceValue::Skills {
+                skills: vec![SkillSummary {
+                    id: "i".into(),
+                    name: "n".into(),
+                    description: None,
+                }],
+            },
+            SourceValue::Mcp {
+                block: "<mcp_instructions>\n</mcp_instructions>".into(),
+            },
+            SourceValue::Date {
+                value: "Thu Oct 22 2026".into(),
+            },
+            SourceValue::Environment {
+                value: "<env></env>".into(),
+            },
+        ];
+        for value in &values {
+            let once = serde_json::to_string(value).expect("serializable");
+            let twice = serde_json::to_string(value).expect("serializable");
+            assert_eq!(once, twice, "deterministic");
+        }
+        assert_eq!(
+            serde_json::to_string(&SourceValue::Date { value: "x".into() }).unwrap(),
+            r#"{"kind":"date","value":"x"}"#
+        );
+    }
+
+    #[test]
+    fn unreadable_agents_md_is_unavailable_not_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the file should be: read_to_string fails with
+        // IsADirectory, which is not NotFound.
+        std::fs::create_dir(dir.path().join("AGENTS.md")).unwrap();
+        let observed = gather(dir.path(), None);
+        assert!(matches!(observed[2].value, ObservedValue::Unavailable));
+        // Truly absent → Removed.
+        std::fs::remove_dir(dir.path().join("AGENTS.md")).unwrap();
+        let observed = gather(dir.path(), None);
+        assert!(matches!(observed[2].value, ObservedValue::Removed));
+    }
+
+    #[test]
+    fn render_initial_skips_non_present_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let observed = gather(dir.path(), None); // no AGENTS.md / skills / mcp
+        let render = render_initial(&observed);
+        assert!(!render.contains("Instructions from:"));
+        assert!(render.contains("Today's date: "));
     }
 }
