@@ -431,24 +431,41 @@ impl Drop for Harness {
 impl Harness {
     /// Spawn the server with the given chat scripts and an empty registry.
     async fn spawn(scripts: Vec<Script>) -> Self {
-        Self::spawn_inner(scripts, ToolRegistry::new(), false).await
+        Self::spawn_inner(scripts, ToolRegistry::new(), false, None).await
     }
 
     /// Spawn the server with the given chat scripts and tool registry.
     async fn spawn_with(scripts: Vec<Script>, tools: ToolRegistry) -> Self {
-        Self::spawn_inner(scripts, tools, false).await
+        Self::spawn_inner(scripts, tools, false, None).await
     }
 
     /// Spawn with `[magic_context] enabled` (the pinboard tail is rendered).
     async fn spawn_mctx(scripts: Vec<Script>) -> Self {
-        Self::spawn_inner(scripts, ToolRegistry::new(), true).await
+        Self::spawn_inner(scripts, ToolRegistry::new(), true, None).await
     }
 
-    async fn spawn_inner(scripts: Vec<Script>, tools: ToolRegistry, magic_context: bool) -> Self {
+    /// Spawn against an explicit database file: a "restart" over state a
+    /// previous (since dropped) harness wrote, with fresh process memory.
+    async fn spawn_on(scripts: Vec<Script>, db_path: &std::path::Path) -> Self {
+        Self::spawn_inner(
+            scripts,
+            ToolRegistry::new(),
+            false,
+            Some(db_path.to_path_buf()),
+        )
+        .await
+    }
+
+    async fn spawn_inner(
+        scripts: Vec<Script>,
+        tools: ToolRegistry,
+        magic_context: bool,
+        db_path: Option<std::path::PathBuf>,
+    ) -> Self {
         let port = free_port();
         let dir = tempfile::tempdir().expect("tempdir");
         let mut config = Config {
-            db_path: dir.path().join("ox.db"),
+            db_path: db_path.unwrap_or_else(|| dir.path().join("ox.db")),
             listen: format!("127.0.0.1:{port}"),
             ..Config::default()
         };
@@ -934,11 +951,11 @@ async fn prompt_runs_text_turn_and_accumulates_tokens() {
         .expect("pending");
     assert_eq!(pending, 0, "inbox drained");
 
-    // The model saw the system prompt, then the user turn.
+    // The model saw the dual system head, then the user turn.
     let requests = harness.chat.requests();
     assert_eq!(requests.len(), 1, "one chat request");
     let messages = requests[0].messages.len();
-    assert_eq!(messages, 2, "system + user");
+    assert_eq!(messages, 3, "dual system + user");
 }
 
 // ---------------------------------------------------------------------------
@@ -1287,7 +1304,7 @@ async fn mid_stream_failure_settles_partial_tool_with_stream_error() {
         .collect();
     assert_eq!(
         roles,
-        vec!["system", "user", "assistant", "tool", "user"],
+        vec!["system", "system", "user", "assistant", "tool", "user"],
         "failed call + error result replay, then the continuation prompt"
     );
     let replayed = requests[1]
@@ -1933,9 +1950,9 @@ async fn overflow_compacts_and_retries_once() {
     // The retry sees only the checkpoint: the compaction row replaced the
     // whole transcript.
     let retry = &requests[2];
-    assert_eq!(retry.messages.len(), 2, "system + checkpoint");
+    assert_eq!(retry.messages.len(), 3, "dual system + checkpoint");
     assert!(matches!(
-        &retry.messages[1],
+        &retry.messages[2],
         ox::cardinal::wire::ChatMessage::User { content }
             if content.as_str().contains("<conversation-checkpoint>")
                 && content.as_str().contains("S2 summary")
@@ -2791,8 +2808,13 @@ fn recorded_head(harness: &Harness) -> Option<String> {
     harness.chat.requests().iter().find_map(|request| {
         let mut messages = request.messages.iter();
         assert!(matches!(messages.next(), Some(ChatMessage::System { .. })));
-        match messages.next() {
-            Some(ChatMessage::User { content }) => Some(content.as_str().to_owned()),
+        // The keyed-instruction layer is a second system message.
+        let mut next = messages.next()?;
+        if matches!(next, ChatMessage::System { .. }) {
+            next = messages.next()?;
+        }
+        match next {
+            ChatMessage::User { content } => Some(content.as_str().to_owned()),
             _ => None,
         }
     })
@@ -2804,8 +2826,13 @@ fn recorded_halves(harness: &Harness) -> Option<(String, String)> {
     harness.chat.requests().iter().find_map(|request| {
         let mut messages = request.messages.iter();
         assert!(matches!(messages.next(), Some(ChatMessage::System { .. })));
-        let m0 = match messages.next() {
-            Some(ChatMessage::User { content }) => content.as_str().to_owned(),
+        // Skip the keyed-instruction system layer to reach the head halves.
+        let mut next = messages.next()?;
+        if matches!(next, ChatMessage::System { .. }) {
+            next = messages.next()?;
+        }
+        let m0 = match next {
+            ChatMessage::User { content } => content.as_str().to_owned(),
             _ => return None,
         };
         let m1 = match messages.next() {
@@ -3014,5 +3041,212 @@ async fn tags_are_visible_and_an_applied_drop_leaves_the_request() {
     assert!(
         users.iter().any(|text| text.contains("Say hello again")),
         "the new turn is present: {users:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Keyed instruction sync (dual system layers)
+// ---------------------------------------------------------------------------
+
+/// Byte-stable request prefix for one session: the dual system messages plus
+/// the first transcript row (the magic-context `m[0]` when enabled, the first
+/// user prompt otherwise — both are frozen once written).
+fn prefix_of(messages: &[ChatMessage]) -> String {
+    messages[..3]
+        .iter()
+        .map(|m| match m {
+            ChatMessage::System { content } => content.as_str(),
+            ChatMessage::User { content } => content.as_str(),
+            other => panic!("unexpected prefix message: {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The session's persisted instruction-delta rows (oldest first).
+async fn system_rows(db: &ox::db::Db, session_id: &str) -> Vec<Value> {
+    let conn = db.acquire().await.expect("conn");
+    let mut stmt = conn
+        .prepare(
+            "SELECT data FROM session_message \
+             WHERE session_id = ?1 AND type = 'system' ORDER BY seq",
+        )
+        .await
+        .expect("prepare");
+    let mut rows = stmt.query([session_id]).await.expect("query");
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().await.expect("row") {
+        let data: String = row.get(0).expect("data");
+        out.push(serde_json::from_str(&data).expect("json"));
+    }
+    out
+}
+
+/// The keyed-instruction lifecycle over one session: a mid-session edit emits
+/// a durable delta that rides the request tail, a compaction swallowing that
+/// row triggers a re-delivery from the frozen baseline, and a restart
+/// re-baselines from the current file without flapping — all while the
+/// request prefix keeps its bytes.
+#[tokio::test]
+async fn instruction_sync_across_edit_swallow_and_restart() {
+    // The project holds the editable AGENTS.md; the store holds the database
+    // file so the restart leg can reopen it under a fresh server.
+    let project_dir = tempfile::tempdir().expect("project dir");
+    std::fs::write(project_dir.path().join("AGENTS.md"), "rule one\n").expect("seed");
+    let project = project_dir
+        .path()
+        .canonicalize()
+        .expect("canonical project dir")
+        .display()
+        .to_string();
+    let store = tempfile::tempdir().expect("store dir");
+    let db_path = store.path().join("ox.db");
+
+    let harness = Harness::spawn_on(
+        vec![
+            MockChat::text("one"),
+            MockChat::text("two"),
+            MockChat::text("three"),
+        ],
+        &db_path,
+    )
+    .await;
+    let session_id = harness.create_session_in(&project).await;
+
+    // Turn 1: the dual system head, the instruction layer carrying rule one,
+    // and no delta. The prefix freezes here.
+    prompt_turn(&harness, &session_id, &project, "first", 1).await;
+    let requests = harness.chat.requests();
+    assert_eq!(requests.len(), 1, "one model call for the turn");
+    let first = &requests[0].messages;
+    assert!(
+        matches!(&first[0], ChatMessage::System { content } if content.contains("# Harness")),
+        "system[0] is the static layer: {:?}",
+        first[0]
+    );
+    assert!(
+        matches!(&first[1], ChatMessage::System { content } if content.contains("rule one")),
+        "system[1] is the frozen initial render: {:?}",
+        first[1]
+    );
+    assert!(
+        !first[2..].iter().any(|m| match m {
+            ChatMessage::System { content } => content.contains("The instructions"),
+            _ => false,
+        }),
+        "no instruction delta on the first turn: {first:?}"
+    );
+    let prefix = prefix_of(first);
+    let static_layer = match &first[0] {
+        ChatMessage::System { content } => content.clone(),
+        other => panic!("unexpected: {other:?}"),
+    };
+    let head_row = match &first[2] {
+        ChatMessage::User { content } => content.as_str().to_owned(),
+        other => panic!("unexpected: {other:?}"),
+    };
+
+    // Turn 2, after a mid-session AGENTS.md edit: one delta rides the request
+    // tail (before the current prompt) and lands as a durable system row.
+    std::fs::write(project_dir.path().join("AGENTS.md"), "rule two\n").expect("edit");
+    prompt_turn(&harness, &session_id, &project, "second", 2).await;
+    let requests = harness.chat.requests();
+    assert_eq!(requests.len(), 2, "one model call per turn");
+    let second = &requests[1].messages;
+    let last_user = second
+        .iter()
+        .rposition(|m| matches!(m, ChatMessage::User { .. }))
+        .expect("the current prompt");
+    let delta = second
+        .iter()
+        .position(|m| match m {
+            ChatMessage::System { content } => content.contains("rule two"),
+            _ => false,
+        })
+        .expect("the delta text rides the request");
+    assert!(
+        delta > 1 && delta < last_user,
+        "the delta sits between the head and the current prompt: {second:?}"
+    );
+    assert_eq!(prefix_of(second), prefix, "prefix stable across the edit");
+    let rows = system_rows(&harness.db, &session_id).await;
+    assert_eq!(rows.len(), 1, "one durable delta row: {rows:?}");
+    assert_eq!(
+        rows[0]["description"],
+        json!("Instructions updated: core/instructions")
+    );
+    assert!(
+        rows[0]["text"].as_str().expect("text").contains("rule two"),
+        "the row carries the new content: {}",
+        rows[0]["text"]
+    );
+
+    // Simulate a compaction swallowing the delta row (the fold-visible effect
+    // of a checkpoint covering it): the wire fold loses the row, so the next
+    // step falls back to the frozen baseline and re-delivers.
+    {
+        let conn = harness.db.acquire().await.expect("conn");
+        conn.execute(
+            "DELETE FROM session_message WHERE session_id = ?1 AND type = 'system'",
+            [session_id.as_str()],
+        )
+        .await
+        .expect("delete");
+    }
+    prompt_turn(&harness, &session_id, &project, "third", 3).await;
+    let requests = harness.chat.requests();
+    assert_eq!(requests.len(), 3, "one model call per turn");
+    let third = &requests[2].messages;
+    assert!(
+        third[2..]
+            .iter()
+            .any(|m| matches!(m, ChatMessage::System { content } if content.contains("rule two"))),
+        "the swallowed delta is re-delivered: {third:?}"
+    );
+    assert_eq!(prefix_of(third), prefix, "prefix stable across the swallow");
+    let rows = system_rows(&harness.db, &session_id).await;
+    assert_eq!(rows.len(), 1, "the re-delivery is durable again: {rows:?}");
+
+    // Restart: a fresh server over the same database re-baselines from the
+    // current file. The static layer and the transcript head keep their
+    // bytes; the instruction layer renders the current content, and the
+    // surviving delta row matches the rebuilt baseline — no re-delivery flap.
+    drop(harness);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let restarted = Harness::spawn_on(vec![MockChat::text("four")], &db_path).await;
+    prompt_turn(&restarted, &session_id, &project, "fourth", 4).await;
+    let requests = restarted.chat.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "the restart makes exactly one model call"
+    );
+    let fourth = &requests[0].messages;
+    assert!(
+        matches!(&fourth[0], ChatMessage::System { content } if *content == static_layer),
+        "the static layer is byte-identical after a restart"
+    );
+    match &fourth[1] {
+        ChatMessage::System { content } => {
+            assert!(
+                content.contains("rule two"),
+                "re-baselined from the current file: {content}"
+            );
+            assert!(
+                !content.contains("rule one"),
+                "the stale content is gone: {content}"
+            );
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+    assert!(
+        matches!(&fourth[2], ChatMessage::User { content } if content.as_str() == head_row),
+        "the transcript head is byte-identical after a restart"
+    );
+    let rows = system_rows(&restarted.db, &session_id).await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "no re-delivery flap after a restart: {rows:?}"
     );
 }
