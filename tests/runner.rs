@@ -3063,6 +3063,18 @@ fn prefix_of(messages: &[ChatMessage]) -> String {
         .join("\n")
 }
 
+/// The dual system layers alone (the provider's cache anchor proper).
+fn system_layers(messages: &[ChatMessage]) -> String {
+    messages[..2]
+        .iter()
+        .map(|m| match m {
+            ChatMessage::System { content } => content.as_str(),
+            other => panic!("unexpected system layer: {other:?}"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The session's persisted instruction-delta rows (oldest first).
 async fn system_rows(db: &ox::db::Db, session_id: &str) -> Vec<Value> {
     let conn = db.acquire().await.expect("conn");
@@ -3083,10 +3095,11 @@ async fn system_rows(db: &ox::db::Db, session_id: &str) -> Vec<Value> {
 }
 
 /// The keyed-instruction lifecycle over one session: a mid-session edit emits
-/// a durable delta that rides the request tail, a compaction swallowing that
-/// row triggers a re-delivery from the frozen baseline, and a restart
-/// re-baselines from the current file without flapping — all while the
-/// request prefix keeps its bytes.
+/// a durable delta that rides the request tail, a completed compaction
+/// checkpoint covers that row (it stays in the DB but leaves the wire window)
+/// and triggers a re-delivery from the frozen baseline, and a restart
+/// re-baselines from the current file without flapping. The dual system
+/// layers keep their bytes throughout.
 #[tokio::test]
 async fn instruction_sync_across_edit_swallow_and_restart() {
     // The project holds the editable AGENTS.md; the store holds the database
@@ -3137,12 +3150,9 @@ async fn instruction_sync_across_edit_swallow_and_restart() {
         "no instruction delta on the first turn: {first:?}"
     );
     let prefix = prefix_of(first);
+    let layers = system_layers(first);
     let static_layer = match &first[0] {
         ChatMessage::System { content } => content.clone(),
-        other => panic!("unexpected: {other:?}"),
-    };
-    let head_row = match &first[2] {
-        ChatMessage::User { content } => content.as_str().to_owned(),
         other => panic!("unexpected: {other:?}"),
     };
 
@@ -3181,18 +3191,51 @@ async fn instruction_sync_across_edit_swallow_and_restart() {
         rows[0]["text"]
     );
 
-    // Simulate a compaction swallowing the delta row (the fold-visible effect
-    // of a checkpoint covering it): the wire fold loses the row, so the next
-    // step falls back to the frozen baseline and re-delivers.
-    {
-        let conn = harness.db.acquire().await.expect("conn");
-        conn.execute(
-            "DELETE FROM session_message WHERE session_id = ?1 AND type = 'system'",
-            [session_id.as_str()],
-        )
+    // The delta row stays in the transcript; a compaction checkpoint lands
+    // after it. The fold's boundary (the latest completed checkpoint) then
+    // hides it — this is the real swallow: the row is still in the DB, just
+    // out of the wire window. The next step falls back to the frozen baseline
+    // and re-delivers.
+    harness
+        .bus
+        .publish(ox::schema::event::SessionEventData::CompactionEnded {
+            session_id: session_id.clone(),
+            reason: ox::schema::event::CompactionReason::Auto,
+            model: None,
+            provider_state: None,
+            provider_context: None,
+            text: "S1 summary".to_owned(),
+            recent: "recent work".to_owned(),
+            cost: None,
+            tokens: None,
+        })
         .await
-        .expect("delete");
-    }
+        .expect("compaction row");
+    let compactions: Vec<Value> = {
+        let conn = harness.db.acquire().await.expect("conn");
+        let mut stmt = conn
+            .prepare(
+                "SELECT data FROM session_message \
+                 WHERE session_id = ?1 AND type = 'compaction' ORDER BY seq",
+            )
+            .await
+            .expect("prepare");
+        let mut rows = stmt.query([session_id.as_str()]).await.expect("query");
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.expect("row") {
+            let data: String = row.get(0).expect("data");
+            out.push(serde_json::from_str(&data).expect("json"));
+        }
+        out
+    };
+    assert_eq!(
+        compactions.len(),
+        1,
+        "one completed checkpoint: {compactions:?}"
+    );
+    assert_eq!(compactions[0]["status"], "completed");
+    assert_eq!(compactions[0]["summary"], "S1 summary");
+
     prompt_turn(&harness, &session_id, &project, "third", 3).await;
     let requests = harness.chat.requests();
     assert_eq!(requests.len(), 3, "one model call per turn");
@@ -3203,17 +3246,40 @@ async fn instruction_sync_across_edit_swallow_and_restart() {
             .any(|m| matches!(m, ChatMessage::System { content } if content.contains("rule two"))),
         "the swallowed delta is re-delivered: {third:?}"
     );
-    assert_eq!(prefix_of(third), prefix, "prefix stable across the swallow");
+    // The checkpoint replaces everything it covers — including the first user
+    // row that used to lead the transcript. The dual system layers are the
+    // part that must keep their bytes.
+    assert_eq!(
+        system_layers(third),
+        layers,
+        "system layers stable across the swallow"
+    );
+    let checkpoint = match &third[2] {
+        ChatMessage::User { content } => content.as_str().to_owned(),
+        other => panic!("the checkpoint leads the transcript: {other:?}"),
+    };
+    assert!(
+        checkpoint.contains("<conversation-checkpoint>") && checkpoint.contains("S1 summary"),
+        "the checkpoint replaced the covered head: {checkpoint}"
+    );
     let rows = system_rows(&harness.db, &session_id).await;
-    assert_eq!(rows.len(), 1, "the re-delivery is durable again: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        2,
+        "the original delta row survived and the re-delivery is durable: {rows:?}"
+    );
 
     // Restart: a fresh server over the same database re-baselines from the
-    // current file. The static layer and the transcript head keep their
+    // current file. The static layer and the checkpoint head keep their
     // bytes; the instruction layer renders the current content, and the
     // surviving delta row matches the rebuilt baseline — no re-delivery flap.
     drop(harness);
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let restarted = Harness::spawn_on(vec![MockChat::text("four")], &db_path).await;
+    let restarted = Harness::spawn_on(
+        vec![MockChat::text("four"), MockChat::text("five")],
+        &db_path,
+    )
+    .await;
     prompt_turn(&restarted, &session_id, &project, "fourth", 4).await;
     let requests = restarted.chat.requests();
     assert_eq!(
@@ -3222,6 +3288,12 @@ async fn instruction_sync_across_edit_swallow_and_restart() {
         "the restart makes exactly one model call"
     );
     let fourth = &requests[0].messages;
+    // Byte identity against the pre-restart prefix is impossible here and that
+    // is by design: the baseline is process memory, re-created from the
+    // current sources, so system[1] now renders "rule two" (verified below)
+    // and the checkpoint, not the covered first user row, leads the
+    // transcript. What must survive the restart byte-for-byte is the static
+    // layer and the checkpoint head; what must not happen is a re-delivery.
     assert!(
         matches!(&fourth[0], ChatMessage::System { content } if *content == static_layer),
         "the static layer is byte-identical after a restart"
@@ -3240,13 +3312,31 @@ async fn instruction_sync_across_edit_swallow_and_restart() {
         other => panic!("unexpected: {other:?}"),
     }
     assert!(
-        matches!(&fourth[2], ChatMessage::User { content } if content.as_str() == head_row),
-        "the transcript head is byte-identical after a restart"
+        matches!(&fourth[2], ChatMessage::User { content } if content.as_str() == checkpoint),
+        "the checkpoint head is byte-identical after a restart"
     );
     let rows = system_rows(&restarted.db, &session_id).await;
     assert_eq!(
         rows.len(),
-        1,
+        2,
         "no re-delivery flap after a restart: {rows:?}"
+    );
+
+    // A turn inside the restarted process keeps the prefix byte-identical:
+    // the rebuilt baseline is stable from here on.
+    let restarted_prefix = prefix_of(fourth);
+    prompt_turn(&restarted, &session_id, &project, "fifth", 5).await;
+    let requests = restarted.chat.requests();
+    assert_eq!(requests.len(), 2, "one model call per turn");
+    assert_eq!(
+        prefix_of(&requests[1].messages),
+        restarted_prefix,
+        "the restarted process keeps the prefix byte-identical"
+    );
+    let rows = system_rows(&restarted.db, &session_id).await;
+    assert_eq!(
+        rows.len(),
+        2,
+        "no re-delivery flap on the next turn: {rows:?}"
     );
 }
