@@ -132,14 +132,20 @@ pub(crate) fn diff(
                 }
             }
             Some(value) => {
-                // Best-known previous content for the diff form: the delivered
-                // snapshot when the surviving wire row matches it, else the
-                // frozen initial value (a swallowed delta re-delivers).
+                // Best-known previous content for the diff form: only a
+                // surviving row that matches what we delivered tells us what
+                // the model actually saw. Anything else (the delta was
+                // compacted away, or a stale row survived a restart) falls
+                // back to the frozen initial value / a full restatement, so
+                // the model never gets a diff against content it may not hold.
                 let previous = match wire.get(source.key) {
+                    // The surviving row is exactly what we delivered: we know its content.
                     Some(w) if w.as_deref() == state.map(|s| s.delivered_hash.as_str()) => {
                         state.and_then(|s| s.delivered_value.as_ref())
                     }
-                    Some(_) => state.and_then(|s| s.delivered_value.as_ref()),
+                    // A stale row (e.g. after a restart): we cannot reconstruct what the
+                    // model saw, so restate the current content in full.
+                    Some(_) => None,
                     None => state.and_then(|s| s.initial_value.as_ref()),
                 };
                 (prompt::changed_text(value, previous), Some(current_hash))
@@ -298,6 +304,23 @@ mod tests {
             deltas2[0].text.contains("rule two v2"),
             "{}",
             deltas2[0].text
+        );
+    }
+
+    #[test]
+    fn stale_wire_row_restates_the_current_content() {
+        // 重启：baseline 已按当前内容重建（delivered == current），wire 仍留着旧 delta 行
+        let current = vec![agents("rule three")];
+        let baseline = baseline(&current);
+        let wire: BTreeMap<String, Option<String>> =
+            [(KEY_INSTRUCTIONS.to_owned(), Some("stale-hash".to_owned()))]
+                .into_iter()
+                .collect();
+        let deltas = diff(&current, &wire, &baseline);
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(
+            deltas[0].text,
+            "Instructions from: /repo/AGENTS.md\nrule three"
         );
     }
 
