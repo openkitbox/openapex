@@ -617,6 +617,28 @@ fn event_session_viewed() {
 }
 
 #[test]
+fn event_session_archive_group() {
+    // Both must parse into their own variant: `round_trip_event` alone would
+    // also pass for the `Unknown` fallback, which re-serialises verbatim.
+    for (kind, archiving) in [("session.archived", true), ("session.unarchived", false)] {
+        let wire = envelope(kind, json!({ "sessionID": "ses_01" }));
+        let parsed: EventEnvelope = serde_json::from_value(wire.clone()).unwrap();
+        let typed = parsed.parse_typed();
+        let matches_variant = match (&typed.data, archiving) {
+            (SessionEventData::SessionArchived { session_id }, true) => session_id == "ses_01",
+            (SessionEventData::SessionUnarchived { session_id }, false) => session_id == "ses_01",
+            _ => false,
+        };
+        assert!(matches_variant, "{kind} fell back to {typed:?}");
+        assert_eq!(
+            serde_json::to_value(typed.into_generic()).unwrap(),
+            wire,
+            "{kind}"
+        );
+    }
+}
+
+#[test]
 fn event_session_moved() {
     round_trip_event(
         "session.moved",
@@ -931,7 +953,6 @@ fn unknown_event_round_trips_losslessly() {
         "session.skill.started",
         "session.shell.started",
         "session.revert.committed",
-        "session.archived",
         "session.idle",
         "some.future.event",
     ] {

@@ -406,6 +406,8 @@ struct CursorQuery {
     project: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     subpath: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    archived: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -463,6 +465,19 @@ fn resolve_limit(raw: Option<String>) -> Result<i64, String> {
     }
 }
 
+/// `archived` list filter: `true` returns only archived sessions, `false` only
+/// live ones, absent returns both (upstream `store.ts:116` adds the condition
+/// only when the parameter is defined). Anything else is rejected rather than
+/// silently treated as absent.
+fn resolve_archived(raw: Option<String>) -> Result<Option<bool>, String> {
+    match raw.as_deref() {
+        None => Ok(None),
+        Some("true") => Ok(Some(true)),
+        Some("false") => Ok(Some(false)),
+        Some(value) => Err(format!("Invalid archived: {value}")),
+    }
+}
+
 fn resolve_order(raw: Option<String>) -> Result<Option<String>, String> {
     match raw.as_deref() {
         None => Ok(None),
@@ -482,6 +497,7 @@ struct SessionsPage {
     subpath: Option<String>,
     search: Option<String>,
     parent_id: Option<String>,
+    archived: Option<bool>,
     ascending: bool,
     anchor: Option<(i64, String)>,
     limit: i64,
@@ -494,6 +510,7 @@ async fn query_sessions(db: &Db, page: SessionsPage) -> Result<Vec<SessionRow>> 
         subpath,
         search,
         parent_id,
+        archived,
         ascending,
         anchor,
         limit,
@@ -518,6 +535,16 @@ async fn query_sessions(db: &Db, page: SessionsPage) -> Result<Vec<SessionRow>> 
     if let Some(search) = search {
         params.push(SqlValue::Text(format!("%{search}%")));
         conds.push(format!("title LIKE ?{}", params.len()));
+    }
+    if let Some(archived) = archived {
+        conds.push(
+            if archived {
+                "time_archived IS NOT NULL"
+            } else {
+                "time_archived IS NULL"
+            }
+            .to_owned(),
+        );
     }
     if let Some(parent_id) = parent_id {
         if parent_id == "null" {
@@ -585,12 +612,25 @@ pub(crate) async fn list(req: &mut Request, depot: &mut Depot, res: &mut Respons
         None => None,
     };
 
+    // Validate the request-level filters even when a cursor carries the query:
+    // an unparseable value fails closed instead of being silently ignored.
+    let archived = match resolve_archived(req.query::<String>("archived")) {
+        Ok(archived) => archived,
+        Err(message) => {
+            invalid_request(res, &message);
+            return;
+        }
+    };
+
     // A cursor carries the whole query; otherwise read it from the request.
     let (query, direction) = match &decoded {
         Some(cursor) => (cursor.query.clone(), cursor.anchor.direction),
         None => {
             let query = match request_query(req) {
-                Ok(query) => query,
+                Ok(mut query) => {
+                    query.archived = archived;
+                    query
+                }
                 Err(message) => {
                     invalid_request(res, &message);
                     return;
@@ -618,6 +658,7 @@ pub(crate) async fn list(req: &mut Request, depot: &mut Depot, res: &mut Respons
         subpath: query.subpath.clone(),
         search: query.search.clone(),
         parent_id: query.parent_id.clone(),
+        archived: query.archived,
         ascending,
         anchor,
         limit,
@@ -677,6 +718,8 @@ fn request_query(req: &Request) -> Result<CursorQuery, String> {
         directory: req.query("directory"),
         project: req.query("project"),
         subpath: req.query("subpath"),
+        // Filled in by `list` so it can be validated even with a cursor.
+        archived: None,
     })
 }
 
@@ -863,6 +906,10 @@ struct UpdateBody {
     metadata: Option<SessionMetadata>,
     #[serde(default)]
     permissions: Option<Vec<Rule>>,
+    /// `true` archives the session, `false` restores it (upstream
+    /// `session.update`); repeating the current state is a no-op.
+    #[serde(default)]
+    archived: Option<bool>,
 }
 
 #[handler] // operation_id: session.update
@@ -878,8 +925,8 @@ pub(crate) async fn update(req: &mut Request, depot: &mut Depot, res: &mut Respo
         return;
     };
 
-    match load_session(&app.db, &session_id).await {
-        Ok(Some(_)) => {}
+    let session = match load_session(&app.db, &session_id).await {
+        Ok(Some(row)) => row,
         Ok(None) => {
             session_not_found(res, &session_id);
             return;
@@ -888,7 +935,7 @@ pub(crate) async fn update(req: &mut Request, depot: &mut Depot, res: &mut Respo
             unknown_error(res, &error);
             return;
         }
-    }
+    };
 
     if let Some(title) = &body.title {
         if !title.is_empty() {
@@ -936,6 +983,27 @@ pub(crate) async fn update(req: &mut Request, depot: &mut Depot, res: &mut Respo
     {
         unknown_error(res, &error);
         return;
+    }
+
+    if let Some(archived) = body.archived {
+        // Upstream `Session.archive`/`Session.unarchive`: repeating the current
+        // state is a no-op, so no second event and no `time_updated` bump.
+        let already = session.time_archived.is_some();
+        if archived != already {
+            let event = if archived {
+                SessionEventData::SessionArchived {
+                    session_id: session_id.clone(),
+                }
+            } else {
+                SessionEventData::SessionUnarchived {
+                    session_id: session_id.clone(),
+                }
+            };
+            if let Err(error) = app.bus.publish(event).await {
+                unknown_error(res, &error);
+                return;
+            }
+        }
     }
 
     no_content(res);

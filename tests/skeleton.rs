@@ -760,3 +760,188 @@ async fn worktree_refresh_acknowledges_without_content() {
     assert_eq!(response.status(), 204);
     handle.abort();
 }
+
+// ---------------------------------------------------------------------------
+// session.update archived + session.list archived filter
+// ---------------------------------------------------------------------------
+
+/// Create a session through the API in `dir`, returning its id.
+async fn create_session_in(client: &reqwest::Client, base: &str, dir: &str) -> String {
+    let created: serde_json::Value = client
+        .post(format!("{base}/api/session"))
+        .header("x-opencode-directory", dir)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    created["data"]["id"].as_str().unwrap().to_string()
+}
+
+async fn session_info(client: &reqwest::Client, base: &str, id: &str) -> serde_json::Value {
+    client
+        .get(format!("{base}/api/session/{id}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+async fn listed_ids(client: &reqwest::Client, base: &str, query: &str) -> Vec<String> {
+    let page: serde_json::Value = client
+        .get(format!("{base}/api/session?{query}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    page["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+async fn patch_archived(
+    client: &reqwest::Client,
+    base: &str,
+    id: &str,
+    archived: bool,
+) -> reqwest::StatusCode {
+    client
+        .patch(format!("{base}/api/session/{id}"))
+        .json(&serde_json::json!({ "archived": archived }))
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+/// `PATCH { archived }` is upstream `session.archive`/`unarchive`: the stamp is
+/// set, `time.updated` follows it, repeating the state publishes nothing,
+/// `session.list?archived=` filters on it across cursor pages, and archiving a
+/// missing session is a 404.
+#[tokio::test]
+async fn session_archive_round_trips_and_filters_the_list() {
+    let (base, handle, dir_guard) = spawn_server().await;
+    let client = reqwest::Client::new();
+    let dir = dir_guard.path().to_str().unwrap().to_string();
+
+    let first = create_session_in(&client, &base, &dir).await;
+    let second = create_session_in(&client, &base, &dir).await;
+    let live = create_session_in(&client, &base, &dir).await;
+
+    assert_eq!(patch_archived(&client, &base, &first, true).await, 204);
+    assert_eq!(patch_archived(&client, &base, &second, true).await, 204);
+
+    let info = session_info(&client, &base, &second).await;
+    let stamp = info["data"]["time"]["archived"]
+        .as_i64()
+        .expect("archiving stamps time.archived");
+    assert_eq!(
+        info["data"]["time"]["updated"].as_i64().unwrap(),
+        stamp,
+        "time.updated follows the archive stamp"
+    );
+
+    // Repeating the current state must not publish a second event; the event
+    // count at the end of the test is what proves it.
+    assert_eq!(patch_archived(&client, &base, &second, true).await, 204);
+
+    let query = format!("directory={dir}");
+    assert_eq!(
+        listed_ids(&client, &base, &format!("{query}&archived=true")).await,
+        vec![second.clone(), first.clone()],
+        "archived sessions, newest first"
+    );
+    assert_eq!(
+        listed_ids(&client, &base, &format!("{query}&archived=false")).await,
+        vec![live.clone()]
+    );
+    assert_eq!(
+        listed_ids(&client, &base, &query).await.len(),
+        3,
+        "no filter returns everything"
+    );
+
+    // The filter has to ride along inside the opaque cursor: page two sends
+    // only `limit` and `cursor`, exactly as the TUI does.
+    let page: serde_json::Value = client
+        .get(format!("{base}/api/session?{query}&archived=true&limit=1"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(page["data"].as_array().unwrap().len(), 1);
+    assert_eq!(page["data"][0]["id"].as_str().unwrap(), second);
+    let cursor = page["cursor"]["next"]
+        .as_str()
+        .expect("a second archived page")
+        .to_string();
+    let next: serde_json::Value = client
+        .get(format!("{base}/api/session?limit=1&cursor={cursor}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        next["data"][0]["id"].as_str().unwrap(),
+        first,
+        "the cursor carries the archived filter"
+    );
+
+    // An unparseable filter fails closed, cursor or not.
+    for target in [
+        format!("{base}/api/session?{query}&archived=yes"),
+        format!("{base}/api/session?limit=1&archived=yes&cursor={cursor}"),
+    ] {
+        let response = client.get(target).send().await.unwrap();
+        assert_eq!(response.status(), 400);
+    }
+
+    // Restoring clears the stamp; archiving an unknown session is a 404.
+    assert_eq!(patch_archived(&client, &base, &second, false).await, 204);
+    let restored = session_info(&client, &base, &second).await;
+    assert!(
+        restored["data"]["time"].get("archived").is_none(),
+        "unarchive clears time.archived"
+    );
+    assert_eq!(
+        patch_archived(&client, &base, "ses_unknown", true).await,
+        404
+    );
+
+    // Read the replay log directly: one event per real state change, none for
+    // the repeated archive.
+    handle.abort();
+    let db_path = dir_guard.path().join("ox.db");
+    let mut opened = None;
+    for _ in 0..50 {
+        if let Ok(db) = ox::db::Db::open(&db_path).await {
+            opened = Some(db);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let db = opened.expect("the database reopens once the server stops");
+    let conn = db.acquire().await.unwrap();
+    for (kind, expected) in [("session.archived@v1", 2_i64), ("session.unarchived@v1", 1)] {
+        let mut stmt = conn
+            .prepare("SELECT count(*) FROM event WHERE type = ?1")
+            .await
+            .unwrap();
+        let mut rows = stmt.query([kind]).await.unwrap();
+        let count = rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap();
+        assert_eq!(count, expected, "{kind}: one event per state change");
+    }
+}

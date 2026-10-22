@@ -968,3 +968,164 @@ async fn instructions_updated_projects_a_system_row() {
     let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
     assert_eq!(count, 1, "bookkeeping event must not add a row");
 }
+
+// ---------------------------------------------------------------------------
+// session.deleted + magic-context tables
+// ---------------------------------------------------------------------------
+
+/// `session.deleted` must clear the magic-context tables too. They carry no
+/// foreign key to `session_v2`, so the cascade that clears `session_message`,
+/// `session_inbox` and `session_pending` never reaches them — measured on the
+/// production database: 28 orphan `mc_tag` rows left by earlier deletions.
+#[tokio::test]
+async fn session_deleted_purges_magic_context_rows() {
+    let bus = bus().await;
+    create(&bus, "s1").await;
+    create(&bus, "s2").await;
+    {
+        let conn = bus.db().acquire().await.unwrap();
+        for sid in ["s1", "s2"] {
+            exec(
+                &conn,
+                &format!(
+                    "INSERT INTO mc_compartments
+                       (id, session_id, coverage_end, importance, tiers, created_at, search_text)
+                     VALUES ('c-{sid}', '{sid}', 'm1', 0.5, 't', 1, '')"
+                ),
+            )
+            .await;
+            exec(
+                &conn,
+                &format!(
+                    "INSERT INTO mc_tag (session_id, tag, message_id, part_path, digest)
+                     VALUES ('{sid}', 1, 'm', 'p', 'd')"
+                ),
+            )
+            .await;
+            exec(
+                &conn,
+                &format!(
+                    "INSERT INTO mc_drop (session_id, tag, reason, state, created_at)
+                     VALUES ('{sid}', 1, 'r', 'queued', 1)"
+                ),
+            )
+            .await;
+            exec(
+                &conn,
+                &format!(
+                    "INSERT INTO mc_historian_run
+                       (id, session_id, state, attempt, created_at, updated_at)
+                     VALUES ('h-{sid}', '{sid}', 'done', 1, 1, 1)"
+                ),
+            )
+            .await;
+            exec(
+                &conn,
+                &format!(
+                    "INSERT INTO mc_frozen_state (session_id, state, version)
+                     VALUES ('{sid}', '{{}}', 1)"
+                ),
+            )
+            .await;
+            exec(
+                &conn,
+                &format!(
+                    "INSERT INTO mc_note
+                       (id, session_id, title, body, status, surface_condition,
+                        created_at, updated_at)
+                     VALUES ('n-{sid}', '{sid}', 't', 'b', 'active', NULL, 1, 1)"
+                ),
+            )
+            .await;
+        }
+    }
+
+    bus.publish(SessionEventData::SessionDeleted {
+        session_id: "s1".to_string(),
+    })
+    .await
+    .unwrap();
+
+    let conn = bus.db().acquire().await.unwrap();
+    for table in [
+        "mc_compartments",
+        "mc_tag",
+        "mc_drop",
+        "mc_historian_run",
+        "mc_frozen_state",
+        "mc_note",
+    ] {
+        let dead = one_row(
+            &conn,
+            &format!("SELECT count(*) FROM {table} WHERE session_id = 's1'"),
+            (),
+        )
+        .await
+        .get::<i64>(0)
+        .unwrap();
+        assert_eq!(dead, 0, "{table} still holds rows of the deleted session");
+        let live = one_row(
+            &conn,
+            &format!("SELECT count(*) FROM {table} WHERE session_id = 's2'"),
+            (),
+        )
+        .await
+        .get::<i64>(0)
+        .unwrap();
+        assert_eq!(live, 1, "{table} lost a live session's rows");
+    }
+}
+
+async fn exec(conn: &turso::Connection, sql: &str) {
+    conn.execute(sql, ()).await.expect("exec");
+}
+
+// ---------------------------------------------------------------------------
+// archive / unarchive
+// ---------------------------------------------------------------------------
+
+/// Upstream `SessionEvent.Archived/Unarchived`: the archive watermark is set
+/// (and `time_updated` bumped) on archive, cleared on unarchive.
+#[tokio::test]
+async fn archive_sets_and_clears_the_archive_watermark() {
+    let bus = bus().await;
+    create(&bus, "s1").await;
+
+    bus.publish(SessionEventData::SessionArchived {
+        session_id: "s1".to_string(),
+    })
+    .await
+    .unwrap();
+    {
+        let conn = bus.db().acquire().await.unwrap();
+        let row = one_row(
+            &conn,
+            "SELECT time_archived, time_updated FROM session_v2 WHERE id = 's1'",
+            (),
+        )
+        .await;
+        let archived = row.get::<Option<i64>>(0).unwrap();
+        assert!(archived.is_some(), "archive must stamp time_archived");
+        assert_eq!(
+            row.get::<i64>(1).unwrap(),
+            archived.unwrap(),
+            "time_updated follows the archive stamp"
+        );
+    }
+
+    bus.publish(SessionEventData::SessionUnarchived {
+        session_id: "s1".to_string(),
+    })
+    .await
+    .unwrap();
+    let conn = bus.db().acquire().await.unwrap();
+    let cleared = one_row(
+        &conn,
+        "SELECT time_archived FROM session_v2 WHERE id = 's1'",
+        (),
+    )
+    .await
+    .get::<Option<i64>>(0)
+    .unwrap();
+    assert!(cleared.is_none(), "unarchive must clear time_archived");
+}

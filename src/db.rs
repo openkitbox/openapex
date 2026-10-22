@@ -369,6 +369,26 @@ CREATE UNIQUE INDEX IF NOT EXISTS mc_historian_run_running_idx
     ON mc_historian_run (session_id) WHERE state = 'running';
 "#;
 
+/// V13: purge magic-context rows whose session no longer exists. The six
+/// `mc_*` tables that carry a `session_id` and no foreign key were never
+/// reached by the cascade from `session_v2`; deletions made before the
+/// projector cleared them explicitly left orphans behind (28 `mc_tag` rows in
+/// the production database). `mc_memory` is project-scoped and
+/// `mc_dream_state` is (project, task)-scoped, so neither is touched.
+///
+/// The `event` index is part of the same retention pass: `event.created` is the
+/// only key the replay-log sweep filters on, and without it the sweep scans the
+/// whole log (114 MB in the production database).
+const MIGRATION_V13: &str = r#"
+DELETE FROM mc_compartments WHERE session_id NOT IN (SELECT id FROM session_v2);
+DELETE FROM mc_tag WHERE session_id NOT IN (SELECT id FROM session_v2);
+DELETE FROM mc_drop WHERE session_id NOT IN (SELECT id FROM session_v2);
+DELETE FROM mc_historian_run WHERE session_id NOT IN (SELECT id FROM session_v2);
+DELETE FROM mc_frozen_state WHERE session_id NOT IN (SELECT id FROM session_v2);
+DELETE FROM mc_note WHERE session_id NOT IN (SELECT id FROM session_v2);
+CREATE INDEX IF NOT EXISTS event_created_idx ON event (created);
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
@@ -385,6 +405,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (10, MIGRATION_V10),
     (11, MIGRATION_V11),
     (12, MIGRATION_V12),
+    (13, MIGRATION_V13),
 ];
 
 /// All indexes the migration creates: V1's verbatim from upstream
@@ -395,6 +416,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
 const EXPECTED_INDEXES: &[&str] = &[
     "event_aggregate_seq_idx",
     "event_aggregate_type_seq_idx",
+    "event_created_idx",
     "session_v2_project_idx",
     "session_v2_workspace_idx",
     "session_v2_parent_idx",
@@ -791,6 +813,22 @@ mod tests {
         query_row(db, sql).await.get::<i64>(0).unwrap()
     }
 
+    /// Seed the `session_v2` row a fixture's `mc_*` rows hang off. Since V13 the
+    /// session-scoped magic-context tables are purged when their session is
+    /// missing, so a fixture without it reads as an orphan.
+    async fn seed_session(conn: &Connection, sid: &str) {
+        conn.execute(
+            &format!(
+                "INSERT INTO session_v2
+                   (id, project_id, slug, directory, version, time_created, time_updated)
+                 VALUES ('{sid}', 'proj', '{sid}', '/p', '1', 1, 1)"
+            ),
+            (),
+        )
+        .await
+        .unwrap();
+    }
+
     async fn columns(db: &Db, table: &str) -> Vec<String> {
         let conn = db.acquire().await.unwrap();
         let mut stmt = conn
@@ -861,6 +899,92 @@ mod tests {
     /// be chased through every upgrade test.
     fn latest_version() -> u32 {
         MIGRATIONS.last().expect("at least one migration").0
+    }
+
+    /// V13 removes magic-context rows whose session no longer exists: those
+    /// six tables carry no foreign key, so deletions made before the projector
+    /// learned to clear them left orphans behind (measured on the production
+    /// database: 28 `mc_tag` rows).
+    #[tokio::test]
+    async fn migration_v13_purges_orphaned_magic_context_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("orphans.db");
+        build_upto(&path, 12).await;
+        {
+            let conn = raw(&path).await;
+            conn.execute(
+                "INSERT INTO session_v2
+                   (id, project_id, slug, directory, version, time_created, time_updated)
+                 VALUES ('ses_live', 'proj', 'slug', '/tmp/ox', '1', 1, 1)",
+                (),
+            )
+            .await
+            .unwrap();
+            for (id, sid) in [("live", "ses_live"), ("dead", "ses_dead")] {
+                for sql in [
+                    format!(
+                        "INSERT INTO mc_compartments
+                           (id, session_id, coverage_end, importance, tiers, created_at)
+                         VALUES ('c-{id}', '{sid}', '4', 50, '{{}}', 1)"
+                    ),
+                    format!(
+                        "INSERT INTO mc_tag (session_id, tag, message_id, part_path, digest)
+                         VALUES ('{sid}', 1, 'm', 'p', 'd')"
+                    ),
+                    format!(
+                        "INSERT INTO mc_drop (session_id, tag, reason, state, created_at)
+                         VALUES ('{sid}', 1, 'r', 'queued', 1)"
+                    ),
+                    format!(
+                        "INSERT INTO mc_historian_run
+                           (id, session_id, state, attempt, created_at, updated_at)
+                         VALUES ('h-{id}', '{sid}', 'done', 1, 1, 1)"
+                    ),
+                    format!(
+                        "INSERT INTO mc_frozen_state (session_id, state, version)
+                         VALUES ('{sid}', '{{}}', 1)"
+                    ),
+                    format!(
+                        "INSERT INTO mc_note
+                           (id, session_id, title, body, status, surface_condition,
+                            created_at, updated_at)
+                         VALUES ('n-{id}', '{sid}', 't', 'b', 'active', NULL, 1, 1)"
+                    ),
+                ] {
+                    conn.execute(sql.as_str(), ()).await.unwrap();
+                }
+            }
+        }
+
+        let upgraded = Db::open(&path).await.unwrap();
+        assert_eq!(upgraded.user_version().await.unwrap(), latest_version());
+        for table in [
+            "mc_compartments",
+            "mc_tag",
+            "mc_drop",
+            "mc_historian_run",
+            "mc_frozen_state",
+            "mc_note",
+        ] {
+            assert_eq!(
+                count(
+                    &upgraded,
+                    &format!("SELECT count(*) FROM {table} WHERE session_id = 'ses_dead'")
+                )
+                .await,
+                0,
+                "{table}: orphan survived the migration"
+            );
+            assert_eq!(
+                count(
+                    &upgraded,
+                    &format!("SELECT count(*) FROM {table} WHERE session_id = 'ses_live'")
+                )
+                .await,
+                1,
+                "{table}: a live session's row was purged"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1052,6 +1176,7 @@ mod tests {
         build_upto(&path, 4).await;
         {
             let conn = raw(&path).await;
+            seed_session(&conn, "ses_1").await;
             conn.execute(
                 // A terminal state on purpose: a `running` row would be settled
                 // by a later migration and stop being the "defaults preserved"
@@ -1084,6 +1209,7 @@ mod tests {
         build_upto(&path, 11).await;
         {
             let conn = raw(&path).await;
+            seed_session(&conn, "ses_1").await;
             // Two running rows for one session: legal before V12, forbidden after.
             conn.execute(
                 "INSERT INTO mc_historian_run (id, session_id, state, chunk_ref, attempt, created_at)
@@ -1158,6 +1284,7 @@ mod tests {
         build_upto(&path, 5).await;
         {
             let conn = raw(&path).await;
+            seed_session(&conn, "ses_1").await;
             // A pre-V6 compartment row carries the (neutral) placeholders.
             conn.execute(
                 "INSERT INTO mc_compartments
@@ -1212,6 +1339,7 @@ mod tests {
         build_upto(&path, 6).await;
         {
             let conn = raw(&path).await;
+            seed_session(&conn, "ses_1").await;
             // Rows written before the search indexes exist, one per source.
             for sql in [
                 "INSERT INTO mc_memory (id, project, content, category, created_at, updated_at)

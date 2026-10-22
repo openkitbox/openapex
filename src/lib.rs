@@ -255,6 +255,11 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
             tracing::warn!(error = %error, "settle interrupted historian runs failed");
         }
     }
+    // Replay-log retention: the `event` table is history for SSE reconnect, not
+    // state, so old rows are swept on a fixed window (`[events] retention_days`,
+    // 0 keeps everything). Deliberately started here rather than in
+    // `build_state_with`: tests must not acquire a background writer.
+    event_bus::spawn_pruner(state.db.clone(), state.config.events.retention_days);
     let router = build_router(state.clone());
     Ok((state, router))
 }

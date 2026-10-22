@@ -207,6 +207,29 @@ impl Default for SubagentConfig {
     }
 }
 
+/// Event-log retention (`[events]` section). The `event` table is the SSE
+/// replay log — the read models it feeds are written in the same transaction —
+/// so dropping old rows costs only replay depth, never state.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EventsConfig {
+    /// Days of replay events to keep. `0` keeps everything, which is what
+    /// upstream does; the default keeps a week.
+    #[serde(default = "default_retention_days")]
+    pub retention_days: u64,
+}
+
+fn default_retention_days() -> u64 {
+    7
+}
+
+impl Default for EventsConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_retention_days(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     /// Base URL of the cardinal LLM gateway (cardinal's `listen`, e.g.
@@ -249,6 +272,9 @@ pub struct Config {
     /// Subagent behavior (`[subagent]` section).
     #[serde(default)]
     pub subagent: SubagentConfig,
+    /// Replay-log retention (`[events]` section).
+    #[serde(default)]
+    pub events: EventsConfig,
 }
 
 fn default_event_heartbeat_ms() -> u64 {
@@ -267,6 +293,7 @@ impl Default for Config {
             magic_context: MctxConfig::default(),
             mcp: McpConfig::default(),
             subagent: SubagentConfig::default(),
+            events: EventsConfig::default(),
         }
     }
 }
@@ -393,6 +420,15 @@ mod tests {
         assert_eq!(cfg.event_heartbeat_ms, 15_000);
         assert!(cfg.db_path.ends_with("ox.db"));
         assert!(cfg.default_model.is_none());
+    }
+
+    #[test]
+    fn event_retention_defaults_to_a_week_and_zero_disables_it() {
+        assert_eq!(Config::default().events.retention_days, 7);
+        let off: Config = toml::from_str("[events]\nretention_days = 0\n").unwrap();
+        assert_eq!(off.events.retention_days, 0);
+        let custom: Config = toml::from_str("[events]\nretention_days = 30\n").unwrap();
+        assert_eq!(custom.events.retention_days, 30);
     }
 
     #[test]

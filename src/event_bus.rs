@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
 use dashmap::DashMap;
@@ -39,6 +40,89 @@ fn is_ephemeral(kind: &str) -> bool {
             | "session.usage.updated"
             | "session.compaction.delta"
     )
+}
+
+/// How often the replay-log sweep runs. Six hours is frequent enough to keep a
+/// week's window tight and rare enough to be invisible.
+const PRUNE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Rows deleted per transaction, so a large backlog drains without holding the
+/// writer gate for the whole sweep.
+const PRUNE_BATCH: u64 = 5_000;
+
+/// Upper bound on the configured window, purely so the arithmetic cannot
+/// overflow into a window that would delete everything.
+const MAX_RETENTION_DAYS: u64 = 3_650;
+
+/// Epoch-millisecond cutoff below which replay events may be dropped.
+/// `days == 0` keeps everything, which is upstream's behavior.
+pub(crate) fn retention_cutoff(now_ms: i64, days: u64) -> Option<i64> {
+    if days == 0 {
+        return None;
+    }
+    // A nonsensical `retention_days` must not wrap into a negative window,
+    // which would delete every event: clamp to a decade before multiplying.
+    let days = days.min(MAX_RETENTION_DAYS) as i64;
+    Some(now_ms - days * 86_400_000)
+}
+
+/// Delete replay events created before `cutoff_ms`, returning how many went.
+/// The `event_sequence` watermark is untouched: sequence numbers must stay
+/// monotonic even when their rows are gone (a reconnecting client simply sees
+/// fewer rows after its `after` cursor).
+///
+/// Two deliberate properties: each batch commits through [`Db::begin`], so the
+/// sweep shares the writer gate with the projector instead of racing it, and
+/// the work is chunked so one sweep cannot hold that gate for the length of a
+/// full-table delete.
+pub(crate) async fn prune_events_before(db: &Db, cutoff_ms: i64) -> Result<u64> {
+    prune_events_before_in_batches(db, cutoff_ms, PRUNE_BATCH).await
+}
+
+/// The sweep itself, with the batch size injected so a test can cross a batch
+/// boundary without inserting thousands of rows. Termination relies on the
+/// delete being exact: a short batch means the predicate set is exhausted.
+async fn prune_events_before_in_batches(db: &Db, cutoff_ms: i64, batch_size: u64) -> Result<u64> {
+    let mut pruned = 0u64;
+    loop {
+        let tx = db.begin().await?;
+        let batch = tx
+            .execute(
+                "DELETE FROM event WHERE rowid IN
+                   (SELECT rowid FROM event WHERE created < ?1 LIMIT ?2)",
+                (cutoff_ms, batch_size as i64),
+            )
+            .await
+            .context("prune replay events")?;
+        tx.commit().await.context("commit replay prune")?;
+        pruned += batch;
+        if batch < batch_size {
+            return Ok(pruned);
+        }
+    }
+}
+
+/// Sweep the replay log once now and then every [`PRUNE_INTERVAL`]. `days == 0`
+/// disables retention entirely (upstream keeps every event forever); the sweep
+/// is best-effort — a failure is logged and retried on the next tick.
+pub fn spawn_pruner(db: Db, days: u64) {
+    if days == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            if let Some(cutoff) = retention_cutoff(now_millis(), days) {
+                match prune_events_before(&db, cutoff).await {
+                    Ok(0) => {}
+                    Ok(pruned) => tracing::info!(pruned, days, "pruned replay events"),
+                    Err(error) => {
+                        tracing::warn!(error = %error, "pruning replay events failed");
+                    }
+                }
+            }
+            tokio::time::sleep(PRUNE_INTERVAL).await;
+        }
+    });
 }
 
 /// Event version for the persisted `type` suffix `{kind}@v{version}`.
@@ -395,6 +479,8 @@ pub(crate) fn session_id_of(data: &SessionEventData) -> Option<&str> {
         | E::SessionMetadataUpdated { session_id, .. }
         | E::SessionPermissions { session_id, .. }
         | E::SessionViewed { session_id, .. }
+        | E::SessionArchived { session_id, .. }
+        | E::SessionUnarchived { session_id, .. }
         | E::SessionUsageRecorded { session_id, .. }
         | E::SessionUsageUpdated { session_id, .. }
         | E::SessionInstructionsUpdated { session_id, .. }
@@ -433,4 +519,110 @@ pub(crate) fn session_id_of(data: &SessionEventData) -> Option<&str> {
         | E::CompactionFailed { session_id, .. } => session_id,
         E::Unknown { .. } => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retention_cutoff_is_a_day_window_and_zero_disables() {
+        let now = 1_000_000_000_000;
+        assert_eq!(retention_cutoff(now, 0), None, "0 keeps every event");
+        assert_eq!(retention_cutoff(now, 7), Some(now - 7 * 86_400_000));
+        assert_eq!(retention_cutoff(now, 1), Some(now - 86_400_000));
+        assert_eq!(
+            retention_cutoff(now, u64::MAX),
+            Some(now - 3_650 * 86_400_000),
+            "an absurd window clamps instead of overflowing"
+        );
+    }
+
+    /// The sweep drops rows past the cutoff and leaves the per-aggregate
+    /// watermark alone: sequence numbers must keep ascending after their rows
+    /// are gone.
+    #[tokio::test]
+    async fn prune_drops_old_events_and_keeps_the_sequence_watermark() {
+        let db = Db::open_in_memory().await.unwrap();
+        {
+            let conn = db.acquire().await.unwrap();
+            // `event.aggregate_id` references `event_sequence`, so the watermark
+            // row comes first.
+            conn.execute(
+                "INSERT INTO event_sequence (aggregate_id, seq) VALUES ('ses_1', 1)",
+                (),
+            )
+            .await
+            .unwrap();
+            for (id, seq, created) in [("evt_old", 0_i64, 1_000_i64), ("evt_new", 1, 2_000)] {
+                conn.execute(
+                    "INSERT INTO event (id, aggregate_id, seq, created, type, data)
+                     VALUES (?1, 'ses_1', ?2, ?3, 'session.renamed@v1', '{}')",
+                    (id, seq, created),
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        assert_eq!(prune_events_before(&db, 1_500).await.unwrap(), 1);
+
+        let conn = db.acquire().await.unwrap();
+        let mut stmt = conn.prepare("SELECT id FROM event").await.unwrap();
+        let mut rows = stmt.query(()).await.unwrap();
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            ids.push(row.get::<String>(0).unwrap());
+        }
+        assert_eq!(ids, vec!["evt_new".to_string()]);
+        drop(rows);
+        drop(stmt);
+
+        let mut stmt = conn
+            .prepare("SELECT seq FROM event_sequence WHERE aggregate_id = 'ses_1'")
+            .await
+            .unwrap();
+        let mut rows = stmt.query(()).await.unwrap();
+        let row = rows.next().await.unwrap().expect("watermark row");
+        assert_eq!(
+            row.get::<i64>(0).unwrap(),
+            1,
+            "watermark survives the sweep"
+        );
+    }
+
+    /// A backlog larger than one batch must drain completely: the loop only
+    /// stops on a short batch, so an off-by-one here would either spin forever
+    /// or leave rows behind.
+    #[tokio::test]
+    async fn prune_drains_more_than_one_batch() {
+        let db = Db::open_in_memory().await.unwrap();
+        {
+            let conn = db.acquire().await.unwrap();
+            conn.execute(
+                "INSERT INTO event_sequence (aggregate_id, seq) VALUES ('ses_1', 4)",
+                (),
+            )
+            .await
+            .unwrap();
+            for seq in 0..5 {
+                conn.execute(
+                    "INSERT INTO event (id, aggregate_id, seq, created, type, data)
+                     VALUES (?1, 'ses_1', ?2, 1_000, 'session.renamed@v1', '{}')",
+                    (format!("evt_{seq}"), seq),
+                )
+                .await
+                .unwrap();
+            }
+        }
+
+        let pruned = prune_events_before_in_batches(&db, 1_500, 2).await.unwrap();
+        assert_eq!(pruned, 5, "every row past the cutoff goes");
+
+        let conn = db.acquire().await.unwrap();
+        let mut stmt = conn.prepare("SELECT count(*) FROM event").await.unwrap();
+        let mut rows = stmt.query(()).await.unwrap();
+        let left = rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap();
+        assert_eq!(left, 0);
+    }
 }

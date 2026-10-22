@@ -290,6 +290,19 @@ pub enum SessionEventData {
         /// Epoch-millisecond idle watermark the viewer observed.
         idle: i64,
     },
+    /// Archive the session: it stays stored but drops out of the archived
+    /// filter of `session.list` (upstream `SessionEvent.Archived`).
+    #[serde(rename = "session.archived")]
+    SessionArchived {
+        #[serde(rename = "sessionID")]
+        session_id: String,
+    },
+    /// Restore an archived session (upstream `SessionEvent.Unarchived`).
+    #[serde(rename = "session.unarchived")]
+    SessionUnarchived {
+        #[serde(rename = "sessionID")]
+        session_id: String,
+    },
 
     // -- Execution ------------------------------------------------------------
     #[serde(rename = "session.execution.started")]
@@ -654,6 +667,8 @@ impl SessionEventData {
             SessionEventData::SessionMetadataUpdated { .. } => "session.metadata.updated",
             SessionEventData::SessionPermissions { .. } => "session.permissions",
             SessionEventData::SessionViewed { .. } => "session.viewed",
+            SessionEventData::SessionArchived { .. } => "session.archived",
+            SessionEventData::SessionUnarchived { .. } => "session.unarchived",
             SessionEventData::ExecutionStarted { .. } => "session.execution.started",
             SessionEventData::ExecutionSucceeded { .. } => "session.execution.succeeded",
             SessionEventData::ExecutionFailed { .. } => "session.execution.failed",
@@ -715,6 +730,8 @@ impl SessionEventData {
             | SessionEventData::SessionMetadataUpdated { session_id, .. }
             | SessionEventData::SessionPermissions { session_id, .. }
             | SessionEventData::SessionViewed { session_id, .. }
+            | SessionEventData::SessionArchived { session_id, .. }
+            | SessionEventData::SessionUnarchived { session_id, .. }
             | SessionEventData::ExecutionStarted { session_id, .. }
             | SessionEventData::ExecutionSucceeded { session_id, .. }
             | SessionEventData::ExecutionFailed { session_id, .. }

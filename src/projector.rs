@@ -94,6 +94,27 @@ pub async fn project(
         }
 
         E::SessionDeleted { session_id } => {
+            // `session_message`, `session_inbox` and `session_pending` cascade
+            // from the `session_v2` delete; these magic-context tables carry no
+            // foreign key, so they are cleared here in the same transaction or
+            // they leak (and later searches/timelines resurrect a session the
+            // user deleted). `mc_note` is session-scoped state — every read
+            // filters `session_id = ?` — so it goes with its session, unlike
+            // `mc_memory` and `mc_dream_state`, which are project-scoped.
+            for table in [
+                "mc_compartments",
+                "mc_tag",
+                "mc_drop",
+                "mc_historian_run",
+                "mc_frozen_state",
+                "mc_note",
+            ] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE session_id = ?1"),
+                    [session_id.as_str()],
+                )
+                .await?;
+            }
             tx.execute(
                 "DELETE FROM session_v2 WHERE id = ?1",
                 [session_id.as_str()],
@@ -226,6 +247,20 @@ pub async fn project(
                    time_updated = time_updated
                  WHERE id = ?1",
                 (session_id.as_str(), *idle),
+            )
+            .await?;
+        }
+        E::SessionArchived { session_id } => {
+            tx.execute(
+                "UPDATE session_v2 SET time_archived = ?2, time_updated = ?2 WHERE id = ?1",
+                (session_id.as_str(), env.created),
+            )
+            .await?;
+        }
+        E::SessionUnarchived { session_id } => {
+            tx.execute(
+                "UPDATE session_v2 SET time_archived = NULL, time_updated = ?2 WHERE id = ?1",
+                (session_id.as_str(), env.created),
             )
             .await?;
         }
