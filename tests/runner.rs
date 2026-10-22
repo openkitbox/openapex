@@ -429,6 +429,20 @@ impl Drop for Harness {
 }
 
 impl Harness {
+    /// Graceful stop: abort the server and event collector, then await the
+    /// joins. Plain `drop` only *schedules* the aborts — the server task owns
+    /// the router → state → Db chain, and until it has actually unwound the
+    /// database file is still held, so a restart harness reopening the same
+    /// file must await the joins (this replaces a fixed 100ms sleep).
+    async fn shutdown(mut self) {
+        self.handle.abort();
+        self.collector.abort();
+        // Aborted joins resolve once the tasks have unwound and released
+        // everything they captured.
+        let _ = (&mut self.handle).await;
+        let _ = (&mut self.collector).await;
+    }
+
     /// Spawn the server with the given chat scripts and an empty registry.
     async fn spawn(scripts: Vec<Script>) -> Self {
         Self::spawn_inner(scripts, ToolRegistry::new(), false, None).await
@@ -546,6 +560,10 @@ impl Harness {
 
     /// Create a session bound to `directory` (the per-request project
     /// directory the client sends), returning its id.
+    ///
+    /// Same load-bearing title as [`Self::create_session`]: the non-empty
+    /// title keeps title generation from firing on the first prompt, so the
+    /// request-count assertions below see step calls only.
     async fn create_session_in(&self, directory: &str) -> String {
         let response = self
             .client
@@ -3264,8 +3282,7 @@ async fn instruction_sync_across_edit_swallow_and_restart() {
     // current file. The static layer and the checkpoint head keep their
     // bytes; the instruction layer renders the current content, and the
     // surviving delta row matches the rebuilt baseline — no re-delivery flap.
-    drop(harness);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    harness.shutdown().await;
     let restarted = Harness::spawn_on(
         vec![MockChat::text("four"), MockChat::text("five")],
         &db_path,
@@ -3359,11 +3376,12 @@ async fn restart_with_unchanged_files_keeps_the_request_prefix() {
     let session_id = harness.create_session_in(&project).await;
     prompt_turn(&harness, &session_id, &project, "first", 1).await;
     let requests = harness.chat.requests();
+    // Counts step calls only: the titled session never triggers title
+    // generation (see create_session_in).
     assert_eq!(requests.len(), 1, "one model call for the turn");
     let prefix = prefix_of(&requests[0].messages);
 
-    drop(harness);
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    harness.shutdown().await;
     let restarted = Harness::spawn_on(vec![MockChat::text("two")], &db_path).await;
     prompt_turn(&restarted, &session_id, &project, "second", 2).await;
     let requests = restarted.chat.requests();

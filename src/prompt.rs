@@ -1,74 +1,12 @@
-//! Minimal system prompt (plan §6).
-//!
-//! Upstream assembles a large instruction stack (instructions state machine,
-//! agent prompt, skills, snapshots). ox's runner (task 6) needs a well-formed
-//! starting point: an environment block plus the project's `AGENTS.md` when
-//! one exists at the working directory. Later tasks extend this template.
+//! System prompt assembly: the static harness layer ([`system_static`]) plus
+//! the keyed instruction layer. [`gather`] observes this step's sources in
+//! upstream combine order; [`render_initial`] freezes the first render into
+//! system[1], and [`changed_text`]/[`removed_text`] render per-key deltas
+//! against the runner's baseline (see `runner/instructions.rs`).
 
 use std::path::Path;
 
 use serde::Serialize;
-
-/// Build the system prompt for a step: an environment block (working
-/// directory, platform, today's UTC date) plus `AGENTS.md` contents read
-/// from `directory` when present (read fresh each step — small files only).
-///
-/// [`build_with_mcp`] without MCP instructions.
-pub fn build(directory: &Path) -> String {
-    build_with_mcp(directory, None)
-}
-
-/// [`build`] plus the MCP instruction block (upstream
-/// `mcp/instructions.ts`). `None` preserves the pre-MCP prompt byte for
-/// byte, which is what the zero-server configuration must keep doing.
-pub fn build_with_mcp(directory: &Path, mcp_instructions: Option<&str>) -> String {
-    let mut prompt = format!(
-        "You are a coding agent running in ox, an opencode-compatible server.\n\n\
-         <env>\n\
-         Working directory: {}\n\
-         Platform: {}\n\
-         Today's date: {}\n\
-         </env>",
-        directory.display(),
-        std::env::consts::OS,
-        today_iso(),
-    );
-    if let Ok(agents) = std::fs::read_to_string(directory.join("AGENTS.md")) {
-        prompt.push_str("\n\n<project_instructions>\n");
-        prompt.push_str(agents.trim_end());
-        prompt.push_str("\n</project_instructions>");
-        // No AGENTS.md (or unreadable): the env block alone is the prompt.
-    }
-    // The available-skills block (upstream `skill/instructions.ts`): the model
-    // sees id/name/description and loads the body with the `skill` tool. The
-    // block is omitted when nothing is discovered so the prompt stays small.
-    let skills = crate::tool::skills::discover(directory);
-    if !skills.is_empty() {
-        prompt.push_str(
-            "\n\nSkills provide specialized instructions and workflows for specific tasks.\n\
-             Use the skill tool to load a skill when a task matches its description.\n\
-             <available_skills>\n",
-        );
-        for skill in &skills {
-            prompt.push_str("  <skill>\n");
-            prompt.push_str(&format!("    <id>{}</id>\n", escape(&skill.id)));
-            prompt.push_str(&format!("    <name>{}</name>\n", escape(&skill.name)));
-            if let Some(description) = &skill.description {
-                prompt.push_str(&format!(
-                    "    <description>{}</description>\n",
-                    escape(description)
-                ));
-            }
-            prompt.push_str("  </skill>\n");
-        }
-        prompt.push_str("</available_skills>");
-    }
-    if let Some(block) = mcp_instructions {
-        prompt.push_str("\n\n");
-        prompt.push_str(block);
-    }
-    prompt
-}
 
 /// The skills block embeds user-controlled text in an XML-ish envelope; a raw
 /// `<` would let a skill description break the block out early.
@@ -76,11 +14,6 @@ fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
-}
-
-/// Today's UTC date as `YYYY-MM-DD` (civil-from-days; no chrono dependency).
-fn today_iso() -> String {
-    days_to_iso(crate::id::now_millis().div_euclid(86_400_000))
 }
 
 /// Civil date from days since the Unix epoch (Howard Hinnant's algorithm).
@@ -101,8 +34,8 @@ pub(crate) fn days_to_iso(days: i64) -> String {
 
 /// Static system layer — verbatim port of upstream
 /// `packages/core/src/session/runner/prompt/system.txt`, with the identity
-/// line's `OpenCode` → ox. `${OPENCODE_TOOL_GUIDANCE}` is substituted at
-/// build time from the registered tool set (upstream
+/// line's `OpenCode` → ox. `${OPENCODE_TOOL_GUIDANCE}` is rendered from the
+/// registered tool set on every assembly (upstream
 /// `session/system-prompt.ts:render`).
 const HARNESS_TEMPLATE: &str = "You are an AI agent running in ox, an opencode-compatible server. Help the user accomplish their goals using the tools you have available.\n\n# Harness\n- Responses are rendered as GitHub-flavored Markdown.\n- `<system-reminder>` blocks are harness instructions, not user-authored content. Read and follow them.\n- Prefer parallelizing independent tool calls.\n${OPENCODE_TOOL_GUIDANCE}\n\n# Communication\n- Use clear file paths when referring to files.\n- Keep responses clear and concise, and avoid unnecessary technical jargon.\n\n# Working in codebases\n- Keep changes consistent with the structure, naming, style, and patterns of the surrounding code.\n- Treat unfamiliar files or changes as potential user work and investigate before deleting or overwriting them.\n";
 
@@ -463,36 +396,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn today_iso_matches_known_epoch_anchors() {
+    fn days_to_iso_matches_known_epoch_anchors() {
         // Day 0 = 1970-01-01; leap-year and century boundaries stay exact.
         assert_eq!(days_to_iso(0), "1970-01-01");
         assert_eq!(days_to_iso(59), "1970-03-01");
         assert_eq!(days_to_iso(19_723), "2024-01-01");
-    }
-
-    #[test]
-    fn build_includes_env_block() {
-        let dir = std::env::temp_dir();
-        let prompt = build(&dir);
-        assert!(prompt.contains("Working directory: "));
-        assert!(prompt.contains("Today's date: "));
-    }
-
-    #[test]
-    fn mcp_instructions_are_appended_when_present() {
-        let dir = std::env::temp_dir();
-        let with = build_with_mcp(&dir, Some("<mcp_instructions>\n</mcp_instructions>"));
-        assert!(with.contains("<mcp_instructions>"));
-        assert!(!build(&dir).contains("<mcp_instructions>"));
-    }
-
-    #[test]
-    fn build_does_not_carry_the_memory_pinboard() {
-        // The pinboard lives in the magic-context head (m[0]), not in the
-        // system prompt: the system prompt must stay byte-identical whether
-        // the integration is on or off.
-        let dir = std::env::temp_dir();
-        assert!(!build(&dir).contains("<project-memory>"));
     }
 
     #[test]
