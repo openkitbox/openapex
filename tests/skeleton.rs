@@ -646,3 +646,117 @@ async fn wait_idle_404s_unknown_session_and_204s_when_idle() {
     assert_eq!(response.status(), 204);
     handle.abort();
 }
+
+// ---------------------------------------------------------------------------
+// worktree.list — the TUI's Worktrees panel
+// ---------------------------------------------------------------------------
+
+/// Run `git` in `dir` with a deterministic identity; returns stdout.
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args(["-c", "user.email=test@example.com", "-c", "user.name=Test"])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git runs");
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("utf8")
+}
+
+/// The panel's list call: a BARE array of `{directory, strategy?}` (upstream
+/// `Worktree.List` — no `location`/`data` envelope), the root checkout without
+/// a strategy and linked checkouts labelled `git`.
+#[tokio::test]
+async fn worktree_list_answers_the_repository_checkouts() {
+    let (base, handle, dir) = spawn_server().await;
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("README.md"), "hi\n").unwrap();
+    git(&repo, &["add", "README.md"]);
+    git(&repo, &["commit", "-q", "-m", "init"]);
+    let checkout = dir.path().join("checkout");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            checkout.to_str().unwrap(),
+            "-b",
+            "side",
+        ],
+    );
+    let repo = repo.canonicalize().unwrap();
+    let checkout = checkout.canonicalize().unwrap();
+
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/api/worktree?projectID=default"))
+        .header("x-opencode-directory", repo.display().to_string())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let entries = body.as_array().expect("bare array, no envelope");
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert_eq!(
+        entries[0]["directory"],
+        serde_json::json!(repo.display().to_string())
+    );
+    assert!(
+        entries[0].get("strategy").is_none(),
+        "the root checkout carries no strategy: {entries:?}"
+    );
+    assert_eq!(
+        entries[1]["directory"],
+        serde_json::json!(checkout.display().to_string())
+    );
+    assert_eq!(entries[1]["strategy"], serde_json::json!("git"));
+    handle.abort();
+}
+
+/// Outside a repository (or without git) the list degrades to the requested
+/// directory instead of failing the panel.
+#[tokio::test]
+async fn worktree_list_falls_back_to_the_requested_directory() {
+    let (base, handle, dir) = spawn_server().await;
+    let plain = dir.path().join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let plain = plain.canonicalize().unwrap();
+
+    let response = reqwest::Client::new()
+        .get(format!("{base}/api/worktree?projectID=default"))
+        .header("x-opencode-directory", plain.display().to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!([{ "directory": plain.display().to_string() }]),
+        "single root entry"
+    );
+    handle.abort();
+}
+
+/// The panel re-lists through `refresh` on open; ox has no inventory to
+/// reconcile, so it acknowledges instead of erroring.
+#[tokio::test]
+async fn worktree_refresh_acknowledges_without_content() {
+    let (base, handle, _dir) = spawn_server().await;
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/worktree/refresh"))
+        .json(&serde_json::json!({ "projectID": "default" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 204);
+    handle.abort();
+}

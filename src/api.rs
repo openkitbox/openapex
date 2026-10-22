@@ -234,6 +234,48 @@ async fn query_projects(db: &Db) -> anyhow::Result<Vec<Project>> {
 }
 
 // ---------------------------------------------------------------------------
+// worktree.list / worktree.refresh — the TUI's Worktrees panel
+// ---------------------------------------------------------------------------
+
+/// `GET /api/worktree?projectID=` — a bare `Worktree.Directory[]` (upstream
+/// `Worktree.List`: no `location`/`data` envelope), read from git rather than
+/// from an inventory table (see `crate::worktree`).
+#[handler] // operation_id: worktree.list
+async fn worktree_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(state) = state(depot, res) else {
+        return;
+    };
+    let directory = worktree_directory(state, req).await;
+    res.render(Json(crate::worktree::list(&directory).await));
+}
+
+/// `POST /api/worktree/refresh` — the panel calls this on open to reconcile a
+/// server-side inventory with git. ox keeps none, so it only acknowledges; the
+/// following list already answers from fresh `git worktree list` state.
+#[handler] // operation_id: worktree.refresh
+async fn worktree_refresh(res: &mut Response) {
+    res.status_code(StatusCode::NO_CONTENT);
+}
+
+/// The directory whose checkouts the requested project covers: the `project`
+/// row's canonical directory when the DB is shared with an upstream server,
+/// otherwise the directory the client asked about (`x-opencode-directory`).
+async fn worktree_directory(state: &AppState, req: &mut Request) -> String {
+    let requested = req.query::<String>("projectID").unwrap_or_default();
+    if !requested.is_empty() && state.db.table_exists("project").await.unwrap_or(false) {
+        match query_projects(&state.db).await {
+            Ok(rows) => {
+                if let Some(project) = rows.into_iter().find(|project| project.id == requested) {
+                    return project.canonical;
+                }
+            }
+            Err(error) => tracing::warn!(error = %error, "worktree list: project query failed"),
+        }
+    }
+    compat::directory_of(req)
+}
+
+// ---------------------------------------------------------------------------
 // model.list — GET /api/model
 // ---------------------------------------------------------------------------
 
@@ -493,6 +535,11 @@ pub fn build_router(state: AppState) -> Router {
                 .push(Router::with_path("info").get(server_info))
                 .push(Router::with_path("location").get(location_get))
                 .push(Router::with_path("project").get(project_list))
+                .push(
+                    Router::with_path("worktree")
+                        .get(worktree_list)
+                        .push(Router::with_path("refresh").post(worktree_refresh)),
+                )
                 .push(Router::with_path("model").get(model_list))
                 .push(Router::with_path("model/default").get(model_default))
                 .push(Router::with_path("agent").get(agent_list))

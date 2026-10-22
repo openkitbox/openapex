@@ -21,6 +21,7 @@ pub mod schema;
 pub mod slug;
 pub mod tool;
 pub(crate) mod which;
+pub(crate) mod worktree;
 
 use std::sync::Arc;
 
