@@ -4,7 +4,7 @@
 //! config/db/id/api so integration tests can drive the real router.
 //! The `acp` subcommand runs the Agent Client Protocol translator instead
 //! (`src/acp`); the default path boots the server exactly as before.
-
+//!
 use anyhow::Result;
 #[tokio::main]
 async fn main() -> Result<()> {

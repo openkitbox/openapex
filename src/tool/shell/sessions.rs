@@ -112,7 +112,10 @@ impl OutputBuffer {
     pub fn page(&self, cursor: u64, limit: usize) -> OutputPage {
         let dropped = self.dropped();
         let truncated = cursor < dropped;
-        let start = cursor.max(dropped);
+        // Clamp both ends: a cursor past the capture's end is EOF (an empty
+        // page), not a panic — `bytes[offset..]` rejects offset > len even
+        // for an empty range.
+        let start = cursor.max(dropped).min(self.total);
         let offset = (start - dropped) as usize;
         let available = self.bytes.len().saturating_sub(offset);
         let take = available.min(limit.max(1));
@@ -634,6 +637,32 @@ mod tests {
         assert_eq!(page.output, "");
         assert_eq!(page.cursor, 0);
         assert_eq!(page.size, 0);
+        assert!(!page.truncated);
+    }
+
+    #[test]
+    fn a_cursor_beyond_the_end_reads_as_caught_up() {
+        // Production panic 2026-10-22: a model-invented cursor of 2000 on a
+        // 1292-byte capture panicked slicing `bytes[2000..2000]`. Past-the-end
+        // is a valid read (EOF semantics), never a panic.
+        let mut buffer = OutputBuffer::with_capacity(2048);
+        buffer.append(&[b'x'; 1292]);
+        let page = buffer.page(2000, 64);
+        assert_eq!(page.output, "");
+        assert_eq!(page.cursor, 1292);
+        assert_eq!(page.size, 1292);
+        assert!(!page.truncated);
+    }
+
+    #[test]
+    fn a_cursor_beyond_the_end_with_a_dropped_front_reads_as_caught_up() {
+        let mut buffer = OutputBuffer::with_capacity(8);
+        buffer.append(b"0123456789");
+        assert_eq!(buffer.dropped(), 2);
+        let page = buffer.page(99, 4);
+        assert_eq!(page.output, "");
+        assert_eq!(page.cursor, 10);
+        assert_eq!(page.size, 10);
         assert!(!page.truncated);
     }
 }
