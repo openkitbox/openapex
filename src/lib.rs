@@ -204,7 +204,7 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
     let db = Db::open(&config.db_path).await?;
     let bus = EventBus::new(db.clone());
     tools.register_todowrite(db.clone());
-    tools.register_subagent(db.clone(), bus.clone());
+    tools.register_subagent(db.clone(), bus.clone(), config.subagent.depth);
     let chat = cardinal_chat(&config)?;
     let state = build_state_on_with_bus(config, chat, tools, db, bus).await?;
     // Fetch the model list before serving, so the first client that asks

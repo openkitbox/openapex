@@ -17,6 +17,7 @@ pub const ENV_CARDINAL_KEY: &str = "OX_CARDINAL_KEY";
 pub const ENV_DB_PATH: &str = "OX_DB_PATH";
 pub const ENV_LISTEN: &str = "OX_LISTEN";
 pub const ENV_DEFAULT_MODEL: &str = "OX_DEFAULT_MODEL";
+pub const ENV_SUBAGENT_DEPTH: &str = "OX_SUBAGENT_DEPTH";
 
 fn default_cardinal_url() -> String {
     DEFAULT_CARDINAL_URL.to_owned()
@@ -183,6 +184,29 @@ impl McpConfig {
     }
 }
 
+/// Subagent behavior (`[subagent]` section).
+#[derive(Debug, Clone, Deserialize)]
+pub struct SubagentConfig {
+    /// Maximum nesting depth. A session with this many ancestor hops (along
+    /// `parent_id`) may not spawn another subagent. `1` matches upstream's
+    /// `experimental.subagent_depth` default: root→child is allowed,
+    /// child→grandchild is not. `0` forbids subagents entirely.
+    #[serde(default = "default_subagent_depth")]
+    pub depth: usize,
+}
+
+fn default_subagent_depth() -> usize {
+    1
+}
+
+impl Default for SubagentConfig {
+    fn default() -> Self {
+        Self {
+            depth: default_subagent_depth(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     /// Base URL of the cardinal LLM gateway (cardinal's `listen`, e.g.
@@ -222,6 +246,9 @@ pub struct Config {
     /// configuration advertises the same toolset as before.
     #[serde(default)]
     pub mcp: McpConfig,
+    /// Subagent behavior (`[subagent]` section).
+    #[serde(default)]
+    pub subagent: SubagentConfig,
 }
 
 fn default_event_heartbeat_ms() -> u64 {
@@ -239,6 +266,7 @@ impl Default for Config {
             event_heartbeat_ms: default_event_heartbeat_ms(),
             magic_context: MctxConfig::default(),
             mcp: McpConfig::default(),
+            subagent: SubagentConfig::default(),
         }
     }
 }
@@ -289,6 +317,15 @@ impl Config {
         if let Ok(model) = std::env::var(ENV_DEFAULT_MODEL) {
             config.default_model = Some(model);
         }
+        if let Ok(raw) = std::env::var(ENV_SUBAGENT_DEPTH) {
+            match raw.trim().parse::<usize>() {
+                Ok(depth) => config.subagent.depth = depth,
+                Err(_) => tracing::warn!(
+                    value = %raw,
+                    "OX_SUBAGENT_DEPTH is not a non-negative integer; keeping configured depth"
+                ),
+            }
+        }
 
         config.magic_context = config.magic_context.validated();
         config.mcp.validate()?;
@@ -299,6 +336,13 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// `Config::load_from` consults `OX_SUBAGENT_DEPTH` unconditionally, and
+    /// cargo runs these tests as parallel threads of one process — so any test
+    /// that loads a config while another has the variable set must hold this
+    /// lock or the "default" assertion races the "override" one.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn model_entry_keeps_cardinal_reasoning_metadata() {
@@ -515,5 +559,35 @@ disabled = true
             toml::from_str("[mcp.servers.web]\ntype = \"remote\"\nurl = \"ftp://example.com\"\n")
                 .unwrap();
         assert!(bad.mcp.validate().is_err());
+    }
+
+    #[test]
+    fn subagent_depth_defaults_to_one_and_reads_toml() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ox.toml");
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(Config::load_from(path.clone()).unwrap().subagent.depth, 1);
+
+        std::fs::write(&path, "[subagent]\ndepth = 3\n").unwrap();
+        assert_eq!(Config::load_from(path).unwrap().subagent.depth, 3);
+    }
+
+    #[test]
+    fn subagent_depth_env_overrides_toml() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ox.toml");
+        std::fs::write(&path, "[subagent]\ndepth = 3\n").unwrap();
+        // SAFETY: this test is the only one touching OX_SUBAGENT_DEPTH.
+        unsafe { std::env::set_var(ENV_SUBAGENT_DEPTH, "5") };
+        let config = Config::load_from(path).unwrap();
+        unsafe { std::env::remove_var(ENV_SUBAGENT_DEPTH) };
+        assert_eq!(config.subagent.depth, 5);
+
+        unsafe { std::env::set_var(ENV_SUBAGENT_DEPTH, "not-a-number") };
+        let config = Config::load_from(dir.path().join("ox.toml")).unwrap();
+        unsafe { std::env::remove_var(ENV_SUBAGENT_DEPTH) };
+        assert_eq!(config.subagent.depth, 3, "invalid env falls back to toml");
     }
 }

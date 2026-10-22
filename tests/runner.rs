@@ -2206,7 +2206,7 @@ async fn no_tools_session_omits_tools_key() {
     let db = ox::db::Db::open_in_memory().await.expect("in-memory db");
     let bus = ox::event_bus::EventBus::new(db.clone());
     let mut registry = ToolRegistry::new();
-    registry.register_subagent(db, bus);
+    registry.register_subagent(db, bus, 1);
     assert!(registry.remove("subagent"));
     let harness = Harness::spawn_with(vec![MockChat::text("hi")], registry).await;
     let session_id = harness.create_session().await;

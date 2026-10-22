@@ -16,6 +16,10 @@ use crate::runner::{Tool, ToolContext, ToolOutput};
 
 use super::{fail, object_param, ok_text, param};
 
+/// Model-facing text when the request is interrupted mid-flight. Deliberately
+/// not `question`'s sentinel: no question was cancelled here.
+const CANCELLED_SENTINEL: &str = "(web search cancelled by user interrupt)";
+
 /// The provider is selected by URL template: `{query}` is replaced by the
 /// url-encoded query. DuckDuckGo's instant-answer endpoint is the built-in
 /// fallback because it needs no API key.
@@ -142,7 +146,7 @@ async fn search(
     let body = tokio::select! {
         response = tool.client.get(&url).send() => response,
         () = ctx.cancellation.cancelled() => {
-            return fail(crate::tool::question::CANCELLED_SENTINEL);
+            return fail(CANCELLED_SENTINEL);
         }
     };
     let body = match body {
@@ -335,5 +339,17 @@ mod tests {
             .execute(ctx(), serde_json::json!({ "query": "  " }))
             .await;
         assert!(output.error.as_deref().unwrap().contains("query"));
+    }
+
+    #[test]
+    fn cancelled_sentinel_is_not_the_question_one() {
+        assert_ne!(
+            super::CANCELLED_SENTINEL,
+            crate::tool::question::CANCELLED_SENTINEL
+        );
+        assert_eq!(
+            super::CANCELLED_SENTINEL,
+            "(web search cancelled by user interrupt)"
+        );
     }
 }
