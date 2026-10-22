@@ -1341,7 +1341,9 @@ pub(crate) fn compaction_boundary(messages: &[Message]) -> usize {
 /// - `assistant` → `{role: "assistant", content: text parts joined,
 ///   tool_calls: the row's tool parts, reasoning_content: reasoning parts
 ///   joined}`; `reasoning_content` is omitted when the row has no reasoning
-///   (upstream `lowerAssistantMessage`).
+///   (upstream `lowerAssistantMessage`). Empty text parts are filtered, an
+///   interrupted or failed row degrades its reasoning to text, and a row must
+///   never go out with neither `content` nor `tool_calls` — see the arm below.
 /// - A settled assistant tool part (`completed`/`error`, `executed: false`)
 ///   additionally becomes `{role: "tool", tool_call_id, content}` — joined
 ///   JSON content for completed calls, `{error: …}` for failed ones
@@ -1409,20 +1411,40 @@ pub(crate) fn build_chat_messages(
                 let mut reasoning: Vec<String> = Vec::new();
                 let mut tool_calls: Vec<ToolCall> = Vec::new();
                 let mut tool_results: Vec<ChatMessage> = Vec::new();
+                // Upstream `reasoningInterrupted` (to-llm-message.ts:158): a
+                // reasoning part with no completion time was cut off mid-thought.
+                let reasoning_interrupted = assistant.content.iter().any(|content| {
+                    matches!(
+                        content,
+                        AssistantContent::Reasoning { time, .. }
+                            if time.as_ref().is_some_and(|time| time.completed.is_none())
+                    )
+                });
+                // Reasoning is model-scoped proof: upstream replays it as
+                // `reasoning_content` only for a clean row and degrades an
+                // interrupted/failed one to readable text
+                // (to-llm-message.ts:174-184).
+                let replay_reasoning = assistant.error.is_none() && !reasoning_interrupted;
                 for content in &assistant.content {
                     match content {
-                        AssistantContent::Text { text, .. } => parts.push(text.clone()),
-                        // Replayed verbatim as `reasoning_content`: thinking
-                        // vendors (GLM/Z.ai, Kimi) 400 follow-up turns without
-                        // it (upstream `lowerAssistantMessage` replays the same
+                        // Upstream `meaningful`: an empty text part carries
+                        // nothing and is filtered (to-llm-message.ts:202-206).
+                        AssistantContent::Text { text, .. } if !text.is_empty() => {
+                            parts.push(text.clone())
+                        }
+                        AssistantContent::Text { .. } => {}
+                        // Replayed as `reasoning_content`: thinking vendors
+                        // (GLM/Z.ai, Kimi) 400 follow-up turns without it
+                        // (upstream `lowerAssistantMessage` replays the same
                         // joined text). Replayed regardless of the row's model
                         // — upstream degrades cross-model reasoning to text
                         // (to-llm-message.ts `sameModel`); ox has no
                         // per-provider gate, cardinal owns dialects.
-                        AssistantContent::Reasoning { text, .. } if !text.is_empty() => {
+                        AssistantContent::Reasoning { text, .. } if text.is_empty() => {}
+                        AssistantContent::Reasoning { text, .. } if replay_reasoning => {
                             reasoning.push(text.clone())
                         }
-                        AssistantContent::Reasoning { .. } => {}
+                        AssistantContent::Reasoning { text, .. } => parts.push(text.clone()),
                         AssistantContent::Tool {
                             id,
                             name,
@@ -1458,13 +1480,21 @@ pub(crate) fn build_chat_messages(
                         }
                     }
                 }
-                // A reasoning-only row still carries its reasoning_content on
-                // the wire (upstream `meaningful` keeps it) — dropping the row
-                // would 400 thinking vendors on the next turn.
-                if parts.is_empty() && tool_calls.is_empty() && reasoning.is_empty() {
+                // No assistant message may reach the wire with neither content
+                // nor tool calls: strict upstreams reject exactly that shape
+                // ("Invalid assistant message: content or tool_calls must be
+                // non-empty", live 2026-10-22). A row whose only substance is
+                // reasoning keeps its thought as text instead.
+                if parts.is_empty() && tool_calls.is_empty() && !reasoning.is_empty() {
+                    parts = std::mem::take(&mut reasoning);
+                }
+                if parts.is_empty() && tool_calls.is_empty() {
                     continue;
                 }
                 out.push(ChatMessage::Assistant {
+                    // Upstream sends `null` only for a tool-call-only turn
+                    // (openai-chat.ts:491); any other row carries its joined
+                    // text, which is non-empty by the guard above.
                     content: if parts.is_empty() {
                         None
                     } else {
@@ -1765,7 +1795,8 @@ mod tests {
     use super::*;
     use crate::cardinal::wire::Usage;
     use crate::schema::message::{
-        AssistantContent, AssistantMessage, AssistantTime, CompactionReason, Message, TimeCreated,
+        AssistantContent, AssistantMessage, AssistantTime, CompactionReason, Message, ShellTime,
+        TimeCreated, ToolTime,
     };
     use crate::schema::support::{ModelRef, Prompt};
 
@@ -1941,14 +1972,242 @@ mod tests {
             matches!(
                 &built[3],
                 ChatMessage::Assistant {
-                    content: None,
+                    content: Some(text),
                     tool_calls: None,
-                    reasoning_content: Some(reasoning),
-                    ..
-                } if reasoning == "only thought"
+                    reasoning_content: None,
+                } if text == "only thought"
             ),
-            "reasoning-only row survives with content: null"
+            "a reasoning-only row keeps its thought as readable text: an \
+             assistant message with neither content nor tool calls is what \
+             strict upstreams reject"
         );
+    }
+
+    /// A row that was cut off mid-step. Upstream sets `error` on a failed or
+    /// interrupted assistant row (`to-llm-message.ts` `reuseProviderMetadata`).
+    fn failed_assistant_row(id: &str, content: Vec<AssistantContent>) -> Message {
+        let mut row = assistant_row(id, content);
+        if let Message::Assistant(message) = &mut row {
+            message.error = Some(SessionError {
+                kind: "provider.unknown".to_owned(),
+                message: "Step interrupted".to_owned(),
+                status: None,
+                response: None,
+            });
+        }
+        row
+    }
+
+    fn reasoning_row(id: &str, text: &str, time: Option<ShellTime>) -> Message {
+        assistant_row(
+            id,
+            vec![AssistantContent::Reasoning {
+                text: text.to_owned(),
+                state: None,
+                time,
+            }],
+        )
+    }
+
+    fn text_row(id: &str, text: &str) -> Message {
+        assistant_row(
+            id,
+            vec![AssistantContent::Text {
+                text: text.to_owned(),
+                state: None,
+            }],
+        )
+    }
+
+    // Live regression (2026-10-22, ses_e9c3f2c3…): a step interrupted while
+    // reasoning settled a reasoning-only assistant row; every later request
+    // replayed it as `{"role":"assistant","content":null,"reasoning_content":
+    // …}` and the upstream 400'd the whole session with "Invalid assistant
+    // message: content or tool_calls must be non-empty". Upstream degrades
+    // reasoning to plain text for errored rows (to-llm-message.ts:174-184).
+    #[test]
+    fn interrupted_reasoning_replays_as_text() {
+        let built = build_chat_messages(
+            "sys",
+            "",
+            &[],
+            &[failed_assistant_row(
+                "msg_a",
+                vec![AssistantContent::Reasoning {
+                    text: "half a thought".to_owned(),
+                    state: None,
+                    time: Some(ShellTime {
+                        created: 1,
+                        completed: Some(2),
+                    }),
+                }],
+            )],
+        );
+        assert!(
+            matches!(
+                &built[1],
+                ChatMessage::Assistant {
+                    content: Some(text),
+                    tool_calls: None,
+                    reasoning_content: None,
+                } if text == "half a thought"
+            ),
+            "an errored row's reasoning is text, not model-scoped reasoning_content"
+        );
+    }
+
+    // Upstream `reasoningInterrupted`: an incomplete reasoning part is not
+    // replayable even when the row itself carries no error.
+    #[test]
+    fn unfinished_reasoning_replays_as_text() {
+        let built = build_chat_messages(
+            "sys",
+            "",
+            &[],
+            &[reasoning_row(
+                "msg_a",
+                "still thinking",
+                Some(ShellTime {
+                    created: 1,
+                    completed: None,
+                }),
+            )],
+        );
+        assert!(matches!(
+            &built[1],
+            ChatMessage::Assistant {
+                content: Some(text),
+                reasoning_content: None,
+                ..
+            } if text == "still thinking"
+        ));
+    }
+
+    // Upstream `meaningful` filters text parts whose text is empty
+    // (to-llm-message.ts:202-206): a row left with nothing must not become an
+    // empty assistant turn.
+    #[test]
+    fn empty_text_parts_do_not_produce_an_empty_assistant_turn() {
+        let built = build_chat_messages(
+            "sys",
+            "",
+            &[],
+            &[
+                text_row("msg_empty_1", ""),
+                assistant_row(
+                    "msg_empty_2",
+                    vec![
+                        AssistantContent::Text {
+                            text: String::new(),
+                            state: None,
+                        },
+                        AssistantContent::Text {
+                            text: String::new(),
+                            state: None,
+                        },
+                    ],
+                ),
+            ],
+        );
+        assert_eq!(built.len(), 1, "only the system message remains");
+    }
+
+    // `content: null` is only legal next to tool calls (openai-chat.ts:491):
+    // a tool-call-only turn keeps it, so the empty text part must not turn
+    // the message into `"content": ""`.
+    #[test]
+    fn empty_text_with_a_tool_call_keeps_null_content() {
+        let built = build_chat_messages(
+            "sys",
+            "",
+            &[],
+            &[assistant_row(
+                "msg_a",
+                vec![
+                    AssistantContent::Text {
+                        text: String::new(),
+                        state: None,
+                    },
+                    AssistantContent::Tool {
+                        id: "call_1".to_owned(),
+                        name: "read".to_owned(),
+                        executed: None,
+                        provider_state: None,
+                        provider_result_state: None,
+                        state: Box::new(ToolState::Completed {
+                            input: Record::new(),
+                            content: vec![Content::Text {
+                                text: "file body".to_owned(),
+                            }],
+                            metadata: None,
+                        }),
+                        time: ToolTime {
+                            created: 1,
+                            ran: None,
+                            completed: Some(2),
+                        },
+                    },
+                ],
+            )],
+        );
+        assert!(matches!(
+            &built[1],
+            ChatMessage::Assistant {
+                content: None,
+                tool_calls: Some(calls),
+                reasoning_content: None,
+            } if calls.len() == 1
+        ));
+        assert!(
+            matches!(&built[2], ChatMessage::Tool { tool_call_id, .. } if tool_call_id == "call_1"),
+            "the settled call still echoes its result"
+        );
+    }
+
+    // The invariant behind the cases above: no assembled assistant message may
+    // carry neither content nor tool calls, whatever the stored shapes are.
+    #[test]
+    fn no_assistant_message_is_ever_contentless() {
+        let built = build_chat_messages(
+            "sys",
+            "",
+            &[],
+            &[
+                reasoning_row("msg_r1", "thought", None),
+                reasoning_row(
+                    "msg_r2",
+                    "cut off",
+                    Some(ShellTime {
+                        created: 1,
+                        completed: None,
+                    }),
+                ),
+                failed_assistant_row("msg_r3", Vec::new()),
+                text_row("msg_t", ""),
+                failed_assistant_row(
+                    "msg_r4",
+                    vec![AssistantContent::Reasoning {
+                        text: "failed thought".to_owned(),
+                        state: None,
+                        time: None,
+                    }],
+                ),
+            ],
+        );
+        for message in &built {
+            if let ChatMessage::Assistant {
+                content,
+                tool_calls,
+                ..
+            } = message
+            {
+                assert!(
+                    content.as_deref().is_some_and(|text| !text.is_empty())
+                        || tool_calls.as_ref().is_some_and(|calls| !calls.is_empty()),
+                    "contentless assistant message reached the wire: {message:?}"
+                );
+            }
+        }
     }
 
     #[test]
