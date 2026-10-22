@@ -450,7 +450,7 @@ mod tests {
         t.set_query("needle");
         // sticky was on (tail); a search must take the viewport to the match.
         assert!(!t.sticky_bottom);
-        assert!(t.scroll <= 30 * 1 - 3, "scroll clamped to the tail");
+        assert!(t.scroll <= 30 - 3, "scroll clamped to the tail");
         t.next_match(true);
         assert!(t.search().current == Some(1));
     }

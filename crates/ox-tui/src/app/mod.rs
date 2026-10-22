@@ -47,6 +47,8 @@ pub struct App {
     pending_home_prompt: Option<String>,
     /// Home 底部的单行错误（会话创建失败）。
     home_error: Option<String>,
+    /// Home 的静态装饰（agent/model/目录/分支），由 bootstrap 组装。
+    pub home_chrome: crate::ui::home::Chrome,
     dirty: bool,
     mode: Mode,
     show_help: bool,
@@ -56,6 +58,7 @@ impl App {
     pub fn new(
         route: Route,
         session: Option<String>,
+        home_chrome: crate::ui::home::Chrome,
         commands: mpsc::UnboundedSender<AppCommand>,
         seq_tx: watch::Sender<Option<i64>>,
     ) -> Self {
@@ -80,6 +83,7 @@ impl App {
             pending_reload: None,
             pending_home_prompt: None,
             home_error: None,
+            home_chrome,
             dirty: true,
             mode: Mode::Compose,
             show_help: false,
@@ -369,6 +373,7 @@ impl App {
                                         frame,
                                         frame.area(),
                                         &mut self.composer,
+                                        &self.home_chrome,
                                         self.home_error.as_deref(),
                                     );
                                 })?;
@@ -430,7 +435,16 @@ mod tests {
     fn app(route: Route, session: Option<&str>) -> (App, mpsc::UnboundedReceiver<AppCommand>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let (seq_tx, _seq_rx) = watch::channel(None);
-        (App::new(route, session.map(String::from), tx, seq_tx), rx)
+        (
+            App::new(
+                route,
+                session.map(String::from),
+                crate::ui::home::Chrome::default(),
+                tx,
+                seq_tx,
+            ),
+            rx,
+        )
     }
 
     fn key(app: &mut App, code: KeyCode) {

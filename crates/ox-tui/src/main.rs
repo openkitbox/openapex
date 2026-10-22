@@ -1,4 +1,4 @@
-use ox_tui::{app, bootstrap, terminal};
+use ox_tui::{app, bootstrap, terminal, ui};
 
 use tokio::sync::{mpsc, watch};
 
@@ -48,6 +48,7 @@ async fn main() -> anyhow::Result<()> {
 
     let route;
     let online;
+    let mut home_chrome = ui::home::Chrome::default();
     let bootstrap: bootstrap::Bootstrap = match demo {
         Some(_) => {
             online = false;
@@ -66,8 +67,10 @@ async fn main() -> anyhow::Result<()> {
             None => {
                 online = true;
                 route = app::state::Route::Home;
+                let client = bootstrap::check_reachable(&server, &directory).await?;
+                home_chrome = bootstrap::chrome(&client, &directory).await;
                 bootstrap::Bootstrap {
-                    client: bootstrap::check_reachable(&server, &directory).await?,
+                    client,
                     session: None,
                 }
             }
@@ -168,6 +171,6 @@ async fn main() -> anyhow::Result<()> {
         drop(seq_rx);
     }
 
-    let mut app = App::new(route, bootstrap.session, command_tx, seq_tx);
+    let mut app = App::new(route, bootstrap.session, home_chrome, command_tx, seq_tx);
     app.run(&mut guard, event_rx).await
 }
