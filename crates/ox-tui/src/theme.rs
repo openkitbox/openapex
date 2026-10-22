@@ -33,6 +33,12 @@ pub struct Palette {
     pub panel_border: Style,
     /// The agent chip in the composer metadata line (upstream violet).
     pub agent: Style,
+    /// The slash-command menu surface (upstream `background.raised.high`).
+    pub menu: Style,
+    /// The menu's four-sided border (upstream `border.base`).
+    pub menu_border: Style,
+    /// The selected menu row: accent background, dark foreground.
+    pub menu_selected: Style,
 }
 
 impl Palette {
@@ -55,6 +61,11 @@ impl Palette {
                 agent: Style::default()
                     .fg(Color::Rgb(167, 139, 250))
                     .bg(Color::Rgb(28, 39, 63)),
+                menu: Style::default().bg(Color::Rgb(36, 50, 78)),
+                menu_border: Style::default().fg(Color::Rgb(72, 72, 72)),
+                menu_selected: Style::default()
+                    .fg(Color::Rgb(18, 26, 40))
+                    .bg(Color::Rgb(86, 182, 194)),
             },
             Deck::Ansi16 => Self {
                 text: Style::default(),
@@ -69,6 +80,9 @@ impl Palette {
                 agent: Style::default()
                     .fg(Color::Magenta)
                     .add_modifier(Modifier::BOLD),
+                menu: Style::default().bg(Color::DarkGray),
+                menu_border: Style::default().fg(Color::Gray),
+                menu_selected: Style::default().fg(Color::Black).bg(Color::Cyan),
             },
             Deck::NoColor => Self {
                 text: Style::default(),
@@ -79,6 +93,9 @@ impl Palette {
                 panel: Style::default(),
                 panel_border: Style::default().add_modifier(Modifier::DIM),
                 agent: Style::default().add_modifier(Modifier::BOLD),
+                menu: Style::default(),
+                menu_border: Style::default().add_modifier(Modifier::DIM),
+                menu_selected: Style::default().add_modifier(Modifier::REVERSED),
             },
         }
     }
@@ -141,6 +158,17 @@ mod tests {
         let p = Palette::for_deck(Deck::Truecolor);
         assert!(matches!(p.accent.fg, Some(Color::Rgb(..))));
         assert!(matches!(p.highlight.bg, Some(Color::Rgb(..))));
+    }
+
+    #[test]
+    fn menu_tokens_exist_per_deck() {
+        let p = Palette::for_deck(Deck::Truecolor);
+        assert!(matches!(p.menu.bg, Some(Color::Rgb(..))));
+        assert!(matches!(p.menu_border.fg, Some(Color::Rgb(..))));
+        assert!(matches!(p.menu_selected.bg, Some(Color::Rgb(..))));
+        let p = Palette::for_deck(Deck::NoColor);
+        assert_eq!(p.menu.bg, None, "no colour may leak through NO_COLOR");
+        assert!(p.menu_selected.add_modifier.contains(Modifier::REVERSED));
     }
 
     #[test]

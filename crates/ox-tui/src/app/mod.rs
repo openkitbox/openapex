@@ -4,16 +4,18 @@ pub mod state;
 
 use std::time::Duration;
 
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ox_client::sse::StreamMsg;
 use ox_client::store::{DataStore, Item};
 use tokio::sync::{mpsc, watch};
 
 use crate::pipeline;
 use crate::terminal::TerminalGuard;
-use crate::ui::composer::{Composer, SearchAction, SearchBox};
+use crate::ui::commands::CommandAction;
+use crate::ui::composer::{SearchAction, SearchBox};
 use crate::ui::dock::{self, StatusMode};
 use crate::ui::layout;
+use crate::ui::prompt::{Chrome, Prompt, PromptAction, pick_placeholder, placeholder_line};
 use crate::ui::timeline::Transcript;
 use command::AppCommand;
 use event::AppEvent;
@@ -21,16 +23,17 @@ use state::{Route, ViewState};
 
 pub const RENDER_TICK: Duration = Duration::from_millis(33);
 const SCROLL_PAGE: usize = 10;
+const SESSION_HINTS: &str = "ctrl+f search";
 
-/// Three modes, no cursor: `Compose` types into the composer, `SearchInput`
-/// edits the `/` query, `Browse` navigates the finished search (n/N, j/k, g/G).
-/// Letter keys are global only in `Browse`, so typing a message is never
+/// Three modes, no cursor: `Compose` types into the prompt, `SearchInput`
+/// edits the `ctrl+f` query, `Browse` navigates the finished search (n/N, j/k,
+/// g/G). Letter keys are global only in `Browse`, so typing a message is never
 /// hijacked.
 pub enum Mode {
     Compose,
     // Boxed: TextArea is hundreds of bytes next to two unit variants
     // (clippy::large_enum_variant), and the box is allocated only while the
-    // `/` prompt is open.
+    // search prompt is open.
     SearchInput(Box<SearchBox>),
     Browse,
 }
@@ -39,7 +42,7 @@ pub struct App {
     pub route: Route,
     pub session: Option<String>,
     pub view: ViewState,
-    pub composer: Composer,
+    pub prompt: Prompt,
     pub store: DataStore,
     pub transcript: Transcript,
     pub commands: mpsc::UnboundedSender<AppCommand>,
@@ -50,8 +53,6 @@ pub struct App {
     pending_home_prompt: Option<String>,
     /// Home 底部的单行错误（会话创建失败）。
     home_error: Option<String>,
-    /// Home 的静态装饰（agent/model/目录/分支），由 bootstrap 组装。
-    pub home_chrome: crate::ui::home::Chrome,
     dirty: bool,
     mode: Mode,
     show_help: bool,
@@ -61,7 +62,7 @@ impl App {
     pub fn new(
         route: Route,
         session: Option<String>,
-        home_chrome: crate::ui::home::Chrome,
+        home_chrome: Chrome,
         commands: mpsc::UnboundedSender<AppCommand>,
         seq_tx: watch::Sender<Option<i64>>,
     ) -> Self {
@@ -69,15 +70,16 @@ impl App {
         // is E0451; assign the pub fields on a default instance instead.
         let mut store = DataStore::default();
         store.session = session.clone();
-        let placeholder = match route {
-            Route::Home => crate::ui::home::placeholder_line(crate::ui::home::pick_placeholder()),
-            Route::Session => "输入消息…".to_string(),
+        let placeholder = placeholder_line(pick_placeholder());
+        let hints = match route {
+            Route::Home => "",
+            Route::Session => SESSION_HINTS,
         };
         Self {
             route,
             session,
             view: ViewState::new(),
-            composer: Composer::new_with_placeholder(&placeholder),
+            prompt: Prompt::new(&placeholder, home_chrome, hints),
             store,
             transcript: Transcript::new(80, 20),
             commands,
@@ -86,7 +88,6 @@ impl App {
             pending_reload: None,
             pending_home_prompt: None,
             home_error: None,
-            home_chrome,
             dirty: true,
             mode: Mode::Compose,
             show_help: false,
@@ -112,6 +113,7 @@ impl App {
         self.session = Some(session.clone());
         self.store.session = Some(session.clone());
         self.route = Route::Session;
+        self.prompt.set_hints(SESSION_HINTS);
         self.store.push_user(&prompt);
         let _ = self.commands.send(AppCommand::Prompt {
             session,
@@ -122,7 +124,7 @@ impl App {
 
     fn handle_session_failed(&mut self, err: String) {
         if let Some(draft) = self.pending_home_prompt.take() {
-            self.composer.restore(&draft);
+            self.prompt.restore(&draft);
         }
         self.home_error = Some(err);
         self.dirty = true;
@@ -153,24 +155,15 @@ impl App {
     }
 
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            if self.store.running_since.is_some() {
-                if let Some(session) = self.session.clone() {
-                    let _ = self.commands.send(AppCommand::Interrupt { session });
-                }
-            } else {
-                self.view.should_quit = true;
+        // The search prompt owns the keyboard while it is open.
+        if let Mode::SearchInput(boxed) = &mut self.mode {
+            if is_ctrl(&key, 'c') {
+                self.transcript.clear_search();
+                self.mode = Mode::Compose;
+                self.dirty = true;
+                return;
             }
-            return;
-        }
-
-        // The `/` prompt owns the keyboard while it is open.
-        let search_action = match &mut self.mode {
-            Mode::SearchInput(boxed) => Some(boxed.handle_key(key)),
-            _ => None,
-        };
-        if let Some(action) = search_action {
-            match action {
+            match boxed.handle_key(key) {
                 SearchAction::Cancel => {
                     self.transcript.clear_search();
                     self.mode = Mode::Compose;
@@ -189,8 +182,13 @@ impl App {
         }
 
         // Browse mode: single-letter navigation is safe here because the
-        // composer is not receiving keys.
+        // prompt is not receiving keys.
         if matches!(self.mode, Mode::Browse) {
+            if is_ctrl(&key, 'c') {
+                self.interrupt_or_quit();
+                self.dirty = true;
+                return;
+            }
             match key.code {
                 KeyCode::Esc => {
                     self.transcript.clear_search();
@@ -217,9 +215,7 @@ impl App {
                 }
                 KeyCode::Char('?') => self.show_help = !self.show_help,
                 _ => {
-                    // Any other key leaves browse mode; the query stays active
-                    // so n/N still work from the composer side? No — without
-                    // browse mode the letters are text again, so drop it.
+                    // Any other key leaves browse mode and goes back to typing.
                     self.transcript.clear_search();
                     self.show_help = false;
                     self.mode = Mode::Compose;
@@ -231,66 +227,103 @@ impl App {
             return;
         }
 
-        self.handle_compose_key(key);
-    }
-
-    fn handle_compose_key(&mut self, key: crossterm::event::KeyEvent) {
-        // Home：只有 composer 在收键，没有会话可搜索/滚动；首次提交惰性建会话。
-        if self.route == Route::Home {
-            let is_submit =
-                key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT);
-            if is_submit && self.pending_home_prompt.is_some() {
-                // A creation is already in flight; ignore extra submits but
-                // keep whatever is being typed.
-                self.dirty = true;
-                return;
-            }
-            let submitted = self.composer.handle_key(key);
-            self.dirty = true;
-            if let Some(text) = submitted {
-                self.pending_home_prompt = Some(text.clone());
-                self.home_error = None;
-                let _ = self.commands.send(AppCommand::CreateSessionAndPrompt(text));
-            }
-            return;
-        }
-        // `/` opens search only on an empty draft: inside a message a slash is
-        // an ordinary character (paths, dates).
-        if key.code == KeyCode::Char('/') && self.composer.is_empty() {
+        // Compose. `ctrl+f` opens the transcript search; upstream has no such
+        // feature, and `/` now belongs to the slash-command menu.
+        if is_ctrl(&key, 'f') && self.route == Route::Session {
             self.transcript.clear_search();
             self.mode = Mode::SearchInput(Box::default());
             self.dirty = true;
             return;
         }
-        match key.code {
-            KeyCode::PageUp => {
-                self.transcript.scroll_up(SCROLL_PAGE);
-                self.dirty = true;
-                return;
-            }
-            KeyCode::PageDown => {
-                self.transcript.scroll_down(SCROLL_PAGE);
-                self.dirty = true;
-                return;
-            }
-            KeyCode::End => {
-                self.transcript.scroll_to_bottom();
-                self.dirty = true;
-                return;
-            }
-            _ => {}
+        self.handle_compose_key(key);
+    }
+
+    fn handle_compose_key(&mut self, key: KeyEvent) {
+        // A creation already in flight: swallow the submit but keep whatever is
+        // being typed (the composer must not consume the draft).
+        if self.route == Route::Home
+            && self.pending_home_prompt.is_some()
+            && key.code == KeyCode::Enter
+            && key.modifiers.is_empty()
+        {
+            self.dirty = true;
+            return;
         }
-        let submitted = self.composer.handle_key(key);
-        // Every key handed to the composer may have typed, deleted or moved the
-        // caret — the frame must repaint even when nothing was submitted.
-        self.dirty = true;
-        if let Some(text) = submitted {
-            // 本地乐观显示：随后一帧就有用户消息；服务端确认后由历史重拉覆盖。
-            self.store.push_user(&text);
-            self.refresh();
-            if let Some(session) = self.session.clone() {
-                let _ = self.commands.send(AppCommand::Prompt { session, text });
+        // Scrollback keys stay global while the slash menu is closed.
+        if !self.prompt.autocomplete_visible() {
+            match key.code {
+                KeyCode::PageUp => {
+                    self.transcript.scroll_up(SCROLL_PAGE);
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::PageDown => {
+                    self.transcript.scroll_down(SCROLL_PAGE);
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::End => {
+                    self.transcript.scroll_to_bottom();
+                    self.dirty = true;
+                    return;
+                }
+                _ => {}
             }
+        }
+        match self.prompt.handle_key(key) {
+            PromptAction::Ignored => {}
+            PromptAction::CtrlC => self.interrupt_or_quit(),
+            PromptAction::Submit(text) => self.submit(text),
+            PromptAction::Run(action) => self.run_command(action),
+        }
+        self.dirty = true;
+    }
+
+    fn submit(&mut self, text: String) {
+        if self.route == Route::Home {
+            if self.pending_home_prompt.is_some() {
+                // A creation is already in flight; keep whatever is typed.
+                return;
+            }
+            self.pending_home_prompt = Some(text.clone());
+            self.home_error = None;
+            let _ = self.commands.send(AppCommand::CreateSessionAndPrompt(text));
+            return;
+        }
+        // 本地乐观显示：随后一帧就有用户消息；服务端确认后由历史重拉覆盖。
+        self.store.push_user(&text);
+        self.refresh();
+        if let Some(session) = self.session.clone() {
+            let _ = self.commands.send(AppCommand::Prompt { session, text });
+        }
+    }
+
+    fn run_command(&mut self, action: CommandAction) {
+        match action {
+            CommandAction::Exit => self.view.should_quit = true,
+            CommandAction::New | CommandAction::Clear => {
+                self.session = None;
+                self.store = DataStore::default();
+                self.transcript = Transcript::new(80, 20);
+                self.pending_reload = None;
+                self.pending_home_prompt = None;
+                self.home_error = None;
+                self.show_help = false;
+                self.route = Route::Home;
+                self.prompt
+                    .set_placeholder(&placeholder_line(pick_placeholder()));
+            }
+        }
+    }
+
+    /// ctrl+c with an empty draft: interrupt a running turn, otherwise quit.
+    fn interrupt_or_quit(&mut self) {
+        if self.store.running_since.is_some() {
+            if let Some(session) = self.session.clone() {
+                let _ = self.commands.send(AppCommand::Interrupt { session });
+            }
+        } else {
+            self.view.should_quit = true;
         }
     }
 
@@ -375,25 +408,45 @@ impl App {
                                     crate::ui::home::render(
                                         frame,
                                         frame.area(),
-                                        &mut self.composer,
-                                        &self.home_chrome,
+                                        &mut self.prompt,
                                         self.home_error.as_deref(),
                                     );
                                 })?;
                             }
                             Route::Session => {
                                 terminal.terminal.draw(|frame| {
-                                    let composer_height = match &self.mode {
-                                        Mode::SearchInput(_) => 1,
-                                        _ => self.composer.height(),
-                                    };
-                                    let (timeline_area, composer_area, dock_area) =
-                                        layout::split(frame.area(), composer_height);
+                                    let full = frame.area();
+                                    let searching = matches!(self.mode, Mode::SearchInput(_));
+                                    let prompt_h = self
+                                        .prompt
+                                        .height(full.height)
+                                        .min(full.height.saturating_sub(1));
+                                    let (timeline_area, prompt_area, dock_area) = layout::split(
+                                        full,
+                                        if searching { 1 } else { prompt_h },
+                                    );
                                     match &mut self.mode {
                                         Mode::SearchInput(boxed) => {
-                                            boxed.render(frame, composer_area)
+                                            boxed.render(frame, prompt_area)
                                         }
-                                        _ => self.composer.render(frame, composer_area),
+                                        _ => {
+                                            let pad: u16 = if full.width < 44 { 1 } else { 2 };
+                                            let prompt_area = ratatui::layout::Rect {
+                                                x: prompt_area.x + pad,
+                                                width: prompt_area
+                                                    .width
+                                                    .saturating_sub(pad * 2)
+                                                    .max(1),
+                                                ..prompt_area
+                                            };
+                                            let running = self.store.running_since.is_some();
+                                            self.prompt.render(
+                                                frame,
+                                                prompt_area,
+                                                full,
+                                                running,
+                                            );
+                                        }
                                     }
                                     self.transcript.render(frame, timeline_area);
                                     let now_ms = std::time::SystemTime::now()
@@ -426,6 +479,10 @@ impl App {
     }
 }
 
+fn is_ctrl(key: &KeyEvent, ch: char) -> bool {
+    key.code == KeyCode::Char(ch) && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
 #[cfg(test)]
 mod tests {
     use super::App;
@@ -442,7 +499,7 @@ mod tests {
             App::new(
                 route,
                 session.map(String::from),
-                crate::ui::home::Chrome::default(),
+                crate::ui::prompt::Chrome::default(),
                 tx,
                 seq_tx,
             ),
@@ -452,6 +509,13 @@ mod tests {
 
     fn key(app: &mut App, code: KeyCode) {
         app.handle(AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    fn ctrl(app: &mut App, ch: char) {
+        app.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char(ch),
+            KeyModifiers::CONTROL,
+        )));
     }
 
     fn type_text(app: &mut App, text: &str) {
@@ -479,7 +543,7 @@ mod tests {
         }
         assert_eq!(app.route, Route::Home);
         assert!(
-            app.composer.is_empty(),
+            app.prompt.is_empty(),
             "the draft moves to the pending prompt"
         );
         assert_eq!(app.pending_home_prompt.as_deref(), Some("hi"));
@@ -516,29 +580,32 @@ mod tests {
         key(&mut app, KeyCode::Enter);
         app.handle(AppEvent::SessionFailed("server down".into()));
         assert_eq!(app.route, Route::Home);
-        assert_eq!(app.composer.text(), "keep me");
+        assert_eq!(app.prompt.text(), "keep me");
         assert_eq!(app.home_error.as_deref(), Some("server down"));
         assert!(app.pending_home_prompt.is_none());
     }
 
     #[test]
-    fn ctrl_c_on_home_quits() {
+    fn ctrl_c_on_home_quits_when_the_draft_is_empty() {
         let (mut app, _rx) = app(Route::Home, None);
-        app.handle(AppEvent::Key(KeyEvent::new(
-            KeyCode::Char('c'),
-            KeyModifiers::CONTROL,
-        )));
+        ctrl(&mut app, 'c');
         assert!(app.view.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_with_a_draft_clears_it_instead_of_quitting() {
+        let (mut app, _rx) = app(Route::Home, None);
+        type_text(&mut app, "keep me");
+        ctrl(&mut app, 'c');
+        assert!(!app.view.should_quit);
+        assert!(app.prompt.is_empty());
     }
 
     #[test]
     fn ctrl_c_while_running_interrupts_instead_of_quitting() {
         let (mut app, mut rx) = app(Route::Session, Some("ses_live"));
         app.store.running_since = Some(0); // a turn is in flight
-        app.handle(AppEvent::Key(KeyEvent::new(
-            KeyCode::Char('c'),
-            KeyModifiers::CONTROL,
-        )));
+        ctrl(&mut app, 'c');
         assert!(!app.view.should_quit);
         match rx.try_recv().expect("interrupt must be sent") {
             AppCommand::Interrupt { session } => assert_eq!(session, "ses_live"),
@@ -556,14 +623,72 @@ mod tests {
         key(&mut app, KeyCode::Enter); // suppressed
         assert!(rx.try_recv().is_err(), "no second creation command");
         assert_eq!(app.pending_home_prompt.as_deref(), Some("first"));
-        assert_eq!(app.composer.text(), "x");
+        assert_eq!(app.prompt.text(), "x");
     }
 
     #[test]
-    fn slash_search_is_disabled_on_home() {
+    fn slash_opens_the_command_menu_on_home() {
         let (mut app, _rx) = app(Route::Home, None);
         key(&mut app, KeyCode::Char('/'));
         assert!(matches!(app.mode, super::Mode::Compose));
-        assert_eq!(app.composer.text(), "/");
+        assert!(app.prompt.autocomplete_visible());
+        assert_eq!(app.prompt.text(), "/");
+    }
+
+    #[test]
+    fn slash_opens_the_command_menu_instead_of_the_search() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        key(&mut app, KeyCode::Char('/'));
+        assert!(matches!(app.mode, super::Mode::Compose));
+        assert!(app.prompt.autocomplete_visible());
+    }
+
+    #[test]
+    fn ctrl_f_opens_the_transcript_search() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        ctrl(&mut app, 'f');
+        assert!(matches!(app.mode, super::Mode::SearchInput(_)));
+    }
+
+    #[test]
+    fn ctrl_f_does_nothing_on_home() {
+        let (mut app, _rx) = app(Route::Home, None);
+        ctrl(&mut app, 'f');
+        assert!(matches!(app.mode, super::Mode::Compose));
+    }
+
+    #[test]
+    fn select_exit_command_quits_without_sending_a_prompt() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        type_text(&mut app, "/exit");
+        key(&mut app, KeyCode::Enter);
+        assert!(app.view.should_quit);
+        assert!(rx.try_recv().is_err(), "a command is not a prompt");
+    }
+
+    #[test]
+    fn select_new_command_returns_to_home() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        type_text(&mut app, "/new");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.route, Route::Home);
+        assert!(app.session.is_none());
+        assert!(app.store.items.is_empty());
+        assert!(app.prompt.is_empty());
+        assert_eq!(
+            app.prompt
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            crate::ui::prompt::PromptAction::Ignored,
+            "an empty prompt does not submit"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn menu_enter_never_submits_the_typed_command_as_a_message() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        type_text(&mut app, "/new");
+        key(&mut app, KeyCode::Enter);
+        assert!(rx.try_recv().is_err());
     }
 }

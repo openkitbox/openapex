@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
 
     let route;
     let online;
-    let mut home_chrome = ui::home::Chrome::default();
+    let mut home_chrome = ui::prompt::Chrome::default();
     let bootstrap: bootstrap::Bootstrap = match demo {
         Some(_) => {
             online = false;
