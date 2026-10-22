@@ -35,12 +35,12 @@ thiserror = "2"
 tokio = { version = "1.53.3", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 toml = "1.1.8"
-turso = "=0.9.0-pre.1"
+turso = { version = "=0.9.0-pre.1", default-features = false, features = ["fts"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter", "time"] }
-# turso (default feature "mimalloc") installs the global allocator itself, so ox
-# must not declare one. This dependency exists only to switch on the no_thp
-# feature for the shared libmimalloc-sys build.
+# ox declares the global allocator itself (src/main.rs), so turso's default
+# "mimalloc" feature — which would install its own — stays disabled. The
+# no_thp feature rides on the same libmimalloc-sys build.
 mimalloc = { version = "0.1.52", features = ["no_thp"] }
 grep-searcher = "0.1.17"
 grep-regex = "0.1.14"

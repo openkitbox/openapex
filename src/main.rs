@@ -5,6 +5,13 @@
 //! The `acp` subcommand runs the Agent Client Protocol translator instead
 //! (`src/acp`); the default path boots the server exactly as before.
 //!
+//! ox owns the process-wide allocator: turso's default `mimalloc` feature
+//! (which would install its own `#[global_allocator]`) is disabled in
+//! Cargo.toml so the declaration can live here.
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use anyhow::Result;
 #[tokio::main]
 async fn main() -> Result<()> {
