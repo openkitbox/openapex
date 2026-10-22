@@ -397,6 +397,7 @@ pub(crate) fn session_id_of(data: &SessionEventData) -> Option<&str> {
         | E::SessionViewed { session_id, .. }
         | E::SessionUsageRecorded { session_id, .. }
         | E::SessionUsageUpdated { session_id, .. }
+        | E::SessionInstructionsUpdated { session_id, .. }
         | E::SessionSynthetic { session_id, .. }
         | E::SessionRetryScheduled { session_id, .. }
         | E::SessionMessageContentUpdated { session_id, .. }

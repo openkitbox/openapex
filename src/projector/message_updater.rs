@@ -356,6 +356,29 @@ pub async fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Resu
             insert_message(tx, session_id, seq, &msg).await?;
         }
 
+        E::SessionInstructionsUpdated {
+            session_id,
+            delta,
+            text,
+            metadata,
+        } => {
+            // Upstream message-updater.ts:152: an update without text is
+            // bookkeeping only — no transcript row.
+            if let Some(text) = text
+                && !text.is_empty()
+            {
+                let keys: Vec<&str> = delta.keys().map(String::as_str).collect();
+                let msg = Message::System {
+                    id: id::from_event(&env.id),
+                    metadata: metadata.clone(),
+                    time: TimeCreated { created },
+                    text: text.clone(),
+                    description: Some(format!("Instructions updated: {}", keys.join(", "))),
+                };
+                insert_message(tx, session_id, seq, &msg).await?;
+            }
+        }
+
         E::SessionSynthetic {
             session_id,
             text,

@@ -4,7 +4,7 @@ use ox::db::Db;
 use ox::event_bus::EventBus;
 use ox::schema::event::SessionEventData;
 use ox::schema::inbox::{Delivery, Item, UserPayload};
-use ox::schema::support::{LocationRef, ModelRef, Prompt, TokenCache, TokenUsage};
+use ox::schema::support::{LocationRef, ModelRef, Prompt, Record, TokenCache, TokenUsage};
 
 fn location() -> LocationRef {
     LocationRef {
@@ -918,4 +918,55 @@ async fn copied_tags_are_stripped_from_persisted_reasoning() {
         value["content"][0]["text"].as_str().unwrap(),
         "Let me look at the drop order"
     );
+}
+
+#[tokio::test]
+async fn instructions_updated_projects_a_system_row() {
+    let db = Db::open_in_memory().await.unwrap();
+    let bus = EventBus::new(db.clone());
+    create(&bus, "s1").await;
+    let delta: Record =
+        serde_json::from_value(serde_json::json!({"core/date": "abc123"})).expect("delta record");
+    let metadata: Record = serde_json::from_value(serde_json::json!({
+        "notice": "instructions",
+        "instructionSources": ["core/date"],
+        "instructions": {"core/date": "abc123"},
+    }))
+    .expect("metadata record");
+    bus.publish(SessionEventData::SessionInstructionsUpdated {
+        session_id: "s1".to_string(),
+        delta,
+        text: Some("Today's date is now: Fri Oct 23 2026".to_string()),
+        metadata: Some(metadata),
+    })
+    .await
+    .unwrap();
+    // text 为 None = 纯簿记，不落行
+    bus.publish(SessionEventData::SessionInstructionsUpdated {
+        session_id: "s1".to_string(),
+        delta: Default::default(),
+        text: None,
+        metadata: None,
+    })
+    .await
+    .unwrap();
+    let conn = db.acquire().await.expect("conn");
+    let row = one_row(
+        &conn,
+        "SELECT data FROM session_message WHERE session_id = ?1 AND type = 'system'",
+        ["s1"],
+    )
+    .await;
+    let data: serde_json::Value =
+        serde_json::from_str(&row.get::<String>(0).expect("data")).expect("json");
+    assert_eq!(data["text"], "Today's date is now: Fri Oct 23 2026");
+    assert_eq!(data["description"], "Instructions updated: core/date");
+    assert_eq!(data["metadata"]["instructions"]["core/date"], "abc123");
+    let mut stmt = conn
+        .prepare("SELECT COUNT(*) FROM session_message WHERE session_id = ?1 AND type = 'system'")
+        .await
+        .expect("prepare");
+    let mut rows = stmt.query(["s1"]).await.expect("query");
+    let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(count, 1, "bookkeeping event must not add a row");
 }

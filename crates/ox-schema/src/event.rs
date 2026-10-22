@@ -207,6 +207,19 @@ pub enum SessionEventData {
         cost: MoneyUsd,
         tokens: TokenUsage,
     },
+    /// Upstream `SessionEvent.InstructionsUpdated`: a keyed-instruction delta.
+    /// `text` absent = bookkeeping only (no transcript row, mirroring the
+    /// upstream updater). `delta` maps source key → hash (`null` = removed).
+    #[serde(rename = "session.instructions.updated")]
+    SessionInstructionsUpdated {
+        #[serde(rename = "sessionID")]
+        session_id: String,
+        delta: Record,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        metadata: Option<Record>,
+    },
     #[serde(rename = "session.synthetic")]
     SessionSynthetic {
         #[serde(rename = "sessionID")]
@@ -629,6 +642,7 @@ impl SessionEventData {
             SessionEventData::SessionForked { .. } => "session.forked",
             SessionEventData::SessionUsageRecorded { .. } => "session.usage.recorded",
             SessionEventData::SessionUsageUpdated { .. } => "session.usage.updated",
+            SessionEventData::SessionInstructionsUpdated { .. } => "session.instructions.updated",
             SessionEventData::SessionSynthetic { .. } => "session.synthetic",
             SessionEventData::SessionRetryScheduled { .. } => "session.retry.scheduled",
             SessionEventData::SessionMessageContentUpdated { .. } => {
@@ -691,6 +705,7 @@ impl SessionEventData {
             | SessionEventData::SessionForked { session_id, .. }
             | SessionEventData::SessionUsageRecorded { session_id, .. }
             | SessionEventData::SessionUsageUpdated { session_id, .. }
+            | SessionEventData::SessionInstructionsUpdated { session_id, .. }
             | SessionEventData::SessionSynthetic { session_id, .. }
             | SessionEventData::SessionRetryScheduled { session_id, .. }
             | SessionEventData::SessionMessageContentUpdated { session_id, .. }
