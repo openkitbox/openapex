@@ -79,7 +79,14 @@ pub(crate) fn fold(messages: &[Message], boundary: usize) -> BTreeMap<String, Op
             && let Some(Value::Object(delta)) = metadata.get("instructions")
         {
             for (key, value) in delta {
-                folded.insert(key.clone(), value.as_str().map(str::to_owned));
+                // `"removed"` is upstream's sentinel; a legacy `null` decodes
+                // the same way. Anything that is not a string is a malformed
+                // row, treated as removed.
+                let decoded = match value.as_str() {
+                    Some(REMOVED_SENTINEL) | None => None,
+                    Some(hash) => Some(hash.to_owned()),
+                };
+                folded.insert(key.clone(), decoded);
             }
         }
     }
@@ -165,6 +172,29 @@ pub(crate) fn render_updates(deltas: &[Delta]) -> String {
         .map(|d| d.text.as_str())
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// Upstream `Instruction.removed` wire sentinel (`schema/src/instruction.ts:20`).
+pub(crate) const REMOVED_SENTINEL: &str = "removed";
+
+/// Encode deltas as the event/metadata `delta` record: source key → hash, or
+/// `"removed"` (upstream `Instruction.Delta`).
+pub(crate) fn delta_record(
+    deltas: &[Delta],
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+    deltas
+        .iter()
+        .map(|d| {
+            (
+                d.key.to_owned(),
+                serde_json::Value::String(
+                    d.hash
+                        .clone()
+                        .unwrap_or_else(|| REMOVED_SENTINEL.to_owned()),
+                ),
+            )
+        })
+        .collect()
 }
 
 /// Record the emitted deltas into the baseline (delivered only; the frozen
@@ -398,12 +428,34 @@ mod tests {
     fn fold_reads_last_write_per_key_and_respects_boundary() {
         let rows = vec![
             system_row(json!({"core/date": "aaa"})),
-            system_row(json!({"core/date": "bbb", "core/mcp-guidance": null})),
+            system_row(json!({"core/date": "bbb", "core/mcp-guidance": "removed"})),
         ];
         let folded = fold(&rows, 0);
         assert_eq!(folded["core/date"].as_deref(), Some("bbb"));
         assert_eq!(folded["core/mcp-guidance"], None);
         let folded = fold(&rows, 1);
         assert_eq!(folded["core/date"].as_deref(), Some("bbb"));
+        // Legacy `null` rows and malformed non-string values decode as removed.
+        let legacy = vec![system_row(json!({
+            "core/mcp-guidance": null,
+            "core/skill-guidance": 42,
+        }))];
+        let folded = fold(&legacy, 0);
+        assert_eq!(folded["core/mcp-guidance"], None);
+        assert_eq!(folded["core/skill-guidance"], None);
+    }
+
+    #[test]
+    fn delta_record_encodes_removed_with_the_upstream_sentinel() {
+        let baseline = baseline(&[agents("rule one")]);
+        let changed = diff(&[agents("rule two v2")], &BTreeMap::new(), &baseline);
+        let record = delta_record(&changed);
+        assert_eq!(
+            record[KEY_INSTRUCTIONS].as_str(),
+            changed[0].hash.as_deref()
+        );
+        let removed = diff(&[absent(KEY_INSTRUCTIONS)], &BTreeMap::new(), &baseline);
+        let record = delta_record(&removed);
+        assert_eq!(record[KEY_INSTRUCTIONS].as_str(), Some("removed"));
     }
 }

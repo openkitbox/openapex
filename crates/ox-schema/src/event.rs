@@ -209,7 +209,8 @@ pub enum SessionEventData {
     },
     /// Upstream `SessionEvent.InstructionsUpdated`: a keyed-instruction delta.
     /// `text` absent = bookkeeping only (no transcript row, mirroring the
-    /// upstream updater). `delta` maps source key → hash (`null` = removed).
+    /// upstream updater). `delta` maps source key → hash (`"removed"` =
+    /// removed, upstream `Instruction.removed`).
     #[serde(rename = "session.instructions.updated")]
     SessionInstructionsUpdated {
         #[serde(rename = "sessionID")]
