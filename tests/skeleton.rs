@@ -539,9 +539,9 @@ async fn skill_catalog_echoes_the_requested_directory() {
     let (base, handle, dir) = spawn_server().await;
     let client = reqwest::Client::new();
     let project = dir.path().join("proj");
-    std::fs::create_dir_all(project.join("skills/review")).unwrap();
+    std::fs::create_dir_all(project.join(".ox/skills/review")).unwrap();
     std::fs::write(
-        project.join("skills/review/SKILL.md"),
+        project.join(".ox/skills/review/SKILL.md"),
         "---\nname: Review\ndescription: code review\n---\nBe thorough.\n",
     )
     .unwrap();

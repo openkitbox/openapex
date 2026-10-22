@@ -165,15 +165,15 @@ mod tests {
 
     fn project_with_skills() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("skills/review")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".ox/skills/review")).unwrap();
         std::fs::write(
-            dir.path().join("skills/review/SKILL.md"),
+            dir.path().join(".ox/skills/review/SKILL.md"),
             "---\nname: Code Review\ndescription: Review a pull request against the diff\n---\nbody",
         )
         .unwrap();
-        std::fs::create_dir_all(dir.path().join("skills/migrate")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".ox/skills/migrate")).unwrap();
         std::fs::write(
-            dir.path().join("skills/migrate/SKILL.md"),
+            dir.path().join(".ox/skills/migrate/SKILL.md"),
             "---\nname: Migration\ndescription: Database schema migrations\n---\nbody",
         )
         .unwrap();

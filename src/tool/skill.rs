@@ -102,9 +102,9 @@ mod tests {
     #[tokio::test]
     async fn a_known_skill_loads_its_body() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("skills/review")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".ox/skills/review")).unwrap();
         std::fs::write(
-            dir.path().join("skills/review/SKILL.md"),
+            dir.path().join(".ox/skills/review/SKILL.md"),
             "---\nname: Review\ndescription: code review\n---\nLook at the diff.\n",
         )
         .unwrap();
@@ -124,8 +124,8 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_skill_lists_the_available_ones() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("skills/review")).unwrap();
-        std::fs::write(dir.path().join("skills/review/SKILL.md"), "body").unwrap();
+        std::fs::create_dir_all(dir.path().join(".ox/skills/review")).unwrap();
+        std::fs::write(dir.path().join(".ox/skills/review/SKILL.md"), "body").unwrap();
 
         let output = SkillTool
             .execute(ctx(dir.path()), serde_json::json!({ "name": "nope" }))

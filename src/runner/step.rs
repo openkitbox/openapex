@@ -1258,7 +1258,7 @@ fn to_session_error(error: &CardinalError) -> SessionError {
 /// the transcript floor they cover, or `(None, None, 0)` when the integration
 /// is off or the pass failed (the prompt then stays byte-identical to the
 /// integration-off one — a broken head must never fail the turn).
-async fn mctx_head(
+pub(crate) async fn mctx_head(
     ctx: &DrainCtx,
     budget: crate::mctx::budget::Budget,
 ) -> (Option<String>, Option<String>, i64) {

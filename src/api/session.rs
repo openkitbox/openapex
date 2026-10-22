@@ -2111,3 +2111,144 @@ pub(crate) async fn wait_idle(req: &mut Request, depot: &mut Depot, res: &mut Re
     }
     res.status_code(StatusCode::NO_CONTENT);
 }
+
+// ---------------------------------------------------------------------------
+// session.generate — the TUI's `/btw` side question
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Deserialize)]
+struct GenerateBody {
+    #[serde(default)]
+    prompt: String,
+}
+
+/// `POST /api/session/{sessionID}/generate` — upstream `session.generate`
+/// ("Generates text from current Session context without mutating the
+/// Session"): one answer from the session's current context, nothing persisted
+/// and no event published. The TUI's `/btw` side question is the caller
+/// (`feature-plugins/prompt/btw.tsx` → `client.session.generate`); the reply is
+/// `{"location":…,"data":{"text":…}}`, which the client unwraps to `{text}`.
+#[handler] // operation_id: session.generate
+pub(crate) async fn generate(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(app) = state(depot, res) else {
+        return;
+    };
+    let Some(session_id) = req.param::<String>("sessionID") else {
+        invalid_request(res, "Missing sessionID");
+        return;
+    };
+    let Some(body) = parse_body::<GenerateBody>(req, res).await else {
+        return;
+    };
+    let prompt_text = body.prompt.trim();
+    if prompt_text.is_empty() {
+        invalid_request(res, "Missing prompt");
+        return;
+    }
+    if !matches!(load_session(&app.db, &session_id).await, Ok(Some(_))) {
+        session_not_found(res, &session_id);
+        return;
+    }
+    match app.runner.generate(&session_id, prompt_text).await {
+        Ok(text) => {
+            let directory = crate::api::compat::directory_of(req);
+            res.render(Json(crate::api::compat::envelope(
+                &directory,
+                json!({ "text": text }),
+            )));
+        }
+        Err(error) => unknown_error(res, &error),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// session.move — the TUI's `/cd`
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Default, Deserialize)]
+struct MoveBody {
+    #[serde(default)]
+    directory: String,
+}
+
+/// `POST /api/session/{sessionID}/move` — upstream `session.move`: re-root the
+/// session at `directory` (the TUI's `/cd`). The destination resolves against
+/// the session's current directory (`move.ts:81`), `~` expands to the user's
+/// home, and it must exist as a directory.
+///
+/// Deliberate deviation from upstream: the move is published immediately
+/// instead of being admitted as an inbox `move` item. ox rebuilds its drain
+/// context per busy period from the session row, so a turn already in flight
+/// keeps the old directory until the next one starts — the same boundary
+/// upstream's steer delivery lands on, one turn coarser.
+#[handler] // operation_id: session.move
+pub(crate) async fn move_session(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(app) = state(depot, res) else {
+        return;
+    };
+    let Some(session_id) = req.param::<String>("sessionID") else {
+        invalid_request(res, "Missing sessionID");
+        return;
+    };
+    let Some(body) = parse_body::<MoveBody>(req, res).await else {
+        return;
+    };
+    let Some(session) = load_session(&app.db, &session_id).await.ok().flatten() else {
+        session_not_found(res, &session_id);
+        return;
+    };
+    let raw = body.directory.trim();
+    if raw.is_empty() {
+        invalid_request(res, "Missing directory");
+        return;
+    }
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let expanded = match raw {
+        "~" => home,
+        _ => match raw.strip_prefix("~/") {
+            Some(rest) => home.join(rest),
+            None => std::path::PathBuf::from(raw),
+        },
+    };
+    let destination = if expanded.is_absolute() {
+        expanded
+    } else {
+        std::path::PathBuf::from(&session.directory).join(expanded)
+    };
+    let Ok(canonical) = destination.canonicalize() else {
+        invalid_request(
+            res,
+            &format!("Destination does not exist: {}", destination.display()),
+        );
+        return;
+    };
+    if !canonical.is_dir() {
+        invalid_request(
+            res,
+            &format!("Destination is not a directory: {}", canonical.display()),
+        );
+        return;
+    }
+    let directory = canonical.display().to_string();
+    let (project_id, project_directory) = resolve_project(&app.db, &directory).await;
+    let payload = crate::schema::inbox::MovePayload {
+        location: LocationRef {
+            directory: directory.clone(),
+            workspace_id: session.workspace_id.clone(),
+        },
+        project_id,
+        subpath: subpath_of(&directory, &project_directory),
+    };
+    if let Err(error) = app
+        .bus
+        .publish(SessionEventData::SessionMoved {
+            session_id: session_id.clone(),
+            payload,
+        })
+        .await
+    {
+        unknown_error(res, &error);
+        return;
+    }
+    res.status_code(StatusCode::NO_CONTENT);
+}

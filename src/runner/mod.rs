@@ -26,6 +26,7 @@ pub use crate::cardinal::chat::Chat;
 
 pub(crate) mod compaction;
 pub mod drain;
+pub(crate) mod generate;
 mod historian_trigger;
 pub(crate) mod instructions;
 pub(crate) mod provider_error;
@@ -401,6 +402,13 @@ impl Runner {
         }
         self.spawn_if_parked(session_id, handle).await;
         Ok(())
+    }
+
+    /// Answer `prompt` from the session's current context without mutating it
+    /// (upstream `session.generate`, the TUI's `/btw` dependency). Nothing is
+    /// persisted, no event is published and no tool loop runs.
+    pub async fn generate(&self, session_id: &str, prompt: &str) -> Result<String> {
+        generate::run(&self.inner, session_id, prompt).await
     }
 
     /// Cancel the session's in-flight busy period. Returns whether one was

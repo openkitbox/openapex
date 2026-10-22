@@ -537,6 +537,8 @@ pub fn build_router(state: AppState) -> Router {
                                         ),
                                 )
                                 .push(Router::with_path("prompt").post(session::prompt))
+                                .push(Router::with_path("generate").post(session::generate))
+                                .push(Router::with_path("move").post(session::move_session))
                                 .push(
                                     Router::with_path("inbox").get(session::inbox_list).push(
                                         Router::with_path("{inboxID}")

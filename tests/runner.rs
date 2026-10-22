@@ -3438,3 +3438,271 @@ async fn global_instructions_render_before_project_instructions() {
         "the layer carries the upstream file header: {layer}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// session.generate (`/btw`'s server dependency)
+// ---------------------------------------------------------------------------
+
+/// `POST /api/session/{id}/generate` answers from the session's context and
+/// does not mutate it (upstream `SessionGenerate.generate`: "Generates text
+/// from current Session context without mutating the Session"): no rows, no
+/// events, no tool loop — the request carries the session's own context plus
+/// the prompt as the final user message.
+#[tokio::test]
+async fn generate_answers_from_context_without_mutating_the_session() {
+    let (echo, executed) = EchoTool::tool(false, Duration::ZERO, None);
+    let harness = Harness::spawn_with(
+        vec![
+            MockChat::text("first answer"),
+            MockChat::text("side answer"),
+        ],
+        registry_with(echo),
+    )
+    .await;
+    let session = harness.create_session().await;
+    harness
+        .post(
+            &format!("/api/session/{session}/prompt"),
+            json!({ "text": "hello" }),
+        )
+        .await;
+    harness
+        .wait_for(&session, "assistant completion", |messages| {
+            messages
+                .iter()
+                .any(|m| m["type"] == "assistant" && m["time"]["completed"].is_number())
+        })
+        .await;
+
+    let before = harness.messages(&session).await;
+    let events_before = harness.event_kinds().await.len();
+
+    let response = harness
+        .post(
+            &format!("/api/session/{session}/generate"),
+            json!({ "prompt": "what did I ask?" }),
+        )
+        .await;
+    assert_eq!(response.status(), 200, "generate");
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["data"]["text"], json!("side answer"));
+
+    // The session is untouched: same rows, no events.
+    assert_eq!(harness.messages(&session).await.len(), before.len());
+    assert_eq!(harness.event_kinds().await.len(), events_before);
+
+    // The request: context layers, the session's history, then the prompt.
+    let requests = harness.chat.requests();
+    let generate = requests.last().expect("generate request");
+    assert!(
+        !generate.tools.is_empty(),
+        "tools ride the generate request"
+    );
+    assert!(
+        !executed.load(Ordering::SeqCst),
+        "no tool loop runs for a generate request"
+    );
+    match generate.messages.last() {
+        Some(ChatMessage::User { content }) => match content {
+            ox::cardinal::wire::UserContent::Text(text) => assert_eq!(text, "what did I ask?"),
+            other => panic!("prompt must be plain text: {other:?}"),
+        },
+        other => panic!("prompt must be the final message: {other:?}"),
+    }
+    assert!(
+        generate.messages.iter().any(|m| matches!(
+            m,
+            ChatMessage::Assistant { content: Some(text), .. } if text.contains("first answer")
+        )),
+        "history rides the generate request: {:?}",
+        generate.messages
+    );
+    let systems = generate
+        .messages
+        .iter()
+        .filter(|m| matches!(m, ChatMessage::System { .. }))
+        .count();
+    assert!(
+        systems >= 2,
+        "static + instruction layers ride the request: {:?}",
+        generate.messages
+    );
+}
+
+/// A generate response carrying only tool calls surfaces as an empty answer:
+/// upstream runs no tool loop for this request ("a tool call would surface as
+/// an empty answer").
+#[tokio::test]
+async fn generate_with_a_tool_call_answers_empty() {
+    let harness = Harness::spawn(vec![Script::Events(MockChat::tool_events(
+        "call_1",
+        "test_echo",
+        "{\"q\": \"side\"}",
+    ))])
+    .await;
+    let session = harness.create_session().await;
+
+    let response = harness
+        .post(
+            &format!("/api/session/{session}/generate"),
+            json!({ "prompt": "call a tool" }),
+        )
+        .await;
+    assert_eq!(response.status(), 200, "generate");
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["data"]["text"], json!(""));
+    // No tool ran and nothing was written.
+    assert!(harness.messages(&session).await.is_empty());
+}
+
+/// Unknown sessions answer 404; a missing prompt is a 400.
+#[tokio::test]
+async fn generate_rejects_unknown_sessions_and_missing_prompts() {
+    let harness = Harness::spawn(vec![]).await;
+    let response = harness
+        .post(
+            "/api/session/ses_missing/generate",
+            json!({ "prompt": "hi" }),
+        )
+        .await;
+    assert_eq!(response.status(), 404, "unknown session");
+    let session = harness.create_session().await;
+    let response = harness
+        .post(&format!("/api/session/{session}/generate"), json!({}))
+        .await;
+    assert_eq!(response.status(), 400, "missing prompt");
+}
+
+// ---------------------------------------------------------------------------
+// session.move (`/cd`'s server dependency)
+// ---------------------------------------------------------------------------
+
+/// `POST /api/session/{id}/move` re-roots the session to the destination
+/// directory: the row follows, `session.moved` is published, and the next
+/// turn's request is assembled against the new directory.
+#[tokio::test]
+async fn move_re_roots_the_session_to_the_destination() {
+    let harness = Harness::spawn(vec![MockChat::text("ok"), MockChat::text("ok")]).await;
+    let root = TempDir::new().expect("root");
+    let from = root.path().join("from");
+    let to = root.path().join("to");
+    std::fs::create_dir_all(&from).expect("from");
+    std::fs::create_dir_all(&to).expect("to");
+    let from = from.canonicalize().expect("from canonical");
+    let to = to.canonicalize().expect("to canonical");
+    let session = harness.create_session_in(&from.display().to_string()).await;
+
+    let response = harness
+        .post(
+            &format!("/api/session/{session}/move"),
+            json!({ "directory": to.display().to_string() }),
+        )
+        .await;
+    assert_eq!(response.status(), 204, "move accepted");
+    harness.wait_event("session.moved").await;
+
+    let response = harness.get(&format!("/api/session/{session}")).await;
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(
+        body["data"]["location"]["directory"],
+        json!(to.display().to_string()),
+        "row follows the move"
+    );
+
+    // The next turn runs in the destination: the static context's env block
+    // names it.
+    harness
+        .post(
+            &format!("/api/session/{session}/prompt"),
+            json!({ "text": "hello from the new place" }),
+        )
+        .await;
+    harness
+        .wait_for(&session, "assistant completion", |messages| {
+            messages
+                .iter()
+                .any(|m| m["type"] == "assistant" && m["time"]["completed"].is_number())
+        })
+        .await;
+    let requests = harness.chat.requests();
+    let layer = requests
+        .last()
+        .expect("turn request")
+        .messages
+        .iter()
+        .find_map(|m| match m {
+            ChatMessage::System { content } if content.contains("<env>") => Some(content.clone()),
+            _ => None,
+        })
+        .expect("env layer");
+    assert!(
+        layer.contains(&format!("Working directory: {}", to.display())),
+        "the new directory reaches the prompt: {layer}"
+    );
+}
+
+/// Relative destinations resolve against the session's current directory
+/// (upstream `move.ts:81`).
+#[tokio::test]
+async fn move_resolves_relative_destinations_against_the_session() {
+    let harness = Harness::spawn(vec![]).await;
+    let root = TempDir::new().expect("root");
+    let from = root.path().join("from");
+    let nested = from.join("nested");
+    std::fs::create_dir_all(&nested).expect("nested");
+    let from = from.canonicalize().expect("from canonical");
+    let nested = nested.canonicalize().expect("nested canonical");
+    let session = harness.create_session_in(&from.display().to_string()).await;
+
+    let response = harness
+        .post(
+            &format!("/api/session/{session}/move"),
+            json!({ "directory": "nested" }),
+        )
+        .await;
+    assert_eq!(response.status(), 204, "relative move accepted");
+    let response = harness.get(&format!("/api/session/{session}")).await;
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(
+        body["data"]["location"]["directory"],
+        json!(nested.display().to_string())
+    );
+}
+
+/// Unknown sessions answer 404; a missing directory or a file is a 400.
+#[tokio::test]
+async fn move_rejects_unknown_sessions_and_bad_destinations() {
+    let harness = Harness::spawn(vec![]).await;
+    let response = harness
+        .post(
+            "/api/session/ses_missing/move",
+            json!({ "directory": "/tmp" }),
+        )
+        .await;
+    assert_eq!(response.status(), 404, "unknown session");
+
+    let root = TempDir::new().expect("root");
+    let from = root.path().join("from");
+    std::fs::create_dir_all(&from).expect("from");
+    let from = from.canonicalize().expect("from canonical");
+    let session = harness.create_session_in(&from.display().to_string()).await;
+
+    let response = harness
+        .post(
+            &format!("/api/session/{session}/move"),
+            json!({ "directory": root.path().join("nope").display().to_string() }),
+        )
+        .await;
+    assert_eq!(response.status(), 400, "missing destination");
+
+    let file = root.path().join("file.txt");
+    std::fs::write(&file, "x").expect("file");
+    let response = harness
+        .post(
+            &format!("/api/session/{session}/move"),
+            json!({ "directory": file.display().to_string() }),
+        )
+        .await;
+    assert_eq!(response.status(), 400, "file destination");
+}
