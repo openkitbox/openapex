@@ -241,6 +241,11 @@ struct Inner {
     /// Connected MCP servers: tools (registered before the runner was built)
     /// plus the instruction block the system prompt carries.
     mcp: Arc<crate::mcp::Hub>,
+    /// Per-session keyed-instruction baselines (process memory only; a restart
+    /// re-baselines from current sources and the wire fold corrects stale
+    /// delta rows).
+    instruction_baselines:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, instructions::Baseline>>>,
     sessions: DashMap<String, SessionHandle>,
 }
 
@@ -314,6 +319,7 @@ impl Runner {
             tools,
             model_catalog,
             mcp,
+            instruction_baselines: Default::default(),
             sessions: DashMap::new(),
         });
         if let Some(handle) = SUBAGENT_HANDLE.get() {
@@ -508,6 +514,7 @@ impl ActorTask {
                 tools: self.inner.tools.clone(),
                 model_catalog: Arc::clone(&self.inner.model_catalog),
                 mcp: self.inner.mcp.clone(),
+                instruction_baselines: self.inner.instruction_baselines.clone(),
             };
             let mut scope = drain::Promotable::Input;
             loop {

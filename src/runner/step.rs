@@ -78,6 +78,7 @@ use crate::schema::support::{
 use super::ToolContext;
 use super::compaction;
 use super::drain::DrainCtx;
+use super::instructions;
 
 /// Upstream `STEP_INTERRUPTED` (runner/step.ts).
 const STEP_INTERRUPTED: &str = "Step interrupted";
@@ -214,14 +215,42 @@ pub(crate) async fn run(
         } else {
             load_history_after(&ctx.db, &ctx.session_id, floor).await?
         };
-        let system =
-            prompt::build_with_mcp(&ctx.directory, ctx.mcp.instructions_block().as_deref());
+        let observed = prompt::gather(&ctx.directory, ctx.mcp.instructions_block().as_deref());
+        let instruction_update = sync_instructions(ctx, &observed, &rows).await;
+        let system_static = {
+            let names: Vec<String> = ctx
+                .tools
+                .definitions()
+                .iter()
+                .map(|d| d.function.name.clone())
+                .collect();
+            prompt::system_static(&names.iter().map(String::as_str).collect::<Vec<_>>())
+        };
+        let instructions_initial = {
+            let baselines = super::lock(&ctx.instruction_baselines);
+            baselines
+                .get(&ctx.session_id)
+                .map(|b| b.initial_render.clone())
+                .unwrap_or_default()
+        };
+        let mut chat_messages = build_chat_messages(
+            &system_static,
+            &instructions_initial,
+            &[head_m0.as_deref(), head_m1.as_deref()],
+            &rows,
+        );
+        // The delta row is durable for future steps; this step's already-loaded
+        // rows predate it, so the text rides this request in memory (upstream
+        // `generate.ts:55` appends `Message.system(instructionUpdate)`).
+        if let Some(text) = instruction_update {
+            chat_messages.push(ChatMessage::System { content: text });
+        }
         let mut request = ChatRequest::new(
             // cardinal routes on the bare model id; the providerID/modelID
             // qualified form is upstream's provider-adapter vocabulary and
             // cardinal answers "no route for model cardinal/<id>" to it.
             params.model.id.clone(),
-            build_chat_messages(&system, &[head_m0.as_deref(), head_m1.as_deref()], &rows),
+            chat_messages,
         );
         request.tools = ctx.tools.definitions();
         // The session's selected reasoning level (model variant) rides every
@@ -1265,8 +1294,27 @@ async fn latest_seq(db: &crate::db::Db, session_id: &str) -> Result<i64> {
     Ok(seq)
 }
 
-/// Build the OpenAI message list: the system prompt, then the session
-/// transcript in `seq` order.
+/// Upstream `messageEntries`: history starts at the latest completed
+/// compaction row, so the checkpoint replaces everything before it. Shared
+/// by `build_chat_messages` and the instruction wire fold.
+pub(crate) fn compaction_boundary(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .rposition(|message| {
+            matches!(
+                message,
+                Message::Compaction(CompactionMessage {
+                    compaction: Compaction::Completed(_),
+                    ..
+                })
+            )
+        })
+        .unwrap_or(0)
+}
+
+/// Build the OpenAI message list: the static system layer, the frozen
+/// instruction layer, then the session transcript in `seq` order. An empty
+/// instruction layer is filtered (upstream `baseTranscript`).
 ///
 /// Mapping (upstream `to-llm-message.ts`):
 /// - `user`     → `{role: "user", content: joined text parts}`, dropped
@@ -1289,24 +1337,22 @@ async fn latest_seq(db: &crate::db::Db, session_id: &str) -> Result<i64> {
 ///   anyway (upstream `SessionHistory` boundary).
 /// - idle/shell/switch markers never reach the model.
 pub(crate) fn build_chat_messages(
-    system: &str,
+    system_static: &str,
+    instructions: &str,
     head: &[Option<&str>],
     messages: &[Message],
 ) -> Vec<ChatMessage> {
-    // Upstream `messageEntries`: history starts at the latest completed
-    // compaction row, so the checkpoint replaces everything before it.
-    let boundary = messages.iter().rposition(|message| {
-        matches!(
-            message,
-            Message::Compaction(CompactionMessage {
-                compaction: Compaction::Completed(_),
-                ..
-            })
-        )
-    });
+    let boundary = compaction_boundary(messages);
     let mut out = vec![ChatMessage::System {
-        content: system.to_owned(),
+        content: system_static.to_owned(),
     }];
+    // Upstream `baseTranscript`: empty instruction parts are filtered, so a
+    // session with no sources sends exactly one system message.
+    if !instructions.is_empty() {
+        out.push(ChatMessage::System {
+            content: instructions.to_owned(),
+        });
+    }
     // The head halves are synthetic user messages leading the transcript: they
     // stand in for the covered history. They stay SEPARATE because the baseline
     // (`m[0]`) is the provider's cache anchor — merging them would rewrite the
@@ -1316,7 +1362,7 @@ pub(crate) fn build_chat_messages(
             content: (*half).to_owned().into(),
         });
     }
-    for message in messages.iter().skip(boundary.unwrap_or(0)) {
+    for message in messages.iter().skip(boundary) {
         match message {
             Message::User { prompt, .. } => {
                 let content = user_prompt_text(prompt);
@@ -1442,6 +1488,46 @@ pub(crate) fn build_chat_messages(
         }
     }
     out
+}
+
+/// Per-step keyed-instruction sync: diff current sources against what the
+/// wire shows, publish durable delta rows, and return the update text for
+/// this request's tail.
+async fn sync_instructions(
+    ctx: &DrainCtx,
+    observed: &[prompt::Observed],
+    rows: &[Message],
+) -> Option<String> {
+    let deltas = {
+        let mut baselines = super::lock(&ctx.instruction_baselines);
+        let baseline = baselines
+            .entry(ctx.session_id.clone())
+            .or_insert_with(|| instructions::baseline(observed));
+        let wire = instructions::fold(rows, compaction_boundary(rows));
+        instructions::diff(observed, &wire, baseline)
+    };
+    if deltas.is_empty() {
+        return None;
+    }
+    let text = instructions::render_updates(&deltas);
+    let delta = instructions::delta_record(&deltas);
+    if let Err(error) = ctx
+        .bus
+        .publish(SessionEventData::SessionInstructionsUpdated {
+            session_id: ctx.session_id.clone(),
+            delta,
+            text: Some(text.clone()),
+        })
+        .await
+    {
+        tracing::warn!(session = %ctx.session_id, %error, "instruction update publish failed");
+        return None;
+    }
+    let mut baselines = super::lock(&ctx.instruction_baselines);
+    if let Some(baseline) = baselines.get_mut(&ctx.session_id) {
+        instructions::apply(&deltas, baseline);
+    }
+    Some(text)
 }
 
 /// A tool part's call input for the wire: parsed from the streaming state's
@@ -1664,7 +1750,7 @@ mod tests {
     use super::*;
     use crate::cardinal::wire::Usage;
     use crate::schema::message::{
-        AssistantContent, AssistantMessage, AssistantTime, Message, TimeCreated,
+        AssistantContent, AssistantMessage, AssistantTime, CompactionReason, Message, TimeCreated,
     };
     use crate::schema::support::{ModelRef, Prompt};
 
@@ -1687,7 +1773,7 @@ mod tests {
                 description: None,
             },
         ];
-        let built = build_chat_messages("system", &[], &messages);
+        let built = build_chat_messages("system", "", &[], &messages);
         assert_eq!(built.len(), 2, "system + the one with text: {built:?}");
         assert!(matches!(
             &built[1],
@@ -1814,6 +1900,7 @@ mod tests {
         );
         let built = build_chat_messages(
             "sys",
+            "",
             &[],
             &[with_reasoning, without_reasoning, reasoning_only],
         );
@@ -1890,7 +1977,7 @@ mod tests {
             },
             assistant,
         ];
-        let chat = build_chat_messages("sys", &[], &messages);
+        let chat = build_chat_messages("sys", "", &[], &messages);
         let system_roles: Vec<&str> = chat
             .iter()
             .filter_map(|m| match m {
@@ -1929,7 +2016,7 @@ mod tests {
     #[test]
     fn head_halves_stay_separate_and_empty_halves_vanish() {
         let messages = Vec::new();
-        let chat = build_chat_messages("sys", &[Some("M0"), Some("M1")], &messages);
+        let chat = build_chat_messages("sys", "", &[Some("M0"), Some("M1")], &messages);
         let heads: Vec<&str> = chat
             .iter()
             .filter_map(|m| match m {
@@ -1939,7 +2026,7 @@ mod tests {
             .collect();
         assert_eq!(heads, vec!["M0", "M1"], "two messages, baseline first");
 
-        let chat = build_chat_messages("sys", &[Some("M0"), None], &messages);
+        let chat = build_chat_messages("sys", "", &[Some("M0"), None], &messages);
         assert_eq!(
             chat.iter()
                 .filter(|m| matches!(m, ChatMessage::User { .. }))
@@ -1947,5 +2034,80 @@ mod tests {
             1,
             "a None half injects nothing"
         );
+    }
+
+    // Upstream `baseTranscript`: the static layer leads, the frozen dynamic
+    // layer (instructions) follows, and an empty dynamic layer is filtered.
+    #[test]
+    fn two_system_parts_lead_the_transcript() {
+        let built = build_chat_messages("STATIC", "INSTRUCTIONS", &[], &[]);
+        assert_eq!(
+            built
+                .iter()
+                .map(|m| match m {
+                    ChatMessage::System { content } => content.as_str(),
+                    _ => "other",
+                })
+                .collect::<Vec<_>>(),
+            vec!["STATIC", "INSTRUCTIONS"]
+        );
+        // Empty instructions are filtered (upstream `.filter(part.length > 0)`).
+        let built = build_chat_messages("STATIC", "", &[], &[]);
+        assert_eq!(built.len(), 1);
+    }
+
+    // Durable instruction rows are plain `Message::System` rows, so they ride
+    // the transcript after the two leading layers.
+    #[test]
+    fn system_rows_reach_the_wire_verbatim() {
+        let messages = vec![Message::System {
+            id: "msg_sys".to_owned(),
+            metadata: None,
+            time: TimeCreated { created: 0 },
+            text: "The instructions changed:\nInstructions from: /repo/AGENTS.md\nnew".to_owned(),
+            description: None,
+        }];
+        let built = build_chat_messages("STATIC", "INSTRUCTIONS", &[], &messages);
+        assert!(matches!(
+            &built[2],
+            ChatMessage::System { content } if content.starts_with("The instructions changed:")
+        ));
+    }
+
+    // The instruction fold shares the transcript's compaction boundary: rows
+    // before the latest completed checkpoint are replaced by it.
+    #[test]
+    fn compaction_boundary_points_at_the_last_completed_checkpoint() {
+        let completed = Message::Compaction(CompactionMessage {
+            id: "msg_c".to_owned(),
+            metadata: None,
+            time: TimeCreated { created: 3 },
+            compaction: Compaction::Completed(Box::new(CompactionCompleted {
+                reason: CompactionReason::Auto,
+                model: None,
+                provider_state: None,
+                summary: "s".to_owned(),
+                recent: "r".to_owned(),
+                provider_context: None,
+                cost: None,
+                tokens: None,
+            })),
+        });
+        let messages = vec![
+            user_row("msg_u1", "before"),
+            completed,
+            user_row("msg_u2", "after"),
+        ];
+        assert_eq!(compaction_boundary(&messages), 1);
+        let built = build_chat_messages("S", "I", &[], &messages);
+        let rendered: Vec<&str> = built
+            .iter()
+            .filter_map(|m| match m {
+                ChatMessage::User { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(!rendered.iter().any(|c| *c == "before"));
+        assert!(rendered.iter().any(|c| c.contains("after")));
     }
 }

@@ -103,6 +103,11 @@ pub(crate) struct DrainCtx {
     pub model_catalog: Arc<crate::model_catalog::ModelCatalog>,
     /// MCP servers whose instructions join the system prompt.
     pub mcp: Arc<crate::mcp::Hub>,
+    /// Per-session keyed-instruction baselines, shared by every actor of the
+    /// process (the instruction layer's frozen initial render rides system[1]).
+    pub instruction_baselines: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, super::instructions::Baseline>>,
+    >,
 }
 
 /// Run drains until the inbox is quiet, a control interrupts, or a turn
@@ -789,6 +794,7 @@ mod tests {
                     Vec::new(),
                 )),
                 mcp: Arc::new(crate::mcp::Hub::empty()),
+                instruction_baselines: Default::default(),
             }
         }
     }

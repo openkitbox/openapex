@@ -86,6 +86,9 @@ pub async fn build_state_with(
     tools: runner::ToolRegistry,
 ) -> Result<AppState> {
     let db = Db::open(&config.db_path).await?;
+    // The env block advertises <ox_home>/tmp as the preferred scratch space
+    // (upstream `global.tmp`); create it once at boot.
+    let _ = std::fs::create_dir_all(crate::config::ox_home().join("tmp"));
     build_state_on(config, chat, tools, db).await
 }
 
