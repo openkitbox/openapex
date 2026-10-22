@@ -57,10 +57,10 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 
-use ox_schema::wire::ToolDef;
+use crate::runner::{Tool, ToolContext, ToolOutput};
 use ox_db::{Db, optional};
 use ox_schema::id::now_millis;
-use crate::runner::{Tool, ToolContext, ToolOutput};
+use ox_schema::wire::ToolDef;
 use ox_tools::{object_param, ok_text};
 
 /// The closed category set, in pinboard render order.

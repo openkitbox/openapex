@@ -10,10 +10,10 @@
 
 use serde_json::{Value, json};
 
-use ox_schema::wire::ToolDef;
 use crate::contract::{Tool, ToolContext, ToolOutput};
 use ox_schema::event::SessionEventData;
 use ox_schema::support::{LocationRef, SessionMetadata};
+use ox_schema::wire::ToolDef;
 
 use super::{fail, object_param, ok_text, param};
 
@@ -179,9 +179,8 @@ fn required(input: &Value, key: &str) -> Result<String, ToolOutput> {
 }
 
 async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutput {
-    let runner_missing = || {
-        fail("The subagent runner is not attached; the server is mis-configured".to_owned())
-    };
+    let runner_missing =
+        || fail("The subagent runner is not attached; the server is mis-configured".to_owned());
     let prompt = match required(input, "prompt") {
         Ok(prompt) => prompt,
         Err(output) => return output,
@@ -238,7 +237,13 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
     } else {
         let (child_id, project_id, directory, workspace_id, subpath) =
             match load_parent(&tool.handle.db, &ctx.session_id).await {
-                Ok(Some(parent)) => (ox_schema::id::id("ses"), parent.0, parent.1, parent.2, parent.3),
+                Ok(Some(parent)) => (
+                    ox_schema::id::id("ses"),
+                    parent.0,
+                    parent.1,
+                    parent.2,
+                    parent.3,
+                ),
                 Ok(None) => {
                     return fail(format!("Unknown parent session: {}", ctx.session_id));
                 }
@@ -658,35 +663,33 @@ mod tests {
     use ox_schema::support::LocationRef;
 
     fn assistant_text(text: &str) -> ox_schema::message::Message {
-        ox_schema::message::Message::Assistant(Box::new(
-            ox_schema::message::AssistantMessage {
-                id: "msg_a".to_owned(),
-                metadata: None,
-                time: ox_schema::message::AssistantTime {
-                    created: 0,
-                    streamed: None,
-                    completed: Some(1),
-                },
-                agent: "build".to_owned(),
-                model: ox_schema::support::ModelRef {
-                    id: "k3".to_owned(),
-                    provider_id: "cardinal".to_owned(),
-                    variant: None,
-                },
-                content: vec![ox_schema::message::AssistantContent::Text {
-                    text: text.to_owned(),
-                    state: None,
-                }],
-                snapshot: None,
-                finish: None,
-                raw_finish: None,
-                provider_state: None,
-                cost: None,
-                tokens: None,
-                error: None,
-                retry: None,
+        ox_schema::message::Message::Assistant(Box::new(ox_schema::message::AssistantMessage {
+            id: "msg_a".to_owned(),
+            metadata: None,
+            time: ox_schema::message::AssistantTime {
+                created: 0,
+                streamed: None,
+                completed: Some(1),
             },
-        ))
+            agent: "build".to_owned(),
+            model: ox_schema::support::ModelRef {
+                id: "k3".to_owned(),
+                provider_id: "cardinal".to_owned(),
+                variant: None,
+            },
+            content: vec![ox_schema::message::AssistantContent::Text {
+                text: text.to_owned(),
+                state: None,
+            }],
+            snapshot: None,
+            finish: None,
+            raw_finish: None,
+            provider_state: None,
+            cost: None,
+            tokens: None,
+            error: None,
+            retry: None,
+        }))
     }
 
     fn idle(outcome: ox_schema::message::IdleOutcome) -> ox_schema::message::Message {
@@ -766,9 +769,7 @@ mod tests {
 
     async fn seeded_db() -> (ox_db::Db, ox_core::event_bus::EventBus) {
         let dir = tempfile::tempdir().unwrap();
-        let db = ox_db::Db::open(&dir.path().join("ox.db"))
-            .await
-            .unwrap();
+        let db = ox_db::Db::open(&dir.path().join("ox.db")).await.unwrap();
         let bus = ox_core::event_bus::EventBus::new(db.clone());
         for (id, parent) in [
             ("ses_root", None),

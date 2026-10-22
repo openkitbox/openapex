@@ -52,9 +52,9 @@ use std::collections::HashMap;
 use anyhow::{Context as _, Result};
 use serde_json::Value;
 
+use ox_core::copied_tags::strip_copied_tag_notation;
 use ox_db::{Db, optional};
 use ox_schema::id::now_millis;
-use ox_core::copied_tags::strip_copied_tag_notation;
 
 /// One tagged item: the tag handle plus where the content lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -644,7 +644,10 @@ pub async fn mark_drops_applied(db: &Db, session_id: &str, tags: &[u64]) -> Resu
     // parameter lists.
     let mut params: Vec<ox_db::turso::Value> = Vec::with_capacity(tags.len() + 1);
     params.push(ox_db::turso::Value::Text(session_id.to_owned()));
-    params.extend(tags.iter().map(|tag| ox_db::turso::Value::Integer(*tag as i64)));
+    params.extend(
+        tags.iter()
+            .map(|tag| ox_db::turso::Value::Integer(*tag as i64)),
+    );
     let conn = db.acquire().await?;
     conn.execute(
         &format!(

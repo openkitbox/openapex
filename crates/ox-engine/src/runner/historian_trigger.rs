@@ -23,14 +23,14 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::cardinal::chat::Chat;
-use ox_core::config::Config;
-use ox_db::Db;
 use crate::mctx::budget::Budget;
 use crate::mctx::compartments::{self, Compartment};
 use crate::mctx::historian::{self, ChunkLimits};
 use crate::mctx::memory;
 use crate::runner::drain::DrainCtx;
 use crate::runner::step::rows_after_with_seq;
+use ox_core::config::Config;
+use ox_db::Db;
 
 // ---------------------------------------------------------------------------
 // Historian trigger (step boundary)
@@ -338,8 +338,8 @@ mod tests {
     use crate::cardinal::ChatRequest;
     use crate::cardinal::chat::{BoxChatStream, ChatFuture};
     use crate::cardinal::stream::StreamEvent;
-    use ox_core::config::ModelEntry;
     use crate::mctx::MctxConfig;
+    use ox_core::config::ModelEntry;
 
     const SESSION: &str = "ses_historian";
 

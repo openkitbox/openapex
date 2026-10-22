@@ -176,11 +176,11 @@ use regex::Regex;
 
 use crate::cardinal::chat::Chat;
 use crate::cardinal::wire::{ChatMessage, ChatRequest};
+use crate::mctx::historian::{collect_completion, historian_model};
+use crate::mctx::memory::{self, CATEGORIES};
 use ox_core::config::Config;
 use ox_db::Db;
 use ox_schema::id::now_millis;
-use crate::mctx::historian::{collect_completion, historian_model};
-use crate::mctx::memory::{self, CATEGORIES};
 
 /// Consecutive failures of one `(project, task)` after which the task stops
 /// being retried on every tick and waits for its next interval slot instead
@@ -1860,8 +1860,8 @@ mod tests {
     use crate::cardinal::CardinalError;
     use crate::cardinal::chat::{BoxChatStream, ChatFuture};
     use crate::cardinal::stream::StreamEvent;
-    use ox_core::config::ModelEntry;
     use crate::mctx::memory::{self, active_memories, write_memory};
+    use ox_core::config::ModelEntry;
 
     /// The shortest interval [`MctxConfig::validated`](crate::mctx::MctxConfig)
     /// accepts, so a test's "next slot" is one wall-minute apart.

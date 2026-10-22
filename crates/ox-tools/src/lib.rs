@@ -45,9 +45,9 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
-use ox_db::Db;
 pub use crate::contract::Attachment;
 use crate::contract::{Tool, ToolOutput, ToolRegistry};
+use ox_db::Db;
 
 /// The eight built-in tools, registered under their upstream names.
 impl ToolRegistry {
@@ -81,7 +81,7 @@ impl ToolRegistry {
     /// behind `experimental.todo`, a config surface ox does not have.
     pub fn register_todowrite(&mut self, db: Db) {
         self.register_all(vec![
-            Arc::new(crate::todowrite::TodoWriteTool::new(db)) as Arc<dyn Tool>,
+            Arc::new(crate::todowrite::TodoWriteTool::new(db)) as Arc<dyn Tool>
         ]);
     }
 }
@@ -134,11 +134,7 @@ pub fn fail(message: impl Into<String>) -> ToolOutput {
 
 /// Upstream `runtime.ts` `formatInputIssues`: the model-facing error for
 /// arguments that fail input validation.
-pub fn invalid_arguments(
-    tool: &str,
-    issues: &[(&str, String)],
-    input: &Value,
-) -> ToolOutput {
+pub fn invalid_arguments(tool: &str, issues: &[(&str, String)], input: &Value) -> ToolOutput {
     let shown: Vec<String> = issues
         .iter()
         .take(5)
@@ -164,11 +160,7 @@ pub fn invalid_arguments(
 // ---------------------------------------------------------------------------
 
 /// A required string field.
-pub fn required_str<'a>(
-    tool: &str,
-    input: &'a Value,
-    key: &str,
-) -> Result<&'a str, ToolOutput> {
+pub fn required_str<'a>(tool: &str, input: &'a Value, key: &str) -> Result<&'a str, ToolOutput> {
     let object = input
         .as_object()
         .ok_or_else(|| invalid_arguments(tool, &[(key, "Expected an object".to_owned())], input))?;
@@ -208,11 +200,7 @@ pub fn optional_str<'a>(
 }
 
 /// An optional boolean field.
-pub fn optional_bool(
-    tool: &str,
-    input: &Value,
-    key: &str,
-) -> Result<Option<bool>, ToolOutput> {
+pub fn optional_bool(tool: &str, input: &Value, key: &str) -> Result<Option<bool>, ToolOutput> {
     let Some(object) = input.as_object() else {
         return Ok(None);
     };
@@ -273,11 +261,7 @@ pub fn optional_positive_int(
 
 /// An optional JSON number (absent or `null` → `None`); anything else is an
 /// invalid-arguments error.
-pub fn optional_number(
-    tool: &str,
-    input: &Value,
-    key: &str,
-) -> Result<Option<f64>, ToolOutput> {
+pub fn optional_number(tool: &str, input: &Value, key: &str) -> Result<Option<f64>, ToolOutput> {
     match input.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Number(value)) => Ok(value.as_f64()),

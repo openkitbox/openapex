@@ -35,10 +35,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cardinal::chat::Chat;
 use ox_core::config::Config;
-use ox_db::Db;
 use ox_core::event_bus::EventBus;
-use ox_schema::id;
+use ox_db::Db;
 use ox_schema::event::SessionEventData;
+use ox_schema::id;
 use ox_schema::inbox::{Delivery, Item};
 use ox_schema::message::{CompactionReason, Message};
 use ox_schema::support::{FinishReason, SessionError};

@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-
 const DEFAULT_CARDINAL_URL: &str = "http://127.0.0.1:10202";
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
 
@@ -704,9 +703,7 @@ impl MctxConfig {
         // value would silently move every budget with it.
         // The ranges are owned by `budget`: they are the ranges its arithmetic
         // is written against.
-        if !(MIN_EXECUTE_PCT..=MAX_EXECUTE_PCT)
-            .contains(&self.execute_threshold_percentage)
-        {
+        if !(MIN_EXECUTE_PCT..=MAX_EXECUTE_PCT).contains(&self.execute_threshold_percentage) {
             tracing::warn!(
                 setting = "execute_threshold_percentage",
                 value = self.execute_threshold_percentage,
@@ -716,9 +713,7 @@ impl MctxConfig {
             );
             self.execute_threshold_percentage = default_execute_threshold_percentage();
         }
-        if !(MIN_HISTORY_SHARE..=MAX_HISTORY_SHARE)
-            .contains(&self.history_budget_percentage)
-        {
+        if !(MIN_HISTORY_SHARE..=MAX_HISTORY_SHARE).contains(&self.history_budget_percentage) {
             tracing::warn!(
                 setting = "history_budget_percentage",
                 value = self.history_budget_percentage,
@@ -894,4 +889,3 @@ pub enum EmbeddingProvider {
     #[serde(rename = "openai-compatible")]
     OpenAiCompatible,
 }
-

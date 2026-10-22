@@ -8,8 +8,8 @@
 pub mod message_updater;
 
 use anyhow::{Result, anyhow, bail};
-use serde_json::{Value, json};
 use ox_db::turso::Connection;
+use serde_json::{Value, json};
 
 use ox_schema::event::{EventEnvelope, InterruptReason, SessionEventData};
 use ox_schema::inbox::{Delivery, Item};
@@ -731,11 +731,10 @@ async fn project_fork(tx: &Connection, env: &EventEnvelope<SessionEventData>) ->
              ORDER BY seq DESC LIMIT 1"
         })
         .await?;
-    let copied_seq: Option<i64> =
-        ox_db::optional(&mut stmt, (parent_id.as_str(), boundary_seq))
-            .await?
-            .map(|row| row.get(0))
-            .transpose()?;
+    let copied_seq: Option<i64> = ox_db::optional(&mut stmt, (parent_id.as_str(), boundary_seq))
+        .await?
+        .map(|row| row.get(0))
+        .transpose()?;
 
     // Forked row: new slug, cost/tokens zeroed (column defaults), location and
     // settings inherited from the parent. Upstream `.onConflictDoNothing()`
@@ -858,10 +857,10 @@ async fn project_fork(tx: &Connection, env: &EventEnvelope<SessionEventData>) ->
 mod tests {
     use super::*;
     use ox_db::Db;
+    use ox_db::turso::Connection;
     use ox_schema::event::DurableEnvelope;
     use ox_schema::event::SessionEventData;
     use ox_schema::support::ModelRef;
-    use ox_db::turso::Connection;
 
     fn model() -> ModelRef {
         ModelRef {

@@ -21,8 +21,8 @@
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
-use ox_db::Db;
 use crate::mctx::decay_render::DecayRenderCompartment;
+use ox_db::Db;
 
 /// The paraphrase tiers and heading fields of one compartment — the `tiers`
 /// JSON column. `p1..p4` are the paraphrase ladder; `p1` absent or empty

@@ -6,12 +6,12 @@
 //! direct turso calls; the projection logic is ported faithfully.
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use serde_json::Value;
 use ox_db::turso::Connection;
+use serde_json::Value;
 
-use ox_schema::id;
 use crate::copied_tags::strip_copied_tag_notation;
 use ox_schema::event::{EventEnvelope, SessionEventData, StepFailedFinish};
+use ox_schema::id;
 use ox_schema::message::{
     AssistantContent, AssistantMessage, AssistantRetry, AssistantSnapshot, AssistantTime,
     Compaction, CompactionCompleted, CompactionMessage, IdleOutcome, LocationSwitch, Message,

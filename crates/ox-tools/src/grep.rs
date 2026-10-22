@@ -23,8 +23,8 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use ox_schema::wire::ToolDef;
 use crate::contract::{Tool, ToolContext, ToolOutput};
+use ox_schema::wire::ToolDef;
 
 use super::glob::{DEFAULT_SEARCH_LIMIT, DEFAULT_SEARCH_TIMEOUT};
 use super::{

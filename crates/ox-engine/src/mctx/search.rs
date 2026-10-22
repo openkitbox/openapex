@@ -79,8 +79,8 @@ use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 
 use crate::cardinal::wire::ToolDef;
-use ox_db::Db;
 use crate::runner::{Tool, ToolContext, ToolOutput};
+use ox_db::Db;
 use ox_tools::{object_param, ok_text};
 
 use super::compartments::Tiers;

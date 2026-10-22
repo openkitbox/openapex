@@ -31,9 +31,9 @@
 use anyhow::Result;
 
 use crate::cardinal::wire::{ChatMessage, ChatRequest};
-use ox_db::Db;
-use ox_core::event_bus::EventBus;
 use crate::runner::Chat;
+use ox_core::event_bus::EventBus;
+use ox_db::Db;
 use ox_schema::event::SessionEventData;
 use ox_schema::message::{AssistantContent, Message};
 use ox_schema::support::ModelRef;

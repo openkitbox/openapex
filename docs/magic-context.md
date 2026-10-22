@@ -59,7 +59,7 @@ every row is re-embedded by the same backfill instead of being compared across
 vector spaces. A search whose embedding call fails degrades to the index with a
 warning.
 
-Comparison is an in-memory cosine over the stored `f32` bytes (`src/mctx/embed.rs`);
+Comparison is an in-memory cosine over the stored `f32` bytes (`crates/ox-engine/src/mctx/embed.rs`);
 ox does not use turso's built-in vector index — only the FTS indexes are turso's.
 
 Verified end to end against a running instance (2026-10-19): a memory written with
@@ -123,5 +123,5 @@ text (`turso`, `ox.db`, `Tantivy`, `fts` all absent) — returned that memory as
 - Design deviations from the reference (budget-as-fence, no `map-memories`, no
   staleness signal, one in-process claim instead of leases, semantic ranking
   only for memories) are documented at the top of the module that owns them —
-  start with `src/mctx/dreamer.rs`, `src/mctx/search.rs` and
-  `src/runner/historian_trigger.rs`.
+  start with `crates/ox-engine/src/mctx/dreamer.rs`, `crates/ox-engine/src/mctx/search.rs` and
+  `crates/ox-engine/src/runner/historian_trigger.rs`.

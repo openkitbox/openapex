@@ -16,11 +16,11 @@ use std::pin::Pin;
 
 use serde_json::{Value, json};
 
-use ox_schema::wire::ToolDef;
-use ox_db::Db;
 use crate::contract::{Tool, ToolContext, ToolOutput};
-use ox_schema::message::{AssistantContent, Message, ToolState};
 use crate::{fail, object_param, ok_text, param};
+use ox_db::Db;
+use ox_schema::message::{AssistantContent, Message, ToolState};
+use ox_schema::wire::ToolDef;
 
 /// Upstream `TodoTool.Info` status literals, in display order.
 const STATUSES: [&str; 4] = ["pending", "in_progress", "completed", "cancelled"];
@@ -408,10 +408,7 @@ mod tests {
             .prepare("SELECT value FROM kv WHERE key = 'todo:reminders:ses_a'")
             .await
             .unwrap();
-        let row = ox_db::optional(&mut stmt, ())
-            .await
-            .unwrap()
-            .expect("row");
+        let row = ox_db::optional(&mut stmt, ()).await.unwrap().expect("row");
         let value: String = row.get(0).unwrap();
         assert_eq!(value, "0", "a touched list re-arms the budget");
     }

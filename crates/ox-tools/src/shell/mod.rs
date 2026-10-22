@@ -13,8 +13,8 @@
 
 pub mod sessions;
 
-use ox_schema::wire::ToolDef;
 use crate::contract::{Tool, ToolContext, ToolOutput};
+use ox_schema::wire::ToolDef;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

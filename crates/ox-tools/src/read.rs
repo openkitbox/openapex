@@ -18,8 +18,8 @@ use serde_json::Value;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use ox_schema::wire::ToolDef;
 use crate::contract::{Tool, ToolContext, ToolOutput};
+use ox_schema::wire::ToolDef;
 
 use super::{
     fail, int_param, object_param, ok_text, optional_nonneg_int, param, required_str, resolve_path,

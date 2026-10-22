@@ -30,9 +30,9 @@ use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+use ox_core::which;
 use ox_tools::contract::ToolOutput;
 use ox_tools::{fail, ok_text};
-use ox_core::which;
 
 pub mod tools;
 

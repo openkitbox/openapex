@@ -50,14 +50,14 @@
 use anyhow::{Context as _, Result};
 use cortexkit_cache_core::{CoreState, DurabilityClass, FrozenUnit};
 
-use ox_db::{Db, optional};
-use ox_schema::id::now_millis;
 use crate::mctx::budget::Budget;
 use crate::mctx::cache::{HeadRenderer, McCache, PassOutcome, RenderedPass, Signals, run_pass};
 use crate::mctx::compartments::{self, Compartment};
 use crate::mctx::memory::{MemoryRow, active_memories};
 use crate::mctx::render::{M0Inputs, assemble_m1, render_m0, render_memory_block};
 use crate::mctx::tagger::{mark_drops_applied, peek_queued_drops};
+use ox_db::{Db, optional};
+use ox_schema::id::now_millis;
 
 /// What one pass produced for the request builder.
 #[derive(Debug, Clone, PartialEq, Eq)]

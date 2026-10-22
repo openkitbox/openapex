@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 use std::ffi::OsStr;
 use std::time::{Duration, Instant};
 
-use ox_schema::wire::ToolDef;
 use crate::contract::{Tool, ToolContext, ToolOutput};
+use ox_schema::wire::ToolDef;
 
 use super::{
     fail, int_param, object_param, ok_text, optional_bool, optional_positive_int, optional_str,

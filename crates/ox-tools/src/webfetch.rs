@@ -14,8 +14,8 @@
 use serde_json::Value;
 use std::time::Duration;
 
-use ox_schema::wire::ToolDef;
 use crate::contract::{Tool, ToolContext, ToolOutput};
+use ox_schema::wire::ToolDef;
 
 use super::{fail, object_param, ok_text, optional_number, param, required_str};
 

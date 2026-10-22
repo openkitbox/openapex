@@ -254,8 +254,8 @@ mod tests {
     use crate::client::ToolInfo;
     use crate::jsonrpc::RpcError;
     use crate::transport::{CallError, Rpc};
-    use ox_tools::contract::ToolContext;
     use futures_util::future::BoxFuture;
+    use ox_tools::contract::ToolContext;
     use std::path::PathBuf;
     use std::sync::Mutex;
     use tokio_util::sync::CancellationToken;

@@ -156,8 +156,8 @@ pub(crate) async fn on_turn_ended(db: &Db, bus: &ox_core::event_bus::EventBus, s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ox_db::Db;
     use ox_core::event_bus::EventBus;
+    use ox_db::Db;
 
     /// Seed a session with one assistant row holding a completed todowrite
     /// call. The session row is required: `session_inbox` has a foreign key

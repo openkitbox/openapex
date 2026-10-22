@@ -48,8 +48,8 @@ use tokio_util::sync::CancellationToken;
 pub use ox_tools::contract::{Attachment, Tool, ToolContext, ToolOutput, ToolRegistry};
 
 use ox_core::config::Config;
-use ox_db::Db;
 use ox_core::event_bus::EventBus;
+use ox_db::Db;
 use ox_schema::event::{InterruptReason, SessionEventData};
 use ox_schema::support::SessionError;
 
@@ -678,7 +678,10 @@ impl ToolRegistryExt for ToolRegistry {
         self.register_all(vec![
             Arc::new(crate::mctx::tools::CtxReduceTool::new(db.clone())) as Arc<dyn Tool>,
             Arc::new(crate::mctx::tools::CtxExpandTool::new(db.clone())),
-            Arc::new(crate::mctx::memory::CtxMemoryTool::new(db.clone(), embedder.clone())),
+            Arc::new(crate::mctx::memory::CtxMemoryTool::new(
+                db.clone(),
+                embedder.clone(),
+            )),
             Arc::new(crate::mctx::memory::CtxNoteTool::new(db.clone())),
             Arc::new(crate::mctx::search::CtxSearchTool::new(db, embedder)),
         ]);
@@ -709,11 +712,11 @@ impl ox_tools::subagent::SubagentSpawner for Runner {
         Runner::interrupt(self, session_id)
     }
 
-    fn load_history<'a>(
-        &'a self,
-        session_id: &'a str,
-    ) -> ox_tools::subagent::LoadHistory<'a> {
-        Box::pin(crate::runner::step::load_history(&self.inner.db, session_id))
+    fn load_history<'a>(&'a self, session_id: &'a str) -> ox_tools::subagent::LoadHistory<'a> {
+        Box::pin(crate::runner::step::load_history(
+            &self.inner.db,
+            session_id,
+        ))
     }
 }
 

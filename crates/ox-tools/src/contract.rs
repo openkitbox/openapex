@@ -4,9 +4,9 @@
 //! depending on each other.
 
 use std::future::Future;
-use std::sync::Arc;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use anyhow::{Result, bail};
 use serde_json::Value;

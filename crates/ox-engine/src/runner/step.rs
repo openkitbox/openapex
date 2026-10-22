@@ -63,10 +63,10 @@ use crate::cardinal::wire::{
     ChatMessage, ChatRequest, FunctionCall, FunctionType, ImageUrl, ToolCall, Usage, UserPart,
     reasoning_effort_of,
 };
-use ox_schema::id;
-use ox_core::copied_tags::strip_copied_tag_notation;
 use crate::prompt;
+use ox_core::copied_tags::strip_copied_tag_notation;
 use ox_schema::event::SessionEventData;
+use ox_schema::id;
 use ox_schema::message::{
     AssistantContent, Compaction, CompactionCompleted, CompactionMessage, Message, ToolState,
 };
@@ -1676,9 +1676,7 @@ pub(crate) async fn last_assistant_text(
                 .content
                 .iter()
                 .filter_map(|part| match part {
-                    ox_schema::message::AssistantContent::Text { text, .. } => {
-                        Some(text.as_str())
-                    }
+                    ox_schema::message::AssistantContent::Text { text, .. } => Some(text.as_str()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()

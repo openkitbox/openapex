@@ -7,7 +7,7 @@ pub mod api;
 pub(crate) mod worktree;
 
 pub use ox_cbm as cbm;
-pub use ox_core::{config, event_bus, model_catalog, projector, USER_AGENT};
+pub use ox_core::{USER_AGENT, config, event_bus, model_catalog, projector};
 pub use ox_db as db;
 pub use ox_engine::{cardinal, mctx, prompt, runner};
 pub use ox_mcp as mcp;
@@ -20,10 +20,10 @@ use anyhow::Result;
 use salvo::prelude::*;
 
 use crate::api::AppState;
-use ox_engine::cardinal::client::CardinalClient;
 use ox_core::config::Config;
-use ox_db::Db;
 use ox_core::event_bus::EventBus;
+use ox_db::Db;
+use ox_engine::cardinal::client::CardinalClient;
 use ox_engine::runner::{Runner, ToolRegistryExt};
 
 /// One client constructor shared by [`build_state`] and [`run`], so both map

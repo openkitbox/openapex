@@ -23,9 +23,9 @@ use std::sync::OnceLock;
 use regex::Regex;
 use serde_json::{Value, json};
 
-use ox_schema::wire::ToolDef;
-use ox_db::Db;
 use crate::runner::{Tool, ToolContext, ToolOutput};
+use ox_db::Db;
+use ox_schema::wire::ToolDef;
 use ox_tools::{object_param, ok_text};
 
 use super::tagger::{DropState, QueueOutcome, Recovered, queue_drop_outcome, recover};
@@ -414,8 +414,8 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use crate::mctx::tagger::Tagger;
-    use crate::runner::ToolRegistryExt;
     use crate::mctx::tagger::test_support::store_messages;
+    use crate::runner::ToolRegistryExt;
 
     const SESSION: &str = "ses_test";
 

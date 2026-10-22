@@ -195,8 +195,8 @@ pub(crate) fn render_m0(inputs: &M0Inputs<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ox_db::Db;
     use crate::mctx::memory::write_memory;
+    use ox_db::Db;
 
     const PROJECT: &str = "/proj/a";
 

@@ -19,17 +19,17 @@
 use anyhow::{Context as _, Result, anyhow};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use ox_db::turso::Value as SqlValue;
 use salvo::http::StatusCode;
 use salvo::prelude::*;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
-use ox_db::turso::Value as SqlValue;
 
 use ox_db::Db;
-use ox_schema::id;
 use ox_schema::event::SessionEventData;
+use ox_schema::id;
 use ox_schema::message::Message;
 use ox_schema::support::{ForkBoundary, LocationRef, ModelRef, Rule, SessionMetadata};
 
@@ -1794,9 +1794,7 @@ pub(crate) async fn prompt(req: &mut Request, depot: &mut Depot, res: &mut Respo
     }
 
     let message_id = body.id.clone().unwrap_or_else(|| id::id("msg"));
-    let delivery = body
-        .delivery
-        .unwrap_or(ox_schema::inbox::Delivery::Steer);
+    let delivery = body.delivery.unwrap_or(ox_schema::inbox::Delivery::Steer);
     let payload = ox_schema::inbox::UserPayload {
         prompt: ox_schema::support::Prompt {
             text,

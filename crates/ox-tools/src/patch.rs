@@ -12,8 +12,8 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use ox_schema::wire::ToolDef;
 use crate::contract::{Tool, ToolContext, ToolOutput};
+use ox_schema::wire::ToolDef;
 
 use super::diff::{self as Diff, DiffStatus};
 use super::{fail, object_param, ok_text, param, required_str, resolve_path, resource_of};
