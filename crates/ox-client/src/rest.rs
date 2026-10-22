@@ -11,6 +11,38 @@ pub struct ProjectRef {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct Envelope<T> {
+    data: T,
+}
+
+/// One entry of `/api/agent`: only the fields the TUI chrome needs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentRef {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub hidden: bool,
+}
+
+/// `/api/model/default`: the model a new session would start with.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DefaultModel {
+    #[serde(rename = "modelID")]
+    pub model_id: String,
+    #[serde(rename = "providerID")]
+    pub provider_id: String,
+}
+
+/// One entry of `/api/provider`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderRef {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct LocationInfo {
     pub directory: String,
     pub project: ProjectRef,
@@ -130,5 +162,41 @@ impl Client {
             return Err(Error::Status(resp.status()));
         }
         Ok(())
+    }
+
+    /// Visible primary agents, in server order (the first is the default).
+    pub async fn agents(&self) -> Result<Vec<AgentRef>> {
+        let resp = self
+            .request(reqwest::Method::GET, "/api/agent")
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Error::Status(resp.status()));
+        }
+        Ok(resp.json::<Envelope<Vec<AgentRef>>>().await?.data)
+    }
+
+    /// The model a fresh session starts on.
+    pub async fn default_model(&self) -> Result<DefaultModel> {
+        let resp = self
+            .request(reqwest::Method::GET, "/api/model/default")
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Error::Status(resp.status()));
+        }
+        Ok(resp.json::<Envelope<DefaultModel>>().await?.data)
+    }
+
+    /// Provider catalogue (display names live here, not on the model).
+    pub async fn providers(&self) -> Result<Vec<ProviderRef>> {
+        let resp = self
+            .request(reqwest::Method::GET, "/api/provider")
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Error::Status(resp.status()));
+        }
+        Ok(resp.json::<Envelope<Vec<ProviderRef>>>().await?.data)
     }
 }
