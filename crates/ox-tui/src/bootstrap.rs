@@ -2,20 +2,28 @@ use ox_client::Client;
 
 pub struct Bootstrap {
     pub client: Client,
-    pub session: String,
+    /// `None` on the home route: the session is created on first submit.
+    pub session: Option<String>,
 }
 
+/// Fast-fail reachability probe (keeps the old startup behaviour without
+/// creating a session).
+pub async fn check_reachable(server: &str, directory: &str) -> anyhow::Result<Client> {
+    let client = Client::new(server, directory);
+    let _location = client.location().await?;
+    Ok(client)
+}
+
+/// Connect for the `--session` path: probe, then keep (or create) a session.
 pub async fn connect(
     server: &str,
     directory: &str,
     session: Option<String>,
 ) -> anyhow::Result<Bootstrap> {
-    let client = Client::new(server, directory);
-    // 先确认协议可达（也是 server.connected 之前的快速失败点）。
-    let _location = client.location().await?;
+    let client = check_reachable(server, directory).await?;
     let session = match session {
-        Some(session) => session,
-        None => client.create_session().await?,
+        Some(session) => Some(session),
+        None => Some(client.create_session().await?),
     };
     Ok(Bootstrap { client, session })
 }

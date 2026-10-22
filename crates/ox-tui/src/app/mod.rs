@@ -17,7 +17,7 @@ use crate::ui::layout;
 use crate::ui::timeline::Transcript;
 use command::AppCommand;
 use event::AppEvent;
-use state::ViewState;
+use state::{Route, ViewState};
 
 pub const RENDER_TICK: Duration = Duration::from_millis(33);
 const SCROLL_PAGE: usize = 10;
@@ -33,15 +33,20 @@ pub enum Mode {
 }
 
 pub struct App {
+    pub route: Route,
+    pub session: Option<String>,
     pub view: ViewState,
     pub composer: Composer,
     pub store: DataStore,
     pub transcript: Transcript,
     pub commands: mpsc::UnboundedSender<AppCommand>,
-    session: String,
     seq_tx: watch::Sender<Option<i64>>,
     next_reload_id: u64,
     pending_reload: Option<u64>,
+    /// Home 提交后等待会话创建：失败时把这段文本放回 composer。
+    pending_home_prompt: Option<String>,
+    /// Home 底部的单行错误（会话创建失败）。
+    home_error: Option<String>,
     dirty: bool,
     mode: Mode,
     show_help: bool,
@@ -49,24 +54,32 @@ pub struct App {
 
 impl App {
     pub fn new(
-        session: String,
+        route: Route,
+        session: Option<String>,
         commands: mpsc::UnboundedSender<AppCommand>,
         seq_tx: watch::Sender<Option<i64>>,
     ) -> Self {
         // DataStore has a private field, so FRU (`DataStore { ..Default::default() }`)
         // is E0451; assign the pub fields on a default instance instead.
         let mut store = DataStore::default();
-        store.session = Some(session.clone());
+        store.session = session.clone();
+        let placeholder = match route {
+            Route::Home => crate::ui::home::placeholder_line(crate::ui::home::pick_placeholder()),
+            Route::Session => "输入消息…".to_string(),
+        };
         Self {
+            route,
+            session,
             view: ViewState::new(),
-            composer: Composer::new(),
+            composer: Composer::new_with_placeholder(&placeholder),
             store,
             transcript: Transcript::new(80, 20),
             commands,
-            session,
             seq_tx,
             next_reload_id: 0,
             pending_reload: None,
+            pending_home_prompt: None,
+            home_error: None,
             dirty: true,
             mode: Mode::Compose,
             show_help: false,
@@ -79,7 +92,33 @@ impl App {
             AppEvent::Key(key) => self.handle_key(key),
             AppEvent::Stream(msg) => self.handle_stream(msg),
             AppEvent::History { request_id, items } => self.handle_history(request_id, items),
+            AppEvent::SessionReady { session, prompt } => {
+                self.handle_session_ready(session, prompt)
+            }
+            AppEvent::SessionFailed(err) => self.handle_session_failed(err),
         }
+    }
+
+    fn handle_session_ready(&mut self, session: String, prompt: String) {
+        self.pending_home_prompt = None;
+        self.home_error = None;
+        self.session = Some(session.clone());
+        self.store.session = Some(session.clone());
+        self.route = Route::Session;
+        self.store.push_user(&prompt);
+        let _ = self.commands.send(AppCommand::Prompt {
+            session,
+            text: prompt,
+        });
+        self.refresh();
+    }
+
+    fn handle_session_failed(&mut self, err: String) {
+        if let Some(draft) = self.pending_home_prompt.take() {
+            self.composer.restore(&draft);
+        }
+        self.home_error = Some(err);
+        self.dirty = true;
     }
 
     /// Authoritative history, accepted only if it answers the newest request.
@@ -94,16 +133,24 @@ impl App {
     }
 
     fn request_reload(&mut self) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
         let request_id = self.next_reload_id;
         self.next_reload_id += 1;
         self.pending_reload = Some(request_id);
-        let _ = self.commands.send(AppCommand::ReloadHistory { request_id });
+        let _ = self.commands.send(AppCommand::ReloadHistory {
+            session,
+            request_id,
+        });
     }
 
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             if self.store.running_since.is_some() {
-                let _ = self.commands.send(AppCommand::Interrupt);
+                if let Some(session) = self.session.clone() {
+                    let _ = self.commands.send(AppCommand::Interrupt { session });
+                }
             } else {
                 self.view.should_quit = true;
             }
@@ -181,6 +228,25 @@ impl App {
     }
 
     fn handle_compose_key(&mut self, key: crossterm::event::KeyEvent) {
+        // Home：只有 composer 在收键，没有会话可搜索/滚动；首次提交惰性建会话。
+        if self.route == Route::Home {
+            let is_submit =
+                key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT);
+            if is_submit && self.pending_home_prompt.is_some() {
+                // A creation is already in flight; ignore extra submits but
+                // keep whatever is being typed.
+                self.dirty = true;
+                return;
+            }
+            let submitted = self.composer.handle_key(key);
+            self.dirty = true;
+            if let Some(text) = submitted {
+                self.pending_home_prompt = Some(text.clone());
+                self.home_error = None;
+                let _ = self.commands.send(AppCommand::CreateSessionAndPrompt(text));
+            }
+            return;
+        }
         // `/` opens search only on an empty draft: inside a message a slash is
         // an ordinary character (paths, dates).
         if key.code == KeyCode::Char('/') && self.composer.is_empty() {
@@ -215,7 +281,9 @@ impl App {
             // 本地乐观显示：随后一帧就有用户消息；服务端确认后由历史重拉覆盖。
             self.store.push_user(&text);
             self.refresh();
-            let _ = self.commands.send(AppCommand::Prompt(text));
+            if let Some(session) = self.session.clone() {
+                let _ = self.commands.send(AppCommand::Prompt { session, text });
+            }
         }
     }
 
@@ -227,7 +295,7 @@ impl App {
             }
             StreamMsg::Event(envelope) => {
                 let typed = envelope.parse_typed();
-                if typed.data.session_id() != Some(self.session.as_str()) {
+                if typed.data.session_id() != self.session.as_deref() {
                     return; // 全局流里过滤出本会话
                 }
                 ox_client::store::reduce(&mut self.store, &typed);
@@ -280,44 +348,63 @@ impl App {
             script = Some(frames.into_iter());
         }
 
-        self.request_reload();
+        if self.route == Route::Session {
+            self.request_reload();
+        }
 
         loop {
             tokio::select! {
                 _ = tick.tick() => {
-                    if let Some(frames) = script.as_mut() {
-                        if let Some(raw) = frames.next() {
-                            if let Ok(envelope) = serde_json::from_value::<ox_schema::event::EventEnvelope<serde_json::Value>>(raw) {
+                    if let Some(frames) = script.as_mut()
+                        && let Some(raw) = frames.next()
+                            && let Ok(envelope) = serde_json::from_value::<ox_schema::event::EventEnvelope<serde_json::Value>>(raw) {
                                 self.handle_stream(StreamMsg::Event(Box::new(envelope)));
                             }
-                        }
-                    }
                     if self.dirty {
                         self.dirty = false;
-                        terminal.terminal.draw(|frame| {
-                            let composer_height = match &self.mode {
-                                Mode::SearchInput(_) => 1,
-                                _ => self.composer.height(),
-                            };
-                            let (timeline_area, composer_area, dock_area) =
-                                layout::split(frame.area(), composer_height);
-                            match &mut self.mode {
-                                Mode::SearchInput(boxed) => boxed.render(frame, composer_area),
-                                _ => self.composer.render(frame, composer_area),
+                        match self.route {
+                            Route::Home => {
+                                terminal.terminal.draw(|frame| {
+                                    crate::ui::home::render(
+                                        frame,
+                                        frame.area(),
+                                        &mut self.composer,
+                                        self.home_error.as_deref(),
+                                    );
+                                })?;
                             }
-                            self.transcript.render(frame, timeline_area);
-                            let now_ms = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis() as i64)
-                                .unwrap_or(0);
-                            let line = dock::status_line(
-                                &self.store,
-                                now_ms,
-                                dock_area.width,
-                                self.status_mode(),
-                            );
-                            frame.render_widget(ratatui::widgets::Paragraph::new(line), dock_area);
-                        })?;
+                            Route::Session => {
+                                terminal.terminal.draw(|frame| {
+                                    let composer_height = match &self.mode {
+                                        Mode::SearchInput(_) => 1,
+                                        _ => self.composer.height(),
+                                    };
+                                    let (timeline_area, composer_area, dock_area) =
+                                        layout::split(frame.area(), composer_height);
+                                    match &mut self.mode {
+                                        Mode::SearchInput(boxed) => {
+                                            boxed.render(frame, composer_area)
+                                        }
+                                        _ => self.composer.render(frame, composer_area),
+                                    }
+                                    self.transcript.render(frame, timeline_area);
+                                    let now_ms = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .map(|d| d.as_millis() as i64)
+                                        .unwrap_or(0);
+                                    let line = dock::status_line(
+                                        &self.store,
+                                        now_ms,
+                                        dock_area.width,
+                                        self.status_mode(),
+                                    );
+                                    frame.render_widget(
+                                        ratatui::widgets::Paragraph::new(line),
+                                        dock_area,
+                                    );
+                                })?;
+                            }
+                        }
                     }
                 }
                 Some(event) = events.recv() => {
@@ -334,23 +421,132 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::App;
+    use crate::app::command::AppCommand;
     use crate::app::event::AppEvent;
+    use crate::app::state::Route;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tokio::sync::{mpsc, watch};
 
-    fn app() -> App {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let (seq_tx, _seq_rx) = tokio::sync::watch::channel(None);
-        App::new("ses_test".into(), tx, seq_tx)
+    fn app(route: Route, session: Option<&str>) -> (App, mpsc::UnboundedReceiver<AppCommand>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (seq_tx, _seq_rx) = watch::channel(None);
+        (App::new(route, session.map(String::from), tx, seq_tx), rx)
+    }
+
+    fn key(app: &mut App, code: KeyCode) {
+        app.handle(AppEvent::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for ch in text.chars() {
+            key(app, KeyCode::Char(ch));
+        }
     }
 
     #[test]
     fn typing_marks_the_frame_dirty() {
-        let mut app = app();
-        app.dirty = false; // last frame drawn; a key must schedule the next one
-        app.handle(AppEvent::Key(KeyEvent::new(
-            KeyCode::Char('x'),
-            KeyModifiers::NONE,
-        )));
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        app.dirty = false;
+        key(&mut app, KeyCode::Char('x'));
         assert!(app.dirty, "a typed character must schedule a redraw");
+    }
+
+    #[test]
+    fn home_enter_asks_for_session_creation_and_keeps_the_route() {
+        let (mut app, mut rx) = app(Route::Home, None);
+        type_text(&mut app, "hi");
+        key(&mut app, KeyCode::Enter);
+        match rx.try_recv().expect("a command must be sent") {
+            AppCommand::CreateSessionAndPrompt(text) => assert_eq!(text, "hi"),
+            other => panic!("unexpected command: {other:?}"),
+        }
+        assert_eq!(app.route, Route::Home);
+        assert!(
+            app.composer.is_empty(),
+            "the draft moves to the pending prompt"
+        );
+        assert_eq!(app.pending_home_prompt.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn session_ready_switches_route_and_sends_the_prompt() {
+        let (mut app, mut rx) = app(Route::Home, None);
+        type_text(&mut app, "hi");
+        key(&mut app, KeyCode::Enter);
+        let _ = rx.try_recv();
+        app.handle(AppEvent::SessionReady {
+            session: "ses_new".into(),
+            prompt: "hi".into(),
+        });
+        assert_eq!(app.route, Route::Session);
+        assert_eq!(app.session.as_deref(), Some("ses_new"));
+        assert_eq!(app.store.session.as_deref(), Some("ses_new"));
+        match rx.try_recv().expect("prompt must follow") {
+            AppCommand::Prompt { session, text } => {
+                assert_eq!(session, "ses_new");
+                assert_eq!(text, "hi");
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+        // 乐观显示：store 里已有用户消息
+        assert!(format!("{:?}", app.store.items).contains("hi"));
+    }
+
+    #[test]
+    fn session_failure_restores_the_draft_and_shows_an_error() {
+        let (mut app, _rx) = app(Route::Home, None);
+        type_text(&mut app, "keep me");
+        key(&mut app, KeyCode::Enter);
+        app.handle(AppEvent::SessionFailed("server down".into()));
+        assert_eq!(app.route, Route::Home);
+        assert_eq!(app.composer.text(), "keep me");
+        assert_eq!(app.home_error.as_deref(), Some("server down"));
+        assert!(app.pending_home_prompt.is_none());
+    }
+
+    #[test]
+    fn ctrl_c_on_home_quits() {
+        let (mut app, _rx) = app(Route::Home, None);
+        app.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(app.view.should_quit);
+    }
+
+    #[test]
+    fn ctrl_c_while_running_interrupts_instead_of_quitting() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_live"));
+        app.store.running_since = Some(0); // a turn is in flight
+        app.handle(AppEvent::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(!app.view.should_quit);
+        match rx.try_recv().expect("interrupt must be sent") {
+            AppCommand::Interrupt { session } => assert_eq!(session, "ses_live"),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn home_submit_is_suppressed_while_a_creation_is_in_flight() {
+        let (mut app, mut rx) = app(Route::Home, None);
+        type_text(&mut app, "first");
+        key(&mut app, KeyCode::Enter);
+        let _ = rx.try_recv(); // CreateSessionAndPrompt("first")
+        key(&mut app, KeyCode::Char('x')); // typing continues
+        key(&mut app, KeyCode::Enter); // suppressed
+        assert!(rx.try_recv().is_err(), "no second creation command");
+        assert_eq!(app.pending_home_prompt.as_deref(), Some("first"));
+        assert_eq!(app.composer.text(), "x");
+    }
+
+    #[test]
+    fn slash_search_is_disabled_on_home() {
+        let (mut app, _rx) = app(Route::Home, None);
+        key(&mut app, KeyCode::Char('/'));
+        assert!(matches!(app.mode, super::Mode::Compose));
+        assert_eq!(app.composer.text(), "/");
     }
 }

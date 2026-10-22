@@ -416,7 +416,7 @@ fn indent_wrapped(text: &str, width: u16) -> Vec<Line<'static>> {
 mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::style::Modifier;
+    use ratatui::style::{Color, Modifier};
 
     use super::{Block, Transcript};
 
@@ -471,7 +471,8 @@ mod tests {
             .find(|(x, y)| buffer[(*x, *y)].symbol() == "h")
             .expect("the hit line is on screen");
         assert!(
-            buffer[hit].bg.is_some() || buffer[hit].modifier.contains(Modifier::REVERSED),
+            // ratatui 0.29: Cell.bg is `Color`; `Reset` means "no background".
+            buffer[hit].bg != Color::Reset || buffer[hit].modifier.contains(Modifier::REVERSED),
             "the current match line must be highlighted (palette-dependent)",
         );
     }
