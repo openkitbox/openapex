@@ -28,7 +28,10 @@ const SCROLL_PAGE: usize = 10;
 /// hijacked.
 pub enum Mode {
     Compose,
-    SearchInput(SearchBox),
+    // Boxed: TextArea is hundreds of bytes next to two unit variants
+    // (clippy::large_enum_variant), and the box is allocated only while the
+    // `/` prompt is open.
+    SearchInput(Box<SearchBox>),
     Browse,
 }
 
@@ -255,7 +258,7 @@ impl App {
         // an ordinary character (paths, dates).
         if key.code == KeyCode::Char('/') && self.composer.is_empty() {
             self.transcript.clear_search();
-            self.mode = Mode::SearchInput(SearchBox::new());
+            self.mode = Mode::SearchInput(Box::default());
             self.dirty = true;
             return;
         }
