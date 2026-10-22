@@ -1,5 +1,17 @@
 [workspace]
-members = ["crates/ox-schema", "crates/ox-client", "crates/ox-tui"]
+members = [
+  "crates/ox-acp",
+  "crates/ox-cbm",
+  "crates/ox-client",
+  "crates/ox-core",
+  "crates/ox-db",
+  "crates/ox-engine",
+  "crates/ox-mcp",
+  "crates/ox-schema",
+  "crates/ox-server",
+  "crates/ox-tools",
+  "crates/ox-tui",
+]
 resolver = "2"
 
 [workspace.package]
@@ -24,6 +36,7 @@ globset = "0.4.16"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
 ignore = "0.4.23"
+jiff = "0.2"
 # ox declares the global allocator itself (src/main.rs), so turso's default
 # "mimalloc" feature — which would install its own — stays disabled. The
 # no_thp feature rides on the same libmimalloc-sys build.

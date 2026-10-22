@@ -64,7 +64,7 @@ fn message_not_found(res: &mut Response, session_id: &str, message_id: &str) {
 }
 
 /// 400 `InvalidRequestError`.
-fn invalid_request(res: &mut Response, message: &str) {
+pub(crate) fn invalid_request(res: &mut Response, message: &str) {
     res.status_code(StatusCode::BAD_REQUEST);
     res.render(Json(json!({
         "_tag": "InvalidRequestError",

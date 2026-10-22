@@ -24,6 +24,7 @@ pub mod form;
 pub mod session;
 pub mod shell;
 pub mod skill;
+pub mod stats;
 
 /// Shared application state, injected via `salvo::affix_state`.
 #[derive(Clone)]
@@ -561,6 +562,7 @@ pub fn build_router(state: AppState) -> Router {
                     Router::with_path("experimental/session/{sessionID}/wait")
                         .post(session::wait_idle),
                 )
+                .push(Router::with_path("experimental/session/stats").get(stats::get))
                 .push(
                     Router::with_path("session")
                         .get(session::list)

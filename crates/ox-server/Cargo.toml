@@ -8,6 +8,7 @@ anyhow.workspace = true
 base64.workspace = true
 dirs.workspace = true
 futures-core.workspace = true
+jiff.workspace = true
 ox-cbm.workspace = true
 ox-core.workspace = true
 ox-db.workspace = true
