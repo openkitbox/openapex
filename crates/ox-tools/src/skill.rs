@@ -1,7 +1,7 @@
 //! `skill`: load one discovered skill's model-facing envelope.
 //!
 //! The model learns which skills exist from the system prompt (the
-//! `<available_skills>` block, rendered from [`crate::skills::discover`]) and
+//! `<available_skills>` block, rendered from [`crate::skills::list`]) and
 //! loads one here, exactly the way upstream's `skill` tool does. The result
 //! text is [`crate::skills::prepare`]'s `<skill_content>` envelope — body, base
 //! directory and sampled companion files. There is exactly one format: this

@@ -16,22 +16,6 @@ fn escape(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// Civil date from days since the Unix epoch (Howard Hinnant's algorithm).
-pub(crate) fn days_to_iso(days: i64) -> String {
-    // Howard Hinnant's civil_from_days algorithm.
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!("{y:04}-{m:02}-{d:02}")
-}
-
 /// Static system layer — verbatim port of upstream
 /// `packages/core/src/session/runner/prompt/system.txt`, with the identity
 /// line's `OpenCode` → ox. `${OPENCODE_TOOL_GUIDANCE}` is rendered from the
@@ -138,12 +122,12 @@ pub(crate) fn gather(
     project_root: Option<&Path>,
     mcp_instructions: Option<&str>,
 ) -> Vec<Observed> {
-    let skills: Vec<SkillSummary> = ox_tools::skills::discover(directory)
-        .iter()
+    let skills: Vec<SkillSummary> = ox_tools::skills::list(directory)
+        .into_iter()
         .map(|s| SkillSummary {
-            id: s.id.clone(),
-            name: s.name.clone(),
-            description: s.description.clone(),
+            id: s.id,
+            name: s.name,
+            description: s.description,
         })
         .collect();
     let agents = observed_instructions(directory, home, project_root);
@@ -172,7 +156,9 @@ pub(crate) fn gather(
         Observed {
             key: KEY_DATE,
             value: ObservedValue::Present(SourceValue::Date {
-                value: date_string(),
+                // One zone lookup per step: the system zone can change while
+                // the process runs, so it is never cached.
+                value: local_date(ox_schema::id::now_millis(), &jiff::tz::TimeZone::system()),
             }),
         },
         Observed {
@@ -423,6 +409,8 @@ fn render_skills(skills: &[SkillSummary]) -> String {
          The user may also invoke a skill directly. When that happens, its instructions appear in the conversation as a <skill_content> block, the same shape the skill tool returns. A skill that is already present this way does not need to be invoked again.\n",
     );
     if skills.is_empty() {
+        // Unreachable from `gather`, which classifies an empty list as
+        // `Removed`; upstream renders the same dead branch.
         out.push_str("No skills are currently available.");
         return out;
     }
@@ -520,36 +508,24 @@ fn env_block(directory: &Path) -> String {
     )
 }
 
-/// JS `Date#toDateString` format ("Thu Oct 22 2026"), UTC.
-fn date_string() -> String {
-    date_string_from_days(ox_schema::id::now_millis().div_euclid(86_400_000))
-}
-
-fn date_string_from_days(days: i64) -> String {
-    const WEEKDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let iso = days_to_iso(days); // "YYYY-MM-DD"
-    let year = &iso[0..4];
-    let month: usize = iso[5..7].parse().expect("days_to_iso month");
-    let day = &iso[8..10];
-    // 1970-01-01 (day 0) was a Thursday.
-    let weekday = WEEKDAYS[((days + 4).rem_euclid(7)) as usize];
-    format!("{weekday} {month} {day} {year}", month = MONTHS[month - 1])
+/// The local calendar date at `timestamp_ms` in `zone`, ISO `YYYY-MM-DD`
+/// (upstream renders `new Date().toDateString()`-equivalent local dates).
+///
+/// The wire value was already an ISO date string; what changed is the basis
+/// (UTC calendar day → local calendar day), so the first post-deploy request
+/// per session emits a one-time `core/date` delta — a documented re-baseline,
+/// not a bug.
+fn local_date(timestamp_ms: i64, zone: &jiff::tz::TimeZone) -> String {
+    jiff::Timestamp::from_millisecond(timestamp_ms)
+        .expect("timestamp out of range")
+        .to_zoned(zone.clone())
+        .date()
+        .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn days_to_iso_matches_known_epoch_anchors() {
-        // Day 0 = 1970-01-01; leap-year and century boundaries stay exact.
-        assert_eq!(days_to_iso(0), "1970-01-01");
-        assert_eq!(days_to_iso(59), "1970-03-01");
-        assert_eq!(days_to_iso(19_723), "2024-01-01");
-    }
 
     #[test]
     fn static_layer_carries_the_harness_section_verbatim() {
@@ -893,12 +869,70 @@ mod tests {
     }
 
     #[test]
-    fn date_string_matches_js_todatestring_format() {
-        // Anchor: day 20_748 is 2026-10-22, a Thursday. (The plan's 20_726
-        // was mis-anchored — it is 2026-09-30.)
-        assert_eq!(days_to_iso(20_748), "2026-10-22");
-        assert_eq!(date_string_from_days(20_748), "Thu Oct 22 2026");
-        assert_eq!(date_string_from_days(0), "Thu Jan 01 1970");
+    fn local_date_uses_the_zone_calendar_day() {
+        // 2026-10-22T18:00:00Z is already 2026-10-23 in UTC+8.
+        assert_eq!(
+            local_date(
+                1_792_692_000_000,
+                &jiff::tz::TimeZone::get("Asia/Shanghai").unwrap()
+            ),
+            "2026-10-23"
+        );
+        // 2026-10-22T02:00:00Z is still 2026-10-22 there.
+        assert_eq!(
+            local_date(
+                1_792_634_400_000,
+                &jiff::tz::TimeZone::get("Asia/Shanghai").unwrap()
+            ),
+            "2026-10-22"
+        );
+    }
+
+    #[test]
+    fn local_date_can_differ_from_the_utc_date() {
+        // The same instant is a different calendar day in UTC, which is what
+        // the old epoch-day value reported unconditionally.
+        let instant = 1_792_692_000_000; // 2026-10-22T18:00:00Z
+        assert_eq!(local_date(instant, &jiff::tz::TimeZone::UTC), "2026-10-22");
+        assert_eq!(
+            local_date(instant, &jiff::tz::TimeZone::get("Asia/Shanghai").unwrap()),
+            "2026-10-23"
+        );
+    }
+
+    #[test]
+    fn local_date_respects_dst_transitions() {
+        // 2026-11-01T04:00Z is midnight EDT in New York (fall-back is at 06:00Z
+        // this year): 11-01 locally, but still 10-31 in a fixed UTC-5 zone.
+        // This pins that the zone, not a fixed offset, decides the date.
+        let instant = 1_793_505_600_000; // 2026-11-01T04:00:00Z
+        assert_eq!(
+            local_date(
+                instant,
+                &jiff::tz::TimeZone::get("America/New_York").unwrap()
+            ),
+            "2026-11-01"
+        );
+        assert_eq!(
+            local_date(instant, &jiff::tz::TimeZone::get("Etc/GMT+5").unwrap()),
+            "2026-10-31"
+        );
+    }
+
+    #[test]
+    fn the_date_source_renders_the_iso_local_date() {
+        let zone = jiff::tz::TimeZone::get("Asia/Shanghai").unwrap();
+        let value = local_date(1_792_692_000_000, &zone);
+        assert_eq!(
+            initial_text(&SourceValue::Date {
+                value: value.clone()
+            }),
+            "Today's date: 2026-10-23"
+        );
+        assert_eq!(
+            changed_text(&SourceValue::Date { value }, None),
+            "Today's date is now: 2026-10-23"
+        );
     }
 
     #[test]

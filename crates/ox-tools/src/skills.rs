@@ -38,6 +38,16 @@ pub struct Skill {
     pub content: String,
 }
 
+/// Frontmatter-only view of a skill: what the catalog needs. The body is
+/// parsed and dropped in place — reading the file is inherent to parsing
+/// frontmatter, but the per-step catalog walk must not retain body strings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillMeta {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+}
+
 /// The directories skills are discovered under, in precedence order: the
 /// project-local `.ox` skill dirs, then the global `~/.ox` ones. Each is
 /// scanned shallowly (a skill directory does not contain skills).
@@ -66,88 +76,151 @@ pub fn discover(directory: &Path) -> Vec<Skill> {
     discover_in(&roots(directory))
 }
 
+/// The catalog view of every skill visible from `directory`: id, name and
+/// description only. The bodies are never retained, so a step's catalog walk
+/// costs frontmatter parsing rather than one body allocation per skill.
+pub fn list(directory: &Path) -> Vec<SkillMeta> {
+    list_in(&roots(directory))
+}
+
 /// Discovery over an explicit root set: tests scope themselves to a tempdir
 /// so the host's global skill roots never leak in.
 pub(crate) fn discover_in(roots: &[PathBuf]) -> Vec<Skill> {
-    let mut skills: Vec<Skill> = Vec::new();
-    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    dedupe_and_sort(
+        skill_candidates(roots)
+            .into_iter()
+            .filter_map(|(file, id)| load(&file, id))
+            .collect(),
+        |skill| skill.id.as_str(),
+    )
+}
+
+/// [`discover_in`] restricted to frontmatter metadata.
+pub(crate) fn list_in(roots: &[PathBuf]) -> Vec<SkillMeta> {
+    dedupe_and_sort(
+        skill_candidates(roots)
+            .into_iter()
+            .filter_map(|(file, id)| meta(&file, id))
+            .collect(),
+        |meta| meta.id.as_str(),
+    )
+}
+
+/// Every candidate skill file under `roots` as `(file, id)`, in discovery
+/// order: a directory contributes `<dir>/SKILL.md` with the directory name as
+/// id, a top-level `*.md` file contributes itself with the file stem as id.
+/// No dedupe happens here — a file that fails to parse must not shadow the
+/// same id from a later root.
+fn skill_candidates(roots: &[PathBuf]) -> Vec<(PathBuf, String)> {
+    let mut candidates = Vec::new();
     for root in roots {
-        let Ok(entries) = std::fs::read_dir(root) else {
-            continue;
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            // A missing root is normal — most projects have no skill dirs.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                // Skipping keeps "unreadable is never fatal", but silence here
+                // makes an unreadable root surface later as a bogus 404.
+                tracing::warn!(path = %root.display(), %error, "skill root unreadable; skipping");
+                continue;
+            }
         };
         for entry in entries.flatten() {
             let path = entry.path();
             let skill = if path.is_dir() {
-                skill_from_directory(&path)
-            } else if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
-                skill_from_file(&path)
+                let Some(id) = path.file_name().and_then(OsStr::to_str) else {
+                    continue;
+                };
+                (path.join("SKILL.md"), id.to_owned())
+            } else if path.extension().and_then(OsStr::to_str) == Some("md") {
+                let Some(id) = path.file_stem().and_then(OsStr::to_str).map(str::to_owned) else {
+                    continue;
+                };
+                (path, id)
             } else {
-                None
+                continue;
             };
-            // First root wins on id collision (ordered discovery, upstream's
-            // `Source.equals` dedup).
-            if let Some(skill) = skill
-                && seen.insert(skill.id.clone())
-            {
-                skills.push(skill);
-            }
+            candidates.push(skill);
         }
     }
-    skills.sort_by(|a, b| a.id.cmp(&b.id));
-    skills
+    candidates
 }
 
-/// A directory skill: `<dir>/SKILL.md`, id = directory name.
-fn skill_from_directory(dir: &Path) -> Option<Skill> {
-    let file = dir.join("SKILL.md");
-    let id = dir.file_name()?.to_str()?.to_owned();
-    load(&file, id)
+/// First occurrence wins on id collision (ordered discovery, upstream's
+/// `Source.equals` dedup), then the ids sort ascending. Shared by both views
+/// so `discover` and `list` can never disagree on which skill a step sees.
+fn dedupe_and_sort<T>(items: Vec<T>, id: impl Fn(&T) -> &str) -> Vec<T> {
+    let mut unique: Vec<T> = Vec::with_capacity(items.len());
+    for item in items {
+        if !unique.iter().any(|seen| id(seen) == id(&item)) {
+            unique.push(item);
+        }
+    }
+    unique.sort_by(|a, b| id(a).cmp(id(b)));
+    unique
 }
 
-/// A file skill: `<root>/<id>.md`, id = file stem.
-fn skill_from_file(file: &Path) -> Option<Skill> {
-    let id = file.file_stem()?.to_str()?.to_owned();
-    load(file, id)
-}
-
-/// Read the skill file and parse its frontmatter.
+/// Read the skill file and parse its frontmatter, keeping the body.
 fn load(file: &Path, id: String) -> Option<Skill> {
     let raw = std::fs::read_to_string(file).ok()?;
-    let (frontmatter, content) = parse_frontmatter(&raw);
-    let name = frontmatter
-        .as_ref()
-        .and_then(|front| value(front, "name"))
-        .unwrap_or_else(|| id.clone());
-    let description = frontmatter
-        .as_ref()
-        .and_then(|front| value(front, "description"));
+    let parsed = parse_skill(&raw, &id);
     Some(Skill {
         id,
-        name,
-        description,
+        name: parsed.name,
+        description: parsed.description,
         path: file.to_path_buf(),
-        content,
+        content: parsed.body.to_owned(),
     })
 }
 
-/// Split `---\nname: …\n---\n` frontmatter from the markdown body. Returns
-/// `(None, whole file)` when there is none — a plain markdown file is a valid
-/// skill.
-fn parse_frontmatter(raw: &str) -> (Option<String>, String) {
-    let trimmed = raw.strip_prefix("---").unwrap_or(raw);
-    if trimmed.len() == raw.len() {
-        return (None, raw.to_owned());
+/// Read the skill file and keep the frontmatter only; the body is dropped
+/// with `raw` and never allocated on its own.
+fn meta(file: &Path, id: String) -> Option<SkillMeta> {
+    let raw = std::fs::read_to_string(file).ok()?;
+    let parsed = parse_skill(&raw, &id);
+    Some(SkillMeta {
+        id,
+        name: parsed.name,
+        description: parsed.description,
+    })
+}
+
+/// One skill file's frontmatter fields and the borrowed body after it.
+struct ParsedSkill<'a> {
+    name: String,
+    description: Option<String>,
+    body: &'a str,
+}
+
+/// The one frontmatter parser: both views go through it, so `list` can never
+/// report a name or description `discover` would not.
+fn parse_skill<'a>(raw: &'a str, id: &str) -> ParsedSkill<'a> {
+    let (frontmatter, body) = split_frontmatter(raw);
+    let name = frontmatter
+        .and_then(|front| value(front, "name"))
+        .unwrap_or_else(|| id.to_owned());
+    let description = frontmatter.and_then(|front| value(front, "description"));
+    ParsedSkill {
+        name,
+        description,
+        body,
     }
+}
+
+/// Split `---\nname: …\n---\n` frontmatter from the markdown body. Returns
+/// `None` and the whole file as body when there is none — a plain markdown
+/// file is a valid skill.
+fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
+    let Some(trimmed) = raw.strip_prefix("---") else {
+        return (None, raw);
+    };
     let trimmed = trimmed.trim_start_matches(['\r', '\n']);
     match trimmed.find("\n---") {
-        Some(end) => {
-            let front = trimmed[..end].to_owned();
-            let body = trimmed[end + 4..]
-                .trim_start_matches(['\r', '\n'])
-                .to_owned();
-            (Some(front), body)
-        }
-        None => (None, raw.to_owned()),
+        Some(end) => (
+            Some(&trimmed[..end]),
+            trimmed[end + 4..].trim_start_matches(['\r', '\n']),
+        ),
+        None => (None, raw),
     }
 }
 
@@ -407,11 +480,118 @@ mod tests {
     }
 
     #[test]
+    fn list_reports_the_same_metadata_as_discover_in_the_same_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(project.join("skills/review")).unwrap();
+        std::fs::write(
+            project.join("skills/review/SKILL.md"),
+            "---\nname: Code Review\ndescription: Review a PR\n---\nBe thorough.\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("skills/notes.md"), "Plain body.").unwrap();
+        std::fs::write(project.join("skills/not-a-skill.txt"), "ignored").unwrap();
+        let roots = [project.join("skill"), project.join("skills")];
+
+        let discovered = discover_in(&roots);
+        let listed = list_in(&roots);
+
+        let from_discover: Vec<SkillMeta> = discovered
+            .iter()
+            .map(|skill| SkillMeta {
+                id: skill.id.clone(),
+                name: skill.name.clone(),
+                description: skill.description.clone(),
+            })
+            .collect();
+        assert_eq!(listed, from_discover);
+        assert_eq!(
+            listed
+                .iter()
+                .map(|meta| meta.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["notes", "review"]
+        );
+    }
+
+    #[test]
+    fn list_keeps_the_first_root_on_id_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(project.join("skill/dup")).unwrap();
+        std::fs::create_dir_all(project.join("skills/dup")).unwrap();
+        std::fs::write(
+            project.join("skill/dup/SKILL.md"),
+            "---\nname: First\n---\nfirst body\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("skills/dup/SKILL.md"),
+            "---\nname: Second\n---\nsecond body\n",
+        )
+        .unwrap();
+
+        let listed = list_in(&[project.join("skill"), project.join("skills")]);
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "First");
+    }
+
+    #[test]
+    fn list_does_not_retain_a_huge_body() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("skills/big")).unwrap();
+        let body = "x".repeat(1 << 20);
+        std::fs::write(
+            dir.path().join("skills/big/SKILL.md"),
+            format!("---\nname: Big\ndescription: A big skill\n---\n{body}"),
+        )
+        .unwrap();
+
+        let listed = list_in(&[dir.path().join("skills")]);
+
+        // `SkillMeta` has no body field, so retention is structurally
+        // impossible; the metadata must still match discovery.
+        assert_eq!(
+            listed,
+            vec![SkillMeta {
+                id: "big".to_owned(),
+                name: "Big".to_owned(),
+                description: Some("A big skill".to_owned()),
+            }]
+        );
+        assert_eq!(
+            discover_in(&[dir.path().join("skills")])[0].content.len(),
+            body.len()
+        );
+    }
+
+    #[test]
+    fn an_unreadable_root_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("skills/good")).unwrap();
+        std::fs::write(
+            dir.path().join("skills/good/SKILL.md"),
+            "---\nname: Good\n---\nbody\n",
+        )
+        .unwrap();
+        // A root that is a file cannot be read_dir'd at all.
+        let unreadable = dir.path().join("skills-file");
+        std::fs::write(&unreadable, "not a directory").unwrap();
+        let roots = [unreadable, dir.path().join("skills")];
+
+        let listed = list_in(&roots);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "good");
+        assert_eq!(discover_in(&roots).len(), 1);
+    }
+
+    #[test]
     fn frontmatter_without_a_close_is_not_frontmatter() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("broken.md");
         std::fs::write(&file, "---\nname: x\nbody without a close").unwrap();
-        let skill = skill_from_file(&file).unwrap();
+        let skill = load(&file, "broken".to_owned()).unwrap();
         assert_eq!(skill.name, "broken");
         assert!(skill.content.starts_with("---"));
     }
