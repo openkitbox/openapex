@@ -481,4 +481,66 @@ done
             other => panic!("expected failed, got {other:?}"),
         }
     }
+
+    // ---- Batch B golden fixtures (`.opencode/plans/ox-injection-hardening.md`
+    // §2-B). Fixture provenance + checksum:
+    // `crates/ox-mcp/tests/fixtures/prompt/PROVENANCE.md`.
+
+    const MCP_BLOCK_TXT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/prompt/mcp-block.txt"
+    ));
+
+    #[test]
+    fn g4_instructions_block_matches_the_frozen_bytes() {
+        // Fixture: upstream `packages/core/src/mcp/instructions.ts:17-29`
+        // (`entries`/`render`) @ 8482dbf1e7eba18d6c5d0de6f02f8242112bcf06 —
+        // server name in the attribute, every instruction line indented
+        // 4 spaces. Deviation frozen deliberately (PROVENANCE.md): upstream's
+        // codemode `execute` line is omitted (batch I adds it).
+        let hub = Hub::empty();
+        hub.instructions.write().unwrap().push((
+            "stub".to_owned(),
+            "Keep replies terse.\nPrefer read-only tools.".to_owned(),
+        ));
+        assert_eq!(hub.instructions_block().as_deref(), Some(MCP_BLOCK_TXT));
+    }
+
+    /// The fixture's sha256 must match its PROVENANCE.md entry, and every
+    /// file in the fixture directory must have an entry: a fixture edited or
+    /// added without a provenance update fails the suite.
+    #[test]
+    fn fixture_checksums_match_provenance() {
+        use sha2::Digest;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/prompt");
+        let provenance = std::fs::read_to_string(dir.join("PROVENANCE.md")).unwrap();
+        let mut listed = std::collections::BTreeSet::new();
+        for line in provenance.lines() {
+            let Some((sha, name)) = line.split_once("  ") else {
+                continue;
+            };
+            if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            let bytes = std::fs::read(dir.join(name))
+                .unwrap_or_else(|e| panic!("provenance lists {name} but it is unreadable: {e}"));
+            assert_eq!(
+                format!("{:x}", sha2::Sha256::digest(&bytes)),
+                sha,
+                "fixture {name} changed without a PROVENANCE.md update"
+            );
+            listed.insert(name.to_owned());
+        }
+        assert!(!listed.is_empty(), "no checksum lines parsed");
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            if name == "PROVENANCE.md" {
+                continue;
+            }
+            assert!(
+                listed.contains(&name),
+                "fixture {name} has no provenance entry"
+            );
+        }
+    }
 }

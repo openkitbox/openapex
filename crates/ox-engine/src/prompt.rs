@@ -1136,4 +1136,154 @@ mod tests {
             .collect();
         assert_eq!(instruction_files(&observed), expected);
     }
+
+    // ---- Batch B golden fixtures (`.opencode/plans/ox-injection-hardening.md`
+    // §2-B): byte-level oracles so later batches prove they changed only what
+    // they meant to. Fixture provenance + checksums:
+    // `crates/ox-engine/tests/fixtures/prompt/PROVENANCE.md`.
+
+    const SYSTEM_TXT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/prompt/system.txt"
+    ));
+    const SKILLS_TXT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/prompt/skills.txt"
+    ));
+    const INSTRUCTION_FILES_TXT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/prompt/instruction-files.txt"
+    ));
+    const DATE_TXT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/prompt/date.txt"
+    ));
+    const ENV_TXT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/prompt/env.txt"
+    ));
+
+    #[test]
+    fn g1_system_static_matches_upstream_modulo_the_identity_clause() {
+        // Fixture: upstream `packages/core/src/session/runner/prompt/system.txt`
+        // @ 8482dbf1e7eba18d6c5d0de6f02f8242112bcf06 (byte copy).
+        // The ONLY sanctioned difference is the identity clause; the guidance
+        // bullets substituted for ${OPENCODE_TOOL_GUIDANCE} below are verbatim
+        // copies of upstream `packages/core/src/session/system-prompt.ts:11-32`.
+        let guidance = [
+            "- Prefer dedicated tools over shell commands; fall back to the shell when a tool cannot do what you need.",
+            "- Do not chain shell commands with separators like `echo \"====\";` or `printf '---'`; the output becomes noisy in a way that makes the user's side of the conversation worse.",
+            "- Use the write tool to create files or completely replace their content. Prefer using the edit tool for targeted changes.",
+            "- Use the edit tool for targeted changes to existing text files. It replaces the exact text in `oldString` with `newString`, and the values must differ. By default, `oldString` must occur exactly once. If it occurs multiple times, include more surrounding context to make it unique or set `replaceAll` to true to replace every occurrence.",
+        ]
+        .join("\n");
+        let expected = SYSTEM_TXT
+            .replace(
+                "OpenCode, a coding agent harness",
+                "ox, an opencode-compatible server",
+            )
+            .replace("${OPENCODE_TOOL_GUIDANCE}", &guidance);
+        assert_eq!(system_static(&["shell", "write", "edit"]), expected);
+    }
+
+    #[test]
+    fn g2_render_skills_matches_the_frozen_catalog() {
+        // Fixture: upstream `packages/core/src/skill/instructions.ts:25-33`
+        // (`render`) @ 8482dbf1e7eba18d6c5d0de6f02f8242112bcf06 — entry shape
+        // `<skill>` + id/name/description lines, 2/4-space indentation.
+        // Deviation pinned on purpose (see PROVENANCE.md): a skill without a
+        // description renders no `<description>` line (`beta`).
+        let skills = vec![
+            SkillSummary {
+                id: "alpha".into(),
+                name: "Alpha".into(),
+                description: Some("First skill.".into()),
+            },
+            SkillSummary {
+                id: "beta".into(),
+                name: "Beta".into(),
+                description: None,
+            },
+        ];
+        assert_eq!(render_skills(&skills), SKILLS_TXT);
+    }
+
+    #[test]
+    fn g3_render_instruction_files_matches_the_frozen_blocks() {
+        // Fixture: upstream `packages/core/src/session/instructions.ts:76`
+        // (`Instructions from: ${path}\n${content}`, files joined by "\n\n")
+        // @ 8482dbf1e7eba18d6c5d0de6f02f8242112bcf06.
+        let files = vec![
+            InstructionFile {
+                path: "/repo/AGENTS.md".into(),
+                content: "project rule".into(),
+            },
+            InstructionFile {
+                path: "/repo/docs/AGENTS.md".into(),
+                content: "docs rule".into(),
+            },
+        ];
+        assert_eq!(render_instruction_files(&files), INSTRUCTION_FILES_TXT);
+    }
+
+    #[test]
+    fn g5_date_and_environment_one_liners_are_pinned() {
+        // Fixtures: upstream `packages/core/src/instructions/builtins.ts`
+        // (date line 29, env block lines 36-53)
+        // @ 8482dbf1e7eba18d6c5d0de6f02f8242112bcf06.
+        assert_eq!(
+            initial_text(&SourceValue::Date {
+                value: "2026-10-23".into()
+            }),
+            DATE_TXT
+        );
+        // A path that never exists keeps the `git repo: no` branch
+        // deterministic; @PLATFORM@/@OX_TMP@ are machine-dependent and
+        // substituted at test time (PROVENANCE.md substitution rule 3).
+        let value = env_block(Path::new("/nonexistent-ox-batch-b"));
+        let rendered = initial_text(&SourceValue::Environment { value });
+        let tmp = ox_core::config::ox_home().join("tmp");
+        let expected = ENV_TXT
+            .replace("@PLATFORM@", std::env::consts::OS)
+            .replace("@OX_TMP@", &tmp.display().to_string());
+        assert_eq!(rendered, expected);
+    }
+
+    /// Every fixture's sha256 must match its PROVENANCE.md entry, and every
+    /// file in the fixture directory must have an entry: a fixture edited or
+    /// added without a provenance update fails the suite.
+    #[test]
+    fn fixture_checksums_match_provenance() {
+        use sha2::Digest;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/prompt");
+        let provenance = std::fs::read_to_string(dir.join("PROVENANCE.md")).unwrap();
+        let mut listed = std::collections::BTreeSet::new();
+        for line in provenance.lines() {
+            let Some((sha, name)) = line.split_once("  ") else {
+                continue;
+            };
+            if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            let bytes = std::fs::read(dir.join(name))
+                .unwrap_or_else(|e| panic!("provenance lists {name} but it is unreadable: {e}"));
+            assert_eq!(
+                format!("{:x}", sha2::Sha256::digest(&bytes)),
+                sha,
+                "fixture {name} changed without a PROVENANCE.md update"
+            );
+            listed.insert(name.to_owned());
+        }
+        assert!(!listed.is_empty(), "no checksum lines parsed");
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            if name == "PROVENANCE.md" {
+                continue;
+            }
+            assert!(
+                listed.contains(&name),
+                "fixture {name} has no provenance entry"
+            );
+        }
+    }
 }

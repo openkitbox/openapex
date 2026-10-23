@@ -1,0 +1,6 @@
+<mcp_instructions>
+  <server name="stub">
+    Keep replies terse.
+    Prefer read-only tools.
+  </server>
+</mcp_instructions>
