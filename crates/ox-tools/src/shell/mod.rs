@@ -1,26 +1,30 @@
-//! Port of upstream `packages/core/src/tool/plugin/shell.ts` (+ its
-//! `shell.ts` service): run one shell command with combined stdout/stderr
-//! capture, timeout kill, and cancellation kill.
+//! The `shell` tool: run one command in an embedded brush session (pi-shell),
+//! with combined stdout/stderr capture, timeout kill, and cancellation kill.
 //!
-//! Capture mirrors upstream's model: both streams write to one buffer whose
-//! shared file description interleaves the output, then the tail is
-//! truncated by the tool-output limits (last 2 000 lines / 50 KiB).
-//!
-//! Session model (upstream `Shell` service): a command that is still running
-//! when its yield window closes becomes an owned session, addressed by
-//! `session_id` from `interact` (write stdin, observe) and `stop`. The table
+//! The surface mirrors upstream `packages/core/src/tool/plugin/shell.ts`:
+//! both streams interleave into one buffer, the tail is truncated by the
+//! tool-output limits (last 2 000 lines / 50 KiB), and a command that is
+//! still running when its yield window closes becomes an owned session,
+//! addressed by `session_id` from `interact` (observe) and `stop`. The table
 //! lives in [`sessions`], shared with the `/api/shell` endpoints.
+//!
+//! The engine underneath is pi-shell (pinned oh-my-pi rev): the model writes
+//! `bash`, not the host login shell, and the minimizer compacts the settled
+//! output the model reads while the paged capture stays raw. Commands run
+//! with stdin at `/dev/null` — pi-shell has no writer for a running command,
+//! so the old `chars` parameter is gone and interactive commands fail fast
+//! on EOF instead of hanging.
 
 pub mod sessions;
+
+mod engine;
 
 use crate::contract::{Tool, ToolContext, ToolOutput};
 use ox_schema::wire::ToolDef;
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-
-use super::rtk::RtkRewriter;
 
 use super::{
     fail, object_param, ok_text, optional_bool, optional_nonneg_int, optional_str, param,
@@ -39,88 +43,32 @@ const DEFAULT_INTERACT_YIELD_MS: u64 = 5_000;
 const MAX_LINES: usize = 2_000;
 const MAX_BYTES: usize = 50 * 1024;
 
+/// The dialect the model should write: brush implements `bash`.
+const SHELL_NAME: &str = "bash";
+
 pub struct ShellTool {
-    shell: PathBuf,
-    shell_name: String,
-    /// Optional RTK rewrite seam: when an `rtk` binary is available, each
-    /// command is passed through it before execution (path A integration).
-    rtk: Arc<RtkRewriter>,
     /// Live sessions started by `run`, shared with the `/api/shell` handlers.
     sessions: Arc<sessions::ShellSessions>,
 }
 
 impl ShellTool {
-    /// Resolve the login shell like upstream `ShellSelect`: `$SHELL` when it
-    /// exists and is not a denied shell (fish, nushell), else the platform
-    /// fallback (`/bin/zsh` on macOS, `/bin/bash`, `/bin/sh`). Denied shells
-    /// never enter the candidate list (upstream `compatible`).
     pub fn new() -> Self {
-        let shell = shell_candidates()
-            .into_iter()
-            .find(|candidate| candidate.is_file())
-            .unwrap_or_else(|| PathBuf::from("/bin/sh"));
-        Self::with_shell(shell)
-    }
-
-    /// A shell tool pinned to a specific shell binary (the test seam).
-    pub fn with_shell(shell: PathBuf) -> Self {
-        let name = shell
-            .file_name()
-            .map(|name| name.to_string_lossy().to_lowercase())
-            .unwrap_or_else(|| "sh".to_owned());
         Self {
-            shell,
-            shell_name: name,
-            rtk: Arc::new(RtkRewriter::new()),
             sessions: sessions::shared(),
         }
     }
 
     /// A shell tool over a caller-provided session table, so a test can
     /// inspect the sessions it started.
-    pub fn with_sessions(shell: PathBuf, sessions: Arc<sessions::ShellSessions>) -> Self {
-        Self {
-            sessions,
-            ..Self::with_shell(shell)
-        }
+    pub fn with_sessions(sessions: Arc<sessions::ShellSessions>) -> Self {
+        Self { sessions }
     }
 }
-
-/// Upstream `ShellSelect.META` deny list.
-const DENIED_SHELLS: [&str; 2] = ["fish", "nu"];
-
-/// Upstream `ShellSelect.compatible`: denied by basename.
-fn denied(shell: &Path) -> bool {
-    shell
-        .file_name()
-        .map(|name| DENIED_SHELLS.contains(&name.to_string_lossy().to_lowercase().as_str()))
-        .unwrap_or(true)
-}
-
-/// Serializes tests that mutate `SHELL` against tests that resolve it.
-#[cfg(test)]
-pub static SHELL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 impl Default for ShellTool {
     fn default() -> Self {
         Self::new()
     }
-}
-
-fn shell_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(shell) = std::env::var_os("SHELL") {
-        candidates.push(PathBuf::from(shell));
-    }
-    if cfg!(target_os = "macos") {
-        candidates.push(PathBuf::from("/bin/zsh"));
-    }
-    candidates.push(PathBuf::from("/bin/bash"));
-    candidates.push(PathBuf::from("/bin/sh"));
-    candidates
-        .into_iter()
-        .filter(|candidate| !denied(candidate))
-        .collect()
 }
 
 impl Tool for ShellTool {
@@ -130,11 +78,7 @@ impl Tool for ShellTool {
 
     fn definition(&self) -> ToolDef {
         let mut lines = vec!["Execute a shell command and return its output.".to_owned()];
-        lines.push(format!(
-            "Commands run on {} using {}.",
-            os_name(),
-            self.shell_name
-        ));
+        lines.push(format!("Commands run on {} using {SHELL_NAME}.", os_name()));
         lines.push("Quote file paths containing spaces or special characters.".to_owned());
         lines.push("Prefer dedicated tools over shell commands when possible.".to_owned());
         lines.push(
@@ -170,7 +114,7 @@ impl Tool for ShellTool {
                         json!({
                             "type": "string",
                             "enum": ["run", "interact", "stop"],
-                            "description": "run starts a command; interact observes or feeds an owned session; stop terminates one. Defaults to run.",
+                            "description": "run starts a command; interact observes an owned session; stop terminates one. Defaults to run.",
                         }),
                     ),
                     (
@@ -206,13 +150,6 @@ impl Tool for ShellTool {
                         param(
                             "string",
                             "Owned session handle returned by an earlier run or interact. Required for action=interact and action=stop.",
-                        ),
-                    ),
-                    (
-                        "chars",
-                        param(
-                            "string",
-                            "Exact characters to send to the session's stdin before observing. Omit or leave empty to only observe. Use \\n for Enter and JSON escapes such as \\u0003 for control characters.",
                         ),
                     ),
                     (
@@ -330,14 +267,6 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
         Ok(value) => value.unwrap_or(false),
         Err(output) => return output,
     };
-    // RTK path A: rewrite the command before execution when an `rtk` binary is
-    // available and capable. A missing/incapable/failing rtk returns the
-    // command unchanged (fail-open), so this is transparent when RTK is absent.
-    let command = tool
-        .rtk
-        .rewrite(command)
-        .await
-        .unwrap_or_else(|| command.to_owned());
     // Upstream prepare() failures and spawn failures are both wrapped by the
     // execute mapError, so the model only sees the generic message.
     let wrap = |_cause: String| fail(format!("Unable to execute command: {command}"));
@@ -366,9 +295,8 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
     // request waits out its yield window.
     let yield_ms = if background { 0 } else { yield_time_ms };
     let session = match tool.sessions.spawn(sessions::SpawnRequest {
-        command: command.clone(),
+        command: command.to_owned(),
         cwd: workdir,
-        shell: tool.shell.clone(),
         timeout_ms: Some(timeout_ms).filter(|timeout| *timeout > 0),
     }) {
         Ok(session) => session,
@@ -390,8 +318,11 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
         .status
         .is_some_and(|status| status != sessions::Status::Running)
     {
-        // Settled: this is the ordinary one-shot result.
-        return settled_output(&command, timeout_ms, &page, exit).with_metadata(json!({
+        // Settled: this is the ordinary one-shot result. The model reads the
+        // minimizer's rendering when the engine produced one; the paged
+        // capture stays raw either way.
+        let text = session.minimized_text().unwrap_or(page.output);
+        return settled_output(&session.id, timeout_ms, &text, exit).with_metadata(json!({
             "status": "completed",
             "shellID": session.id,
             "truncated": false,
@@ -407,9 +338,8 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
     };
     text.push_str(&format!(
         "\n\nCommand is still running as shell session {}. Call shell with \
-         action=\"interact\" and session_id={} to observe it, send input with the same \
-         action plus chars, or action=\"stop\" to terminate it. Do not start the same \
-         command again.",
+         action=\"interact\" and session_id={} to observe it, or action=\"stop\" to \
+         terminate it. Do not start the same command again.",
         session.id, session.id
     ));
     ok_text(text).with_metadata(json!({
@@ -420,12 +350,12 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
 
 /// The model-facing text for a settled session.
 fn settled_output(
-    command: &str,
+    session_id: &str,
     timeout_ms: u64,
-    page: &sessions::OutputPage,
+    text: &str,
     exit: sessions::Exit,
 ) -> ToolOutput {
-    let (text, truncated, total_lines, shown_lines) = truncate_output(&page.output);
+    let (text, truncated, total_lines, shown_lines) = truncate_output(text);
     let notice = match exit.status {
         Some(sessions::Status::Timeout) => Some("Timed out before completion".to_owned()),
         _ => exit_notice_parts(exit.code, exit.signal),
@@ -438,10 +368,9 @@ fn settled_output(
     if truncated {
         output.push_str(&format!(
             "\n\n[showing lines {}-{} of {total_lines}; full output is paged through \
-             GET /api/shell/{command_hash}/output]",
+             GET /api/shell/{session_id}/output]",
             total_lines - shown_lines + 1,
             total_lines,
-            command_hash = session_handle(command)
         ));
     }
     if notice.as_deref() == Some("Timed out before completion") {
@@ -457,17 +386,7 @@ fn settled_output(
     ok_text(messages.join("\n\n"))
 }
 
-/// A short stable token for the model-facing "full output" pointer.
-fn session_handle(command: &str) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in command.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
-}
-
-/// Observe or feed an owned session.
+/// Observe an owned session.
 async fn interact(tool: &ShellTool, input: &Value) -> ToolOutput {
     let Some(session_id) = input.get("session_id").and_then(Value::as_str) else {
         return super::invalid_arguments(
@@ -482,10 +401,6 @@ async fn interact(tool: &ShellTool, input: &Value) -> ToolOutput {
     let Some(session) = tool.sessions.get(session_id) else {
         return fail(format!("Unknown shell session: {session_id}"));
     };
-    let chars = input
-        .get("chars")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
     let yield_time_ms = match optional_nonneg_int("shell", input, "yield_time_ms") {
         Ok(value) => value.unwrap_or(DEFAULT_INTERACT_YIELD_MS),
         Err(output) => return output,
@@ -494,13 +409,6 @@ async fn interact(tool: &ShellTool, input: &Value) -> ToolOutput {
         Ok(value) => value.unwrap_or(0),
         Err(output) => return output,
     };
-    if !chars.is_empty()
-        && let Err(error) = session.write(chars.as_bytes(), false).await
-    {
-        return fail(format!(
-            "Unable to write to shell session {session_id}: {error}"
-        ));
-    }
     // Wait for output to change (or for the process to settle) rather than
     // sleeping a fixed poll interval.
     let deadline = Duration::from_millis(yield_time_ms);
@@ -631,8 +539,14 @@ fn truncate_output(raw: &str) -> (String, bool, usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use tempfile::tempdir;
     use tokio_util::sync::CancellationToken;
+
+    /// Serializes tests that mutate process env against each other (the
+    /// engine snapshots the env per spawned session). Tokio-aware so the
+    /// guard may live across the tool call's await.
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     fn ctx(directory: &Path) -> ToolContext {
         ToolContext {
@@ -644,11 +558,11 @@ mod tests {
     }
 
     async fn shell(directory: &Path, input: Value) -> ToolOutput {
-        let tool = ShellTool::with_shell(PathBuf::from("/bin/sh"));
+        let tool = ShellTool::new();
         tool.execute(ctx(directory), input).await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn captures_command_output() {
         let directory = tempdir().unwrap();
         let output = shell(directory.path(), json!({"command": "echo hello"})).await;
@@ -656,7 +570,7 @@ mod tests {
         assert!(output.error.is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn merges_stderr() {
         let directory = tempdir().unwrap();
         let output = shell(
@@ -667,7 +581,22 @@ mod tests {
         assert_eq!(output.content, json!("out\nerr\n"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inherits_the_host_environment() {
+        let _lock = ENV_LOCK.lock().await;
+        let directory = tempdir().unwrap();
+        // SAFETY: serialized by ENV_LOCK; no other test reads this variable.
+        unsafe { std::env::set_var("OX_SHELL_ENV_PROBE", "probe-ok") };
+        let output = shell(
+            directory.path(),
+            json!({"command": "echo value:$OX_SHELL_ENV_PROBE"}),
+        )
+        .await;
+        unsafe { std::env::remove_var("OX_SHELL_ENV_PROBE") };
+        assert_eq!(output.content, json!("value:probe-ok\n"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn runs_in_workdir() {
         let directory = tempdir().unwrap();
         std::fs::create_dir_all(directory.path().join("sub")).unwrap();
@@ -680,7 +609,7 @@ mod tests {
         assert_eq!(output.content, json!("yes\n"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn missing_workdir_fails_with_wrapped_message() {
         let directory = tempdir().unwrap();
         let output = shell(
@@ -694,7 +623,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn timeout_kills_and_reports() {
         let directory = tempdir().unwrap();
         let output = shell(
@@ -710,7 +639,7 @@ mod tests {
         assert!(text.contains("Timed out before completion"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn truncates_large_output_with_notice() {
         let directory = tempdir().unwrap();
         let output = shell(
@@ -726,10 +655,74 @@ mod tests {
         assert!(text.contains("\nline3000\n\n[showing lines"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_truncation_pointer_is_the_real_session_id() {
+        let sessions = Arc::new(sessions::ShellSessions::new());
+        let tool = ShellTool::with_sessions(Arc::clone(&sessions));
+        let directory = tempdir().unwrap();
+        let output = tool
+            .execute(
+                ctx(directory.path()),
+                json!({"command": "i=1; while [ $i -le 3000 ]; do echo line$i; i=$((i+1)); done"}),
+            )
+            .await;
+        let text = output.content.as_str().unwrap();
+        let id = output.metadata.as_ref().unwrap()["shellID"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // Regression: the pointer used to be an FNV hash of the command,
+        // which 404s against the session table.
+        assert!(
+            text.contains(&format!("GET /api/shell/{id}/output")),
+            "unexpected: {text}"
+        );
+        assert!(sessions.get(&id).is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn minimizer_renders_git_output_and_passes_plain_commands_through() {
+        let sessions = Arc::new(sessions::ShellSessions::new());
+        let tool = ShellTool::with_sessions(Arc::clone(&sessions));
+        let directory = tempdir().unwrap();
+        // A real git repo so the minimizer's git filter has something to
+        // chew; the engine only engages at 1 000+ chars, so make the status
+        // long enough with untracked files.
+        let init = shell(
+            directory.path(),
+            json!({"command": "git init -q && git config user.email t@t && git config user.name t && echo x > f && git add f && git commit -qm init && i=1; while [ $i -le 200 ]; do echo x > untracked-file-$i; i=$((i+1)); done"}),
+        )
+        .await;
+        assert!(init.error.is_none(), "setup failed: {init:?}");
+        let output = tool
+            .execute(ctx(directory.path()), json!({"command": "git status"}))
+            .await;
+        assert!(output.error.is_none(), "unexpected error: {output:?}");
+        let id = output.metadata.as_ref().unwrap()["shellID"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let session = sessions.get(&id).expect("session");
+        assert!(
+            session.minimized_text().is_some(),
+            "git output should be minimized: {}",
+            output.content
+        );
+        // A command with no filter stays raw.
+        let plain = tool
+            .execute(ctx(directory.path()), json!({"command": "echo hello"}))
+            .await;
+        let plain_id = plain.metadata.as_ref().unwrap()["shellID"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(sessions.get(&plain_id).unwrap().minimized_text().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancellation_kills_process() {
         let directory = tempdir().unwrap();
-        let tool = ShellTool::with_shell(PathBuf::from("/bin/sh"));
+        let tool = ShellTool::new();
         let token = CancellationToken::new();
         let ctx = ToolContext {
             session_id: "ses_test".to_owned(),
@@ -748,7 +741,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn background_returns_an_owned_session() {
         let directory = tempdir().unwrap();
         let output = shell(
@@ -765,7 +758,7 @@ mod tests {
         sessions::shared().get(session_id).unwrap().stop(true).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn truncation_total_counts_whole_file() {
         let directory = tempdir().unwrap();
         // ~400 KiB capture: the 50 KiB page window holds only the tail, so a
@@ -787,65 +780,66 @@ mod tests {
         assert!(!text.contains(" of 506;"));
     }
 
-    #[test]
-    fn denied_shell_env_falls_back_to_zsh_or_bash() {
-        let lock = SHELL_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn runs_pipelines_and_heredocs() {
         let directory = tempdir().unwrap();
-        let fish = directory.path().join("fish");
-        std::fs::write(&fish, "#!/bin/sh\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&fish, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let original = std::env::var_os("SHELL");
-        // SAFETY: serialized against other SHELL readers by SHELL_ENV_LOCK.
-        unsafe { std::env::set_var("SHELL", &fish) };
+        let output = shell(directory.path(), json!({"command": "echo hello | cat"})).await;
+        assert_eq!(output.content, json!("hello\n"));
+        let output = shell(
+            directory.path(),
+            json!({"command": "cat <<EOF\nheredoc line\nEOF"}),
+        )
+        .await;
+        assert_eq!(output.content, json!("heredoc line\n"));
+        // The zsh-ism the corpus hit: a heredoc inside command substitution
+        // (upstream brush fix #1066; pi-shell's vendored parser carries it).
+        let output = shell(
+            directory.path(),
+            json!({"command": "echo \"$(cat <<EOF\nnested\nEOF\n)\""}),
+        )
+        .await;
+        assert_eq!(output.content, json!("nested\n"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_background_job_does_not_hold_the_result_hostage() {
+        // `sleep 30 &` keeps writing nothing but stays alive: the run must
+        // settle once the foreground completes (pi-shell drains the pipe with
+        // a short grace), not wait out the background job.
+        let directory = tempdir().unwrap();
+        let output = shell(
+            directory.path(),
+            json!({"command": "sleep 30 & echo foreground-done", "yield_time_ms": 15_000}),
+        )
+        .await;
+        assert_eq!(output.error, None);
+        let status = output.metadata.as_ref().expect("metadata")["status"].clone();
+        assert_eq!(status, "completed", "{output:?}");
+        assert!(output.content.as_str().unwrap().contains("foreground-done"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cross_command_state_does_not_leak_between_sessions() {
+        // Each run owns a fresh brush session: variables and cwd changes must
+        // not carry over into the next tool call.
+        let directory = tempdir().unwrap();
+        shell(
+            directory.path(),
+            json!({"command": "export OX_LEAK=1; cd /"}),
+        )
+        .await;
+        let output = shell(directory.path(), json!({"command": "echo x$OX_LEAK"})).await;
+        assert_eq!(output.content, json!("x\n"));
+    }
+
+    #[test]
+    fn the_tool_schema_no_longer_feeds_stdin() {
         let tool = ShellTool::new();
-        match &original {
-            Some(value) => unsafe { std::env::set_var("SHELL", value) },
-            None => unsafe { std::env::remove_var("SHELL") },
-        }
-        let picked = tool.shell.to_string_lossy().to_lowercase();
+        let definition = tool.definition();
+        let schema = serde_json::to_value(&definition).unwrap();
         assert!(
-            picked.ends_with("/zsh") || picked.ends_with("/bash") || picked.ends_with("/sh"),
-            "picked: {picked}"
+            schema["function"]["parameters"]["properties"]["chars"].is_null(),
+            "chars must not be in the schema: {schema}"
         );
-        assert!(!picked.contains("fish"), "picked: {picked}");
-        drop(lock);
-    }
-}
-
-#[cfg(test)]
-mod rtk_integration_tests {
-    use super::*;
-    use serde_json::json;
-    use std::path::Path;
-    use tempfile::TempDir;
-    use tokio_util::sync::CancellationToken;
-
-    fn ctx(directory: &Path) -> ToolContext {
-        ToolContext {
-            session_id: "ses_test".to_owned(),
-            directory: directory.to_path_buf(),
-            call_id: "call_rtk".to_owned(),
-            cancellation: CancellationToken::new(),
-        }
-    }
-
-    /// Live end-to-end: a rewritable command runs through `rtk` and still
-    /// produces output (RTK passes non-rewritten commands through, so this
-    /// works whether or not rtk is installed). Ignored by default.
-    #[tokio::test]
-    #[ignore = "requires rtk on PATH"]
-    async fn shell_runs_rewritten_command() {
-        let _ = TempDir::new();
-        let dir = std::env::temp_dir();
-        let tool = ShellTool::with_shell(std::path::PathBuf::from("/bin/sh"));
-        let output = tool
-            .execute(ctx(&dir), json!({"command": "git status"}))
-            .await;
-        assert!(output.error.is_none(), "unexpected error: {output:?}");
-        // Whatever rtk does, the tool still returns text (never blank-fails).
-        assert!(output.content.is_string());
     }
 }

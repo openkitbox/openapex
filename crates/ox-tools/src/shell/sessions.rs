@@ -1,10 +1,11 @@
 //! Live shell sessions: the process-wide table behind the `shell` tool's
 //! `run` / `interact` / `stop` actions and the `/api/shell` endpoints.
 //!
-//! One [`ShellSession`] owns a spawned child, the merged stdout/stderr tail in
-//! [`OutputBuffer`], and the child's stdin. The table is shared by `Arc`
-//! between the tool (which spawns, writes, and kills) and the API (which lists
-//! sessions and pages their output), so neither side owns the other.
+//! One [`ShellSession`] owns an embedded brush session (pi-shell), the merged
+//! stdout/stderr tail in [`OutputBuffer`], and the run's terminal state. The
+//! table is shared by `Arc` between the tool (which spawns and stops) and the
+//! API (which lists sessions and pages their output), so neither side owns
+//! the other.
 //!
 //! Capture is bounded: the buffer keeps the newest [`OUTPUT_CAPACITY`] bytes
 //! and remembers how many it dropped, so a long-running server cannot grow the
@@ -12,25 +13,21 @@
 //! Output pages are built from one slice, never by copying the whole buffer.
 
 use std::collections::HashMap;
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use pi_shell::cancel::CancelToken;
 use serde::Serialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, ChildStdin};
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Notify;
 use tokio::sync::broadcast;
+
+use super::engine;
 
 /// Newest bytes retained per session. Upstream keeps the whole capture in a
 /// file; the tail is what a client renders and what the model needs.
 pub const OUTPUT_CAPACITY: usize = 8 * 1024 * 1024;
 /// Default page size for one `output` read.
 pub const DEFAULT_PAGE_BYTES: usize = 64 * 1024;
-/// How often the watcher polls the child for exit. Capture is signalled, not
-/// polled; only process exit needs a timer.
-const EXIT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Upstream `Shell.Status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -154,22 +151,19 @@ impl Exit {
     }
 }
 
-struct Live {
-    child: Child,
-    exit: Exit,
-    timeout_ms: Option<u64>,
-}
-
 /// One running or finished shell command.
 pub struct ShellSession {
     pub id: String,
     pub command: String,
     pub cwd: String,
-    pub shell: String,
     pub started: i64,
     output: Mutex<OutputBuffer>,
-    stdin: AsyncMutex<Option<ChildStdin>>,
-    live: AsyncMutex<Option<Live>>,
+    exit: Mutex<Exit>,
+    /// The embedded brush session this command runs in.
+    shell: pi_shell::Shell,
+    /// The minimizer's rendering of the settled run, when the engine produced
+    /// one. Only the model-facing result reads this; paged output stays raw.
+    minimized: Mutex<Option<pi_shell::MinimizerResult>>,
     /// Fires when output is appended or the session settles, so a waiter
     /// needs no polling interval of its own.
     changed: Notify,
@@ -215,17 +209,24 @@ impl ShellSession {
 
     /// Terminal state, or the default (still running) state.
     pub fn exit(&self) -> Exit {
-        // `try_lock` keeps this usable from a sync context; the watcher only
-        // holds the lock across an assignment.
-        match self.live.try_lock() {
-            Ok(guard) => guard.as_ref().map_or_else(Exit::default, |live| live.exit),
-            Err(_) => Exit::default(),
-        }
+        self.exit
+            .lock()
+            .map(|exit| *exit)
+            .unwrap_or_else(|poisoned| *poisoned.into_inner())
     }
 
-    /// Whether the child has settled (exited, timed out, or been killed).
+    /// Whether the command has settled (exited, timed out, or been killed).
     pub fn settled(&self) -> bool {
         self.exit().is_settled()
+    }
+
+    /// The minimizer's rendering of the finished run, if the engine produced
+    /// one. Only meaningful once settled.
+    pub fn minimized_text(&self) -> Option<String> {
+        self.minimized
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|result| result.text.clone()))
     }
 
     /// Wait until output arrives or `timeout` passes, so an `interact` call
@@ -254,54 +255,33 @@ impl ShellSession {
         }
     }
 
-    /// Write to the child's stdin. An empty write with `append_newline`
-    /// becomes a bare newline, which is what a terminal sends on Enter.
-    pub async fn write(&self, bytes: &[u8], append_newline: bool) -> std::io::Result<()> {
-        let mut guard = self.stdin.lock().await;
-        let Some(stdin) = guard.as_mut() else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "shell stdin is closed",
-            ));
-        };
-        stdin.write_all(bytes).await?;
-        if append_newline && !bytes.ends_with(b"\n") {
-            stdin.write_all(b"\n").await?;
-        }
-        stdin.flush().await
-    }
-
-    /// Terminate the child; `force` skips the grace period.
+    /// Terminate the command. pi-shell's abort kills the whole process group
+    /// of the in-flight run, so `force` no longer changes the mechanism (the
+    /// old single-process `start_kill`/`kill` distinction is gone).
     pub async fn stop(&self, force: bool) {
-        let mut guard = self.live.lock().await;
-        let Some(live) = guard.as_mut() else {
-            return;
-        };
-        if live.exit.is_settled() {
-            return;
-        }
-        if force {
-            let _ = live.child.kill().await;
-        } else {
-            let _ = live.child.start_kill();
-        }
-        let exit = Exit {
-            status: Some(Status::Killed),
-            code: live.exit.code,
-            signal: live.exit.signal,
-            completed: live
+        let _ = force;
+        {
+            let mut exit = self
                 .exit
-                .completed
-                .or_else(|| Some(ox_schema::id::now_millis())),
-        };
-        live.exit = exit;
-        drop(guard);
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if exit.is_settled() {
+                return;
+            }
+            *exit = Exit {
+                status: Some(Status::Killed),
+                code: None,
+                signal: None,
+                completed: Some(ox_schema::id::now_millis()),
+            };
+        }
+        self.shell.abort().await;
         self.changed.notify_waiters();
         let _ = self.events.send(ShellEvent {
             kind: "shell.exited",
             id: self.id.clone(),
             status: Status::Killed,
-            exit: exit.code,
+            exit: None,
         });
     }
 
@@ -313,10 +293,14 @@ impl ShellSession {
             status: exit.status.unwrap_or(Status::Running),
             command: self.command.clone(),
             cwd: self.cwd.clone(),
-            shell: self.shell.clone(),
+            shell: "bash".to_owned(),
             // Capture lives in memory; the URL names the paging endpoint.
             file: format!("ox-shell://{}", self.id),
-            pid: None,
+            pid: self
+                .shell
+                .pids()
+                .first()
+                .and_then(|pid| u32::try_from(*pid).ok()),
             exit: exit.code,
             signal: exit.signal.map(|signal| signal.to_string()),
             metadata: HashMap::new(),
@@ -358,7 +342,6 @@ pub struct Time {
 pub struct SpawnRequest {
     pub command: String,
     pub cwd: std::path::PathBuf,
-    pub shell: std::path::PathBuf,
     /// Deadline for the whole session; `None` or `Some(0)` disables it.
     pub timeout_ms: Option<u64>,
 }
@@ -377,50 +360,21 @@ impl ShellSessions {
     /// Spawn one session and start capturing its output. The caller decides
     /// how long to wait before returning control to the model.
     pub fn spawn(&self, request: SpawnRequest) -> std::io::Result<Arc<ShellSession>> {
-        let mut command = tokio::process::Command::new(&request.shell);
-        // The command runs through the user's shell so pipelines, globs and
-        // quoting behave the way the model wrote them.
-        command
-            .arg("-c")
-            .arg(&request.command)
-            .current_dir(&request.cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = command.spawn()?;
-        let stdin = child.stdin.take();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
         let (events, _) = broadcast::channel(32);
         let session = Arc::new(ShellSession {
             id: ox_schema::id::id("sh"),
             command: request.command,
             cwd: request.cwd.to_string_lossy().into_owned(),
-            shell: request.shell.to_string_lossy().into_owned(),
             started: ox_schema::id::now_millis(),
             output: Mutex::new(OutputBuffer::default()),
-            stdin: AsyncMutex::new(stdin),
-            live: AsyncMutex::new(Some(Live {
-                child,
-                exit: Exit::default(),
-                timeout_ms: request.timeout_ms,
-            })),
+            exit: Mutex::new(Exit::default()),
+            shell: engine::shell(),
+            minimized: Mutex::new(None),
             changed: Notify::new(),
             events: events.clone(),
         });
 
-        // Capture both streams into the one buffer the client pages through.
-        if let Some(stdout) = stdout {
-            let session = Arc::clone(&session);
-            tokio::spawn(async move { pump(session, Box::new(stdout)).await });
-        }
-        if let Some(stderr) = stderr {
-            let session = Arc::clone(&session);
-            tokio::spawn(async move { pump(session, Box::new(stderr)).await });
-        }
-        // Watch for exit and for the wall-clock deadline.
-        tokio::spawn(watch(Arc::clone(&session)));
+        tokio::spawn(drive(Arc::clone(&session), request.timeout_ms));
 
         if let Ok(mut table) = self.sessions.lock() {
             table.insert(session.id.clone(), Arc::clone(&session));
@@ -480,103 +434,109 @@ pub fn shared() -> Arc<ShellSessions> {
     TABLE.get_or_init(|| Arc::new(ShellSessions::new())).clone()
 }
 
-/// Copy one pipe into the session buffer until EOF.
-async fn pump(
-    session: Arc<ShellSession>,
-    mut reader: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
-) {
-    let mut chunk = vec![0u8; 16 * 1024];
-    loop {
-        match reader.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(read) => {
+/// Run the session's command to completion: stream raw chunks into the
+/// capture buffer as they arrive, then record the terminal state once and
+/// wake every waiter.
+///
+/// Requires a multi-threaded runtime: pi-shell pumps the interpreter's pipe
+/// output and drives the interpreter on the same runtime, so under
+/// `current_thread` a pipe buffer's worth of output deadlocks the runtime.
+/// Production is `#[tokio::main]` (multi-threaded); tests use the
+/// `multi_thread` flavor for the same reason (as `tests/acp.rs` does).
+async fn drive(session: Arc<ShellSession>, timeout_ms: Option<u64>) {
+    // pi-shell decodes each stream's bytes and forwards them on this channel;
+    // the forwarder is the only writer of the capture buffer. The channel is
+    // unbounded on purpose: pi-shell emits with `send_async` from inside a
+    // nested runtime, so a full bounded channel would await a consumer that
+    // cannot be polled until the run returns (deadlock at 256 chunks).
+    let (chunk_tx, chunk_rx) = flume::unbounded::<String>();
+    let forwarder = {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move {
+            while let Ok(chunk) = chunk_rx.recv_async().await {
                 if let Ok(mut buffer) = session.output.lock() {
-                    buffer.append(&chunk[..read]);
+                    buffer.append(chunk.as_bytes());
                 }
                 session.changed.notify_waiters();
             }
+        })
+    };
+    let options = pi_shell::ShellRunOptions {
+        command: session.command.clone(),
+        cwd: Some(session.cwd.clone()),
+        ..Default::default()
+    };
+    // The deadline lives in pi-shell's cancel token: it maps to the run
+    // result's `timed_out` flag, while an external `stop` lands as
+    // `cancelled`.
+    let timeout = timeout_ms.map(|ms| u32::try_from(ms).unwrap_or(u32::MAX));
+    let result = session
+        .shell
+        .run(options, Some(chunk_tx), CancelToken::new(timeout))
+        .await;
+    // The sender dropped with the run: drain whatever is still queued before
+    // settling so no tail output is lost.
+    let _ = forwarder.await;
+
+    let now = ox_schema::id::now_millis();
+    let exit = match result {
+        Ok(result) => {
+            if let Some(minimized) = result.minimized
+                && let Ok(mut slot) = session.minimized.lock()
+            {
+                *slot = Some(minimized);
+            }
+            Exit {
+                status: Some(if result.timed_out {
+                    Status::Timeout
+                } else if result.cancelled {
+                    Status::Killed
+                } else {
+                    Status::Exited
+                }),
+                code: result.exit_code,
+                // pi-shell reports neither the signal nor the stop reason as
+                // a signal; the session status carries it instead.
+                signal: None,
+                completed: Some(now),
+            }
         }
-    }
+        Err(error) => {
+            // Engine-level failure (spawn, poisoned session): surface it in
+            // the capture so the model sees something actionable.
+            if let Ok(mut buffer) = session.output.lock() {
+                buffer.append(format!("{error}\n").as_bytes());
+            }
+            Exit {
+                status: Some(Status::Exited),
+                code: None,
+                signal: None,
+                completed: Some(now),
+            }
+        }
+    };
+    // A `stop` that landed first already published `Killed`; keep that
+    // earlier terminal state rather than flipping it back.
+    let settled = {
+        let mut slot = session
+            .exit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if slot.is_settled() {
+            false
+        } else {
+            *slot = exit;
+            true
+        }
+    };
     session.changed.notify_waiters();
-}
-
-/// Poll the child until it exits or its deadline passes, record the terminal
-/// state once, and wake every waiter.
-async fn watch(session: Arc<ShellSession>) {
-    loop {
-        let mut settled = None;
-        {
-            let mut guard = session.live.lock().await;
-            let Some(live) = guard.as_mut() else {
-                return;
-            };
-            if live.exit.is_settled() {
-                return;
-            }
-            let now = ox_schema::id::now_millis();
-            match live.child.try_wait() {
-                Ok(Some(status)) => {
-                    live.exit = Exit {
-                        status: Some(Status::Exited),
-                        code: status.code(),
-                        signal: exit_signal(&status),
-                        completed: Some(now),
-                    };
-                    settled = Some(Status::Exited);
-                }
-                Ok(None) => {
-                    let expired = live.timeout_ms.is_some_and(|timeout| {
-                        timeout > 0 && now - session.started >= timeout as i64
-                    });
-                    if expired {
-                        let _ = live.child.start_kill();
-                        live.exit = Exit {
-                            status: Some(Status::Timeout),
-                            code: None,
-                            signal: None,
-                            completed: Some(now),
-                        };
-                        settled = Some(Status::Timeout);
-                    }
-                }
-                Err(_) => {
-                    live.exit = Exit {
-                        status: Some(Status::Exited),
-                        code: None,
-                        signal: None,
-                        completed: Some(now),
-                    };
-                    settled = Some(Status::Exited);
-                }
-            }
-        }
-        if let Some(status) = settled {
-            // The child handle stays: `try_wait` already reaped it, and the
-            // session keeps serving its captured output until the client
-            // deletes it.
-            session.changed.notify_waiters();
-            let _ = session.events.send(ShellEvent {
-                kind: "shell.exited",
-                id: session.id.clone(),
-                status,
-                exit: session.exit().code,
-            });
-            return;
-        }
-        tokio::time::sleep(EXIT_POLL_INTERVAL).await;
-    }
-}
-
-fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        status.signal()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = status;
-        None
+    if settled {
+        let _ = session.events.send(ShellEvent {
+            kind: "shell.exited",
+            id: session.id.clone(),
+            status: exit.status.unwrap_or(Status::Exited),
+            exit: exit.code,
+        });
     }
 }
 

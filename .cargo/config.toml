@@ -1,0 +1,8 @@
+# The shell engine (pi-shell → vendored brush-core fork) requires nightly-only
+# features (`process_setsid`, `portable_simd` via xutf) that ox otherwise does
+# not use. ox stays on the stable toolchain and enables feature gates through
+# RUSTC_BOOTSTRAP instead of moving the whole project to nightly, because
+# nightly breaks an existing stable-only dependency (turso → branches 0.4.x
+# uses `core::intrinsics::abort`, removed from current nightlies).
+[env]
+RUSTC_BOOTSTRAP = "1"

@@ -34,10 +34,10 @@ fn session_id(output: &ox::runner::ToolOutput) -> String {
         .to_owned()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fast_command_settles_within_one_call() {
     let directory = tempfile::tempdir().unwrap();
-    let tool = ShellTool::with_shell("/bin/sh".into());
+    let tool = ShellTool::new();
     let ctx = context(directory.path());
     let output = call(&tool, &ctx, json!({ "command": "echo hello" })).await;
     assert_eq!(output.error, None);
@@ -47,10 +47,10 @@ async fn a_fast_command_settles_within_one_call() {
     assert_eq!(metadata["exit"], 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_long_command_returns_a_session_that_interact_observes() {
     let directory = tempfile::tempdir().unwrap();
-    let tool = ShellTool::with_shell("/bin/sh".into());
+    let tool = ShellTool::new();
     let ctx = context(directory.path());
     let output = call(
         &tool,
@@ -70,48 +70,59 @@ async fn a_long_command_returns_a_session_that_interact_observes() {
             .contains(&format!("action=\"interact\" and session_id={id}"))
     );
 
-    let observed = call(
-        &tool,
-        &ctx,
-        json!({ "action": "interact", "session_id": id, "yield_time_ms": 20 }),
-    )
-    .await;
-    assert!(observed.content.as_str().unwrap().contains("started"));
+    // The engine has a startup latency (embedded brush session), so poll the
+    // session with bounded waits instead of assuming the first observe lands
+    // after `echo started`.
+    let mut observed = String::new();
+    for _ in 0..50 {
+        let output = call(
+            &tool,
+            &ctx,
+            json!({ "action": "interact", "session_id": id, "yield_time_ms": 200 }),
+        )
+        .await;
+        observed.push_str(output.content.as_str().unwrap_or_default());
+        if observed.contains("started") {
+            break;
+        }
+    }
+    assert!(
+        observed.contains("started"),
+        "unexpected output: {observed}"
+    );
 
     let stopped = call(&tool, &ctx, json!({ "action": "stop", "session_id": id })).await;
     assert_eq!(stopped.error, None);
     assert_eq!(stopped.metadata.as_ref().unwrap()["status"], "completed");
 }
 
-#[tokio::test]
-async fn interact_feeds_stdin_to_the_running_command() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn interactive_commands_see_eof_not_a_hang() {
+    // pi-shell runs commands with stdin at /dev/null and offers no writer, so
+    // a command that would block on input fails fast instead. This is the
+    // documented replacement for the old `interact.chars` feeding.
     let directory = tempfile::tempdir().unwrap();
-    let tool = ShellTool::with_shell("/bin/sh".into());
+    let tool = ShellTool::new();
     let ctx = context(directory.path());
-    // `read` blocks until stdin supplies a line.
-    let started = call(
+    let output = call(
         &tool,
         &ctx,
-        json!({ "command": "read line; echo got:$line", "yield_time_ms": 50 }),
+        json!({ "command": "read line; echo got:$line", "yield_time_ms": 2_000 }),
     )
     .await;
-    let id = session_id(&started);
-    assert_eq!(started.metadata.as_ref().unwrap()["status"], "running");
-
-    let fed = call(
-        &tool,
-        &ctx,
-        json!({ "action": "interact", "session_id": id, "chars": "hello\n", "yield_time_ms": 500 }),
-    )
-    .await;
-    let text = fed.content.as_str().unwrap();
-    assert!(text.contains("got:hello"), "unexpected output: {text}");
+    assert_eq!(output.error, None);
+    let metadata = output.metadata.as_ref().expect("metadata");
+    assert_eq!(metadata["status"], "completed", "{output:?}");
+    assert!(
+        output.content.as_str().unwrap().contains("got:"),
+        "unexpected: {output:?}"
+    );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interact_without_a_session_fails_cleanly() {
     let directory = tempfile::tempdir().unwrap();
-    let tool = ShellTool::with_shell("/bin/sh".into());
+    let tool = ShellTool::new();
     let ctx = context(directory.path());
     let output = call(
         &tool,
@@ -125,10 +136,10 @@ async fn interact_without_a_session_fails_cleanly() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_without_a_session_fails_cleanly() {
     let directory = tempfile::tempdir().unwrap();
-    let tool = ShellTool::with_shell("/bin/sh".into());
+    let tool = ShellTool::new();
     let ctx = context(directory.path());
     let output = call(
         &tool,
@@ -142,10 +153,10 @@ async fn stop_without_a_session_fails_cleanly() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_timeout_settles_the_session() {
     let directory = tempfile::tempdir().unwrap();
-    let tool = ShellTool::with_shell("/bin/sh".into());
+    let tool = ShellTool::new();
     let ctx = context(directory.path());
     let output = call(
         &tool,
@@ -161,10 +172,10 @@ async fn a_timeout_settles_the_session() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_action_is_an_input_error() {
     let directory = tempfile::tempdir().unwrap();
-    let tool = ShellTool::with_shell("/bin/sh".into());
+    let tool = ShellTool::new();
     let ctx = context(directory.path());
     let output = call(&tool, &ctx, json!({ "action": "resume" })).await;
     assert!(
@@ -176,10 +187,10 @@ async fn an_unknown_action_is_an_input_error() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancelled_call_stops_its_session() {
     let directory = tempfile::tempdir().unwrap();
-    let tool = ShellTool::with_shell("/bin/sh".into());
+    let tool = ShellTool::new();
     let ctx = context(directory.path());
     let token = ctx.cancellation.clone();
     let task =

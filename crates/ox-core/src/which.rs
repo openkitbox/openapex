@@ -1,15 +1,14 @@
-//! Minimal `PATH` lookup shared by the RTK rewriter (`tool::rtk`) and the CBM
-//! gateway (`cbm`).
+//! Minimal `PATH` lookup shared by the CBM gateway (`cbm`) and the shell
+//! session helpers.
 //!
-//! Both callers need the same rule: resolve a bare binary name to an
+//! Callers need the same rule: resolve a bare binary name to an
 //! executable *file*, because a directory or a non-executable file would make
 //! the later spawn fail. Hits are absolutized with [`std::path::absolute`]
 //! (never `canonicalize` — symlinks are left alone) so that callers which
 //! chdir before spawning still execute the binary `PATH` pointed at.
 //!
-//! On Windows the `PATHEXT` suffix probing that `tool::rtk` carried before
-//! this helper existed moves here verbatim; on Unix the executable bit
-//! (`0o111`) decides.
+//! On Windows the `PATHEXT` suffix probing lives here; on Unix the executable
+//! bit (`0o111`) decides.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -35,7 +34,7 @@ pub(crate) fn find_in(paths: &OsStr, name: &str) -> Option<PathBuf> {
 }
 
 /// The suffixes a bare name may carry: one empty suffix on Unix, `PATHEXT`
-/// entries (with rtk's fallback list) on Windows.
+/// entries (falling back to the default Windows list when unset).
 fn executable_extensions() -> Vec<String> {
     if cfg!(windows) {
         std::env::var("PATHEXT")
@@ -58,8 +57,8 @@ fn is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// On non-Unix hosts the extension probing is the gate (rtk's prior rule:
-/// an existing file is a hit).
+/// On non-Unix hosts the extension probing is the gate (an existing file is
+/// a hit).
 #[cfg(not(unix))]
 fn is_executable(path: &Path) -> bool {
     path.is_file()

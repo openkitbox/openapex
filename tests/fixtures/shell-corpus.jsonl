@@ -1,0 +1,61 @@
+{"command": "git status --short && git log --oneline -3", "zsh_exit": 0}
+{"command": "true", "zsh_exit": 0}
+{"command": "ls -la", "zsh_exit": 0}
+{"command": "ls -la && ls reference/opencode | head -50", "zsh_exit": 0}
+{"command": "cat package.json 2>/dev/null | head -60; cat Cargo.toml 2>/dev/null | head -60", "zsh_exit": 0}
+{"command": "find src -type f -name '*.rs' | sort", "zsh_exit": 0}
+{"command": "ls reference/opencode/packages; find reference/opencode/packages/opencode/src -maxdepth 2 -type d | sort | head -60", "zsh_exit": 0}
+{"command": "find reference/opencode/packages/server reference/opencode/packages/session-ui reference/opencode/packages/protocol -type f | head -80", "zsh_exit": 0}
+{"command": "grep -rn \"api/session\" reference/opencode/packages/tui/src --include=*.ts --include=*.tsx | head -50", "zsh_exit": 0}
+{"command": "grep -rn \"session.list\\|sessions.list\\|listSessions\\|/session\" reference/opencode/packages/tui/src 2>/dev/null | head -60", "zsh_exit": 0}
+{"command": "ls reference/opencode/packages/server/src; ls reference/opencode/packages/server/src/handlers 2>/dev/null; ls reference/opencode/packages/server/src/routes 2>/dev/null", "zsh_exit": 1}
+{"command": "sed -n '1,200p' reference/opencode/packages/tui/src/component/dialog-session-list.tsx", "zsh_exit": 1}
+{"command": "ls reference/opencode/packages/tui/src/context/ | head -40; sed -n '1,120p' reference/opencode/packages/tui/src/context/data.tsx", "zsh_exit": 1}
+{"command": "sed -n '1,200p' reference/opencode/packages/server/src/handlers/session.ts", "zsh_exit": 1}
+{"command": "ls reference/opencode/packages/client/src; ls reference/opencode/packages/client/src/solid 2>/dev/null", "zsh_exit": 1}
+{"command": "grep -rn \"session.list\\|session.sync\\|session.get\\|message.list\" reference/opencode/packages/client/src --include='*.ts' --include='*.tsx' | head -60", "zsh_exit": 0}
+{"command": "sed -n '480,580p' reference/opencode/packages/client/src/solid/data.ts", "zsh_exit": 1}
+{"command": "grep -n \"session:\" -A 200 reference/opencode/packages/client/src/solid/data.ts | sed -n '1,260p'", "zsh_exit": 0}
+{"command": "grep -rn \"subpath\" reference/opencode/packages/core/src/session/*.ts | head -60; ls reference/opencode/packages/core/src/session", "zsh_exit": 1}
+{"command": "grep -rn \"session.list\" reference/opencode/packages/protocol/src/groups/session.ts | head; grep -n \"list\" -A 80 reference/opencode/packages/protocol/src/groups/session.ts | sed -n '1,180p'", "zsh_exit": 0}
+{"command": "sed -n '1559,2000p' src/api/session.rs", "zsh_exit": 1}
+{"command": "sed -n '1,220p' reference/opencode/packages/core/src/session/store.ts", "zsh_exit": 1}
+{"command": "grep -rn \"SessionsQuery\" -A 40 reference/opencode/packages/protocol/src/groups/session.ts | head -60", "zsh_exit": 0}
+{"command": "grep -rn \"session.list\\|session\\.sync\\b\" reference/opencode/packages/client/src/solid/data.ts | head -40; grep -n \"async function syncSession\\|session.sync =\\|sync(sessionID\" reference/opencode/packages/client/src/solid/data.ts | head", "zsh_exit": 0}
+{"command": "sed -n '1600,1830p' reference/opencode/packages/client/src/solid/data.ts", "zsh_exit": 1}
+{"command": "cat ~/.ox/config.toml; echo ---; lsof -nP -iTCP -sTCP:LISTEN | grep -i -E \"ox|14090|opencode\" | head", "zsh_exit": 0}
+{"command": "ls tests; grep -rn \"list\" tests/*.rs | head -40", "zsh_exit": 0}
+{"command": "grep -rn \"PublicSessionInfo\" reference/opencode/packages/protocol/src/groups/session.ts | head; grep -rn \"PublicSessionInfo\\s*=\" -A 40 reference/opencode/packages/protocol/src/*.ts | head -60", "zsh_exit": 0}
+{"command": "sed -n '1,120p' reference/opencode/packages/core/src/session/info.ts", "zsh_exit": 1}
+{"command": "sed -n '1,90p' reference/opencode/packages/protocol/src/groups/session.ts", "zsh_exit": 1}
+{"command": "sed -n '1,200p' reference/opencode/packages/core/src/session/session.ts", "zsh_exit": 1}
+{"command": "grep -rn \"global\" reference/opencode/packages/schema/src/project.ts; sed -n '1,80p' reference/opencode/packages/schema/src/project.ts", "zsh_exit": 1}
+{"command": "ls ~/.local/share/opencode/ 2>/dev/null; find ~/.local/share/opencode -maxdepth 2 -name \"*.db\" 2>/dev/null | head; ls ~/Library/Application\\ Support/opencode 2>/dev/null | head", "zsh_exit": 0}
+{"command": "ps aux | grep \"opencode serve\" | grep -v grep | head -3; ls ~/Library/Application\\ Support/opencode 2>/dev/null; cat ~/.local/state/opencode 2>/dev/null; find ~/.local/state/opencode -maxdepth 2 -type f 2>/dev/null | head", "zsh_exit": 0}
+{"command": "cat ~/Library/Application\\ Support/opencode/service.json 2>/dev/null | head -20", "zsh_exit": 0}
+{"command": "ls -la ~/.local/share/opencode/ 2>/dev/null; find / -maxdepth 6 -name \"service.json\" -path \"*opencode*\" 2>/dev/null | head -3", "zsh_exit": 0}
+{"command": "ls -la target/debug/ox; ps aux | grep \"target/debug/ox\\|opencode-rs\" | grep -v grep | head -3", "zsh_exit": 0}
+{"command": "ls -la /tmp/.cargo/target/debug/opencode-rs; date", "zsh_exit": 0}
+{"command": "lsof -nP -iTCP:14090 -sTCP:LISTEN 2>/dev/null | tail -1; ps aux | grep opencode-rs | grep -v grep | head -3", "zsh_exit": 0}
+{"command": "ls -la && find . -name \"target-file*\" -not -path \"./node_modules/*\" -not -path \"./.git/*\" 2>/dev/null", "zsh_exit": 0}
+{"command": "cat /tmp/ox-test.log; echo \"--- ps ---\"; ps aux | grep \"[t]arget/debug/ox\" | head", "zsh_exit": 0}
+{"command": "grep -n \"backfill_root_paths\\|user_version\\|fn migrate\" -B 3 -A 12 src/db.rs | head -80", "zsh_exit": 0}
+{"command": "grep -n \"tube register failed\" logs/client-logs/2026-10-22/run-2026-10-22-4dbdb9796d9a0e2e/all.log | head -40", "zsh_exit": 0}
+{"command": "sed -n '1,80p' reference/opencode/packages/core/src/session/instructions.ts 2>/dev/null | head -80", "zsh_exit": 0}
+{"command": "R=~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/agent-client-protocol-3.4.0; sed -n '30,140p' $R/examples/simple_agent_v2.rs", "zsh_exit": 0}
+{"command": "grep -n \"mcp\" src/api.rs | head -20; echo ---; grep -rn \"mcp\" src/api/session.rs | head", "zsh_exit": 0}
+{"command": "grep -rn \"dialog-mcp\\|mcp\" reference/opencode/packages/tui/src/routes/ reference/opencode/packages/tui/src/app.tsx reference/opencode/packages/tui/src/component/ -l 2>/dev/null | head -6; echo '--- 斜线命令注册 ---'; grep -rn \"\\\"mcp\\\"\\|name: 'mcp'\\|command.*mcp\" reference/opencode/packages/tui/src/ 2>/dev/null | head -6", "zsh_exit": 0}
+{"command": "grep -n \"mcp_servers\\|mcpServers\" ~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/agent-client-protocol-3.4.0/src/*.rs | head -10", "zsh_exit": 0}
+{"command": "grep -rn \"todo\" reference/opencode/packages/server/src --include=\"*.ts\" -il | head; echo ---; ls reference/opencode/packages/server/src 2>/dev/null | head -30; echo ---; grep -rn \"todowrite\" reference/opencode/packages/session-ui/src/tools/tool-renderer.tsx | head; echo ---; grep -rn \"todowrite\\|todo\" reference/opencode/packages/session-ui/src/timeline/projection.ts | head -20", "zsh_exit": 0}
+{"command": "ls reference/ | head; ls reference/opencode 2>/dev/null | head", "zsh_exit": 0}
+{"command": "P=~/.cache/opencode/packages/@cortexkit/opencode-magic-context@latest/node_modules/@cortexkit/opencode-magic-context; cat $P/src/tui/entry.mjs; echo \"=== tui-compiled index\"; cat $P/src/tui-compiled/index.tsx | head -60; echo \"=== size\"; du -sh $P/src/tui-compiled", "zsh_exit": 0}
+{"command": "grep -rn \"struct ToolRegistry\" -A 80 src/ | head -100", "zsh_exit": 0}
+{"command": "grep -rn 'reasoning_effort\\|variants' src/config.rs src/cardinal/wire.rs src/api.rs src/runner/step.rs | head -20; echo ---; grep -n 'struct ModelEntry' -A 15 src/config.rs | head -20", "zsh_exit": 0}
+{"command": "ls -i /private/tmp/.cargo/target/release/opencode-rs /tmp/.cargo/target/release/opencode-rs; echo \"=== running inode from lsof: 85958572 ===\"; stat -f \"%i %Sm\" -t \"%F %T\" /private/tmp/.cargo/target/release/opencode-rs", "zsh_exit": 0}
+{"command": "echo \"=== PID 37421 完整信息 ===\"; ps -p 37421 -o pid,ppid,command | cat\necho \"\"; echo \"=== 进程可执行文件路径 ===\"; lsof -p 37421 2>/dev/null | grep -E \"txt|TXT\" | head -3\necho \"\"; echo \"=== 启动时间/环境 ===\"; ps -p 37421 -o lstart,etime | cat", "zsh_exit": 0}
+{"command": "grep -rn \"pub efforts\" src/ ; echo \"---OPTIONAL FULL---\"; sed -n '1,80p' src/relay/optional.rs", "zsh_exit": 0}
+{"command": "sed -n '175,205p' src/runner/drain.rs; echo '=== SessionMoved 事件 ==='; grep -rn \"Moved\" src/schema/event.rs | head -5; echo '=== 项目解析辅助 ==='; grep -rn \"fn project_id\\|fn resolve_project\\|project_id =\" src/api/session.rs src/db.rs | head -8", "zsh_exit": 0}
+{"command": "R=~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/agent-client-protocol-3.4.0; grep -n \"SessionUpdate\\|session_update\" $R/src/session.rs | head -15", "zsh_exit": 0}
+{"command": "lsof -p 76994 2>/dev/null | awk '$4==\"txt\"{print $9}' | head -3", "zsh_exit": 0}
+{"command": "R=~/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/agent-client-protocol-3.4.0; cat $R/src/stdio.rs; echo \"===CLIENT_TO_AGENT===\"; cat $R/src/schema/client_to_agent/requests.rs", "zsh_exit": 0}
+{"command": "ls -d ~/.cargo/registry/src/*/turso* 2>/dev/null | head; grep -rln \"FromValue\" ~/.cargo/registry/src/*/turso-0.9.0-pre.1/src 2>/dev/null | head", "zsh_exit": 0}

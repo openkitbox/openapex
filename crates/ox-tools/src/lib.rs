@@ -30,7 +30,6 @@ pub mod grep;
 pub mod patch;
 pub mod question;
 pub mod read;
-pub(crate) mod rtk;
 pub mod shell;
 pub mod skill;
 pub mod skills;
@@ -435,10 +434,6 @@ mod tests {
 
     #[test]
     fn with_builtins_registers_all_tools_with_schemas() {
-        // ShellTool::new() reads $SHELL; serialize against env-mutating tests.
-        let lock = crate::shell::SHELL_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let registry = ToolRegistry::with_builtins();
         let mut names: Vec<String> = registry
             .definitions()
@@ -490,6 +485,5 @@ mod tests {
             edit.function.parameters["required"],
             json!(["path", "oldString", "newString"])
         );
-        drop(lock);
     }
 }

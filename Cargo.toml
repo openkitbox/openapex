@@ -30,6 +30,7 @@ cortexkit-cache-core = { git = "https://github.com/cortexkit/commons", rev = "06
 crossterm = "0.28"
 dashmap = "6.2.1"
 dirs = "7.0.0"
+flume = "0.12"
 futures-core = "0.3"
 futures-util = "0.3"
 git2 = { version = "0.21", default-features = false }
@@ -54,6 +55,9 @@ ox-schema = { path = "crates/ox-schema" }
 ox-server = { path = "crates/ox-server" }
 ox-tools = { path = "crates/ox-tools" }
 ox-tui = { path = "crates/ox-tui" }
+# Shell engine: omp's pi-shell (brush-based). The pinned rev is the only
+# supported update path; bump it deliberately and re-run the shell corpus A/B.
+pi-shell = { git = "https://github.com/can1357/oh-my-pi", rev = "2220e58146ebe31508e7a216242840d373e082d0" }
 rand = "0.9"
 ratatui = "0.29"
 regex = "1"
@@ -74,6 +78,14 @@ tracing-subscriber = "0.3.23"
 tui-textarea = { version = "0.7", default-features = false }
 turso = { version = "=0.9.0-pre.1", default-features = false }
 unicode-width = "0.2"
+
+# pi-builtins and the vendored brush-core pull brush-core/brush-parser from
+# crates.io; omp redirects those to its vendored forks at the workspace root.
+# Patches are only honored from the top-level workspace, so ox must repeat them
+# or the graph would mix the crates.io brush with the fork.
+[patch.crates-io]
+brush-core = { git = "https://github.com/can1357/oh-my-pi", rev = "2220e58146ebe31508e7a216242840d373e082d0" }
+brush-parser = { git = "https://github.com/can1357/oh-my-pi", rev = "2220e58146ebe31508e7a216242840d373e082d0" }
 
 [package]
 name = "ox"

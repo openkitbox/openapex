@@ -67,7 +67,7 @@ async fn start_session() -> String {
         call_id: "call_api".to_owned(),
         cancellation: CancellationToken::new(),
     };
-    let tool = ShellTool::with_shell("/bin/sh".into());
+    let tool = ShellTool::new();
     let output = tool
         .execute(
             ctx,
@@ -82,7 +82,7 @@ async fn start_session() -> String {
         .to_owned()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lists_and_pages_a_live_session() {
     let (base, _dir) = server().await;
     let client = reqwest::Client::new();
@@ -116,14 +116,27 @@ async fn lists_and_pages_a_live_session() {
     assert_eq!(info["data"]["status"], "running");
     assert!(info["data"]["command"].is_string());
 
-    let page: Value = client
-        .get(format!("{base}/api/shell/{id}/output?cursor=0&limit=4096"))
-        .send()
-        .await
-        .expect("output")
-        .json()
-        .await
-        .expect("json");
+    // Startup latency: poll the output page with bounded waits until the
+    // session has echoed its first line.
+    let mut page: Value = serde_json::json!({});
+    for _ in 0..50 {
+        page = client
+            .get(format!("{base}/api/shell/{id}/output?cursor=0&limit=4096"))
+            .send()
+            .await
+            .expect("output")
+            .json()
+            .await
+            .expect("json");
+        if page["data"]["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("first")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert!(page["data"]["output"].as_str().unwrap().contains("first"));
     assert!(page["data"]["size"].as_u64().unwrap() >= 6);
     assert_eq!(page["data"]["truncated"], false);
@@ -177,7 +190,7 @@ async fn lists_and_pages_a_live_session() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_sessions_answer_404() {
     let (base, _dir) = server().await;
     let client = reqwest::Client::new();
