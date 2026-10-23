@@ -25,13 +25,16 @@ use salvo::prelude::*;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use std::path::Path;
 use std::sync::Arc;
 
 use ox_db::Db;
 use ox_schema::event::SessionEventData;
 use ox_schema::id;
 use ox_schema::message::Message;
-use ox_schema::support::{ForkBoundary, LocationRef, ModelRef, Rule, SessionMetadata};
+use ox_schema::support::{
+    ForkBoundary, LocationRef, ModelRef, Rule, SessionMetadata, SkillAttachment,
+};
 
 use super::state;
 
@@ -69,6 +72,16 @@ pub(crate) fn invalid_request(res: &mut Response, message: &str) {
     res.render(Json(json!({
         "_tag": "InvalidRequestError",
         "message": message,
+    })));
+}
+
+/// 404 `SkillNotFoundError` (protocol/src/errors.ts, `httpApiStatus: 404`).
+fn skill_not_found(res: &mut Response, skill: &str) {
+    res.status_code(StatusCode::NOT_FOUND);
+    res.render(Json(json!({
+        "_tag": "SkillNotFoundError",
+        "skill": skill,
+        "message": format!("Skill not found: {skill}"),
     })));
 }
 
@@ -1772,6 +1785,59 @@ fn conflict_error(res: &mut Response, message: &str, resource: &str) {
     })));
 }
 
+/// Resolve prompt skill attachments against an already-discovered skill set
+/// (upstream `SessionPrompt.prepare`): ids become `{id, name, text}` with the
+/// `<skill_content>` envelope, the first occurrence of an id carries the body
+/// and later duplicates do not (upstream's de-dup), and an unknown id fails
+/// the whole request with `SkillNotFoundError`.
+///
+/// Lookup is by id only — a display name in the `id` slot is an unknown id —
+/// and touches no filesystem beyond a per-skill companion scan: discovery is
+/// the caller's, one scan per admission answers every id here.
+///
+/// The returned `Err` id becomes a 404 `SkillNotFoundError`, which therefore
+/// means either "no such skill" or "the skill exists but could not be read":
+/// discovery skips unreadable roots and files, so both fail closed alike.
+fn resolve_skills(
+    skills: &[ox_tools::skills::Skill],
+    requested: Option<Vec<SkillAttachment>>,
+) -> Result<Option<Vec<SkillAttachment>>, String> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    if requested.is_empty() {
+        return Ok(None);
+    }
+    // Resolved id -> display name, in first-occurrence order (upstream's
+    // `prepared` map): a repeat emits its name but never the body again.
+    let mut prepared: Vec<(String, String)> = Vec::with_capacity(requested.len());
+    let mut resolved: Vec<SkillAttachment> = Vec::with_capacity(requested.len());
+    for attachment in requested {
+        let id = attachment.id;
+        let mention = attachment.mention;
+        if let Some((_, name)) = prepared.iter().find(|(known, _)| *known == id) {
+            resolved.push(SkillAttachment {
+                id,
+                name: Some(name.clone()),
+                text: None,
+                mention,
+            });
+            continue;
+        }
+        let Some(skill) = ox_tools::skills::prepare_from(skills, &id) else {
+            return Err(id);
+        };
+        prepared.push((skill.id.clone(), skill.name.clone()));
+        resolved.push(SkillAttachment {
+            id: skill.id,
+            name: Some(skill.name),
+            text: Some(skill.text),
+            mention,
+        });
+    }
+    Ok(Some(resolved))
+}
+
 #[handler] // operation_id: session.prompt
 pub(crate) async fn prompt(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let Some(app) = state(depot, res) else {
@@ -1788,25 +1854,22 @@ pub(crate) async fn prompt(req: &mut Request, depot: &mut Depot, res: &mut Respo
         invalid_request(res, "Missing text");
         return;
     };
-    if !matches!(load_session(&app.db, &session_id).await, Ok(Some(_))) {
-        session_not_found(res, &session_id);
-        return;
-    }
-
+    let session = match load_session(&app.db, &session_id).await {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            session_not_found(res, &session_id);
+            return;
+        }
+        Err(error) => {
+            unknown_error(res, &error);
+            return;
+        }
+    };
     let message_id = body.id.clone().unwrap_or_else(|| id::id("msg"));
     let delivery = body.delivery.unwrap_or(ox_schema::inbox::Delivery::Steer);
-    let payload = ox_schema::inbox::UserPayload {
-        prompt: ox_schema::support::Prompt {
-            text,
-            files: body.files,
-            agents: body.agents,
-            skills: body.skills,
-        },
-        metadata: body.metadata,
-    };
     // Upstream `admission.reconcile`: re-prompting with the same id and
     // delivery is idempotent; a delivery mismatch is a prompt conflict.
-    match load_inbox_row(&app.db, &session_id, &message_id).await {
+    let payload = match load_inbox_row(&app.db, &session_id, &message_id).await {
         Ok(Some(existing)) => {
             if existing.delivery != delivery {
                 conflict_error(
@@ -1828,12 +1891,45 @@ pub(crate) async fn prompt(req: &mut Request, depot: &mut Depot, res: &mut Respo
             res.render(Json(json!({ "data": info })));
             return;
         }
-        Ok(None) => {}
+        // First admission only: skills resolve against the session's directory
+        // (upstream `SessionPrompt.prepare`, which runs after the inbox
+        // reconcile). A replay returns the payload stored back then — body
+        // included, even if the skill was renamed or deleted since — so every
+        // stored payload carries the resolved body while a replay scans
+        // nothing. Discovery happens once here and answers every requested id,
+        // and a prompt that requests no skill scans nothing at all.
+        Ok(None) => {
+            let discovered = if body
+                .skills
+                .as_ref()
+                .is_some_and(|skills| !skills.is_empty())
+            {
+                ox_tools::skills::discover(Path::new(&session.directory))
+            } else {
+                Vec::new()
+            };
+            let skills = match resolve_skills(&discovered, body.skills) {
+                Ok(skills) => skills,
+                Err(skill) => {
+                    skill_not_found(res, &skill);
+                    return;
+                }
+            };
+            ox_schema::inbox::UserPayload {
+                prompt: ox_schema::support::Prompt {
+                    text,
+                    files: body.files,
+                    agents: body.agents,
+                    skills,
+                },
+                metadata: body.metadata,
+            }
+        }
         Err(error) => {
             unknown_error(res, &error);
             return;
         }
-    }
+    };
 
     let item = ox_schema::inbox::Item::User {
         payload: payload.clone(),
@@ -3020,5 +3116,495 @@ mod transfer_tests {
             json!({ "type": "compaction", "id": "msg_1", "status": "failed", "summary": "s" });
         sanitize_message(&mut message);
         assert_eq!(message["summary"], "s");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prompt skill resolution — the pure decision half of `session.prompt`
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod skill_resolution_tests {
+    use super::*;
+    use ox_schema::support::{PromptMention, SkillAttachment};
+    use ox_tools::skills::Skill;
+    use std::path::PathBuf;
+
+    /// A discovered skill, built by hand: resolution is decided from the
+    /// discovery result alone, so these tests never touch a filesystem.
+    fn review() -> Skill {
+        Skill {
+            id: "review".to_owned(),
+            name: "Review".to_owned(),
+            description: Some("Review a diff".to_owned()),
+            path: PathBuf::from("/skills/review/SKILL.md"),
+            content: "Look at the diff.\n".to_owned(),
+        }
+    }
+
+    /// A second skill with a different body: resolution must answer each id
+    /// with its own text, never a neighbouring skill's.
+    fn notes() -> Skill {
+        Skill {
+            id: "notes".to_owned(),
+            name: "Notes".to_owned(),
+            description: None,
+            path: PathBuf::from("/skills/notes.md"),
+            content: "Write it down.\n".to_owned(),
+        }
+    }
+
+    /// A requested attachment that carries only an id, as a client sends it.
+    fn requested(id: &str) -> SkillAttachment {
+        SkillAttachment {
+            id: id.to_owned(),
+            name: None,
+            text: None,
+            mention: None,
+        }
+    }
+
+    #[test]
+    fn the_first_occurrence_carries_the_body_and_repeats_carry_only_the_name() {
+        let mention = PromptMention {
+            start: 0,
+            end: 3,
+            text: "/re".to_owned(),
+        };
+        let resolved = resolve_skills(
+            &[review()],
+            Some(vec![
+                SkillAttachment {
+                    mention: Some(mention.clone()),
+                    ..requested("review")
+                },
+                requested("review"),
+            ]),
+        )
+        .expect("resolvable")
+        .expect("a requested skill resolves to Some");
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].id, "review");
+        assert_eq!(resolved[0].name.as_deref(), Some("Review"));
+        let text = resolved[0].text.as_deref().expect("first carries the body");
+        assert!(
+            text.starts_with("<skill_content name=\"Review\">"),
+            "{text}"
+        );
+        assert_eq!(resolved[0].mention, Some(mention));
+
+        assert_eq!(resolved[1].id, "review");
+        assert_eq!(resolved[1].name.as_deref(), Some("Review"));
+        assert_eq!(
+            resolved[1].text, None,
+            "the body is injected exactly once: {resolved:?}"
+        );
+        assert_eq!(resolved[1].mention, None);
+    }
+
+    #[test]
+    fn each_id_resolves_to_its_own_body_in_requested_order() {
+        let skills = [review(), notes()];
+        // A client-supplied `name`/`text` is never trusted: resolution
+        // overwrites both with what discovery and the formatter produced.
+        let resolved = resolve_skills(
+            &skills,
+            Some(vec![
+                SkillAttachment {
+                    name: Some("Spoofed".to_owned()),
+                    text: Some("attacker-chosen body".to_owned()),
+                    ..requested("notes")
+                },
+                requested("review"),
+            ]),
+        )
+        .expect("both ids resolve")
+        .expect("a requested skill resolves to Some");
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].id, "notes", "order follows the request");
+        assert_eq!(resolved[0].name.as_deref(), Some("Notes"));
+        let notes = resolved[0].text.as_deref().expect("first carries its body");
+        assert!(
+            notes.starts_with("<skill_content name=\"Notes\">"),
+            "{notes}"
+        );
+        assert!(notes.contains("Write it down."), "{notes}");
+        assert!(
+            !notes.contains("attacker-chosen body"),
+            "the client text is overwritten: {notes}"
+        );
+
+        assert_eq!(resolved[1].id, "review");
+        assert_eq!(resolved[1].name.as_deref(), Some("Review"));
+        let review = resolved[1]
+            .text
+            .as_deref()
+            .expect("each id gets its own body");
+        assert!(
+            review.starts_with("<skill_content name=\"Review\">"),
+            "{review}"
+        );
+        assert!(review.contains("Look at the diff."), "{review}");
+        assert!(!review.contains("Write it down."), "{review}");
+    }
+
+    #[test]
+    fn an_unknown_or_blank_id_fails_the_whole_request() {
+        let skills = [review()];
+        // Lookup is by id only — a display name in the id slot is unknown.
+        assert_eq!(
+            resolve_skills(&skills, Some(vec![requested("nope")])).unwrap_err(),
+            "nope"
+        );
+        assert_eq!(
+            resolve_skills(&skills, Some(vec![requested("Review")])).unwrap_err(),
+            "Review"
+        );
+        // A blank id is an unknown id, never a fallback.
+        assert_eq!(
+            resolve_skills(&skills, Some(vec![requested("")])).unwrap_err(),
+            ""
+        );
+        // Nothing requested is not an error.
+        assert_eq!(resolve_skills(&skills, None).unwrap(), None);
+        assert_eq!(resolve_skills(&skills, Some(Vec::new())).unwrap(), None);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Prompt skill attachments — `session.prompt` resolves ids at admission
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod skill_prompt_tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::task::JoinHandle;
+
+    /// Boots the real router on an ephemeral port, so admission is exercised
+    /// over HTTP exactly as a client sees it. The project directory is seeded
+    /// with a directory skill (`review`) and a file skill (`notes`); project
+    /// roots are scanned before the global `~/.ox/skills` ones, so a host
+    /// skill with the same id can never shadow these.
+    struct Harness {
+        addr: SocketAddr,
+        db: Db,
+        project: PathBuf,
+        _root: tempfile::TempDir,
+        server: JoinHandle<()>,
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    impl Harness {
+        async fn spawn() -> Self {
+            let root = tempfile::tempdir().expect("tempdir");
+            let project = root.path().join("project");
+            let review = project.join(".ox/skills/review");
+            std::fs::create_dir_all(review.join("scripts")).expect("skill dir");
+            std::fs::write(
+                review.join("SKILL.md"),
+                "---\nname: Review\ndescription: Review a diff\n---\nLook at the diff.\n",
+            )
+            .expect("skill file");
+            std::fs::write(review.join("scripts/b.sh"), "echo\n").expect("companion");
+            std::fs::write(project.join(".ox/skills/notes.md"), "Plain notes.\n")
+                .expect("file skill");
+
+            let config = crate::config::Config {
+                db_path: root.path().join("ox.db"),
+                ..crate::config::Config::default()
+            };
+            let state = crate::build_state(config).await.expect("build state");
+            let db = state.db.clone();
+            let router = crate::build_router(state);
+            let listener = TcpListener::new("127.0.0.1:0").bind().await;
+            let addr = listener.local_addr().expect("bound address");
+            let server = tokio::spawn(async move {
+                Server::new(listener).serve(router).await;
+            });
+            Self {
+                addr,
+                db,
+                project,
+                _root: root,
+                server,
+            }
+        }
+
+        /// One POST, read to EOF. Written by hand (HTTP/1.1, `Connection:
+        /// close`) so the test adds no HTTP client dependency; the body is the
+        /// first JSON value in the response text, which tolerates the chunked
+        /// framing hyper may use.
+        async fn post(&self, path: &str, body: &Value) -> (u16, Value) {
+            let body = body.to_string();
+            let request = format!(
+                "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                self.addr,
+                body.len()
+            );
+            let mut stream = tokio::net::TcpStream::connect(self.addr)
+                .await
+                .expect("connect");
+            stream
+                .write_all(request.as_bytes())
+                .await
+                .expect("write request");
+            let mut raw = Vec::new();
+            stream.read_to_end(&mut raw).await.expect("read response");
+            let text = String::from_utf8(raw).expect("utf-8 response");
+            let status: u16 = text
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .and_then(|code| code.parse().ok())
+                .expect("status line");
+            let start = text.find('{').expect("json body");
+            let body = serde_json::Deserializer::from_str(&text[start..])
+                .into_iter::<Value>()
+                .next()
+                .and_then(Result::ok)
+                .expect("json value");
+            (status, body)
+        }
+
+        /// A session whose directory is the seeded project.
+        async fn create_session(&self) -> String {
+            let (status, body) = self
+                .post(
+                    "/api/session",
+                    &json!({ "location": { "directory": self.project } }),
+                )
+                .await;
+            assert_eq!(status, 200, "session.create: {body}");
+            body["data"]["id"]
+                .as_str()
+                .expect("created session id")
+                .to_owned()
+        }
+
+        async fn prompt(&self, session_id: &str, body: Value) -> (u16, Value) {
+            self.post(&format!("/api/session/{session_id}/prompt"), &body)
+                .await
+        }
+
+        /// `session_inbox` rows for the session — a rejected prompt must not
+        /// leave one behind.
+        async fn inbox_count(&self, session_id: &str) -> i64 {
+            let conn = self.db.acquire().await.expect("acquire");
+            let mut stmt = conn
+                .prepare("SELECT count(*) FROM session_inbox WHERE session_id = ?1")
+                .await
+                .expect("prepare");
+            let mut rows = stmt.query([session_id]).await.expect("query");
+            let row = rows.next().await.expect("next").expect("count row");
+            row.get::<i64>(0).expect("count")
+        }
+    }
+
+    /// The resolved attachments of a `session.prompt` response (the payload
+    /// flattens `Prompt`, so `skills` sits directly under `payload`).
+    fn skills_of(body: &Value) -> &Vec<Value> {
+        body["data"]["payload"]["skills"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no resolved skills in {body}"))
+    }
+
+    #[tokio::test]
+    async fn a_prompt_resolves_the_skill_body_into_the_payload() {
+        let harness = Harness::spawn().await;
+        let session = harness.create_session().await;
+        let (status, body) = harness
+            .prompt(
+                &session,
+                json!({ "text": "go", "skills": [{ "id": "review" }], "resume": false }),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+
+        let skill = &skills_of(&body)[0];
+        assert_eq!(skill["name"], "Review");
+        let text = skill["text"].as_str().expect("resolved body");
+        let directory = harness.project.join(".ox/skills/review");
+        assert!(text.contains("<skill_content name=\"Review\">"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "Base directory for this skill: {}",
+                directory.display()
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "<file>{}</file>",
+                directory.join("scripts/b.sh").display()
+            )),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_skill_id_is_a_404_skill_not_found() {
+        let harness = Harness::spawn().await;
+        let session = harness.create_session().await;
+        let (status, body) = harness
+            .prompt(
+                &session,
+                json!({ "text": "go", "skills": [{ "id": "nope" }], "resume": false }),
+            )
+            .await;
+        assert_eq!(status, 404, "{body}");
+        assert_eq!(body["_tag"], "SkillNotFoundError");
+        assert_eq!(body["skill"], "nope");
+        assert_eq!(
+            harness.inbox_count(&session).await,
+            0,
+            "a rejected prompt must not be enqueued"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_display_name_is_not_an_id() {
+        let harness = Harness::spawn().await;
+        let session = harness.create_session().await;
+        // A blank id is an unknown id — never a fallback to `name`.
+        let (status, body) = harness
+            .prompt(
+                &session,
+                json!({
+                    "text": "go",
+                    "skills": [{ "id": "", "name": "Review" }],
+                    "resume": false,
+                }),
+            )
+            .await;
+        assert_eq!(status, 404, "{body}");
+        assert_eq!(body["_tag"], "SkillNotFoundError");
+        assert_eq!(body["skill"], "");
+        // A display name in the id slot is not an id either.
+        let (status, body) = harness
+            .prompt(
+                &session,
+                json!({ "text": "go", "skills": [{ "id": "Review" }], "resume": false }),
+            )
+            .await;
+        assert_eq!(status, 404, "{body}");
+        assert_eq!(body["_tag"], "SkillNotFoundError");
+        assert_eq!(body["skill"], "Review");
+        assert_eq!(
+            harness.inbox_count(&session).await,
+            0,
+            "a rejected prompt must not be enqueued"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_skill_resolves_without_companions() {
+        let harness = Harness::spawn().await;
+        let session = harness.create_session().await;
+        let (status, body) = harness
+            .prompt(
+                &session,
+                json!({ "text": "go", "skills": [{ "id": "notes" }], "resume": false }),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+
+        let skill = &skills_of(&body)[0];
+        // No frontmatter `name`, so the id is the display name.
+        assert_eq!(skill["name"], "notes");
+        let text = skill["text"].as_str().expect("resolved body");
+        assert!(text.contains("<skill_files>\n</skill_files>"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "Base directory for this skill: {}",
+                harness.project.join(".ox/skills").display()
+            )),
+            "{text}"
+        );
+        // A file skill never lists siblings (upstream gates on `SKILL.md`).
+        assert!(!text.contains("<file>"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_repeated_id_carries_the_body_once() {
+        let harness = Harness::spawn().await;
+        let session = harness.create_session().await;
+        let (status, body) = harness
+            .prompt(
+                &session,
+                json!({
+                    "text": "go",
+                    "skills": [{ "id": "review" }, { "id": "review" }],
+                    "resume": false,
+                }),
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+
+        let skills = skills_of(&body);
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0]["name"], "Review");
+        assert!(
+            skills[0]["text"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty()),
+            "{}",
+            skills[0]
+        );
+        assert_eq!(skills[1]["name"], "Review");
+        assert!(
+            skills[1].get("text").is_none(),
+            "the body is injected once: {}",
+            skills[1]
+        );
+    }
+
+    /// I1 (upstream `admission.reconcile` before `SessionPrompt.prepare`): a
+    /// replay is served from the stored inbox row, never re-resolved, so it
+    /// still succeeds after the skill disappears.
+    #[tokio::test]
+    async fn a_replay_returns_the_stored_payload_after_the_skill_is_gone() {
+        let harness = Harness::spawn().await;
+        let session = harness.create_session().await;
+        let body = json!({
+            "id": "msg_replay",
+            "text": "go",
+            "skills": [{ "id": "review" }],
+            "resume": false,
+        });
+        let (status, first) = harness.prompt(&session, body.clone()).await;
+        assert_eq!(status, 200, "{first}");
+
+        std::fs::remove_dir_all(harness.project.join(".ox/skills/review")).expect("delete skill");
+
+        let (status, replay) = harness.prompt(&session, body).await;
+        assert_eq!(status, 200, "a replay must not re-resolve: {replay}");
+        assert_eq!(skills_of(&replay), skills_of(&first));
+        assert_eq!(harness.inbox_count(&session).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_prompt_without_skills_still_omits_them() {
+        let harness = Harness::spawn().await;
+        let session = harness.create_session().await;
+        let (status, body) = harness
+            .prompt(&session, json!({ "text": "go", "resume": false }))
+            .await;
+        assert_eq!(status, 200, "{body}");
+        let prompt_data = &body["data"]["payload"];
+        assert!(
+            prompt_data.get("skills").is_none(),
+            "an absent skills list must stay absent: {prompt_data}"
+        );
     }
 }

@@ -381,6 +381,14 @@ pub fn object_param(properties: Vec<(&str, Value)>, required: &[&str]) -> Value 
     Value::Object(object)
 }
 
+/// Serializes every test in this crate that reads or writes a process-global
+/// environment variable (`skills` redirects `HOME`; the `shell` tool keeps its
+/// own lock for `SHELL`). Cargo runs one test binary's tests on parallel
+/// threads, so env access has to be serialized across the whole binary — a
+/// module-local lock does not see the other module's readers.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;

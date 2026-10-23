@@ -1382,7 +1382,7 @@ pub(crate) fn build_chat_messages(
     for message in messages.iter().skip(boundary) {
         match message {
             Message::User { prompt, .. } => {
-                let content = user_prompt_text(prompt);
+                let content = user_message_content(prompt);
                 if content.is_empty() {
                     // Upstream: a user message with no assembled content is
                     // omitted from the transcript.
@@ -1631,6 +1631,10 @@ fn tool_result_message(id: &str, state: &ToolState) -> Option<(ChatMessage, Vec<
 /// A user prompt's wire text: the typed text plus attachment markers.
 /// (Upstream `SessionPrompt.prepare` inlines resolved file content; 6a
 /// stores attachments verbatim and marks them instead.)
+///
+/// This is the history/summary rendering: [`build_chat_messages`] uses
+/// [`user_message_content`] instead, because resolved skill bodies go on the
+/// wire but must stay out of the historian's serialised `message.text`.
 pub(crate) fn user_prompt_text(prompt: &Prompt) -> String {
     let mut text = prompt.text.clone();
     if let Some(files) = &prompt.files {
@@ -1640,6 +1644,32 @@ pub(crate) fn user_prompt_text(prompt: &Prompt) -> String {
         }
     }
     text
+}
+
+/// The wire text of a user message: resolved skill bodies first, then the typed
+/// text and attachment markers — upstream `toLLMMessage`'s user content order
+/// (skills → text → files). Upstream emits one text part per skill, the typed
+/// text and each attachment, and its OpenAI-Chat lowering concatenates those
+/// parts with an empty separator
+/// (`packages/ai/src/protocols/openai-chat.ts:436-438`,
+/// `content.map((part) => part.text).join("")`), so ox concatenates too rather
+/// than inserting separators: byte parity, and a skill body's closing
+/// `</skill_content>` (`Skill.toModelOutput`) abuts the typed text exactly as
+/// it does upstream. A skill whose `text` is missing (unresolved or legacy
+/// payload) contributes nothing.
+pub(crate) fn user_message_content(prompt: &Prompt) -> String {
+    let mut parts: Vec<&str> = prompt
+        .skills
+        .iter()
+        .flatten()
+        .filter_map(|skill| skill.text.as_deref())
+        .filter(|text| !text.is_empty())
+        .collect();
+    let text = user_prompt_text(prompt);
+    if !text.is_empty() {
+        parts.push(&text);
+    }
+    parts.concat()
 }
 
 /// The session transcript in `seq` order, decoded from `session_message`.
@@ -1796,7 +1826,7 @@ mod tests {
         AssistantContent, AssistantMessage, AssistantTime, CompactionReason, Message, ShellTime,
         TimeCreated, ToolTime,
     };
-    use ox_schema::support::{ModelRef, Prompt};
+    use ox_schema::support::{ModelRef, Prompt, SkillAttachment};
 
     /// A display-only notice must not become an empty user turn.
     #[test]
@@ -2381,5 +2411,100 @@ mod tests {
             .collect();
         assert!(!rendered.contains(&"before"));
         assert!(rendered.iter().any(|c| c.contains("after")));
+    }
+
+    fn prompt_with_skills(text: &str, skills: Option<Vec<SkillAttachment>>) -> Prompt {
+        Prompt {
+            text: text.to_owned(),
+            files: None,
+            agents: None,
+            skills,
+        }
+    }
+
+    fn skill(id: &str, text: Option<&str>) -> SkillAttachment {
+        SkillAttachment {
+            id: id.to_owned(),
+            name: None,
+            text: text.map(str::to_owned),
+            mention: None,
+        }
+    }
+
+    // Upstream `toLLMMessage` puts each resolved skill body before the typed
+    // text in the user content array, and the OpenAI-Chat lowering joins those
+    // text parts with an empty separator (`join("")`). So `</skill_content>`
+    // abutting `Fix the bug` with no blank line is intentional byte parity with
+    // upstream, not a missing separator.
+    #[test]
+    fn skill_text_precedes_the_typed_text() {
+        let body = "<skill_content name=\"Review\">\nbody\n</skill_content>";
+        let prompt = prompt_with_skills("Fix the bug", Some(vec![skill("review", Some(body))]));
+        assert_eq!(
+            user_message_content(&prompt),
+            format!("{body}Fix the bug"),
+            "the closing </skill_content> intentionally abuts the typed text: \
+             upstream concatenates user text parts with an empty separator"
+        );
+    }
+
+    #[test]
+    fn multiple_skills_keep_their_array_order() {
+        let prompt = prompt_with_skills(
+            "Fix the bug",
+            Some(vec![
+                skill("review", Some("first body")),
+                skill("test", Some("second body")),
+            ]),
+        );
+        assert_eq!(
+            user_message_content(&prompt),
+            "first bodysecond bodyFix the bug"
+        );
+    }
+
+    #[test]
+    fn a_prompt_without_skills_is_byte_identical() {
+        let bare = prompt_with_skills("Fix the bug", None);
+        let unresolved = prompt_with_skills("Fix the bug", Some(vec![skill("review", None)]));
+        assert_eq!(user_message_content(&bare), user_prompt_text(&bare));
+        assert_eq!(
+            user_message_content(&unresolved),
+            user_prompt_text(&unresolved)
+        );
+    }
+
+    #[test]
+    fn a_skill_only_prompt_has_no_leading_separator() {
+        let prompt = prompt_with_skills("", Some(vec![skill("review", Some("body"))]));
+        assert_eq!(user_message_content(&prompt), "body");
+    }
+
+    // The historian/compaction path serialises `message.text`, so it must keep
+    // rendering only the typed text and file markers.
+    #[test]
+    fn history_text_still_excludes_skill_bodies() {
+        let prompt = prompt_with_skills("Fix the bug", Some(vec![skill("review", Some("body"))]));
+        assert_eq!(user_prompt_text(&prompt), "Fix the bug");
+    }
+
+    #[test]
+    fn build_chat_messages_renders_the_skill_body_first() {
+        let body = "<skill_content name=\"Review\">\nbody\n</skill_content>";
+        let messages = vec![Message::User {
+            id: "msg_u1".to_owned(),
+            metadata: None,
+            time: TimeCreated { created: 1 },
+            prompt: prompt_with_skills("Fix the bug", Some(vec![skill("review", Some(body))])),
+        }];
+        let built = build_chat_messages("S", "", &[], &messages);
+        let content = built
+            .iter()
+            .find_map(|m| match m {
+                ChatMessage::User { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .expect("the user turn is rendered");
+        assert_eq!(content, format!("{body}Fix the bug"));
     }
 }
