@@ -31,6 +31,15 @@ const CANCELLED_SENTINEL: &str = "(subagent cancelled by user interrupt)";
 /// with an error instead of hanging or saturating below a higher limit.
 const MAX_DEPTH_WALK: usize = 32;
 
+/// Context prepended to a fresh child's first prompt: who it is and the two
+/// facts that keep a delegation from hanging or losing its result. The
+/// `question` line covers models that still see the tool in a parent-shaped
+/// transcript; the transcript line is the child's output contract (only the
+/// final assistant text is folded back into the parent).
+const SPAWN_PREFIX: &str = "You are a subagent spawned by another session.\n\
+     Do not call the question tool; the user cannot see forms from a subagent.\n\
+     Your final message is the only thing the parent session receives; make it self-contained.\n";
+
 /// The engine capabilities a child session needs. Implemented by the
 /// runner; the tool only ever sees this trait, which is what breaks the
 /// tool → engine dependency without a process-global slot.
@@ -285,11 +294,11 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
     // an HTTP prompt uses.
     let message_id = ox_schema::id::id("msg");
     // A resumed conversation already carries the spawn context; only NEW
-    // children get the fresh-context notice.
+    // children get the fresh-context notice plus the output contract.
     let text = if resumed {
         prompt
     } else {
-        format!("You are a subagent spawned by another session.\n{prompt}")
+        format!("{SPAWN_PREFIX}{prompt}")
     };
     let payload = ox_schema::inbox::UserPayload {
         prompt: ox_schema::support::Prompt {
@@ -665,6 +674,7 @@ fn preview(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::SPAWN_PREFIX;
     use ox_schema::event::SessionEventData;
     use ox_schema::support::LocationRef;
 
@@ -696,6 +706,23 @@ mod tests {
             error: None,
             retry: None,
         }))
+    }
+
+    #[test]
+    fn spawn_prefix_states_the_output_contract() {
+        assert!(SPAWN_PREFIX.starts_with("You are a subagent spawned by another session.\n"));
+        assert!(
+            SPAWN_PREFIX.contains(
+                "Do not call the question tool; the user cannot see forms from a subagent."
+            )
+        );
+        assert!(SPAWN_PREFIX.contains(
+            "Your final message is the only thing the parent session receives; make it self-contained."
+        ));
+        // Three lines, then the caller's prompt on its own line: the prefix is
+        // bounded on purpose (no upstream 97-line prompt port).
+        assert_eq!(SPAWN_PREFIX.lines().count(), 3, "{SPAWN_PREFIX:?}");
+        assert!(SPAWN_PREFIX.ends_with('\n'));
     }
 
     fn idle(outcome: ox_schema::message::IdleOutcome) -> ox_schema::message::Message {

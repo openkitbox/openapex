@@ -136,6 +136,22 @@ impl ToolRegistry {
         self.tools.remove(name).is_some()
     }
 
+    /// A copy of this registry without the named tools, sharing the remaining
+    /// tool `Arc`s. Spawn-time only (a child session drops tools it cannot
+    /// use); the map is rebuilt once per actor, never on a hot path.
+    pub fn without(&self, names: &[&str]) -> Self {
+        let tools = self
+            .tools
+            .iter()
+            .filter(|(name, _)| !names.contains(&name.as_str()))
+            .map(|(name, tool)| (name.clone(), Arc::clone(tool)))
+            .collect();
+        Self {
+            tools,
+            subagent_handle: self.subagent_handle.clone(),
+        }
+    }
+
     /// Bulk-register pre-built tools. Names must be unique; a duplicate is a
     /// programming error caught by debug builds (built-ins have fixed names).
     pub fn register_all(&mut self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) {
@@ -219,6 +235,30 @@ mod tests {
             }
         }
         assert_eq!(Silent.guidance(), None);
+    }
+
+    #[test]
+    fn without_drops_the_named_tools_and_shares_the_rest() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(Stub {
+                name: "zero",
+                guidance: Some("zero line"),
+            }))
+            .unwrap();
+        registry
+            .register(Arc::new(Stub {
+                name: "question",
+                guidance: Some("question line"),
+            }))
+            .unwrap();
+        let child = registry.without(&["question"]);
+        assert!(child.get("zero").is_some());
+        assert!(child.get("question").is_none());
+        let names: Vec<&str> = child.guidances().map(|(name, _)| name).collect();
+        assert_eq!(names, vec!["zero"]);
+        // `without` borrows: the source registry keeps every tool.
+        assert!(registry.get("question").is_some());
     }
 
     #[test]

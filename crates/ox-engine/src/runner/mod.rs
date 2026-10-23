@@ -73,6 +73,12 @@ pub enum ActorMsg {
 /// small bounded queue is ample; a full mailbox means a runaway client.
 const MAILBOX_CAPACITY: usize = 64;
 
+/// Tools a subagent session must not have. `question` opens a form only the
+/// user can answer; no UI watches a child session and a foreground tool call
+/// has no timeout, so the child would wait forever — and the parent's
+/// `subagent` call with it. A fail-closed exclusion, not a permission model.
+const SUBAGENT_EXCLUDED_TOOLS: &[&str] = &["question"];
+
 // ---------------------------------------------------------------------------
 // Runner registry
 // ---------------------------------------------------------------------------
@@ -413,6 +419,10 @@ impl ActorTask {
         let Some(mut rx) = self.rx.take() else {
             return;
         };
+        // Resolve the toolset once per actor task: a session's parent link
+        // never changes, so the child registry (no `question`) is built at
+        // most once per spawn, not per step.
+        let tools = self.session_tools().await;
         loop {
             // Absorb the backlog; the first Enqueue opens a busy period.
             let mut token: Option<CancellationToken> = None;
@@ -477,7 +487,7 @@ impl ActorTask {
                 db: self.inner.db.clone(),
                 bus: self.inner.bus.clone(),
                 chat: self.inner.chat.clone(),
-                tools: self.inner.tools.clone(),
+                tools: Arc::clone(&tools),
                 model_catalog: Arc::clone(&self.inner.model_catalog),
                 mcp: self.inner.mcp.clone(),
                 instruction_baselines: self.inner.instruction_baselines.clone(),
@@ -568,6 +578,55 @@ impl ActorTask {
         // would otherwise live (and grow) with every session the process
         // ever saw. A later dispatch simply re-baselines from the sources.
         lock(&self.inner.instruction_baselines).remove(&self.session_id);
+    }
+
+    /// The registry this session's turns advertise and dispatch against: the
+    /// shared one, minus [`SUBAGENT_EXCLUDED_TOOLS`] for a child session.
+    /// A form opened by a child has no UI behind it, and ox has no foreground
+    /// tool timeout, so `question` there would wait forever and hang the
+    /// parent's `subagent` call with it. Resolved once per actor task.
+    async fn session_tools(&self) -> Arc<ToolRegistry> {
+        if self.session_is_subagent().await {
+            Arc::new(self.inner.tools.without(SUBAGENT_EXCLUDED_TOOLS))
+        } else {
+            Arc::clone(&self.inner.tools)
+        }
+    }
+
+    /// Whether this session is a subagent (its `parent_id` is set). A missing
+    /// row or a failed lookup answers `true`: fail closed, an unanswered form
+    /// is worse than a missing tool for one turn.
+    async fn session_is_subagent(&self) -> bool {
+        let looked_up: anyhow::Result<Option<Option<String>>> = async {
+            let conn = self.inner.db.acquire().await?;
+            let mut stmt = conn
+                .prepare("SELECT parent_id FROM session_v2 WHERE id = ?1")
+                .await?;
+            let row = ox_db::optional(&mut stmt, [self.session_id.as_str()]).await?;
+            match row {
+                Some(row) => Ok(Some(row.get::<Option<String>>(0)?)),
+                None => Ok(None),
+            }
+        }
+        .await;
+        match looked_up {
+            Ok(Some(parent_id)) => parent_id.is_some(),
+            Ok(None) => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    "session row missing; running without the question tool"
+                );
+                true
+            }
+            Err(error) => {
+                tracing::warn!(
+                    session = %self.session_id,
+                    error = %error,
+                    "session parent lookup failed; running without the question tool"
+                );
+                true
+            }
+        }
     }
 
     /// The session's project directory: the `directory` recorded on the

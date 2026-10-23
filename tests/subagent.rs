@@ -27,13 +27,68 @@ use serde_json::json;
 struct GatedChat {
     scripts: Mutex<std::collections::VecDeque<Vec<ox::cardinal::stream::StreamEvent>>>,
     gate: tokio::sync::watch::Receiver<bool>,
+    /// One row per completion issued, so the test can assert what the child
+    /// session's request carried (tools + the registry-driven static layer)
+    /// without reaching into the engine.
+    recorded: Mutex<Vec<Recorded>>,
+}
+
+/// The facts a request carries that distinguish a child turn from a parent
+/// one: the spawn prefix in the user text, the advertised tool names, and
+/// whether the static layer advertises the `question` guidance.
+#[derive(Default)]
+struct Recorded {
+    subagent_prompt: bool,
+    /// The two output-contract lines the spawn prefix must carry.
+    spawn_contract: bool,
+    tools: Vec<String>,
+    question_guidance: bool,
+}
+
+impl Recorded {
+    fn of(request: &ox::cardinal::wire::ChatRequest) -> Self {
+        let mut recorded = Self::default();
+        for message in &request.messages {
+            match message {
+                ox::cardinal::wire::ChatMessage::System { content } => {
+                    if content.contains("Use the question tool for preferences") {
+                        recorded.question_guidance = true;
+                    }
+                }
+                ox::cardinal::wire::ChatMessage::User { content } => {
+                    let text = content.as_str();
+                    if text.contains("You are a subagent spawned by another session.") {
+                        recorded.subagent_prompt = true;
+                    }
+                    if text.contains(
+                        "Do not call the question tool; the user cannot see forms from a subagent.",
+                    ) && text.contains(
+                        "Your final message is the only thing the parent session receives; make it self-contained.",
+                    ) {
+                        recorded.spawn_contract = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        recorded.tools = request
+            .tools
+            .iter()
+            .map(|tool| tool.function.name.clone())
+            .collect();
+        recorded
+    }
 }
 
 impl ox::runner::Chat for GatedChat {
     fn stream_chat<'a>(
         &'a self,
-        _request: &'a ox::cardinal::wire::ChatRequest,
+        request: &'a ox::cardinal::wire::ChatRequest,
     ) -> ox::cardinal::chat::ChatFuture<'a> {
+        self.recorded
+            .lock()
+            .expect("recorded")
+            .push(Recorded::of(request));
         Box::pin(async move {
             let mut gate = self.gate.clone();
             if !*gate.borrow_and_update() {
@@ -97,7 +152,7 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
     };
     let db = ox::db::Db::open(&config.db_path).await.unwrap();
     let bus = ox::event_bus::EventBus::new(db.clone());
-    let mut tools = ToolRegistry::new();
+    let mut tools = ToolRegistry::with_builtins();
     tools.register_subagent(db.clone(), bus.clone(), 1);
     // The gate starts OPEN: every scenario before the background ones runs
     // exactly as it did against ScriptedChat.
@@ -107,6 +162,7 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
             "Child report: done.",
         )])),
         gate: gate_rx,
+        recorded: Mutex::new(Vec::new()),
     });
     // The runner must exist so the tool can dispatch the child, and it must
     // see the SAME registry: `Runner::new` attaches itself to the subagent
@@ -165,6 +221,43 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
     let metadata = output.metadata.expect("metadata");
     let child_id = metadata["sessionID"].as_str().expect("child id");
     assert_eq!(metadata["status"], "completed");
+
+    // --- a child session must not inherit `question` (R6) -----------------
+    // No form UI watches a subagent, and a foreground tool call has no
+    // timeout, so a child `question` would hang the parent's delegation until
+    // the user interrupts. The child's request must therefore carry neither
+    // the tool nor its guidance line (the static layer is registry-driven).
+    {
+        let recorded = chat.recorded.lock().expect("recorded");
+        let child = recorded
+            .iter()
+            .find(|row| row.subagent_prompt)
+            .expect("the child turn was issued");
+        assert!(
+            !child.tools.iter().any(|name| name == "question"),
+            "child tools still advertise question: {:?}",
+            child.tools
+        );
+        assert!(
+            !child.question_guidance,
+            "child system layer still carries the question guidance"
+        );
+        assert!(
+            child.spawn_contract,
+            "the child prompt is missing the output-contract lines"
+        );
+        // Everything else survives: the exclusion is exactly one tool.
+        assert!(
+            child.tools.iter().any(|name| name == "shell"),
+            "{:?}",
+            child.tools
+        );
+        assert!(
+            child.tools.iter().any(|name| name == "subagent"),
+            "{:?}",
+            child.tools
+        );
+    }
 
     // The child session row exists with parent_id = parent.
     let conn = db.acquire().await.unwrap();
