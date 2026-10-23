@@ -14,6 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 ox-client.workspace = true
 ox-schema.workspace = true
+libc.workspace = true
 ratatui = { workspace = true, features = ["crossterm"] }
 crossterm = { workspace = true, features = ["bracketed-paste"] }
 tui-textarea = { workspace = true, features = ["crossterm"] }

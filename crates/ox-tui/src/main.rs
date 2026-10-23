@@ -24,6 +24,10 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| std::env::current_dir().unwrap().display().to_string());
     let session = arg("--session");
 
+    // The terminal's own colours, read once before the input thread starts: the
+    // OSC replies arrive on the same stream as the keystrokes.
+    ox_tui::theme::init(ox_tui::theme::terminal::query());
+
     // 事件线程：阻塞 read 放独立线程。
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let terminal_tx = event_tx.clone();

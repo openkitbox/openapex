@@ -7,11 +7,39 @@ use std::sync::OnceLock;
 
 use ratatui::style::{Color, Modifier, Style};
 
+pub mod system;
+pub mod terminal;
+
+use terminal::{Rgb, TerminalColors};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Deck {
     Truecolor,
     Ansi16,
     NoColor,
+}
+
+impl Deck {
+    /// How much colour the terminal can take. `NO_COLOR` wins over everything;
+    /// truecolor is claimed only when `COLORTERM` says so (the conservative
+    /// reading — a terminal that supports 256 colours but not RGB lands on
+    /// `Ansi16`, which the system theme expresses with named hues only).
+    pub fn from_env() -> Self {
+        let no_color = std::env::var_os("NO_COLOR")
+            .map(|value| !value.is_empty())
+            .unwrap_or(false);
+        let truecolor = matches!(
+            std::env::var("COLORTERM").as_deref(),
+            Ok("truecolor") | Ok("24bit")
+        );
+        if no_color {
+            Self::NoColor
+        } else if truecolor {
+            Self::Truecolor
+        } else {
+            Self::Ansi16
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,19 +129,58 @@ impl Palette {
     }
 
     pub fn from_env() -> Self {
-        let no_color = std::env::var_os("NO_COLOR")
-            .map(|value| !value.is_empty())
-            .unwrap_or(false);
-        let truecolor = matches!(
-            std::env::var("COLORTERM").as_deref(),
-            Ok("truecolor") | Ok("24bit")
-        );
-        Self::for_deck(if no_color {
-            Deck::NoColor
-        } else if truecolor {
-            Deck::Truecolor
-        } else {
-            Deck::Ansi16
+        Self::for_deck(Deck::from_env())
+    }
+
+    /// opencode's `system` theme: the terminal's own palette, with the surfaces
+    /// derived from its reported background. `None` when there is nothing to
+    /// derive from (no probe, or `NO_COLOR` wins), so the caller keeps the
+    /// static palette above.
+    pub fn system(colors: &TerminalColors, deck: Deck) -> Option<Self> {
+        if deck == Deck::NoColor {
+            return None;
+        }
+        let system = system::System::derive(colors)?;
+        let accent = Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        let warn = Style::default().fg(Color::Red);
+
+        if deck != Deck::Truecolor {
+            // The derived ramp cannot be said in 16 colours, so the panel and
+            // menu stay transparent and the chrome falls back to the two grays
+            // the ANSI palette actually has.
+            return Some(Self {
+                text: Style::default(),
+                dim: Style::default().fg(Color::DarkGray),
+                accent,
+                warn,
+                highlight: Style::default().fg(Color::Black).bg(Color::Cyan),
+                panel: Style::default(),
+                panel_border: Style::default().fg(Color::Gray),
+                agent: Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+                menu: Style::default(),
+                menu_border: Style::default().fg(Color::DarkGray),
+                menu_selected: Style::default().fg(Color::Black).bg(Color::Cyan),
+            });
+        }
+
+        let background = rgb(system.background);
+        let panel = rgb(system.grays[2]);
+        Some(Self {
+            text: Style::default(),
+            dim: Style::default().fg(rgb(system.muted)),
+            accent,
+            warn,
+            highlight: Style::default().fg(background).bg(Color::Cyan),
+            panel: Style::default().bg(panel),
+            panel_border: Style::default().fg(rgb(system.grays[8])).bg(panel),
+            agent: Style::default().fg(Color::Magenta).bg(panel),
+            menu: Style::default().bg(rgb(system.grays[3])),
+            menu_border: Style::default().fg(rgb(system.grays[7])),
+            menu_selected: Style::default().fg(background).bg(Color::Cyan),
         })
     }
 
@@ -124,18 +191,36 @@ impl Palette {
     }
 }
 
+static PALETTE: OnceLock<Palette> = OnceLock::new();
+
 /// Read once: the environment does not change under a running session and a
 /// per-frame `env` lookup on every span would be waste.
 pub fn palette() -> &'static Palette {
-    static PALETTE: OnceLock<Palette> = OnceLock::new();
     PALETTE.get_or_init(Palette::from_env)
+}
+
+/// Install the palette once, at startup, when the terminal probe has run.
+///
+/// Without a probe result (piped output, a terminal that ignores OSC) this is
+/// the same static palette `palette()` would have built lazily.
+pub fn init(colors: Option<TerminalColors>) {
+    let deck = Deck::from_env();
+    let palette = colors
+        .as_ref()
+        .and_then(|colors| Palette::system(colors, deck))
+        .unwrap_or_else(|| Palette::for_deck(deck));
+    let _ = PALETTE.set(palette);
+}
+
+fn rgb(color: Rgb) -> Color {
+    Color::Rgb(color.r, color.g, color.b)
 }
 
 #[cfg(test)]
 mod tests {
     use ratatui::style::{Color, Modifier};
 
-    use super::{Deck, Palette};
+    use super::{Deck, Palette, terminal};
 
     #[test]
     fn no_color_degrades_to_modifiers() {
@@ -180,5 +265,52 @@ mod tests {
         let p = Palette::for_deck(Deck::NoColor);
         assert_eq!(p.panel.bg, None, "no colour may leak through NO_COLOR");
         assert!(p.agent.add_modifier.contains(Modifier::BOLD));
+    }
+
+    fn probed(background: terminal::Rgb) -> terminal::TerminalColors {
+        terminal::TerminalColors {
+            background: Some(background),
+            ..terminal::TerminalColors::default()
+        }
+    }
+
+    #[test]
+    fn system_theme_takes_hues_by_name_and_derives_the_surfaces() {
+        let colors = probed(terminal::Rgb::new(16, 16, 16));
+        let p = Palette::system(&colors, Deck::Truecolor).expect("background was reported");
+        // Body text stays the terminal default; the hues are the terminal's own
+        // ANSI slots, not RGB guesses.
+        assert_eq!(p.text, ratatui::style::Style::default());
+        assert_eq!(p.accent.fg, Some(Color::Cyan));
+        assert_eq!(p.warn.fg, Some(Color::Red));
+        assert_eq!(p.agent.fg, Some(Color::Magenta));
+        // Surfaces come from the derived ramp: panel grays[2], menu grays[3],
+        // borders grays[8]/grays[7], muted text.
+        assert_eq!(p.panel.bg, Some(Color::Rgb(31, 31, 31)));
+        assert_eq!(p.menu.bg, Some(Color::Rgb(39, 39, 39)));
+        assert_eq!(p.panel_border.fg, Some(Color::Rgb(79, 79, 79)));
+        assert_eq!(p.menu_border.fg, Some(Color::Rgb(71, 71, 71)));
+        assert_eq!(p.dim.fg, Some(Color::Rgb(164, 164, 164)));
+        // Selection paints the terminal background over the accent.
+        assert_eq!(p.menu_selected.bg, Some(Color::Cyan));
+        assert_eq!(p.menu_selected.fg, Some(Color::Rgb(16, 16, 16)));
+        assert_eq!(p.highlight.fg, Some(Color::Rgb(16, 16, 16)));
+    }
+
+    #[test]
+    fn system_theme_without_truecolor_drops_the_derived_surfaces() {
+        let colors = probed(terminal::Rgb::new(16, 16, 16));
+        let p = Palette::system(&colors, Deck::Ansi16).expect("background was reported");
+        assert_eq!(p.accent.fg, Some(Color::Cyan));
+        assert_eq!(p.panel.bg, None, "no RGB surface on a 16-colour deck");
+        assert_eq!(p.menu.bg, None);
+        assert_eq!(p.dim.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn system_theme_yields_to_no_color_and_to_a_failed_probe() {
+        let colors = probed(terminal::Rgb::new(16, 16, 16));
+        assert!(Palette::system(&colors, Deck::NoColor).is_none());
+        assert!(Palette::system(&terminal::TerminalColors::default(), Deck::Truecolor).is_none());
     }
 }
