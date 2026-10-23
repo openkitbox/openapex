@@ -47,6 +47,13 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
         model_catalog: Arc::clone(&inner.model_catalog),
         mcp: Arc::clone(&inner.mcp),
         instruction_baselines: Arc::clone(&inner.instruction_baselines),
+        // The session handle's cached git-toplevel anchor (the same slot the
+        // busy period's steps use); no live registry entry keeps a fresh,
+        // unused cache.
+        instruction_root: match inner.sessions.get(session_id) {
+            Some(handle) => handle.instruction_root.clone(),
+            None => super::InstructionRootCache::default(),
+        },
     };
 
     let budget = crate::mctx::budget_for(&ctx.config, &ctx.model_catalog, &model.id);
@@ -57,9 +64,14 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
         super::step::load_history_after(&ctx.db, &ctx.session_id, floor).await?
     };
 
+    // Directory and root must share one namespace: the chain's
+    // component-wise prefix check degenerates to leaf-only when the
+    // directory still carries symlink components the canonical root lost.
+    let (directory, project_root) = ctx.instruction_root.get_or_compute(&ctx.directory);
     let observed = crate::prompt::gather(
-        &ctx.directory,
+        &directory,
         &ctx.home,
+        project_root.as_deref(),
         ctx.mcp.instructions_block().as_deref(),
     );
     let names: Vec<String> = ctx

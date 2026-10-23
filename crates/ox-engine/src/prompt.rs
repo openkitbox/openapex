@@ -128,9 +128,14 @@ pub(crate) struct Observed {
 
 /// Gather this step's sources in upstream combine order
 /// (`session/context.ts:155`): MCP, skills, AGENTS.md, date, environment.
+///
+/// `project_root` bounds the AGENTS.md ancestor walk (global, then the
+/// session directory nearest → farthest up to the root); `None` degenerates
+/// to the leaf directory alone.
 pub(crate) fn gather(
     directory: &Path,
     home: &Path,
+    project_root: Option<&Path>,
     mcp_instructions: Option<&str>,
 ) -> Vec<Observed> {
     let skills: Vec<SkillSummary> = ox_tools::skills::discover(directory)
@@ -141,7 +146,7 @@ pub(crate) fn gather(
             description: s.description.clone(),
         })
         .collect();
-    let agents = observed_instructions(directory, home);
+    let agents = observed_instructions(directory, home, project_root);
     vec![
         Observed {
             key: KEY_MCP,
@@ -179,15 +184,72 @@ pub(crate) fn gather(
     ]
 }
 
+/// Hard cap on the ancestor chain. Documented deviation from upstream:
+/// upstream `instruction.ts` has no limit, but ox derives the project root
+/// itself, so a stray `git init` in `/` or `$HOME` must not turn one session
+/// into a walk of the whole filesystem. Over the cap the chain fails closed
+/// to the leaf directory.
+const MAX_INSTRUCTION_ANCESTORS: usize = 16;
+
+/// Directories whose `AGENTS.md` contribute to `core/instructions`, nearest
+/// first. `None` (no repo anchor) degenerates to the leaf directory, which is
+/// today's behaviour. A `project_root` that is not an ancestor, or a chain
+/// deeper than `MAX_INSTRUCTION_ANCESTORS`, also degenerates to the leaf:
+/// a partial chain would inject half the rules into a frozen baseline with no
+/// way for the author to notice (fail-closed).
+///
+/// Every entry is a prefix slice of `directory` — zero path allocation. The
+/// caller canonicalizes; this function is pure path math.
+fn instruction_directories<'a>(directory: &'a Path, project_root: Option<&Path>) -> Vec<&'a Path> {
+    let Some(root) = project_root else {
+        return vec![directory];
+    };
+    if directory == root {
+        return vec![directory];
+    }
+    if !directory.starts_with(root) {
+        return vec![directory];
+    }
+    let mut chain: Vec<&'a Path> = Vec::new();
+    for ancestor in directory.ancestors() {
+        chain.push(ancestor);
+        if ancestor == root {
+            return chain;
+        }
+        if chain.len() == MAX_INSTRUCTION_ANCESTORS {
+            return vec![directory];
+        }
+    }
+    // `starts_with` guarantees `root` is on the chain, so this is unreachable
+    // for component-normalized paths; fail closed rather than return a partial
+    // chain.
+    vec![directory]
+}
+
 /// The `core/instructions` file list: the global `<home>/AGENTS.md` first,
-/// then the project's `<directory>/AGENTS.md`, deduped by path. A missing
-/// file is normal; any other read failure makes the whole source
-/// `Unavailable` (the model keeps what it already has), and an empty list is
-/// `Removed`.
-fn observed_instructions(directory: &Path, home: &Path) -> ObservedValue {
+/// then the session directory's ancestor chain (`instruction_directories`,
+/// nearest → farthest), deduped by path string keeping the first
+/// occurrence. A missing file is normal; any other read failure makes the
+/// whole source `Unavailable` (the model keeps what it already has), and an
+/// empty list is `Removed`.
+///
+/// This function reads files but never canonicalizes: the paths it is given
+/// must already be canonical (the anchor resolution does that) or equal
+/// strings will not dedupe.
+fn observed_instructions(
+    directory: &Path,
+    home: &Path,
+    project_root: Option<&Path>,
+) -> ObservedValue {
+    let mut candidates = vec![home.join("AGENTS.md")];
+    candidates.extend(
+        instruction_directories(directory, project_root)
+            .into_iter()
+            .map(|dir| dir.join("AGENTS.md")),
+    );
     let mut files = Vec::new();
     let mut unavailable = false;
-    for path in [home.join("AGENTS.md"), directory.join("AGENTS.md")] {
+    for path in candidates {
         match std::fs::read_to_string(&path) {
             Ok(content) => {
                 let path = path.display().to_string();
@@ -557,6 +619,7 @@ mod tests {
             let observed = gather(
                 dir,
                 home.path(),
+                None,
                 Some("<mcp_instructions>\n</mcp_instructions>"),
             );
             let keys: Vec<&str> = observed.iter().map(|s| s.key).collect();
@@ -588,7 +651,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join("AGENTS.md"), "global rule\n").unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "project rule\n").unwrap();
-        let observed = gather(dir.path(), home.path(), None);
+        let observed = gather(dir.path(), home.path(), None, None);
         let Some(ObservedValue::Present(SourceValue::Files { files })) = observed
             .iter()
             .find(|s| s.key == KEY_INSTRUCTIONS)
@@ -611,7 +674,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "only rule\n").unwrap();
         // home == directory：同一文件只出现一次
-        let observed = gather(dir.path(), dir.path(), None);
+        let observed = gather(dir.path(), dir.path(), None, None);
         let Some(ObservedValue::Present(SourceValue::Files { files })) = observed
             .iter()
             .find(|s| s.key == KEY_INSTRUCTIONS)
@@ -620,6 +683,68 @@ mod tests {
             panic!("present");
         };
         assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn instruction_directories_walks_leaf_to_project_root() {
+        let directory = Path::new("/root/a/b");
+        let root = Path::new("/root");
+        let chain = instruction_directories(directory, Some(root));
+        assert_eq!(
+            chain,
+            vec![Path::new("/root/a/b"), Path::new("/root/a"), root]
+        );
+    }
+
+    #[test]
+    fn instruction_directories_of_the_project_root_is_the_root_alone() {
+        let directory = Path::new("/root/a/b");
+        let chain = instruction_directories(directory, Some(directory));
+        assert_eq!(chain, vec![directory]);
+    }
+
+    #[test]
+    fn instruction_directories_with_a_non_ancestor_root_reads_the_leaf_only() {
+        let directory = Path::new("/x/y");
+        let chain = instruction_directories(directory, Some(Path::new("/tmp/other")));
+        assert_eq!(chain, vec![directory]);
+    }
+
+    #[test]
+    fn instruction_directories_caps_the_chain_at_sixteen_levels() {
+        // `levels` path components below the root: the chain is `levels + 1`.
+        let nested = |levels: usize| {
+            let mut path = String::from("/root");
+            for level in 0..levels {
+                path.push_str(&format!("/l{level}"));
+            }
+            path
+        };
+        let root = Path::new("/root");
+
+        let at_cap = nested(15);
+        let chain = instruction_directories(Path::new(&at_cap), Some(root));
+        assert_eq!(chain.len(), 16);
+        assert_eq!(chain.first(), Some(&Path::new(at_cap.as_str())));
+        assert_eq!(chain.last(), Some(&root));
+
+        let over_cap = nested(24);
+        assert_eq!(
+            instruction_directories(Path::new(&over_cap), Some(root)),
+            vec![Path::new(over_cap.as_str())]
+        );
+    }
+
+    #[test]
+    fn instruction_directories_are_borrowed_prefixes_in_ancestor_order() {
+        // 15 components below the root: exactly `MAX_INSTRUCTION_ANCESTORS`.
+        let directory = Path::new("/root/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o");
+        let chain = instruction_directories(directory, Some(Path::new("/root")));
+        // Equal to the input's own ancestor chain: no intermediate path is
+        // constructed, the entries are slices of `directory`.
+        let expected: Vec<&Path> = directory.ancestors().take(16).collect();
+        assert_eq!(chain, expected);
+        assert!(chain.iter().all(|entry| directory.starts_with(entry)));
     }
 
     #[test]
@@ -682,7 +807,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("AGENTS.md"), "project rule\n").unwrap();
         std::fs::create_dir(home.path().join("AGENTS.md")).unwrap(); // 目录 → IsADirectory
-        let observed = gather(dir.path(), home.path(), None);
+        let observed = gather(dir.path(), home.path(), None, None);
         let source = observed.iter().find(|s| s.key == KEY_INSTRUCTIONS).unwrap();
         assert!(matches!(source.value, ObservedValue::Unavailable));
     }
@@ -692,7 +817,7 @@ mod tests {
         with_isolated_home(|dir| {
             std::fs::write(dir.join("AGENTS.md"), "rule one\n").unwrap();
             let home = tempfile::tempdir().unwrap();
-            let observed = gather(dir, home.path(), None);
+            let observed = gather(dir, home.path(), None, None);
             let render = render_initial(&observed);
             let date_pos = render.find("Today's date: ").unwrap();
             let env_pos = render
@@ -820,11 +945,11 @@ mod tests {
         // A directory where the file should be: read_to_string fails with
         // IsADirectory, which is not NotFound.
         std::fs::create_dir(dir.path().join("AGENTS.md")).unwrap();
-        let observed = gather(dir.path(), home.path(), None);
+        let observed = gather(dir.path(), home.path(), None, None);
         assert!(matches!(observed[2].value, ObservedValue::Unavailable));
         // Truly absent → Removed.
         std::fs::remove_dir(dir.path().join("AGENTS.md")).unwrap();
-        let observed = gather(dir.path(), home.path(), None);
+        let observed = gather(dir.path(), home.path(), None, None);
         assert!(matches!(observed[2].value, ObservedValue::Removed));
     }
 
@@ -832,9 +957,149 @@ mod tests {
     fn render_initial_skips_non_present_sources() {
         let dir = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let observed = gather(dir.path(), home.path(), None); // no AGENTS.md / skills / mcp
+        let observed = gather(dir.path(), home.path(), None, None); // no AGENTS.md / skills / mcp
         let render = render_initial(&observed);
         assert!(!render.contains("Instructions from:"));
         assert!(render.contains("Today's date: "));
+    }
+
+    /// Paths of the `core/instructions` file list, in injection order.
+    fn instruction_files(observed: &[Observed]) -> Vec<String> {
+        let Some(ObservedValue::Present(SourceValue::Files { files })) = observed
+            .iter()
+            .find(|s| s.key == KEY_INSTRUCTIONS)
+            .map(|s| &s.value)
+        else {
+            panic!("instructions source must be present");
+        };
+        files.iter().map(|f| f.path.clone()).collect()
+    }
+
+    /// `root/a/b` under a tempdir, each with a distinct AGENTS.md.
+    fn nested_dirs(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let a = root.join("a");
+        let b = a.join("b");
+        std::fs::create_dir_all(&b).unwrap();
+        (a, b)
+    }
+
+    #[test]
+    fn gather_walks_the_full_ancestor_chain_global_first() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (a, b) = nested_dirs(root.path());
+        std::fs::write(home.path().join("AGENTS.md"), "global\n").unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "root rule\n").unwrap();
+        std::fs::write(a.join("AGENTS.md"), "middle rule\n").unwrap();
+        std::fs::write(b.join("AGENTS.md"), "leaf rule\n").unwrap();
+        let observed = gather(&b, home.path(), Some(root.path()), None);
+        let expected: Vec<String> = [
+            home.path().join("AGENTS.md"),
+            b.join("AGENTS.md"),
+            a.join("AGENTS.md"),
+            root.path().join("AGENTS.md"),
+        ]
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+        assert_eq!(instruction_files(&observed), expected);
+    }
+
+    #[test]
+    fn gather_skips_a_missing_middle_layer_without_reordering() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (_a, b) = nested_dirs(root.path());
+        std::fs::write(home.path().join("AGENTS.md"), "global\n").unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "root rule\n").unwrap();
+        std::fs::write(b.join("AGENTS.md"), "leaf rule\n").unwrap();
+        // `a` has no AGENTS.md: the gap is skipped, order is preserved.
+        let observed = gather(&b, home.path(), Some(root.path()), None);
+        let expected: Vec<String> = [
+            home.path().join("AGENTS.md"),
+            b.join("AGENTS.md"),
+            root.path().join("AGENTS.md"),
+        ]
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+        assert_eq!(instruction_files(&observed), expected);
+    }
+
+    #[test]
+    fn an_unreadable_ancestor_makes_the_whole_source_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let (a, b) = nested_dirs(root.path());
+        std::fs::write(b.join("AGENTS.md"), "leaf rule\n").unwrap();
+        let ancestor = a.join("AGENTS.md");
+        std::fs::write(&ancestor, "middle rule\n").unwrap();
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads through any file mode; skip rather than flake.
+        if std::fs::read_to_string(&ancestor).is_ok() {
+            std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
+        let observed = gather(&b, home.path(), Some(root.path()), None);
+        std::fs::set_permissions(&ancestor, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let source = observed.iter().find(|s| s.key == KEY_INSTRUCTIONS).unwrap();
+        assert!(matches!(source.value, ObservedValue::Unavailable));
+    }
+
+    #[test]
+    fn a_none_project_root_keeps_the_leaf_only_shape() {
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let b = root.path().join("deep").join("b");
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(home.path().join("AGENTS.md"), "global\n").unwrap();
+        std::fs::write(b.join("AGENTS.md"), "leaf rule\n").unwrap();
+        // D5 invariant: `None` is byte-identical to today's two-file shape.
+        let observed = gather(&b, home.path(), None, None);
+        let expected: Vec<String> = [home.path().join("AGENTS.md"), b.join("AGENTS.md")]
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        assert_eq!(instruction_files(&observed), expected);
+    }
+
+    #[test]
+    fn the_global_file_dedupes_against_the_ancestor_chain() {
+        // home == project root: the farthest chain entry repeats the global
+        // file, and the first occurrence wins.
+        let root = tempfile::tempdir().unwrap();
+        let (a, b) = nested_dirs(root.path());
+        std::fs::write(root.path().join("AGENTS.md"), "global and root\n").unwrap();
+        std::fs::write(a.join("AGENTS.md"), "middle rule\n").unwrap();
+        std::fs::write(b.join("AGENTS.md"), "leaf rule\n").unwrap();
+        let observed = gather(&b, root.path(), Some(root.path()), None);
+        let expected: Vec<String> = [
+            root.path().join("AGENTS.md"),
+            b.join("AGENTS.md"),
+            a.join("AGENTS.md"),
+        ]
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+        assert_eq!(instruction_files(&observed), expected);
+    }
+
+    #[test]
+    fn a_non_ancestor_project_root_reads_the_leaf_only() {
+        let home = tempfile::tempdir().unwrap();
+        let unrelated = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let b = dir.path().join("b");
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(home.path().join("AGENTS.md"), "global\n").unwrap();
+        std::fs::write(unrelated.path().join("AGENTS.md"), "elsewhere\n").unwrap();
+        std::fs::write(b.join("AGENTS.md"), "leaf rule\n").unwrap();
+        let observed = gather(&b, home.path(), Some(unrelated.path()), None);
+        let expected: Vec<String> = [home.path().join("AGENTS.md"), b.join("AGENTS.md")]
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
+        assert_eq!(instruction_files(&observed), expected);
     }
 }

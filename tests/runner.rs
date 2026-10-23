@@ -3440,6 +3440,136 @@ async fn global_instructions_render_before_project_instructions() {
 }
 
 // ---------------------------------------------------------------------------
+// AGENTS.md ancestors (git-anchored instruction discovery)
+// ---------------------------------------------------------------------------
+
+/// Isolated `git init`: the config-neutralizing environment rides the git
+/// child only — the test process's environment is never touched (same shape
+/// as the engine's `repo_toplevel` unit tests).
+fn git_init(directory: &std::path::Path) {
+    let status = std::process::Command::new("git")
+        .arg("init")
+        .current_dir(directory)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .status()
+        .expect("git must exist");
+    assert!(status.success(), "git init failed");
+}
+
+/// A real git repository holding distinct `AGENTS.md` files at the root and
+/// in `sub/`. Returns the tempdir (the caller keeps it alive across the
+/// turns) and the canonicalized `sub` path — the session directory.
+fn git_repo_with_nested_agents() -> (TempDir, String) {
+    let repo = tempfile::tempdir().expect("repo dir");
+    git_init(repo.path());
+    std::fs::write(repo.path().join("AGENTS.md"), "ROOT-RULE-MARKER\n").expect("root agents");
+    std::fs::create_dir_all(repo.path().join("sub")).expect("sub dir");
+    std::fs::write(
+        repo.path().join("sub").join("AGENTS.md"),
+        "SUB-RULE-MARKER\n",
+    )
+    .expect("sub agents");
+    let sub = repo
+        .path()
+        .join("sub")
+        .canonicalize()
+        .expect("canonical sub dir");
+    (repo, sub.display().to_string())
+}
+
+/// Over the real request path, a session rooted in `sub/` of a git repository
+/// carries both its own `AGENTS.md` and the repo root's — nearest first — in
+/// the frozen `core/instructions` layer (the harness home is isolated and
+/// holds no global file, so nothing else rides along). Rewriting the root
+/// file then fires one keyed delta on the next step: it rides the request
+/// between the head and the current prompt, lands as a durable
+/// `Instructions updated: core/instructions` row, and leaves the frozen head
+/// byte-stable (cache stability: changes ride the tail, never rewrite it).
+#[tokio::test]
+async fn ancestor_agents_md_reaches_the_model_and_deltas_on_change() {
+    let (repo, sub) = git_repo_with_nested_agents();
+    let harness = Harness::spawn(vec![MockChat::text("one"), MockChat::text("two")]).await;
+    let session_id = harness.create_session_in(&sub).await;
+
+    // Turn 1: both ancestors ride the frozen instruction layer, nearest
+    // first, and the baseline freezes with no delta row.
+    prompt_turn(&harness, &session_id, &sub, "first", 1).await;
+    let requests = harness.chat.requests();
+    assert_eq!(requests.len(), 1, "one model call for the turn");
+    let first = &requests[0].messages;
+    let layer = match &first[1] {
+        ChatMessage::System { content } => content.clone(),
+        other => panic!("system[1] is the instruction layer: {other:?}"),
+    };
+    let sub_rule = layer
+        .find("SUB-RULE-MARKER")
+        .expect("the sub rule rides the layer");
+    let root_rule = layer
+        .find("ROOT-RULE-MARKER")
+        .expect("the repo root rule reaches the model");
+    assert!(
+        sub_rule < root_rule,
+        "ancestors render nearest first: {layer}"
+    );
+    let rows = system_rows(&harness.db, &session_id).await;
+    assert!(
+        rows.is_empty(),
+        "the first turn freezes the baseline: {rows:?}"
+    );
+    let prefix = prefix_of(first);
+
+    // Turn 2, after the repo-root file changes: the new rule rides the
+    // request tail, the frozen head keeps its bytes (the old root rule stays
+    // there by design — the delta carries the change), and one durable row
+    // records the update.
+    std::fs::write(repo.path().join("AGENTS.md"), "ROTATED-ROOT-MARKER\n").expect("edit");
+    prompt_turn(&harness, &session_id, &sub, "second", 2).await;
+    let requests = harness.chat.requests();
+    assert_eq!(requests.len(), 2, "one model call per turn");
+    let second = &requests[1].messages;
+    assert!(
+        !matches!(&second[1], ChatMessage::System { content } if content.contains("ROTATED-ROOT-MARKER")),
+        "the frozen baseline is not rewritten in place: {:?}",
+        second[1]
+    );
+    assert_eq!(
+        prefix_of(second),
+        prefix,
+        "the head is stable across the edit"
+    );
+    let last_user = second
+        .iter()
+        .rposition(|m| matches!(m, ChatMessage::User { .. }))
+        .expect("the current prompt");
+    let delta = second
+        .iter()
+        .position(|m| match m {
+            ChatMessage::System { content } => content.contains("ROTATED-ROOT-MARKER"),
+            _ => false,
+        })
+        .expect("the delta rides the request");
+    assert!(
+        delta > 1 && delta < last_user,
+        "the delta sits between the head and the current prompt: {second:?}"
+    );
+    let rows = system_rows(&harness.db, &session_id).await;
+    assert_eq!(rows.len(), 1, "one durable delta row: {rows:?}");
+    assert_eq!(
+        rows[0]["description"],
+        json!("Instructions updated: core/instructions")
+    );
+    assert!(
+        rows[0]["text"]
+            .as_str()
+            .expect("text")
+            .contains("ROTATED-ROOT-MARKER"),
+        "the row carries the new content: {}",
+        rows[0]["text"]
+    );
+}
+
+// ---------------------------------------------------------------------------
 // session.generate (`/btw`'s server dependency)
 // ---------------------------------------------------------------------------
 

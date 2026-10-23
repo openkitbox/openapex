@@ -110,6 +110,9 @@ pub(crate) struct DrainCtx {
     pub instruction_baselines: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, super::instructions::Baseline>>,
     >,
+    /// The session's cached git-toplevel anchor, cloned from the session
+    /// handle so step and generate share the same per-directory slot.
+    pub instruction_root: super::InstructionRootCache,
 }
 
 /// Run drains until the inbox is quiet, a control interrupts, or a turn
@@ -798,6 +801,7 @@ mod tests {
                 )),
                 mcp: Arc::new(ox_mcp::Hub::empty()),
                 instruction_baselines: Default::default(),
+                instruction_root: Default::default(),
             }
         }
     }

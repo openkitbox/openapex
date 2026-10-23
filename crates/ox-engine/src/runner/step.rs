@@ -215,9 +215,14 @@ pub(crate) async fn run(
         } else {
             load_history_after(&ctx.db, &ctx.session_id, floor).await?
         };
+        // Directory and root must share one namespace: the chain's
+        // component-wise prefix check degenerates to leaf-only when the
+        // directory still carries symlink components the canonical root lost.
+        let (directory, project_root) = ctx.instruction_root.get_or_compute(&ctx.directory);
         let observed = prompt::gather(
-            &ctx.directory,
+            &directory,
             &ctx.home,
+            project_root.as_deref(),
             ctx.mcp.instructions_block().as_deref(),
         );
         let instruction_update = sync_instructions(ctx, &observed, &rows).await;

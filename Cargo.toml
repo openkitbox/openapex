@@ -32,6 +32,7 @@ dashmap = "6.2.1"
 dirs = "7.0.0"
 futures-core = "0.3"
 futures-util = "0.3"
+git2 = { version = "0.21", default-features = false }
 globset = "0.4.16"
 grep-regex = "0.1.14"
 grep-searcher = "0.1.17"

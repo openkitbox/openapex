@@ -8,6 +8,7 @@ anyhow.workspace = true
 cortexkit-cache-core.workspace = true
 dashmap.workspace = true
 futures-core.workspace = true
+git2.workspace = true
 ox-cbm.workspace = true
 ox-core.workspace = true
 ox-db.workspace = true

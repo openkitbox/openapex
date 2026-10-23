@@ -37,7 +37,7 @@ pub(crate) mod todo_reminder;
 /// Reset the todo reminder budget after the todo tool mutates a list. Kept as a
 /// thin wrapper here so the tool does not depend on the reminder module's
 /// internals; failures never surface (a stalled budget is a lost reminder, not
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Result, bail};
@@ -121,6 +121,73 @@ struct SessionHandle {
     /// cancellation token — covers the gap between enqueue and the actor's
     /// first poll so `is_active` never reports idle for scheduled work.
     scheduled: Arc<Mutex<bool>>,
+    /// The session's instruction anchor: the git working-tree root of the
+    /// session's directory, computed at most once per distinct directory
+    /// (a `/cd` invalidates it by keying on the directory itself).
+    instruction_root: InstructionRootCache,
+}
+
+/// The working-tree root of the repository containing `directory`, or `None`
+/// outside a repository (or for a bare repository). Synchronous, in-process
+/// (libgit2): deliberately ignores `GIT_DIR`/`GIT_CEILING_DIRECTORIES` — the
+/// anchor is the physical tree of the session's directory, never the
+/// environment. This mirrors `git rev-parse --show-toplevel`, whose CLI form
+/// is intentionally not used here: the engine must not inherit the git-CLI
+/// contract (flags, PATH, quoting) that the server's porcelain layer needs.
+fn repo_toplevel(directory: &Path) -> Option<PathBuf> {
+    let repo = git2::Repository::discover(directory).ok()?;
+    repo.workdir().map(Path::to_path_buf)
+}
+
+/// One cache slot: the directory the anchor was computed for and the root
+/// found there (`None` = not a repository — cached so non-repo sessions
+/// don't rediscover on every step).
+struct RootCacheEntry {
+    directory: PathBuf,
+    root: Option<PathBuf>,
+}
+
+/// Per-session instruction anchor cache. A single slot keyed on the
+/// directory, so a `/cd` to a new directory recomputes and going back
+/// recomputes again; clones (session handle ↔ busy period's `DrainCtx`)
+/// share the one slot. Locks are held only around reads and writes —
+/// never across discovery.
+#[derive(Clone, Default)]
+pub(crate) struct InstructionRootCache(Arc<Mutex<Option<RootCacheEntry>>>);
+
+impl InstructionRootCache {
+    /// The git working-tree root for `directory` together with the
+    /// canonicalized directory the anchor was computed for. Callers must use
+    /// the returned directory as the gather directory: directory and root
+    /// share one namespace only in their canonical spelling.
+    pub(crate) fn get_or_compute(&self, directory: &Path) -> (PathBuf, Option<PathBuf>) {
+        self.get_or_compute_with(directory, repo_toplevel)
+    }
+
+    /// [`Self::get_or_compute`] with the discovery injected, so tests run
+    /// without a repository. The returned directory (the cache key) and the
+    /// root are both canonicalized (falling back to the raw path when
+    /// canonicalization fails), so the pair stays consistent even when the
+    /// input path carries symlink components.
+    fn get_or_compute_with(
+        &self,
+        directory: &Path,
+        compute: impl FnOnce(&Path) -> Option<PathBuf>,
+    ) -> (PathBuf, Option<PathBuf>) {
+        let key = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
+        if let Some(entry) = lock(&self.0)
+            .as_ref()
+            .filter(|entry| entry.directory == key)
+        {
+            return (entry.directory.clone(), entry.root.clone());
+        }
+        let root = compute(directory).map(|root| std::fs::canonicalize(&root).unwrap_or(root));
+        *lock(&self.0) = Some(RootCacheEntry {
+            directory: key.clone(),
+            root: root.clone(),
+        });
+        (key, root)
+    }
 }
 
 /// Lock a std mutex, recovering from poisoning (a panic in one actor must
@@ -304,6 +371,7 @@ impl Runner {
                     parked: Arc::new(tokio::sync::Mutex::new(Some(rx))),
                     cancel: Arc::new(Mutex::new(None)),
                     scheduled: Arc::new(Mutex::new(false)),
+                    instruction_root: InstructionRootCache::default(),
                 }
             })
             .clone()
@@ -413,6 +481,7 @@ impl ActorTask {
                 model_catalog: Arc::clone(&self.inner.model_catalog),
                 mcp: self.inner.mcp.clone(),
                 instruction_baselines: self.inner.instruction_baselines.clone(),
+                instruction_root: self.handle.instruction_root.clone(),
             };
             let mut scope = drain::Promotable::Input;
             loop {
@@ -795,5 +864,188 @@ mod registration_tests {
                 ),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod instruction_root_tests {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::{InstructionRootCache, repo_toplevel};
+
+    /// Isolated `git init` (no user/system config bleeds into the repo).
+    fn git_init(directory: &Path, bare: bool) {
+        let mut command = std::process::Command::new("git");
+        command.arg("init");
+        if bare {
+            command.arg("--bare");
+        }
+        let status = command
+            .current_dir(directory)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .status()
+            .expect("git must exist");
+        assert!(status.success(), "git init failed");
+    }
+
+    /// T11: inside a fresh repository the anchor is the canonicalized tempdir
+    /// (git resolves symlinks — macOS `/var` is `/private/var`).
+    #[test]
+    fn repo_toplevel_resolves_the_repository_root() {
+        let dir = tempfile::tempdir().unwrap();
+        git_init(dir.path(), false);
+
+        let root = repo_toplevel(dir.path());
+        let expected = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(root.as_deref(), Some(expected.as_path()));
+    }
+
+    /// T11: a bare repository has no working tree, matching
+    /// `git rev-parse --show-toplevel` failing there.
+    #[test]
+    fn repo_toplevel_is_none_for_a_bare_repository() {
+        let dir = tempfile::tempdir().unwrap();
+        git_init(dir.path(), true);
+
+        assert_eq!(repo_toplevel(dir.path()), None);
+    }
+
+    /// T11: a directory outside any repository has no anchor.
+    #[test]
+    fn repo_toplevel_is_none_outside_a_repository() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert_eq!(repo_toplevel(dir.path()), None);
+    }
+
+    /// T12: the same directory computes at most once — the second call is a
+    /// cache hit (exactly one injected compute).
+    #[test]
+    fn instruction_root_cache_computes_once_per_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let cache = InstructionRootCache::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let compute = {
+            let calls = Arc::clone(&calls);
+            let root = root.clone();
+            move |_: &Path| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Some(root.clone())
+            }
+        };
+
+        let (first_dir, first_root) = cache.get_or_compute_with(dir.path(), compute.clone());
+        let (second_dir, second_root) = cache.get_or_compute_with(dir.path(), compute.clone());
+
+        assert_eq!(first_dir, root);
+        assert_eq!(first_root.as_deref(), Some(root.as_path()));
+        assert_eq!((second_dir, second_root), (first_dir, first_root));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// A missing anchor (not a repository) is cached too: `/tmp` sessions must
+    /// not re-run discovery on every step.
+    #[test]
+    fn instruction_root_cache_caches_a_missing_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = InstructionRootCache::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let compute = {
+            let calls = Arc::clone(&calls);
+            move |_: &Path| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                None::<PathBuf>
+            }
+        };
+
+        let (first_dir, first_root) = cache.get_or_compute_with(dir.path(), compute.clone());
+        let (_second_dir, second_root) = cache.get_or_compute_with(dir.path(), compute.clone());
+
+        assert_eq!(first_root, None);
+        assert_eq!(second_root, None);
+        // The canonical directory is handed back even without an anchor.
+        assert_eq!(first_dir, std::fs::canonicalize(dir.path()).unwrap());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// T13: a different directory is a miss (the `/cd` invalidation) — the
+    /// single-slot cache recomputes for the new key.
+    #[test]
+    fn instruction_root_cache_recomputes_when_the_directory_changes() {
+        let first_dir = tempfile::tempdir().unwrap();
+        let second_dir = tempfile::tempdir().unwrap();
+        let cache = InstructionRootCache::default();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let compute = {
+            let calls = Arc::clone(&calls);
+            move |directory: &Path| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Some(directory.to_path_buf())
+            }
+        };
+
+        let (first_dir_anchor, first_root) =
+            cache.get_or_compute_with(first_dir.path(), compute.clone());
+        let (second_dir_anchor, second_root) =
+            cache.get_or_compute_with(second_dir.path(), compute.clone());
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_ne!(
+            (first_dir_anchor, first_root),
+            (second_dir_anchor, second_root),
+            "a different directory is a miss"
+        );
+    }
+
+    /// T14: the returned pair shares one namespace. A session reached through
+    /// a symlink gets the canonical directory handed back beside the canonical
+    /// root, so the chain's component-wise prefix check holds and gather walks
+    /// the full ancestor chain — the raw symlinked path used to degenerate to
+    /// leaf-only and miss the root's AGENTS.md despite a found anchor.
+    #[cfg(unix)]
+    #[test]
+    fn instruction_root_pair_shares_one_namespace_with_the_chain() {
+        let repo = tempfile::tempdir().unwrap();
+        git_init(repo.path(), false);
+        let sub = repo.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("AGENTS.md"), "sub rule\n").unwrap();
+        std::fs::write(repo.path().join("AGENTS.md"), "repo rule\n").unwrap();
+
+        let outside = tempfile::tempdir().unwrap();
+        let link = outside.path().join("link");
+        if std::os::unix::fs::symlink(&sub, &link).is_err() {
+            return; // environment denies symlinks: nothing to pin here
+        }
+
+        let cache = InstructionRootCache::default();
+        let (directory, root) = cache.get_or_compute(&link);
+
+        let canonical_sub = std::fs::canonicalize(&sub).unwrap();
+        let canonical_repo = std::fs::canonicalize(repo.path()).unwrap();
+        assert_eq!(directory, canonical_sub);
+        assert_eq!(root.as_deref(), Some(canonical_repo.as_path()));
+        // The component-wise prefix check the chain relies on now holds for
+        // the handed-out directory…
+        assert!(directory.starts_with(root.as_deref().unwrap()));
+        // …so the gather chain is [sub, repo]: the repo AGENTS.md is
+        // injected after the leaf's, nearest first.
+        let home = tempfile::tempdir().unwrap();
+        let observed = crate::prompt::gather(&directory, home.path(), root.as_deref(), None);
+        let Some(crate::prompt::ObservedValue::Present(crate::prompt::SourceValue::Files {
+            files,
+        })) = observed
+            .iter()
+            .find(|source| source.key == crate::prompt::KEY_INSTRUCTIONS)
+            .map(|source| &source.value)
+        else {
+            panic!("the instructions source must be present");
+        };
+        let rules: Vec<&str> = files.iter().map(|file| file.content.as_str()).collect();
+        assert_eq!(rules, vec!["sub rule", "repo rule"]);
     }
 }
