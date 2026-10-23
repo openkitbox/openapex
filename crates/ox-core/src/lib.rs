@@ -9,6 +9,7 @@ pub mod copied_tags;
 pub mod event_bus;
 pub mod model_catalog;
 pub mod projector;
+pub mod reminder_tags;
 pub mod which;
 
 /// How ox identifies itself to everything it calls: the LLM gateway, the model
