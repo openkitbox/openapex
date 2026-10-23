@@ -2,7 +2,7 @@
 
 - Upstream anchor: `/Users/john/github/opencode` (`reference/agents/opencode`)
 - Upstream commit: `8482dbf1e7eba18d6c5d0de6f02f8242112bcf06` (v2.1.2 tree)
-- Captured: 2026-10-23, batch B of `.opencode/plans/ox-injection-hardening.md`
+- Captured: 2026-10-23, batch B of `.ox/plans/ox-injection-hardening.md`
 
 | Fixture | Upstream source | Kind |
 |---|---|---|
@@ -11,7 +11,7 @@
 | `instruction-files.txt` | `packages/core/src/session/instructions.ts:76` (``Instructions from: ${path}\n${content}`` joined by `\n\n`) | hand-written expected output |
 | `date.txt` | `packages/core/src/instructions/builtins.ts:29` (`Today's date: ${date}`) | hand-written expected output |
 | `env.txt` | `packages/core/src/instructions/builtins.ts:36-53` (`<env>` block + initial wrapper) | hand-written expected output with tokens |
-| `skills-compact.txt` | none (batch F compact policy, `.opencode/plans/ox-injection-hardening.md` §2-F) | hand-written expected output from the batch-F spec: shared preamble, the frozen hint line, `- id: name` entries |
+| `skills-compact.txt` | none (batch F compact policy, `.ox/plans/ox-injection-hardening.md` §2-F) | hand-written expected output from the batch-F spec: shared preamble, the frozen hint line, `- id: name` entries |
 
 ## Substitution rules applied by the tests (nothing else may differ)
 

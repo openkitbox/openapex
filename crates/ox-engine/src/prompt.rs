@@ -39,7 +39,7 @@ pub fn system_static(tools: &[(&str, Option<&'static str>)]) -> String {
 }
 
 /// Upstream `session/system-prompt.ts:11-32`, verbatim, then the documented
-/// deviation from `.opencode/plans/ox-injection-hardening.md` §2-C: one bullet
+/// deviation from `.ox/plans/ox-injection-hardening.md` §2-C: one bullet
 /// per registered tool that contributes guidance, in tool-name order.
 /// Duplicate lines (`ctx_*` share one) render once, and a toolset contributing
 /// nothing keeps the upstream portion byte-identical.
@@ -99,7 +99,7 @@ pub(crate) enum CatalogPolicy {
 
 /// The catalog's byte budget: at or under it the catalog renders in full,
 /// past it in [`CatalogPolicy::Compact`] (documented deviation from upstream,
-/// which always injects the full catalog — `.opencode/plans/
+/// which always injects the full catalog — `.ox/plans/
 /// ox-injection-hardening.md` §2-F). Fixed, not a config knob: one threshold
 /// keeps the wire and the goldens testable without a configuration surface.
 pub(crate) const SKILLS_CATALOG_BUDGET_BYTES: usize = 8 * 1024;
@@ -1235,7 +1235,7 @@ mod tests {
         assert!(render.contains("Today's date: "));
     }
 
-    // ---- Batch F (`.opencode/plans/ox-injection-hardening.md` §2-F): the
+    // ---- Batch F (`.ox/plans/ox-injection-hardening.md` §2-F): the
     // injection surface is accounted for in bytes so the baseline log answers
     // "what does this session's context cost before any transcript?".
 
@@ -1338,7 +1338,7 @@ mod tests {
         );
     }
 
-    // ---- Batch F2 (`.opencode/plans/ox-injection-hardening.md` §2-F): the
+    // ---- Batch F2 (`.ox/plans/ox-injection-hardening.md` §2-F): the
     // skills catalog degrades to a compact form once it crosses a fixed byte
     // budget, and the policy is part of the observed value so a flip is one
     // ordinary keyed delta.
@@ -1645,7 +1645,7 @@ mod tests {
         assert_eq!(instruction_files(&observed), expected);
     }
 
-    // ---- Batch B golden fixtures (`.opencode/plans/ox-injection-hardening.md`
+    // ---- Batch B golden fixtures (`.ox/plans/ox-injection-hardening.md`
     // §2-B): byte-level oracles so later batches prove they changed only what
     // they meant to. Fixture provenance + checksums:
     // `crates/ox-engine/tests/fixtures/prompt/PROVENANCE.md`.
@@ -1701,7 +1701,7 @@ mod tests {
         );
     }
 
-    /// Batch C (`.opencode/plans/ox-injection-hardening.md` §2-C): the appended
+    /// Batch C (`.ox/plans/ox-injection-hardening.md` §2-C): the appended
     /// section exists only for tools that contribute guidance. A toolset whose
     /// tools all answer `None` keeps the upstream prefix byte-identical (the G1
     /// expectation is the oracle), and adding `None` tools changes nothing.
@@ -1828,7 +1828,7 @@ mod tests {
         assert_eq!(render_instruction_files(&files), INSTRUCTION_FILES_TXT);
     }
 
-    /// Batch D (`.opencode/plans/ox-injection-hardening.md` §2-D): a checked-in
+    /// Batch D (`.ox/plans/ox-injection-hardening.md` §2-D): a checked-in
     /// instruction file may not forge the harness framing system[0] declares
     /// authoritative. Only the leading `<` is escaped, so the text stays
     /// readable while no longer parsing as a tag.
@@ -1863,7 +1863,7 @@ mod tests {
         );
     }
 
-    /// Batch G (`.opencode/plans/ox-injection-hardening.md` §2-G): the
+    /// Batch G (`.ox/plans/ox-injection-hardening.md` §2-G): the
     /// model-visible header never leaks the home directory. `redact_home`
     /// units own the string shape; this pins the render site.
     #[test]

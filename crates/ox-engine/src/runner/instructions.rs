@@ -463,7 +463,7 @@ mod tests {
 
     /// Batch F2: the catalog policy is part of the observed value, so a flip
     /// mid-session hashes differently and the keyed framework re-asserts the
-    /// catalog exactly once (`.opencode/plans/ox-injection-hardening.md` §2-F).
+    /// catalog exactly once (`.ox/plans/ox-injection-hardening.md` §2-F).
     #[test]
     fn a_catalog_policy_flip_fires_exactly_one_delta() {
         use crate::prompt::{CatalogPolicy, KEY_SKILLS, SkillSummary};

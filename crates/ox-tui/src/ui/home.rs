@@ -1,6 +1,6 @@
 //! Home 落地页：居中 logo + 共享的 [`Prompt`] 输入面。
 //!
-//! 视觉规格见 .opencode/opencode-tui-components/16-home-splash.md；输入面本身
+//! 视觉规格见 .ox/plans/opencode-tui-components/16-home-splash.md；输入面本身
 //! 由 `ui::prompt` 负责（面板、metadata 行、`╹`/`▀` 收尾、footer、slash 菜单）。
 //! 这里只剩 Home 独有的东西：logo 掩码渲染与 75 列内容列。
 

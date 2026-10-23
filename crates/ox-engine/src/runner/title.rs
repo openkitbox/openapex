@@ -4,7 +4,7 @@
 //! Upstream runs this as a dedicated hidden agent ("title") with a
 //! model-selection chain (agent model → provider's small model → primary) and
 //! an exact publish-sequence guard. Per the recorded decision (see the module
-//! doc in `.opencode/plans`, session note #6), ox's port is deliberately
+//! doc in `.ox/plans`, session note #6), ox's port is deliberately
 //! smaller:
 //!
 //! - **No dedicated title agent.** ox has no agent registry; the title

@@ -2,7 +2,7 @@
 
 - Upstream anchor: `/Users/john/github/opencode` (`reference/agents/opencode`)
 - Upstream commit: `8482dbf1e7eba18d6c5d0de6f02f8242112bcf06` (v2.1.2 tree)
-- Captured: 2026-10-23, batch B of `.opencode/plans/ox-injection-hardening.md`
+- Captured: 2026-10-23, batch B of `.ox/plans/ox-injection-hardening.md`
 
 | Fixture | Upstream source | Kind |
 |---|---|---|

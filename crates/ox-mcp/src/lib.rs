@@ -482,7 +482,7 @@ done
         }
     }
 
-    // ---- Batch B golden fixtures (`.opencode/plans/ox-injection-hardening.md`
+    // ---- Batch B golden fixtures (`.ox/plans/ox-injection-hardening.md`
     // §2-B). Fixture provenance + checksum:
     // `crates/ox-mcp/tests/fixtures/prompt/PROVENANCE.md`.
 

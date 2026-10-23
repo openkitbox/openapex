@@ -683,7 +683,7 @@ Note: file list is sampled.
         assert!(rendered.ends_with("</skill_content>"));
     }
 
-    /// Batch G (`.opencode/plans/ox-injection-hardening.md` §2-G): the
+    /// Batch G (`.ox/plans/ox-injection-hardening.md` §2-G): the
     /// envelope's base-directory line is injected text, so a skill under the
     /// user's home renders `~`. `PreparedSkill::directory` keeps the real
     /// path — tools and file access use it.
@@ -709,7 +709,7 @@ Note: file list is sampled.
         assert_eq!(prepared.directory, skill_dir);
     }
 
-    /// Batch D (`.opencode/plans/ox-injection-hardening.md` §2-D): a skill body
+    /// Batch D (`.ox/plans/ox-injection-hardening.md` §2-D): a skill body
     /// may not forge `<system-reminder>` framing inside its envelope. Both the
     /// `skill` tool and the injected `Prompt.skills[].text` come through this
     /// one formatter, so neutralizing here covers both surfaces.

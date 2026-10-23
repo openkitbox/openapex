@@ -3,7 +3,7 @@
 //!
 //! ox pins `pi-shell` to an oh-my-pi rev (root `Cargo.toml`). Two deliberate
 //! choices live here (the deviation ledger in
-//! `.opencode/plans/ox-pi-shell-integration.md` has the full list):
+//! `.ox/plans/ox-pi-shell-integration.md` has the full list):
 //!
 //! - **Environment**: pi-shell never inherits implicitly — its session
 //!   creation hard-codes `do_not_inherit_env` — so ox snapshots the host

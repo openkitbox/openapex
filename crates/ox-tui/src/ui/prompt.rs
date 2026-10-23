@@ -2,7 +2,7 @@
 //! metadata row, `╹`/`▀` bottom edge, footer row, and the slash-command menu.
 //!
 //! Visual spec and deviations are recorded in
-//! `.opencode/plans/ox-tui-prompt-surface.md`. Upstream reference:
+//! `.ox/plans/ox-tui-prompt-surface.md`. Upstream reference:
 //! `component/prompt/index.tsx` (panel), `component/prompt/metadata.tsx`
 //! (metadata degradation), `component/prompt/autocomplete.tsx` (menu).
 

@@ -9,7 +9,7 @@
 //! One implementation for every untrusted body: `ox-engine`'s instruction-file
 //! renderer and `ox-tools`' skill envelope both call this, so the two can never
 //! neutralize differently. Deliberately not applied to MCP server instructions
-//! (byte-compat with upstream, see `.opencode/plans/ox-injection-hardening.md`
+//! (byte-compat with upstream, see `.ox/plans/ox-injection-hardening.md`
 //! §2-D) or to the `<available_skills>` catalog, whose XML escape already turns
 //! `<` into `&lt;`.
 
