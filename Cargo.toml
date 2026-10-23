@@ -130,5 +130,15 @@ tokio-util.workspace = true
 [workspace.lints.clippy]
 result_large_err = "allow"
 
+# The shell engine (pi-builtins' grep-pcre2) and libgit2-sys' bundled PCRE2
+# (both hardwired in their build scripts, neither exposes a feature to drop
+# it) export the same `__pcre2_*` C symbols into one binary. ox uses each
+# through disjoint paths (shell `grep -P` vs. libgit2 repo discovery only),
+# so the duplicated tables are harmless; rustc relays ld's complaint about
+# them as linker-messages warnings, which are pure build noise here. Errors
+# from the linker still fail the build — only the relayed warnings are muted.
+[workspace.lints.rust]
+linker_messages = "allow"
+
 [lints]
 workspace = true

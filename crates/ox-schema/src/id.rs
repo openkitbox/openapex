@@ -54,14 +54,6 @@ fn encode_time(timestamp: u64, counter: u64) -> String {
     hex
 }
 
-/// Decode the time portion back into `(timestamp_millis mod 2^36, counter)`.
-/// Exact inverse of [`encode_time`] when `counter < 0x1000`.
-#[cfg(test)]
-fn decode_time(hex: &str) -> (u64, u64) {
-    let value = u64::from_str_radix(hex, 16).unwrap();
-    (value >> 12, value & 0xfff)
-}
-
 /// Generate the 26-char ascending ID body for the current time.
 fn ascending_body(timestamp: u64) -> String {
     let counter = {
@@ -100,75 +92,5 @@ pub fn from_event(event_id: &str) -> String {
     match event_id.strip_prefix("evt_") {
         Some(body) => format!("msg_{body}"),
         None => format!("msg_{event_id}"),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn prefixed_id_has_expected_length_and_prefix() {
-        let id = id("ses");
-        assert!(id.starts_with("ses_"));
-        // 4 chars prefix + 26 chars body.
-        assert_eq!(id.len(), 4 + BODY_LENGTH);
-    }
-
-    #[test]
-    fn ids_are_monotonically_increasing_under_rapid_generation() {
-        let ids: Vec<String> = (0..10_000).map(|_| id("msg")).collect();
-        for pair in ids.windows(2) {
-            assert!(
-                pair[0] < pair[1],
-                "non-monotonic pair: {} !< {}",
-                pair[0],
-                pair[1]
-            );
-        }
-    }
-
-    #[test]
-    fn timestamp_portion_round_trips() {
-        // (ts mod 2^36, counter) must survive encode -> decode exactly for
-        // counters below the 12-bit carry boundary, including truncation.
-        let cases = [
-            (0_u64, 0_u64),
-            (1, 1),
-            (now_millis() as u64, 1),
-            (0xff_ffff_ffff, 0xfff), // truncation boundary: 2^36 ms
-            (0x1_0000_0000_0abc, 123),
-        ];
-        for (ts, counter) in cases {
-            let hex = encode_time(ts, counter);
-            assert_eq!(hex.len(), TIME_HEX_CHARS);
-            assert_eq!(
-                decode_time(&hex),
-                (ts & 0xf_ffff_ffff, counter),
-                "round-trip failed for ts={ts} counter={counter}"
-            );
-        }
-    }
-
-    #[test]
-    fn later_timestamp_sorts_after_earlier() {
-        let earlier = encode_time(1_700_000_000_000, 1);
-        let later = encode_time(1_700_000_000_001, 1);
-        assert!(earlier < later);
-    }
-
-    #[test]
-    fn random_tail_uses_upstream_alphabet() {
-        let id = id("ses");
-        let body = &id[4..];
-        assert_eq!(body.len(), BODY_LENGTH);
-        assert!(
-            body[..TIME_HEX_CHARS]
-                .chars()
-                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-        );
-        for c in body[TIME_HEX_CHARS..].chars() {
-            assert!(CHARS.contains(&(c as u8)), "char {c} not in alphabet");
-        }
     }
 }

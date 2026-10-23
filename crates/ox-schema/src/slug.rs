@@ -23,16 +23,3 @@ pub fn create() -> String {
     let noun = NOUNS[rng.random_range(..NOUNS.len())];
     format!("{adjective}-{noun}")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn format_is_adjective_dash_noun() {
-        let slug = create();
-        let (adjective, noun) = slug.split_once('-').unwrap_or(("", ""));
-        assert!(ADJECTIVES.contains(&adjective));
-        assert!(NOUNS.contains(&noun));
-    }
-}

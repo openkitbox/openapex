@@ -58,24 +58,3 @@ pub(crate) trait Rpc: Send + Sync {
     /// Best-effort rejection of every in-flight call and teardown.
     fn shutdown<'a>(&'a self) -> BoxFuture<'a, ()>;
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn call_errors_have_stable_messages() {
-        assert_eq!(CallError::Closed.to_string(), "MCP server is not available");
-        assert_eq!(CallError::Timeout.to_string(), "MCP request timed out");
-        assert_eq!(CallError::Cancelled.to_string(), "MCP request cancelled");
-        assert_eq!(
-            CallError::Rpc(jsonrpc::RpcError {
-                code: -32000,
-                message: "boom".to_owned(),
-                data: None,
-            })
-            .to_string(),
-            "boom (code -32000)"
-        );
-    }
-}

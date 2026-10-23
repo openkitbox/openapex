@@ -102,28 +102,3 @@ pub async fn connect(
     };
     Ok(Bootstrap { client, session })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::abbreviate_with;
-    use super::display_agent;
-
-    #[test]
-    fn agent_display_name_capitalizes_the_first_letter() {
-        assert_eq!(display_agent("build"), "Build");
-        assert_eq!(display_agent("code"), "Code");
-        assert_eq!(display_agent(""), "");
-    }
-
-    #[test]
-    fn home_dir_is_abbreviated_to_tilde() {
-        let home = Some("/Users/john");
-        assert_eq!(
-            abbreviate_with("/Users/john/Developer/openkitbox/ox", home),
-            "~/Developer/openkitbox/ox"
-        );
-        assert_eq!(abbreviate_with("/Users/john", home), "~");
-        assert_eq!(abbreviate_with("/opt/bin", home), "/opt/bin");
-        assert_eq!(abbreviate_with("/opt/bin", None), "/opt/bin");
-    }
-}

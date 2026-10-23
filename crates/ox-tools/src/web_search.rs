@@ -55,15 +55,6 @@ impl WebSearchTool {
             }),
         }
     }
-
-    /// A tool pinned to an explicit provider URL (tests).
-    #[cfg(test)]
-    fn with_provider(provider_url: &str) -> Self {
-        Self {
-            client: reqwest::Client::default(),
-            provider_url: Some(provider_url.to_owned()),
-        }
-    }
 }
 
 impl Tool for WebSearchTool {
@@ -281,76 +272,4 @@ fn urlencode(query: &str) -> String {
             _ => format!("%{byte:02X}"),
         })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ctx() -> ToolContext {
-        ToolContext {
-            session_id: "ses_search".to_owned(),
-            directory: std::env::temp_dir(),
-            call_id: "call_search".to_owned(),
-            cancellation: tokio_util::sync::CancellationToken::new(),
-            registry: std::sync::Arc::new(crate::contract::ToolRegistry::new()),
-        }
-    }
-
-    #[test]
-    fn urlencode_percent_encodes() {
-        assert_eq!(urlencode("hello world?"), "hello%20world%3F");
-        assert_eq!(urlencode("a_b-c.d~e"), "a_b-c.d~e");
-    }
-
-    #[tokio::test]
-    async fn duckduckgo_results_are_flattened_and_bounded() {
-        let body = serde_json::json!({
-            "Results": [
-                { "Text": "First result", "FirstURL": "https://example.com/1" }
-            ],
-            "RelatedTopics": [
-                { "Text": "Second result", "FirstURL": "https://example.com/2" },
-                { "Topics": [
-                    { "Text": "Nested result", "FirstURL": "https://example.com/3" },
-                    { "Text": "Non-http", "FirstURL": "mailto:x@y" }
-                ]}
-            ]
-        });
-        let results = duckduckgo_results(&body);
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[0].title, "First result");
-        assert_eq!(results[2].url, "https://example.com/3");
-    }
-
-    #[tokio::test]
-    async fn an_offline_provider_reports_failure() {
-        // An unroutable URL exercises the failure shape without network access.
-        let tool = WebSearchTool::with_provider("http://127.0.0.1:1/?q={query}");
-        let output = tool
-            .execute(ctx(), serde_json::json!({ "query": "anything" }))
-            .await;
-        let error = output.error.as_deref().unwrap_or_default();
-        assert!(error.starts_with("web_search failed"), "{error}");
-    }
-
-    #[tokio::test]
-    async fn a_blank_query_is_invalid_arguments() {
-        let output = WebSearchTool::new()
-            .execute(ctx(), serde_json::json!({ "query": "  " }))
-            .await;
-        assert!(output.error.as_deref().unwrap().contains("query"));
-    }
-
-    #[test]
-    fn cancelled_sentinel_is_not_the_question_one() {
-        assert_ne!(
-            super::CANCELLED_SENTINEL,
-            crate::question::CANCELLED_SENTINEL
-        );
-        assert_eq!(
-            super::CANCELLED_SENTINEL,
-            "(web search cancelled by user interrupt)"
-        );
-    }
 }

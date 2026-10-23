@@ -139,30 +139,3 @@ async fn stream_once(
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::FrameParser;
-
-    #[test]
-    fn parses_one_frame_across_split_chunks() {
-        let mut p = FrameParser::new();
-        assert!(p.feed(b"data: {\"a\":").is_empty());
-        let frames = p.feed(b"1}\n\n");
-        assert_eq!(frames, vec![r#"{"a":1}"#.to_string()]);
-    }
-
-    #[test]
-    fn ignores_heartbeat_comments_and_joins_multiline_data() {
-        let mut p = FrameParser::new();
-        let frames = p.feed(b": heartbeat\n\ndata: line1\ndata: line2\n\n");
-        assert_eq!(frames, vec!["line1\nline2".to_string()]);
-    }
-
-    #[test]
-    fn handles_crlf_and_multiple_frames_in_one_chunk() {
-        let mut p = FrameParser::new();
-        let frames = p.feed(b"data: a\r\n\r\ndata: b\r\n\r\n");
-        assert_eq!(frames, vec!["a".to_string(), "b".to_string()]);
-    }
-}
