@@ -1,16 +1,27 @@
 //! Skills: user-authored instruction files the model can load on demand.
 //!
 //! The discovery contract mirrors upstream opencode
-//! (`packages/core/src/config/plugin/skill-scan.ts`): a directory with a
-//! `SKILL.md` is a skill whose id is the directory name, and a top-level
-//! `*.md` file is a skill whose id is the file stem. Frontmatter carries the
-//! display `name` and `description`; everything after it is the body the
-//! `skill` tool loads into the conversation.
+//! (`packages/core/src/config/plugin/skill-scan.ts` @ v2.1.2): a recursive
+//! walk to six directory levels that skips dot-prefixed entries and a fixed
+//! set of dependency directories at every level. A directory with a
+//! `SKILL.md` is a skill whose id is the directory's basename (a skill
+//! directory is a leaf — its nested directories are not skills), and a root's
+//! own `*.md` files are file skills whose id is the file stem. Frontmatter
+//! carries the display `name` and `description`; everything after it is the
+//! body the `skill` tool loads into the conversation.
 //!
-//! Deliberate deviation from upstream: the roots are ox-native `.ox` paths
-//! (project `.ox/skill(s)` + global `~/.ox/skill(s)`) instead of upstream's
-//! bare `skill(s)` dirs and opencode-branded config paths, so ox owns its
-//! skills namespace and never reads another tool's config directory.
+//! The roots are ox-native `.ox` skill dirs first, then upstream's ecosystem
+//! roots (`config/plugin/compatibility.ts:42-43`: `.claude/skills`,
+//! `.agents/skills`) appended read-only after the native roots at each level
+//! — project before global. First root wins on id collisions, so a native
+//! skill always shades an ecosystem twin of the same id.
+//!
+//! The model-facing catalog is stricter than discovery (upstream
+//! `skill/instructions.ts:81-84`): a skill without a description, or with
+//! auto-invocation off, is never listed in `<available_skills>` — but stays
+//! loadable by explicit id, because the lookup the `skill` tool and user
+//! attachments go through has no such filter (upstream `Skill.Service.get`,
+//! `skill.ts:126-128`).
 //!
 //! The model-facing envelope has exactly one formatter, `render_content`
 //! (upstream `Skill.toModelOutput`), reached through two entry points that
@@ -20,6 +31,7 @@
 //! every requested id). `select_files` is their pure companion-file policy, so
 //! neither entry point can format differently.
 
+use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -48,17 +60,51 @@ pub struct SkillMeta {
     pub description: Option<String>,
 }
 
+/// How deep the scan walks below a root, upstream `MAX_DEPTH`
+/// (`skill-scan.ts:7`): the root itself is depth 0, a child of a depth-5
+/// directory is scanned at depth 6, and a depth-6 directory's children are
+/// never enqueued (`item.depth < MAX_DEPTH`, `skill-scan.ts:38-43`) — so the
+/// deepest skill directory is six levels below the root.
+const MAX_DEPTH: u32 = 6;
+
+/// The directory names upstream's scan skips at any depth
+/// (`FSUtil.ignoredDirectories`, `fs-util.ts:281`, in upstream order).
+const IGNORED_DIRECTORIES: [&str; 5] = ["node_modules", ".git", ".venv", "venv", "__pycache__"];
+
+/// [`IGNORED_DIRECTORIES`] matching, shared by the discovery scan and the
+/// companion-file walk so the two can never disagree on the names.
+fn is_ignored_directory(name: &OsStr) -> bool {
+    IGNORED_DIRECTORIES
+        .iter()
+        .any(|ignored| name == OsStr::new(ignored))
+}
+
+/// Whether the discovery scan skips a directory entry outright
+/// (`skill-scan.ts:18`): dot-prefixed names — files as well as directories,
+/// so a dot file is never a file skill either — and [`IGNORED_DIRECTORIES`],
+/// at every level.
+fn skipped_scan_entry(name: &OsStr) -> bool {
+    name.as_encoded_bytes().first() == Some(&b'.') || is_ignored_directory(name)
+}
+
 /// The directories skills are discovered under, in precedence order: the
-/// project-local `.ox` skill dirs, then the global `~/.ox` ones. Each is
-/// scanned shallowly (a skill directory does not contain skills).
+/// project-local roots, then the global ones, each level native-first (`.ox`)
+/// with upstream's ecosystem roots (`.claude/skills`, `.agents/skills`,
+/// `compatibility.ts:42-43`) appended read-only after the native ones. Each
+/// root is walked recursively to [`MAX_DEPTH`] levels (a skill directory does
+/// not contain skills).
 fn roots(directory: &Path) -> Vec<PathBuf> {
     let mut roots = vec![
         directory.join(".ox").join("skill"),
         directory.join(".ox").join("skills"),
+        directory.join(".claude").join("skills"),
+        directory.join(".agents").join("skills"),
     ];
     if let Some(home) = dirs_home() {
         roots.push(home.join(".ox").join("skill"));
         roots.push(home.join(".ox").join("skills"));
+        roots.push(home.join(".claude").join("skills"));
+        roots.push(home.join(".agents").join("skills"));
     }
     roots
 }
@@ -95,52 +141,117 @@ pub(crate) fn discover_in(roots: &[PathBuf]) -> Vec<Skill> {
     )
 }
 
-/// [`discover_in`] restricted to frontmatter metadata.
+/// [`discover_in`] restricted to frontmatter metadata, filtered to what the
+/// catalog may show: upstream `skill/instructions.ts:81-84` skips skills
+/// whose `description` is unset or whose `autoinvoke` is `false`. Loading is
+/// untouched — [`discover_in`] and [`prepare`] still see every skill, so an
+/// explicit id keeps working (upstream `Skill.Service.get` has no filter,
+/// `skill.ts:126-128`).
 pub(crate) fn list_in(roots: &[PathBuf]) -> Vec<SkillMeta> {
-    dedupe_and_sort(
+    let listed = dedupe_and_sort(
         skill_candidates(roots)
             .into_iter()
             .filter_map(|(file, id)| meta(&file, id))
             .collect(),
-        |meta| meta.id.as_str(),
-    )
+        |(meta, _)| meta.id.as_str(),
+    );
+    // After the dedupe, not before: the filter must judge the skill a step
+    // would actually load — the first root's entry, not a later root's
+    // better-documented twin of the same id.
+    listed
+        .into_iter()
+        .filter(|(meta, autoinvoke)| *autoinvoke && meta.description.is_some())
+        .map(|(meta, _)| meta)
+        .collect()
 }
 
 /// Every candidate skill file under `roots` as `(file, id)`, in discovery
-/// order: a directory contributes `<dir>/SKILL.md` with the directory name as
-/// id, a top-level `*.md` file contributes itself with the file stem as id.
-/// No dedupe happens here — a file that fails to parse must not shadow the
-/// same id from a later root.
+/// order — upstream `SkillScan.scan` (`skill-scan.ts:11-46`) as a
+/// breadth-first walk:
+///
+/// - entries whose name starts with `.` or is in [`IGNORED_DIRECTORIES`] are
+///   skipped at every level, files as well as directories
+///   (`skill-scan.ts:18`);
+/// - a directory containing `SKILL.md` is a skill and a leaf — the walk does
+///   not descend into it (`skill-scan.ts:29-33`). Its id is the directory's
+///   basename, so `skills/group/foo/SKILL.md` is `foo` (upstream
+///   `skill-file.ts:47`, the `basename(dirname(filepath))` branch; a
+///   `SKILL.md` in a root itself names the skill after that root);
+/// - only a root's own `*.md` files are file skills, id = file stem
+///   (`skill-scan.ts:34-37`, `skill-file.ts:44-46`);
+/// - recursion stops below [`MAX_DEPTH`] (`skill-scan.ts:38-43`).
+///
+/// Symlinks are classified by what they point at (`Path::is_dir` follows
+/// them, like upstream's `stat`, `skill-scan.ts:21-26`); a broken link is
+/// neither. No dedupe happens here — a file that fails to parse must not
+/// shadow the same id from a later root.
 fn skill_candidates(roots: &[PathBuf]) -> Vec<(PathBuf, String)> {
     let mut candidates = Vec::new();
     for root in roots {
-        let entries = match std::fs::read_dir(root) {
-            Ok(entries) => entries,
-            // A missing root is normal — most projects have no skill dirs.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                // Skipping keeps "unreadable is never fatal", but silence here
-                // makes an unreadable root surface later as a bogus 404.
-                tracing::warn!(path = %root.display(), %error, "skill root unreadable; skipping");
+        // A root without a basename (`/`) cannot name a root-level
+        // `SKILL.md`; nested skills inside it would still be sound, but no
+        // real skill root looks like that — skip it.
+        if root.file_name().and_then(OsStr::to_str).is_none() {
+            continue;
+        }
+        let mut queue = VecDeque::from([(root.to_path_buf(), 0u32)]);
+        while let Some((directory, depth)) = queue.pop_front() {
+            let entries = match std::fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                // A missing directory is normal — most projects have no
+                // skill dirs anywhere along the walk.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    // Skipping keeps "unreadable is never fatal", but silence
+                    // here makes an unreadable directory surface later as a
+                    // bogus 404.
+                    tracing::warn!(
+                        path = %directory.display(),
+                        %error,
+                        "skill directory unreadable; skipping"
+                    );
+                    continue;
+                }
+            };
+            let mut directories = Vec::new();
+            let mut markdown = Vec::new();
+            let mut skill: Option<PathBuf> = None;
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if skipped_scan_entry(&name) {
+                    continue;
+                }
+                let path = entry.path();
+                if path.is_dir() {
+                    directories.push(path);
+                } else if name == *OsStr::new("SKILL.md") {
+                    skill = Some(path);
+                } else if depth == 0 && path.extension().and_then(OsStr::to_str) == Some("md") {
+                    let Some(id) = path.file_stem().and_then(OsStr::to_str).map(str::to_owned)
+                    else {
+                        continue;
+                    };
+                    markdown.push((path, id));
+                }
+            }
+            if let Some(file) = skill {
+                // Upstream id = basename of the containing directory
+                // (`skill-file.ts:47`); every enqueued directory has a file
+                // name, the fallback just keeps non-addressable paths honest.
+                let Some(dir_id) = directory.file_name().and_then(OsStr::to_str) else {
+                    continue;
+                };
+                candidates.push((file, dir_id.to_owned()));
                 continue;
             }
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let skill = if path.is_dir() {
-                let Some(id) = path.file_name().and_then(OsStr::to_str) else {
-                    continue;
-                };
-                (path.join("SKILL.md"), id.to_owned())
-            } else if path.extension().and_then(OsStr::to_str) == Some("md") {
-                let Some(id) = path.file_stem().and_then(OsStr::to_str).map(str::to_owned) else {
-                    continue;
-                };
-                (path, id)
-            } else {
-                continue;
-            };
-            candidates.push(skill);
+            if depth == 0 {
+                candidates.append(&mut markdown);
+            }
+            if depth < MAX_DEPTH {
+                for path in directories {
+                    queue.push_back((path, depth + 1));
+                }
+            }
         }
     }
     candidates
@@ -174,21 +285,34 @@ fn load(file: &Path, id: String) -> Option<Skill> {
 }
 
 /// Read the skill file and keep the frontmatter only; the body is dropped
-/// with `raw` and never allocated on its own.
-fn meta(file: &Path, id: String) -> Option<SkillMeta> {
+/// with `raw` and never allocated on its own. Returns the metadata plus the
+/// parsed `autoinvoke` — the catalog filter needs both, and [`SkillMeta`]
+/// stays a pure id/name/description view.
+fn meta(file: &Path, id: String) -> Option<(SkillMeta, bool)> {
     let raw = std::fs::read_to_string(file).ok()?;
     let parsed = parse_skill(&raw, &id);
-    Some(SkillMeta {
-        id,
-        name: parsed.name,
-        description: parsed.description,
-    })
+    Some((
+        SkillMeta {
+            id,
+            name: parsed.name,
+            description: parsed.description,
+        },
+        parsed.autoinvoke,
+    ))
 }
 
 /// One skill file's frontmatter fields and the borrowed body after it.
 struct ParsedSkill<'a> {
     name: String,
     description: Option<String>,
+    /// Whether the model may invoke the skill on its own (upstream
+    /// `autoinvoke`, `skill-file.ts:48-50`): the `autoinvoke` key (ox's
+    /// spelling), the upstream-canonical `opencode/autoinvoke` (flat, or
+    /// nested under `metadata:` — the line parser matches the trimmed key
+    /// either way), else the inverse of a truthy `disable-model-invocation`
+    /// (the Claude compatibility spelling). Defaults to true. Only the
+    /// catalog honors it (`skill/instructions.ts:81-84`).
+    autoinvoke: bool,
     body: &'a str,
 }
 
@@ -200,9 +324,19 @@ fn parse_skill<'a>(raw: &'a str, id: &str) -> ParsedSkill<'a> {
         .and_then(|front| value(front, "name"))
         .unwrap_or_else(|| id.to_owned());
     let description = frontmatter.and_then(|front| value(front, "description"));
+    let autoinvoke = frontmatter
+        .map(|front| {
+            boolean_value(front, "autoinvoke")
+                .or_else(|| boolean_value(front, "opencode/autoinvoke"))
+                .unwrap_or_else(|| {
+                    !boolean_value(front, "disable-model-invocation").unwrap_or(false)
+                })
+        })
+        .unwrap_or(true);
     ParsedSkill {
         name,
         description,
+        autoinvoke,
         body,
     }
 }
@@ -225,10 +359,15 @@ fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
 }
 
 /// One `key: value` line of frontmatter. A deliberate subset — skills use
-/// `name` and `description`, and a YAML parser dependency is not justified.
+/// `name`, `description` and the auto-invoke keys, and a YAML parser
+/// dependency is not justified. A line without a colon says nothing about
+/// any key; it must not stop the scan (upstream parses real YAML, where such
+/// lines are ordinary).
 fn value(frontmatter: &str, key: &str) -> Option<String> {
     for line in frontmatter.lines() {
-        let (head, tail) = line.split_once(':')?;
+        let Some((head, tail)) = line.split_once(':') else {
+            continue;
+        };
         if head.trim() == key {
             let text = tail.trim().trim_matches('"').trim_matches('\'');
             if !text.is_empty() {
@@ -237,6 +376,17 @@ fn value(frontmatter: &str, key: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// A frontmatter boolean, upstream `booleanValue` (`skill-file.ts:28-36`):
+/// `true/false/1/0/yes/no/on/off`, case-insensitive; anything else — or an
+/// absent key — is unset.
+fn boolean_value(frontmatter: &str, key: &str) -> Option<bool> {
+    match value(frontmatter, key)?.to_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 /// Render the model-facing envelope for one skill (upstream
@@ -318,10 +468,6 @@ fn base_directory(skill: &Skill) -> &Path {
     }
 }
 
-/// The directory names upstream's scan skips at any depth
-/// (`FSUtil.ignoredDirectories`, in upstream order).
-const IGNORED_DIRECTORIES: [&str; 5] = ["node_modules", ".git", ".venv", "venv", "__pycache__"];
-
 /// The I/O half of upstream `prepare`: walk a directory skill's directory for
 /// its companions (upstream `fs.scan("**/*", {absolute: true, include: "file",
 /// dot: true, ignore: FSUtil.ignoreGlobs})`) and apply [`select_files`]. A file
@@ -354,9 +500,7 @@ pub fn companion_files(skill: &Skill) -> Vec<PathBuf> {
                 || !(entry
                     .file_type()
                     .is_some_and(|file_type| file_type.is_dir())
-                    && IGNORED_DIRECTORIES
-                        .iter()
-                        .any(|ignored| entry.file_name() == OsStr::new(ignored)))
+                    && is_ignored_directory(entry.file_name()))
         })
         .build()
         .flatten()
@@ -416,7 +560,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn roots_are_ox_native_project_and_global_paths() {
+    fn roots_are_ox_native_then_ecosystem_project_and_global_paths() {
         // Serialize HOME redirection against every other reader in the binary:
         // cargo runs tests on parallel threads and `std::env::set_var` is
         // process-global.
@@ -434,13 +578,20 @@ mod tests {
                 None => std::env::remove_var("HOME"),
             }
         }
+        // Native roots first, then upstream's ecosystem roots
+        // (`compatibility.ts:42-43` joins the claude/agents roots with
+        // "skills") read-only after them — project level before global.
         assert_eq!(
             roots,
             vec![
                 dir.path().join(".ox").join("skill"),
                 dir.path().join(".ox").join("skills"),
+                dir.path().join(".claude").join("skills"),
+                dir.path().join(".agents").join("skills"),
                 home.path().join(".ox").join("skill"),
                 home.path().join(".ox").join("skills"),
+                home.path().join(".claude").join("skills"),
+                home.path().join(".agents").join("skills"),
             ]
         );
     }
@@ -491,7 +642,7 @@ mod tests {
     }
 
     #[test]
-    fn list_reports_the_same_metadata_as_discover_in_the_same_order() {
+    fn the_catalog_lists_the_described_subset_of_discovery() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("proj");
         std::fs::create_dir_all(project.join("skills/review")).unwrap();
@@ -507,22 +658,21 @@ mod tests {
         let discovered = discover_in(&roots);
         let listed = list_in(&roots);
 
-        let from_discover: Vec<SkillMeta> = discovered
-            .iter()
-            .map(|skill| SkillMeta {
-                id: skill.id.clone(),
-                name: skill.name.clone(),
-                description: skill.description.clone(),
-            })
-            .collect();
-        assert_eq!(listed, from_discover);
+        // Catalog filter (upstream `skill/instructions.ts:81-84`): `notes`
+        // has no description, so only `review` is listed — while discovery
+        // keeps both, because an explicit id still loads either one.
         assert_eq!(
-            listed
-                .iter()
-                .map(|meta| meta.id.as_str())
-                .collect::<Vec<_>>(),
-            vec!["notes", "review"]
+            listed,
+            vec![SkillMeta {
+                id: "review".to_owned(),
+                name: "Code Review".to_owned(),
+                description: Some("Review a PR".to_owned()),
+            }]
         );
+        let mut discovered_ids: Vec<&str> =
+            discovered.iter().map(|skill| skill.id.as_str()).collect();
+        discovered_ids.sort_unstable();
+        assert_eq!(discovered_ids, vec!["notes", "review"]);
     }
 
     #[test]
@@ -533,12 +683,12 @@ mod tests {
         std::fs::create_dir_all(project.join("skills/dup")).unwrap();
         std::fs::write(
             project.join("skill/dup/SKILL.md"),
-            "---\nname: First\n---\nfirst body\n",
+            "---\nname: First\ndescription: first\n---\nfirst body\n",
         )
         .unwrap();
         std::fs::write(
             project.join("skills/dup/SKILL.md"),
-            "---\nname: Second\n---\nsecond body\n",
+            "---\nname: Second\ndescription: second\n---\nsecond body\n",
         )
         .unwrap();
 
@@ -546,6 +696,260 @@ mod tests {
 
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, "First");
+    }
+
+    // ---- Batch H (`.opencode/plans/ox-injection-hardening.md` H): recursive
+    // discovery, catalog filters, ecosystem roots. Upstream anchors:
+    // `config/plugin/skill-scan.ts`, `config/plugin/compatibility.ts`,
+    // `skill/instructions.ts` (all @ v2.1.2).
+
+    /// A directory skill at `relative` under `root`, carrying `frontmatter`
+    /// (with its `---` delimiters, may be empty) and a one-line body.
+    fn write_skill(root: &Path, relative: &str, frontmatter: &str, body: &str) {
+        let directory = root.join(relative);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("SKILL.md"),
+            format!("{frontmatter}\n{body}\n"),
+        )
+        .unwrap();
+    }
+
+    fn skill_ids(skills: &[Skill]) -> Vec<&str> {
+        skills.iter().map(|skill| skill.id.as_str()).collect()
+    }
+
+    fn listed_ids(metas: &[SkillMeta]) -> Vec<&str> {
+        metas.iter().map(|meta| meta.id.as_str()).collect()
+    }
+
+    #[test]
+    fn nested_skills_are_found_to_the_sixth_level_and_not_below() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("skills");
+        write_skill(&root, "a/b/deep", "---\ndescription: d3\n---\n", "depth 3");
+        write_skill(
+            &root,
+            "l1/l2/l3/l4/l5/six",
+            "---\ndescription: d6\n---\n",
+            "depth 6",
+        );
+        write_skill(
+            &root,
+            "l1/l2/l3/l4/l5/six/seven",
+            "---\ndescription: d7\n---\n",
+            "depth 7",
+        );
+
+        // Upstream caps the walk at `MAX_DEPTH = 6` (skill-scan.ts:7): the
+        // root is depth 0, a directory at depth 6 is still scanned, and its
+        // children are never enqueued (`item.depth < MAX_DEPTH`,
+        // skill-scan.ts:38-43). `six` is depth 6, `seven` is depth 7.
+        assert_eq!(
+            skill_ids(&discover_in(std::slice::from_ref(&root))),
+            vec!["deep", "six"]
+        );
+        assert_eq!(listed_ids(&list_in(&[root])), vec!["deep", "six"]);
+    }
+
+    #[test]
+    fn dot_and_ignored_directories_are_skipped_at_every_level() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("skills");
+        write_skill(&root, "real", "---\ndescription: found\n---\n", "found");
+        write_skill(&root, ".hidden", "---\ndescription: dot\n---\n", "dot root");
+        write_skill(
+            &root,
+            "node_modules/pkg/nested",
+            "---\ndescription: ignored\n---\n",
+            "ignored root",
+        );
+        write_skill(
+            &root,
+            "group/.secret",
+            "---\ndescription: dot\n---\n",
+            "dot below",
+        );
+        write_skill(
+            &root,
+            "group/node_modules/pkg/nested",
+            "---\ndescription: ignored\n---\n",
+            "ignored below",
+        );
+        // The entry filter (skill-scan.ts:18) drops dot-*files* too, at the
+        // root level where `*.md` files are file skills.
+        std::fs::write(root.join(".hidden.md"), "dot file skill").unwrap();
+
+        // Names are skipped at every level, not just the root's
+        // (skill-scan.ts:18 applies to each directory's entries).
+        assert_eq!(
+            skill_ids(&discover_in(std::slice::from_ref(&root))),
+            vec!["real"]
+        );
+    }
+
+    #[test]
+    fn a_skill_directory_is_a_leaf() {
+        // skill-scan.ts:29-33: a directory containing SKILL.md is recorded
+        // and the walk `continue`s — nothing nested inside is a skill.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("skills");
+        write_skill(&root, "outer", "---\ndescription: outer\n---\n", "outer");
+        write_skill(
+            &root,
+            "outer/nested",
+            "---\ndescription: inner\n---\n",
+            "inner",
+        );
+
+        assert_eq!(
+            skill_ids(&discover_in(std::slice::from_ref(&root))),
+            vec!["outer"]
+        );
+    }
+
+    #[test]
+    fn the_catalog_hides_undescribed_and_manual_skills_but_both_stay_loadable() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("skills");
+        write_skill(
+            &root,
+            "described",
+            "---\ndescription: Listable\n---\n",
+            "listed",
+        );
+        write_skill(
+            &root,
+            "manual",
+            "---\ndescription: Manual\nautoinvoke: false\n---\n",
+            "not catalogued",
+        );
+        // Upstream's canonical spelling (`skill-file.ts:48`: metadata
+        // `opencode/autoinvoke`, flat or nested — the line parser matches the
+        // trimmed key either way).
+        write_skill(
+            &root,
+            "opencode-manual",
+            "---\ndescription: Manual\nopencode/autoinvoke: false\n---\n",
+            "not catalogued",
+        );
+        // The Claude compatibility spelling (`skill-file.ts:49-50`), which
+        // real `.claude/skills` entries carry.
+        write_skill(
+            &root,
+            "claude-manual",
+            "---\ndescription: Manual\ndisable-model-invocation: true\n---\n",
+            "not catalogued",
+        );
+        // An explicit `autoinvoke` wins over `disable-model-invocation`
+        // (`skill-file.ts:50`: `??`, not a fallback chain into falseness).
+        write_skill(
+            &root,
+            "forced-on",
+            "---\ndescription: Forced\nautoinvoke: true\ndisable-model-invocation: true\n---\n",
+            "listed",
+        );
+        write_skill(
+            &root,
+            "blanked",
+            "---\nname: Blanked\n---\n",
+            "no description",
+        );
+
+        let discovered = discover_in(std::slice::from_ref(&root));
+        assert_eq!(
+            skill_ids(&discovered),
+            vec![
+                "blanked",
+                "claude-manual",
+                "described",
+                "forced-on",
+                "manual",
+                "opencode-manual"
+            ]
+        );
+        assert_eq!(
+            listed_ids(&list_in(std::slice::from_ref(&root))),
+            vec!["described", "forced-on"]
+        );
+        // Loading is untouched (upstream `Skill.Service.get` has no filter,
+        // `skill.ts:126-128`; the `skill` tool resolves ids through it,
+        // `tool/plugin/skill.ts:48`): every hidden skill still loads.
+        for id in ["blanked", "claude-manual", "manual", "opencode-manual"] {
+            assert!(
+                prepare_from(&discovered, id, Path::new("/nonexistent-ox-home")).is_some(),
+                "{id} must stay loadable"
+            );
+        }
+    }
+
+    #[test]
+    fn the_native_root_wins_over_the_ecosystem_root_on_id_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(project.join(".ox/skills/dup")).unwrap();
+        std::fs::write(
+            project.join(".ox/skills/dup/SKILL.md"),
+            "---\ndescription: Native\n---\nnative body\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(project.join(".claude/skills/dup")).unwrap();
+        std::fs::write(
+            project.join(".claude/skills/dup/SKILL.md"),
+            "---\ndescription: Claude\n---\nclaude body\n",
+        )
+        .unwrap();
+        let roots = [project.join(".ox/skills"), project.join(".claude/skills")];
+
+        // First root wins (`.ox` precedes `.claude`), for loading…
+        let skills = discover_in(&roots);
+        assert_eq!(skill_ids(&skills), vec!["dup"]);
+        assert_eq!(skills[0].content.trim(), "native body");
+        // …and for the catalog.
+        let listed = list_in(&roots);
+        assert_eq!(listed[0].description.as_deref(), Some("Native"));
+    }
+
+    #[test]
+    fn ecosystem_roots_are_scanned_with_an_isolated_home() {
+        let _guard = crate::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", home.path()) };
+        let project = tempfile::tempdir().unwrap();
+        write_skill(
+            &project.path().join(".claude/skills"),
+            "claude-only",
+            "---\ndescription: From .claude\n---\n",
+            "claude body",
+        );
+        write_skill(
+            &project.path().join(".agents/skills"),
+            "agents-only",
+            "---\ndescription: From .agents\n---\n",
+            "agents body",
+        );
+        write_skill(
+            &home.path().join(".claude/skills"),
+            "global-ecosystem",
+            "---\ndescription: From global .claude\n---\n",
+            "global body",
+        );
+
+        let listed = list(project.path());
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        assert_eq!(
+            listed_ids(&listed),
+            vec!["agents-only", "claude-only", "global-ecosystem"]
+        );
     }
 
     #[test]
@@ -583,7 +987,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("skills/good")).unwrap();
         std::fs::write(
             dir.path().join("skills/good/SKILL.md"),
-            "---\nname: Good\n---\nbody\n",
+            "---\nname: Good\ndescription: fine\n---\nbody\n",
         )
         .unwrap();
         // A root that is a file cannot be read_dir'd at all.
