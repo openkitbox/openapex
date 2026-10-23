@@ -114,6 +114,7 @@ mod tests {
             directory: dir.to_path_buf(),
             call_id: "call_skill".to_owned(),
             cancellation: tokio_util::sync::CancellationToken::new(),
+            registry: std::sync::Arc::new(crate::contract::ToolRegistry::new()),
         }
     }
 

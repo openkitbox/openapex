@@ -515,6 +515,7 @@ mod tests {
             directory: directory.to_path_buf(),
             call_id: "call_1".to_owned(),
             cancellation: CancellationToken::new(),
+            registry: std::sync::Arc::new(crate::contract::ToolRegistry::new()),
         }
     }
 

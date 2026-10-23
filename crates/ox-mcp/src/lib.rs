@@ -83,6 +83,15 @@ pub struct Hub {
     templates: RwLock<Vec<TemplateInfo>>,
 }
 
+/// Appended after the upstream-rendered `<mcp_instructions>` block: upstream
+/// `mcp/instructions.ts:22` names each server's tools per server ("through
+/// `execute` under `tools[\"<server>\"]`"), but that is the codemode bridge —
+/// ox registers MCP tools directly under their qualified `<server>_<tool>`
+/// names (`crate::tool::qualified_name`). The line is the ox adaptation of
+/// that naming guidance; the upstream bytes before it are untouched (batch I,
+/// recorded as a deviation in `tests/fixtures/prompt/PROVENANCE.md`).
+const TOOL_NAMING_LINE: &str = "Use tools from these servers directly by their `<server>_<tool>` names (sanitized server name, underscore, sanitized tool name).";
+
 impl Hub {
     /// A hub with no servers. `Runner::new` uses this so tests that build a
     /// runner directly get the pre-MCP behavior.
@@ -165,6 +174,8 @@ impl Hub {
 
     /// `<mcp_instructions>` for the system prompt; `None` when no server
     /// supplied instructions, so the zero-server prompt stays byte-identical.
+    /// The upstream block bytes are a strict prefix; [`TOOL_NAMING_LINE`]
+    /// follows as the one documented deviation.
     pub fn instructions_block(&self) -> Option<String> {
         let instructions = self.instructions.read().unwrap();
         if instructions.is_empty() {
@@ -181,6 +192,8 @@ impl Hub {
             block.push_str("  </server>");
         }
         block.push_str("\n</mcp_instructions>");
+        block.push('\n');
+        block.push_str(TOOL_NAMING_LINE);
         Some(block)
     }
 }
@@ -405,7 +418,7 @@ done
         assert_eq!(
             hub.instructions_block().as_deref(),
             Some(
-                "<mcp_instructions>\n  <server name=\"stub\">\n    stub instructions\n  </server>\n</mcp_instructions>"
+                "<mcp_instructions>\n  <server name=\"stub\">\n    stub instructions\n  </server>\n</mcp_instructions>\nUse tools from these servers directly by their `<server>_<tool>` names (sanitized server name, underscore, sanitized tool name)."
             )
         );
         let (resources, templates) = hub.resources();
@@ -496,14 +509,34 @@ done
         // Fixture: upstream `packages/core/src/mcp/instructions.ts:17-29`
         // (`entries`/`render`) @ 8482dbf1e7eba18d6c5d0de6f02f8242112bcf06 —
         // server name in the attribute, every instruction line indented
-        // 4 spaces. Deviation frozen deliberately (PROVENANCE.md): upstream's
-        // codemode `execute` line is omitted (batch I adds it).
+        // 4 spaces. Batch I appends ONE ox-specific line after the upstream
+        // bytes (ox has no codemode `execute` bridge to name); the upstream
+        // bytes must stay a strict prefix. Deviation recorded in
+        // PROVENANCE.md.
         let hub = Hub::empty();
         hub.instructions.write().unwrap().push((
             "stub".to_owned(),
             "Keep replies terse.\nPrefer read-only tools.".to_owned(),
         ));
-        assert_eq!(hub.instructions_block().as_deref(), Some(MCP_BLOCK_TXT));
+        let rendered = hub.instructions_block().unwrap();
+        assert!(
+            rendered.starts_with(MCP_BLOCK_TXT),
+            "upstream bytes must be the block's prefix: {rendered}"
+        );
+        assert_eq!(
+            &rendered[MCP_BLOCK_TXT.len()..],
+            format!("\n{TOOL_NAMING_LINE}"),
+            "exactly one deviation line may follow the upstream bytes"
+        );
+    }
+
+    #[test]
+    fn the_naming_line_names_the_qualified_tool_form() {
+        assert_eq!(
+            TOOL_NAMING_LINE,
+            "Use tools from these servers directly by their `<server>_<tool>` names \
+             (sanitized server name, underscore, sanitized tool name)."
+        );
     }
 
     /// The fixture's sha256 must match its PROVENANCE.md entry, and every

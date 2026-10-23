@@ -310,6 +310,7 @@ mod tests {
             directory: PathBuf::from("/tmp"),
             call_id: "call_1".to_owned(),
             cancellation: CancellationToken::new(),
+            registry: std::sync::Arc::new(ox_tools::contract::ToolRegistry::new()),
         }
     }
 

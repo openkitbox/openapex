@@ -33,6 +33,37 @@ use crate::support::{
 };
 
 // ---------------------------------------------------------------------------
+// Instructions sources (batch I / L6: machine-readable source classification)
+// ---------------------------------------------------------------------------
+
+/// How one instruction source reaches the context. `global` is the home
+/// instruction file, `project` is a session-directory ancestor-chain file
+/// (R3 semantics), `config` is a non-file source (skills catalog, MCP block,
+/// date, environment).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstructionSourceKind {
+    Global,
+    Project,
+    Config,
+}
+
+/// One source behind a `session.instructions.updated` delta, for the
+/// projected system row's `instructionSources` metadata: replay/audit tooling
+/// classifies sources without string-matching paths. Additive on the wire —
+/// consumers that don't know `kind` ignore it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InstructionSource {
+    /// The keyed source this entry belongs to (`core/instructions`, ...).
+    pub key: String,
+    /// Absolute file path; absent for non-file sources.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<InstructionSourceKind>,
+}
+
+// ---------------------------------------------------------------------------
 // Envelope (packages/schema/src/event.ts)
 // ---------------------------------------------------------------------------
 
@@ -212,11 +243,16 @@ pub enum SessionEventData {
     /// upstream updater). `delta` maps source key → hash (`"removed"` =
     /// removed, upstream `Instruction.removed`). Metadata rides on the
     /// envelope only; the projector builds the row metadata from `delta`.
+    /// `sources` is the ox-specific machine-readable classification behind
+    /// the row's `instructionSources` metadata (batch I): empty on pre-batch
+    /// events, which replay with key strings only.
     #[serde(rename = "session.instructions.updated")]
     SessionInstructionsUpdated {
         #[serde(rename = "sessionID")]
         session_id: String,
         delta: Record,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sources: Vec<InstructionSource>,
         #[serde(skip_serializing_if = "Option::is_none")]
         text: Option<String>,
     },

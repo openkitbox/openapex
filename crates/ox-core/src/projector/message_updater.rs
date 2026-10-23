@@ -359,6 +359,7 @@ pub async fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Resu
         E::SessionInstructionsUpdated {
             session_id,
             delta,
+            sources,
             text,
         } => {
             // Upstream message-updater.ts:152: an update without text is
@@ -371,14 +372,21 @@ pub async fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Resu
                     "notice".to_owned(),
                     serde_json::Value::String("instructions".to_owned()),
                 );
+                // Batch I: machine-readable per-file classification when the
+                // event carries it; pre-batch-I events (replayed from old
+                // rows) keep the key-string form.
                 metadata.insert(
                     "instructionSources".to_owned(),
-                    serde_json::Value::Array(
-                        delta
-                            .keys()
-                            .map(|key| serde_json::Value::String(key.clone()))
-                            .collect(),
-                    ),
+                    if sources.is_empty() {
+                        serde_json::Value::Array(
+                            delta
+                                .keys()
+                                .map(|key| serde_json::Value::String(key.clone()))
+                                .collect(),
+                        )
+                    } else {
+                        serde_json::to_value(sources).expect("InstructionSource is serializable")
+                    },
                 );
                 // ox keeps the delta itself on the row: the wire fold reads it
                 // back (upstream stores hashes in InstructionStateTable instead).

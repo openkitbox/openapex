@@ -33,6 +33,12 @@ pub struct ToolContext {
     pub call_id: String,
     /// Fires when the turn is interrupted; long tools should poll it.
     pub cancellation: CancellationToken,
+    /// The registry the call runs in — the session's live toolset (a
+    /// `subagent` child's excludes what the child drops). Only cross-tool
+    /// seams read it: `capability_search` indexes the catalog from here, so
+    /// MCP and CBM tools are covered exactly as advertised. Most tools never
+    /// touch it.
+    pub registry: std::sync::Arc<ToolRegistry>,
 }
 
 /// One attachment a tool result carries to the model (upstream
@@ -180,6 +186,17 @@ impl ToolRegistry {
         self.tools
             .iter()
             .map(|(name, tool)| (name.as_str(), tool.guidance()))
+    }
+
+    /// Every registered tool's `(name, description)`, in name order —
+    /// `capability_search`'s live catalog view. Definitions are rebuilt per
+    /// call: the catalog is dozens of entries and the tool is model-invoked,
+    /// never a hot path.
+    pub fn catalog(&self) -> Vec<(String, String)> {
+        self.definitions()
+            .into_iter()
+            .map(|def| (def.function.name, def.function.description))
+            .collect()
     }
 }
 

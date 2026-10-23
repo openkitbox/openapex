@@ -197,6 +197,34 @@ pub(crate) fn delta_record(
         .collect()
 }
 
+/// The machine-readable source entries behind one delta (batch I / L6): the
+/// projected system row's `instructionSources` metadata carries one entry per
+/// instruction file (`global` = home file, `project` = ancestor chain) and
+/// one `config` entry per non-file source, so replay/audit tooling never
+/// string-matches paths. Removed sources carry no files: one key-only entry.
+pub(crate) fn source_records(deltas: &[Delta]) -> Vec<ox_schema::event::InstructionSource> {
+    deltas
+        .iter()
+        .flat_map(|delta| match &delta.value {
+            Some(SourceValue::Files { files }) => files
+                .iter()
+                .map(|file| ox_schema::event::InstructionSource {
+                    key: delta.key.to_owned(),
+                    path: Some(file.path.clone()),
+                    kind: Some(file.kind),
+                })
+                .collect::<Vec<_>>(),
+            _ => {
+                vec![ox_schema::event::InstructionSource {
+                    key: delta.key.to_owned(),
+                    path: None,
+                    kind: Some(ox_schema::event::InstructionSourceKind::Config),
+                }]
+            }
+        })
+        .collect()
+}
+
 /// Record the emitted deltas into the baseline (delivered only; the frozen
 /// initial state never moves).
 pub(crate) fn apply(deltas: &[Delta], baseline: &mut Baseline) {
@@ -229,6 +257,7 @@ mod tests {
                 files: vec![crate::prompt::InstructionFile {
                     path: "/repo/AGENTS.md".to_owned(),
                     content: content.to_owned(),
+                    kind: ox_schema::event::InstructionSourceKind::Project,
                 }],
             }),
         }
@@ -459,6 +488,57 @@ mod tests {
         let removed = diff(&[absent(KEY_INSTRUCTIONS)], &BTreeMap::new(), &baseline);
         let record = delta_record(&removed);
         assert_eq!(record[KEY_INSTRUCTIONS].as_str(), Some("removed"));
+    }
+
+    #[test]
+    fn source_records_kind_tag_every_file_and_mark_config_sources() {
+        // Batch I / L6: a global+project file mix yields one entry per file
+        // with its kind; a non-file source yields one `config` entry.
+        use ox_schema::event::InstructionSourceKind;
+        let observed = vec![
+            Observed {
+                key: KEY_INSTRUCTIONS,
+                value: ObservedValue::Present(SourceValue::Files {
+                    files: vec![
+                        crate::prompt::InstructionFile {
+                            path: "/home/.ox/AGENTS.md".to_owned(),
+                            content: "global rule".to_owned(),
+                            kind: InstructionSourceKind::Global,
+                        },
+                        crate::prompt::InstructionFile {
+                            path: "/repo/AGENTS.md".to_owned(),
+                            content: "project rule".to_owned(),
+                            kind: InstructionSourceKind::Project,
+                        },
+                    ],
+                }),
+            },
+            date("Fri Oct 23 2026"),
+        ];
+        let baseline = baseline(&[]);
+        let deltas = diff(&observed, &BTreeMap::new(), &baseline);
+        assert_eq!(deltas.len(), 2);
+        let records = source_records(&deltas);
+        assert_eq!(
+            records,
+            vec![
+                ox_schema::event::InstructionSource {
+                    key: KEY_INSTRUCTIONS.to_owned(),
+                    path: Some("/home/.ox/AGENTS.md".to_owned()),
+                    kind: Some(InstructionSourceKind::Global),
+                },
+                ox_schema::event::InstructionSource {
+                    key: KEY_INSTRUCTIONS.to_owned(),
+                    path: Some("/repo/AGENTS.md".to_owned()),
+                    kind: Some(InstructionSourceKind::Project),
+                },
+                ox_schema::event::InstructionSource {
+                    key: KEY_DATE.to_owned(),
+                    path: None,
+                    kind: Some(InstructionSourceKind::Config),
+                },
+            ]
+        );
     }
 
     /// Batch F2: the catalog policy is part of the observed value, so a flip

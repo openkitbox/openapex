@@ -1596,6 +1596,7 @@ mod tests {
             directory: std::path::PathBuf::from(project),
             call_id: "call_1".to_owned(),
             cancellation: CancellationToken::new(),
+            registry: std::sync::Arc::new(crate::runner::ToolRegistry::new()),
         }
     }
 

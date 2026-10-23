@@ -35,6 +35,7 @@ fn context(tool: &str) -> ToolContext {
         directory: env!("CARGO_MANIFEST_DIR").into(),
         call_id: tool.to_owned(),
         cancellation: CancellationToken::new(),
+        registry: std::sync::Arc::new(ox_tools::contract::ToolRegistry::new()),
     }
 }
 

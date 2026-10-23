@@ -1229,6 +1229,7 @@ mod tests {
             directory,
             call_id: "call_1".to_owned(),
             cancellation: CancellationToken::new(),
+            registry: std::sync::Arc::new(crate::runner::ToolRegistry::new()),
         }
     }
 

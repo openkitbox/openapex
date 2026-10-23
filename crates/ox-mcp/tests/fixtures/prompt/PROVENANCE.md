@@ -19,6 +19,25 @@ per server when codemode is on; ox omits it (batch I of the plan adds it and
 will update this fixture in the same commit). ox XML-escapes the server name;
 the fixed input has no escapable characters.
 
+## Batch I deviation (2026-10-23, appended — everything above stays as written)
+
+`mcp-block.txt` is unchanged (checksum below still verifies). The G4 test no
+longer compares the whole block byte-for-byte: the upstream bytes are a strict
+**prefix**, and exactly one ox-specific line follows:
+
+> Use tools from these servers directly by their `<server>_<tool>` names
+> (sanitized server name, underscore, sanitized tool name).
+
+Why a line instead of the upstream line: upstream's per-server line
+(`instructions.ts:22`) names the codemode bridge — "Use tools from this server
+through \`execute\` under \`tools[\"<server>\"]\`" — which does not exist in ox.
+ox registers MCP tools directly under their qualified names
+(`ox_mcp::tool::qualified_name`: sanitized server, `_`, sanitized tool), so the
+naming guidance is adapted to that mechanism and appended once after the block
+instead of per server. Wire effect after deploy: every session's frozen
+`core/mcp-guidance` source changes for servers that supply instructions → one
+keyed delta on the first step (documented keyed-framework re-baseline).
+
 ## Checksums (verified at test time; keep in sync when a fixture changes)
 
 ```

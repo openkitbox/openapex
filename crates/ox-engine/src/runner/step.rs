@@ -979,6 +979,9 @@ fn spawn_tool_task(
     // A child token: interrupting the busy period cancels the tool at its
     // next await point.
     let cancellation = token.child_token();
+    // The session's live toolset rides in the context: `capability_search`
+    // indexes its catalog from here.
+    let registry = ctx.tools.clone();
     tokio::spawn(async move {
         let output = tool
             .execute(
@@ -987,6 +990,7 @@ fn spawn_tool_task(
                     directory,
                     call_id: call_id.clone(),
                     cancellation,
+                    registry,
                 },
                 input,
             )
@@ -1592,6 +1596,7 @@ async fn sync_instructions(
         .publish(SessionEventData::SessionInstructionsUpdated {
             session_id: ctx.session_id.clone(),
             delta,
+            sources: instructions::source_records(&deltas),
             text: Some(text.clone()),
         })
         .await

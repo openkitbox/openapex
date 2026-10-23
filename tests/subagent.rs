@@ -199,6 +199,7 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
         directory: dir.path().to_path_buf(),
         call_id: "call_sub".to_owned(),
         cancellation: tokio_util::sync::CancellationToken::new(),
+        registry: std::sync::Arc::new(ox::runner::ToolRegistry::new()),
     };
     let output = tool
         .execute(
@@ -283,6 +284,7 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
         directory: dir.path().to_path_buf(),
         call_id: "call_sub_resume".to_owned(),
         cancellation: tokio_util::sync::CancellationToken::new(),
+        registry: std::sync::Arc::new(ox::runner::ToolRegistry::new()),
     };
     let output_resume = tool
         .execute(
@@ -361,6 +363,7 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
         directory: dir.path().to_path_buf(),
         call_id: "call_sub_other".to_owned(),
         cancellation: tokio_util::sync::CancellationToken::new(),
+        registry: std::sync::Arc::new(ox::runner::ToolRegistry::new()),
     };
     let output_other = tool
         .execute(
@@ -413,6 +416,7 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
         directory: dir.path().to_path_buf(),
         call_id: "call_sub_depth".to_owned(),
         cancellation: tokio_util::sync::CancellationToken::new(),
+        registry: std::sync::Arc::new(ox::runner::ToolRegistry::new()),
     };
     let tool2 = tools2.get("subagent").expect("subagent registered");
     let output2 = tool2
@@ -452,6 +456,7 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
         directory: dir.path().to_path_buf(),
         call_id: "call_sub_bg".to_owned(),
         cancellation: tokio_util::sync::CancellationToken::new(),
+        registry: std::sync::Arc::new(ox::runner::ToolRegistry::new()),
     };
     let output_bg = tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -564,6 +569,7 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
         directory: dir.path().to_path_buf(),
         call_id: "call_sub_orphan".to_owned(),
         cancellation: tokio_util::sync::CancellationToken::new(),
+        registry: std::sync::Arc::new(ox::runner::ToolRegistry::new()),
     };
     let output_orphan = tokio::time::timeout(
         std::time::Duration::from_secs(5),

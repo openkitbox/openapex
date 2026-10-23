@@ -43,6 +43,7 @@ async fn every_corpus_command_settles_without_an_engine_error() {
             directory: directory.path().to_path_buf(),
             call_id: "call_corpus".to_owned(),
             cancellation: CancellationToken::new(),
+            registry: std::sync::Arc::new(ox::runner::ToolRegistry::new()),
         };
         let input = json!({
             "command": command,

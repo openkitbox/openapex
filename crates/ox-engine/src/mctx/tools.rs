@@ -437,6 +437,7 @@ mod tests {
             directory: std::env::temp_dir(),
             call_id: "call_1".to_owned(),
             cancellation: CancellationToken::new(),
+            registry: std::sync::Arc::new(crate::runner::ToolRegistry::new()),
         }
     }
 

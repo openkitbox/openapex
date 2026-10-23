@@ -1,10 +1,12 @@
-//! `capability_search`: find a skill by describing what is needed.
+//! `capability_search`: find a skill or a registered tool by describing what
+//! is needed.
 //!
-//! fx's tool of the same name searches installed skills and MCP tools; ox's
-//! MCP tools are registered by the MCP hub but are not indexed here yet, so
-//! this covers skills only. Matching is a simple scored
-//! token overlap over id/name/description — the catalog is small enough that
-//! no index is warranted.
+//! fx's tool of the same name searches installed skills and MCP tools; ox
+//! indexes both — skills from the discovery roots, tools read live from the
+//! registry the call runs in ([`crate::contract::ToolContext::registry`]), so
+//! MCP and CBM tools are covered exactly as advertised. Matching is a simple
+//! scored token overlap over id/name/description — the catalog is small
+//! enough that no index is warranted.
 
 use serde_json::Value;
 
@@ -33,11 +35,11 @@ impl Tool for CapabilitySearchTool {
     fn definition(&self) -> ToolDef {
         ToolDef::function(
             "capability_search",
-            "Find installed skills for a described capability. Optimizes for recall: returns the \
-             best matches with their ids, names, and descriptions, so the next step is a `skill` \
-             call.\n\n\
-             When to use: a task might match an installed skill but its id or exact description \
-             is unknown.\n\
+            "Find installed skills or registered tools for a described capability. Optimizes for \
+             recall: returns the best matches with their ids, names, and descriptions, so the \
+             next step is a `skill` call for a skill or a direct call for a tool.\n\n\
+             When to use: a task might match an installed skill or a registered tool but its id \
+             or exact description is unknown.\n\
              When NOT to use: the skill's id is already known (call `skill` directly), or the \
              capability is plain file work the basic tools cover.",
             object_param(
@@ -93,16 +95,60 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
         .collect();
 
     let skills = super::skills::discover(&ctx.directory);
-    let mut scored: Vec<(usize, &super::skills::Skill)> = skills
-        .iter()
-        .map(|skill| (score(skill, &tokens), skill))
-        .filter(|(score, _)| *score > 0)
-        .collect();
-    scored.sort_by_key(|a| std::cmp::Reverse(a.0));
+    // One candidate list over both catalogs: skills from the discovery
+    // roots, tools live from the registry the call runs in.
+    struct Match {
+        /// `skill` or `tool` — rendered per entry so the model knows whether
+        /// the next step is a `skill` call or a direct tool call.
+        kind: &'static str,
+        title: String,
+        /// Tie-break key (skill id / tool name) so equal scores stay
+        /// deterministic.
+        sort_key: String,
+        description: String,
+        score: usize,
+    }
 
-    if scored.is_empty() {
+    let mut matches: Vec<Match> = skills
+        .iter()
+        .map(|skill| Match {
+            kind: "skill",
+            title: format!("{} ({})", skill.id, skill.name),
+            sort_key: skill.id.clone(),
+            description: skill
+                .description
+                .clone()
+                .unwrap_or_else(|| "(no description)".to_owned()),
+            score: score(
+                &skill.id,
+                Some(&skill.name),
+                skill.description.as_deref().unwrap_or_default(),
+                &tokens,
+            ),
+        })
+        .chain(
+            ctx.registry
+                .catalog()
+                .into_iter()
+                .map(|(name, description)| {
+                    // Tools have no separate display name: the registry key scores
+                    // as both id and name.
+                    let score = score(&name, None, &description, &tokens);
+                    Match {
+                        kind: "tool",
+                        title: name.clone(),
+                        sort_key: name,
+                        description,
+                        score,
+                    }
+                }),
+        )
+        .filter(|matched| matched.score > 0)
+        .collect();
+
+    if matches.is_empty() {
         return ok_text(format!(
-            "No skills matched `{query}`.{}",
+            "No skills or tools matched `{query}`.{}",
             if skills.is_empty() {
                 " No skills are installed.".to_owned()
             } else {
@@ -118,27 +164,30 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
         ));
     }
 
-    let mut text = format!("Skills matching `{query}`:\n");
-    for (score, skill) in scored.into_iter().take(limit) {
-        let description = skill.description.as_deref().unwrap_or("(no description)");
+    matches.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.kind.cmp(b.kind))
+            .then_with(|| a.sort_key.cmp(&b.sort_key))
+    });
+
+    let mut text = format!("Capabilities matching `{query}`:\n");
+    for matched in matches.into_iter().take(limit) {
         text.push_str(&format!(
-            "- {} ({}) [score {score}] — {description}\n",
-            skill.id, skill.name,
+            "- {}: {} [score {}] — {}\n",
+            matched.kind, matched.title, matched.score, matched.description
         ));
     }
     ok_text(text.trim_end().to_owned())
 }
 
-/// A skill's relevance to the query: exact-id hits dominate, then
-/// name/description token overlap.
-fn score(skill: &super::skills::Skill, tokens: &[String]) -> usize {
-    let id = skill.id.to_lowercase();
-    let name = skill.name.to_lowercase();
-    let description = skill
-        .description
-        .as_deref()
-        .unwrap_or_default()
-        .to_lowercase();
+/// A candidate's relevance to the query: exact-id hits dominate, then
+/// name/description token overlap. Tools have no separate display name
+/// (`None`): the registry key scores as both id and name.
+fn score(id: &str, name: Option<&str>, description: &str, tokens: &[String]) -> usize {
+    let id = id.to_lowercase();
+    let name = name.map(str::to_lowercase).unwrap_or_else(|| id.clone());
+    let description = description.to_lowercase();
     let mut score = 0;
     for token in tokens {
         if id == *token {
@@ -159,13 +208,46 @@ fn score(skill: &super::skills::Skill, tokens: &[String]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contract::ToolRegistry;
+    use std::sync::Arc;
 
-    fn ctx(dir: &std::path::Path) -> ToolContext {
+    /// A registry-only tool for the catalog tests; execution is never reached.
+    struct FakeTool {
+        name: &'static str,
+        description: &'static str,
+    }
+
+    impl Tool for FakeTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn definition(&self) -> ToolDef {
+            ToolDef::function(
+                self.name,
+                self.description,
+                serde_json::json!({ "type": "object" }),
+            )
+        }
+
+        fn execute(
+            &self,
+            _ctx: ToolContext,
+            _input: Value,
+        ) -> std::pin::Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
+            unimplemented!("fake tool is never executed")
+        }
+    }
+
+    fn ctx(dir: &std::path::Path, tools: Vec<Arc<dyn Tool>>) -> ToolContext {
+        let mut registry = ToolRegistry::new();
+        registry.register_all(tools);
         ToolContext {
             session_id: "ses_caps".to_owned(),
             directory: dir.to_path_buf(),
             call_id: "call_caps".to_owned(),
             cancellation: tokio_util::sync::CancellationToken::new(),
+            registry: Arc::new(registry),
         }
     }
 
@@ -191,12 +273,89 @@ mod tests {
         let dir = project_with_skills();
         let output = CapabilitySearchTool
             .execute(
-                ctx(dir.path()),
+                ctx(dir.path(), vec![]),
                 serde_json::json!({ "query": "review a PR" }),
             )
             .await;
         let text = output.content.as_str().unwrap();
         assert!(text.contains("review (Code Review)"), "{text}");
+    }
+
+    /// Batch I: registered tools are indexed next to skills, read live from
+    /// the context's registry — an MCP-shaped `srv_tool` included.
+    #[tokio::test]
+    async fn a_registered_tool_is_indexed_next_to_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = CapabilitySearchTool
+            .execute(
+                ctx(
+                    dir.path(),
+                    vec![
+                        Arc::new(FakeTool {
+                            name: "srv_tool",
+                            description: "Serve widgets over the network",
+                        }) as Arc<dyn Tool>,
+                        Arc::new(FakeTool {
+                            name: "write",
+                            description: "Write a file to disk",
+                        }),
+                    ],
+                ),
+                serde_json::json!({ "query": "serve widgets" }),
+            )
+            .await;
+        let text = output.content.as_str().unwrap();
+        assert!(text.contains("- tool: srv_tool"), "{text}");
+        assert!(!text.contains("- tool: write"), "{text}");
+    }
+
+    /// Deterministic mixed ordering: score desc, then skills before tools,
+    /// then name — equal-score tools come out in name order.
+    #[tokio::test]
+    async fn mixed_results_order_deterministically() {
+        let dir = project_with_skills();
+        let output = CapabilitySearchTool
+            .execute(
+                ctx(
+                    dir.path(),
+                    vec![
+                        Arc::new(FakeTool {
+                            name: "zzz_reviewer",
+                            description: "Review a change",
+                        }) as Arc<dyn Tool>,
+                        Arc::new(FakeTool {
+                            name: "aaa_reviewer",
+                            description: "Review a change",
+                        }),
+                    ],
+                ),
+                serde_json::json!({ "query": "review" }),
+            )
+            .await;
+        let text = output.content.as_str().unwrap();
+        let skill = text.find("- skill: review").expect("skill entry");
+        let aaa = text.find("- tool: aaa_reviewer").expect("aaa entry");
+        let zzz = text.find("- tool: zzz_reviewer").expect("zzz entry");
+        assert!(
+            skill < aaa && aaa < zzz,
+            "expected skill, aaa_reviewer, zzz_reviewer: {text}"
+        );
+    }
+
+    /// Nothing in the registry does not break the skill search: an empty
+    /// registry behaves exactly like the pre-batch tool.
+    #[tokio::test]
+    async fn an_empty_registry_indexes_only_skills() {
+        let dir = project_with_skills();
+        let output = CapabilitySearchTool
+            .execute(
+                ctx(dir.path(), vec![]),
+                serde_json::json!({ "query": "review a PR" }),
+            )
+            .await;
+        let text = output.content.as_str().unwrap();
+        assert!(text.contains("- skill: review (Code Review)"), "{text}");
+        assert!(!text.contains("- tool:"), "{text}");
     }
 
     #[tokio::test]
@@ -213,7 +372,7 @@ mod tests {
         let dir = project_with_skills();
         let output = CapabilitySearchTool
             .execute(
-                ctx(dir.path()),
+                ctx(dir.path(), vec![]),
                 serde_json::json!({ "query": "migration database schema review", "max_results": 1 }),
             )
             .await;

@@ -550,10 +550,13 @@ fn event_session_instructions_updated() {
         SessionEventData::SessionInstructionsUpdated {
             session_id,
             delta,
+            sources,
             text,
         } => {
             assert_eq!(session_id, "ses_01");
             assert_eq!(delta["core/date"], json!("abc123"));
+            // Wire JSON without `sources` (pre-batch-I events) defaults empty.
+            assert!(sources.is_empty());
             assert_eq!(text, None);
         }
         other => panic!("expected SessionInstructionsUpdated, got {other:?}"),

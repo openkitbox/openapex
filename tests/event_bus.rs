@@ -931,6 +931,7 @@ async fn instructions_updated_projects_a_system_row() {
     bus.publish(SessionEventData::SessionInstructionsUpdated {
         session_id: "s1".to_string(),
         delta,
+        sources: Vec::new(),
         text: Some("Today's date is now: Fri Oct 23 2026".to_string()),
     })
     .await
@@ -939,6 +940,7 @@ async fn instructions_updated_projects_a_system_row() {
     bus.publish(SessionEventData::SessionInstructionsUpdated {
         session_id: "s1".to_string(),
         delta: Default::default(),
+        sources: Vec::new(),
         text: None,
     })
     .await
@@ -967,6 +969,62 @@ async fn instructions_updated_projects_a_system_row() {
     let mut rows = stmt.query(["s1"]).await.expect("query");
     let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
     assert_eq!(count, 1, "bookkeeping event must not add a row");
+}
+
+/// Batch I / L6: an event carrying `sources` projects one machine-readable
+/// entry per instruction file — `global` for the home file, `project` for
+/// every ancestor-chain file — so replay/audit tooling never string-matches
+/// paths. Events without `sources` (the test above) keep the legacy
+/// key-string form.
+#[tokio::test]
+async fn instructions_sources_kind_tag_the_projected_row() {
+    let db = Db::open_in_memory().await.unwrap();
+    let bus = EventBus::new(db.clone());
+    create(&bus, "s1").await;
+    let delta: Record = serde_json::from_value(serde_json::json!({"core/instructions": "abc123"}))
+        .expect("delta record");
+    let sources = vec![
+        ox_schema::event::InstructionSource {
+            key: "core/instructions".to_owned(),
+            path: Some("/home/.ox/AGENTS.md".to_owned()),
+            kind: Some(ox_schema::event::InstructionSourceKind::Global),
+        },
+        ox_schema::event::InstructionSource {
+            key: "core/instructions".to_owned(),
+            path: Some("/repo/AGENTS.md".to_owned()),
+            kind: Some(ox_schema::event::InstructionSourceKind::Project),
+        },
+        ox_schema::event::InstructionSource {
+            key: "core/date".to_owned(),
+            path: None,
+            kind: Some(ox_schema::event::InstructionSourceKind::Config),
+        },
+    ];
+    bus.publish(SessionEventData::SessionInstructionsUpdated {
+        session_id: "s1".to_string(),
+        delta,
+        sources,
+        text: Some("Instructions from: /repo/AGENTS.md".to_string()),
+    })
+    .await
+    .unwrap();
+    let conn = db.acquire().await.expect("conn");
+    let row = one_row(
+        &conn,
+        "SELECT data FROM session_message WHERE session_id = ?1 AND type = 'system'",
+        ["s1"],
+    )
+    .await;
+    let data: serde_json::Value =
+        serde_json::from_str(&row.get::<String>(0).expect("data")).expect("json");
+    assert_eq!(
+        data["metadata"]["instructionSources"],
+        serde_json::json!([
+            {"key": "core/instructions", "path": "/home/.ox/AGENTS.md", "kind": "global"},
+            {"key": "core/instructions", "path": "/repo/AGENTS.md", "kind": "project"},
+            {"key": "core/date", "kind": "config"},
+        ])
+    );
 }
 
 // ---------------------------------------------------------------------------

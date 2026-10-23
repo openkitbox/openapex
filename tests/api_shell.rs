@@ -66,6 +66,7 @@ async fn start_session() -> String {
         directory: std::env::temp_dir(),
         call_id: "call_api".to_owned(),
         cancellation: CancellationToken::new(),
+        registry: std::sync::Arc::new(ox::runner::ToolRegistry::new()),
     };
     let tool = ShellTool::new();
     let output = tool

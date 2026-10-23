@@ -83,6 +83,7 @@ async fn a_question_tool_call_is_answered_over_http() {
         directory: std::env::temp_dir(),
         call_id: "call_form".to_owned(),
         cancellation: CancellationToken::new(),
+        registry: std::sync::Arc::new(ox::runner::ToolRegistry::new()),
     };
     let task = tokio::spawn(async move {
         QuestionTool
@@ -194,6 +195,7 @@ async fn a_cancelled_form_fails_the_tool_with_its_message() {
         directory: std::env::temp_dir(),
         call_id: "call_form2".to_owned(),
         cancellation: CancellationToken::new(),
+        registry: std::sync::Arc::new(ox::runner::ToolRegistry::new()),
     };
     let task = tokio::spawn(async move {
         QuestionTool
@@ -265,6 +267,7 @@ async fn a_malformed_reply_body_is_a_400() {
         directory: std::env::temp_dir(),
         call_id: "call_form3".to_owned(),
         cancellation: CancellationToken::new(),
+        registry: std::sync::Arc::new(ox::runner::ToolRegistry::new()),
     };
     let task = tokio::spawn(async move {
         QuestionTool
@@ -335,6 +338,7 @@ async fn a_form_reaches_the_sse_event_stream() {
         directory: std::env::temp_dir(),
         call_id: "call_form_sse".to_owned(),
         cancellation: CancellationToken::new(),
+        registry: std::sync::Arc::new(ox::runner::ToolRegistry::new()),
     };
     let task = tokio::spawn(async move {
         QuestionTool

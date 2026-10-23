@@ -22,6 +22,7 @@ fn context(directory: &std::path::Path) -> ToolContext {
         directory: directory.to_path_buf(),
         call_id: "call_shell".to_owned(),
         cancellation: CancellationToken::new(),
+        registry: std::sync::Arc::new(ox::runner::ToolRegistry::new()),
     }
 }
 

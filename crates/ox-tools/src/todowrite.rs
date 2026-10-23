@@ -312,6 +312,7 @@ mod tests {
             directory: std::env::temp_dir(),
             call_id: "call_1".to_owned(),
             cancellation: tokio_util::sync::CancellationToken::new(),
+            registry: std::sync::Arc::new(crate::contract::ToolRegistry::new()),
         }
     }
 
