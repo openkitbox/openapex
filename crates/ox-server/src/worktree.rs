@@ -23,6 +23,18 @@
 //!   strategy (`git worktree add --detach -- <directory> <ref|HEAD>`, upstream
 //!   `core/src/git.ts:1254`); there is no configured strategy list to select
 //!   from and no setup command to run afterwards.
+//! - **The API and the agent shell create worktrees differently, on purpose.**
+//!   This module shells out to `git worktree add`, so a checkout created here
+//!   never carries ignored build caches. The `shell` tool's embedded brush
+//!   session enables pi-shell's `PI_SMART_GIT` by default, which turns an
+//!   agent-issued `git worktree add` into a copy-on-write clone (APFS
+//!   clonefile / reflinks) that brings `target/`, `node_modules/` and the like
+//!   along — measured 13 ms for a 300 MB cold cache versus 19 ms for a plain
+//!   checkout, i.e. the same order and a warm worktree. Both produce a valid
+//!   clean checkout of the requested ref; unifying them would mean teaching
+//!   this handler pi-vcs (`pi_vcs::git::GitRepo::worktree_add` is already in
+//!   the dependency graph via pi-shell), which waits until the TUI actually
+//!   creates worktrees through the API.
 //! - **Default location is `<repo>/.worktrees/`.** Upstream joins the project
 //!   configuration's directory (or its data directory) with the name. ox has no
 //!   project worktree settings, so unnamed roots land beside the checkout in

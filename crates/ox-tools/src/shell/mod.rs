@@ -720,6 +720,86 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn git_worktree_add_clones_ignored_caches_by_default() {
+        let _lock = ENV_LOCK.lock().await;
+        let original = std::env::var_os("PI_SMART_GIT");
+        // The engine default, not the developer's shell, decides here.
+        // SAFETY: serialized by ENV_LOCK; no other test reads this variable.
+        unsafe { std::env::remove_var("PI_SMART_GIT") };
+        let directory = tempdir().unwrap();
+        let repo = directory.path().join("repo");
+        std::fs::create_dir_all(repo.join("heavy")).unwrap();
+        let setup = shell(
+            &repo,
+            json!({"command": "git init -q && git config user.email t@t && git config user.name t && printf 'heavy/\\n' > .gitignore && echo tracked > tracked.txt && head -c 2000000 /dev/zero > heavy/blob && git add .gitignore tracked.txt && git commit -qm init"}),
+        )
+        .await;
+        assert!(setup.error.is_none(), "setup failed: {setup:?}");
+        let added = shell(
+            &repo,
+            json!({"command": "git worktree add ../wt --detach HEAD"}),
+        )
+        .await;
+        match &original {
+            Some(value) => unsafe { std::env::set_var("PI_SMART_GIT", value) },
+            None => unsafe { std::env::remove_var("PI_SMART_GIT") },
+        }
+        assert_eq!(added.error, None, "{added:?}");
+        assert_eq!(
+            added.metadata.as_ref().unwrap()["exit"],
+            json!(0),
+            "{added:?}"
+        );
+        let wt = directory.path().join("wt");
+        assert!(wt.join("tracked.txt").is_file(), "tracked file missing");
+        let status = shell(&wt, json!({"command": "git status --porcelain"})).await;
+        // A clean worktree prints nothing; the tool renders empty as this.
+        assert_eq!(
+            status.content,
+            json!("(no output)"),
+            "worktree is not clean"
+        );
+        // APFS clonefile: the ignored 2 MB blob rides along with the clone.
+        // On filesystems without a copy backend pi-vcs falls back to an
+        // in-process checkout (ignored files absent), so only assert here.
+        #[cfg(target_os = "macos")]
+        assert!(
+            wt.join("heavy/blob").is_file(),
+            "ignored build cache was not cloned"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn smart_worktree_honors_an_explicit_opt_out() {
+        let _lock = ENV_LOCK.lock().await;
+        // SAFETY: serialized by ENV_LOCK; no other test reads this variable.
+        unsafe { std::env::set_var("PI_SMART_GIT", "0") };
+        let directory = tempdir().unwrap();
+        let repo = directory.path().join("repo");
+        std::fs::create_dir_all(repo.join("heavy")).unwrap();
+        let setup = shell(
+            &repo,
+            json!({"command": "git init -q && git config user.email t@t && git config user.name t && printf 'heavy/\\n' > .gitignore && echo tracked > tracked.txt && head -c 2000000 /dev/zero > heavy/blob && git add .gitignore tracked.txt && git commit -qm init"}),
+        )
+        .await;
+        assert!(setup.error.is_none(), "setup failed: {setup:?}");
+        let added = shell(
+            &repo,
+            json!({"command": "git worktree add ../wt --detach HEAD"}),
+        )
+        .await;
+        unsafe { std::env::remove_var("PI_SMART_GIT") };
+        assert_eq!(added.error, None, "{added:?}");
+        let wt = directory.path().join("wt");
+        assert!(wt.join("tracked.txt").is_file());
+        // An explicit opt-out means plain git: ignored files never travel.
+        assert!(
+            !wt.join("heavy/blob").exists(),
+            "opt-out still carried the ignored cache"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cancellation_kills_process() {
         let directory = tempdir().unwrap();
         let tool = ShellTool::new();

@@ -13,6 +13,14 @@
 //! - **Minimizer**: enabled by default. The streamed chunks and the
 //!   `/api/shell` pages stay raw; only the model-facing settled text is the
 //!   minimized rendering when the engine produced one.
+//! - **Smart worktree (`PI_SMART_GIT`)**: on by default unless the host env
+//!   says otherwise. `git worktree add` then copy-on-write clones the source
+//!   checkout through pi-vcs — ignored build caches (target/, node_modules/)
+//!   come along, so a parallel worktree does not rebuild from zero — and
+//!   anything the layer does not support falls through to the plain git
+//!   binary. `PI_GIT_GUARD` (refusing stash/reset --hard/checkout in a shared
+//!   checkout) stays opt-in: the user decided it defaults to off, and the
+//!   host env passes straight through when they set it.
 
 use std::collections::HashMap;
 
@@ -25,9 +33,17 @@ pub fn shell() -> pi_shell::Shell {
     }))
 }
 
-/// The host process environment, frozen for one session.
+/// The host process environment, frozen for one session, plus ox's engine
+/// defaults for unset pi-shell switches.
+///
+/// pi-shell reads each switch from the session env first and the process env
+/// second, and treats `""`, `"0"` and `"false"` as off — so a host setting of
+/// `PI_SMART_GIT=0` survives this default instead of being overridden.
 fn env_snapshot() -> HashMap<String, String> {
-    std::env::vars().collect()
+    let mut env: HashMap<String, String> = std::env::vars().collect();
+    env.entry("PI_SMART_GIT".to_owned())
+        .or_insert_with(|| "1".to_owned());
+    env
 }
 
 /// Default-on minimizer: every built-in filter active, engine defaults for
