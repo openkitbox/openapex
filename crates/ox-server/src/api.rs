@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use salvo::http::StatusCode;
 use salvo::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use ox_core::config::Config;
 use ox_core::event_bus::EventBus;
@@ -20,11 +20,13 @@ use ox_schema::id::now_millis;
 
 pub mod compat;
 pub mod event;
+pub mod files;
 pub mod form;
 pub mod session;
 pub mod shell;
 pub mod skill;
 pub mod stats;
+pub mod vcs;
 
 /// Shared application state, injected via `salvo::affix_state`.
 #[derive(Clone)]
@@ -246,7 +248,14 @@ async fn worktree_list(req: &mut Request, depot: &mut Depot, res: &mut Response)
     let Some(state) = state(depot, res) else {
         return;
     };
-    let directory = worktree_directory(state, req).await;
+    let directory = worktree_directory(
+        state,
+        req,
+        req.query::<String>("projectID")
+            .as_deref()
+            .unwrap_or_default(),
+    )
+    .await;
     res.render(Json(crate::worktree::list(&directory).await));
 }
 
@@ -258,11 +267,109 @@ async fn worktree_refresh(res: &mut Response) {
     res.status_code(StatusCode::NO_CONTENT);
 }
 
+/// Upstream `Worktree.CreateInput` as the TUI sends it: `projectID` plus an
+/// optional name (`dialog-open.tsx:462`), with `from`/`branch`/`directory`
+/// available to other clients.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeCreateBody {
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    directory: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// Upstream `Worktree.RemoveInput`; `force` is required on the wire there, ox
+/// treats a missing value as `false` so a plain delete still works.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeRemoveBody {
+    #[serde(default)]
+    project_id: Option<String>,
+    directory: String,
+    #[serde(default)]
+    force: bool,
+}
+
+/// `POST /api/worktree` — create a linked checkout and tell the panel to
+/// refresh. Answers `Worktree.Info` (`{ directory }`), the exact field the TUI
+/// navigates to afterwards.
+#[handler] // operation_id: worktree.create
+async fn worktree_create(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(state) = state(depot, res) else {
+        return;
+    };
+    let Ok(body) = req.parse_json::<WorktreeCreateBody>().await else {
+        return session::invalid_request(res, "Invalid worktree create payload");
+    };
+    let project_id = body.project_id.clone().unwrap_or_default();
+    let directory = worktree_directory(state, req, &project_id).await;
+    let input = crate::worktree::CreateInput {
+        from: body.from,
+        branch: body.branch,
+        directory: body.directory,
+        name: body.name,
+    };
+    match crate::worktree::create(&directory, input).await {
+        Ok(created) => {
+            state.bus.broadcast_ephemeral(
+                "worktree.updated",
+                serde_json::json!({ "projectID": project_id }),
+                Some(&directory),
+            );
+            res.render(Json(serde_json::json!({ "directory": created })));
+        }
+        Err(failure) => worktree_error(res, failure),
+    }
+}
+
+/// `DELETE /api/worktree` — remove a linked checkout. A dirty checkout without
+/// `force` answers a `WorktreeError` carrying `forceRequired`, which is what the
+/// panel turns into its force-confirmation prompt.
+#[handler] // operation_id: worktree.remove
+async fn worktree_remove(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(state) = state(depot, res) else {
+        return;
+    };
+    let Ok(body) = req.parse_json::<WorktreeRemoveBody>().await else {
+        return session::invalid_request(res, "Invalid worktree remove payload");
+    };
+    match crate::worktree::remove(&body.directory, body.force).await {
+        Ok(()) => {
+            state.bus.broadcast_ephemeral(
+                "worktree.updated",
+                serde_json::json!({ "projectID": body.project_id.unwrap_or_default() }),
+                None,
+            );
+            res.status_code(StatusCode::NO_CONTENT);
+        }
+        Err(failure) => worktree_error(res, failure),
+    }
+}
+
+fn worktree_error(res: &mut Response, failure: crate::worktree::Failure) {
+    res.status_code(StatusCode::BAD_REQUEST);
+    let mut data = serde_json::Map::new();
+    data.insert("message".into(), failure.message.into());
+    if failure.force_required {
+        data.insert("forceRequired".into(), true.into());
+    }
+    res.render(Json(serde_json::json!({
+        "name": "WorktreeError",
+        "data": serde_json::Value::Object(data),
+    })));
+}
+
 /// The directory whose checkouts the requested project covers: the `project`
 /// row's canonical directory when the DB is shared with an upstream server,
 /// otherwise the directory the client asked about (`x-opencode-directory`).
-async fn worktree_directory(state: &AppState, req: &mut Request) -> String {
-    let requested = req.query::<String>("projectID").unwrap_or_default();
+async fn worktree_directory(state: &AppState, req: &mut Request, requested: &str) -> String {
     if !requested.is_empty() && state.db.table_exists("project").await.unwrap_or(false) {
         match query_projects(&state.db).await {
             Ok(rows) => {
@@ -539,12 +646,24 @@ pub fn build_router(state: AppState) -> Router {
                 .push(
                     Router::with_path("worktree")
                         .get(worktree_list)
+                        .post(worktree_create)
+                        .delete(worktree_remove)
                         .push(Router::with_path("refresh").post(worktree_refresh)),
                 )
                 .push(Router::with_path("model").get(model_list))
                 .push(Router::with_path("model/default").get(model_default))
                 .push(Router::with_path("agent").get(agent_list))
                 .push(Router::with_path("event").get(event::subscribe))
+                .push(Router::with_path("fs/read/{**path}").get(files::read))
+                .push(
+                    Router::with_path("vcs")
+                        .get(vcs::info)
+                        .push(Router::with_path("base").get(vcs::base))
+                        .push(Router::with_path("status").get(vcs::status))
+                        .push(Router::with_path("branch").get(vcs::branches))
+                        .push(Router::with_path("diff").get(vcs::diff))
+                        .push(Router::with_path("init").post(vcs::init)),
+                )
                 .push(compat::mount(Router::new()))
                 .push(Router::with_path("form").get(form::list))
                 .push(Router::with_path("skill").get(skill::list))
@@ -563,6 +682,13 @@ pub fn build_router(state: AppState) -> Router {
                         .post(session::wait_idle),
                 )
                 .push(Router::with_path("experimental/session/stats").get(stats::get))
+                .push(Router::with_path("experimental/session/import").post(session::import))
+                .push(
+                    Router::with_path("experimental/session/{sessionID}/export")
+                        .get(session::export),
+                )
+                .push(Router::with_path("experimental/session/{sessionID}/log").get(event::log))
+                .push(Router::with_path("session/{sessionID}/synthetic").post(session::synthetic))
                 .push(
                     Router::with_path("session")
                         .get(session::list)

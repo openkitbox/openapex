@@ -46,7 +46,7 @@ fn fallback_directory() -> String {
 
 /// `decodeURIComponent` semantics with upstream's raw fallback: `%XX` byte
 /// sequences decoded into a UTF-8 string; malformed input comes back as-is.
-fn percent_decode(input: &str) -> String {
+pub(crate) fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -134,29 +134,6 @@ pub(crate) async fn mcp_resource_catalog(req: &mut Request, depot: &mut Depot, r
     res.render(Json(envelope(
         &directory,
         json!({ "resources": resources, "templates": templates }),
-    )));
-}
-
-/// `GET /api/vcs` — upstream `vcs.get`: the directory's git branch read with
-/// a plain `git` invocation; not-a-repo degrades to empty branch names.
-#[handler] // operation_id: vcs.get
-pub(crate) async fn vcs_get(req: &mut Request, res: &mut Response) {
-    let directory = directory_of(req);
-    let command = tokio::process::Command::new("git")
-        .args(["-C", &directory, "rev-parse", "--abbrev-ref", "HEAD"])
-        .kill_on_drop(true)
-        .output();
-    // A wedged git helper must not park the endpoint; an empty branch is
-    // the documented degradation.
-    let current = match tokio::time::timeout(std::time::Duration::from_secs(2), command).await {
-        Ok(Ok(output)) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_owned()
-        }
-        _ => String::new(),
-    };
-    res.render(Json(envelope(
-        &directory,
-        json!({ "branch": { "current": current, "default": "" } }),
     )));
 }
 
@@ -271,7 +248,6 @@ pub(crate) fn mount(api: Router) -> Router {
     api.push(
         Router::new()
             .push(Router::with_path("config").get(config_get))
-            .push(Router::with_path("vcs").get(vcs_get))
             .push(Router::with_path("command").get(command_list))
             .push(Router::with_path("mcp").get(mcp_list))
             .push(Router::with_path("mcp/resource").get(mcp_resource_catalog))

@@ -119,7 +119,90 @@ pub(crate) async fn subscribe(req: &mut Request, depot: &mut Depot, res: &mut Re
     let bus: EventBus = state.bus.clone();
     // Guard against a zero interval spinning the select loop.
     let period = Duration::from_millis(state.config.event_heartbeat_ms.max(1));
+    stream(res, bus, period, cursor, None, true, true).await;
+}
 
+/// `GET /api/experimental/session/{sessionID}/log` — the session-scoped durable
+/// log the TUI's devtools bar reads (`session.log`, `follow=false` by default).
+///
+/// Upstream streams `SessionEvent.Durable | EventLog.Synced` items; ox reuses
+/// the `/api/event` frame vocabulary (envelopes carrying `type`, `created`,
+/// `data` and `durable`), which is what the devtools consumer reads
+/// (`component/devtools-bar.tsx:165`). `after` is the exclusive per-aggregate
+/// sequence and defaults to 0, so the first call replays the whole log.
+///
+/// Documented deviations: no `log.synced` marker (the only consumer skips it),
+/// and no heartbeats when streaming a finite log (`follow=false` ends after the
+/// replay, so there is nothing to keep alive).
+#[handler] // operation_id: session.log
+pub(crate) async fn log(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(state) = state(depot, res) else {
+        return;
+    };
+    let Some(session_id) = req.param::<String>("sessionID") else {
+        return invalid_cursor(res, "Missing sessionID");
+    };
+    if !session_exists(&state.db, &session_id).await {
+        res.status_code(StatusCode::NOT_FOUND);
+        return res.render(Json(json!({
+            "_tag": "SessionNotFoundError",
+            "sessionID": session_id,
+            "message": format!("Session not found: {session_id}"),
+        })));
+    }
+    // Absent `after` means "the whole log", and aggregate sequences start at
+    // 0 (`session.created`), so the inclusive start is -1; a supplied `after`
+    // stays exclusive.
+    let after = match req.query::<String>("after") {
+        None => -1,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(n) if n >= 0 => n,
+            _ => return invalid_cursor(res, "`after` must be a non-negative integer sequence"),
+        },
+    };
+    let follow = req
+        .query::<String>("follow")
+        .map(|raw| raw == "true" || raw == "1")
+        .unwrap_or(false);
+    let bus: EventBus = state.bus.clone();
+    let period = Duration::from_millis(state.config.event_heartbeat_ms.max(1));
+    stream(
+        res,
+        bus,
+        period,
+        Some((session_id.clone(), after)),
+        Some(session_id),
+        false,
+        follow,
+    )
+    .await;
+}
+
+async fn session_exists(db: &ox_db::Db, session_id: &str) -> bool {
+    let Ok(conn) = db.acquire().await else {
+        return false;
+    };
+    let Ok(mut stmt) = conn.prepare("SELECT 1 FROM session_v2 WHERE id = ?1").await else {
+        return false;
+    };
+    match stmt.query((session_id,)).await {
+        Ok(mut rows) => matches!(rows.next().await, Ok(Some(_))),
+        Err(_) => false,
+    }
+}
+
+/// Shared SSE plumbing: optional replay from `cursor`, then live forwarding
+/// (filtered to `only`'s aggregate when set) until the client goes away.
+#[allow(clippy::too_many_arguments)]
+async fn stream(
+    res: &mut Response,
+    bus: EventBus,
+    period: Duration,
+    cursor: Option<ReplayCursor>,
+    only: Option<String>,
+    connected: bool,
+    follow: bool,
+) {
     // Subscribe to the broadcast BEFORE the replay query runs (in the task
     // below): anything committed while the replay reads is buffered here and
     // deduplicated against the replayed range.
@@ -129,10 +212,12 @@ pub(crate) async fn subscribe(req: &mut Request, depot: &mut Depot, res: &mut Re
     tokio::spawn(async move {
         // Upstream sends `server.connected` immediately on connect (no
         // `created` field on this frame).
-        let connected =
-            json!({ "id": ox_schema::id::id("evt"), "type": "server.connected", "data": {} });
-        if tx.send(format!("data: {connected}\n\n")).await.is_err() {
-            return; // client already gone
+        if connected {
+            let frame =
+                json!({ "id": ox_schema::id::id("evt"), "type": "server.connected", "data": {} });
+            if tx.send(format!("data: {frame}\n\n")).await.is_err() {
+                return; // client already gone
+            }
         }
 
         // Replay the requested durable range, remembering where it ended.
@@ -157,6 +242,9 @@ pub(crate) async fn subscribe(req: &mut Request, depot: &mut Depot, res: &mut Re
                 }
             }
         }
+        if !follow {
+            return; // finite log: dropping `tx` ends the body
+        }
 
         // Live loop: forward broadcast events, emit heartbeats when idle.
         // interval_at (not interval) so the first heartbeat waits a full
@@ -172,6 +260,14 @@ pub(crate) async fn subscribe(req: &mut Request, depot: &mut Depot, res: &mut Re
                 }
                 event = live.recv() => match event {
                     Ok(env) => {
+                        if let Some(aggregate) = &only
+                            && env
+                                .durable
+                                .as_ref()
+                                .is_none_or(|durable| durable.aggregate_id != *aggregate)
+                        {
+                            continue;
+                        }
                         // Drop durable events the replay already delivered.
                         if let Some((aggregate_id, seq)) = &replayed
                             && let Some(durable) = &env.durable
