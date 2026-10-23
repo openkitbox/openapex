@@ -10,7 +10,6 @@ dashmap.workspace = true
 futures-core.workspace = true
 git2.workspace = true
 jiff.workspace = true
-ox-cbm.workspace = true
 ox-core.workspace = true
 ox-db.workspace = true
 ox-mcp.workspace = true

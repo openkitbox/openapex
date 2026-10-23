@@ -191,7 +191,9 @@ fn tool_kind(name: &str) -> ToolKind {
     match name {
         "read" | "glob" => ToolKind::Read,
         "edit" | "write" | "patch" | "diff" => ToolKind::Edit,
-        "grep" | "capability_search" | "search_graph" | "ctx_search" => ToolKind::Search,
+        "grep" | "capability_search" | "search_graph" | "codegraph_search_graph" | "ctx_search" => {
+            ToolKind::Search
+        }
         "shell" | "subagent" => ToolKind::Execute,
         "question" | "ctx_note" | "ctx_memory" => ToolKind::Think,
         "web_search" | "webfetch" => ToolKind::Fetch,

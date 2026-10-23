@@ -784,21 +784,6 @@ pub trait ToolRegistryExt {
     /// Called exactly once from `build_state_with`. Session scoping needs no
     /// dispatch change: `ToolContext` already carries `session_id`.
     fn register_mctx(&mut self, db: Db, embedder: Option<Arc<crate::mctx::embed::Embedder>>);
-
-    /// Register the CBM code-graph tools (`index_repository`, `search_graph`,
-    /// `trace_path`, `get_code_snippet`, `get_architecture`). Deliberately
-    /// separate from [`ToolRegistry::with_builtins`]:
-    ///
-    /// 1. The `codebase-memory-mcp` binary is optional, so the tools are
-    ///    registered only when it is discovered — at the composition root —
-    ///    keeping the advertised toolset unchanged on machines without it.
-    /// 2. The names are BARE names borrowed from the binary's own CLI
-    ///    contract so its error hints match verbatim; the borrow enters the
-    ///    registry here, in the module that owns the registration.
-    ///
-    /// Called exactly once from `run` when `ox_cbm::Cbm::discover`
-    /// finds the binary.
-    fn register_cbm(&mut self, cbm: ox_cbm::Cbm);
 }
 
 impl ToolRegistryExt for ToolRegistry {
@@ -813,10 +798,6 @@ impl ToolRegistryExt for ToolRegistry {
             Arc::new(crate::mctx::memory::CtxNoteTool::new(db.clone())),
             Arc::new(crate::mctx::search::CtxSearchTool::new(db, embedder)),
         ]);
-    }
-
-    fn register_cbm(&mut self, cbm: ox_cbm::Cbm) {
-        self.register_all(ox_cbm::tools::all(Arc::new(cbm)));
     }
 }
 

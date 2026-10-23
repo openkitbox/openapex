@@ -1,7 +1,6 @@
 [workspace]
 members = [
   "crates/ox-acp",
-  "crates/ox-cbm",
   "crates/ox-client",
   "crates/ox-core",
   "crates/ox-db",
@@ -46,7 +45,6 @@ libc = "0.2"
 mimalloc = { version = "0.1.52", features = ["no_thp"] }
 ox-client = { path = "crates/ox-client" }
 ox-acp = { path = "crates/ox-acp" }
-ox-cbm = { path = "crates/ox-cbm" }
 ox-core = { path = "crates/ox-core" }
 ox-db = { path = "crates/ox-db" }
 ox-engine = { path = "crates/ox-engine" }
@@ -101,7 +99,6 @@ anyhow.workspace = true
 # The façade re-exports every crate so `ox::…` stays one import path for
 # tests and the binary; the binary itself needs only a few of these.
 ox-acp.workspace = true
-ox-cbm.workspace = true
 ox-core.workspace = true
 ox-db.workspace = true
 ox-engine.workspace = true

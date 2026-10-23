@@ -4926,7 +4926,6 @@ dependencies = [
  "futures-core",
  "mimalloc",
  "ox-acp",
- "ox-cbm",
  "ox-core",
  "ox-db",
  "ox-engine",
@@ -4959,22 +4958,6 @@ dependencies = [
  "salvo",
  "serde_json",
  "tokio",
- "tracing",
-]
-
-[[package]]
-name = "ox-cbm"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ox-core",
- "ox-schema",
- "ox-tools",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-util",
  "tracing",
 ]
 
@@ -5032,7 +5015,6 @@ dependencies = [
  "futures-core",
  "git2",
  "jiff",
- "ox-cbm",
  "ox-core",
  "ox-db",
  "ox-mcp",
@@ -5089,7 +5071,6 @@ dependencies = [
  "dirs",
  "futures-core",
  "jiff",
- "ox-cbm",
  "ox-core",
  "ox-db",
  "ox-engine",

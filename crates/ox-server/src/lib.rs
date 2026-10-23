@@ -6,7 +6,6 @@
 pub mod api;
 pub(crate) mod worktree;
 
-pub use ox_cbm as cbm;
 pub use ox_core::{USER_AGENT, config, event_bus, model_catalog, projector};
 pub use ox_db as db;
 pub use ox_engine::{cardinal, mctx, prompt, runner};
@@ -181,17 +180,9 @@ pub async fn run(config: Config) -> Result<()> {
 /// own-mode (binds an ephemeral port and reports the real address).
 pub async fn compose(config: Config) -> Result<(AppState, Router)> {
     let mut tools = runner::ToolRegistry::with_builtins();
-    match cbm::Cbm::discover() {
-        Some(cbm) => tools.register_cbm(cbm),
-        None => tracing::info!(
-            "codebase-memory-mcp not found on PATH; code-graph tools disabled: \
-             index_repository, search_graph, trace_path, get_code_snippet, \
-             get_architecture. Install it on the server's PATH to enable them"
-        ),
-    }
     // The todowrite tool needs the DB (it resets the todo reminder budget and
     // the reminder scans the transcript), so it joins here at the composition
-    // root rather than in `with_builtins` — the same seam the CBM tools use.
+    // root rather than in `with_builtins`.
     // Tests that inject their own registry keep a deterministic toolset.
     // `subagent` joins the same way below: it needs the runner, which only
     // exists after `build_state_on`, so `run` registers it through the
