@@ -66,6 +66,9 @@ pub mod decay_render;
 /// Decay rendering and `m[0]`/`m[1]` synthetic-message composition.
 pub mod render;
 
+/// Temporal awareness: the per-message gap markers (`<!-- +1h 5m -->`).
+pub mod temporal;
+
 /// Model-window geometry: the pressure bands and the three token budgets every
 /// consumer measures against.
 pub mod budget;

@@ -2,13 +2,15 @@
 //!
 //! # Sources
 //!
-//! Four labels, three of them indexed:
+//! Five labels, four of them indexed:
 //!
 //! - `memory` — durable project facts (`mc_memory`),
 //! - `note` — session-scoped parked intentions (`mc_note`),
 //! - `compartment` — folded conversation summaries (`mc_compartments`),
 //! - `transcript` — raw `session_message` text the historian has NOT folded
-//!   yet (the plan's 会话历史 LIKE 回退).
+//!   yet (the plan's 会话历史 LIKE 回退),
+//! - `commit` — recent git history, read from the repository at query time
+//!   (see [`search_commits`]; there is no commit index).
 //!
 //! The first three are each served by their own Tantivy-backed FTS index
 //! (migration V7): `mc_memory_fts`, `mc_note_fts` and `mc_compartments_fts`.
@@ -19,6 +21,9 @@
 //! magic-context store. ox reads it directly with a case-insensitive `LIKE`
 //! over the message JSON — the plan's 会话历史 LIKE 回退, and the same shape as
 //! the reference's fallback when its raw-message index is unavailable.
+//! Commits are not indexed either: git already stores them, and a derived
+//! index would be a second source of truth to keep in sync for no benefit at
+//! this corpus size (see the deviation note below).
 //!
 //! # Index maintenance: none
 //!
@@ -49,6 +54,18 @@
 //! outranks one matching a single coincidental word. This also matches the
 //! reference's note lane, whose `LIKE` predicates are joined by `OR`.
 //!
+//! # Automatic recall (the per-turn hint)
+//!
+//! A turn's opening request may be preceded by a context the model does not
+//! expect: a memory, a parked note, a compartment folded out of the window.
+//! [`render_recall_block`] turns the top few hits for the prompt's own typed
+//! text into a compact `<recall>` block, and the step appends it to that same
+//! user message — so the hint lives in the per-turn tail of the request rather
+//! than in `system`/`m[0]`/`m[1]`, where it would rewrite the provider's cached
+//! prefix on every turn. Snippets are capped and never carry a body: a hint is
+//! a pointer, not an injection, and the model follows up with `ctx_search` /
+//! `ctx_expand` when it wants the whole thing.
+//!
 //! # Deviations from the reference (documented, not accidental)
 //!
 //! - **Semantic search only where it pays: the memory lane.** When
@@ -57,7 +74,18 @@
 //!   keep their index (`LIKE`/FTS) because their corpora are small and
 //!   session-scoped. There is no blended score: cosine either replaces the
 //!   memory lane's BM25 order or, with the embedder off, BM25 is what runs.
-//!   No auto-search hints, git-commit index or primers.
+//!   Automatic recall reuses the same lanes (see [`render_recall_block`]) but
+//!   runs without an embedder: the step that assembles a request has none, so
+//!   a hint is always lexical.
+//! - **Commit history is read at query time, never indexed.** The reference
+//!   offers an opt-in git-commit index (embeddings in a store table, kept in
+//!   sync as commits land). ox walks the newest
+//!   [`COMMIT_SCAN_LIMIT`] commits on `HEAD` with libgit2 and matches the
+//!   summary line lexically. Deriving the answer from the repository on demand
+//!   costs one revwalk and cannot drift; an index would need a sync mechanism,
+//!   a schema and a re-embedding path for a corpus that is already on disk.
+//!   The cost is the bound itself: a commit older than the window is not
+//!   found, and branches other than the checked-out one are not searched.
 //! - **No result suppression.** The reference hides memories already visible
 //!   in `<project-memory>` and messages still in the live tail; ox returns
 //!   every match with its id so the model can decide.
@@ -96,6 +124,17 @@ const MAX_LIMIT: usize = 25;
 const SOURCE_FETCH_LIMIT: i64 = 100;
 /// Milliseconds in one UTC day; `to` is the last millisecond of its day.
 const DAY_MS: i64 = 86_400_000;
+/// Seconds in one UTC day; the commit lane works in git's seconds.
+const SECONDS_PER_DAY: i64 = 86_400;
+/// Commits one search may walk back from `HEAD`. The walk is the whole cost of
+/// the lane, so it is bounded: history older than this window is not searched
+/// (see [`search_commits`]).
+const COMMIT_SCAN_LIMIT: usize = 500;
+/// The commit lane's score band. Commits rank below every indexed lane
+/// (memory 100, compartments 95/90, notes 80) and above the raw transcript
+/// (0): "why was this changed" is a secondary question next to the project's
+/// own facts and decisions, so an old commit is a hint rather than an answer.
+const COMMIT_SCORE: i64 = 50;
 
 // ---------------------------------------------------------------------------
 // Result model
@@ -112,6 +151,8 @@ pub(crate) enum Source {
     Compartment,
     /// Raw, not-yet-folded transcript (`session_message`).
     Transcript,
+    /// Recent git history on `HEAD`, read from the repository at query time.
+    Commit,
 }
 
 impl Source {
@@ -122,6 +163,7 @@ impl Source {
             Source::Note => "note",
             Source::Compartment => "compartment",
             Source::Transcript => "transcript",
+            Source::Commit => "commit",
         }
     }
 
@@ -132,6 +174,7 @@ impl Source {
             "note" => Some(Source::Note),
             "compartment" => Some(Source::Compartment),
             "transcript" => Some(Source::Transcript),
+            "commit" => Some(Source::Commit),
             _ => None,
         }
     }
@@ -139,11 +182,18 @@ impl Source {
 
 /// The set of sources a query may draw from, indexed by [`Source`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SourceFilter([bool; 4]);
+pub(crate) struct SourceFilter([bool; 5]);
 
 impl SourceFilter {
     /// Every source (the default when `sources` is omitted or empty).
-    pub(crate) const ALL: Self = Self([true; 4]);
+    pub(crate) const ALL: Self = Self([true; 5]);
+
+    /// The lanes automatic recall draws from: memories, notes and folded
+    /// compartments — context that can drift out of the live window without
+    /// the model noticing. Not the transcript (whatever is in the window is
+    /// already in the request) and not commit history (a different corpus,
+    /// and one the model asks about explicitly).
+    pub(crate) const RECALL: Self = Self([true, true, true, false, false]);
 
     fn contains(self, source: Source) -> bool {
         self.0[source as usize]
@@ -178,7 +228,8 @@ pub(crate) struct SearchHit {
     /// Which corpus the hit came from.
     pub(crate) source: Source,
     /// The source row's handle (`#N` bodies for memory/note; opaque id for
-    /// compartments; the message id for a transcript row).
+    /// compartments; the message id for a transcript row; the 7-character
+    /// short oid for a commit).
     pub(crate) id: String,
     /// A short window around the match.
     pub(crate) snippet: String,
@@ -227,6 +278,7 @@ impl SearchHit {
                 self.id,
                 self.ordinal.unwrap_or_default()
             ),
+            Source::Commit => format!("[{index}] [{source}] id={} scope={}", self.id, self.scope),
         }
     }
 }
@@ -315,6 +367,9 @@ pub(crate) async fn search(
     }
     if request.sources.contains(Source::Transcript) {
         ranked.extend(search_transcript(db, request, &tokens).await?);
+    }
+    if request.sources.contains(Source::Commit) {
+        ranked.extend(search_commits(request));
     }
     // Score is a per-source band, so `rank` is only ever compared between
     // two hits of the same source; `id` is the total tiebreak.
@@ -713,6 +768,125 @@ async fn search_transcript(
         .collect())
 }
 
+/// The commit lane: the newest [`COMMIT_SCAN_LIMIT`] commits on `HEAD` whose
+/// summary line (the first line of the message) contains every query token.
+///
+/// Work is bounded by the walk, not by the repository's age: at most
+/// [`COMMIT_SCAN_LIMIT`] commits are visited and at most
+/// [`SOURCE_FETCH_LIMIT`] matches are kept, so a call costs one revwalk and one
+/// snippet allocation per hit. Two documented limits follow from deriving
+/// instead of indexing:
+///
+/// - a commit older than the window is never found;
+/// - only `HEAD`'s history is walked, so a branch that has not been merged
+///   into the checked-out branch is not searched.
+///
+/// A project that is not a repository, or whose repository cannot be read, has
+/// no commits to search: the lane returns no hits rather than an error, since
+/// "no history" is an answer, not a failure.
+fn search_commits(request: &SearchRequest<'_>) -> Vec<RankedHit> {
+    let needles = commit_tokens(request.query);
+    if needles.is_empty() {
+        return Vec::new();
+    }
+    let Ok(repo) = git2::Repository::discover(request.project) else {
+        return Vec::new();
+    };
+    let mut walk = match repo.revwalk() {
+        Ok(walk) => walk,
+        Err(_) => return Vec::new(),
+    };
+    // Newest first, so the within-source rank is recency order. Sorting is set
+    // before the walk starts (libgit2 rejects a change once it has).
+    if walk.set_sorting(git2::Sort::TIME).is_err() || walk.push_head().is_err() {
+        return Vec::new();
+    }
+    let mut hits = Vec::new();
+    for oid in walk.take(COMMIT_SCAN_LIMIT) {
+        let Ok(oid) = oid else { continue };
+        let Ok(commit) = repo.find_commit(oid) else {
+            continue;
+        };
+        let time = commit.time().seconds();
+        if !in_range(time.saturating_mul(1000), request.from_ms, request.to_ms) {
+            continue;
+        }
+        let summary = commit_summary(commit.message().unwrap_or(""));
+        if !summary_matches(summary, &needles) {
+            continue;
+        }
+        let author = commit.author();
+        hits.push(SearchHit {
+            source: Source::Commit,
+            id: short_oid(oid),
+            snippet: format!(
+                "{} {}: {summary}",
+                author.name().unwrap_or("unknown"),
+                utc_date(time)
+            ),
+            score: COMMIT_SCORE,
+            scope: request.project.to_owned(),
+            category: None,
+            status: None,
+            title: Some(summary.to_owned()),
+            range: None,
+            ordinal: None,
+        });
+        if hits.len() == SOURCE_FETCH_LIMIT as usize {
+            break;
+        }
+    }
+    hits.into_iter()
+        .enumerate()
+        .map(|(rank, hit)| RankedHit { rank, hit })
+        .collect()
+}
+
+/// The commit lane's tokens: the query split on every non-alphanumeric
+/// character and lowercased.
+///
+/// Commits are matched lexically against one English summary line, so the
+/// punctuation that carries meaning in the FTS lanes (`_ . / : -`, see
+/// [`query_tokens`]) is a separator here, and one-character tokens are dropped
+/// because they match nearly every summary. Duplicates are dropped, preserving
+/// first-seen order.
+fn commit_tokens(query: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    for word in query.split(|ch: char| !ch.is_alphanumeric()) {
+        if word.chars().count() < 2 {
+            continue;
+        }
+        let token = word.to_lowercase();
+        if !tokens.contains(&token) {
+            tokens.push(token);
+        }
+    }
+    tokens
+}
+
+/// Whether every token appears in `summary`, case-insensitively. An empty token
+/// list matches nothing: there is no query to answer.
+fn summary_matches(summary: &str, needles: &[String]) -> bool {
+    if needles.is_empty() {
+        return false;
+    }
+    let lowered = summary.to_lowercase();
+    needles
+        .iter()
+        .all(|needle| lowered.contains(needle.as_str()))
+}
+
+/// The summary: the first line of a commit message, without trailing
+/// whitespace (git's `%s` for the common single-paragraph case).
+fn commit_summary(message: &str) -> &str {
+    message.lines().next().unwrap_or("").trim_end()
+}
+
+/// Git's abbreviated oid: the first seven hex characters.
+fn short_oid(oid: git2::Oid) -> String {
+    oid.to_string()[..7].to_owned()
+}
+
 /// The searchable text of one stored message row: the taggable parts joined
 /// by newlines, in part order — the same extraction [`crate::mctx::tagger`]
 /// tags, so a transcript hit covers exactly the text the model could have
@@ -916,7 +1090,7 @@ fn first_match(text: &str, query: &str) -> Option<(usize, usize)> {
 fn render_hits(query: &str, hits: &[SearchHit]) -> String {
     if hits.is_empty() {
         return format!(
-            "No results found for \"{query}\" across memories, notes, compartments, or transcript."
+            "No results found for \"{query}\" across memories, notes, compartments, transcript, or commits."
         );
     }
     let mut lines = vec![format!(
@@ -930,6 +1104,59 @@ fn render_hits(query: &str, hits: &[SearchHit]) -> String {
         lines.push(hit.snippet.clone());
     }
     lines.join("\n")
+}
+
+/// The most hits one recall block lists; the caller asks for at most this
+/// many, and the cap here keeps the line budget even if it does not.
+const RECALL_LINES: usize = 3;
+/// Characters of a hit's snippet a recall line keeps. A hint is a pointer: it
+/// is enough to recognize the match, never enough to stand in for it.
+const RECALL_SNIPPET_CHARS: usize = 200;
+
+/// Render the automatic-recall block for this turn's hits (`None` when there
+/// is nothing to recall).
+///
+/// The format is fixed: one `<recall>` element, one explanatory line, one
+/// `- [source] handle: snippet` line per hit, and nothing after the closing
+/// tag. The prose says the context was retrieved rather than quoted, so the
+/// model treats it as a weak hint instead of something the user asked about.
+pub(crate) fn render_recall_block(hits: &[SearchHit]) -> Option<String> {
+    if hits.is_empty() {
+        return None;
+    }
+    let hits = hits.iter().take(RECALL_LINES);
+    let mut lines: Vec<String> = Vec::with_capacity(RECALL_LINES + 3);
+    lines.push("<recall>".to_owned());
+    lines.push(
+        "Possibly relevant context retrieved automatically for this turn (the user did not quote it):"
+            .to_owned(),
+    );
+    for hit in hits {
+        // Memory and note ids print with the `#` handle `ctx_expand` takes
+        // (the `ctx_search` header's form); a compartment's id is already an
+        // opaque handle and is printed bare.
+        let mut line = format!("- [{}] ", hit.source.label());
+        if matches!(hit.source, Source::Memory | Source::Note) {
+            line.push('#');
+        }
+        line.push_str(&hit.id);
+        line.push_str(": ");
+        line.push_str(&recall_snippet(&hit.snippet));
+        lines.push(line);
+    }
+    lines.push("</recall>".to_owned());
+    Some(lines.join("\n"))
+}
+
+/// One recall line's snippet: whitespace (newlines included) collapsed to
+/// single spaces, the first [`RECALL_SNIPPET_CHARS`] characters kept, then
+/// XML-escaped — escaped last, so a memory body containing `<` or `&` can
+/// neither close the element nor read as markup, and the cap counts source
+/// characters rather than escape expansions.
+fn recall_snippet(snippet: &str) -> String {
+    let collapsed = snippet.split_whitespace().collect::<Vec<_>>().join(" ");
+    let capped: String = collapsed.chars().take(RECALL_SNIPPET_CHARS).collect();
+    super::historian::escape_xml_content(&capped)
 }
 
 // ---------------------------------------------------------------------------
@@ -975,6 +1202,8 @@ impl Tool for CtxSearchTool {
              - note — parked follow-ups with their recorded text; \"did we leave a follow-up\"\n\
              - compartment — folded conversation summaries; \"what did we decide earlier\"\n\
              - transcript — raw messages not yet folded; \"did we discuss this\"\n\
+             - commit — git history: scans the last 500 commits on HEAD, newest first, \
+             matching each commit's summary line; \"why was this changed\"\n\
              Use from/to to restrict every source to an inclusive UTC date range.",
             object_param(
                 vec![
@@ -1001,7 +1230,7 @@ impl Tool for CtxSearchTool {
                             "type": "array",
                             "items": {
                                 "type": "string",
-                                "enum": ["memory", "note", "compartment", "transcript"],
+                                "enum": ["memory", "note", "compartment", "transcript", "commit"],
                             },
                             "description": "Restrict to these sources; omitting it or \
                                             passing [] searches every source.",
@@ -1106,7 +1335,7 @@ fn parse_sources(input: &Value) -> std::result::Result<SourceFilter, String> {
         None | Some(Value::Null) => Ok(SourceFilter::ALL),
         Some(Value::Array(items)) if items.is_empty() => Ok(SourceFilter::ALL),
         Some(Value::Array(items)) => {
-            let mut filter = SourceFilter([false; 4]);
+            let mut filter = SourceFilter([false; 5]);
             for item in items {
                 let Some(name) = item.as_str() else {
                     return Err(format!(
@@ -1117,7 +1346,7 @@ fn parse_sources(input: &Value) -> std::result::Result<SourceFilter, String> {
                     Some(source) => filter.enable(source),
                     None => {
                         return Err(format!(
-                            "Error: unknown source '{name}' (memory, note, compartment, transcript)."
+                            "Error: unknown source '{name}' (memory, note, compartment, transcript, commit)."
                         ));
                     }
                 }
@@ -1198,4 +1427,332 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
     let day_of_year = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     era * 146_097 + day_of_era - 719_468
+}
+
+/// The UTC calendar date of a unix timestamp (seconds), as `YYYY-MM-DD`.
+///
+/// Used only for display, never for parsing, so integer arithmetic is enough:
+/// no calendar crate and no timezone database is involved. The timestamp is
+/// UTC by definition; git stores the author's offset, which the summary line
+/// deliberately does not show.
+fn utc_date(seconds: i64) -> String {
+    let (year, month, day) = civil_from_days(seconds.div_euclid(SECONDS_PER_DAY));
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// The proleptic-Gregorian calendar date of a day count since 1970-01-01
+/// (Howard Hinnant's `civil_from_days`, the inverse of [`days_from_civil`]).
+fn civil_from_days(days: i64) -> (i64, i64, i64) {
+    let days = days + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    };
+    (year + i64::from(month <= 2), month, day)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    /// A repository in a temp dir. Commits are written with libgit2 itself: no
+    /// `git` process, no global config, and the timestamps are whatever the
+    /// test says they are.
+    struct TestRepo {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl TestRepo {
+        fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().to_path_buf();
+            git2::Repository::init(&path).unwrap();
+            Self { _dir: dir, path }
+        }
+
+        /// One commit with an empty tree and `message`; returns its full oid.
+        fn commit(&self, message: &str, seconds: i64) -> String {
+            let repo = git2::Repository::open(&self.path).unwrap();
+            let builder = repo.treebuilder(None).unwrap();
+            let tree_oid = builder.write().unwrap();
+            let tree = repo.find_tree(tree_oid).unwrap();
+            let signature = git2::Signature::new(
+                "Test Author",
+                "test@example.com",
+                &git2::Time::new(seconds, 0),
+            )
+            .unwrap();
+            let parent = repo.head().ok().and_then(|head| head.peel_to_commit().ok());
+            let parents: Vec<&git2::Commit<'_>> = parent.iter().collect();
+            let oid = repo
+                .commit(
+                    Some("HEAD"),
+                    &signature,
+                    &signature,
+                    message,
+                    &tree,
+                    &parents,
+                )
+                .unwrap();
+            oid.to_string()
+        }
+
+        fn path(&self) -> &str {
+            self.path.to_str().unwrap()
+        }
+    }
+
+    fn request<'a>(project: &'a str, query: &'a str) -> SearchRequest<'a> {
+        SearchRequest {
+            project,
+            session_id: "ses_search_test",
+            query,
+            sources: SourceFilter::ALL,
+            limit: DEFAULT_LIMIT,
+            from_ms: None,
+            to_ms: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Pure
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn commit_tokens_lowercase_dedupe_and_drop_single_characters() {
+        assert_eq!(
+            commit_tokens("Fix FIX a b_Commit ctx-search"),
+            ["fix", "commit", "ctx", "search"]
+        );
+    }
+
+    #[test]
+    fn summary_matches_requires_every_token() {
+        let needles = commit_tokens("Memory BUDGET");
+        assert!(summary_matches("feat: add memory budget", &needles));
+        assert!(!summary_matches("feat: add memory accounting", &needles));
+        assert!(!summary_matches("feat: add budget", &needles));
+    }
+
+    #[test]
+    fn punctuation_only_query_yields_no_tokens_and_no_hits() {
+        assert!(commit_tokens("?!,.; ").is_empty());
+        assert!(commit_tokens("").is_empty());
+        let repo = TestRepo::new();
+        repo.commit("feat: add memory budget", 1_600_000_000);
+        assert!(search_commits(&request(repo.path(), "?!,.; ")).is_empty());
+    }
+
+    #[test]
+    fn utc_dates_are_exact_for_leap_days_and_the_epoch() {
+        assert_eq!(utc_date(0), "1970-01-01");
+        assert_eq!(utc_date(1_600_000_000), "2020-09-13");
+        assert_eq!(utc_date(-86_400), "1969-12-31");
+        // 2000-02-29 00:00:00 UTC: a leap day in a century-divisible year.
+        assert_eq!(utc_date(951_782_400), "2000-02-29");
+    }
+
+    // -----------------------------------------------------------------------
+    // Automatic recall
+    // -----------------------------------------------------------------------
+
+    fn hit(source: Source, id: &str, snippet: &str) -> SearchHit {
+        SearchHit {
+            source,
+            id: id.to_owned(),
+            snippet: snippet.to_owned(),
+            score: 0,
+            scope: "scope".to_owned(),
+            category: None,
+            status: None,
+            title: None,
+            range: None,
+            ordinal: None,
+        }
+    }
+
+    #[test]
+    fn no_hits_render_no_recall_block() {
+        assert_eq!(render_recall_block(&[]), None);
+    }
+
+    #[test]
+    fn recall_block_lists_one_line_per_hit() {
+        let hits = [
+            hit(Source::Memory, "3", "the budget keeps the pinboard small"),
+            hit(Source::Note, "7", "revisit the fold threshold"),
+            hit(Source::Compartment, "cmp_1", "we decided to fold at 60%"),
+        ];
+        let block = render_recall_block(&hits).unwrap();
+        let lines: Vec<&str> = block.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "<recall>",
+                "Possibly relevant context retrieved automatically for this turn (the user did \
+                 not quote it):",
+                "- [memory] #3: the budget keeps the pinboard small",
+                "- [note] #7: revisit the fold threshold",
+                "- [compartment] cmp_1: we decided to fold at 60%",
+                "</recall>",
+            ]
+        );
+        assert!(block.starts_with("<recall>\n"));
+        assert!(block.ends_with("</recall>"));
+        assert!(!block.ends_with('\n'));
+    }
+
+    #[test]
+    fn recall_block_keeps_at_most_three_lines() {
+        let hits = [
+            hit(Source::Memory, "1", "one"),
+            hit(Source::Memory, "2", "two"),
+            hit(Source::Memory, "3", "three"),
+            hit(Source::Memory, "4", "four"),
+        ];
+        let block = render_recall_block(&hits).unwrap();
+        assert_eq!(block.matches("- [memory]").count(), RECALL_LINES);
+        assert!(!block.contains("four"));
+    }
+
+    #[test]
+    fn recall_snippets_collapse_newlines_and_escape_markup() {
+        let hits = [hit(
+            Source::Memory,
+            "9",
+            "first line\nsecond line <recall> & more",
+        )];
+        let block = render_recall_block(&hits).unwrap();
+        assert!(block.contains("- [memory] #9: first line second line &lt;recall&gt; &amp; more"));
+        assert_eq!(block.matches('\n').count(), 3);
+    }
+
+    #[test]
+    fn recall_snippets_are_capped_at_the_character_budget() {
+        let long = "x".repeat(RECALL_SNIPPET_CHARS + 50);
+        let hits = [hit(Source::Memory, "1", &long)];
+        let block = render_recall_block(&hits).unwrap();
+        let line = block.lines().nth(2).unwrap();
+        let snippet = line.strip_prefix("- [memory] #1: ").unwrap();
+        assert_eq!(snippet.chars().count(), RECALL_SNIPPET_CHARS);
+    }
+
+    #[test]
+    fn recall_truncation_never_splits_a_multibyte_character() {
+        let long = "é".repeat(RECALL_SNIPPET_CHARS + 10);
+        let hits = [hit(Source::Note, "2", &long)];
+        let block = render_recall_block(&hits).unwrap();
+        let line = block.lines().nth(2).unwrap();
+        let snippet = line.strip_prefix("- [note] #2: ").unwrap();
+        assert_eq!(snippet.chars().count(), RECALL_SNIPPET_CHARS);
+        assert!(snippet.chars().all(|ch| ch == 'é'));
+    }
+
+    // -----------------------------------------------------------------------
+    // Repo-backed
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn only_matching_summaries_are_hits_and_ids_are_short_oids() {
+        let repo = TestRepo::new();
+        repo.commit("chore: bootstrap repo", 1_600_000_000);
+        let wanted = repo.commit("feat: add memory budget", 1_600_000_100);
+        let hits = search_commits(&request(repo.path(), "memory budget"));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].hit.source, Source::Commit);
+        assert_eq!(hits[0].hit.id, wanted[..7]);
+        assert_eq!(
+            hits[0].hit.title.as_deref(),
+            Some("feat: add memory budget")
+        );
+        assert_eq!(
+            hits[0].hit.snippet,
+            "Test Author 2020-09-13: feat: add memory budget"
+        );
+        assert_eq!(hits[0].hit.scope, repo.path());
+    }
+
+    #[test]
+    fn the_commit_body_is_not_searched() {
+        let repo = TestRepo::new();
+        repo.commit(
+            "feat: pinboard sizing\n\nadds the memory cache",
+            1_600_000_000,
+        );
+        assert!(search_commits(&request(repo.path(), "memory cache")).is_empty());
+    }
+
+    #[test]
+    fn non_repository_directory_yields_no_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(git2::Repository::discover(dir.path()).is_err());
+        let path = dir.path().to_str().unwrap();
+        assert!(search_commits(&request(path, "memory budget")).is_empty());
+    }
+
+    #[test]
+    fn matches_are_ranked_newest_first() {
+        let repo = TestRepo::new();
+        let old = repo.commit("feat: memory budget v1", 1_500_000_000);
+        let new = repo.commit("feat: memory budget v2", 1_600_000_000);
+        let hits = search_commits(&request(repo.path(), "memory budget"));
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].hit.id, new[..7]);
+        assert_eq!(hits[0].rank, 0);
+        assert_eq!(hits[1].hit.id, old[..7]);
+        assert_eq!(hits[1].rank, 1);
+    }
+
+    #[test]
+    fn date_window_excludes_older_commits() {
+        let repo = TestRepo::new();
+        let old = repo.commit("feat: memory budget v1", 1_500_000_000);
+        let new = repo.commit("feat: memory budget v2", 1_600_000_000);
+        let mut request = request(repo.path(), "memory budget");
+        request.from_ms = Some(1_550_000_000_000);
+        let hits = search_commits(&request);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].hit.id, new[..7]);
+        assert_ne!(new[..7], old[..7]);
+    }
+
+    #[tokio::test]
+    async fn sources_commit_alone_skips_the_indexed_lanes() {
+        let repo = TestRepo::new();
+        repo.commit("feat: add memory budget", 1_600_000_000);
+        let db = Db::open_in_memory().await.unwrap();
+        crate::mctx::memory::write_memory(
+            &db,
+            repo.path(),
+            "the memory budget keeps the pinboard small",
+            "ARCHITECTURE",
+        )
+        .await
+        .unwrap();
+
+        let mut everything = request(repo.path(), "memory budget");
+        everything.limit = MAX_LIMIT;
+        let hits = search(&db, None, &everything).await.unwrap();
+        assert!(hits.iter().any(|hit| hit.source == Source::Memory));
+        assert!(hits.iter().any(|hit| hit.source == Source::Commit));
+
+        let mut commits_only = request(repo.path(), "memory budget");
+        commits_only.sources = SourceFilter([false; 5]);
+        commits_only.sources.enable(Source::Commit);
+        let hits = search(&db, None, &commits_only).await.unwrap();
+        assert!(!hits.is_empty());
+        assert!(hits.iter().all(|hit| hit.source == Source::Commit));
+    }
 }

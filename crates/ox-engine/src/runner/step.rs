@@ -60,9 +60,10 @@ use crate::cardinal::CardinalError;
 use crate::cardinal::chat::BoxChatStream;
 use crate::cardinal::stream::StreamEvent;
 use crate::cardinal::wire::{
-    ChatMessage, ChatRequest, FunctionCall, FunctionType, ImageUrl, ToolCall, Usage, UserPart,
-    reasoning_effort_of,
+    ChatMessage, ChatRequest, FunctionCall, FunctionType, ImageUrl, ToolCall, Usage, UserContent,
+    UserPart, reasoning_effort_of,
 };
+use crate::mctx::{search, temporal};
 use crate::prompt;
 use ox_core::copied_tags::strip_copied_tag_notation;
 use ox_schema::event::SessionEventData;
@@ -92,6 +93,11 @@ const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(250);
 /// continuation prompt published after an interrupted stream so the model
 /// resumes where it left off.
 const CONTINUE_AFTER_INCOMPLETE_STREAM: &str = "The previous response was interrupted. Continue from where you left off without repeating completed content.";
+/// Hits automatic recall may attach to one turn (the hint's line budget).
+const RECALL_LIMIT: usize = 3;
+/// Shortest typed prompt worth searching. A greeting or a `/clear` retrieves
+/// nothing, and every turn that clears this bar pays one indexed query.
+const RECALL_MIN_QUERY_CHARS: usize = 8;
 
 /// Terminal states of one step, consumed by the drain loop.
 #[derive(Debug)]
@@ -265,6 +271,57 @@ pub(crate) async fn run(
                     chat_messages.insert(at, delta);
                 }
                 _ => chat_messages.push(delta),
+            }
+        }
+        // Automatic recall: the turn's opening request gets the top few
+        // memories/notes/compartments matching the prompt's own typed text, as
+        // one compact `<recall>` block appended to that user message.
+        //
+        // The hint rides only the first request of a turn: both the trailing
+        // transcript row and the trailing chat message must be that prompt (a
+        // later step ends with tool output, and any row pushed after the prompt
+        // means this request is not the opening one). So a long tool loop pays
+        // at most one extra prefill of the trailing user message — the message
+        // the block disappeared from on step 2 — and NO stored row is touched:
+        // the bytes exist for this request only, and re-rendering the same rows
+        // yields the same content again. Putting it in the tail rather than
+        // `system`/`m[0]`/`m[1]` is what keeps the cached prefix intact.
+        if ctx.config.magic_context.enabled
+            && matches!(chat_messages.last(), Some(ChatMessage::User { .. }))
+            && let Some(query) = recall_query(&rows)
+        {
+            let project = ctx.directory.to_string_lossy();
+            let request = search::SearchRequest {
+                project: project.as_ref(),
+                session_id: &ctx.session_id,
+                query: &query,
+                sources: search::SourceFilter::RECALL,
+                limit: RECALL_LIMIT,
+                from_ms: None,
+                to_ms: None,
+            };
+            // No embedder on this path (it belongs to the `ctx_search` tool), so
+            // a hint is lexical. A failed query is silent by design: a turn must
+            // never stall or fail because a hint could not be retrieved, and the
+            // request is still well-formed without it.
+            match search::search(&ctx.db, None, &request).await {
+                Ok(hits) => {
+                    if let Some(block) = search::render_recall_block(&hits)
+                        && let Some(ChatMessage::User {
+                            content: UserContent::Text(text),
+                        }) = chat_messages.last_mut()
+                    {
+                        // Move the text out and put the appended version back:
+                        // the only string this path rewrites is that one, and it
+                        // is not cloned on the way. A parts-list user turn (prompt
+                        // + media) keeps its bytes: the block is plain text.
+                        let content = std::mem::take(text);
+                        *text = append_recall(content, &block);
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(session = %ctx.session_id, error = %error, "automatic recall failed");
+                }
             }
         }
         let mut request = ChatRequest::new(
@@ -1338,6 +1395,17 @@ pub(crate) fn compaction_boundary(messages: &[Message]) -> usize {
         .unwrap_or(0)
 }
 
+/// The effective end of a row for gap measurement (upstream
+/// `effectiveEndMs`): an assistant's completion once it settled, otherwise its
+/// creation. Shell rows use `created` too — they never reach the wire, and
+/// their tool output replays through the assistant row that called them.
+fn effective_end_ms(message: &Message) -> i64 {
+    match message {
+        Message::Assistant(assistant) => assistant.time.completed.unwrap_or(assistant.time.created),
+        other => other.time_created(),
+    }
+}
+
 /// Build the OpenAI message list: the static system layer, the frozen
 /// instruction layer, then the session transcript in `seq` order. An empty
 /// instruction layer is filtered (upstream `baseTranscript`).
@@ -1364,6 +1432,9 @@ pub(crate) fn compaction_boundary(messages: &[Message]) -> usize {
 ///   skipped, and history selection starts at the latest completed row
 ///   anyway (upstream `SessionHistory` boundary).
 /// - idle/shell/switch markers never reach the model.
+/// - A `user` turn more than [`temporal::TEMPORAL_THRESHOLD_SECONDS`] after the
+///   previous row's effective end is prefixed with `<!-- +2h -->\n`
+///   (temporal awareness; the marker is never stored).
 pub(crate) fn build_chat_messages(
     system_static: &str,
     instructions: &str,
@@ -1390,15 +1461,38 @@ pub(crate) fn build_chat_messages(
             content: (*half).to_owned().into(),
         });
     }
+    // Temporal awareness (upstream `injectTemporalMarkers`): a user turn whose
+    // gap from the previous row's effective end crosses the threshold gets a
+    // `<!-- +2h -->` prefix. The marker is request-side rendering only and is
+    // never stored, so re-rendering the same rows yields the same bytes and
+    // there is no double-injection path. `prev_end_ms` starts empty: the head
+    // halves stand in for an unknown span, so the first row above them has no
+    // predecessor to measure against.
+    let mut prev_end_ms: Option<i64> = None;
     for message in messages.iter().skip(boundary) {
+        // Every row advances the cursor, including rows the wire drops
+        // (upstream `collectTemporalCandidates` sets `prev = msg`
+        // unconditionally).
+        let previous_end_ms = prev_end_ms;
+        prev_end_ms = Some(effective_end_ms(message));
         match message {
-            Message::User { prompt, .. } => {
+            Message::User { prompt, time, .. } => {
                 let content = user_message_content(prompt);
                 if content.is_empty() {
                     // Upstream: a user message with no assembled content is
                     // omitted from the transcript.
                     continue;
                 }
+                // Deliberate deviation: only an authored `user` row is marked.
+                // `synthetic`/`skill` rows are host notices, not spans of human
+                // time (upstream's `hasMeaningfulUserText` sees its notices as
+                // user parts; ox tells them apart by row type).
+                let content = match previous_end_ms
+                    .and_then(|previous| temporal::marker_prefix((time.created - previous) / 1000))
+                {
+                    Some(prefix) => prefix + &content,
+                    None => content,
+                };
                 out.push(ChatMessage::User {
                     content: content.into(),
                 });
@@ -1544,6 +1638,35 @@ pub(crate) fn build_chat_messages(
         }
     }
     out
+}
+
+/// The typed text that opens the current turn, when this request is that
+/// turn's opening request: `None` unless the transcript's trailing row is the
+/// user prompt (a later step trails tool output) and it carries enough text to
+/// retrieve anything.
+///
+/// The rows are the request *view*, so their text carries the overlay's `§N§`
+/// prefix. That prefix is not something the user typed: leaving it in would
+/// make its number a query token (the tagger's `§1§` becomes the word `1`) and
+/// every turn would match whatever the corpus says about that number. The same
+/// strip the persistence boundary applies removes it.
+fn recall_query(rows: &[Message]) -> Option<String> {
+    let Some(Message::User { prompt, .. }) = rows.last() else {
+        return None;
+    };
+    let typed = strip_copied_tag_notation(&prompt.text);
+    let text = typed.trim();
+    (text.chars().count() >= RECALL_MIN_QUERY_CHARS).then(|| text.to_owned())
+}
+
+/// Append the recall block to a user message's content: one blank line between
+/// the prompt and the block, no trailing newline.
+fn append_recall(mut content: String, block: &str) -> String {
+    if !content.is_empty() {
+        content.push_str("\n\n");
+    }
+    content.push_str(block);
+    content
 }
 
 /// Per-step keyed-instruction sync: diff current sources against what the
@@ -1852,4 +1975,217 @@ pub(crate) fn decode_row(value: &serde_json::Value) -> Result<Message> {
         .and_then(serde_json::Value::as_str)
         .context("session_message row without a type")?;
     Ok(Message::from_row_data(id, kind, value.clone())?)
+}
+
+#[cfg(test)]
+mod temporal_tests {
+    use super::*;
+    use ox_schema::message::{AssistantMessage, AssistantTime, TimeCreated};
+    use ox_schema::support::ModelRef;
+
+    fn user_at(id: &str, created: i64, text: &str) -> Message {
+        Message::User {
+            id: id.to_owned(),
+            metadata: None,
+            time: TimeCreated { created },
+            prompt: Prompt {
+                text: text.to_owned(),
+                files: None,
+                agents: None,
+                skills: None,
+            },
+        }
+    }
+
+    fn assistant_at(id: &str, created: i64, completed: Option<i64>) -> Message {
+        Message::Assistant(Box::new(AssistantMessage {
+            id: id.to_owned(),
+            metadata: None,
+            time: AssistantTime {
+                created,
+                streamed: None,
+                completed,
+            },
+            agent: "build".to_owned(),
+            model: ModelRef {
+                id: "test-model".to_owned(),
+                provider_id: "test".to_owned(),
+                variant: None,
+            },
+            content: vec![AssistantContent::Text {
+                text: "done".to_owned(),
+                state: None,
+            }],
+            snapshot: None,
+            finish: None,
+            raw_finish: None,
+            provider_state: None,
+            cost: None,
+            tokens: None,
+            error: None,
+            retry: None,
+        }))
+    }
+
+    fn synthetic_at(id: &str, created: i64, text: &str) -> Message {
+        Message::Synthetic {
+            id: id.to_owned(),
+            metadata: None,
+            time: TimeCreated { created },
+            text: text.to_owned(),
+            description: None,
+        }
+    }
+
+    fn build(messages: &[Message], head: &[Option<&str>]) -> Vec<ChatMessage> {
+        build_chat_messages("system", "", head, messages)
+    }
+
+    fn user_contents(chat: &[ChatMessage]) -> Vec<String> {
+        chat.iter()
+            .filter_map(|message| match message {
+                ChatMessage::User { content } => Some(content.as_str().to_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_two_hour_gap_marks_the_second_authored_turn_only() {
+        let messages = [
+            user_at("u1", 0, "first"),
+            assistant_at("a1", 1_000, Some(2_000)),
+            user_at("u2", 7_202_000, "second"),
+        ];
+        let contents = user_contents(&build(&messages, &[None]));
+        assert_eq!(contents, vec!["first", "<!-- +2h -->\nsecond"]);
+    }
+
+    #[test]
+    fn a_sub_threshold_gap_leaves_the_bytes_untouched() {
+        let messages = [
+            user_at("u1", 0, "first"),
+            assistant_at("a1", 1_000, Some(2_000)),
+            // Four minutes after the assistant completed.
+            user_at("u2", 242_000, "second"),
+        ];
+        let contents = user_contents(&build(&messages, &[None]));
+        assert_eq!(contents, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn the_gap_is_measured_from_the_assistants_completion() {
+        let messages = [
+            user_at("u1", 0, "first"),
+            // Created an hour before it completed: from `created` the gap to
+            // `u2` is 3660 s (`+1h 1m`); from `completed` it is 60 s (no
+            // marker).
+            assistant_at("a1", 1_000, Some(3_601_000)),
+            user_at("u2", 3_661_000, "second"),
+        ];
+        let contents = user_contents(&build(&messages, &[None]));
+        assert_eq!(contents, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn a_synthetic_row_never_receives_a_marker() {
+        let messages = [
+            user_at("u1", 0, "first"),
+            synthetic_at("s1", 7_201_000, "notice"),
+        ];
+        let contents = user_contents(&build(&messages, &[None]));
+        assert_eq!(contents, vec!["first", "notice"]);
+    }
+
+    #[test]
+    fn the_first_row_after_the_head_halves_has_no_marker() {
+        let messages = [
+            user_at("u1", 7_201_000, "first"),
+            assistant_at("a1", 7_202_000, Some(7_203_000)),
+            user_at("u2", 14_404_000, "second"),
+        ];
+        let contents = user_contents(&build(&messages, &[Some("m0"), Some("m1")]));
+        assert_eq!(contents, vec!["m0", "m1", "first", "<!-- +2h -->\nsecond"]);
+    }
+}
+
+#[cfg(test)]
+mod recall_tests {
+    use super::*;
+    use ox_schema::message::TimeCreated;
+
+    fn user_at(text: &str) -> Message {
+        Message::User {
+            id: "u1".to_owned(),
+            metadata: None,
+            time: TimeCreated { created: 0 },
+            prompt: Prompt {
+                text: text.to_owned(),
+                files: None,
+                agents: None,
+                skills: None,
+            },
+        }
+    }
+
+    /// A trailing row that is not the opening prompt (later steps end with the
+    /// assistant's tool output, and a steer can land behind the prompt).
+    fn assistant_at() -> Message {
+        Message::Synthetic {
+            id: "s1".to_owned(),
+            metadata: None,
+            time: TimeCreated { created: 1 },
+            text: "tool output".to_owned(),
+            description: None,
+        }
+    }
+
+    #[test]
+    fn a_trailing_user_row_is_the_recall_candidate() {
+        let rows = [assistant_at(), user_at("  where is the retrieval index  ")];
+        assert_eq!(
+            recall_query(&rows).as_deref(),
+            Some("where is the retrieval index")
+        );
+    }
+
+    #[test]
+    fn the_overlay_tag_prefix_is_not_part_of_the_query() {
+        // The request view prefixes every item with `§N§ `; the tag's number
+        // must not become a search term of its own.
+        let rows = [user_at("§12§ where is the retrieval index")];
+        assert_eq!(
+            recall_query(&rows).as_deref(),
+            Some("where is the retrieval index")
+        );
+    }
+
+    #[test]
+    fn a_trailing_non_user_row_has_no_candidate() {
+        let rows = [user_at("where is the retrieval index"), assistant_at()];
+        assert_eq!(recall_query(&rows), None);
+        assert_eq!(recall_query(&[]), None);
+    }
+
+    #[test]
+    fn a_prompt_below_the_text_budget_is_skipped() {
+        // Seven characters trims below the bound; eight passes.
+        assert_eq!(recall_query(&[user_at("  seven ")]), None);
+        assert_eq!(
+            recall_query(&[user_at("  eight ok ")]).as_deref(),
+            Some("eight ok")
+        );
+    }
+
+    #[test]
+    fn recall_is_appended_after_one_blank_line() {
+        assert_eq!(
+            append_recall("prompt".to_owned(), "<recall></recall>"),
+            "prompt\n\n<recall></recall>"
+        );
+        assert_eq!(
+            append_recall(String::new(), "<recall></recall>"),
+            "<recall></recall>"
+        );
+    }
 }

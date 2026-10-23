@@ -3,9 +3,12 @@
 //! The dreamer is the only place in ox where a model is asked to *maintain*
 //! the memory store instead of answering a user turn. A tick enumerates the
 //! projects that have memories, and for every due `(project, task)` pair runs
-//! one task: `verify` (memory vs. code) and `curate` (duplicate/stale
-//! consolidation). Results are applied host-side through
-//! [`crate::mctx::memory`]'s store functions, never by the model.
+//! one task: `verify` (memory vs. code), `curate` (duplicate/stale
+//! consolidation), `classify` (importance scoring for the injection budget),
+//! `retrospective` (durable lessons from the user's own turns) and
+//! `surface_notes` (parked smart notes whose condition now holds). Results are
+//! applied host-side through [`crate::mctx::memory`]'s store functions, never by
+//! the model.
 //!
 //! # Port map (reference → ox)
 //!
@@ -74,6 +77,26 @@
 //! - **`verify` prompt** — `dreamer/verify-prompt.ts::VERIFY_SYSTEM_PROMPT`
 //!   (line 23): three of its four verdicts, the present-tense update rule, the
 //!   directive restriction, and "be conservative about archiving".
+//! - **`classify` scores without rendering** — `dreamer.md` ("classify") and the
+//!   reference's classify task: one hidden completion scores the pool's
+//!   importance, and its only effect is a column update ("do not disturb the
+//!   live prompt cache"). ox writes `mc_memory.importance`, which the
+//!   pinboard's *selection* reads and its *render* never prints, so a
+//!   classification changes no prompt byte.
+//! - **`retrospective` reads the user's own turns** — `dreamer.md`
+//!   ("retrospective"): the durable-lesson pass. ox scopes it to at most one
+//!   lesson per run over the project's recent user messages, and writes it
+//!   through [`memory::write_memory`] — the same row `ctx_memory` writes, so
+//!   there is one memory path, not two.
+//! - **`surface_notes` judges conditions against the user's turns** —
+//!   `dreamer.md` ("`evaluate-n-notes` compiles n-note conditions into checks,
+//!   runs them in a sandbox and surfaces notes whose condition holds") and
+//!   `memory-and-search.md` ("when the condition holds, the note is surfaced to
+//!   the session"). The host side is the same: parked notes in, a list of ids
+//!   out, applied through the note store. The gate is a cheap count and the
+//!   evidence is the same user-turn window `retrospective` reads, so a project
+//!   with no parked note and a project with no new activity both cost zero
+//!   model calls.
 //! - **Failure classes** — `provider-output-failure.ts` /
 //!   `dreamer.md` ("Failure records": `provider_timeout`, `provider_error`,
 //!   `empty_completion`, `no_models`, `child_aborted`, `parse_failed`,
@@ -87,7 +110,7 @@
 //!
 //! - **Interval, not cron.** The reference stores one cron string per task
 //!   (`dreamer/task-config.ts`) and runs each task at its own cadence (most
-//!   nightly, `curate` weekly). ox runs both tasks on the single
+//!   nightly, `curate` weekly). ox runs every task on the single
 //!   `dreamer_interval_minutes` tick. Cron parsing, per-task schedules and the
 //!   `/ctx-dream` manual trigger are out of scope for the MVP.
 //! - **One in-process task at a time, no leases.** The reference takes a
@@ -161,12 +184,37 @@
 //! - **No user-profile rule.** `curate-memory-safety.ts`'s
 //!   `user-profile-is-not-project-memory` guards a cross-project profile ox
 //!   does not have (explicitly out of scope).
-//! - **Not ported at all:** the other ten reference tasks, doc proposals,
-//!   smart notes, primers, the mural, `classify`, token budgets, model
-//!   fallback chains, `retrospective` watermarks, and the
-//!   `MC-D09`/`MC-S05` status reporting.
+//! - **`surface_notes` is one completion, not a compiled check.** The
+//!   reference compiles a note's condition into a check and runs it in a
+//!   sandbox (`evaluate-n-notes`), standing down in favour of a scheduled-wake
+//!   daemon when one exists. ox has neither a sandbox nor a daemon: the
+//!   condition is natural-language, the evidence is the project's recent user
+//!   turns, and the judge is the same hidden completion the other tasks use. A
+//!   condition phrased as something a shell command could decide is therefore
+//!   judged by reading, not by running — which is why the prompt tells the
+//!   checker to leave anything it cannot decide parked.
+//! - **A backlog larger than the batch can outrun its evidence.** The batch is
+//!   the 20 lowest handles, and the evidence window is the turns since the last
+//!   completed sweep, so a note queued behind twenty others is judged only
+//!   against turns from after the sweep that skipped it. A condition whose
+//!   evidence was one specific past turn can therefore go unjudged; the failure
+//!   direction is safe — the note stays parked — and a sweep that did not run at
+//!   all never advances the window, so the evidence survives a failure.
+//! - **A project with notes but no memories is not swept.** The tick enumerates
+//!   the projects that hold active memories
+//!   ([`memory::projects_with_active_memories`]), so a project whose only
+//!   durable text is parked notes never reaches `surface_notes`. Enumerating
+//!   note projects as well would put every task's cheap gate into projects the
+//!   dreamer has never seen — a scheduling change this task does not make, so
+//!   the limitation is recorded instead.
+//! - **Not ported at all:** the reference's remaining tasks (doc proposals,
+//!   primers, the mural, user-memory review), `scope`/`shareable` on classify
+//!   (single project model, no consumer), token budgets, model fallback chains,
+//!   and the `MC-D09`/`MC-S05` status reporting. `retrospective` uses the same
+//!   `last_run_at` watermark as every other task (one unswept window per run)
+//!   rather than the reference's per-task cursor set.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, UNIX_EPOCH};
@@ -256,31 +304,142 @@ Rules:
 - <merge> needs at least two ids and the consolidated text; <archive> needs a reason.
 - A run that changes nothing is a valid answer: emit an empty <curate></curate>.";
 
+/// The classify task's prefixed completion prompt. The output is a strict JSON
+/// object because the only effect is a numeric column: there is no manifest to
+/// apply, no text to store, and nothing the model may write itself.
+const CLASSIFY_SYSTEM_PROMPT: &str = "You are a memory classifier for the magic-context system. You score a project's memories by importance.
+
+IMPORTANCE is how much the fact deserves a permanent slot in every future request's prefix:
+- 90-100: a rule the agent must never violate (a hard constraint, a safety rule, a stated directive).
+- 60-89: an architectural fact or a hard-won gotcha that prevents real mistakes.
+- 30-59: a useful convention, a config value, a path.
+- 1-29: background that is nice to know.
+- 0: trivia, restated context, or something the code already says.
+
+Judge the fact itself, not how recently it was written, and use the whole range — a pool where everything scores 80 tells the host nothing.
+
+Output ONE JSON object at the very end and NOTHING else — no narration, no reasoning:
+{ \"12\": 90, \"13\": 20 }
+
+Rules:
+- Every id listed below appears exactly once, with a number between 0 and 100.
+- Ids you were not given are ignored.";
+
+/// Most memories one `classify` completion carries. Larger than the verify
+/// batch because a score is one number per row and the prompt is the whole
+/// cost: forty short facts still fit comfortably.
+const CLASSIFY_BATCH: usize = 40;
+
+/// Characters of one memory the classifier sees. A memory is already one fact;
+/// the cap is a cost guard against a single verbose row eating the batch.
+const CLASSIFY_CONTENT_CHARS: usize = 400;
+
+/// The retrospective task's prefixed completion prompt. One element, or an
+/// empty one: the whole task is "at most one durable lesson", so an answer that
+/// emits a list is out of contract and rejected.
+const RETROSPECTIVE_SYSTEM_PROMPT: &str = "You are a memory curator for the magic-context system, reviewing the user's own turns from a recent working session.
+
+Your job: find AT MOST ONE durable lesson — a correction the user made, a constraint they stated twice, or a convention they set — that every future session of this project should know. Ignore task chatter, one-off instructions, and anything that only makes sense for the work of the moment.
+
+Rules:
+1. One fact, phrased to stand alone: present tense, no pronouns pointing back at the conversation, no \"the user said\".
+2. The category must be one of: PROJECT_RULES (how work is done here), ARCHITECTURE (how the system is built), CONSTRAINTS (a hard limit or a gotcha), CONFIG_VALUES (a specific value or path), NAMING (what something is called).
+3. Only a lesson the user actually stated or corrected. Never infer one, never generalize from a single request, and never restate something ordinary.
+4. Nothing durable in these turns is a valid answer.
+
+Output ONE element at the very end and NOTHING else — no narration, no reasoning:
+<memory category=\"CONSTRAINTS\">one self-contained fact</memory>
+
+Or, when nothing is durable:
+<memory/>";
+
+/// Most user turns one retrospective run reads, newest first (the reference's
+/// window, reduced to a fixed bound).
+const RETROSPECTIVE_TURNS: usize = 80;
+
+/// Characters of one user turn the retrospective sees. A correction is usually
+/// one or two sentences; the cap keeps a pasted stack trace out of the prompt.
+const RETROSPECTIVE_TURN_CHARS: usize = 600;
+
+/// Total characters of transcript one retrospective prompt carries. A cost
+/// guard, not a model limit: the newest turns win the budget, so the oldest are
+/// the ones dropped.
+const RETROSPECTIVE_TOTAL_CHARS: usize = 8_000;
+
+/// Cap on the one fact a run may record: a memory is injected into every future
+/// request, so a chatty lesson must not become a wall of text.
+const RETROSPECTIVE_MAX_CHARS: usize = 2_000;
+
+/// The surface-notes task's prefixed completion prompt. The answer is a list of
+/// ids and nothing else: a note's text is the model's own writing from an
+/// earlier turn, so the only decision here is "is the condition satisfied", and
+/// nothing the model says about a note may be stored.
+const SURFACE_SYSTEM_PROMPT: &str = "You are a note-surfacing checker for the magic-context system. Each note below was parked with a condition that must hold before the note is worth showing again. You read the user's own recent turns from this project and decide which conditions hold NOW.
+
+Rules:
+1. A condition holds only on evidence in the turns below: something the user did, said, asked for, or finished. Do not infer progress from the note's own text, and do not surface a note because its topic came up.
+2. A condition that is still ahead of the work, or that the turns cannot decide, does not hold. Leaving a note parked costs nothing; surfacing it early intrudes on work that is not ready for it.
+3. A condition is a plain-language statement about state (\"after the schema migration lands\", \"when the user asks about pricing\"). Judge it as written.
+
+Output ONE element at the very end for each satisfied note and NOTHING else — no narration, no per-note commentary:
+<ready id=\"7\"/>
+<ready id=\"9\"/>
+
+Or, when no condition holds, emit no <ready> element at all — a one-line answer saying so is fine.";
+
+/// Most parked notes one `surface_notes` completion carries. A note is a
+/// paragraph rather than a fact, so the batch is half the classify batch.
+const SURFACE_BATCH: usize = 20;
+
+/// Characters of one note's body the checker sees. The condition is what is
+/// judged; the body only says what would be surfaced.
+const SURFACE_BODY_CHARS: usize = 300;
+
+/// Characters of one user turn the checker sees: the same cap the retrospective
+/// uses, for the same reason (a correction is a sentence; a paste is not).
+const SURFACE_TURN_CHARS: usize = 600;
+
 // ---------------------------------------------------------------------------
 // Task, failure and report types
 // ---------------------------------------------------------------------------
 
 /// The tasks the MVP schedules, in the order a tick runs them. The order is
 /// the reference's: `task-registry.ts::CANONICAL_DREAM_TASKS` lists `verify`
-/// before `curate`, and `compareTaskOrder` orders due tasks that way. It is
-/// fixed so a tick is deterministic.
+/// before `curate`, and `compareTaskOrder` orders due tasks that way; the tasks
+/// added for context management follow them, cheapest first. It is fixed so a
+/// tick is deterministic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DreamTask {
     /// Re-check memories whose referenced files are missing or newer.
     Verify,
     /// Duplicate/stale consolidation of one memory category.
     Curate,
+    /// Score unclassified memories for the pinboard's injection budget.
+    Classify,
+    /// Record at most one durable lesson from the project's recent user turns.
+    Retrospective,
+    /// Move parked smart notes whose condition holds to `ready`.
+    SurfaceNotes,
 }
 
 impl DreamTask {
     /// Every task, in tick order.
-    pub const ALL: [DreamTask; 2] = [DreamTask::Verify, DreamTask::Curate];
+    pub const ALL: [DreamTask; 5] = [
+        DreamTask::Verify,
+        DreamTask::Curate,
+        DreamTask::Classify,
+        DreamTask::Retrospective,
+        DreamTask::SurfaceNotes,
+    ];
 
     /// The `task` column spelling.
     pub fn as_str(self) -> &'static str {
         match self {
             DreamTask::Verify => "verify",
             DreamTask::Curate => "curate",
+            DreamTask::Classify => "classify",
+            DreamTask::Retrospective => "retrospective",
+            DreamTask::SurfaceNotes => "surface_notes",
         }
     }
 }
@@ -661,6 +820,9 @@ impl Dreamer {
         match task {
             DreamTask::Verify => self.run_verify(project, started_at).await,
             DreamTask::Curate => self.run_curate(project, state).await,
+            DreamTask::Classify => self.run_classify(project).await,
+            DreamTask::Retrospective => self.run_retrospective(project, state).await,
+            DreamTask::SurfaceNotes => self.run_surface_notes(project, state, started_at).await,
         }
     }
 
@@ -790,6 +952,231 @@ impl Dreamer {
                 }
             }
             Err(error) => TaskOutcome::Failed(TaskFailure::host("apply curate manifest", &error)),
+        }
+    }
+
+    // -- classify -----------------------------------------------------------
+
+    /// `classify`: score memories that have never been scored, so the
+    /// pinboard's budget walks the pool by weight instead of by recency alone.
+    ///
+    /// The only write is `importance`, which no render reads: a classification
+    /// changes no prompt byte. Score zero memories and the task is skipped
+    /// without a model call (`dreamer/task-gates.ts`).
+    async fn run_classify(&self, project: &str) -> TaskOutcome {
+        let pending = match unclassified_count(&self.db, project).await {
+            Ok(pending) => pending,
+            Err(error) => {
+                return TaskOutcome::Failed(TaskFailure::host(
+                    "count unclassified memories",
+                    &error,
+                ));
+            }
+        };
+        if pending == 0 {
+            return TaskOutcome::Skipped {
+                detail: "no unclassified memories".to_owned(),
+            };
+        }
+        let batch = match unclassified_batch(&self.db, project).await {
+            Ok(batch) => batch,
+            Err(error) => {
+                return TaskOutcome::Failed(TaskFailure::host(
+                    "read unclassified memories",
+                    &error,
+                ));
+            }
+        };
+        // A row written between the count and the read can leave the batch
+        // empty; the gate's answer is still "nothing to do".
+        if batch.is_empty() {
+            return TaskOutcome::Skipped {
+                detail: "no unclassified memories".to_owned(),
+            };
+        }
+        let prompt = render_classify_prompt(project, &batch);
+        let text = match self.complete(CLASSIFY_SYSTEM_PROMPT, &prompt).await {
+            Ok(text) => text,
+            Err(failure) => return TaskOutcome::Failed(failure),
+        };
+        let manifest = match parse_classify_manifest(&text, &batch) {
+            Ok(manifest) => manifest,
+            Err(message) => {
+                return TaskOutcome::Failed(TaskFailure {
+                    class: FailureClass::ParseFailed,
+                    message,
+                });
+            }
+        };
+        match apply_classify_manifest(&self.db, project, &manifest).await {
+            Ok(applied) => TaskOutcome::Completed {
+                detail: format!("classified {applied} memories"),
+                cursor: None,
+            },
+            Err(error) => TaskOutcome::Failed(TaskFailure::host("apply classify manifest", &error)),
+        }
+    }
+
+    // -- retrospective ------------------------------------------------------
+
+    /// `retrospective`: the user's own turns since the last successful sweep,
+    /// distilled into at most one durable memory.
+    ///
+    /// "No recent user messages" is a skip: it is decided before the hidden
+    /// completion, so the tick has spent nothing and the slot can be retired
+    /// without moving the watermark.
+    ///
+    /// "Nothing durable" and "already recorded" are completed, not skipped: the
+    /// completion has already been paid for, and a skip would leave
+    /// `last_run_at` where it was — every later tick would re-read the same
+    /// turns and pay for the same answer again. Advancing the watermark is what
+    /// makes a sweep a sweep.
+    ///
+    /// The write goes through [`memory::write_memory`] — the same path
+    /// `ctx_memory` uses — so a lesson is an ordinary memory row (and changes
+    /// the pinboard exactly once, by design).
+    async fn run_retrospective(&self, project: &str, state: &DreamState) -> TaskOutcome {
+        let turns = match recent_user_turns(&self.db, project, state.last_run_at.unwrap_or(0)).await
+        {
+            Ok(turns) => turns,
+            Err(error) => {
+                return TaskOutcome::Failed(TaskFailure::host("read recent user turns", &error));
+            }
+        };
+        if turns.is_empty() {
+            return TaskOutcome::Skipped {
+                detail: "no recent user messages".to_owned(),
+            };
+        }
+        let prompt = render_retrospective_prompt(project, &turns);
+        let text = match self.complete(RETROSPECTIVE_SYSTEM_PROMPT, &prompt).await {
+            Ok(text) => text,
+            Err(failure) => return TaskOutcome::Failed(failure),
+        };
+        let lesson = match parse_retrospective(&text) {
+            Ok(Some(lesson)) => lesson,
+            Ok(None) => {
+                return TaskOutcome::Completed {
+                    detail: "nothing durable".to_owned(),
+                    cursor: None,
+                };
+            }
+            Err(message) => {
+                return TaskOutcome::Failed(TaskFailure {
+                    class: FailureClass::ParseFailed,
+                    message,
+                });
+            }
+        };
+        match fact_recorded(&self.db, project, &lesson.content).await {
+            Ok(false) => {}
+            Ok(true) => {
+                return TaskOutcome::Completed {
+                    detail: "already recorded".to_owned(),
+                    cursor: None,
+                };
+            }
+            Err(error) => {
+                return TaskOutcome::Failed(TaskFailure::host("check recorded facts", &error));
+            }
+        }
+        match memory::write_memory(&self.db, project, &lesson.content, lesson.category).await {
+            Ok(id) => TaskOutcome::Completed {
+                detail: format!("recorded memory #{id}"),
+                cursor: None,
+            },
+            Err(error) => TaskOutcome::Failed(TaskFailure::host("write memory", &error)),
+        }
+    }
+
+    // -- surface_notes ------------------------------------------------------
+
+    /// `surface_notes`: judge the parked notes' conditions against the user's
+    /// own turns from the unswept window, and move the satisfied ones to
+    /// `ready`.
+    ///
+    /// Two cheap gates run before the completion is paid for: no parked note
+    /// with a usable condition, and no recent user turns to check against. Both
+    /// are skips, because nothing was spent.
+    ///
+    /// "No condition holds" is `Completed`, not `Skipped` — the completion has
+    /// already been paid for, and a skip would freeze `last_run_at`, so every
+    /// later tick would re-read the same turns and pay for the same answer
+    /// again (the same reasoning as `retrospective`).
+    ///
+    /// `at` is the run's start, stamped on every surfaced row: the reference's
+    /// natural-boundary triggers (after a commit, after the historian, after a
+    /// todo completes) have no equivalent here, so the watermark is what moves
+    /// a sweep forward.
+    async fn run_surface_notes(&self, project: &str, state: &DreamState, at: i64) -> TaskOutcome {
+        let parked = match parked_note_count(&self.db, project).await {
+            Ok(parked) => parked,
+            Err(error) => {
+                return TaskOutcome::Failed(TaskFailure::host("count parked notes", &error));
+            }
+        };
+        if parked == 0 {
+            return TaskOutcome::Skipped {
+                detail: "no parked notes with a condition".to_owned(),
+            };
+        }
+        let batch = match parked_notes(&self.db, project).await {
+            Ok(batch) => batch,
+            Err(error) => {
+                return TaskOutcome::Failed(TaskFailure::host("read parked notes", &error));
+            }
+        };
+        // A note dismissed between the count and the read can leave the batch
+        // empty; the gate's answer is still "nothing to do".
+        if batch.is_empty() {
+            return TaskOutcome::Skipped {
+                detail: "no parked notes with a condition".to_owned(),
+            };
+        }
+        let turns = match recent_user_turns(&self.db, project, state.last_run_at.unwrap_or(0)).await
+        {
+            Ok(turns) => turns,
+            Err(error) => {
+                return TaskOutcome::Failed(TaskFailure::host("read recent user turns", &error));
+            }
+        };
+        if turns.is_empty() {
+            return TaskOutcome::Skipped {
+                detail: "no recent activity to check conditions against".to_owned(),
+            };
+        }
+        let prompt = render_surface_prompt(project, &batch, &turns);
+        let text = match self.complete(SURFACE_SYSTEM_PROMPT, &prompt).await {
+            Ok(text) => text,
+            // This is the one task whose contract allows an empty answer ("no
+            // condition holds"), so an empty completion is a verdict, not the
+            // outage shape the other tasks read it as. Nothing is surfaced
+            // either way — the fail-closed direction — but recording a failure
+            // would freeze `last_run_at` and re-pay for the same window on
+            // every tick.
+            Err(failure) if failure.class == FailureClass::EmptyCompletion => String::new(),
+            Err(failure) => return TaskOutcome::Failed(failure),
+        };
+        let batch_ids: Vec<&str> = batch.iter().map(|note| note.id.as_str()).collect();
+        let ids = match parse_ready_ids(&text, &batch_ids) {
+            Ok(ids) => ids,
+            Err(message) => {
+                return TaskOutcome::Failed(TaskFailure {
+                    class: FailureClass::ParseFailed,
+                    message,
+                });
+            }
+        };
+        match apply_surfaced(&self.db, &ids, at).await {
+            Ok(0) => TaskOutcome::Completed {
+                detail: "no conditions satisfied".to_owned(),
+                cursor: None,
+            },
+            Ok(applied) => TaskOutcome::Completed {
+                detail: format!("surfaced {applied} notes"),
+                cursor: None,
+            },
+            Err(error) => TaskOutcome::Failed(TaskFailure::host("apply surfaced notes", &error)),
         }
     }
 }
@@ -1749,6 +2136,582 @@ async fn apply_curate_manifest(
 }
 
 // ---------------------------------------------------------------------------
+// Shared prompt helpers
+// ---------------------------------------------------------------------------
+
+/// The first `max` characters of `text`, cut on a character boundary.
+///
+/// Borrowed, never copied: a prompt is built once per run from rows the caller
+/// already owns. A byte slice would panic on a multi-byte character, which
+/// model-written memory text is full of.
+fn head_chars(text: &str, max: usize) -> &str {
+    match text.char_indices().nth(max) {
+        Some((index, _)) => &text[..index],
+        None => text,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// classify: the host-side gate
+// ---------------------------------------------------------------------------
+
+/// One unclassified memory as the classify task reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClassifyItem {
+    id: String,
+    category: String,
+    content: String,
+}
+
+/// How many active memories of this project have no score yet. The cheap gate:
+/// a fully classified pool costs one `count(*)` per tick and no model call.
+async fn unclassified_count(db: &Db, project: &str) -> Result<i64> {
+    let context = format!("count unclassified memories for project {project}");
+    let result: Result<i64> = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT count(*) FROM mc_memory
+                  WHERE project = ?1 AND status = 'active' AND importance = 0",
+            )
+            .await?;
+        let row = stmt.query_row([project]).await?;
+        Ok(row.get(0)?)
+    }
+    .await;
+    result.with_context(|| context)
+}
+
+/// The memories one `classify` completion covers: the lowest ids first, so a
+/// pool larger than the batch is scored in stable, resumable slices.
+async fn unclassified_batch(db: &Db, project: &str) -> Result<Vec<ClassifyItem>> {
+    let context = format!("read unclassified memories for project {project}");
+    let result: Result<Vec<ClassifyItem>> = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, category, content FROM mc_memory
+                  WHERE project = ?1 AND status = 'active' AND importance = 0
+                  ORDER BY CAST(id AS INTEGER)
+                  LIMIT ?2",
+            )
+            .await?;
+        let mut rows = stmt.query((project, CLASSIFY_BATCH as i64)).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(ClassifyItem {
+                id: row.get(0)?,
+                category: row.get(1)?,
+                content: row.get(2)?,
+            });
+        }
+        Ok(out)
+    }
+    .await;
+    result.with_context(|| context)
+}
+
+/// The `classify` user prompt: the batch, one handle per memory.
+fn render_classify_prompt(project: &str, batch: &[ClassifyItem]) -> String {
+    let mut parts = vec![format!(
+        "## Project: {project}\n\nThese memories have no importance score yet. Score every one of them.\n"
+    )];
+    for item in batch {
+        parts.push(format!(
+            "#{} [{}]\n{}",
+            item.id,
+            item.category,
+            head_chars(&item.content, CLASSIFY_CONTENT_CHARS)
+        ));
+    }
+    parts.join("\n")
+}
+
+/// Parse the `{"<id>": <number>}` manifest.
+///
+/// Strict where it matters and forgiving where it costs nothing: prose around
+/// the object is tolerated (the first `{` to the last `}` is the manifest), but
+/// every id of the batch must be scored — a partial answer is the shape of a
+/// truncated response, and applying it would silently leave the rest at `0`
+/// while banking a success. Ids outside the batch are dropped with a warning
+/// (the reference drops unknown manifest ids the same way).
+fn parse_classify_manifest(
+    text: &str,
+    batch: &[ClassifyItem],
+) -> Result<BTreeMap<String, f64>, String> {
+    let (Some(start), Some(end)) = (text.find('{'), text.rfind('}')) else {
+        return Err("classify manifest carried no JSON object".to_owned());
+    };
+    if end < start {
+        return Err("classify manifest carried no complete JSON object".to_owned());
+    }
+    let raw: BTreeMap<String, f64> = serde_json::from_str(&text[start..=end]).map_err(|error| {
+        format!("classify manifest is not a JSON object of ids to numbers: {error}")
+    })?;
+    let mut manifest: BTreeMap<String, f64> = BTreeMap::new();
+    let mut unknown = 0usize;
+    for (id, score) in raw {
+        if !batch.iter().any(|item| item.id == id) {
+            unknown += 1;
+            continue;
+        }
+        manifest.insert(id, clamp_importance(score));
+    }
+    if unknown > 0 {
+        tracing::warn!(
+            unknown,
+            "classify manifest named memories outside the batch; dropped"
+        );
+    }
+    for item in batch {
+        if !manifest.contains_key(&item.id) {
+            return Err(format!(
+                "classify manifest is missing memory #{}; rejecting a partial manifest",
+                item.id
+            ));
+        }
+    }
+    Ok(manifest)
+}
+
+/// A model score forced into the stored range. A non-finite value is a broken
+/// answer, and `0` (unscored) is the safe reading: it leaves the row for the
+/// next run instead of pinning it to the top of the selection.
+fn clamp_importance(score: f64) -> f64 {
+    if score.is_finite() {
+        score.clamp(0.0, 100.0)
+    } else {
+        0.0
+    }
+}
+
+/// Apply a parsed manifest: one transaction, one `importance` write per id,
+/// each guarded by `active` so an archived row cannot be scored through a
+/// stale batch.
+async fn apply_classify_manifest(
+    db: &Db,
+    project: &str,
+    manifest: &BTreeMap<String, f64>,
+) -> Result<usize> {
+    let context = format!("apply classify manifest for project {project}");
+    let result: Result<usize> = async {
+        let tx = db.begin().await?;
+        let mut applied = 0;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "UPDATE mc_memory SET importance = ?2
+                      WHERE project = ?3 AND id = ?1 AND status = 'active'",
+                )
+                .await?;
+            for (id, importance) in manifest {
+                applied += stmt.execute((id.as_str(), *importance, project)).await? as usize;
+            }
+        }
+        tx.commit().await?;
+        Ok(applied)
+    }
+    .await;
+    result.with_context(|| context)
+}
+
+// ---------------------------------------------------------------------------
+// retrospective
+// ---------------------------------------------------------------------------
+
+/// The one durable lesson a retrospective run may record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RetrospectiveLesson {
+    /// One of [`CATEGORIES`].
+    category: &'static str,
+    /// The fact text, newline-collapsed and length-capped.
+    content: String,
+}
+
+/// The project's user turns newer than `after`, newest first.
+///
+/// The project key is the session directory (that is what `ctx_memory` stores
+/// and what the dreamer enumerates by), so this joins every session of the
+/// project. The watermark is the last *successful* run's start, which is what
+/// makes a sweep cover exactly the turns that have not been read yet. Rows whose
+/// `data` does not decode, or that carry no text, are skipped: a turn with
+/// nothing typed into it has nothing to learn from.
+async fn recent_user_turns(db: &Db, project: &str, after: i64) -> Result<Vec<String>> {
+    let context = format!("read recent user turns for project {project}");
+    let result: Result<Vec<String>> = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.data FROM session_message m
+                   JOIN session_v2 s ON s.id = m.session_id
+                  WHERE m.type = 'user' AND s.directory = ?1 AND m.time_created > ?2
+                  ORDER BY m.time_created DESC
+                  LIMIT ?3",
+            )
+            .await?;
+        let mut rows = stmt
+            .query((project, after, RETROSPECTIVE_TURNS as i64))
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let data: String = row.get(0)?;
+            let text = serde_json::from_str::<serde_json::Value>(&data)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+            if !text.trim().is_empty() {
+                out.push(text);
+            }
+        }
+        Ok(out)
+    }
+    .await;
+    result.with_context(|| context)
+}
+
+/// The `retrospective` user prompt: the recent turns, oldest first.
+///
+/// `turns` arrives newest-first (the query's order) and the prompt reads them in
+/// the order they happened. The character budget is spent from the newest end,
+/// so an over-long window drops the oldest turns rather than the most recent
+/// corrections — which are exactly the ones worth learning from.
+fn render_retrospective_prompt(project: &str, turns: &[String]) -> String {
+    let mut kept: Vec<&str> = Vec::new();
+    let mut budget = RETROSPECTIVE_TOTAL_CHARS;
+    for turn in turns {
+        let text = head_chars(turn.trim(), RETROSPECTIVE_TURN_CHARS);
+        let cost = text.chars().count();
+        if cost == 0 {
+            continue;
+        }
+        if cost > budget {
+            break;
+        }
+        budget -= cost;
+        kept.push(text);
+    }
+    kept.reverse();
+    let mut parts = vec![format!(
+        "## Project: {project}\n\nThe user's own turns from the recent working session, in the order they happened. Look for a durable lesson.\n\n<turns>"
+    )];
+    for text in kept {
+        parts.push(format!("<turn>{text}</turn>"));
+    }
+    parts.push("</turns>".to_owned());
+    parts.join("\n")
+}
+
+/// Parse the one `<memory …>…</memory>` element.
+///
+/// Three answers are legal: exactly one element carrying a known category, one
+/// empty/self-closing element (`nothing durable`), or no element at all (also
+/// `nothing durable`). Everything else is a parse failure and writes nothing —
+/// an unknown category, an unclosed element (truncation), or two elements (the
+/// task asked for at most one, so a list means the model drifted from the
+/// contract).
+fn parse_retrospective(text: &str) -> Result<Option<RetrospectiveLesson>, String> {
+    let mut elements = memory_element_regex().captures_iter(text);
+    let Some(captures) = elements.next() else {
+        if memory_open_regex().is_match(text) {
+            return Err("retrospective answer carries an unclosed <memory> element".to_owned());
+        }
+        return Ok(None);
+    };
+    if elements.next().is_some() {
+        return Err("retrospective answer carries more than one <memory> element".to_owned());
+    }
+    let attrs = captures.get(1).map_or("", |group| group.as_str());
+    let body = captures.get(2).map_or("", |group| group.as_str());
+    // Newlines become single spaces: a memory is one line in every prefix it
+    // is rendered into, and a model answer is often indented. An element with
+    // no fact in it is the contract's "nothing durable", whatever it says about
+    // a category.
+    let collapsed = collapse_lines(body);
+    let content = head_chars(&collapsed, RETROSPECTIVE_MAX_CHARS).to_owned();
+    if content.is_empty() {
+        return Ok(None);
+    }
+    let Some(category) = attr_of(attrs, "category") else {
+        return Err("retrospective <memory> element is missing a category".to_owned());
+    };
+    let category = category.trim();
+    let Some(category) = CATEGORIES.iter().find(|known| **known == category) else {
+        return Err(format!(
+            "retrospective <memory> element carries an unknown category: {category}"
+        ));
+    };
+    Ok(Some(RetrospectiveLesson { category, content }))
+}
+
+/// Every non-empty line of `text`, trimmed and joined by single spaces.
+fn collapse_lines(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(line);
+    }
+    out
+}
+
+/// Whether the project already carries this exact fact as an active memory.
+///
+/// Equality on the stored content is the dedup rule: a lesson identical to an
+/// existing memory teaches nothing, and rewriting the row would only bump
+/// `updated_at` (moving it up the pinboard's recency tie-break) for no gain.
+async fn fact_recorded(db: &Db, project: &str, content: &str) -> Result<bool> {
+    let context = format!("check recorded facts for project {project}");
+    let result: Result<bool> = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT 1 FROM mc_memory
+                  WHERE project = ?1 AND status = 'active' AND content = ?2
+                  LIMIT 1",
+            )
+            .await?;
+        Ok(ox_db::optional(&mut stmt, (project, content))
+            .await?
+            .is_some())
+    }
+    .await;
+    result.with_context(|| context)
+}
+
+fn memory_element_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?is)<memory\b([^>]*?)(?:/>|>(.*?)</memory\s*>)")
+            .expect("retrospective memory element regex")
+    })
+}
+
+fn memory_open_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?is)<memory\b").expect("retrospective memory open regex"))
+}
+
+// ---------------------------------------------------------------------------
+// surface_notes
+// ---------------------------------------------------------------------------
+
+/// One parked smart note as the checker reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SurfaceNote {
+    /// `#N` handle body.
+    id: String,
+    title: String,
+    body: String,
+    /// The condition the note was parked on, verbatim.
+    condition: String,
+}
+
+/// The cheap gate: how many of this project's notes are parked on a usable
+/// condition. A project with none costs one `count(*)` per tick and no model
+/// call (`dreamer/task-gates.ts`).
+///
+/// The project key is the session directory (that is what the dreamer
+/// enumerates by), so this joins the notes to their sessions. An empty
+/// condition is not a condition: `write_note` drops a blank one, and a row that
+/// somehow carries one has nothing to judge.
+async fn parked_note_count(db: &Db, project: &str) -> Result<i64> {
+    let context = format!("count parked notes for project {project}");
+    let result: Result<i64> = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT count(*) FROM mc_note n
+                   JOIN session_v2 s ON s.id = n.session_id
+                  WHERE s.directory = ?1 AND n.status = 'pending'
+                    AND n.surface_condition IS NOT NULL AND n.surface_condition <> ''",
+            )
+            .await?;
+        let row = stmt.query_row([project]).await?;
+        Ok(row.get(0)?)
+    }
+    .await;
+    result.with_context(|| context)
+}
+
+/// The parked notes one `surface_notes` completion covers: the lowest handles
+/// first, so a backlog larger than the batch is swept in stable, resumable
+/// slices. `session_id` is deliberately not selected — handles are unique across
+/// the table and the apply is guarded by id alone.
+async fn parked_notes(db: &Db, project: &str) -> Result<Vec<SurfaceNote>> {
+    let context = format!("read parked notes for project {project}");
+    let result: Result<Vec<SurfaceNote>> = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT n.id, n.title, n.body, n.surface_condition FROM mc_note n
+                   JOIN session_v2 s ON s.id = n.session_id
+                  WHERE s.directory = ?1 AND n.status = 'pending'
+                    AND n.surface_condition IS NOT NULL AND n.surface_condition <> ''
+                  ORDER BY CAST(n.id AS INTEGER)
+                  LIMIT ?2",
+            )
+            .await?;
+        let mut rows = stmt.query((project, SURFACE_BATCH as i64)).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(SurfaceNote {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                body: row.get(2)?,
+                condition: row.get(3)?,
+            });
+        }
+        Ok(out)
+    }
+    .await;
+    result.with_context(|| context)
+}
+
+/// The `surface_notes` user prompt: the parked notes, then the user's turns.
+///
+/// `turns` arrives newest-first (the query's order) and the prompt reads them in
+/// the order they happened, so a condition about "after X" is read against a
+/// transcript that runs forwards.
+fn render_surface_prompt(project: &str, batch: &[SurfaceNote], turns: &[String]) -> String {
+    let mut parts = vec![format!(
+        "## Project: {project}\n\nThese notes are parked on a condition. Decide which conditions hold NOW, on the evidence of the user's own turns below.\n\n<notes>"
+    )];
+    for note in batch {
+        parts.push(format!("<note id=\"{}\">", note.id));
+        parts.push(format!("<condition>{}</condition>", note.condition));
+        parts.push(format!("<title>{}</title>", note.title));
+        let body = head_chars(note.body.trim(), SURFACE_BODY_CHARS);
+        if !body.is_empty() {
+            parts.push(body.to_owned());
+        }
+        parts.push("</note>".to_owned());
+    }
+    parts.push("</notes>".to_owned());
+    parts.push("<turns>".to_owned());
+    for turn in turns.iter().rev() {
+        parts.push(format!(
+            "<turn>{}</turn>",
+            head_chars(turn.trim(), SURFACE_TURN_CHARS)
+        ));
+    }
+    parts.push("</turns>".to_owned());
+    parts.join("\n")
+}
+
+/// Parse the `<ready id="N"/>` list.
+///
+/// The tolerant half mirrors the other manifests (prose around the elements is
+/// ignored, ids outside the batch are dropped with a warning) and adds one
+/// concession the answer invites: `id='7'` is accepted as well as `id="7"`,
+/// because a one-attribute list is exactly the shape a model switches quoting
+/// on. Duplicates collapse — a note is either surfaced or not.
+///
+/// The strict half is fail-closed: a `<ready>` element the host cannot address,
+/// or an unclosed `<ready` (truncation), rejects the whole answer instead of
+/// surfacing a guessed subset. No `<ready` at all is the contract's "no
+/// condition holds".
+fn parse_ready_ids(text: &str, batch_ids: &[&str]) -> Result<Vec<String>, String> {
+    // A `<ready` opener without a complete element is a truncated answer: the
+    // ids that did arrive would be a prefix of the verdict, never the verdict.
+    if ready_open_regex().find_iter(text).count() > ready_element_regex().find_iter(text).count() {
+        return Err("surface answer carries an unclosed <ready> element".to_owned());
+    }
+    let mut ids: Vec<String> = Vec::new();
+    let mut unknown = 0usize;
+    let mut unaddressed = false;
+    for captures in ready_element_regex().captures_iter(text) {
+        let attrs = captures.get(1).map_or("", |group| group.as_str());
+        let Some(id) = ready_id_attr(attrs) else {
+            unaddressed = true;
+            continue;
+        };
+        if !batch_ids.contains(&id.as_str()) {
+            unknown += 1;
+            continue;
+        }
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    if unaddressed {
+        return Err("surface answer carries a <ready> element without an id".to_owned());
+    }
+    if unknown > 0 {
+        tracing::warn!(
+            unknown,
+            "surface answer named notes outside the batch; dropped"
+        );
+    }
+    Ok(ids)
+}
+
+/// The `id` attribute of one `<ready>` element, in either quote style. `None`
+/// covers a missing attribute and an empty value: neither addresses a note.
+fn ready_id_attr(attrs: &str) -> Option<String> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r#"(?i)\bid\s*=\s*(?:"([^"]*)"|'([^']*)')"#).expect("ready id attr regex")
+    });
+    let captures = re.captures(attrs)?;
+    let value = captures.get(1).or_else(|| captures.get(2))?.as_str().trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+/// Apply a surface verdict: one transaction, one status flip per id, each
+/// guarded by `pending` so a note that was dismissed, edited into `active` or
+/// surfaced by an earlier run cannot be flipped through a stale batch.
+///
+/// `at` is the run's start (see [`crate::mctx::dreamer`]'s watermark rules); it
+/// becomes the row's `updated_at`, which is what the `ctx_note read` page ages.
+async fn apply_surfaced(db: &Db, ids: &[String], at: i64) -> Result<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let context = format!("surface {} notes", ids.len());
+    let result: Result<usize> = async {
+        let tx = db.begin().await?;
+        let mut applied = 0;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "UPDATE mc_note SET status = 'ready', updated_at = ?2
+                      WHERE id = ?1 AND status = 'pending'",
+                )
+                .await?;
+            for id in ids {
+                applied += stmt.execute((id.as_str(), at)).await? as usize;
+            }
+        }
+        tx.commit().await?;
+        Ok(applied)
+    }
+    .await;
+    result.with_context(|| context)
+}
+
+/// The `<ready` opener (any of `/>`, `>`, or a truncated element).
+fn ready_open_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?is)<ready\b").expect("ready open regex"))
+}
+
+/// One complete `<ready …>` element's attribute string.
+fn ready_element_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?is)<ready\b([^>]*?)/?>").expect("ready element regex"))
+}
+
+// ---------------------------------------------------------------------------
 // Applied-manifest report
 // ---------------------------------------------------------------------------
 
@@ -1845,4 +2808,486 @@ fn merge_regex() -> &'static Regex {
     RE.get_or_init(|| {
         Regex::new(r"(?is)<merge\b([^>]*?)(?:/>|>(.*?)</merge\s*>)").expect("merge element regex")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(id: &str, content: &str) -> ClassifyItem {
+        ClassifyItem {
+            id: id.to_owned(),
+            category: CATEGORIES[1].to_owned(),
+            content: content.to_owned(),
+        }
+    }
+
+    async fn insert_memory(db: &Db, id: &str, project: &str, status: &str, importance: f64) {
+        let conn = db.acquire().await.unwrap();
+        conn.execute(
+            "INSERT INTO mc_memory
+                 (id, project, content, category, created_at, updated_at, status, importance)
+             VALUES (?1, ?2, 'fact', 'ARCHITECTURE', 1, 1, ?3, ?4)",
+            (id, project, status, importance),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn tasks_are_named_and_ordered_by_cost() {
+        let names: Vec<&str> = DreamTask::ALL.iter().map(|task| task.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "verify",
+                "curate",
+                "classify",
+                "retrospective",
+                "surface_notes"
+            ]
+        );
+    }
+
+    // -- classify -----------------------------------------------------------
+
+    #[test]
+    fn classify_manifest_reads_every_batch_id() {
+        let batch = vec![item("7", "a"), item("9", "b")];
+        let manifest = parse_classify_manifest(r#"{"7": 90, "9": 20}"#, &batch).unwrap();
+        assert_eq!(manifest.get("7"), Some(&90.0));
+        assert_eq!(manifest.get("9"), Some(&20.0));
+    }
+
+    #[test]
+    fn classify_manifest_clamps_scores_into_range() {
+        let batch = vec![item("1", "a"), item("2", "b"), item("3", "c")];
+        let manifest =
+            parse_classify_manifest(r#"{"1": 150, "2": -12, "3": 40.5}"#, &batch).unwrap();
+        assert_eq!(manifest.get("1"), Some(&100.0));
+        assert_eq!(manifest.get("2"), Some(&0.0));
+        assert_eq!(manifest.get("3"), Some(&40.5));
+    }
+
+    #[test]
+    fn classify_manifest_requires_every_batch_id() {
+        let batch = vec![item("1", "a"), item("2", "b")];
+        let error = parse_classify_manifest(r#"{"1": 10}"#, &batch).unwrap_err();
+        assert!(error.contains("#2"), "{error}");
+    }
+
+    #[test]
+    fn classify_manifest_rejects_junk() {
+        let batch = vec![item("1", "a")];
+        assert!(parse_classify_manifest("I classified them all as important.", &batch).is_err());
+        assert!(parse_classify_manifest(r#"{"1": "high"}"#, &batch).is_err());
+        assert!(parse_classify_manifest("{}", &batch).is_err());
+        assert!(parse_classify_manifest("", &batch).is_err());
+    }
+
+    #[test]
+    fn classify_manifest_reads_the_object_out_of_prose_and_drops_unknown_ids() {
+        let batch = vec![item("1", "a")];
+        let manifest =
+            parse_classify_manifest("Here is my answer:\n{\"1\": 55, \"44\": 99}\nDone.", &batch)
+                .unwrap();
+        assert_eq!(manifest.len(), 1);
+        assert_eq!(manifest.get("1"), Some(&55.0));
+    }
+
+    #[tokio::test]
+    async fn classify_gate_counts_only_unclassified_active_rows() {
+        let db = Db::open_in_memory().await.unwrap();
+        insert_memory(&db, "1", "/project", "active", 0.0).await;
+        insert_memory(&db, "2", "/project", "active", 70.0).await;
+        insert_memory(&db, "3", "/project", "archived", 0.0).await;
+        insert_memory(&db, "4", "/other", "active", 0.0).await;
+
+        assert_eq!(unclassified_count(&db, "/project").await.unwrap(), 1);
+        let batch = unclassified_batch(&db, "/project").await.unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].id, "1");
+    }
+
+    #[tokio::test]
+    async fn applying_the_classify_manifest_empties_the_gate() {
+        let db = Db::open_in_memory().await.unwrap();
+        insert_memory(&db, "1", "/project", "active", 0.0).await;
+        insert_memory(&db, "2", "/project", "active", 0.0).await;
+        insert_memory(&db, "3", "/project", "archived", 0.0).await;
+
+        // The batch is the host's shape: a manifest outside it is a parse
+        // failure, so the ids come from the gate read itself.
+        let batch = unclassified_batch(&db, "/project").await.unwrap();
+        let manifest = parse_classify_manifest(r#"{"1": 90, "2": 10}"#, &batch).unwrap();
+        assert_eq!(
+            apply_classify_manifest(&db, "/project", &manifest)
+                .await
+                .unwrap(),
+            2
+        );
+
+        assert_eq!(unclassified_count(&db, "/project").await.unwrap(), 0);
+        let rows = memory::active_memories(&db, "/project").await.unwrap();
+        let scores: Vec<(&str, f64)> = rows
+            .iter()
+            .map(|row| (row.id.as_str(), row.importance))
+            .collect();
+        assert_eq!(scores, [("1", 90.0), ("2", 10.0)]);
+    }
+
+    #[tokio::test]
+    async fn classify_apply_leaves_archived_rows_alone() {
+        // Fail closed: the apply statement carries the `active` guard itself,
+        // so an id that is not active cannot be scored even by a hand-built
+        // manifest.
+        let db = Db::open_in_memory().await.unwrap();
+        insert_memory(&db, "3", "/project", "archived", 0.0).await;
+
+        let manifest = std::collections::BTreeMap::from([("3".to_owned(), 90.0)]);
+        assert_eq!(
+            apply_classify_manifest(&db, "/project", &manifest)
+                .await
+                .unwrap(),
+            0
+        );
+        let conn = db.acquire().await.unwrap();
+        let mut stmt = conn
+            .prepare("SELECT importance FROM mc_memory WHERE project = '/project' AND id = '3'")
+            .await
+            .unwrap();
+        let row = stmt.query_row(()).await.unwrap();
+        assert_eq!(row.get::<f64>(0).unwrap(), 0.0);
+    }
+
+    // -- retrospective ------------------------------------------------------
+
+    #[test]
+    fn retrospective_parses_one_memory() {
+        let lesson = parse_retrospective(
+            "Nothing else to add.\n\
+             <memory category=\"PROJECT_RULES\">Run the tests before committing.</memory>",
+        )
+        .unwrap()
+        .expect("one lesson");
+        assert_eq!(lesson.category, "PROJECT_RULES");
+        assert_eq!(lesson.content, "Run the tests before committing.");
+    }
+
+    #[test]
+    fn retrospective_without_a_fact_is_a_skip() {
+        assert_eq!(parse_retrospective("Nothing durable here.").unwrap(), None);
+        assert_eq!(parse_retrospective("<memory/>").unwrap(), None);
+        assert_eq!(parse_retrospective("<memory></memory>").unwrap(), None);
+        assert_eq!(
+            parse_retrospective("<memory category=\"NAMING\">   </memory>").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn retrospective_collapses_newlines_and_caps_the_fact() {
+        let text = format!(
+            "<memory category=\"CONSTRAINTS\">\n  first line\n\n second line\n{}</memory>",
+            "x".repeat(3_000)
+        );
+        let lesson = parse_retrospective(&text).unwrap().expect("one lesson");
+        assert!(
+            lesson.content.starts_with("first line second line"),
+            "{lesson:?}"
+        );
+        assert!(!lesson.content.contains('\n'));
+        assert_eq!(lesson.content.chars().count(), RETROSPECTIVE_MAX_CHARS);
+    }
+
+    #[test]
+    fn retrospective_rejects_an_unknown_or_missing_category() {
+        let unknown =
+            parse_retrospective("<memory category=\"GOSSIP\">a fact</memory>").unwrap_err();
+        assert!(unknown.contains("GOSSIP"), "{unknown}");
+        assert!(parse_retrospective("<memory>a fact</memory>").is_err());
+    }
+
+    #[test]
+    fn retrospective_rejects_an_unclosed_element() {
+        let error = parse_retrospective("<memory category=\"NAMING\">a fact").unwrap_err();
+        assert!(error.contains("unclosed"), "{error}");
+    }
+
+    #[test]
+    fn retrospective_rejects_two_elements() {
+        let text = "<memory category=\"NAMING\">one</memory>\n\
+                    <memory category=\"NAMING\">two</memory>";
+        assert!(parse_retrospective(text).is_err());
+    }
+
+    #[test]
+    fn retrospective_prompt_renders_turns_oldest_first() {
+        // The gate hands turns over newest-first, the way the query returns
+        // them; the prompt reads them in the order they happened.
+        let turns = vec!["AAA".to_owned(), "BBB".to_owned(), "CCC".to_owned()];
+        let prompt = render_retrospective_prompt("/project", &turns);
+        let first = prompt.find("CCC").unwrap();
+        let second = prompt.find("BBB").unwrap();
+        let third = prompt.find("AAA").unwrap();
+        assert!(first < second && second < third, "{prompt}");
+    }
+
+    #[test]
+    fn retrospective_prompt_truncates_one_long_turn() {
+        let turns = vec!["y".repeat(RETROSPECTIVE_TURN_CHARS + 500)];
+        let prompt = render_retrospective_prompt("/project", &turns);
+        assert!(prompt.contains(&"y".repeat(RETROSPECTIVE_TURN_CHARS)));
+        assert!(!prompt.contains(&"y".repeat(RETROSPECTIVE_TURN_CHARS + 1)));
+    }
+
+    #[test]
+    fn retrospective_prompt_spends_its_budget_on_the_newest_turns() {
+        let turns: Vec<String> = (0..40)
+            .map(|turn| format!("turn-{turn}-\n{}", "z".repeat(600)))
+            .collect();
+        let prompt = render_retrospective_prompt("/project", &turns);
+        assert!(prompt.contains("turn-0-"), "the newest turn must survive");
+        assert!(
+            !prompt.contains("turn-39-"),
+            "the oldest turn must be dropped"
+        );
+        assert!(prompt.chars().count() < RETROSPECTIVE_TOTAL_CHARS + 1_000);
+    }
+
+    async fn insert_session(db: &Db, id: &str, directory: &str) {
+        let conn = db.acquire().await.unwrap();
+        conn.execute(
+            "INSERT INTO session_v2
+                 (id, project_id, slug, directory, version, time_created, time_updated)
+             VALUES (?1, '/project', ?1, ?2, '1', 1, 1)",
+            (id, directory),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn insert_user_message(db: &Db, id: &str, session: &str, at: i64, text: &str) {
+        let data = serde_json::json!({ "text": text }).to_string();
+        let conn = db.acquire().await.unwrap();
+        conn.execute(
+            "INSERT INTO session_message
+                 (id, session_id, type, seq, time_created, time_updated, data)
+             VALUES (?1, ?2, 'user', ?3, ?3, ?3, ?4)",
+            (id, session, at, data),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retrospective_gate_reads_only_this_projects_newer_user_turns() {
+        let db = Db::open_in_memory().await.unwrap();
+        insert_session(&db, "s1", "/project").await;
+        insert_session(&db, "s2", "/other").await;
+        insert_user_message(&db, "m1", "s1", 100, "old").await;
+        insert_user_message(&db, "m2", "s1", 300, "newest").await;
+        insert_user_message(&db, "m3", "s2", 400, "other project").await;
+
+        // Newest first (the query's order) and only past the watermark.
+        let turns = recent_user_turns(&db, "/project", 200).await.unwrap();
+        assert_eq!(turns, ["newest"]);
+        // A watermark past every turn is the "already swept" answer.
+        assert!(
+            recent_user_turns(&db, "/project", 500)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn retrospective_dedup_matches_active_rows_by_content() {
+        let db = Db::open_in_memory().await.unwrap();
+        let fact = "Run the tests before committing.";
+
+        assert!(!fact_recorded(&db, "/project", fact).await.unwrap());
+        // The write goes through the one memory path, so the row is exactly
+        // what `ctx_memory write` would have produced.
+        let id = memory::write_memory(&db, "/project", fact, "PROJECT_RULES")
+            .await
+            .unwrap();
+        assert_eq!(id, "1");
+        assert!(fact_recorded(&db, "/project", fact).await.unwrap());
+        assert!(
+            !fact_recorded(&db, "/project", "a different fact")
+                .await
+                .unwrap()
+        );
+        // Another project's pool is not deduped against.
+        assert!(!fact_recorded(&db, "/other", fact).await.unwrap());
+    }
+
+    // -- surface_notes ------------------------------------------------------
+
+    fn surface(id: &str, condition: &str) -> SurfaceNote {
+        SurfaceNote {
+            id: id.to_owned(),
+            title: "a title".to_owned(),
+            body: "a body".to_owned(),
+            condition: condition.to_owned(),
+        }
+    }
+
+    #[test]
+    fn surface_answer_reads_every_ready_id() {
+        let batch = ["7", "9"];
+        let ids = parse_ready_ids(
+            "Both hold.\n<ready id=\"7\"/>\n<ready id=\"9\"></ready>",
+            &batch,
+        )
+        .unwrap();
+        assert_eq!(ids, ["7", "9"]);
+    }
+
+    #[test]
+    fn surface_answer_accepts_single_quotes_and_a_bare_element() {
+        let batch = ["1", "2"];
+        let ids = parse_ready_ids("<ready id='1'>\n<ready id=\"2\" />", &batch).unwrap();
+        assert_eq!(ids, ["1", "2"]);
+    }
+
+    #[test]
+    fn surface_answer_drops_ids_outside_the_batch() {
+        let batch = ["1"];
+        let ids = parse_ready_ids("<ready id=\"1\"/>\n<ready id=\"44\"/>", &batch).unwrap();
+        assert_eq!(ids, ["1"]);
+    }
+
+    #[test]
+    fn surface_answer_collapses_a_repeated_id() {
+        let batch = ["1", "2"];
+        let ids = parse_ready_ids("<ready id=\"1\"/>\n<ready id=\"1\"/>", &batch).unwrap();
+        assert_eq!(ids, ["1"]);
+    }
+
+    #[test]
+    fn surface_answer_rejects_an_element_without_an_id() {
+        // Fail closed: a `<ready>` the host cannot address is the shape of a
+        // drifted answer, and guessing which note it meant is never safe.
+        let batch = ["1"];
+        assert!(parse_ready_ids("<ready id=\"1\"/>\n<ready/>", &batch).is_err());
+        assert!(parse_ready_ids("<ready id=\"\"/>", &batch).is_err());
+        assert!(parse_ready_ids("<ready note=\"1\"/>", &batch).is_err());
+    }
+
+    #[test]
+    fn surface_answer_rejects_a_truncated_element() {
+        let batch = ["1"];
+        let error = parse_ready_ids("Nothing yet.\n<ready id=\"1\"", &batch).unwrap_err();
+        assert!(error.contains("unclosed"), "{error}");
+    }
+
+    #[test]
+    fn surface_answer_without_a_tag_means_no_condition_is_satisfied() {
+        let batch = ["1"];
+        assert!(
+            parse_ready_ids("None of them hold yet.", &batch)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(parse_ready_ids("", &batch).unwrap().is_empty());
+    }
+
+    #[test]
+    fn surface_prompt_prints_the_condition_and_caps_the_body() {
+        let notes = vec![SurfaceNote {
+            id: "7".to_owned(),
+            title: "Big refactor".to_owned(),
+            body: "b".repeat(SURFACE_BODY_CHARS + 200),
+            condition: "after the schema migration lands".to_owned(),
+        }];
+        let prompt = render_surface_prompt("/project", &notes, &[]);
+        assert!(
+            prompt.contains("after the schema migration lands"),
+            "{prompt}"
+        );
+        assert!(prompt.contains(&"b".repeat(SURFACE_BODY_CHARS)));
+        assert!(!prompt.contains(&"b".repeat(SURFACE_BODY_CHARS + 1)));
+    }
+
+    #[test]
+    fn surface_prompt_reads_turns_oldest_first() {
+        // The gate hands turns over newest-first, the way the query returns
+        // them; the checker reads them in the order they happened.
+        let turns = vec!["AAA".to_owned(), "BBB".to_owned(), "CCC".to_owned()];
+        let prompt = render_surface_prompt("/project", &[surface("1", "cond")], &turns);
+        let first = prompt.find("CCC").unwrap();
+        let second = prompt.find("BBB").unwrap();
+        let third = prompt.find("AAA").unwrap();
+        assert!(first < second && second < third, "{prompt}");
+    }
+
+    async fn insert_note(db: &Db, id: &str, session: &str, status: &str, condition: Option<&str>) {
+        let conn = db.acquire().await.unwrap();
+        conn.execute(
+            "INSERT INTO mc_note
+                 (id, session_id, title, body, status, surface_condition, created_at, updated_at)
+             VALUES (?1, ?2, 'title', 'body', ?3, ?4, 1, 1)",
+            (id, session, status, condition),
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn note_status(db: &Db, id: &str) -> (String, i64) {
+        let conn = db.acquire().await.unwrap();
+        let mut stmt = conn
+            .prepare("SELECT status, updated_at FROM mc_note WHERE id = ?1")
+            .await
+            .unwrap();
+        let row = stmt.query_row([id]).await.unwrap();
+        (row.get(0).unwrap(), row.get(1).unwrap())
+    }
+
+    #[tokio::test]
+    async fn surface_gate_reads_only_this_projects_parked_notes() {
+        let db = Db::open_in_memory().await.unwrap();
+        insert_session(&db, "s1", "/project").await;
+        insert_session(&db, "s2", "/other").await;
+        insert_note(&db, "1", "s1", "pending", Some("after the migration")).await;
+        // A parked row with no usable condition is not a candidate: there is
+        // nothing for the checker to judge.
+        insert_note(&db, "2", "s1", "pending", None).await;
+        insert_note(&db, "3", "s1", "pending", Some("")).await;
+        // Already surfaced, dismissed and ordinary notes are behind the gate.
+        insert_note(&db, "4", "s1", "ready", Some("done already")).await;
+        insert_note(&db, "5", "s1", "dismissed", Some("never mind")).await;
+        insert_note(&db, "6", "s1", "active", None).await;
+        // Another project's notes are not this sweep's work.
+        insert_note(&db, "7", "s2", "pending", Some("elsewhere")).await;
+
+        assert_eq!(parked_note_count(&db, "/project").await.unwrap(), 1);
+        let batch = parked_notes(&db, "/project").await.unwrap();
+        let ids: Vec<&str> = batch.iter().map(|note| note.id.as_str()).collect();
+        assert_eq!(ids, ["1"]);
+        assert_eq!(batch[0].condition, "after the migration");
+    }
+
+    #[tokio::test]
+    async fn surfacing_flips_only_pending_rows() {
+        let db = Db::open_in_memory().await.unwrap();
+        insert_session(&db, "s1", "/project").await;
+        insert_note(&db, "1", "s1", "pending", Some("a")).await;
+        insert_note(&db, "2", "s1", "pending", Some("b")).await;
+        insert_note(&db, "3", "s1", "ready", Some("c")).await;
+        insert_note(&db, "4", "s1", "active", None).await;
+
+        // The apply statement carries the `pending` guard itself, so even a
+        // hand-built id list cannot flip a row the checker did not judge.
+        let ids = vec!["1".to_owned(), "3".to_owned(), "4".to_owned()];
+        assert_eq!(apply_surfaced(&db, &ids, 500).await.unwrap(), 1);
+
+        assert_eq!(note_status(&db, "1").await, ("ready".to_owned(), 500));
+        assert_eq!(note_status(&db, "2").await.0, "pending");
+        assert_eq!(note_status(&db, "3").await.0, "ready");
+        assert_eq!(note_status(&db, "4").await.0, "active");
+        // An empty answer writes nothing and is not an error.
+        assert_eq!(apply_surfaced(&db, &[], 900).await.unwrap(), 0);
+    }
 }

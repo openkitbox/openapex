@@ -393,6 +393,19 @@ DELETE FROM mc_note WHERE session_id NOT IN (SELECT id FROM session_v2);
 CREATE INDEX IF NOT EXISTS event_created_idx ON event (created);
 "#;
 
+/// V14: the memory selection weight (`importance`), fed by the dreamer's
+/// classify task (see `.ox/plans/ox-context-management-backlog.md`, M1/M2).
+///
+/// The pinboard is a fixed prefix paid on every request, so which memories get
+/// in is a budget decision; `importance` is the first sort key of that
+/// decision (`ox-engine::mctx::memory::select_memories`). `0` is the
+/// pre-classify value: every row ties, and selection falls back to the last
+/// touch (`max(verified_at, updated_at)`). Purely additive, so it applies onto
+/// any V13-stamped database.
+const MIGRATION_V14: &str = r#"
+ALTER TABLE mc_memory ADD COLUMN importance real NOT NULL DEFAULT 0;
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
@@ -410,6 +423,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (11, MIGRATION_V11),
     (12, MIGRATION_V12),
     (13, MIGRATION_V13),
+    (14, MIGRATION_V14),
 ];
 
 /// Async handle to the database.

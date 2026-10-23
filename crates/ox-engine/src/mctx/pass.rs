@@ -50,11 +50,13 @@
 use anyhow::{Context as _, Result};
 use cortexkit_cache_core::{CoreState, DurabilityClass, FrozenUnit};
 
-use crate::mctx::budget::Budget;
+use crate::mctx::budget::{Budget, memory_budget};
 use crate::mctx::cache::{HeadRenderer, McCache, PassOutcome, RenderedPass, Signals, run_pass};
 use crate::mctx::compartments::{self, Compartment};
-use crate::mctx::memory::{MemoryRow, active_memories};
-use crate::mctx::render::{M0Inputs, assemble_m1, render_m0, render_memory_block};
+use crate::mctx::memory::{MemoryRow, ReadyNote, active_memories, ready_notes, select_memories};
+use crate::mctx::render::{
+    M0Inputs, assemble_m1, render_m0, render_memory_block, render_ready_notes_block,
+};
 use crate::mctx::tagger::{mark_drops_applied, peek_queued_drops};
 use ox_db::{Db, optional};
 use ox_schema::id::now_millis;
@@ -110,6 +112,9 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
 
     let compartments = compartments::load(db, session_id).await?;
     let memories = active_memories(db, project).await?;
+    // Surfaced smart notes ride the same volatile half as the pinboard: a
+    // note that becomes `ready` is a `Soft` bust, never a rebuild of m[0].
+    let notes = ready_notes(db, session_id).await?;
     let cache = McCache::new(db.clone(), session_id);
     let state = cache.load().await?;
 
@@ -132,7 +137,7 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
     // model. This is upstream's "reconcile" case: rebuild and re-anchor.
     let stale = claimed > last_seq;
 
-    let plan = plan_units(&compartments, &memories, coverage, budget.history);
+    let plan = plan_units(&compartments, &memories, &notes, coverage, budget.history);
 
     // Queued drops ride the planned units, not the kernel's defer queue: our
     // durable `mc_drop` rows are the carrier ("queued, not immediate" — the
@@ -281,10 +286,11 @@ impl Plan {
 }
 
 /// Render the two head halves: m[0] over every compartment the head covers,
-/// m[1] over the pinboard.
+/// m[1] over the pinboard and the session's surfaced notes.
 fn plan_units(
     compartments: &[Compartment],
     memories: &[MemoryRow],
+    notes: &[ReadyNote],
     coverage: i64,
     history_budget_tokens: u32,
 ) -> Plan {
@@ -299,8 +305,14 @@ fn plan_units(
         history_budget_tokens: f64::from(history_budget_tokens),
     });
     // The pinboard rides the volatile half: a memory write must not rebuild the
-    // provider's cache anchor.
-    let m1_body = assemble_m1(&render_memory_block(memories));
+    // provider's cache anchor. It is also the one section that grows with the
+    // project's lifetime, so it is selected under its own budget first — a
+    // memory that does not fit is skipped, the rest of the list still renders.
+    let selected = select_memories(memories, memory_budget(f64::from(history_budget_tokens)));
+    let m1_body = assemble_m1(
+        &render_memory_block(&selected),
+        &render_ready_notes_block(notes),
+    );
     Plan {
         m0,
         // The unit payload carries the blank line that separates it from m[0]:
@@ -448,5 +460,36 @@ impl HeadRenderer for PrecomputedRenderer {
             queued: Vec::new(),
             new_boundary_id: Some(self.boundary_id.clone()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The seam contract: whatever m[1] carries, `split_prefix` must recognize
+    /// where the baseline ends. A delta that opens with neither marker is
+    /// silently lost (`head_m1` empty), which is why the surfaced-notes shapes
+    /// are pinned here and not only in the render tests.
+    #[test]
+    fn the_prefix_split_keeps_both_halves_with_ready_notes() {
+        let m0 = render_m0(&M0Inputs {
+            compartments: &[],
+            history_budget_tokens: 0.0,
+        });
+        let notes = "<ready-notes>\n#7: Migrate — then run\n</ready-notes>";
+        let pinboard =
+            "<project-memory>\n<PROJECT_RULES>\n#1: a fact\n</PROJECT_RULES>\n</project-memory>";
+
+        // Pinboard and notes: the delta opens with the pinboard.
+        let m1 = assemble_m1(pinboard, notes);
+        let prefix = format!("{m0}\n\n{m1}");
+        assert_eq!(split_prefix(&prefix), (m0.as_str(), m1.as_str()));
+
+        // Notes alone (every memory fell out of the budget): the placeholder
+        // leads, so the seam is still found.
+        let m1 = assemble_m1("", notes);
+        let prefix = format!("{m0}\n\n{m1}");
+        assert_eq!(split_prefix(&prefix), (m0.as_str(), m1.as_str()));
     }
 }

@@ -208,6 +208,33 @@ impl Budget {
     }
 }
 
+/// The share of the `m[0]` history budget the `<project-memory>` pinboard may
+/// spend. The pinboard is a fixed prefix paid on every request, so it is
+/// bounded by the history budget it rides beside rather than by a knob of its
+/// own (the reference's `trimMemoriesToBudgetV2` shape: a share, clamped).
+pub const MEMORY_BUDGET_SHARE: f64 = 0.25;
+/// Floor of [`memory_budget`]: a tiny window still injects the most important
+/// facts (a bare share would round a small history budget down to nothing, and
+/// the pinboard is what makes a fresh session competent).
+pub const MEMORY_BUDGET_MIN: usize = 1_000;
+/// Ceiling of [`memory_budget`]: no window is large enough to justify paying
+/// more than this on project memories every turn.
+pub const MEMORY_BUDGET_MAX: usize = 8_000;
+
+/// The token budget for the `<project-memory>` pinboard, derived from the
+/// history budget it rides beside ([`MEMORY_BUDGET_SHARE`] of it, clamped to
+/// [`MEMORY_BUDGET_MIN`]..=[`MEMORY_BUDGET_MAX`]).
+///
+/// A non-finite history budget takes the floor: the selection is conservative
+/// on spend, and a zero budget would silently drop every memory.
+pub fn memory_budget(history_tokens: f64) -> usize {
+    if !history_tokens.is_finite() {
+        return MEMORY_BUDGET_MIN;
+    }
+    ((history_tokens.max(0.0) * MEMORY_BUDGET_SHARE).round() as usize)
+        .clamp(MEMORY_BUDGET_MIN, MEMORY_BUDGET_MAX)
+}
+
 /// `usable = window × execute%`, at least one token and never more than the
 /// window itself.
 fn usable_tokens(window: u32, execute_pct: f64) -> u32 {
@@ -227,4 +254,21 @@ fn percent(value: f64, default: f64, min: f64, max: f64) -> f64 {
 
 fn clamp_u32(value: f64, min: f64, max: f64) -> u32 {
     value.clamp(min, max) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_budget_clamps_at_both_ends() {
+        // A share of the history budget, clamped so a tiny window still buys a
+        // usable pinboard and a large one cannot let the prefix grow forever.
+        assert_eq!(memory_budget(0.0), MEMORY_BUDGET_MIN);
+        assert_eq!(memory_budget(2_000.0), MEMORY_BUDGET_MIN); // 500 → floored
+        assert_eq!(memory_budget(4_000.0), MEMORY_BUDGET_MIN); // exactly 25%
+        assert_eq!(memory_budget(20_000.0), 5_000); // 25% inside the band
+        assert_eq!(memory_budget(60_000.0), MEMORY_BUDGET_MAX); // 15 000 → capped
+        assert_eq!(memory_budget(f64::NAN), MEMORY_BUDGET_MIN);
+    }
 }

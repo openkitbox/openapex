@@ -5,7 +5,8 @@
 //! - **m[0]** — the frozen baseline: `<session-history>`, the decay-rendered
 //!   compartment set, measured against the session's history budget.
 //! - **m[1]** — the volatile half: the `<project-memory>` pinboard, then the
-//!   placeholder that keeps the block non-empty.
+//!   surfaced `<ready-notes>` and the placeholder that keeps the block
+//!   non-empty.
 //!
 //! Everything that folds — and only folding — changes m[0]: it is a pure
 //! function of the compartment rows and the budget, so a fold and nothing else
@@ -49,7 +50,7 @@
 use crate::mctx::decay_render::{
     DecayRenderCompartment, estimate_tokens, render_decayed_compartments,
 };
-use crate::mctx::memory::MemoryRow;
+use crate::mctx::memory::{MemoryRow, ReadyNote, numeric_id};
 
 /// The m0 body when no compartment exists. The `<session-history>` tag is
 /// always present (never omitted) so the provider prompt cache has a stable
@@ -60,6 +61,11 @@ pub const M0_EMPTY_BODY: &str = "<session-history></session-history>";
 /// for the same cache-anchoring reason.
 pub const M1_PLACEHOLDER: &str =
     "<session-history-since>(no new content since last materialization)</session-history-since>";
+
+/// Characters of a surfaced note's body the pinboard carries. A note is an
+/// intention, not a fact: the title and the opening of the body are enough to
+/// recognize it, and the full text is one `ctx_note read` away.
+const READY_BODY_CHARS: usize = 400;
 
 /// The five canonical memory categories, in render order.
 const MEMORY_CATEGORY_ORDER: [&str; 5] = [
@@ -108,12 +114,6 @@ fn memory_render_order(left: &MemoryRow, right: &MemoryRow) -> std::cmp::Orderin
     }
 }
 
-/// Sort key for a handle id: numeric ids order numerically, anything else
-/// sorts after them.
-fn numeric_id(id: &str) -> i64 {
-    id.parse().unwrap_or(i64::MAX)
-}
-
 /// Render one compact memory fact line. Importance controls selection but is
 /// deliberately absent from the wire, so a classification-only update does not
 /// change a single byte of the prompt.
@@ -130,11 +130,15 @@ fn render_memory_line(memory: &MemoryRow) -> String {
 }
 
 /// The `<project-memory>` block, or an empty string when there are no memories.
-pub(crate) fn render_memory_block(memories: &[MemoryRow]) -> String {
+///
+/// Takes the rows the caller selected ([`crate::mctx::memory::select_memories`]
+/// decides *who* is in, under a token budget); this function only decides the
+/// byte order, so the same included set always renders the same bytes.
+pub(crate) fn render_memory_block(memories: &[&MemoryRow]) -> String {
     if memories.is_empty() {
         return String::new();
     }
-    let mut ordered: Vec<&MemoryRow> = memories.iter().collect();
+    let mut ordered: Vec<&MemoryRow> = memories.to_vec();
     ordered.sort_by(|left, right| memory_render_order(left, right));
 
     let mut lines = Vec::with_capacity(memories.len() * 2 + 3);
@@ -157,15 +161,59 @@ pub(crate) fn render_memory_block(memories: &[MemoryRow]) -> String {
     lines.join("\n")
 }
 
-/// Assemble the m1 body: the pinboard, or the placeholder when there is none.
+/// The `<ready-notes>` block, or an empty string when nothing is surfaced.
 ///
-/// The placeholder is always present when the pinboard is empty: the m1 half
-/// must never vanish, or every byte after it shifts.
-pub(crate) fn assemble_m1(memories: &str) -> String {
-    if memories.is_empty() {
-        return M1_PLACEHOLDER.to_string();
+/// One line per note: `#7: <title> — <body>`. A note's body is model-written
+/// prose, so it is escaped like memory text, cut at [`READY_BODY_CHARS`] on a
+/// character boundary and flattened to one line — a note that was parked on a
+/// condition is a reminder, not a document, and the pinboard pays for it on
+/// every request while it is surfaced. A one-line note renders its title alone.
+pub(crate) fn render_ready_notes_block(notes: &[ReadyNote]) -> String {
+    if notes.is_empty() {
+        return String::new();
     }
-    format!("{memories}\n{M1_PLACEHOLDER}")
+    let mut lines = Vec::with_capacity(notes.len() + 2);
+    lines.push("<ready-notes>".to_string());
+    for note in notes {
+        let title = escape_xml_content(&note.title);
+        let body = escape_xml_content(head_chars(&note.body, READY_BODY_CHARS)).replace('\n', " ");
+        let body = body.trim();
+        if body.is_empty() {
+            lines.push(format!("#{}: {title}", note.id));
+        } else {
+            lines.push(format!("#{}: {title} — {body}", note.id));
+        }
+    }
+    lines.push("</ready-notes>".to_string());
+    lines.join("\n")
+}
+
+/// The first `max` characters of `text`, cut on a character boundary. Borrowed,
+/// never copied — the block above is built once per pass from rows the caller
+/// already owns.
+fn head_chars(text: &str, max: usize) -> &str {
+    match text.char_indices().nth(max) {
+        Some((index, _)) => &text[..index],
+        None => text,
+    }
+}
+
+/// Assemble the m1 body: the pinboard, then the surfaced notes, or the
+/// placeholder when neither exists.
+///
+/// The placeholder is the marker the prefix split looks for at the seam, so it
+/// is load-bearing in exactly one case: when nothing but notes is shown it
+/// leads the half (`{M1_PLACEHOLDER}\n{notes}`), because a delta opening with
+/// `<ready-notes>` would not be recognized as m[1] at all. Byte stability is the
+/// other half of the contract: with no surfaced notes the output is byte-for-
+/// byte what it was before notes existed.
+pub(crate) fn assemble_m1(memories: &str, notes: &str) -> String {
+    match (memories.is_empty(), notes.is_empty()) {
+        (true, true) => M1_PLACEHOLDER.to_string(),
+        (false, false) => format!("{memories}\n{notes}"),
+        (false, true) => format!("{memories}\n{M1_PLACEHOLDER}"),
+        (true, false) => format!("{M1_PLACEHOLDER}\n{notes}"),
+    }
 }
 
 /// Inputs to [`render_m0`], after the caller has loaded the rows it means to
@@ -190,4 +238,116 @@ pub(crate) fn render_m0(inputs: &M0Inputs<'_>) -> String {
         return M0_EMPTY_BODY.to_string();
     }
     format!("<session-history>\n{history}\n</session-history>")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mctx::memory::select_memories;
+
+    fn memory(id: &str, category: &str, content: &str) -> MemoryRow {
+        MemoryRow {
+            id: id.to_string(),
+            category: category.to_string(),
+            content: content.to_string(),
+            importance: 0.0,
+            updated_at: 0,
+            verified_at: 0,
+        }
+    }
+
+    #[test]
+    fn rendered_bytes_are_unchanged_when_every_memory_fits() {
+        // Selection only decides who is included: the framing, category
+        // grouping, numeric-id order and escaping stay byte-identical.
+        let rows = [
+            memory("2", "PROJECT_RULES", "Rule B"),
+            memory("1", "PROJECT_RULES", "Rule A & <x>"),
+        ];
+        // A budget every row fits under keeps the whole set...
+        let selected = select_memories(&rows, 1_000);
+        assert_eq!(selected.len(), rows.len());
+        let expected = "<project-memory>\n\
+                        <PROJECT_RULES>\n\
+                        #1: Rule A &amp; &lt;x&gt;\n\
+                        #2: Rule B\n\
+                        </PROJECT_RULES>\n\
+                        </project-memory>";
+        // ...and its rendering is byte-identical to the pre-budget output.
+        assert_eq!(render_memory_block(&selected), expected);
+    }
+
+    // -- ready notes --------------------------------------------------------
+
+    fn note(id: &str, title: &str, body: &str) -> ReadyNote {
+        ReadyNote {
+            id: id.to_string(),
+            title: title.to_string(),
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn m1_bytes_are_unchanged_without_ready_notes() {
+        // Byte stability is the whole point of the placeholder rule: a session
+        // with no surfaced notes must render exactly what it rendered before
+        // ready notes existed.
+        assert_eq!(assemble_m1("", ""), M1_PLACEHOLDER);
+        assert_eq!(
+            assemble_m1("<project-memory>\n</project-memory>", ""),
+            format!("<project-memory>\n</project-memory>\n{M1_PLACEHOLDER}")
+        );
+    }
+
+    #[test]
+    fn ready_notes_follow_the_memory_block() {
+        let notes = render_ready_notes_block(&[note("7", "Migrate", "then run")]);
+        assert_eq!(
+            assemble_m1("<project-memory>\n</project-memory>", &notes),
+            format!("<project-memory>\n</project-memory>\n{notes}")
+        );
+    }
+
+    #[test]
+    fn the_placeholder_survives_a_notes_only_delta() {
+        // A budget can drop every memory while a note is still surfaced; the
+        // delta half must still open with one of the markers the prefix split
+        // recognises, or the whole m[1] half is lost at the seam.
+        let notes = render_ready_notes_block(&[note("7", "Migrate", "then run")]);
+        assert_eq!(
+            assemble_m1("", &notes),
+            format!("{M1_PLACEHOLDER}\n{notes}")
+        );
+    }
+
+    #[test]
+    fn a_ready_note_renders_as_one_escaped_line() {
+        let notes = render_ready_notes_block(&[
+            note("7", "Migrate <db>", "first line\nsecond & last"),
+            note("9", "One-liner", ""),
+        ]);
+        assert_eq!(
+            notes,
+            "<ready-notes>\n\
+             #7: Migrate &lt;db&gt; — first line second &amp; last\n\
+             #9: One-liner\n\
+             </ready-notes>"
+        );
+    }
+
+    #[test]
+    fn a_ready_note_body_is_capped_on_a_character_boundary() {
+        let body = format!("{}\n{}", "é".repeat(READY_BODY_CHARS), "tail");
+        let notes = render_ready_notes_block(&[note("1", "T", &body)]);
+        assert!(
+            notes.contains(&format!("— {}", "é".repeat(READY_BODY_CHARS))),
+            "{notes}"
+        );
+        assert!(!notes.contains("tail"), "{notes}");
+    }
+
+    #[test]
+    fn no_ready_notes_renders_nothing() {
+        assert_eq!(render_ready_notes_block(&[]), "");
+    }
 }

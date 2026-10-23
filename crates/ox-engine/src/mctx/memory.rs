@@ -11,7 +11,9 @@
 //!   for.
 //! - **Notes** are session-scoped pending intentions: work to return to,
 //!   with its findings attached. They are pull-based (the model asks with
-//!   `ctx_note read`); they never enter a prompt on their own.
+//!   `ctx_note read`) — with one exception: a note parked on a
+//!   `surface_condition` is surfaced into the session's pinboard by the
+//!   dreamer once the condition holds (see the deviation below).
 //!
 //! # Handles and lifecycles
 //!
@@ -24,16 +26,25 @@
 //!
 //! Memories: `active` → `archived` (retirable, still `get`-able; the
 //! optional archive reason is kept). Notes: `active`, `pending` (a smart
-//! note parked on a `surface_condition`) and `dismissed`.
+//! note parked on a `surface_condition`), `ready` (the condition holds; it is
+//! in the pinboard) and `dismissed`.
 //!
 //! # Deviations from the reference (documented, not accidental)
 //!
-//! - **No outside checker (MVP).** A note written with `surface_condition`
-//!   is stored as `pending` and stays parked; the reference's periodic
-//!   condition check is not part of ox yet, so `read filter=ready` returns
-//!   nothing, `filter=pending` is where smart notes live, and the
-//!   reference's "ready smart notes first" page order is vacuous — `read`
-//!   orders newest first.
+//! - **A condition is checked by a periodic sweep, and its verdict is rendered
+//!   in the pinboard.** The reference compiles a note's condition into a check
+//!   (`evaluate-n-notes`), surfaces it at natural boundaries, and keeps ready
+//!   notes out of m[1] on purpose (`m1_compose.rs`: "Ready smart notes are
+//!   deliberately absent from m1 … the host's deferred-notes reminder, then
+//!   `ctx_note read`"). ox has one trigger form — the dreamer's
+//!   `surface_notes` task, on the dreamer interval — and its verdict is a
+//!   status flip to `ready`, which the session's next pinboard rebuild renders
+//!   as a `<ready-notes>` line ([`crate::mctx::render`]). Nothing is appended
+//!   to the live transcript, so a surfacing never writes a prompt mid-turn; it
+//!   costs the same one-turn `Soft` prefix shift a memory write does. `read`
+//!   still orders newest first for every filter: the reference's "ready first"
+//!   page order is not ported, because handle order already puts a
+//!   just-surfaced note near the front (ids ascend with write time).
 //! - **Merge candidates are active rows only.** An archived row can be
 //!   neither survivor (its content would be stranded outside the pinboard)
 //!   nor loser (its archive reason would be overwritten), so a merge needs
@@ -57,6 +68,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 
+use crate::mctx::decay_render::estimate_tokens;
 use crate::runner::{Tool, ToolContext, ToolOutput};
 use ox_db::{Db, optional};
 use ox_schema::id::now_millis;
@@ -88,6 +100,11 @@ const NOTE_ID_LIMIT: usize = 50;
 const MAX_NOTE_PAGE: usize = 200;
 /// Default `read` page size.
 const NOTE_PAGE: usize = 25;
+/// Most surfaced notes one session's pinboard carries. A surfaced note is an
+/// intention to return to, and the pinboard pays for it on every request, so
+/// the list is bounded; the oldest handles win, because they have waited
+/// longest.
+const READY_NOTE_LIMIT: usize = 10;
 
 // ---------------------------------------------------------------------------
 // Store: memories
@@ -98,7 +115,11 @@ const NOTE_PAGE: usize = 25;
 /// Public so the historian's `<project-memory>` renderer
 /// ([`crate::mctx::historian::render_historian_memory_block`]) can take it:
 /// that renderer is deliberately a different shape from the pinboard's.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `PartialEq` but not `Eq`: `importance` is an `f64`. The weight controls
+/// selection ([`select_memories`]) and is deliberately absent from the wire, so
+/// a classification-only update changes no prompt byte.
+#[derive(Debug, Clone, PartialEq)]
 pub struct MemoryRow {
     /// `#N` handle body.
     pub id: String,
@@ -106,6 +127,14 @@ pub struct MemoryRow {
     pub category: String,
     /// The fact text.
     pub content: String,
+    /// Selection weight from the dreamer's classify task; `0` until it runs,
+    /// which ties every row and leaves recency to decide.
+    pub importance: f64,
+    /// Last write to the row, in epoch milliseconds.
+    pub updated_at: i64,
+    /// Last verification against the cited files, in epoch milliseconds; `0`
+    /// means never verified.
+    pub verified_at: i64,
 }
 
 /// One memory as `get` reads it (every status).
@@ -384,9 +413,10 @@ pub(crate) async fn active_memories(db: &Db, project: &str) -> Result<Vec<Memory
         let conn = db.acquire().await?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, category, content FROM mc_memory
-                 WHERE project = ?1 AND status = 'active'
-                 ORDER BY CAST(id AS INTEGER)",
+                "SELECT id, category, content, importance, updated_at, verified_at
+                   FROM mc_memory
+                  WHERE project = ?1 AND status = 'active'
+                  ORDER BY CAST(id AS INTEGER)",
             )
             .await?;
         let mut rows = stmt.query([project]).await?;
@@ -396,12 +426,71 @@ pub(crate) async fn active_memories(db: &Db, project: &str) -> Result<Vec<Memory
                 id: row.get(0)?,
                 category: row.get(1)?,
                 content: row.get(2)?,
+                importance: row.get(3)?,
+                updated_at: row.get(4)?,
+                verified_at: row.get(5)?,
             });
         }
         Ok(out)
     }
     .await;
     result.with_context(|| context)
+}
+
+/// Choose which memories the pinboard carries under `budget_tokens`.
+///
+/// Order: [`MemoryRow::importance`] descending (the classify task's weight,
+/// `0` until it runs), then the last touch (`max(verified_at, updated_at)`)
+/// descending, then the numeric id ascending. The id tie-break is numeric, not
+/// lexicographic — handles are numbers (`#9` before `#10`).
+///
+/// A memory that does not fit is **skipped, not truncated**, and the walk
+/// continues: a short fact behind a long one still makes it in. The budget
+/// accounts for the fact text only; the framing (`#id: `, category tags) is a
+/// constant per included row and not what the budget exists to bound.
+///
+/// Pure: no IO, no DB, and no content copy — the selection is a list of
+/// borrows.
+pub(crate) fn select_memories(memories: &[MemoryRow], budget_tokens: usize) -> Vec<&MemoryRow> {
+    let mut ordered: Vec<&MemoryRow> = memories.iter().collect();
+    ordered.sort_by(|left, right| selection_order(left, right));
+
+    let mut used = 0usize;
+    let mut selected = Vec::new();
+    for memory in ordered {
+        let cost = estimate_tokens(&memory.content);
+        if used + cost > budget_tokens {
+            continue;
+        }
+        used += cost;
+        selected.push(memory);
+    }
+    selected
+}
+
+/// Selection order (see [`select_memories`]). `total_cmp` keeps the order
+/// total even if a row somehow carries a NaN weight.
+fn selection_order(left: &MemoryRow, right: &MemoryRow) -> std::cmp::Ordering {
+    right
+        .importance
+        .total_cmp(&left.importance)
+        .then_with(|| last_touch(right).cmp(&last_touch(left)))
+        .then_with(|| numeric_id(&left.id).cmp(&numeric_id(&right.id)))
+        // Ids are numeric today, but a non-numeric one must not make the
+        // selection depend on row order.
+        .then_with(|| left.id.cmp(&right.id))
+}
+
+/// The most recent of the two watermarks: a row is "fresh" when either it was
+/// rewritten or its citations were re-verified.
+fn last_touch(memory: &MemoryRow) -> i64 {
+    memory.verified_at.max(memory.updated_at)
+}
+
+/// Sort key for a handle id: numeric ids order numerically, anything else
+/// sorts after them.
+pub(crate) fn numeric_id(id: &str) -> i64 {
+    id.parse().unwrap_or(i64::MAX)
 }
 
 /// One active memory as the dreamer's gate reads it: the render's shape plus
@@ -425,8 +514,9 @@ pub(crate) struct StoredMemory {
 
 /// [`active_memories`] with both watermarks attached (`updated_at` for the
 /// write, `verified_at` for the dreamer's gate). Kept separate from the
-/// pinboard read: the renderer has no use for the timestamps, and the
-/// dreamer is the only caller that does.
+/// pinboard read because the dreamer wants the watermark pair without the
+/// selection weight: the two shapes differ, and neither grows a field its own
+/// caller does not read.
 pub(crate) async fn active_memories_with_watermark(
     db: &Db,
     project: &str,
@@ -565,9 +655,16 @@ pub(crate) async fn embedded_memories(
 
 /// The projects that have at least one active memory, ascending. The dreamer
 /// enumerates work by project (its grain is `(project, task)`), and a project
-/// with no memories has nothing for any of its tasks to do — this is the
+/// with no memories has nothing for most of its tasks to do — this is the
 /// reference's cheap idle-project pruning (`pruneIdleScheduleIdentities`),
 /// reduced to the one identity form ox has.
+///
+/// One task is the exception: `surface_notes` works on `mc_note`, which is
+/// session-scoped, so a project that has parked notes but no memory at all is
+/// not enumerated and its notes stay parked. ox accepts that (a project the
+/// agent has worked in carries memories, and the alternative — enumerating note
+/// projects too — would put every task's gate into projects the dreamer has
+/// never seen) and it is recorded in the module docs' deviation list.
 pub(crate) async fn projects_with_active_memories(db: &Db) -> Result<Vec<String>> {
     let result: Result<Vec<String>> = async {
         let conn = db.acquire().await?;
@@ -657,7 +754,8 @@ pub(crate) enum NoteFilter {
     Active,
     /// Parked smart notes (`pending`).
     Pending,
-    /// Surfaced smart notes. MVP: always empty (no outside checker).
+    /// Surfaced smart notes (`ready`): the ones the dreamer's `surface_notes`
+    /// task judged in.
     Ready,
     /// Dismissed notes.
     Dismissed,
@@ -680,16 +778,15 @@ impl NoteFilter {
         }
     }
 
-    /// The SQL `status IN (...)` clause body, or `None` for an always-empty
-    /// view (`ready`).
-    fn statuses(self) -> Option<&'static str> {
+    /// The SQL `status IN (...)` clause body.
+    fn statuses(self) -> &'static str {
         match self {
-            NoteFilter::Default_ => Some("'active', 'pending'"),
-            NoteFilter::All => Some("'active', 'pending', 'dismissed'"),
-            NoteFilter::Active => Some("'active'"),
-            NoteFilter::Pending => Some("'pending'"),
-            NoteFilter::Ready => None,
-            NoteFilter::Dismissed => Some("'dismissed'"),
+            NoteFilter::Default_ => "'active', 'pending', 'ready'",
+            NoteFilter::All => "'active', 'pending', 'ready', 'dismissed'",
+            NoteFilter::Active => "'active'",
+            NoteFilter::Pending => "'pending'",
+            NoteFilter::Ready => "'ready'",
+            NoteFilter::Dismissed => "'dismissed'",
         }
     }
 }
@@ -751,9 +848,9 @@ pub(crate) async fn write_note(
     result.with_context(|| format!("write note for session {session_id}"))
 }
 
-/// The `read` page: newest first (parked smart notes would lead the page only
-/// once an outside checker can mark them ready — tox has none yet, so the
-/// reference's "ready first" ordering is vacuous here).
+/// The `read` page: newest first, for every filter (the reference leads with
+/// ready smart notes; ox orders by handle, which is write order, so a note
+/// surfaced just now at least does not sink behind older ones).
 pub(crate) async fn list_notes(
     db: &Db,
     session_id: &str,
@@ -761,9 +858,7 @@ pub(crate) async fn list_notes(
     limit: usize,
     offset: usize,
 ) -> Result<Vec<NoteRow>> {
-    let Some(statuses) = filter.statuses() else {
-        return Ok(Vec::new());
-    };
+    let statuses = filter.statuses();
     let sql = format!(
         "SELECT id, title, body, status, surface_condition,
                 COALESCE(updated_at, created_at)
@@ -786,6 +881,51 @@ pub(crate) async fn list_notes(
     }
     .await;
     result.with_context(|| format!("list notes for session {session_id}"))
+}
+
+/// One surfaced smart note as the pinboard render reads it.
+///
+/// The pinboard is the one place a note reaches a prompt: a `ready` note is
+/// work to return to, so it is shown to the model without being asked for. Only
+/// the three fields the render prints live here — the status is implied by the
+/// query, and the condition has already done its job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadyNote {
+    /// `#N` handle body.
+    pub id: String,
+    /// First line of the note text.
+    pub title: String,
+    /// Remainder of the note text (empty when the note is one line).
+    pub body: String,
+}
+
+/// The session's surfaced notes for the pinboard: `ready` rows, oldest handle
+/// first, at most [`READY_NOTE_LIMIT`].
+pub(crate) async fn ready_notes(db: &Db, session_id: &str) -> Result<Vec<ReadyNote>> {
+    let context = format!("read ready notes for session {session_id}");
+    let result: Result<Vec<ReadyNote>> = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, title, body FROM mc_note
+                  WHERE session_id = ?1 AND status = 'ready'
+                  ORDER BY CAST(id AS INTEGER)
+                  LIMIT ?2",
+            )
+            .await?;
+        let mut rows = stmt.query((session_id, READY_NOTE_LIMIT as i64)).await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            out.push(ReadyNote {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                body: row.get(2)?,
+            });
+        }
+        Ok(out)
+    }
+    .await;
+    result.with_context(|| context)
 }
 
 /// Full note rows for the given ids, in the requested order (unknown ids
@@ -1323,7 +1463,7 @@ impl Tool for CtxNoteTool {
                             "enum": ["write", "read", "update", "dismiss"],
                             "description": "write: save a new note (content required). \
                                             read: one row per note — `#id · age · title` — \
-                                            ready smart notes first, then newest; rows \
+                                            newest first; rows \
                                             untouched 30+ days are marked stale. Pass \
                                             note_ids to read full bodies; limit/offset \
                                             page; filter selects other statuses. update: \
@@ -1352,10 +1492,13 @@ impl Tool for CtxNoteTool {
                         "surface_condition",
                         json!({
                             "type": "string",
-                            "description": "Deprecated: this build stores the condition and \
-                                            parks the note as pending, but ox does not run \
-                                            the outside checker yet, so it will never \
-                                            surface on its own. Do not rely on it.",
+                            "description": "A condition that must hold before the note is \
+                                            worth surfacing. The note is parked as pending and \
+                                            a background task re-checks the condition against \
+                                            this project's recent user turns; once it holds, \
+                                            the note becomes ready and appears in the session \
+                                            pinboard without being asked for. Omit it for an \
+                                            ordinary note you read yourself.",
                         }),
                     ),
                     (
@@ -1363,8 +1506,8 @@ impl Tool for CtxNoteTool {
                         json!({
                             "type": "string",
                             "enum": ["all", "active", "pending", "ready", "dismissed"],
-                            "description": "Which notes read returns (default: active and \
-                                            parked smart notes).",
+                            "description": "Which notes read returns (default: active, parked \
+                                            and surfaced smart notes).",
                         }),
                     ),
                     (
@@ -1574,4 +1717,162 @@ async fn active_summary(db: &Db, session_id: &str) -> Result<String> {
         }
         _ => String::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One row with both watermarks set to the same value and no category
+    /// variety — the selection tests vary exactly one dimension each.
+    fn row(id: &str, content: String, importance: f64, touched_at: i64) -> MemoryRow {
+        MemoryRow {
+            id: id.to_string(),
+            category: "PROJECT_RULES".to_string(),
+            content,
+            importance,
+            updated_at: touched_at,
+            verified_at: touched_at,
+        }
+    }
+
+    fn ids<'a>(memories: &[&'a MemoryRow]) -> Vec<&'a str> {
+        memories.iter().map(|memory| memory.id.as_str()).collect()
+    }
+
+    #[test]
+    fn over_budget_selection_skips_and_keeps_fitting_memories() {
+        // 100 + 200 + 10 tokens against a 120-token budget: the 200-token row
+        // does not fit and is SKIPPED, not truncated, so the short row behind
+        // it still makes it in.
+        let memories = [
+            row("1", "a".repeat(400), 2.0, 10),
+            row("2", "b".repeat(800), 1.0, 10),
+            row("3", "c".repeat(40), 0.0, 10),
+        ];
+        assert_eq!(ids(&select_memories(&memories, 120)), ["1", "3"]);
+    }
+
+    #[test]
+    fn equal_scores_tie_break_on_numeric_id() {
+        // Ids are numeric handles: 9 orders before 10, unlike the strings.
+        let memories = [
+            row("10", "a".repeat(40), 0.0, 5),
+            row("9", "b".repeat(40), 0.0, 5),
+        ];
+        let selected = select_memories(&memories, 10);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "9");
+    }
+
+    #[test]
+    fn importance_outranks_recency() {
+        let memories = [
+            row("1", "a".repeat(40), 5.0, 1),
+            row("2", "b".repeat(40), 1.0, 99),
+        ];
+        let selected = select_memories(&memories, 10);
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "1");
+    }
+
+    #[test]
+    fn fresher_memory_outranks_stale_one_at_equal_importance() {
+        // The watermark is max(verified_at, updated_at): re-verifying a fact
+        // moves it up without touching its content.
+        let memories = [
+            row("1", "a".repeat(40), 1.0, 1),
+            row("2", "b".repeat(40), 1.0, 2),
+        ];
+        let selected = select_memories(&memories, 10);
+        assert_eq!(ids(&selected), ["2"]);
+    }
+
+    #[tokio::test]
+    async fn migration_v14_defaults_importance_for_existing_rows() {
+        let db = Db::open_in_memory().await.unwrap();
+        // A pre-V14 row: the insert names every column that existed then, so
+        // `importance` must come from the migration's DEFAULT.
+        {
+            let conn = db.acquire().await.unwrap();
+            conn.execute(
+                "INSERT INTO mc_memory (id, project, content, category, created_at, updated_at)
+                 VALUES ('7', '/project', 'fact', 'ARCHITECTURE', 1, 2)",
+                (),
+            )
+            .await
+            .unwrap();
+        }
+        let rows = active_memories(&db, "/project").await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].importance, 0.0);
+        assert_eq!(rows[0].updated_at, 2);
+        assert_eq!(rows[0].verified_at, 0);
+
+        let conn = db.acquire().await.unwrap();
+        let mut stmt = conn.prepare("PRAGMA user_version").await.unwrap();
+        let row = stmt.query_row(()).await.unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 14);
+    }
+
+    // -- ready notes --------------------------------------------------------
+
+    async fn insert_raw_note(db: &Db, id: &str, session: &str, status: &str) {
+        let conn = db.acquire().await.unwrap();
+        conn.execute(
+            "INSERT INTO mc_note
+                 (id, session_id, title, body, status, surface_condition, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, 1, 1)",
+            (
+                id,
+                session,
+                format!("title {id}"),
+                format!("body {id}"),
+                status,
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ready_notes_read_ready_rows_of_this_session_only() {
+        let db = Db::open_in_memory().await.unwrap();
+        for id in 1..=12 {
+            insert_raw_note(&db, &id.to_string(), "s1", "ready").await;
+        }
+        insert_raw_note(&db, "13", "s1", "pending").await;
+        insert_raw_note(&db, "14", "s1", "active").await;
+        insert_raw_note(&db, "15", "s1", "dismissed").await;
+        // Another session's surfaced note is not this session's pinboard.
+        insert_raw_note(&db, "16", "s2", "ready").await;
+
+        let notes = ready_notes(&db, "s1").await.unwrap();
+        let ids: Vec<&str> = notes.iter().map(|note| note.id.as_str()).collect();
+        // The cap keeps the OLDEST handles: a surfaced note is a follow-up
+        // waiting the longest, and ids are minted in write order.
+        assert_eq!(ids, ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]);
+        assert_eq!(notes[0].title, "title 1");
+        assert_eq!(notes[0].body, "body 1");
+        // An empty session renders nothing rather than an error.
+        assert!(ready_notes(&db, "s3").await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn note_filters_include_ready() {
+        // `ready` used to be an always-empty view (no consumer existed); it is
+        // now a stored status, so every listing that claims to show live notes
+        // must carry it.
+        for filter in [NoteFilter::Default_, NoteFilter::All] {
+            assert!(filter.statuses().contains("'ready'"), "{filter:?}");
+        }
+        assert_eq!(NoteFilter::Ready.statuses(), "'ready'");
+        for filter in [
+            NoteFilter::Active,
+            NoteFilter::Pending,
+            NoteFilter::Dismissed,
+        ] {
+            assert!(!filter.statuses().contains("'ready'"), "{filter:?}");
+        }
+    }
 }
