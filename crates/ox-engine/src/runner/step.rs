@@ -225,11 +225,18 @@ pub(crate) async fn run(
             project_root.as_deref(),
             ctx.mcp.instructions_block().as_deref(),
         );
-        let instruction_update = sync_instructions(ctx, &observed, &rows).await;
-        let system_static = {
+        let (system_static, tool_count) = {
             let guidance: Vec<(&str, Option<&'static str>)> = ctx.tools.guidances().collect();
-            prompt::system_static(&guidance)
+            // The baseline log's tool count is the registry size; the names
+            // iterate in the same order the definitions do.
+            let count = guidance.len();
+            (prompt::system_static(&guidance), count)
         };
+        // The baseline log needs the static layer's size, so it is built
+        // before the sync: assembling it is pure string work over the
+        // registry's guidance, unaffected by the keyed sources.
+        let instruction_update =
+            sync_instructions(ctx, &observed, &rows, system_static.len(), tool_count).await;
         let instructions_initial = {
             let baselines = super::lock(&ctx.instruction_baselines);
             baselines
@@ -1537,20 +1544,44 @@ pub(crate) fn build_chat_messages(
 
 /// Per-step keyed-instruction sync: diff current sources against what the
 /// wire shows, publish durable delta rows, and return the update text for
-/// this request's tail.
+/// this request's tail. The first step of a session builds its baseline and
+/// logs the injection-surface accounting once (`injection baseline`).
 async fn sync_instructions(
     ctx: &DrainCtx,
     observed: &[prompt::Observed],
     rows: &[Message],
+    system0_bytes: usize,
+    tool_count: usize,
 ) -> Option<String> {
-    let deltas = {
+    let (deltas, baseline_sizes) = {
         let mut baselines = super::lock(&ctx.instruction_baselines);
+        // The sizes are pure from `observed`, so they can be reported after
+        // the lock is released: tracing must not hold the baseline mutex.
+        let fresh = !baselines.contains_key(&ctx.session_id);
         let baseline = baselines
             .entry(ctx.session_id.clone())
             .or_insert_with(|| instructions::baseline(observed));
         let wire = instructions::fold(rows, compaction_boundary(rows));
-        instructions::diff(observed, &wire, baseline)
+        let deltas = instructions::diff(observed, &wire, baseline);
+        let sizes = fresh.then(|| prompt::injection_sizes(observed, system0_bytes, tool_count));
+        (deltas, sizes)
     };
+    if let Some(sizes) = baseline_sizes {
+        tracing::info!(
+            session = %ctx.session_id,
+            system0_bytes = sizes.system0_bytes,
+            mcp_bytes = sizes.mcp_bytes,
+            skills_bytes = sizes.skills_bytes,
+            skills_catalog = ?sizes.skills_catalog,
+            instructions_bytes = sizes.instructions_bytes,
+            date_bytes = sizes.date_bytes,
+            env_bytes = sizes.env_bytes,
+            tools = sizes.tools,
+            total_bytes = sizes.total_bytes,
+            estimated_tokens = sizes.estimated_tokens,
+            "injection baseline"
+        );
+    }
     if deltas.is_empty() {
         return None;
     }

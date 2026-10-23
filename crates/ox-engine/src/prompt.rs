@@ -16,6 +16,14 @@ fn escape(text: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// The length [`escape`] returns, without materializing the string: `&` grows
+/// by 4 bytes, `<` and `>` by 3 each.
+fn escaped_len(text: &str) -> usize {
+    text.len()
+        + 4 * text.bytes().filter(|&b| b == b'&').count()
+        + 3 * text.bytes().filter(|&b| b == b'<' || b == b'>').count()
+}
+
 /// Static system layer — verbatim port of upstream
 /// `packages/core/src/session/runner/prompt/system.txt`, with the identity
 /// line's `OpenCode` → ox. `${OPENCODE_TOOL_GUIDANCE}` is rendered from the
@@ -75,6 +83,59 @@ pub(crate) const KEY_INSTRUCTIONS: &str = "core/instructions";
 pub(crate) const KEY_DATE: &str = "core/date";
 pub(crate) const KEY_ENVIRONMENT: &str = "core/environment";
 
+/// How the skills catalog renders when its byte size crosses
+/// [`SKILLS_CATALOG_BUDGET_BYTES`]. The policy rides inside the observed
+/// `skills` value, so crossing the threshold mid-session hashes differently
+/// and the keyed framework fires exactly one delta — there is no second
+/// delivery path to keep in sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CatalogPolicy {
+    /// Every entry's id, name, and description (upstream's only form).
+    Full,
+    /// id + name, plus the frozen hint line; descriptions are omitted.
+    Compact,
+}
+
+/// The catalog's byte budget: at or under it the catalog renders in full,
+/// past it in [`CatalogPolicy::Compact`] (documented deviation from upstream,
+/// which always injects the full catalog — `.opencode/plans/
+/// ox-injection-hardening.md` §2-F). Fixed, not a config knob: one threshold
+/// keeps the wire and the goldens testable without a configuration surface.
+pub(crate) const SKILLS_CATALOG_BUDGET_BYTES: usize = 8 * 1024;
+
+/// The policy for a catalog of `bytes` bytes (see [`catalog_bytes`]).
+pub(crate) fn catalog_policy(bytes: usize) -> CatalogPolicy {
+    if bytes <= SKILLS_CATALOG_BUDGET_BYTES {
+        CatalogPolicy::Full
+    } else {
+        CatalogPolicy::Compact
+    }
+}
+
+/// Byte size of the catalog block [`render_skills`] with
+/// [`CatalogPolicy::Full`] would emit for `skills`: the `<available_skills>`
+/// wrapper plus, per entry, its `<skill>` tags and the escaped id/name (and
+/// description, when present) inside theirs.
+///
+/// The measurement is *policy-independent* on purpose: it sizes the catalog
+/// itself, not whichever rendering is active, so a flip can never oscillate
+/// (the compact rendering shrinking below the budget does not flip the policy
+/// back). `catalog_bytes_is_the_full_render_of_the_catalog_block` pins this
+/// against the renderer byte for byte.
+fn catalog_bytes(skills: &[SkillSummary]) -> usize {
+    let mut bytes = "<available_skills>\n".len() + "</available_skills>".len();
+    for skill in skills {
+        bytes += "  <skill>\n".len() + "  </skill>\n".len();
+        bytes += "    <id></id>\n".len() + escaped_len(&skill.id);
+        bytes += "    <name></name>\n".len() + escaped_len(&skill.name);
+        if let Some(description) = &skill.description {
+            bytes += "    <description></description>\n".len() + escaped_len(description);
+        }
+    }
+    bytes
+}
+
 /// One keyed source's value. Struct variants throughout: serde's internally
 /// tagged representation (`tag = "kind"`) cannot serialize newtype variants
 /// holding a `String`/`Vec`, and later steps hash this JSON.
@@ -88,6 +149,9 @@ pub(crate) enum SourceValue {
     },
     Skills {
         skills: Vec<SkillSummary>,
+        /// How this catalog renders this step; part of the hashed value, so a
+        /// budget crossing re-asserts the catalog once (batch F).
+        policy: CatalogPolicy,
     },
     /// Pre-rendered `<mcp_instructions>` block from the MCP hub.
     Mcp {
@@ -171,7 +235,8 @@ pub(crate) fn gather(
             value: if skills.is_empty() {
                 ObservedValue::Removed
             } else {
-                ObservedValue::Present(SourceValue::Skills { skills })
+                let policy = catalog_policy(catalog_bytes(&skills));
+                ObservedValue::Present(SourceValue::Skills { skills, policy })
             },
         },
         Observed {
@@ -308,13 +373,89 @@ pub(crate) fn render_initial(sources: &[Observed]) -> String {
 pub(crate) fn initial_text(value: &SourceValue) -> String {
     match value {
         SourceValue::Mcp { block } => block.clone(),
-        SourceValue::Skills { skills } => render_skills(skills),
+        SourceValue::Skills { skills, policy } => render_skills(skills, *policy),
         SourceValue::Files { files } => render_instruction_files(files),
         SourceValue::Date { value } => format!("Today's date: {value}"),
         SourceValue::Environment { value } => format!(
             "Here is some useful information about the environment you are running in:\n{value}"
         ),
     }
+}
+
+/// Byte accounting of one step's injection surface. Tokens are estimated with
+/// the historian's convention (`bytes / 4`, rounded up — see
+/// `crate::mctx::decay_render::estimate_tokens`); they are a scale signal, not
+/// billing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct InjectionSizes {
+    pub system0_bytes: usize,
+    pub mcp_bytes: usize,
+    pub skills_bytes: usize,
+    pub instructions_bytes: usize,
+    pub date_bytes: usize,
+    pub env_bytes: usize,
+    /// Number of registered tools (`tools` is not a text source: its cost is
+    /// the JSON definitions on the wire).
+    pub tools: usize,
+    /// The catalog policy of the skills source (`None` when there are no
+    /// skills), so the baseline log can name the degradation.
+    pub skills_catalog: Option<CatalogPolicy>,
+    /// system[0] + every keyed source's rendered bytes + the two-byte
+    /// separators [`render_initial`] inserts between present sources.
+    pub total_bytes: usize,
+    pub estimated_tokens: usize,
+}
+
+/// Measure this step's injection surface. Each source is measured by the
+/// length of the bytes its own renderer emits ([`initial_text`]), i.e. exactly
+/// what system[1] shows for it; bytes are never re-serialized separately. The
+/// five named fields cover the five keyed sources; a source added later
+/// without a field still counts toward `total_bytes`.
+pub(crate) fn injection_sizes(
+    observed: &[Observed],
+    system_static_len: usize,
+    tool_count: usize,
+) -> InjectionSizes {
+    let mut sizes = InjectionSizes {
+        system0_bytes: system_static_len,
+        mcp_bytes: 0,
+        skills_bytes: 0,
+        instructions_bytes: 0,
+        date_bytes: 0,
+        env_bytes: 0,
+        tools: tool_count,
+        skills_catalog: None,
+        total_bytes: system_static_len,
+        estimated_tokens: 0,
+    };
+    let mut present: usize = 0;
+    for source in observed {
+        let bytes = match &source.value {
+            ObservedValue::Present(value) => {
+                present += 1;
+                let rendered = initial_text(value);
+                sizes.total_bytes += rendered.len();
+                if let SourceValue::Skills { policy, .. } = value {
+                    sizes.skills_catalog = Some(*policy);
+                }
+                rendered.len()
+            }
+            ObservedValue::Removed | ObservedValue::Unavailable => 0,
+        };
+        match source.key {
+            KEY_MCP => sizes.mcp_bytes = bytes,
+            KEY_SKILLS => sizes.skills_bytes = bytes,
+            KEY_INSTRUCTIONS => sizes.instructions_bytes = bytes,
+            KEY_DATE => sizes.date_bytes = bytes,
+            KEY_ENVIRONMENT => sizes.env_bytes = bytes,
+            _ => {}
+        }
+    }
+    // `render_initial` joins present blocks with "\n\n"; an absent source
+    // leaves no separator behind.
+    sizes.total_bytes += 2 * present.saturating_sub(1);
+    sizes.estimated_tokens = sizes.total_bytes.div_ceil(4);
+    sizes
 }
 
 /// Upstream per-source `changed` renderers; `previous: None` falls back to
@@ -328,9 +469,13 @@ pub(crate) fn changed_text(value: &SourceValue, previous: Option<&SourceValue>) 
         (SourceValue::Files { files: after }, Some(SourceValue::Files { files: before })) => {
             instruction_files_update(before, after)
         }
-        (SourceValue::Skills { skills: after }, Some(SourceValue::Skills { skills: before })) => {
-            skills_update(before, after)
-        }
+        (
+            SourceValue::Skills {
+                skills: after,
+                policy,
+            },
+            Some(SourceValue::Skills { skills: before, .. }),
+        ) => skills_update(before, after, *policy),
         (SourceValue::Mcp { block }, Some(_)) => format!(
             "The available MCP server instructions have changed. This list supersedes the previous one.\n{block}"
         ),
@@ -436,9 +581,12 @@ fn instruction_file_changed(previous: &InstructionFile, current: &InstructionFil
     }
 }
 
-/// Upstream `skill/instructions.ts:render`, plus ox's escaping and optional
-/// description (documented deviation: upstream assumes a description).
-fn render_skills(skills: &[SkillSummary]) -> String {
+/// Upstream `skill/instructions.ts:render`, plus ox's escaping, optional
+/// description (documented deviation: upstream assumes a description), and
+/// catalog policy (batch F): [`CatalogPolicy::Full`] is upstream's bytes
+/// exactly; [`CatalogPolicy::Compact`] lists `id: name` lines with the frozen
+/// hint, descriptions omitted.
+fn render_skills(skills: &[SkillSummary], policy: CatalogPolicy) -> String {
     let mut out = String::from(
         "Skills provide specialized instructions and workflows for specific tasks.\n\
          Use the skill tool to load a skill when a task matches its description.\n\
@@ -450,33 +598,54 @@ fn render_skills(skills: &[SkillSummary]) -> String {
         out.push_str("No skills are currently available.");
         return out;
     }
+    if policy == CatalogPolicy::Compact {
+        out.push_str(SKILLS_COMPACT_HINT);
+        out.push('\n');
+    }
     out.push_str("<available_skills>\n");
-    push_skill_entries(&mut out, skills);
+    push_skill_entries(&mut out, skills, policy);
     out.push_str("</available_skills>");
     out
 }
 
-fn push_skill_entries(out: &mut String, skills: &[SkillSummary]) {
+/// The frozen one-line explanation a compact catalog carries (pinned by the
+/// `skills-compact.txt` golden; changing it is a wire change).
+const SKILLS_COMPACT_HINT: &str =
+    "Descriptions omitted (catalog over budget); use capability_search to find skills.";
+
+fn push_skill_entries(out: &mut String, skills: &[SkillSummary], policy: CatalogPolicy) {
     // `escape` already turns `<` into `&lt;`, so a skill id/name/description
     // carrying `<system-reminder>` is inert here: no reminder-tag neutralization
     // on top (that would double-escape an already-inert catalog).
     for skill in skills {
-        out.push_str("  <skill>\n");
-        out.push_str(&format!("    <id>{}</id>\n", escape(&skill.id)));
-        out.push_str(&format!("    <name>{}</name>\n", escape(&skill.name)));
-        if let Some(description) = &skill.description {
-            out.push_str(&format!(
-                "    <description>{}</description>\n",
-                escape(description)
-            ));
+        match policy {
+            CatalogPolicy::Full => {
+                out.push_str("  <skill>\n");
+                out.push_str(&format!("    <id>{}</id>\n", escape(&skill.id)));
+                out.push_str(&format!("    <name>{}</name>\n", escape(&skill.name)));
+                if let Some(description) = &skill.description {
+                    out.push_str(&format!(
+                        "    <description>{}</description>\n",
+                        escape(description)
+                    ));
+                }
+                out.push_str("  </skill>\n");
+            }
+            CatalogPolicy::Compact => {
+                out.push_str(&format!(
+                    "- {}: {}\n",
+                    escape(&skill.id),
+                    escape(&skill.name)
+                ));
+            }
         }
-        out.push_str("  </skill>\n");
     }
 }
 
 /// Upstream `skill/instructions.ts:update` — per-id added/changed/removed,
-/// full restatement only when no entry differs.
-fn skills_update(before: &[SkillSummary], after: &[SkillSummary]) -> String {
+/// full restatement only when no entry differs. `policy` is the *current*
+/// catalog's policy: it shapes the rendered lists, never the notice wording.
+fn skills_update(before: &[SkillSummary], after: &[SkillSummary], policy: CatalogPolicy) -> String {
     let added: Vec<&SkillSummary> = after
         .iter()
         .filter(|s| !before.iter().any(|b| b.id == s.id))
@@ -497,7 +666,7 @@ fn skills_update(before: &[SkillSummary], after: &[SkillSummary]) -> String {
     if added.is_empty() && changed.is_empty() && removed.is_empty() {
         return format!(
             "The available skills have changed. This list supersedes the previous available skills list.\n{}",
-            render_skills(after)
+            render_skills(after, policy)
         );
     }
     let mut sections: Vec<String> = Vec::new();
@@ -507,6 +676,7 @@ fn skills_update(before: &[SkillSummary], after: &[SkillSummary]) -> String {
         push_skill_entries(
             &mut s,
             &added.iter().map(|s| (*s).clone()).collect::<Vec<_>>(),
+            policy,
         );
         sections.push(s.trim_end().to_owned());
     }
@@ -517,6 +687,7 @@ fn skills_update(before: &[SkillSummary], after: &[SkillSummary]) -> String {
         push_skill_entries(
             &mut s,
             &changed.iter().map(|s| (*s).clone()).collect::<Vec<_>>(),
+            policy,
         );
         sections.push(s.trim_end().to_owned());
     }
@@ -989,6 +1160,7 @@ mod tests {
                     name: "n".into(),
                     description: None,
                 }],
+                policy: CatalogPolicy::Full,
             },
             SourceValue::Mcp {
                 block: "<mcp_instructions>\n</mcp_instructions>".into(),
@@ -1034,6 +1206,276 @@ mod tests {
         let render = render_initial(&observed);
         assert!(!render.contains("Instructions from:"));
         assert!(render.contains("Today's date: "));
+    }
+
+    // ---- Batch F (`.opencode/plans/ox-injection-hardening.md` §2-F): the
+    // injection surface is accounted for in bytes so the baseline log answers
+    // "what does this session's context cost before any transcript?".
+
+    fn present(key: &'static str, value: SourceValue) -> Observed {
+        Observed {
+            key,
+            value: ObservedValue::Present(value),
+        }
+    }
+
+    fn absent(key: &'static str) -> Observed {
+        Observed {
+            key,
+            value: ObservedValue::Removed,
+        }
+    }
+
+    fn one_file(content: &str) -> SourceValue {
+        SourceValue::Files {
+            files: vec![InstructionFile {
+                path: "/repo/AGENTS.md".into(),
+                content: content.into(),
+            }],
+        }
+    }
+
+    /// Every keyed source is measured by the bytes its own renderer emits, so
+    /// the breakdown sums to the injected surface (plus system[0] and the
+    /// two-byte separators `render_initial` joins present sources with).
+    #[test]
+    fn injection_sizes_break_down_every_keyed_source() {
+        let mcp = SourceValue::Mcp {
+            block: "<mcp_instructions>\n  server tool\n</mcp_instructions>".into(),
+        };
+        let files = one_file("rule one");
+        let date = SourceValue::Date {
+            value: "2026-10-23".into(),
+        };
+        let env = SourceValue::Environment {
+            value: "<env>\n</env>".into(),
+        };
+        let observed = vec![
+            present(KEY_MCP, mcp.clone()),
+            absent(KEY_SKILLS),
+            present(KEY_INSTRUCTIONS, files.clone()),
+            present(KEY_DATE, date.clone()),
+            present(KEY_ENVIRONMENT, env.clone()),
+        ];
+        let sizes = injection_sizes(&observed, 500, 12);
+
+        assert_eq!(sizes.system0_bytes, 500);
+        assert_eq!(sizes.mcp_bytes, initial_text(&mcp).len());
+        assert_eq!(sizes.instructions_bytes, initial_text(&files).len());
+        assert_eq!(sizes.date_bytes, initial_text(&date).len());
+        assert_eq!(sizes.env_bytes, initial_text(&env).len());
+        assert_eq!(sizes.tools, 12, "the tool count is a scale signal");
+
+        // 4 present sources: three `"\n\n"` separators between them.
+        let parts = sizes.mcp_bytes
+            + sizes.skills_bytes
+            + sizes.instructions_bytes
+            + sizes.date_bytes
+            + sizes.env_bytes;
+        assert_eq!(sizes.total_bytes, 500 + parts + 2 * 3);
+        assert_eq!(sizes.total_bytes, 500 + render_initial(&observed).len());
+    }
+
+    /// An absent source contributes nothing: a session with no skills is not
+    /// charged for the catalog block.
+    #[test]
+    fn injection_sizes_counts_absent_sources_as_zero() {
+        let observed = vec![present(KEY_DATE, SourceValue::Date { value: "x".into() })];
+        let sizes = injection_sizes(&observed, 0, 0);
+        assert_eq!(sizes.mcp_bytes, 0);
+        assert_eq!(sizes.skills_bytes, 0);
+        assert_eq!(sizes.instructions_bytes, 0);
+        assert_eq!(sizes.env_bytes, 0);
+        assert_eq!(
+            sizes.date_bytes,
+            initial_text(&SourceValue::Date { value: "x".into() }).len()
+        );
+        assert_eq!(sizes.total_bytes, sizes.date_bytes);
+
+        let nothing = injection_sizes(&[], 0, 0);
+        assert_eq!(nothing.total_bytes, 0);
+        assert_eq!(nothing.estimated_tokens, 0);
+    }
+
+    /// The estimate is the historian's `bytes / 4`, rounded up
+    /// (`crate::mctx::decay_render::estimate_tokens`): 10 bytes → 3 tokens.
+    #[test]
+    fn injection_sizes_estimate_tokens_as_ceiling_of_bytes_over_four() {
+        let sizes = injection_sizes(&[], 10, 3);
+        assert_eq!(sizes.total_bytes, 10);
+        assert_eq!(sizes.estimated_tokens, 3);
+        let exact = injection_sizes(&[], 8, 0);
+        assert_eq!(
+            exact.estimated_tokens, 2,
+            "no spurious rounding at a boundary"
+        );
+    }
+
+    // ---- Batch F2 (`.opencode/plans/ox-injection-hardening.md` §2-F): the
+    // skills catalog degrades to a compact form once it crosses a fixed byte
+    // budget, and the policy is part of the observed value so a flip is one
+    // ordinary keyed delta.
+
+    /// The catalog the frozen `skills.txt`/`skills-compact.txt` fixtures pin:
+    /// alpha (described) + beta (bare). Both goldens must read the same list.
+    fn catalog_sample() -> Vec<SkillSummary> {
+        vec![
+            SkillSummary {
+                id: "alpha".into(),
+                name: "Alpha".into(),
+                description: Some("First skill.".into()),
+            },
+            SkillSummary {
+                id: "beta".into(),
+                name: "Beta".into(),
+                description: None,
+            },
+        ]
+    }
+
+    /// Full up to and including the budget; Compact one byte past it.
+    #[test]
+    fn catalog_policy_flips_just_over_the_budget() {
+        assert_eq!(SKILLS_CATALOG_BUDGET_BYTES, 8 * 1024);
+        assert_eq!(
+            catalog_policy(SKILLS_CATALOG_BUDGET_BYTES - 1),
+            CatalogPolicy::Full
+        );
+        assert_eq!(
+            catalog_policy(SKILLS_CATALOG_BUDGET_BYTES),
+            CatalogPolicy::Full
+        );
+        assert_eq!(
+            catalog_policy(SKILLS_CATALOG_BUDGET_BYTES + 1),
+            CatalogPolicy::Compact
+        );
+    }
+
+    /// `catalog_bytes` must count exactly the bytes `render_skills(.., Full)`
+    /// emits for the catalog block, so a tag-shape change in the renderer
+    /// fails here instead of silently shifting the budget. Escapable
+    /// characters prove the accounting is over escaped bytes.
+    #[test]
+    fn catalog_bytes_is_the_full_render_of_the_catalog_block() {
+        let skills = vec![
+            SkillSummary {
+                id: "a&b".into(),
+                name: "A <B>".into(),
+                description: Some("D & <E>".into()),
+            },
+            SkillSummary {
+                id: "beta".into(),
+                name: "Beta".into(),
+                description: None,
+            },
+        ];
+        let full = render_skills(&skills, CatalogPolicy::Full);
+        let block_at = full.find("<available_skills>").expect("catalog block");
+        assert_eq!(catalog_bytes(&skills), full.len() - block_at);
+    }
+
+    #[test]
+    fn g4_compact_catalog_matches_the_frozen_fixture() {
+        // Fixture: hand-written from the batch-F spec (PROVENANCE.md): the
+        // shared preamble, the frozen hint line, then `- id: name` entries
+        // inside <available_skills> — descriptions never render.
+        assert_eq!(
+            render_skills(&catalog_sample(), CatalogPolicy::Compact),
+            SKILLS_COMPACT_TXT
+        );
+    }
+
+    /// The policy only changes the rendering; a delta against a compact
+    /// catalog still reports added/changed/removed, but its entry lines carry
+    /// no descriptions.
+    #[test]
+    fn a_compact_delta_never_leaks_descriptions() {
+        let before = SourceValue::Skills {
+            skills: vec![],
+            policy: CatalogPolicy::Full,
+        };
+        let after = SourceValue::Skills {
+            skills: vec![SkillSummary {
+                id: "new".into(),
+                name: "New".into(),
+                description: Some("a long description".into()),
+            }],
+            policy: CatalogPolicy::Compact,
+        };
+        let text = changed_text(&after, Some(&before));
+        assert!(text.contains("- new: New"), "{text}");
+        assert!(!text.contains("a long description"), "{text}");
+    }
+
+    #[test]
+    fn skills_policy_serializes_snake_case() {
+        let value = SourceValue::Skills {
+            skills: vec![],
+            policy: CatalogPolicy::Compact,
+        };
+        assert_eq!(
+            serde_json::to_string(&value).unwrap(),
+            r#"{"kind":"skills","skills":[],"policy":"compact"}"#
+        );
+    }
+
+    /// Discovery feeds the policy: one over-budget description flips the
+    /// observed value to Compact, a small catalog stays Full.
+    #[test]
+    fn gather_picks_the_policy_from_the_catalog_bytes() {
+        with_isolated_home(|_| {
+            let dir = tempfile::tempdir().unwrap();
+            let home = tempfile::tempdir().unwrap();
+            let skill_dir = dir.path().join(".ox").join("skills").join("huge");
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            let write = |description: &str| {
+                std::fs::write(
+                    skill_dir.join("SKILL.md"),
+                    format!("---\nname: Huge\ndescription: {description}\n---\nbody\n"),
+                )
+                .unwrap();
+            };
+            let skills_policy = |observed: &[Observed]| {
+                let Some(ObservedValue::Present(SourceValue::Skills { policy, .. })) = observed
+                    .iter()
+                    .find(|s| s.key == KEY_SKILLS)
+                    .map(|s| &s.value)
+                else {
+                    panic!("skills source must be present");
+                };
+                *policy
+            };
+            write("short");
+            let observed = gather(dir.path(), home.path(), None, None);
+            assert_eq!(skills_policy(&observed), CatalogPolicy::Full);
+            write(&"x".repeat(9000));
+            let observed = gather(dir.path(), home.path(), None, None);
+            assert_eq!(skills_policy(&observed), CatalogPolicy::Compact);
+        });
+    }
+
+    /// The skills size in the accounting is the rendered catalog under the
+    /// active policy, and the log line can name it.
+    #[test]
+    fn injection_sizes_report_the_catalog_policy() {
+        let observed = vec![present(
+            KEY_SKILLS,
+            SourceValue::Skills {
+                skills: catalog_sample(),
+                policy: CatalogPolicy::Compact,
+            },
+        )];
+        let sizes = injection_sizes(&observed, 0, 0);
+        assert_eq!(sizes.skills_catalog, Some(CatalogPolicy::Compact));
+        assert_eq!(
+            sizes.skills_bytes,
+            render_skills(&catalog_sample(), CatalogPolicy::Compact).len()
+        );
+        assert_eq!(
+            injection_sizes(&[absent(KEY_SKILLS)], 0, 0).skills_catalog,
+            None,
+            "no catalog, no policy"
+        );
     }
 
     /// Paths of the `core/instructions` file list, in injection order.
@@ -1189,6 +1631,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/prompt/skills.txt"
     ));
+    const SKILLS_COMPACT_TXT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/prompt/skills-compact.txt"
+    ));
     const INSTRUCTION_FILES_TXT: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/prompt/instruction-files.txt"
@@ -1329,20 +1775,12 @@ mod tests {
         // (`render`) @ 8482dbf1e7eba18d6c5d0de6f02f8242112bcf06 — entry shape
         // `<skill>` + id/name/description lines, 2/4-space indentation.
         // Deviation pinned on purpose (see PROVENANCE.md): a skill without a
-        // description renders no `<description>` line (`beta`).
-        let skills = vec![
-            SkillSummary {
-                id: "alpha".into(),
-                name: "Alpha".into(),
-                description: Some("First skill.".into()),
-            },
-            SkillSummary {
-                id: "beta".into(),
-                name: "Beta".into(),
-                description: None,
-            },
-        ];
-        assert_eq!(render_skills(&skills), SKILLS_TXT);
+        // description renders no `<description>` line (`beta`). Batch F: the
+        // Full policy must render exactly these bytes.
+        assert_eq!(
+            render_skills(&catalog_sample(), CatalogPolicy::Full),
+            SKILLS_TXT
+        );
     }
 
     #[test]

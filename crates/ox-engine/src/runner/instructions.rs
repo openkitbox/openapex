@@ -460,4 +460,41 @@ mod tests {
         let record = delta_record(&removed);
         assert_eq!(record[KEY_INSTRUCTIONS].as_str(), Some("removed"));
     }
+
+    /// Batch F2: the catalog policy is part of the observed value, so a flip
+    /// mid-session hashes differently and the keyed framework re-asserts the
+    /// catalog exactly once (`.opencode/plans/ox-injection-hardening.md` §2-F).
+    #[test]
+    fn a_catalog_policy_flip_fires_exactly_one_delta() {
+        use crate::prompt::{CatalogPolicy, KEY_SKILLS, SkillSummary};
+        fn skills(policy: CatalogPolicy) -> Observed {
+            Observed {
+                key: KEY_SKILLS,
+                value: ObservedValue::Present(SourceValue::Skills {
+                    skills: vec![SkillSummary {
+                        id: "i".into(),
+                        name: "N".into(),
+                        description: Some("d".into()),
+                    }],
+                    policy,
+                }),
+            }
+        }
+        let mut baseline = baseline(&[skills(CatalogPolicy::Full)]);
+        let deltas = diff(
+            &[skills(CatalogPolicy::Compact)],
+            &BTreeMap::new(),
+            &baseline,
+        );
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0].key, KEY_SKILLS);
+        apply(&deltas, &mut baseline);
+        // The wire now shows the delta row the publish projected, so the
+        // believed state is what we just delivered: no second delta.
+        let wire: BTreeMap<String, Option<String>> =
+            [(KEY_SKILLS.to_owned(), deltas[0].hash.clone())]
+                .into_iter()
+                .collect();
+        assert!(diff(&[skills(CatalogPolicy::Compact)], &wire, &baseline).is_empty());
+    }
 }
