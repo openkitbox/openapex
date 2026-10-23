@@ -19,11 +19,13 @@ pub const LOGO_LEFT: [&str; 4] = [
     "▀▀▀▀ █▀▀▀ ▀▀▀▀ ▀~~▀",
 ];
 
+/// ox = **o**pen **apex**：左块是 `OPEN`（上游原样），右块是 `APEX`（ox 自己的名字，
+/// 上游这里是 `CODE`）。字形沿用上游的 4×3 掩码字母表，`A`/`X` 由同一套 `▄`/`▀` 半块拼出。
 pub const LOGO_RIGHT: [&str; 4] = [
     "             ▄     ",
-    "█▀▀▀ █▀▀█ █▀▀█ █▀▀█",
-    "█___ █__█ █__█ █^^^",
-    "▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀",
+    "▄▀▀▄ █▀▀█ █▀▀█ █__█",
+    "█▀▀█ █__█ █^^^ _██_",
+    "█__█ █▀▀▀ ▀▀▀▀ █__█",
 ];
 
 pub const GO_RIGHT: [&str; 4] = ["    ", "█▀▀█", "█__█", "▀▀▀▀"];
@@ -176,6 +178,29 @@ mod tests {
 
     fn pal() -> crate::theme::Palette {
         crate::theme::Palette::for_deck(Deck::Truecolor)
+    }
+
+    #[test]
+    fn logo_masks_are_rectangular_and_use_the_documented_alphabet() {
+        // Hand-edited art: a stray character shifts every following glyph and a
+        // wrong width breaks the medium-tier stacking, so pin both.
+        const ALPHABET: &str = "█▀▄ _^~,";
+        for line in super::LOGO_LEFT.iter().chain(super::LOGO_RIGHT.iter()) {
+            assert_eq!(line.chars().count(), 19, "logo rows are 19 cells: {line:?}");
+            for ch in line.chars() {
+                assert!(
+                    ALPHABET.contains(ch),
+                    "unknown mask char {ch:?} in row {line:?}"
+                );
+            }
+        }
+        for line in super::GO_RIGHT {
+            assert_eq!(
+                line.chars().count(),
+                4,
+                "go mark rows are 4 cells: {line:?}"
+            );
+        }
     }
 
     #[test]
