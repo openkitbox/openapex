@@ -83,6 +83,14 @@ pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     /// The OpenAI `tools` array entry advertised to the model.
     fn definition(&self) -> ToolDef;
+    /// One line of cross-tool policy appended to the static system layer while
+    /// this tool is registered (upstream pi's tool-contributed `guideline`).
+    /// Distilled from this tool's own `definition` description — the single
+    /// source of truth — and kept to one short sentence: prompt budget, not
+    /// documentation. `None` (the default) contributes nothing.
+    fn guidance(&self) -> Option<&'static str> {
+        None
+    }
     /// Run the tool with the parsed `arguments` object.
     fn execute(
         &self,
@@ -147,5 +155,91 @@ impl ToolRegistry {
     /// The OpenAI `tools` array in name order.
     pub fn definitions(&self) -> Vec<ToolDef> {
         self.tools.values().map(|tool| tool.definition()).collect()
+    }
+
+    /// Each registered tool's name with the guidance it contributes, in name
+    /// order. Borrowed throughout: the static system layer is assembled from
+    /// this without cloning tool names.
+    pub fn guidances(&self) -> impl Iterator<Item = (&str, Option<&'static str>)> + '_ {
+        self.tools
+            .iter()
+            .map(|(name, tool)| (name.as_str(), tool.guidance()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A tool that only answers the registry seam (name, definition, the
+    /// optional guidance); execution is never reached.
+    struct Stub {
+        name: &'static str,
+        guidance: Option<&'static str>,
+    }
+
+    impl Tool for Stub {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn definition(&self) -> ToolDef {
+            ToolDef::function(self.name, "stub", serde_json::json!({ "type": "object" }))
+        }
+
+        fn guidance(&self) -> Option<&'static str> {
+            self.guidance
+        }
+
+        fn execute(
+            &self,
+            _ctx: ToolContext,
+            _input: Value,
+        ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
+            unimplemented!("stub tool is never executed")
+        }
+    }
+
+    #[test]
+    fn guidance_defaults_to_none() {
+        struct Silent;
+        impl Tool for Silent {
+            fn name(&self) -> &str {
+                "silent"
+            }
+            fn definition(&self) -> ToolDef {
+                ToolDef::function("silent", "stub", serde_json::json!({ "type": "object" }))
+            }
+            fn execute(
+                &self,
+                _ctx: ToolContext,
+                _input: Value,
+            ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
+                unimplemented!("stub tool is never executed")
+            }
+        }
+        assert_eq!(Silent.guidance(), None);
+    }
+
+    #[test]
+    fn guidances_iterate_in_name_order_and_carry_each_tools_line() {
+        let mut registry = ToolRegistry::new();
+        registry
+            .register(Arc::new(Stub {
+                name: "zeta",
+                guidance: Some("zeta line"),
+            }))
+            .unwrap();
+        registry
+            .register(Arc::new(Stub {
+                name: "alpha",
+                guidance: None,
+            }))
+            .unwrap();
+        let collected: Vec<(&str, Option<&'static str>)> = registry.guidances().collect();
+        assert_eq!(
+            collected,
+            vec![("alpha", None), ("zeta", Some("zeta line"))]
+        );
     }
 }

@@ -978,6 +978,10 @@ impl Tool for CtxMemoryTool {
         "ctx_memory"
     }
 
+    fn guidance(&self) -> Option<&'static str> {
+        Some(super::CTX_GUIDANCE)
+    }
+
     fn definition(&self) -> ToolDef {
         ToolDef::function(
             "ctx_memory",
@@ -1290,6 +1294,10 @@ impl CtxNoteTool {
 impl Tool for CtxNoteTool {
     fn name(&self) -> &str {
         "ctx_note"
+    }
+
+    fn guidance(&self) -> Option<&'static str> {
+        Some(super::CTX_GUIDANCE)
     }
 
     fn definition(&self) -> ToolDef {

@@ -227,13 +227,8 @@ pub(crate) async fn run(
         );
         let instruction_update = sync_instructions(ctx, &observed, &rows).await;
         let system_static = {
-            let names: Vec<String> = ctx
-                .tools
-                .definitions()
-                .iter()
-                .map(|d| d.function.name.clone())
-                .collect();
-            prompt::system_static(&names.iter().map(String::as_str).collect::<Vec<_>>())
+            let guidance: Vec<(&str, Option<&'static str>)> = ctx.tools.guidances().collect();
+            prompt::system_static(&guidance)
         };
         let instructions_initial = {
             let baselines = super::lock(&ctx.instruction_baselines);

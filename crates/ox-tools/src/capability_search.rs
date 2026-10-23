@@ -24,6 +24,12 @@ impl Tool for CapabilitySearchTool {
         "capability_search"
     }
 
+    fn guidance(&self) -> Option<&'static str> {
+        Some(
+            "Use capability_search when a task might match an installed skill but its id or exact description is unknown.",
+        )
+    }
+
     fn definition(&self) -> ToolDef {
         ToolDef::function(
             "capability_search",

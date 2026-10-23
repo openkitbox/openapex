@@ -33,6 +33,12 @@ pub(crate) fn budget_for(
     )
 }
 
+/// The `ctx_*` family's shared one-line system-layer guidance. The family's
+/// policy is cross-tool (which member to reach for), so it is written once
+/// here and every member answers with the same line; `prompt::system_static`
+/// renders identical contributions once.
+pub(crate) const CTX_GUIDANCE: &str = "ctx_note parks follow-ups, ctx_reduce drops stale items, ctx_expand recovers them, ctx_search finds the archive, ctx_memory stores facts.";
+
 /// The embedding client and its vector helpers.
 pub mod embed;
 

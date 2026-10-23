@@ -74,14 +74,8 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
         project_root.as_deref(),
         ctx.mcp.instructions_block().as_deref(),
     );
-    let names: Vec<String> = ctx
-        .tools
-        .definitions()
-        .iter()
-        .map(|definition| definition.function.name.clone())
-        .collect();
-    let system_static =
-        crate::prompt::system_static(&names.iter().map(String::as_str).collect::<Vec<_>>());
+    let guidance: Vec<(&str, Option<&'static str>)> = ctx.tools.guidances().collect();
+    let system_static = crate::prompt::system_static(&guidance);
     let instructions = super::instructions::baseline(&observed).initial_render;
     let mut messages = super::step::build_chat_messages(
         &system_static,

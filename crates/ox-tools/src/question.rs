@@ -32,6 +32,12 @@ impl Tool for QuestionTool {
         "question"
     }
 
+    fn guidance(&self) -> Option<&'static str> {
+        Some(
+            "Use the question tool for preferences, tradeoffs, or irreversible decisions only; never for facts a tool can inspect.",
+        )
+    }
+
     fn definition(&self) -> ToolDef {
         ToolDef::function(
             "question",

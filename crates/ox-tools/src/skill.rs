@@ -21,6 +21,12 @@ impl Tool for SkillTool {
         "skill"
     }
 
+    fn guidance(&self) -> Option<&'static str> {
+        Some(
+            "Load a skill from the `<available_skills>` listing with the skill tool before relying on its workflow.",
+        )
+    }
+
     fn definition(&self) -> ToolDef {
         ToolDef::function(
             "skill",

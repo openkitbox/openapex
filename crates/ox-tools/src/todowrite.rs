@@ -41,6 +41,12 @@ impl Tool for TodoWriteTool {
         "todowrite"
     }
 
+    fn guidance(&self) -> Option<&'static str> {
+        Some(
+            "Track multi-step work with todowrite: send the full list on every call; it replaces the previous one.",
+        )
+    }
+
     fn definition(&self) -> ToolDef {
         ToolDef::function(
             "todowrite",

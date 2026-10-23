@@ -955,6 +955,10 @@ impl Tool for CtxSearchTool {
         "ctx_search"
     }
 
+    fn guidance(&self) -> Option<&'static str> {
+        Some(super::CTX_GUIDANCE)
+    }
+
     fn definition(&self) -> ToolDef {
         ToolDef::function(
             "ctx_search",

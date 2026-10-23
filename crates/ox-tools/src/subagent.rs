@@ -110,6 +110,12 @@ impl Tool for SubagentTool {
         "subagent"
     }
 
+    fn guidance(&self) -> Option<&'static str> {
+        Some(
+            "Use the subagent tool for isolated exploration that would flood this context; only its final message comes back.",
+        )
+    }
+
     fn definition(&self) -> ToolDef {
         ToolDef::function(
             "subagent",

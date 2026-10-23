@@ -23,25 +23,50 @@ fn escape(text: &str) -> String {
 /// `session/system-prompt.ts:render`).
 const HARNESS_TEMPLATE: &str = "You are an AI agent running in ox, an opencode-compatible server. Help the user accomplish their goals using the tools you have available.\n\n# Harness\n- Responses are rendered as GitHub-flavored Markdown.\n- `<system-reminder>` blocks are harness instructions, not user-authored content. Read and follow them.\n- Prefer parallelizing independent tool calls.\n${OPENCODE_TOOL_GUIDANCE}\n\n# Communication\n- Use clear file paths when referring to files.\n- Keep responses clear and concise, and avoid unnecessary technical jargon.\n\n# Working in codebases\n- Keep changes consistent with the structure, naming, style, and patterns of the surrounding code.\n- Treat unfamiliar files or changes as potential user work and investigate before deleting or overwriting them.\n";
 
-/// Build the static system layer from the registered tool names.
-pub fn system_static(tool_names: &[&str]) -> String {
-    HARNESS_TEMPLATE.replace("${OPENCODE_TOOL_GUIDANCE}", &tool_guidance(tool_names))
+/// Build the static system layer from the registered tools: their names drive
+/// the upstream bullets, and any guidance they contribute (see
+/// [`ox_tools::contract::Tool::guidance`]) follows them.
+pub fn system_static(tools: &[(&str, Option<&'static str>)]) -> String {
+    HARNESS_TEMPLATE.replace("${OPENCODE_TOOL_GUIDANCE}", &tool_guidance(tools))
 }
 
-/// Upstream `session/system-prompt.ts:11-32`, verbatim.
-fn tool_guidance(tool_names: &[&str]) -> String {
+/// Upstream `session/system-prompt.ts:11-32`, verbatim, then the documented
+/// deviation from `.opencode/plans/ox-injection-hardening.md` §2-C: one bullet
+/// per registered tool that contributes guidance, in tool-name order.
+/// Duplicate lines (`ctx_*` share one) render once, and a toolset contributing
+/// nothing keeps the upstream portion byte-identical.
+fn tool_guidance(tools: &[(&str, Option<&'static str>)]) -> String {
+    let has = |name: &str| tools.iter().any(|(candidate, _)| *candidate == name);
     let mut instructions: Vec<&str> = Vec::new();
-    if tool_names.contains(&"shell") {
+    if has("shell") {
         instructions.push("- Prefer dedicated tools over shell commands; fall back to the shell when a tool cannot do what you need.");
         instructions.push("- Do not chain shell commands with separators like `echo \"====\";` or `printf '---'`; the output becomes noisy in a way that makes the user's side of the conversation worse.");
     }
-    if tool_names.contains(&"write") {
+    if has("write") {
         instructions.push("- Use the write tool to create files or completely replace their content. Prefer using the edit tool for targeted changes.");
     }
-    if tool_names.contains(&"edit") {
+    if has("edit") {
         instructions.push("- Use the edit tool for targeted changes to existing text files. It replaces the exact text in `oldString` with `newString`, and the values must differ. By default, `oldString` must occur exactly once. If it occurs multiple times, include more surrounding context to make it unique or set `replaceAll` to true to replace every occurrence.");
     }
-    instructions.join("\n")
+    let mut own: Vec<(&str, &'static str)> = tools
+        .iter()
+        .filter_map(|(name, guidance)| guidance.map(|guidance| (*name, guidance)))
+        .collect();
+    own.sort_unstable_by_key(|(name, _)| *name);
+    let mut rendered = instructions.join("\n");
+    let mut seen: Vec<&str> = Vec::new();
+    for (_, text) in own {
+        if seen.contains(&text) {
+            continue;
+        }
+        seen.push(text);
+        if !rendered.is_empty() {
+            rendered.push('\n');
+        }
+        rendered.push_str("- ");
+        rendered.push_str(text);
+    }
+    rendered
 }
 
 pub(crate) const KEY_MCP: &str = "core/mcp-guidance";
@@ -529,7 +554,7 @@ mod tests {
 
     #[test]
     fn static_layer_carries_the_harness_section_verbatim() {
-        let s = system_static(&["shell", "write", "edit"]);
+        let s = system_static(&[("shell", None), ("write", None), ("edit", None)]);
         assert!(s.starts_with(
             "You are an AI agent running in ox, an opencode-compatible server. Help the user accomplish their goals using the tools you have available."
         ));
@@ -548,7 +573,7 @@ mod tests {
 
     #[test]
     fn tool_guidance_follows_the_registered_tools() {
-        let shell_only = system_static(&["shell"]);
+        let shell_only = system_static(&[("shell", None)]);
         assert!(shell_only.contains("- Prefer dedicated tools over shell commands; fall back to the shell when a tool cannot do what you need."));
         assert!(
             shell_only
@@ -558,7 +583,7 @@ mod tests {
         assert!(!shell_only.contains("Use the write tool to create files"));
         let none = system_static(&[]);
         assert!(!none.contains("- Prefer dedicated tools over shell commands;"));
-        let edit = system_static(&["edit"]);
+        let edit = system_static(&[("edit", None)]);
         assert!(edit.contains("- Use the edit tool for targeted changes to existing text files."));
     }
 
@@ -1183,7 +1208,105 @@ mod tests {
                 "ox, an opencode-compatible server",
             )
             .replace("${OPENCODE_TOOL_GUIDANCE}", &guidance);
-        assert_eq!(system_static(&["shell", "write", "edit"]), expected);
+        assert_eq!(
+            system_static(&[("shell", None), ("write", None), ("edit", None)]),
+            expected
+        );
+    }
+
+    /// Batch C (`.opencode/plans/ox-injection-hardening.md` §2-C): the appended
+    /// section exists only for tools that contribute guidance. A toolset whose
+    /// tools all answer `None` keeps the upstream prefix byte-identical (the G1
+    /// expectation is the oracle), and adding `None` tools changes nothing.
+    #[test]
+    fn tools_without_guidance_leave_the_prefix_untouched() {
+        let baseline = system_static(&[("shell", None), ("write", None), ("edit", None)]);
+        let widened = system_static(&[
+            ("shell", None),
+            ("write", None),
+            ("edit", None),
+            ("glob", None),
+            ("patch", None),
+            ("read", None),
+        ]);
+        assert_eq!(widened, baseline);
+        assert!(!baseline.contains("subagent"));
+        assert!(baseline.ends_with("\n\n# Communication\n- Use clear file paths when referring to files.\n- Keep responses clear and concise, and avoid unnecessary technical jargon.\n\n# Working in codebases\n- Keep changes consistent with the structure, naming, style, and patterns of the surrounding code.\n- Treat unfamiliar files or changes as potential user work and investigate before deleting or overwriting them.\n"));
+    }
+
+    /// The appended bullets are ordered by tool name, so two registries holding
+    /// the same tools in a different insertion order render identical bytes.
+    #[test]
+    fn appended_guidance_is_deterministic() {
+        let forward = system_static(&[
+            ("capability_search", Some("CAP")),
+            ("subagent", Some("SUB")),
+            ("todowrite", Some("TODO")),
+        ]);
+        let reversed = system_static(&[
+            ("todowrite", Some("TODO")),
+            ("subagent", Some("SUB")),
+            ("capability_search", Some("CAP")),
+        ]);
+        assert_eq!(forward, reversed);
+        assert!(
+            forward.contains("- CAP\n- SUB\n- TODO\n\n# Communication"),
+            "{forward:?}"
+        );
+    }
+
+    /// Identical contributions render once: the five `ctx_*` tools share a
+    /// single line, so the family adds one bullet regardless of membership.
+    #[test]
+    fn identical_guidance_renders_once() {
+        let line = "ctx_note parks follow-ups.";
+        let one = system_static(&[("ctx_note", Some(line))]);
+        let all = system_static(&[
+            ("ctx_expand", Some(line)),
+            ("ctx_memory", Some(line)),
+            ("ctx_note", Some(line)),
+            ("ctx_reduce", Some(line)),
+            ("ctx_search", Some(line)),
+        ]);
+        assert_eq!(all, one);
+        assert_eq!(all.matches(line).count(), 1);
+    }
+
+    /// Batch C end to end over the registry the app builds at startup: every
+    /// contribution a registered tool advertises reaches the static layer, and
+    /// nothing else does.
+    #[tokio::test]
+    async fn every_registered_contribution_reaches_the_static_layer() {
+        use crate::runner::ToolRegistryExt;
+        let db = ox_db::Db::open_in_memory().await.unwrap();
+        let mut registry = crate::runner::ToolRegistry::with_builtins();
+        registry.register_todowrite(db.clone());
+        registry.register_mctx(db.clone(), None);
+        registry.register_subagent(db.clone(), ox_core::event_bus::EventBus::new(db.clone()), 1);
+        let guidance: Vec<(&str, Option<&'static str>)> = registry.guidances().collect();
+        let mut contributed: Vec<&str> = guidance.iter().filter_map(|(_, line)| *line).collect();
+        contributed.dedup();
+        assert_eq!(
+            contributed.len(),
+            6,
+            "one line each: capability_search, the shared ctx_* line, question, skill, subagent, todowrite: {contributed:?}"
+        );
+        let static_layer = system_static(&guidance);
+        let mut last = 0;
+        for line in contributed {
+            let at = static_layer
+                .find(&format!("- {line}\n"))
+                .unwrap_or_else(|| panic!("missing `{line}`"));
+            assert!(at > last, "`{line}` is out of name order");
+            last = at;
+        }
+        assert_eq!(
+            static_layer
+                .matches(&format!("- {}\n", crate::mctx::CTX_GUIDANCE))
+                .count(),
+            1,
+            "the five ctx_* tools share one bullet"
+        );
     }
 
     #[test]
