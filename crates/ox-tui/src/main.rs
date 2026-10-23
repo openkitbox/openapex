@@ -26,17 +26,14 @@ async fn main() -> anyhow::Result<()> {
 
     // 事件线程：阻塞 read 放独立线程。
     let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let key_tx = event_tx.clone();
+    let terminal_tx = event_tx.clone();
     std::thread::spawn(move || {
-        loop {
-            match crossterm::event::read() {
-                Ok(crossterm::event::Event::Key(key)) => {
-                    if key_tx.send(app::event::AppEvent::Key(key)).is_err() {
-                        break;
-                    }
-                }
-                Ok(_) => {}
-                Err(_) => break,
+        while let Ok(raw) = crossterm::event::read() {
+            let Some(event) = app::event::AppEvent::from_terminal(raw) else {
+                continue;
+            };
+            if terminal_tx.send(event).is_err() {
+                break;
             }
         }
     });

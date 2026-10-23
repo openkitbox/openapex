@@ -244,8 +244,21 @@ impl Transcript {
     }
 
     pub fn set_viewport(&mut self, width: u16, height: u16) {
-        self.width = width;
         self.height = height;
+        if self.width != width {
+            self.width = width;
+            // Re-wrap eagerly: `search.matches` holds absolute wrapped-line
+            // numbers, and a width change renumbers every line after the first
+            // one that now wraps differently. Costs nothing on the frames that
+            // keep the width (the guard above), and makes `render`'s own
+            // `lines_for` calls no-ops for this pass.
+            for entry in &mut self.entries {
+                entry.lines_for(width);
+            }
+            if !self.search.query.is_empty() {
+                self.recompute_search();
+            }
+        }
         self.clamp();
     }
 
@@ -495,6 +508,37 @@ mod tests {
             t.entry_generation(1),
             first_gen,
             "changed block bumps generation"
+        );
+    }
+
+    #[test]
+    fn resizing_rewraps_and_rekeys_search_matches() {
+        let text = "alpha beta gamma alpha delta epsilon alpha";
+        let mut t = Transcript::new(60, 4);
+        t.sync(&[Block::user(text)], 0);
+        assert_eq!(
+            t.set_query("alpha"),
+            1,
+            "the whole text fits one line at this width, so all three hits share it"
+        );
+        let wide_lines = t.total_lines();
+
+        t.set_viewport(12, 4);
+
+        assert!(
+            t.total_lines() > wide_lines,
+            "a narrower viewport must re-wrap the cached block into more lines"
+        );
+        let expected: Vec<usize> = super::render_block(&Block::user(text), 12)
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| super::line_text(line).to_lowercase().contains("alpha"))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            t.search().matches,
+            expected,
+            "match indices are absolute wrapped-line numbers and must follow a re-wrap"
         );
     }
 

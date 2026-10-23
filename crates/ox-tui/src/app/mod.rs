@@ -98,6 +98,7 @@ impl App {
         match event {
             AppEvent::Quit => self.view.should_quit = true,
             AppEvent::Key(key) => self.handle_key(key),
+            AppEvent::Resize => self.dirty = true,
             AppEvent::Stream(msg) => self.handle_stream(msg),
             AppEvent::History { request_id, items } => self.handle_history(request_id, items),
             AppEvent::SessionReady { session, prompt } => {
@@ -530,6 +531,16 @@ mod tests {
         app.dirty = false;
         key(&mut app, KeyCode::Char('x'));
         assert!(app.dirty, "a typed character must schedule a redraw");
+    }
+
+    #[test]
+    fn resize_marks_the_frame_dirty() {
+        // Idle app: the tick only redraws when `dirty`, so a resize that does
+        // not set it leaves the old frame on screen forever.
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        app.dirty = false;
+        app.handle(AppEvent::Resize);
+        assert!(app.dirty, "a terminal resize must schedule a redraw");
     }
 
     #[test]
