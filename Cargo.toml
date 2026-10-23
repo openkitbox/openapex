@@ -22,7 +22,7 @@ edition = "2024"
 # bump touches exactly one file.
 [workspace.dependencies]
 anyhow = "1.0.104"
-agent-client-protocol = { version = "=3.4.0" }
+agent-client-protocol = { version = "3.5" }
 base64 = "0.23.1"
 bytes = "1.12"
 cortexkit-cache-core = { git = "https://github.com/openkitbox/commons", rev = "067701f1ab61cd2c81aa58fb66b0cb65fbaef9e7" }
