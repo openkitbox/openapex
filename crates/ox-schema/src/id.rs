@@ -18,7 +18,7 @@ use std::fmt::Write as _;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rand::Rng;
+use rand::RngExt;
 
 /// Length of the unprefixed ID body (upstream `length = 26`).
 pub const BODY_LENGTH: usize = 26;

@@ -15,7 +15,14 @@ use ox_schema::message::Message;
 pub(crate) fn hash(value: &Option<SourceValue>) -> String {
     use sha2::Digest;
     let canonical = serde_json::to_string(value).expect("SourceValue is serializable");
-    format!("{:x}", sha2::Sha256::digest(canonical.as_bytes()))
+    digest_hex(&sha2::Sha256::digest(canonical.as_bytes()))
+}
+
+/// Lowercase hex of a SHA-256 digest. sha2 0.11's output type no longer
+/// implements `LowerHex`, so the encoding is spelled out here; the digest
+/// itself is unchanged and the persisted delta rows stay comparable.
+pub(crate) fn digest_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// What the model is believed to hold for one source.

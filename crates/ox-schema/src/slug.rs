@@ -1,7 +1,7 @@
 //! Human-readable session slugs, ported from
 //! `packages/core/src/util/slug.ts` (`Slug.create`): `"adjective-noun"`.
 
-use rand::Rng;
+use rand::RngExt;
 
 const ADJECTIVES: [&str; 29] = [
     "brave", "calm", "clever", "cosmic", "crisp", "curious", "eager", "gentle", "glowing", "happy",

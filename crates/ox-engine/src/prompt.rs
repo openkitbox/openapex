@@ -2004,7 +2004,7 @@ mod tests {
             let bytes = std::fs::read(dir.join(name))
                 .unwrap_or_else(|e| panic!("provenance lists {name} but it is unreadable: {e}"));
             assert_eq!(
-                format!("{:x}", sha2::Sha256::digest(&bytes)),
+                crate::runner::instructions::digest_hex(&sha2::Sha256::digest(&bytes)),
                 sha,
                 "fixture {name} changed without a PROVENANCE.md update"
             );
