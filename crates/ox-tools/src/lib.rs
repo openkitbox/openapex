@@ -276,13 +276,18 @@ pub fn optional_number(tool: &str, input: &Value, key: &str) -> Result<Option<f6
 // Path helpers
 // ---------------------------------------------------------------------------
 
-/// Resolve a tool path argument: absolute paths pass through, relative ones
-/// join the session directory (upstream `FileAccess.resolvePath`). `.` and
+/// Resolve a tool path argument: a leading `~` expands to the user's home
+/// (batch G redacts injected paths that way, so the model can act on them),
+/// absolute paths pass through, relative ones join the session directory
+/// (upstream `FileAccess.resolvePath`). `~user` is not expanded. `.` and
 /// empty components are normalized away so result paths render cleanly.
 pub fn resolve_path(directory: &Path, path: &str) -> PathBuf {
-    let candidate = Path::new(path);
+    let candidate = match ox_core::home_paths::expand_tilde(path, &ox_core::config::user_home()) {
+        Some(expanded) => expanded,
+        None => Path::new(path).to_path_buf(),
+    };
     let joined = if candidate.is_absolute() {
-        candidate.to_path_buf()
+        candidate
     } else {
         directory.join(candidate)
     };
@@ -418,6 +423,40 @@ mod tests {
         assert_eq!(
             resource_of(directory, Path::new("/etc/passwd")),
             "/etc/passwd"
+        );
+    }
+
+    /// Batch G: injected paths render the home directory as `~`, so the tool
+    /// path boundary expands it back through the one home source. The
+    /// assertions compare against `user_home()` itself — machine-independent,
+    /// and failing if the expansion ever drifts to a different home.
+    #[test]
+    fn resolve_path_expands_a_leading_tilde_to_the_user_home() {
+        let directory = Path::new("/tmp/ws");
+        let home = ox_core::config::user_home();
+        assert_eq!(
+            resolve_path(directory, "~/notes.txt"),
+            home.join("notes.txt")
+        );
+        assert_eq!(resolve_path(directory, "~"), home);
+        // Outside the home prefix: absolute and relative resolution unchanged.
+        assert_eq!(
+            resolve_path(directory, "/etc/hosts"),
+            PathBuf::from("/etc/hosts")
+        );
+        assert_eq!(
+            resolve_path(directory, "src/main.rs"),
+            PathBuf::from("/tmp/ws/src/main.rs")
+        );
+    }
+
+    /// `~user` is not expanded (no user lookup): it stays a relative path, so
+    /// it fails to resolve instead of naming another user's directory.
+    #[test]
+    fn resolve_path_does_not_expand_a_named_tilde() {
+        assert_eq!(
+            resolve_path(Path::new("/tmp/ws"), "~john/notes.txt"),
+            PathBuf::from("/tmp/ws/~john/notes.txt")
         );
     }
 

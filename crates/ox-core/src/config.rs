@@ -296,12 +296,20 @@ impl Default for Config {
     }
 }
 
+/// The user's home directory, falling back to `.` when it cannot be
+/// determined.
+///
+/// This is the one home source for model-visible paths: injected text renders
+/// it as `~` and [`crate::home_paths::expand_tilde`] expands it back, so a
+/// redacted path stays resolvable.
+pub fn user_home() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
 /// The ox home directory (`~/.ox`), falling back to `./.ox` when the home
 /// directory cannot be determined.
 pub fn ox_home() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".ox")
+    user_home().join(".ox")
 }
 
 impl Config {

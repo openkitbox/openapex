@@ -13,9 +13,11 @@
 //!
 //! Deliberate deviation: the file is read into memory instead of streamed.
 //! Previews are images and text; the extra copy is cheaper than a streaming
-//! body on this server. Path resolution matches `fs.list`/`fs.find`: an
-//! absolute path is used as-is, anything else is relative to the requested
-//! location, and `..` may leave it (upstream documents the same escape).
+//! body on this server. Path resolution matches `fs.list`/`fs.find`: a
+//! leading `~` expands to the user's home (batch G renders injected paths that
+//! way, so they must still resolve), an absolute path is used as-is, anything
+//! else is relative to the requested location, and `..` may leave it (upstream
+//! documents the same escape).
 
 use std::path::{Path, PathBuf};
 
@@ -106,6 +108,17 @@ pub(crate) async fn read(req: &mut Request, res: &mut Response) {
 }
 
 fn resolve(location: &str, relative: &str) -> PathBuf {
+    resolve_with_home(location, relative, &ox_core::config::user_home())
+}
+
+/// [`resolve`] with an explicit home, so the tilde rule is testable without
+/// touching the machine's home directory. `~user` is not a tilde form ox
+/// expands: it falls through to the location-relative branch, so it fails to
+/// resolve rather than naming another user's directory.
+fn resolve_with_home(location: &str, relative: &str, home: &Path) -> PathBuf {
+    if let Some(expanded) = ox_core::home_paths::expand_tilde(relative, home) {
+        return expanded;
+    }
     let candidate = Path::new(relative);
     if candidate.is_absolute() {
         candidate.to_path_buf()
@@ -407,5 +420,38 @@ mod tests {
             PathBuf::from("/repo/src/main.rs")
         );
         assert_eq!(resolve("/repo", "/etc/hosts"), PathBuf::from("/etc/hosts"));
+    }
+
+    /// Batch G: injected paths render the home directory as `~`, so the read
+    /// endpoint expands it back. `resolve_with_home` takes the home
+    /// explicitly so the fixture never touches the machine's home directory:
+    /// before batch G the same request resolved to `<location>/~/…` and 404ed.
+    #[test]
+    fn a_leading_tilde_resolves_under_home() {
+        let home = Path::new("/fake/home");
+        assert_eq!(
+            resolve_with_home("/repo", "~/notes.txt", home),
+            PathBuf::from("/fake/home/notes.txt")
+        );
+        assert_eq!(
+            resolve_with_home("/repo", "~", home),
+            PathBuf::from("/fake/home")
+        );
+        // `~user` is not expanded: it stays location-relative, so the request
+        // fails instead of reading another user's home.
+        assert_eq!(
+            resolve_with_home("/repo", "~john/x", home),
+            PathBuf::from("/repo/~john/x")
+        );
+    }
+
+    /// The handler's resolution uses the one user-home source, so a redacted
+    /// path resolves to the same file it was rendered from.
+    #[test]
+    fn resolve_expands_tilde_through_the_user_home() {
+        assert_eq!(
+            resolve("/repo", "~/notes.txt"),
+            ox_core::config::user_home().join("notes.txt")
+        );
     }
 }

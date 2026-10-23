@@ -7,6 +7,7 @@
 pub mod config;
 pub mod copied_tags;
 pub mod event_bus;
+pub mod home_paths;
 pub mod model_catalog;
 pub mod projector;
 pub mod reminder_tags;

@@ -1824,7 +1824,9 @@ fn resolve_skills(
             });
             continue;
         }
-        let Some(skill) = ox_tools::skills::prepare_from(skills, &id) else {
+        let Some(skill) =
+            ox_tools::skills::prepare_from(skills, &id, &ox_core::config::user_home())
+        else {
             return Err(id);
         };
         prepared.push((skill.id.clone(), skill.name.clone()));

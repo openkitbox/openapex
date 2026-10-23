@@ -80,7 +80,8 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
             input,
         );
     };
-    let Some(prepared) = super::skills::prepare(&ctx.directory, id) else {
+    let Some(prepared) = super::skills::prepare(&ctx.directory, id, &ox_core::config::user_home())
+    else {
         let available: Vec<String> = super::skills::discover(&ctx.directory)
             .into_iter()
             .map(|skill| skill.id)
@@ -103,6 +104,8 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     fn ctx(dir: &std::path::Path) -> ToolContext {
@@ -250,7 +253,9 @@ mod tests {
         .unwrap();
         std::fs::write(skill_dir.join("scripts/b.sh"), "echo").unwrap();
 
-        let prepared = super::super::skills::prepare(dir.path(), "review").unwrap();
+        let prepared =
+            super::super::skills::prepare(dir.path(), "review", Path::new("/nonexistent-ox-home"))
+                .unwrap();
         let output = SkillTool
             .execute(ctx(dir.path()), serde_json::json!({ "id": "review" }))
             .await;
