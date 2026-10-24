@@ -346,6 +346,7 @@ Rules:
 2. The category must be one of: PROJECT_RULES (how work is done here), ARCHITECTURE (how the system is built), CONSTRAINTS (a hard limit or a gotcha), CONFIG_VALUES (a specific value or path), NAMING (what something is called).
 3. Only a lesson the user actually stated or corrected. Never infer one, never generalize from a single request, and never restate something ordinary.
 4. Nothing durable in these turns is a valid answer.
+5. Distill, do not transcribe: never quote the user, never include dates, and never preserve session-local anger.
 
 Output ONE element at the very end and NOTHING else — no narration, no reasoning:
 <memory category=\"CONSTRAINTS\">one self-contained fact</memory>
@@ -1068,6 +1069,24 @@ impl Dreamer {
                 });
             }
         };
+        // "Distill, do not transcribe" (upstream
+        // dreamer/retrospective-learnings.ts:164-168): a lesson that is really
+        // a transcription of these turns is dropped and logged, never written.
+        // That is a correct outcome, not a parse failure, so the tick
+        // completes — and completes-without-write is also what advances the
+        // watermark past a rejected window.
+        let source_turns: Vec<&str> = turns.iter().map(String::as_str).collect();
+        if let Err(reason) = validate_retrospective_lesson(&lesson.content, &source_turns) {
+            tracing::info!(
+                target: "mctx::dreamer",
+                project = %project,
+                "retrospective rejected: {reason:?}"
+            );
+            return TaskOutcome::Completed {
+                detail: format!("rejected: {reason:?}"),
+                cursor: None,
+            };
+        }
         match fact_recorded(&self.db, project, &lesson.content).await {
             Ok(false) => {}
             Ok(true) => {
@@ -2448,6 +2467,150 @@ fn parse_retrospective(text: &str) -> Result<Option<RetrospectiveLesson>, String
     Ok(Some(RetrospectiveLesson { category, content }))
 }
 
+/// Why [`validate_retrospective_lesson`] rejected a retrospective lesson
+/// (upstream dreamer/retrospective-learnings.ts:125-134).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LessonRejection {
+    /// A quoted run of >=4 characters — transcription, not distillation.
+    RawQuote,
+    /// A 19xx/20xx year literal — session-local chronology.
+    DateLiteral,
+    /// Session-local frustration phrasing.
+    FrustrationMarker,
+    /// Shares a verbatim word-run of `run_cap` words with a source turn.
+    SourceOverlap,
+}
+
+/// The longest verbatim word-run a lesson may share with a source turn
+/// (upstream `MAX_SOURCE_WORD_RUN`, retrospective-learnings.ts:68).
+const MAX_SOURCE_WORD_RUN: usize = 7;
+
+/// Words of one lesson the overlap check reads (upstream
+/// `MAX_OVERLAP_LEARNING_WORDS`, :74). A lesson is one line by contract and
+/// already capped by [`RETROSPECTIVE_MAX_CHARS`]; the cap is defense.
+const MAX_OVERLAP_LEARNING_WORDS: usize = 200;
+
+/// The strongest correction phrases, lowercased. A reduction of the upstream
+/// `FRUSTRATION_MARKER_REGEX` (:14-15): that regex also counts "this is
+/// wrong", "you missed", "stop claiming/using", repeated no/wrong/again/stop
+/// runs, and `???` bursts.
+const FRUSTRATION_MARKERS: [&str; 5] = [
+    "not what i asked",
+    "i already said",
+    "you ignored",
+    "that's wrong",
+    "stop doing",
+];
+
+/// Validate one parsed retrospective lesson against the upstream
+/// "distill, do not transcribe" gate (retrospective-learnings.ts:65-67 and
+/// :125-134): a durable memory must be the third-person lesson, never the
+/// user's own words. A lesson that quotes the user, carries a date literal,
+/// preserves session-local anger, or shares a verbatim word-run with a source
+/// turn is rejected — the caller drops it and logs, never writes.
+///
+/// Two deliberate reductions from the upstream regexes (documented, not
+/// accidental): the frustration check keeps the five strongest correction
+/// phrases plus a `!!!` burst; the date check keys on bare 19xx/20xx year
+/// literals where upstream requires a full date shape.
+pub(crate) fn validate_retrospective_lesson(
+    content: &str,
+    source_user_texts: &[&str],
+) -> Result<(), LessonRejection> {
+    if has_raw_quote(content) {
+        return Err(LessonRejection::RawQuote);
+    }
+    if has_year_literal(content) {
+        return Err(LessonRejection::DateLiteral);
+    }
+    if has_frustration_marker(content) {
+        return Err(LessonRejection::FrustrationMarker);
+    }
+    if has_source_overlap(content, source_user_texts) {
+        return Err(LessonRejection::SourceOverlap);
+    }
+    Ok(())
+}
+
+/// A run of >=4 characters between any two double-quote-class characters
+/// (`" “ ”`, interchangeable as openers/closers in the upstream
+/// `RAW_QUOTE_REGEX`, :36), or between two apostrophes. An unpaired
+/// apostrophe — a contraction — never matches; two contractions in one
+/// sentence can, which the upstream regex also does.
+fn has_raw_quote(content: &str) -> bool {
+    fn paired_run(text: &str, is_quote: impl Fn(char) -> bool) -> bool {
+        let mut inside = false;
+        let mut run = 0usize;
+        for ch in text.chars() {
+            if is_quote(ch) {
+                if inside && run >= 4 {
+                    return true;
+                }
+                inside = true;
+                run = 0;
+            } else if inside {
+                run += 1;
+            }
+        }
+        false
+    }
+    paired_run(content, |ch| matches!(ch, '"' | '“' | '”')) || paired_run(content, |ch| ch == '\'')
+}
+
+/// A bare 19xx/20xx year literal: any four-digit ASCII run carrying one of
+/// the two century prefixes (upstream `DATE_REGEX`, :37-38, reduced — see
+/// [`validate_retrospective_lesson`]).
+fn has_year_literal(content: &str) -> bool {
+    content
+        .split(|ch: char| !ch.is_ascii_digit())
+        .any(|run| run.len() == 4 && (run.starts_with("19") || run.starts_with("20")))
+}
+
+/// A correction phrase, or a `!!!` punctuation burst.
+fn has_frustration_marker(content: &str) -> bool {
+    let lowered = content.to_lowercase();
+    lowered.contains("!!!")
+        || FRUSTRATION_MARKERS
+            .iter()
+            .any(|marker| lowered.contains(marker))
+}
+
+/// Lowercase alphanumeric words — the token convention the mctx search's
+/// `is_token_char` uses, and the upstream `toWords` (:76-83) minus the
+/// Unicode letter classes ox's tokenizer never carried.
+fn overlap_words(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(|word| word.to_lowercase())
+        .collect()
+}
+
+/// The shared-run length that means transcription: an absolute cap of
+/// [`MAX_SOURCE_WORD_RUN`], or half the lesson's own length for very short
+/// lessons, floored at 3 (upstream :102-105).
+fn source_run_cap(lesson_words: usize) -> usize {
+    MAX_SOURCE_WORD_RUN.min(3.max(lesson_words.div_ceil(2)))
+}
+
+/// True when the lesson shares a contiguous run of `run_cap` words with any
+/// source turn: some runCap-gram of the lesson occurs verbatim in the source
+/// (upstream `hasHighSourceOverlap`, :99-123). Sources are never truncated —
+/// a lifted run at any offset is caught.
+fn has_source_overlap(content: &str, source_user_texts: &[&str]) -> bool {
+    let mut lesson = overlap_words(content);
+    lesson.truncate(MAX_OVERLAP_LEARNING_WORDS);
+    let run_cap = source_run_cap(lesson.len());
+    if lesson.len() < run_cap {
+        return false;
+    }
+    let grams: HashSet<String> = lesson.windows(run_cap).map(|run| run.join(" ")).collect();
+    source_user_texts.iter().any(|source| {
+        overlap_words(source)
+            .windows(run_cap)
+            .any(|run| grams.contains(&run.join(" ")))
+    })
+}
+
 /// Every non-empty line of `text`, trimmed and joined by single spaces.
 fn collapse_lines(text: &str) -> String {
     let mut out = String::new();
@@ -3022,6 +3185,91 @@ mod tests {
     }
 
     #[test]
+    fn retrospective_validator_rejects_transcription() {
+        let sources = [
+            "we should always deploy to staging first and let the soak window run overnight before any production rollout",
+        ];
+        // A clean third-person distillation passes (9 words -> runCap 5; the
+        // longest run it shares with the source is "staging soak window", 3).
+        assert_eq!(
+            validate_retrospective_lesson(
+                "Production rollouts wait for an overnight staging soak window.",
+                &sources,
+            ),
+            Ok(())
+        );
+        // Raw quote: a double-quoted run of >=4 chars transcribes the user.
+        assert_eq!(
+            validate_retrospective_lesson(
+                "The user said \"always deploy to staging\" about rollouts.",
+                &sources,
+            ),
+            Err(LessonRejection::RawQuote)
+        );
+        // Single-quoted run of >=4 chars also counts.
+        assert_eq!(
+            validate_retrospective_lesson("Preference noted: 'deploy to staging' first.", &sources),
+            Err(LessonRejection::RawQuote)
+        );
+        // An apostrophe that never pairs is NOT a quote.
+        assert_eq!(
+            validate_retrospective_lesson("Deployments shouldn't rush the staging phase.", &[]),
+            Ok(())
+        );
+        // Date literal.
+        assert_eq!(
+            validate_retrospective_lesson("Since 2023 the team ships behind a flag.", &[]),
+            Err(LessonRejection::DateLiteral)
+        );
+        // Frustration markers (case-insensitive).
+        for marker in [
+            "not what i asked for",
+            "I already said how this works",
+            "you ignored the config",
+            "that's wrong about modules",
+            "stop doing manual rebuilds",
+        ] {
+            assert_eq!(
+                validate_retrospective_lesson(marker, &[]),
+                Err(LessonRejection::FrustrationMarker),
+                "marker: {marker}"
+            );
+        }
+        // Exclamation runs count as frustration.
+        assert_eq!(
+            validate_retrospective_lesson("Rebuilds failed again!!!", &[]),
+            Err(LessonRejection::FrustrationMarker)
+        );
+        // Source overlap: 10 words -> runCap 5; the lesson shares the 5-word
+        // run "always deploy to staging first" with the source.
+        assert_eq!(
+            validate_retrospective_lesson(
+                "always deploy to staging first and let the soak run",
+                &sources,
+            ),
+            Err(LessonRejection::SourceOverlap)
+        );
+        // Just under the cap: 7 words -> runCap 4; the longest shared run is
+        // "staging soak" (2), so every 4-gram of the lesson misses the source.
+        assert_eq!(
+            validate_retrospective_lesson(
+                "Staging soak windows gate production rollouts safely.",
+                &sources,
+            ),
+            Ok(())
+        );
+        // The overlap check is case-insensitive and ignores punctuation
+        // (12 words -> runCap 6; shares "always deploy to staging first and").
+        assert_eq!(
+            validate_retrospective_lesson(
+                "Always deploy to staging first, and let the soak window run overnight.",
+                &sources,
+            ),
+            Err(LessonRejection::SourceOverlap)
+        );
+    }
+
+    #[test]
     fn retrospective_prompt_renders_turns_oldest_first() {
         // The gate hands turns over newest-first, the way the query returns
         // them; the prompt reads them in the order they happened.
@@ -3121,6 +3369,57 @@ mod tests {
         );
         // Another project's pool is not deduped against.
         assert!(!fact_recorded(&db, "/other", fact).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn retrospective_write_path_drops_a_transcribed_lesson() {
+        // `run_retrospective`'s post-completion sequence is parse -> validate
+        // -> dedup -> write. There is no recorded-stream Dreamer harness (the
+        // completion seam needs the full Chat + model-catalog stack, and no
+        // test in the crate builds one), so this drives that composition
+        // directly at the point the validator is wired; a wiring mistake
+        // inside `run_retrospective` itself is not caught here.
+        let db = Db::open_in_memory().await.unwrap();
+        let turns = ["we should always deploy to staging first and let the soak window run overnight before any production rollout".to_owned()];
+        let source_turns: Vec<&str> = turns.iter().map(String::as_str).collect();
+
+        // The model echoes the user's own words: parse succeeds, the gate
+        // rejects, and — because a rejection returns before the write — the
+        // memory pool stays empty.
+        let transcribed = "<memory category=\"PROJECT_RULES\">always deploy to staging first and let the soak run</memory>";
+        let lesson = parse_retrospective(transcribed)
+            .unwrap()
+            .expect("one lesson");
+        assert_eq!(
+            validate_retrospective_lesson(&lesson.content, &source_turns),
+            Err(LessonRejection::SourceOverlap)
+        );
+        assert_eq!(
+            memory::active_memories(&db, "/project")
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+
+        // The distilled lesson passes the same gate and writes through the
+        // ordinary memory path.
+        let distilled = "<memory category=\"PROJECT_RULES\">Production rollouts wait for an overnight staging soak window.</memory>";
+        let lesson = parse_retrospective(distilled).unwrap().expect("one lesson");
+        assert_eq!(
+            validate_retrospective_lesson(&lesson.content, &source_turns),
+            Ok(())
+        );
+        memory::write_memory(&db, "/project", &lesson.content, lesson.category)
+            .await
+            .unwrap();
+        assert_eq!(
+            memory::active_memories(&db, "/project")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     // -- surface_notes ------------------------------------------------------

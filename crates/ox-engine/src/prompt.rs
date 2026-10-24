@@ -4,6 +4,7 @@
 //! system[1], and [`changed_text`]/[`removed_text`] render per-key deltas
 //! against the runner's baseline (see `runner/instructions.rs`).
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use serde::Serialize;
@@ -117,6 +118,18 @@ pub(crate) enum CatalogPolicy {
 /// ox-injection-hardening.md` §2-F). Fixed, not a config knob: one threshold
 /// keeps the wire and the goldens testable without a configuration surface.
 pub(crate) const SKILLS_CATALOG_BUDGET_BYTES: usize = 8 * 1024;
+
+/// Per-file budget for instruction files in the rendered system layer
+/// (plan 2026-10-24-ox-prompt-uplift-p1.md Unit F). Over budget, a file
+/// renders as head + marker + tail (mirroring `bound_tool_output`'s wire
+/// policy) so leading rules and recent additions both survive. The budget
+/// bounds only the *rendered* bytes: the keyed hash diffed each step is over
+/// the raw `SourceValue` (`runner/instructions.rs::hash`), so an edit inside
+/// the elided middle still produces a delta — delivered as a diff hunk by
+/// [`changed_text`], which works on raw contents.
+pub(crate) const INSTRUCTION_FILE_BUDGET_BYTES: usize = 16 * 1024;
+const INSTRUCTION_FILE_HEAD_BYTES: usize = 12 * 1024;
+const INSTRUCTION_FILE_TAIL_BYTES: usize = 4 * 1024;
 
 /// The policy for a catalog of `bytes` bytes (see [`catalog_bytes`]).
 pub(crate) fn catalog_policy(bytes: usize) -> CatalogPolicy {
@@ -540,12 +553,59 @@ pub(crate) fn removed_text(key: &str) -> Option<String> {
 /// The header path is model-visible, so a leading `home` renders as `~`
 /// ([`ox_core::home_paths::redact_home`], batch G); tools and file access
 /// still use the real path.
+///
+/// The body is budgeted after escaping ([`bound_instruction_file_content`],
+/// Unit F): the cap applies to the bytes that actually reach the wire.
 fn render_file(file: &InstructionFile, home: &Path) -> String {
     format!(
         "Instructions from: {}\n{}",
         ox_core::home_paths::redact_home(Path::new(&file.path), home),
-        ox_core::reminder_tags::neutralize_reminder_tags(&file.content)
+        bound_instruction_file_content(&ox_core::reminder_tags::neutralize_reminder_tags(
+            &file.content
+        )),
     )
+}
+
+/// The render-time byte policy for one instruction file (plan
+/// 2026-10-24-ox-prompt-uplift-p1.md Unit F): at or under
+/// [`INSTRUCTION_FILE_BUDGET_BYTES`] the content passes through verbatim;
+/// over it the file renders as head + marker + tail so leading rules and
+/// recent additions both survive, mirroring `bound_tool_output`'s wire
+/// policy (`runner/output_budget.rs`). Both cut points snap to char
+/// boundaries, so no character is ever split. The keyed diff hashes raw
+/// contents (`runner/instructions.rs::hash`), so this elision cannot hide an
+/// edit: a change inside the middle still reaches the model as a diff hunk.
+fn bound_instruction_file_content(content: &str) -> Cow<'_, str> {
+    // Under the budget the bytes go out verbatim and nothing is allocated.
+    if content.len() <= INSTRUCTION_FILE_BUDGET_BYTES {
+        return Cow::Borrowed(content);
+    }
+    let head_end = floor_char_boundary(content, INSTRUCTION_FILE_HEAD_BYTES);
+    let tail_start = ceil_char_boundary(content, content.len() - INSTRUCTION_FILE_TAIL_BYTES);
+    let head = &content[..head_end];
+    let tail = &content[tail_start..];
+    Cow::Owned(format!(
+        "{head}\n\n[… truncated {} bytes …]\n\n{tail}",
+        content.len() - head.len() - tail.len()
+    ))
+}
+
+/// The largest index `<= at` that starts a character (mirrors
+/// `runner/output_budget.rs`).
+fn floor_char_boundary(s: &str, mut at: usize) -> usize {
+    while at > 0 && !s.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+/// The smallest index `>= at` that starts a character (mirrors
+/// `runner/output_budget.rs`).
+fn ceil_char_boundary(s: &str, mut at: usize) -> usize {
+    while at < s.len() && !s.is_char_boundary(at) {
+        at += 1;
+    }
+    at
 }
 
 fn render_instruction_files(files: &[InstructionFile]) -> String {
@@ -1094,6 +1154,227 @@ mod tests {
         );
         assert!(changed.contains("The instructions"), "{changed}");
         assert!(changed.contains("new project rule"), "{changed}");
+    }
+
+    /// Exactly 20480 bytes of ASCII: head sentinel in the first line, the
+    /// middle sentinel exactly at the head/tail elision boundary, tail
+    /// sentinel in the last line. 12 KiB visible head + 4 KiB elided middle
+    /// + 4 KiB visible tail.
+    fn oversized_content() -> String {
+        let mut content = String::new();
+        content.push_str("HEAD-SENTINEL leading rules\n"); // 28 bytes
+        content.push_str(&"a".repeat(INSTRUCTION_FILE_HEAD_BYTES - 28));
+        content.push_str("MIDDLE-SENTINEL elided detail\n"); // 30 bytes
+        content.push_str(&"b".repeat(INSTRUCTION_FILE_TAIL_BYTES - 30));
+        content.push_str(&"c".repeat(INSTRUCTION_FILE_TAIL_BYTES - 31));
+        content.push_str("TAIL-SENTINEL recent additions\n"); // 31 bytes
+        debug_assert_eq!(content.len(), INSTRUCTION_FILE_BUDGET_BYTES + 4 * 1024);
+        content
+    }
+
+    /// ~18.5 KiB of 64-byte rule lines (typical AGENTS.md shape, unlike
+    /// [`oversized_content`]'s giant filler lines), so a one-line edit diffs
+    /// to a few dozen bytes and the diff form wins the length race.
+    fn oversized_small_lines() -> String {
+        let line = format!("rule {}\n", "x".repeat(56)); // 64 bytes
+        let mut content = String::from("HEAD-SENTINEL leading rules\n"); // 28 bytes
+        while content.len() < INSTRUCTION_FILE_HEAD_BYTES + 1024 {
+            content.push_str(&line);
+        }
+        content.push_str("MIDDLE-SENTINEL elided detail\n"); // 30 bytes
+        while content.len() < INSTRUCTION_FILE_BUDGET_BYTES + 2048 {
+            content.push_str(&line);
+        }
+        content.push_str("TAIL-SENTINEL recent additions\n"); // 30 bytes
+        assert!(content.len() > INSTRUCTION_FILE_BUDGET_BYTES);
+        content
+    }
+
+    /// Unit F: over budget, a file renders as header + head + marker + tail,
+    /// byte-exactly, and never shows the elided middle.
+    #[test]
+    fn oversized_instruction_file_renders_head_marker_tail() {
+        let content = oversized_content();
+        let file = InstructionFile {
+            path: "/repo/AGENTS.md".into(),
+            content: content.clone(),
+            kind: ox_schema::event::InstructionSourceKind::Project,
+        };
+        let rendered = render_file(&file, Path::new("/home"));
+
+        assert!(
+            rendered.contains("HEAD-SENTINEL"),
+            "head survives: {rendered}"
+        );
+        assert!(
+            rendered.contains("TAIL-SENTINEL"),
+            "tail survives: {rendered}"
+        );
+        assert!(
+            !rendered.contains("MIDDLE-SENTINEL"),
+            "elided middle must not render: {rendered}"
+        );
+        // The marker names the elided byte count and the visible body is
+        // exactly the budget: head_bytes + tail_bytes, no rounding slack.
+        let marker = format!(
+            "\n\n[… truncated {} bytes …]\n\n",
+            content.len() - INSTRUCTION_FILE_HEAD_BYTES - INSTRUCTION_FILE_TAIL_BYTES
+        );
+        assert_eq!(marker, "\n\n[… truncated 4096 bytes …]\n\n");
+        let head = &content[..INSTRUCTION_FILE_HEAD_BYTES];
+        let tail = &content[content.len() - INSTRUCTION_FILE_TAIL_BYTES..];
+        let header = "Instructions from: /repo/AGENTS.md\n";
+        assert_eq!(
+            rendered,
+            format!("{header}{head}{marker}{tail}"),
+            "render = header + head + marker + tail, byte-exact"
+        );
+        assert_eq!(
+            rendered.len(),
+            INSTRUCTION_FILE_BUDGET_BYTES + marker.len() + header.len(),
+            "visible body == budget; only marker and header ride on top"
+        );
+    }
+
+    /// Unit F: the head/tail cuts snap back/forward to char boundaries, so a
+    /// multibyte character straddling either cut point cannot split (a naive
+    /// byte cut would panic the str slice — this test is red if the fallback
+    /// regresses).
+    #[test]
+    fn oversized_instruction_file_boundary_is_utf8_safe() {
+        let header = "Instructions from: /repo/AGENTS.md\n";
+        let mut content = String::from("HEAD-UTF8 规则\n"); // 17 bytes
+        assert_eq!(content.len(), 17);
+        // First '中' occupies [HEAD_BYTES - 1, HEAD_BYTES + 2): the naive
+        // head cut at HEAD_BYTES lands on its middle byte.
+        content.push_str(&"x".repeat(INSTRUCTION_FILE_HEAD_BYTES - 1 - 17));
+        content.push('中');
+        // Pad, then a second '中' whose middle byte sits on the naive tail
+        // cut: tail cut = len - TAIL_BYTES = start_of_char + 1 exactly when
+        // the padding after it is TAIL_BYTES - 2.
+        content.push_str(&"x".repeat(1024));
+        content.push('中');
+        content.push_str(&"x".repeat(INSTRUCTION_FILE_TAIL_BYTES - 2));
+        assert_eq!(content.len(), 17411);
+        assert_eq!(content.matches('中').count(), 2);
+
+        let file = InstructionFile {
+            path: "/repo/AGENTS.md".into(),
+            content,
+            kind: ox_schema::event::InstructionSourceKind::Project,
+        };
+        let rendered = render_file(&file, Path::new("/home"));
+        let content = &file.content;
+
+        // Both straddling characters fall inside the elided middle (the head
+        // cut snapped back one byte, the tail cut forward two).
+        assert_eq!(
+            rendered.matches('中').count(),
+            0,
+            "cut-straddling chars are elided whole"
+        );
+        assert!(rendered.contains("HEAD-UTF8 规则"), "visible head survives");
+        assert!(
+            rendered.starts_with(&format!(
+                "{header}{}",
+                &content[..INSTRUCTION_FILE_HEAD_BYTES - 1]
+            )),
+            "head cut fell back to the char boundary"
+        );
+        assert!(
+            rendered.ends_with(&content[content.len() - INSTRUCTION_FILE_TAIL_BYTES + 2..]),
+            "tail cut fell forward to the char boundary"
+        );
+        let marker = format!(
+            "\n\n[… truncated {} bytes …]\n\n",
+            content.len() - (INSTRUCTION_FILE_HEAD_BYTES - 1) - (INSTRUCTION_FILE_TAIL_BYTES - 2)
+        );
+        assert!(rendered.contains(&marker), "{rendered}");
+        assert_eq!(
+            rendered.len(),
+            header.len()
+                + (INSTRUCTION_FILE_HEAD_BYTES - 1)
+                + (INSTRUCTION_FILE_TAIL_BYTES - 2)
+                + marker.len()
+        );
+    }
+
+    /// Unit F seam check. The keyed diff hashes RAW file contents
+    /// (`runner/instructions.rs::hash`), not rendered bytes, so the
+    /// truncation budget does not blind it: an edit wholly inside the elided
+    /// middle still produces a delta, and because `changed_text`'s diff form
+    /// works on raw contents the model receives the edit text even though the
+    /// render elides it. When even the diff outweighs the budgeted
+    /// restatement, the replacement form wins and its restated file is the
+    /// truncated render (head + marker + tail).
+    #[test]
+    fn instruction_diff_sees_through_truncation() {
+        let make = |content: &str| Observed {
+            key: KEY_INSTRUCTIONS,
+            value: ObservedValue::Present(SourceValue::Files {
+                files: vec![InstructionFile {
+                    path: "/repo/AGENTS.md".into(),
+                    content: content.to_owned(),
+                    kind: ox_schema::event::InstructionSourceKind::Project,
+                }],
+            }),
+        };
+        let baseline = crate::runner::instructions::baseline(&[make(&oversized_small_lines())]);
+        let wire = std::collections::BTreeMap::new();
+
+        // Edit ONLY the elided middle (same byte length → identical cut
+        // points): the delta still fires and its diff form carries the edit.
+        let mut middle_edited = oversized_small_lines();
+        let at = middle_edited.find("MIDDLE-SENTINEL").unwrap();
+        middle_edited.replace_range(at..at + "MIDDLE-SENTINEL".len(), "MIDDLE-EDITEDXX");
+        assert!(
+            at >= INSTRUCTION_FILE_HEAD_BYTES,
+            "edit starts in the elided region"
+        );
+        let deltas = crate::runner::instructions::diff(&[make(&middle_edited)], &wire, &baseline);
+        assert_eq!(deltas.len(), 1, "an elided-middle edit still notifies");
+        assert!(
+            deltas[0].text.contains("MIDDLE-EDITEDXX"),
+            "{}",
+            deltas[0].text
+        );
+        assert!(
+            deltas[0].text.contains("Here's the diff:"),
+            "small edit wins as the diff form: {}",
+            deltas[0].text
+        );
+
+        // A head edit likewise notifies…
+        let mut head_edited = oversized_small_lines();
+        let at = head_edited.find("HEAD-SENTINEL").unwrap();
+        head_edited.replace_range(at..at + "HEAD-SENTINEL".len(), "HEAD-EDITEDXX");
+        let deltas = crate::runner::instructions::diff(&[make(&head_edited)], &wire, &baseline);
+        assert_eq!(deltas.len(), 1);
+        assert!(
+            deltas[0].text.contains("HEAD-EDITEDXX"),
+            "{}",
+            deltas[0].text
+        );
+
+        // …and a full rewrite diffs to more than the budgeted restatement, so
+        // the replacement form wins and carries the truncated render.
+        let rewritten = "z".repeat(20480);
+        let deltas = crate::runner::instructions::diff(&[make(&rewritten)], &wire, &baseline);
+        assert_eq!(deltas.len(), 1);
+        assert!(
+            deltas[0]
+                .text
+                .contains("The instructions changed:\nInstructions from: /repo/AGENTS.md\n"),
+            "{}",
+            deltas[0].text
+        );
+        assert!(
+            deltas[0]
+                .text
+                .contains("\n\n[… truncated 4096 bytes …]\n\n"),
+            "replacement form restates the budgeted render: {}",
+            deltas[0].text
+        );
     }
 
     #[test]

@@ -33,13 +33,25 @@ struct GatedChat {
     recorded: Mutex<Vec<Recorded>>,
 }
 
+/// The output-contract lines the spawn prefix must carry, verbatim and in
+/// full: the three identity/contract facts plus the four behavioral rules.
+const SPAWN_CONTRACT_LINES: [&str; 7] = [
+    "You are a subagent spawned by another session.",
+    "Do not call the question tool; the user cannot see forms from a subagent.",
+    "Your final message is the only thing the parent session receives; make it self-contained.",
+    "Begin the final message with the outcome, then the evidence for it, then open questions or caveats.",
+    "Report only verification you actually performed; state explicitly what you did not verify.",
+    "Do not poll or sleep; when blocked on a background task, say so in the final message and end the turn.",
+    "Work only within the assigned task; do not modify files outside it.",
+];
+
 /// The facts a request carries that distinguish a child turn from a parent
 /// one: the spawn prefix in the user text, the advertised tool names, and
 /// whether the static layer advertises the `question` guidance.
 #[derive(Default)]
 struct Recorded {
     subagent_prompt: bool,
-    /// The two output-contract lines the spawn prefix must carry.
+    /// The output-contract lines the spawn prefix must carry.
     spawn_contract: bool,
     tools: Vec<String>,
     question_guidance: bool,
@@ -60,11 +72,7 @@ impl Recorded {
                     if text.contains("You are a subagent spawned by another session.") {
                         recorded.subagent_prompt = true;
                     }
-                    if text.contains(
-                        "Do not call the question tool; the user cannot see forms from a subagent.",
-                    ) && text.contains(
-                        "Your final message is the only thing the parent session receives; make it self-contained.",
-                    ) {
+                    if SPAWN_CONTRACT_LINES.iter().all(|line| text.contains(line)) {
                         recorded.spawn_contract = true;
                     }
                 }

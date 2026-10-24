@@ -31,14 +31,18 @@ const CANCELLED_SENTINEL: &str = "(subagent cancelled by user interrupt)";
 /// with an error instead of hanging or saturating below a higher limit.
 const MAX_DEPTH_WALK: usize = 32;
 
-/// Context prepended to a fresh child's first prompt: who it is and the two
-/// facts that keep a delegation from hanging or losing its result. The
-/// `question` line covers models that still see the tool in a parent-shaped
-/// transcript; the transcript line is the child's output contract (only the
-/// final assistant text is folded back into the parent).
-const SPAWN_PREFIX: &str = "You are a subagent spawned by another session.\n\
-     Do not call the question tool; the user cannot see forms from a subagent.\n\
-     Your final message is the only thing the parent session receives; make it self-contained.\n";
+/// Context prepended to a fresh child's first prompt: who it is, the facts
+/// that keep a delegation from hanging or losing its result, and the output
+/// contract. The `question` line covers models that still see the tool in a
+/// parent-shaped transcript; the transcript line is the output channel (only
+/// the final assistant text is folded back into the parent). Four behavioral
+/// lines: outcome-then-evidence-then-caveats structure (CodeWhale's
+/// five-section output contract), report only verification actually
+/// performed (oh-my-pi: "workers don't verify"), no polling or sleeping
+/// while blocked (dimcode/opencode subagent discipline), and stay inside the
+/// assigned task's files (twelve-repo convergence line; surveys under
+/// `.ox/reference/agents/surveys/`).
+const SPAWN_PREFIX: &str = "You are a subagent spawned by another session.\nDo not call the question tool; the user cannot see forms from a subagent.\nYour final message is the only thing the parent session receives; make it self-contained.\nBegin the final message with the outcome, then the evidence for it, then open questions or caveats.\nReport only verification you actually performed; state explicitly what you did not verify.\nDo not poll or sleep; when blocked on a background task, say so in the final message and end the turn.\nWork only within the assigned task; do not modify files outside it.\n";
 
 /// The engine capabilities a child session needs. Implemented by the
 /// runner; the tool only ever sees this trait, which is what breaks the
