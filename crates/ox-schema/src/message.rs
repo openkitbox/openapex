@@ -167,12 +167,15 @@ pub struct AssistantRetry {
 // Compaction (tagged union on `status`)
 // ---------------------------------------------------------------------------
 
-/// Upstream compaction `reason` literal: auto | manual.
+/// Upstream compaction `reason` literal: auto | manual. `idle` is ox's own
+/// addition (plan D5): the silent background fold's checkpoint rows carry it
+/// on the wire as `"idle"`; it never rides the live SSE stream.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CompactionReason {
     Auto,
     Manual,
+    Idle,
 }
 
 /// Upstream `Session.Message.Compaction` union (discriminated by `status`;
@@ -490,5 +493,42 @@ impl Message {
         let mut merged = data;
         Self::merge_row_columns(id, kind, &mut merged);
         Self::from_merged_row(merged)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Plan ox-background-fold D5: `idle` joins the reason union for the
+    // silent background fold's checkpoint rows; the upstream literals keep
+    // their spellings (old rows keep decoding as before).
+    #[test]
+    fn compaction_reason_wire_round_trip() {
+        assert_eq!(
+            serde_json::from_str::<CompactionReason>("\"idle\"").unwrap(),
+            CompactionReason::Idle
+        );
+        assert_eq!(
+            serde_json::to_string(&CompactionReason::Idle).unwrap(),
+            "\"idle\""
+        );
+
+        assert_eq!(
+            serde_json::from_str::<CompactionReason>("\"auto\"").unwrap(),
+            CompactionReason::Auto
+        );
+        assert_eq!(
+            serde_json::from_str::<CompactionReason>("\"manual\"").unwrap(),
+            CompactionReason::Manual
+        );
+        assert_eq!(
+            serde_json::to_string(&CompactionReason::Auto).unwrap(),
+            "\"auto\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CompactionReason::Manual).unwrap(),
+            "\"manual\""
+        );
     }
 }

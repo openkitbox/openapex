@@ -104,7 +104,14 @@ pub(crate) fn mctx_historian(ctx: &DrainCtx, budget: Budget, floor: i64) {
 /// it: `input + cache.read` — the same sum the client's footer divides by the
 /// model window. `None` when the tail holds no assistant turn (a fresh session)
 /// or the row carries no token counts.
-fn prompt_tokens(row: &serde_json::Value) -> Option<i64> {
+///
+/// One measurement, one meaning: the background fold's usage criterion reads
+/// the tail through this same function (plan D1), so the two triggers can
+/// never disagree about what a turn cost. Its decoded twin is step.rs's
+/// `assistant_tokens`; the parity test
+/// `token_parity_tests::assistant_tokens_parity_with_raw_prompt_tokens`
+/// (bottom of step.rs) locks the two to one meaning per row shape.
+pub(crate) fn prompt_tokens(row: &serde_json::Value) -> Option<i64> {
     if row.get("type").and_then(|kind| kind.as_str()) != Some("assistant") {
         return None;
     }
@@ -116,6 +123,38 @@ fn prompt_tokens(row: &serde_json::Value) -> Option<i64> {
         .and_then(|read| read.as_i64())
         .unwrap_or(0);
     Some(input + cached)
+}
+
+/// The background fold's synchronous patch (plan D6): at most one historian
+/// run folding the explicit range past `floor`, as far as the chunk budget
+/// and the protected-tail fence allow. Returns whether a run published
+/// compartments (the floor advanced); `Ok(false)` covers every benign skip —
+/// a run already in flight, an empty tail, the fence. Errors are the
+/// caller's cue to fall back (the template path), not retried here.
+pub(crate) async fn patch_fold(ctx: &DrainCtx, budget: Budget, floor: i64) -> Result<bool> {
+    let project = ctx.directory.to_string_lossy();
+    let firing = Firing {
+        db: &ctx.db,
+        config: &ctx.config,
+        chat: &ctx.chat,
+        catalog: &ctx.model_catalog,
+        budget,
+        session_id: &ctx.session_id,
+        project: &project,
+    };
+    match firing.patch(floor).await {
+        Ok(Some(published)) => {
+            tracing::info!(
+                session = %ctx.session_id,
+                covered = %published.covered,
+                compartments = published.compartments,
+                "historian patch published"
+            );
+            Ok(true)
+        }
+        Ok(None) => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 /// One firing decision's context: the session, its derived budgets, and the
@@ -135,14 +174,11 @@ struct Firing<'a> {
 impl Firing<'_> {
     /// Measure the tail, classify the pressure, pick the chunk and run it.
     async fn run(self, floor: i64) -> Result<Option<Published>> {
-        let Firing {
+        let Self {
             db,
-            config,
-            chat,
-            catalog,
             budget,
             session_id,
-            project,
+            ..
         } = self;
         // One pending run per session: a second step in the same burst must not
         // summarize the same range twice. This pre-check is only a shortcut —
@@ -257,7 +293,93 @@ impl Firing<'_> {
             }
             return Ok(None);
         };
+        self.execute(chunk, Some(trigger)).await
+    }
 
+    /// One synchronous patch run for the background fold (plan D6): fold the
+    /// explicit range past `floor` as far as the chunk budget allows — the
+    /// same fence as [`Firing::run`] (never fold into the protected tail) —
+    /// but no pressure-band classification, because the caller has already
+    /// decided a fold must happen (the checkpoint's recent budget is busted).
+    /// One attempt, no retry; the single-flight claim stays `historian::run`'s,
+    /// so a detached run already in flight wins and this returns `Ok(None)`.
+    async fn patch(self, floor: i64) -> Result<Option<Published>> {
+        let Self {
+            db,
+            budget,
+            session_id,
+            ..
+        } = self;
+        // Shortcut, not the authority: the claim below is one statement, so a
+        // run started after this check simply loses it and returns `None`.
+        if historian::has_running_run(db, session_id).await? {
+            return Ok(None);
+        }
+        let rows = rows_after_with_seq(db, session_id, floor).await?;
+        // The newest row stays uncovered, exactly as in [`Firing::run`]: it is
+        // the turn in flight, and the fence below protects its neighbourhood.
+        let Some((last_ordinal, _)) = rows.last() else {
+            return Ok(None);
+        };
+        let usage = rows.iter().rev().find_map(|(_, row)| prompt_tokens(row));
+        let usage_pct = usage.and_then(|tokens| budget.usage_percentage(tokens));
+        // The same fence arithmetic as [`Firing::run`]: what a run may fold is
+        // the tail's real size minus the protected tail. Here the surviving
+        // tail becomes the checkpoint's recent part rather than the model's
+        // verbatim budget, but the guard is the same — never fold a session
+        // down to nothing verbatim.
+        let Some(whole) = historian::chunk(&rows, floor + 1, i64::MAX, ChunkLimits::unbounded())
+        else {
+            return Ok(None);
+        };
+        let protected = budget.protected_tail(usage_pct.unwrap_or(0.0));
+        let foldable = whole.context_tokens.saturating_sub(protected as usize);
+        if foldable == 0 {
+            tracing::debug!(
+                session = %session_id,
+                tail_tokens = whole.context_tokens,
+                protected_tail = protected,
+                "historian patch skipped: nothing outside the protected tail"
+            );
+            return Ok(None);
+        }
+        let Some(chunk) = historian::chunk(
+            &rows,
+            floor + 1,
+            *last_ordinal,
+            ChunkLimits {
+                request: budget.historian_chunk as usize,
+                context: foldable,
+            },
+        ) else {
+            tracing::debug!(
+                session = %session_id,
+                foldable,
+                protected_tail = protected,
+                "historian patch skipped: the oldest eligible block alone crosses the protected tail"
+            );
+            return Ok(None);
+        };
+        self.execute(chunk, None).await
+    }
+
+    /// The prompt assembly and the run itself, shared by the detached
+    /// pressure trigger and the background fold's patch path. `trigger` is
+    /// logged — `Some` for a pressure-band firing, `None` for a patch run.
+    async fn execute(
+        self,
+        chunk: historian::Chunk,
+        trigger: Option<historian::Trigger>,
+    ) -> Result<Option<Published>> {
+        let Firing {
+            db,
+            config,
+            chat,
+            catalog,
+            session_id,
+            project,
+            ..
+        } = self;
         let compartments = compartments::load(db, session_id).await?;
         let references: Vec<historian::ReferenceCompartment> = compartments
             .iter()

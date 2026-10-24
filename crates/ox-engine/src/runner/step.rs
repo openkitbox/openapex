@@ -221,6 +221,21 @@ pub(crate) async fn run(
         } else {
             load_history_after(&ctx.db, &ctx.session_id, floor).await?
         };
+        // Step-boundary fold trigger (plan D2): the tail is already decoded
+        // in memory, so the usage criterion costs no query — the newest
+        // assistant row's provider-reported tokens against this attempt's
+        // budget, the same reading `fold_decision` recomputes inside. At or
+        // over the threshold a detached silent fold starts; it re-runs the
+        // full gate itself, so this site stays cheap and may double-fire
+        // harmlessly (single-flight CAS + the gate).
+        let usage_pct = rows
+            .iter()
+            .rev()
+            .find_map(assistant_tokens)
+            .and_then(|tokens| budget.usage_percentage(tokens));
+        if usage_pct.is_some_and(|pct| pct >= super::compaction::FOLD_USAGE_THRESHOLD * 100.0) {
+            super::compaction::spawn_background_fold(ctx);
+        }
         // Directory and root must share one namespace: the chain's
         // component-wise prefix check degenerates to leaf-only when the
         // directory still carries symlink components the canonical root lost.
@@ -1467,6 +1482,25 @@ pub(crate) fn compaction_boundary(messages: &[Message]) -> usize {
         .unwrap_or(0)
 }
 
+/// The provider-reported context cost of one decoded row: the decoded twin
+/// of [`super::historian_trigger::prompt_tokens`] — the same
+/// `tokens.input + tokens.cache.read` sum over the projected JSON, read
+/// from the already-decoded tail so the step-boundary fold trigger costs no
+/// query (plan D1: one measurement, one meaning).
+///
+/// Parity with the raw reader is pinned per row shape by
+/// `token_parity_tests::assistant_tokens_parity_with_raw_prompt_tokens`
+/// (bottom of this file) — change both readers or neither.
+fn assistant_tokens(message: &Message) -> Option<i64> {
+    match message {
+        Message::Assistant(assistant) => {
+            let tokens = assistant.tokens.as_ref()?;
+            Some(tokens.input + tokens.cache.read)
+        }
+        _ => None,
+    }
+}
+
 /// The effective end of a row for gap measurement (upstream
 /// `effectiveEndMs`): an assistant's completion once it settled, otherwise its
 /// creation. Shell rows use `created` too — they never reach the wire, and
@@ -1948,7 +1982,7 @@ pub(crate) async fn last_assistant_text(
 }
 
 /// Load a session transcript at or below `upper`: rows with a smaller or
-/// equal ordinal. The idle fold snapshots the transcript this way (plan D4):
+/// equal ordinal. The background fold snapshots the transcript this way (plan D4):
 /// the summary must describe only rows that existed when the fold started,
 /// so rows written while the fold streams stay out of its input and are
 /// carried verbatim in `recent` instead.
@@ -2357,5 +2391,101 @@ mod pairing_recorder_tests {
         );
         let digest = tool_call_digest(&request);
         assert!(digest.starts_with("c0,c1,") && digest.ends_with("…(+10 more)"));
+    }
+}
+
+// Parity anchor for the two usage readers of one assistant row (plan
+// ox-background-fold review fix): the step-boundary trigger measures the
+// decoded tail through `assistant_tokens`, the fold gate re-measures the same
+// rows raw through `historian_trigger::prompt_tokens`. Each shape a stored
+// assistant row can arrive in is built exactly the way `rows_after_with_seq`
+// returns it (the `data` JSON with the id/type columns merged in) and fed
+// through both extractors, so a drift between the twins fails here instead of
+// in production.
+#[cfg(test)]
+mod token_parity_tests {
+    use super::*;
+    use crate::runner::historian_trigger::prompt_tokens;
+    use ox_schema::message::{AssistantMessage, AssistantTime};
+    use ox_schema::support::{ModelRef, TokenCache, TokenUsage};
+
+    /// A stored assistant row as `rows_after_with_seq` yields it: the `data`
+    /// column's JSON (the `seed_assistant_turn` shape) with the id/type
+    /// columns merged in.
+    fn raw_row(tokens: Option<serde_json::Value>) -> serde_json::Value {
+        let mut data = serde_json::json!({
+            "time": {"created": 1},
+            "agent": "build",
+            "model": {"id": "test-model", "providerID": "test", "variant": null},
+            "content": [],
+        });
+        if let Some(tokens) = tokens {
+            data["tokens"] = tokens;
+        }
+        Message::merge_row_columns("msg_parity", "assistant", &mut data);
+        data
+    }
+
+    #[test]
+    fn assistant_tokens_parity_with_raw_prompt_tokens() {
+        // `tokens.input` + `tokens.cache.read`, both present: the exact bytes
+        // go through the production decode into `assistant_tokens`.
+        let raw = raw_row(Some(serde_json::json!({
+            "input": 150, "output": 30, "reasoning": 0,
+            "cache": {"read": 50, "write": 5},
+        })));
+        let decoded = Message::from_merged_row(raw.clone()).unwrap();
+        let usage = prompt_tokens(&raw);
+        assert_eq!(assistant_tokens(&decoded), usage);
+        assert_eq!(usage, Some(200));
+
+        // `tokens.cache` absent: the raw extractor reads it as read 0, but
+        // `TokenUsage.cache` carries no `#[serde(default)]` (ox-schema
+        // support.rs), so these bytes cannot round-trip the strict decode —
+        // the decoded twin is built structurally with exactly that meaning
+        // (read 0).
+        let raw = raw_row(Some(serde_json::json!({
+            "input": 150, "output": 30, "reasoning": 0,
+        })));
+        assert!(Message::from_merged_row(raw.clone()).is_err());
+        let decoded = Message::Assistant(Box::new(AssistantMessage {
+            id: "msg_parity".to_owned(),
+            metadata: None,
+            time: AssistantTime {
+                created: 1,
+                streamed: None,
+                completed: Some(2),
+            },
+            agent: "build".to_owned(),
+            model: ModelRef {
+                id: "test-model".to_owned(),
+                provider_id: "test".to_owned(),
+                variant: None,
+            },
+            content: Vec::new(),
+            snapshot: None,
+            finish: None,
+            raw_finish: None,
+            provider_state: None,
+            cost: None,
+            tokens: Some(TokenUsage {
+                input: 150,
+                output: 30,
+                reasoning: 0,
+                cache: TokenCache { read: 0, write: 0 },
+            }),
+            error: None,
+            retry: None,
+        }));
+        let usage = prompt_tokens(&raw);
+        assert_eq!(assistant_tokens(&decoded), usage);
+        assert_eq!(usage, Some(150));
+
+        // `tokens` absent: neither path sees a usage reading.
+        let raw = raw_row(None);
+        let decoded = Message::from_merged_row(raw.clone()).unwrap();
+        let usage = prompt_tokens(&raw);
+        assert_eq!(assistant_tokens(&decoded), usage);
+        assert_eq!(usage, None);
     }
 }

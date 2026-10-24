@@ -131,7 +131,7 @@ struct SessionHandle {
     /// session's directory, computed at most once per distinct directory
     /// (a `/cd` invalidates it by keying on the directory itself).
     instruction_root: InstructionRootCache,
-    /// An idle fold is running for this session (plan D3): at most one fold
+    /// A background fold is running for this session (plan D3): at most one fold
     /// at a time, and a running compaction row that belongs to it is not
     /// stale (drain entry must not settle it out from under the live task).
     fold_in_flight: Arc<std::sync::atomic::AtomicBool>,
@@ -567,7 +567,7 @@ impl ActorTask {
                             // (`session.execution.succeeded` → idle()): the
                             // busy period is over, the tail may fold in the
                             // background.
-                            compaction::spawn_idle_fold(&ctx);
+                            compaction::spawn_background_fold(&ctx);
                             break;
                         }
                         // Fresh work: the next pass starts at an input boundary.

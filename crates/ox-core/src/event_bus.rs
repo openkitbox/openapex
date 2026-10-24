@@ -206,6 +206,39 @@ impl EventBus {
     /// ephemeral events only broadcast. Returns the constructed (typed)
     /// envelope.
     pub async fn publish(&self, data: SessionEventData) -> Result<EventEnvelope<SessionEventData>> {
+        self.publish_durable(data, true).await
+    }
+
+    /// Publish an event without broadcasting it to live subscribers.
+    ///
+    /// Durable-event semantics only: an ephemeral kind has no durable form,
+    /// and through `publish_quiet` it still broadcasts — broadcasting is the
+    /// only existence an ephemeral event has.
+    ///
+    /// The durable write path is identical to [`Self::publish`]: persistence
+    /// and projection happen in full — the projector runs in the same
+    /// transaction, the per-aggregate `event_sequence` watermark advances and
+    /// the `event` row commits — so sequence numbers stay contiguous. The
+    /// single difference: after COMMIT the envelope is not sent on the
+    /// broadcast channel, so active SSE subscribers receive nothing, while a
+    /// reconnecting client replaying the event log still sees the event
+    /// (deliberate: sequence integrity is never sacrificed for silence).
+    pub async fn publish_quiet(
+        &self,
+        data: SessionEventData,
+    ) -> Result<EventEnvelope<SessionEventData>> {
+        self.publish_durable(data, false).await
+    }
+
+    /// Shared publish path. `fanout == false` suppresses only the post-commit
+    /// broadcast of the published envelope itself; the post-commit secondary
+    /// effects below are shared verbatim (they fire only when the projector
+    /// reports recorded usage, which no quiet caller produces).
+    async fn publish_durable(
+        &self,
+        data: SessionEventData,
+        fanout: bool,
+    ) -> Result<EventEnvelope<SessionEventData>> {
         let kind = data.kind().to_string();
         let created = now_millis();
 
@@ -311,7 +344,9 @@ impl EventBus {
             location: None,
             metadata: None,
         };
-        let _ = self.tx.send(env.clone().into_generic());
+        if fanout {
+            let _ = self.tx.send(env.clone().into_generic());
+        }
 
         // Post-commit secondary effects (ephemeral usage broadcasts).
         for action in post_commit {
@@ -519,4 +554,175 @@ pub(crate) fn session_id_of(data: &SessionEventData) -> Option<&str> {
         | E::CompactionFailed { session_id, .. } => session_id,
         E::Unknown { .. } => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use ox_schema::event::CompactionReason;
+
+    async fn test_bus() -> EventBus {
+        EventBus::new(Db::open_in_memory().await.expect("open test db"))
+    }
+
+    async fn one_row(
+        conn: &ox_db::turso::Connection,
+        sql: &str,
+        params: impl ox_db::turso::IntoParams,
+    ) -> ox_db::turso::Row {
+        let mut stmt = conn.prepare(sql).await.expect("prepare");
+        let mut rows = stmt.query(params).await.expect("query");
+        rows.next().await.expect("next").expect("one row")
+    }
+
+    /// Drain the broadcast stream without blocking; used to assert both
+    /// presence (publish) and absence (publish_quiet) of frames.
+    fn drain(rx: &mut broadcast::Receiver<EventEnvelope>) -> Vec<EventEnvelope> {
+        let mut got = Vec::new();
+        while let Ok(env) = rx.try_recv() {
+            got.push(env);
+        }
+        got
+    }
+
+    async fn create_session(bus: &EventBus, sid: &str) {
+        bus.publish(SessionEventData::SessionCreated {
+            session_id: sid.to_string(),
+            project_id: "proj".to_string(),
+            location: LocationRef {
+                directory: "/tmp/ox".to_string(),
+                workspace_id: None,
+            },
+            subpath: None,
+            parent_id: None,
+            slug: sid.to_string(),
+            title: Some("quiet".to_string()),
+            agent: None,
+            model: None,
+            metadata: None,
+            permissions: None,
+            version: "1.0.0".to_string(),
+        })
+        .await
+        .expect("seed session");
+    }
+
+    fn compaction_ended(session_id: &str, text: &str) -> SessionEventData {
+        SessionEventData::CompactionEnded {
+            session_id: session_id.to_string(),
+            reason: CompactionReason::Idle,
+            model: None,
+            provider_state: None,
+            provider_context: None,
+            text: text.to_string(),
+            recent: String::new(),
+            cost: None,
+            tokens: None,
+        }
+    }
+
+    /// T8: `publish_quiet` keeps the full durable write path — event row,
+    /// `event_sequence` watermark, projection — while an active subscriber
+    /// receives nothing. Reconnect replay still sees the event (deliberate:
+    /// sequence integrity is never sacrificed for silence).
+    #[tokio::test]
+    async fn publish_quiet_persists_and_projects_without_fanout() {
+        let bus = test_bus().await;
+        create_session(&bus, "s-quiet").await;
+        let mut rx = bus.subscribe();
+
+        let env = bus
+            .publish_quiet(compaction_ended("s-quiet", "quiet checkpoint"))
+            .await
+            .expect("quiet publish");
+        let seq = env.durable.as_ref().expect("durable envelope").seq;
+
+        let conn = bus.db().acquire().await.expect("conn");
+
+        // The event row is persisted …
+        let persisted = one_row(
+            &conn,
+            "SELECT count(*) FROM event WHERE aggregate_id = 's-quiet'
+              AND type LIKE 'session.compaction.ended%'",
+            (),
+        )
+        .await
+        .get::<i64>(0)
+        .unwrap();
+        assert_eq!(persisted, 1, "quiet event lands in the event log");
+
+        // … the watermark advanced …
+        let watermark = one_row(
+            &conn,
+            "SELECT seq FROM event_sequence WHERE aggregate_id = 's-quiet'",
+            (),
+        )
+        .await
+        .get::<i64>(0)
+        .unwrap();
+        assert_eq!(watermark, seq, "event_sequence advanced to the quiet seq");
+
+        // … the projection ran (ended-without-started ⇒ fresh completed row).
+        let row = one_row(
+            &conn,
+            "SELECT json_extract(data, '$.status'), json_extract(data, '$.summary')
+              FROM session_message WHERE id = ?1 AND type = 'compaction'",
+            [ox_schema::id::from_event(&env.id)],
+        )
+        .await;
+        assert_eq!(row.get::<String>(0).unwrap(), "completed");
+        assert_eq!(row.get::<String>(1).unwrap(), "quiet checkpoint");
+
+        // Replay sees it; the live subscriber does not.
+        let log = bus.event_log("s-quiet", 0).await.expect("event log");
+        assert_eq!(
+            log.last().map(|e| e.id.as_str()),
+            Some(env.id.as_str()),
+            "reconnect replay still sees the quiet event"
+        );
+        assert!(
+            drain(&mut rx).is_empty(),
+            "no frame may reach an active subscriber"
+        );
+    }
+
+    /// T9 + interleave control: `publish` and `publish_quiet` share one write
+    /// path, so per-aggregate seqs stay strictly monotonic across both entry
+    /// points; the loud events fan out, the quiet one does not.
+    #[tokio::test]
+    async fn publish_and_publish_quiet_share_one_sequence() {
+        let bus = test_bus().await;
+        create_session(&bus, "s-mix").await;
+        let mut rx = bus.subscribe();
+
+        let a = bus
+            .publish(compaction_ended("s-mix", "loud a"))
+            .await
+            .expect("publish");
+        let b = bus
+            .publish_quiet(compaction_ended("s-mix", "quiet b"))
+            .await
+            .expect("publish_quiet");
+        let c = bus
+            .publish(compaction_ended("s-mix", "loud c"))
+            .await
+            .expect("publish");
+
+        // created = 0, then 1..=3 with no gap or reuse across the two paths.
+        let seqs = [
+            a.durable.as_ref().unwrap().seq,
+            b.durable.as_ref().unwrap().seq,
+            c.durable.as_ref().unwrap().seq,
+        ];
+        assert_eq!(seqs, [1, 2, 3], "one sequence counter for both paths");
+
+        let frames = drain(&mut rx);
+        let ids: Vec<&str> = frames.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![a.id.as_str(), c.id.as_str()],
+            "publish fans out, publish_quiet does not, commit order preserved"
+        );
+    }
 }

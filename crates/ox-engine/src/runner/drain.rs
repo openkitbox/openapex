@@ -113,7 +113,7 @@ pub(crate) struct DrainCtx {
     /// The session's cached git-toplevel anchor, cloned from the session
     /// handle so step and generate share the same per-directory slot.
     pub instruction_root: super::InstructionRootCache,
-    /// The session's idle-fold slot (plan D3): shared with the handle so the
+    /// The session's background-fold slot (plan D3): shared with the handle so the
     /// drain entry knows a running compaction row is alive, and so a manual
     /// compaction never runs beside a fold.
     pub fold_in_flight: Arc<std::sync::atomic::AtomicBool>,
@@ -130,8 +130,9 @@ pub(crate) async fn drain(
     // A process death skips compaction/tool finalizers; settle orphans
     // first (upstream settleStaleCompactions + settleStaleToolCalls).
     // Failures only warn: a broken settle must not wedge the turn.
-    // A running row that belongs to a live idle fold is NOT an orphan — the
-    // flag is the difference between "crashed mid-fold" and "folding now".
+    // Background folds publish no running row, so a running row here belongs
+    // to a blocking compaction; the flag check stays as belt-and-suspenders
+    // in case a fold ever regains a durable in-flight marker.
     if ctx
         .fold_in_flight
         .load(std::sync::atomic::Ordering::Acquire)
@@ -196,7 +197,7 @@ pub(crate) async fn drain(
                 {
                     tracing::info!(
                         session = %ctx.session_id,
-                        "manual compaction skipped: an idle fold is running"
+                        "manual compaction skipped: a background fold is running"
                     );
                 } else if let Err(error) =
                     compaction::compact(ctx, CompactionReason::Manual, Some(next.id.clone())).await
