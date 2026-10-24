@@ -137,3 +137,19 @@ kimi3.1pro 配置无法从本机查看）。**§4-A 的 wire 修复治不了本�
 - **(b)** 把 k3-256k 路由临时指回 kimi3.1pro，在本机对 ox→cardinal 段做透明字节
   捕获（本地转发器或本地 cardinal payloads=true）——一次复发即可定案：预期 ox
   出站字节配对完好，责任在 cardinal→Moonshot 段。
+
+### 7.2 黑匣子已装（2026-10-24，main `c38716a`，部署 `25fb2fed`）
+
+即便不选 (a)/(b)，下一次复发也会自动定案：step 的请求失败路径在 400 命中配对拒绝
+签名（body 提及 `tool_call_id`/`tool_calls`）时 warn 一条——`upstream_unanswered`
+（从 body 里按 Moonshot 句式提取的被点名 id；DeepSeek 句式不点名则为 null）+
+`sent_tool_calls`（本次出站请求的全部 assistant tool_call id，按 wire 顺序，封顶
+60 条）。`pair_tool_results` 在 `ChatRequest::new` 已经跑过，所以 `sent` 是 ox 真正
+发出的视图：**upstream 点名的 id 不在 sent 里 ⇒ 当场证明 id 由下游制造**。
+
+提取已按三种真实字节形状锁定测试：verbatim body 的 `","` 边界、cardinal 包装的双
+转义 `\",\"`、直连单转义的 `\"` + 收引号——统一实现为在第一个反斜杠或 `","` 处
+截断（provider id 不含反斜杠）。端到端冒烟
+`~/.ox/tmp/pairing-recorder-smoke.py`（mock 先流真 tool call → ox 执行 → 续接请求
+回配对 400 → 断言 warn 同时含两侧 id）：ALL GREEN。注意 server 模式日志走
+**stdout**（acp 才走 stderr），抓日志要捕对流。
