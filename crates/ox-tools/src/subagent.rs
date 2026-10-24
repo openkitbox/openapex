@@ -1,5 +1,5 @@
 //! `subagent`: spawn a child session, run its turn to completion, and fold
-//! its transcript into the parent's tool result.
+//! its final message into the parent's tool result.
 //!
 //! ox has no in-process agent runtime to reuse, so the tool builds on the two
 //! primitives the runner already exposes: `session.create`-style rows (a child
@@ -14,12 +14,18 @@ use crate::contract::{Tool, ToolContext, ToolOutput};
 use ox_schema::event::SessionEventData;
 use ox_schema::support::{LocationRef, SessionMetadata};
 use ox_schema::wire::ToolDef;
+use std::path::Path;
 
 use super::{fail, object_param, ok_text, param};
 
-/// The child's transcript is folded into the parent with this much text per
-/// message, matching the compaction preview budget.
-const MESSAGE_PREVIEW_CHARS: usize = 400;
+/// Inline budget for the child's final message folded into the parent's
+/// result; a longer final message is head-truncated to this many bytes and
+/// its full text spilled to disk.
+const SUBAGENT_FOLD_INLINE_BYTES: usize = 16 * 1024;
+
+/// Directory under `ox_home()` where oversized subagent output is spilled
+/// (one `<child sessionID>.md` per truncated child).
+const SUBAGENT_OUTPUT_DIR: &str = "subagent-output";
 
 /// Model-facing text when the parent's turn is interrupted while it waits.
 /// Deliberately NOT `question`'s sentinel: no question was cancelled here, and
@@ -384,7 +390,11 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
     };
     match child_outcome(&history) {
         ChildOutcome::Completed => {
-            let fold = transcript_fold(&history, &child_id);
+            let fold = transcript_fold(
+                &history,
+                &child_id,
+                &ox_core::config::ox_home().join(SUBAGENT_OUTPUT_DIR),
+            );
             ok_text(format!(
                 "<subagent sessionID=\"{child_id}\" state=\"completed\">\n{fold}\n</subagent>"
             ))
@@ -590,7 +600,7 @@ async fn load_child_parent(
 /// state is invented for it.
 #[derive(Debug, PartialEq, Eq)]
 enum ChildOutcome {
-    /// Turn ended clean: fold the transcript.
+    /// Turn ended clean: fold the final message.
     Completed,
     /// Turn failed: keep the child's sessionID visible so the model can resume.
     Failed(String),
@@ -639,39 +649,193 @@ fn final_text(messages: &[ox_schema::message::Message]) -> Option<String> {
     })
 }
 
-/// The child's reply for the parent: every assistant text message joined
-/// (previewed), or a fallback when the child produced nothing. Pure over an
-/// already-loaded transcript so the caller loads history once.
-fn transcript_fold(messages: &[ox_schema::message::Message], child_id: &str) -> String {
-    use ox_schema::message::{AssistantContent, Message};
-    let mut parts: Vec<String> = Vec::new();
-    for message in messages {
-        if let Message::Assistant(assistant) = message {
-            for content in &assistant.content {
-                if let AssistantContent::Text { text, .. } = content
-                    && !text.trim().is_empty()
-                {
-                    parts.push(preview(text));
-                }
-            }
-        }
-    }
-    if parts.is_empty() {
+/// The child's reply for the parent: only the final assistant message, whole
+/// when it fits [`SUBAGENT_FOLD_INLINE_BYTES`]; otherwise its head plus a
+/// pointer to the full output spilled under `output_dir` (one
+/// `<child sessionID>.md`). Pure over an already-loaded transcript apart
+/// from the spill, so the caller loads history once.
+fn transcript_fold(
+    messages: &[ox_schema::message::Message],
+    child_id: &str,
+    output_dir: &Path,
+) -> String {
+    let Some(final_reply) = final_text(messages) else {
         return format!(
             "Subagent finished without a final reply. Its transcript is on session {child_id}."
         );
+    };
+    if final_reply.len() <= SUBAGENT_FOLD_INLINE_BYTES {
+        return format!("Subagent report:\n\n{final_reply}");
     }
-    format!("Subagent report:\n\n{}", parts.join("\n\n"))
+    let mut end = SUBAGENT_FOLD_INLINE_BYTES;
+    while !final_reply.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = &final_reply[..end];
+    let omitted = final_reply.len() - end;
+    let path = output_dir.join(format!("{child_id}.md"));
+    let marker = match std::fs::create_dir_all(output_dir)
+        .and_then(|()| std::fs::write(&path, &final_reply))
+    {
+        Ok(()) => format!(
+            "[Output truncated: {omitted} bytes omitted. Full output: {}]",
+            path.display()
+        ),
+        Err(error) => format!(
+            "[Output truncated: {omitted} bytes omitted. Writing the full output failed: {error}]"
+        ),
+    };
+    format!("Subagent report:\n\n{head}\n{marker}")
 }
 
-/// Keep the parent's context small: the head of each message only.
-fn preview(text: &str) -> String {
-    let mut end = MESSAGE_PREVIEW_CHARS;
-    if text.len() > end {
-        while !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        return format!("{}…", &text[..end]);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ox_schema::message::{AssistantContent, AssistantMessage, AssistantTime, Message};
+    use ox_schema::support::{ModelRef, SessionError};
+
+    /// One error-free assistant message carrying a single text part.
+    fn assistant_text(id: &str, created: i64, text: &str) -> Message {
+        Message::Assistant(Box::new(AssistantMessage {
+            id: id.to_owned(),
+            metadata: None,
+            time: AssistantTime {
+                created,
+                streamed: None,
+                completed: None,
+            },
+            agent: "build".to_owned(),
+            model: ModelRef {
+                id: "test-model".to_owned(),
+                provider_id: "test".to_owned(),
+                variant: None,
+            },
+            content: vec![AssistantContent::Text {
+                text: text.to_owned(),
+                state: None,
+            }],
+            snapshot: None,
+            finish: None,
+            raw_finish: None,
+            provider_state: None,
+            cost: None,
+            tokens: None,
+            error: None,
+            retry: None,
+        }))
     }
-    text.to_owned()
+
+    /// The same shape, but the turn failed: `final_text` must skip it, so
+    /// its text never folds into the parent.
+    fn assistant_error(id: &str, created: i64, text: &str) -> Message {
+        let mut message = assistant_text(id, created, text);
+        if let Message::Assistant(assistant) = &mut message {
+            assistant.error = Some(SessionError {
+                kind: "execution".to_owned(),
+                message: "boom".to_owned(),
+                status: None,
+                response: None,
+            });
+        }
+        message
+    }
+
+    #[test]
+    fn fold_carries_only_the_final_message() {
+        let history = vec![
+            assistant_text("msg_1", 1, "Narration: reading the files now."),
+            assistant_text("msg_2", 2, "Final report body."),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let fold = transcript_fold(&history, "ses_a", dir.path());
+        assert_eq!(fold, "Subagent report:\n\nFinal report body.");
+    }
+
+    #[test]
+    fn fold_under_budget_is_verbatim_and_spills_nothing() {
+        let text = "x".repeat(1_000);
+        let history = vec![assistant_text("msg_1", 1, &text)];
+        let dir = tempfile::tempdir().unwrap();
+        let fold = transcript_fold(&history, "ses_b", dir.path());
+        assert_eq!(fold, format!("Subagent report:\n\n{text}"));
+        assert!(!dir.path().join("ses_b.md").exists());
+    }
+
+    #[test]
+    fn fold_over_budget_truncates_at_the_budget_and_spills_the_full_text() {
+        let text = "a".repeat(20_000);
+        let history = vec![assistant_text("msg_1", 1, &text)];
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("subagent-output");
+        let fold = transcript_fold(&history, "ses_c", &output_dir);
+        let head = &text[..SUBAGENT_FOLD_INLINE_BYTES];
+        assert_eq!(
+            fold,
+            format!(
+                "Subagent report:\n\n{head}\n[Output truncated: {} bytes omitted. Full output: {}]",
+                text.len() - head.len(),
+                output_dir.join("ses_c.md").display(),
+            )
+        );
+        let spilled = std::fs::read(output_dir.join("ses_c.md")).unwrap();
+        assert_eq!(spilled, text.as_bytes());
+    }
+
+    #[test]
+    fn fold_truncates_multibyte_text_on_a_char_boundary() {
+        // 6_000 three-byte chars = 18_000 bytes; byte 16_384 lands inside a
+        // char, so an unguarded cut would panic mid-char.
+        let text = "世".repeat(6_000);
+        let history = vec![assistant_text("msg_1", 1, &text)];
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("subagent-output");
+        let fold = transcript_fold(&history, "ses_d", &output_dir);
+        let body = fold.strip_prefix("Subagent report:\n\n").expect("prefix");
+        let (head, marker) = body.split_once('\n').expect("marker line");
+        assert!(text.starts_with(head), "head must be a byte prefix");
+        assert!(
+            (SUBAGENT_FOLD_INLINE_BYTES - 2..=SUBAGENT_FOLD_INLINE_BYTES).contains(&head.len()),
+            "a three-byte char cuts the head back by at most two bytes: {}",
+            head.len()
+        );
+        assert_eq!(
+            marker,
+            format!(
+                "[Output truncated: {} bytes omitted. Full output: {}]",
+                text.len() - head.len(),
+                output_dir.join("ses_d.md").display(),
+            )
+        );
+        let spilled = std::fs::read(output_dir.join("ses_d.md")).unwrap();
+        assert_eq!(spilled, text.as_bytes());
+    }
+
+    #[test]
+    fn fold_without_a_final_reply_keeps_the_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let fallback =
+            "Subagent finished without a final reply. Its transcript is on session ses_e.";
+        assert_eq!(transcript_fold(&[], "ses_e", dir.path()), fallback);
+        let history = vec![assistant_error("msg_1", 1, "errored text must not fold")];
+        assert_eq!(transcript_fold(&history, "ses_e", dir.path()), fallback);
+    }
+
+    #[test]
+    fn fold_reports_a_failed_spill_instead_of_panicking() {
+        let text = "a".repeat(20_000);
+        let history = vec![assistant_text("msg_1", 1, &text)];
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, "a file, not a directory").unwrap();
+        let output_dir = blocker.join("subagent-output");
+        let fold = transcript_fold(&history, "ses_f", &output_dir);
+        let omitted = text.len() - SUBAGENT_FOLD_INLINE_BYTES;
+        assert!(
+            fold.contains(&format!(
+                "[Output truncated: {omitted} bytes omitted. Writing the full output failed: "
+            )),
+            "{fold}"
+        );
+        assert!(!fold.contains("Full output:"), "{fold}");
+    }
 }
