@@ -125,6 +125,109 @@ pub(crate) fn prompt_tokens(row: &serde_json::Value) -> Option<i64> {
     Some(input + cached)
 }
 
+/// The tail's total `session_message.data` size in bytes, above `floor`.
+/// One aggregate row: the rows stream through the storage engine without
+/// materializing here.
+async fn tail_bytes(db: &Db, session_id: &str, floor: i64) -> Result<i64> {
+    let conn = db.acquire().await?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT COALESCE(SUM(LENGTH(CAST(data AS BLOB))), 0) FROM session_message \
+             WHERE session_id = ?1 AND seq > ?2",
+        )
+        .await?;
+    let mut rows = stmt.query((session_id, floor)).await?;
+    match rows.next().await? {
+        Some(row) => Ok(row.get::<i64>(0)?),
+        None => Ok(0),
+    }
+}
+
+/// The usage number the gate will compare against the soft band — the same
+/// number the full evaluation's back-scan derives (`rows.rev().find_map`),
+/// read without loading the tail. The third state is the honesty valve: a
+/// back-scan that exhausts its bounded window without finding tokens has NOT
+/// proven "no usage" — an older row could still report, and only the full
+/// load can answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewestUsage {
+    /// The newest assistant row above the floor that reports tokens carries
+    /// this `input + cache.read`.
+    Reported(i64),
+    /// No assistant row above the floor at all: the full path's back-scan
+    /// finds nothing either, so the byte bound alone decides.
+    NoneReported,
+    /// Assistant rows exist but none of the newest
+    /// [`GATE_BACKSCAN_ROWS`] carries tokens. Never a skip.
+    Ambiguous,
+}
+
+/// How many newest assistant rows the gate's usage back-scan may decode
+/// before it gives up and lets the full evaluation look further. One row
+/// answers in the common case; a run of this many tokenless assistant rows
+/// means failed steps in a row, where paying the full load is the old
+/// behavior anyway.
+const GATE_BACKSCAN_ROWS: i64 = 8;
+
+/// The usage the newest assistant rows reported, above `floor` — the same
+/// number the full evaluation derives from the loaded rows (back-scan to the
+/// newest row carrying tokens), read here without loading them. The `type`
+/// column filters (the row JSON does not carry it reliably), so it is
+/// injected before the shared extractor runs.
+async fn newest_reported_usage(db: &Db, session_id: &str, floor: i64) -> Result<NewestUsage> {
+    let conn = db.acquire().await?;
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT data FROM session_message \
+             WHERE session_id = ?1 AND type = 'assistant' AND seq > ?2 \
+             ORDER BY seq DESC LIMIT {GATE_BACKSCAN_ROWS}"
+        ))
+        .await?;
+    let mut rows = stmt.query((session_id, floor)).await?;
+    let mut saw_rows = false;
+    while let Some(row) = rows.next().await? {
+        saw_rows = true;
+        let mut data: serde_json::Value = serde_json::from_str(&row.get::<String>(0)?)?;
+        data["type"] = serde_json::json!("assistant");
+        if let Some(tokens) = prompt_tokens(&data) {
+            return Ok(NewestUsage::Reported(tokens));
+        }
+    }
+    Ok(if saw_rows {
+        NewestUsage::Ambiguous
+    } else {
+        NewestUsage::NoneReported
+    })
+}
+
+/// Whether the trigger's full evaluation could only answer [`historian::Trigger::No`],
+/// which makes the whole-tail load unnecessary.
+///
+/// An ambiguous usage scan never skips: uncertainty is the full load's cue.
+/// A usage at or above the soft band forces an evaluation (the band alone
+/// decides Speculative/Forced, and the chunk selection and fence math need
+/// the rows). Otherwise the tail's raw JSON byte length decides: it embeds
+/// every byte the rendered text carries plus keys and escaping, so the
+/// chunker's estimate — bytes of rendered text over four — is bounded above
+/// by `tail_bytes / 4`. Strictly below the trigger budget, the estimate
+/// cannot exceed the trigger and the decision is No; the bound is
+/// deliberately strict so a tail at the budget still loads.
+fn tail_load_skippable(usage: NewestUsage, tail_bytes: i64, budget: &Budget) -> bool {
+    match usage {
+        NewestUsage::Ambiguous => return false,
+        NewestUsage::Reported(tokens) => {
+            if budget
+                .usage_percentage(tokens)
+                .is_some_and(|pct| pct >= budget.soft_pct)
+            {
+                return false;
+            }
+        }
+        NewestUsage::NoneReported => {}
+    }
+    tail_bytes / 4 < i64::from(budget.trigger)
+}
+
 /// The background fold's synchronous patch (plan D6): at most one historian
 /// run folding the explicit range past `floor`, as far as the chunk budget
 /// and the protected-tail fence allow. Returns whether a run published
@@ -187,6 +290,24 @@ impl Firing<'_> {
         // one write transaction. `settle_running_runs` clears the row a crash
         // leaves behind.
         if historian::has_running_run(db, session_id).await? {
+            return Ok(None);
+        }
+        // Cheap pre-gate: size the tail without materializing it. Loading the
+        // whole tail (raw rows plus the rendered text) is the trigger's
+        // largest transient allocation, and it is paid on every step boundary
+        // even when the decision is No. The aggregate and the newest
+        // assistant row answer "could this possibly fire?" in O(1) memory;
+        // only a tail that might fire pays the full load below.
+        let (tail_bytes, gate_usage) = tokio::try_join!(
+            tail_bytes(db, session_id, floor),
+            newest_reported_usage(db, session_id, floor)
+        )?;
+        if tail_load_skippable(gate_usage, tail_bytes, &budget) {
+            tracing::debug!(
+                session = %session_id,
+                tail_bytes,
+                "historian skipped: tail far below the trigger budget"
+            );
             return Ok(None);
         }
         let rows = rows_after_with_seq(db, session_id, floor).await?;
@@ -446,4 +567,217 @@ struct Published {
     covered: String,
     /// Compartments the run published.
     compartments: usize,
+}
+
+#[cfg(test)]
+mod tail_gate_tests {
+    use super::*;
+
+    fn budget() -> Budget {
+        Budget::derive(&Default::default(), Some(200_000), None)
+    }
+
+    #[test]
+    fn usage_at_or_above_the_soft_band_must_evaluate() {
+        let budget = budget();
+        // 95% of the 200k window: far into the soft band whatever the exact
+        // soft percentage is.
+        assert!(!tail_load_skippable(
+            NewestUsage::Reported(190_000),
+            1,
+            &budget
+        ));
+    }
+
+    #[test]
+    fn a_small_known_usage_tail_is_skipped() {
+        let budget = budget();
+        // Reported but tiny (no window → the percentage cannot decide either
+        // way, exactly as the full path treats it): the byte bound alone.
+        assert!(tail_load_skippable(NewestUsage::Reported(1), 1, &budget));
+        assert!(tail_load_skippable(NewestUsage::NoneReported, 1, &budget));
+    }
+
+    /// The gate may only skip when the full evaluation could only answer No.
+    /// A newest assistant row without tokens is NOT "no usage" — the full
+    /// path back-scans past it to an older reported row, which may sit in
+    /// the soft band. Uncertainty must load.
+    #[test]
+    fn an_ambiguous_usage_scan_never_skips() {
+        let budget = budget();
+        assert!(!tail_load_skippable(NewestUsage::Ambiguous, 1, &budget));
+        assert!(!tail_load_skippable(
+            NewestUsage::Ambiguous,
+            i64::MAX,
+            &budget
+        ));
+    }
+
+    #[test]
+    fn the_byte_bound_is_strict_at_four_tokens_per_byte_group() {
+        let budget = budget();
+        let trigger = i64::from(budget.trigger);
+        // Strictly below 4 bytes per trigger token: the JSON byte length
+        // upper-bounds the rendered text, so the chunker's estimate can only
+        // land at or below the trigger - which answers No.
+        assert!(tail_load_skippable(
+            NewestUsage::NoneReported,
+            4 * trigger - 1,
+            &budget
+        ));
+        // At the bound the estimate may reach the trigger, so the full
+        // evaluation (which also picks the chunk) must run.
+        assert!(!tail_load_skippable(
+            NewestUsage::NoneReported,
+            4 * trigger,
+            &budget
+        ));
+        assert!(!tail_load_skippable(
+            NewestUsage::NoneReported,
+            4 * trigger + 1,
+            &budget
+        ));
+    }
+
+    // The pre-gate's two measurements, against a real database: bytes sum
+    // above the floor, and the newest assistant row reports its tokens.
+
+    async fn db() -> Db {
+        Db::open_in_memory().await.unwrap()
+    }
+
+    /// `session_message` carries a foreign key on the session row.
+    async fn seed_session(db: &Db, session_id: &str) {
+        let conn = db.acquire().await.unwrap();
+        conn.execute(
+            "INSERT INTO session_v2
+             (id, project_id, slug, directory, title, version, time_created, time_updated)
+             VALUES (?1, '/project', 'slug', '/tmp/project', 't', '2', 1, 1)",
+            [session_id],
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn seed_row(db: &Db, session_id: &str, kind: &str, seq: i64, data: &str) {
+        let conn = db.acquire().await.unwrap();
+        conn.execute(
+            "INSERT INTO session_message
+             (id, session_id, type, seq, time_created, time_updated, data)
+             VALUES (?1, ?2, ?3, ?4, 1, 1, ?5)",
+            [
+                format!("msg_{kind}_{seq}"),
+                session_id.to_owned(),
+                kind.to_owned(),
+                seq.to_string(),
+                data.to_owned(),
+            ],
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tail_bytes_sums_data_above_the_floor() {
+        let db = db().await;
+        seed_session(&db, "s").await;
+        let at_floor = "0".repeat(23); // seq 0: at the "whole tail" floor -1
+        seed_row(&db, "s", "user", 1, "abcdef").await;
+        seed_row(&db, "s", "assistant", 2, "abcdefghij").await;
+        seed_row(&db, "s", "user", 0, &at_floor).await;
+        // `seq > floor`: -1 is the trigger's "whole tail" floor, so seq 0 counts.
+        assert_eq!(
+            tail_bytes(&db, "s", -1).await.unwrap(),
+            (16 + at_floor.len()) as i64
+        );
+        assert_eq!(tail_bytes(&db, "s", 0).await.unwrap(), 16);
+        assert_eq!(tail_bytes(&db, "s", 1).await.unwrap(), 10);
+        assert_eq!(tail_bytes(&db, "s", 2).await.unwrap(), 0);
+        assert_eq!(tail_bytes(&db, "absent", -1).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn newest_reported_usage_back_scans_to_the_newest_row_with_tokens() {
+        let db = db().await;
+        seed_session(&db, "s").await;
+        let older = serde_json::json!({
+            "time": {"created": 1}, "agent": "build",
+            "content": [],
+            "tokens": {"input": 10, "output": 1, "cache": {"read": 0}},
+        });
+        let newest = serde_json::json!({
+            "time": {"created": 2}, "agent": "build",
+            "content": [],
+            "tokens": {"input": 30, "output": 1, "cache": {"read": 5}},
+        });
+        seed_row(&db, "s", "assistant", 1, &older.to_string()).await;
+        seed_row(&db, "s", "user", 2, "{\"time\":{\"created\":3}}").await;
+        seed_row(&db, "s", "assistant", 3, &newest.to_string()).await;
+        assert_eq!(
+            newest_reported_usage(&db, "s", -1).await.unwrap(),
+            NewestUsage::Reported(35),
+            "input + cache.read of the NEWEST assistant row"
+        );
+        assert_eq!(
+            newest_reported_usage(&db, "s", 3).await.unwrap(),
+            NewestUsage::NoneReported,
+            "nothing above the floor"
+        );
+    }
+
+    #[tokio::test]
+    async fn newest_reported_usage_is_none_reported_without_an_assistant_row() {
+        let db = db().await;
+        seed_session(&db, "s").await;
+        seed_row(&db, "s", "user", 1, "{\"time\":{\"created\":1}}").await;
+        assert_eq!(
+            newest_reported_usage(&db, "s", -1).await.unwrap(),
+            NewestUsage::NoneReported
+        );
+    }
+
+    /// The parity case the gate exists for: a newest assistant row without
+    /// tokens (a failed step publishes exactly that) must NOT read as "no
+    /// usage". The full evaluation back-scans to the older reported row and
+    /// could fire on it — so the gate must refuse to skip.
+    #[tokio::test]
+    async fn a_tokenless_newest_row_back_scans_to_the_older_reported_row() {
+        let db = db().await;
+        seed_session(&db, "s").await;
+        let reported = serde_json::json!({
+            "time": {"created": 1}, "agent": "build",
+            "content": [],
+            "tokens": {"input": 190_000, "output": 1, "cache": {"read": 0}},
+        });
+        let failed = serde_json::json!({
+            "time": {"created": 2}, "agent": "build",
+            "content": [],
+        });
+        seed_row(&db, "s", "assistant", 1, &reported.to_string()).await;
+        seed_row(&db, "s", "assistant", 2, &failed.to_string()).await;
+        assert_eq!(
+            newest_reported_usage(&db, "s", -1).await.unwrap(),
+            NewestUsage::Reported(190_000),
+            "the same row the full evaluation's back-scan lands on"
+        );
+    }
+
+    /// A back-scan that exhausts its bounded window without finding tokens
+    /// is uncertain, not "none reported" — an older row could still report.
+    #[tokio::test]
+    async fn a_scan_exhausted_without_tokens_is_ambiguous() {
+        let db = db().await;
+        seed_session(&db, "s").await;
+        let failed = serde_json::json!({
+            "time": {"created": 1}, "agent": "build",
+            "content": [],
+        });
+        for seq in 1..=GATE_BACKSCAN_ROWS {
+            seed_row(&db, "s", "assistant", seq, &failed.to_string()).await;
+        }
+        assert_eq!(
+            newest_reported_usage(&db, "s", -1).await.unwrap(),
+            NewestUsage::Ambiguous
+        );
+    }
 }

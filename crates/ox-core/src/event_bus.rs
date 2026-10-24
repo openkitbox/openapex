@@ -414,22 +414,27 @@ impl EventBus {
         ))
     }
 
-    /// Replay the durable event log for an aggregate, ordered by seq.
+    /// Replay the durable event log for an aggregate, ordered by seq, at most
+    /// `limit` envelopes. Callers page by resuming from the last envelope's
+    /// `durable.seq`; a bounded page keeps a reconnect replay's peak memory at
+    /// one page instead of the whole log (which grows between retention sweeps).
+    /// `i64::MAX` means unbounded.
     pub async fn event_log(
         &self,
         aggregate_id: &str,
         after: i64,
+        limit: i64,
     ) -> Result<Vec<EventEnvelope<Value>>> {
         let conn = self.db.acquire().await?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, aggregate_id, seq, created, type, data FROM event \
-                 WHERE aggregate_id = ?1 AND seq > ?2 ORDER BY seq ASC",
+                 WHERE aggregate_id = ?1 AND seq > ?2 ORDER BY seq ASC LIMIT ?3",
             )
             .await
             .context("read event log")?;
         let mut rows = stmt
-            .query((aggregate_id, after))
+            .query((aggregate_id, after, limit))
             .await
             .context("read event log")?;
         let mut out = Vec::new();
@@ -675,7 +680,10 @@ mod tests {
         assert_eq!(row.get::<String>(1).unwrap(), "quiet checkpoint");
 
         // Replay sees it; the live subscriber does not.
-        let log = bus.event_log("s-quiet", 0).await.expect("event log");
+        let log = bus
+            .event_log("s-quiet", 0, i64::MAX)
+            .await
+            .expect("event log");
         assert_eq!(
             log.last().map(|e| e.id.as_str()),
             Some(env.id.as_str()),

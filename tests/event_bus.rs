@@ -467,7 +467,7 @@ async fn event_log_ordering_and_versions() {
     .await
     .unwrap();
 
-    let log = bus.event_log("s1", -1).await.unwrap();
+    let log = bus.event_log("s1", -1, i64::MAX).await.unwrap();
     assert_eq!(log.len(), 3);
     let seqs: Vec<i64> = log
         .iter()
@@ -482,8 +482,53 @@ async fn event_log_ordering_and_versions() {
     assert_eq!(log[2].kind, "session.deleted");
 
     // after filter
-    let after = bus.event_log("s1", 0).await.unwrap();
+    let after = bus.event_log("s1", 0, i64::MAX).await.unwrap();
     assert_eq!(after.len(), 2);
+}
+
+#[tokio::test]
+async fn event_log_respects_a_limit_and_pages_by_seq() {
+    let bus = bus().await;
+    create(&bus, "s1").await;
+    for i in 0..5 {
+        bus.publish(SessionEventData::SessionRenamed {
+            session_id: "s1".to_string(),
+            title: format!("t{i}"),
+        })
+        .await
+        .unwrap();
+    }
+    // created + 5 renames = 6 durable events.
+
+    // A limit caps one page…
+    let page = bus.event_log("s1", -1, 2).await.unwrap();
+    assert_eq!(page.len(), 2);
+
+    // …and resuming from the page's last seq reassembles the whole log
+    // without ever holding more than the page in memory.
+    let mut paged: Vec<i64> = page
+        .iter()
+        .map(|e| e.durable.as_ref().unwrap().seq)
+        .collect();
+    let mut after = *paged.last().unwrap();
+    loop {
+        let next = bus.event_log("s1", after, 2).await.unwrap();
+        if next.is_empty() {
+            break;
+        }
+        paged.extend(next.iter().map(|e| e.durable.as_ref().unwrap().seq));
+        after = *paged.last().unwrap();
+        if next.len() < 2 {
+            break;
+        }
+    }
+
+    let full = bus.event_log("s1", -1, i64::MAX).await.unwrap();
+    let full: Vec<i64> = full
+        .iter()
+        .map(|e| e.durable.as_ref().unwrap().seq)
+        .collect();
+    assert_eq!(paged, full, "paged replay equals the single full query");
 }
 
 // ---------------------------------------------------------------------------

@@ -204,3 +204,55 @@ async fn a_cancelled_call_stops_its_session() {
         Some("Unable to execute command: sleep 30")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Idle eviction: the table otherwise only grows (every tool call spawns one
+// entry and only an explicit DELETE removes it).
+// ---------------------------------------------------------------------------
+
+mod eviction {
+    use super::*;
+
+    use ox::tool::shell::sessions::{SHELL_SESSION_TTL_MS, ShellSessions, SpawnRequest};
+
+    fn request(command: &str, timeout_ms: u64) -> SpawnRequest {
+        SpawnRequest {
+            command: command.to_owned(),
+            cwd: std::env::temp_dir(),
+            timeout_ms: Some(timeout_ms),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_settled_session_is_evicted_after_the_ttl() {
+        let table = ShellSessions::new();
+        let session = table.spawn(request("echo hi", 10_000)).unwrap();
+        assert!(
+            session.wait_settled(Duration::from_secs(5)).await,
+            "the command settles"
+        );
+        let now = ox::schema::id::now_millis();
+        table.evict_idle(now);
+        assert!(
+            table.get(&session.id).is_some(),
+            "a freshly settled session survives the sweep"
+        );
+        table.evict_idle(now + SHELL_SESSION_TTL_MS + 1_000);
+        assert!(
+            table.get(&session.id).is_none(),
+            "a session settled past the TTL is evicted"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_running_session_is_never_evicted() {
+        let table = ShellSessions::new();
+        let session = table.spawn(request("sleep 30", 500)).unwrap();
+        table.evict_idle(ox::schema::id::now_millis() + SHELL_SESSION_TTL_MS + 1_000);
+        assert!(
+            table.get(&session.id).is_some(),
+            "a running session (no completion timestamp) survives any sweep"
+        );
+        let _ = session.wait_settled(Duration::from_secs(5)).await;
+    }
+}

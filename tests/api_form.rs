@@ -160,8 +160,10 @@ async fn a_question_tool_call_is_answered_over_http() {
         )
     );
 
-    // The form is consumed; a second reply conflicts with the settled tag
-    // the TUI client treats as benign, and the list is empty.
+    // The form is consumed and forgotten (memory hygiene: a settled form
+    // kept in the process-wide table would never be dropped), so a second
+    // reply reports NotFound where it previously reported the settled tag.
+    // The awaiting tool already holds its outcome; the list is empty.
     let again = client
         .post(format!(
             "{base}/api/session/{session_id}/form/{form_id}/reply"
@@ -170,9 +172,9 @@ async fn a_question_tool_call_is_answered_over_http() {
         .send()
         .await
         .expect("reply again");
-    assert_eq!(again.status(), 409);
+    assert_eq!(again.status(), 404);
     let again_body: Value = again.json().await.expect("json");
-    assert_eq!(again_body["_tag"], "FormAlreadySettledError");
+    assert_eq!(again_body["_tag"], "FormNotFoundError");
     let after: Value = client
         .get(format!("{base}/api/session/{session_id}/form"))
         .send()

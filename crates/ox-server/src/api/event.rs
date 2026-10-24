@@ -77,6 +77,11 @@ const BODY_CHANNEL_CAPACITY: usize = 64;
 /// delivered by the replay and must be dropped.
 type ReplayCursor = (String, i64);
 
+/// How many durable envelopes one replay query materializes at most. Frames
+/// are rendered page by page, so a reconnect into a long session never holds
+/// the whole log in memory.
+const REPLAY_PAGE: i64 = 500;
+
 #[handler] // operation_id: event.subscribe
 pub(crate) async fn subscribe(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let Some(state) = state(depot, res) else {
@@ -221,26 +226,43 @@ async fn stream(
         }
 
         // Replay the requested durable range, remembering where it ended.
+        // Paged: a reconnect into a long session reads one bounded page at a
+        // time instead of the whole log, and the emitted frames are identical
+        // (same seq order, one page boundary is invisible on the wire).
         let mut replayed: Option<ReplayCursor> = None;
         if let Some((session_id, after)) = cursor {
-            match bus.event_log(&session_id, after).await {
-                Ok(events) => {
-                    for env in &events {
-                        if render_frame(&tx, env).await.is_err() {
-                            return; // client disconnected mid-replay
+            let mut after = after;
+            let mut last_seq: Option<i64> = None;
+            loop {
+                match bus.event_log(&session_id, after, REPLAY_PAGE).await {
+                    Ok(events) => {
+                        for env in &events {
+                            if render_frame(&tx, env).await.is_err() {
+                                return; // client disconnected mid-replay
+                            }
+                        }
+                        let complete = (events.len() as i64) < REPLAY_PAGE;
+                        match events
+                            .last()
+                            .and_then(|last| last.durable.as_ref().map(|d| d.seq))
+                        {
+                            Some(seq) => {
+                                after = seq;
+                                last_seq = Some(seq);
+                            }
+                            None => break,
+                        }
+                        if complete {
+                            break;
                         }
                     }
-                    replayed = events.last().and_then(|last| {
-                        last.durable
-                            .as_ref()
-                            .map(|d| (d.aggregate_id.clone(), d.seq))
-                    });
-                }
-                Err(error) => {
-                    tracing::error!(error = %error, "event replay failed; closing stream");
-                    return;
+                    Err(error) => {
+                        tracing::error!(error = %error, "event replay failed; closing stream");
+                        return;
+                    }
                 }
             }
+            replayed = last_seq.map(|seq| (session_id, seq));
         }
         if !follow {
             return; // finite log: dropping `tx` ends the body

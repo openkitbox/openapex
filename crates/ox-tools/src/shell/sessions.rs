@@ -26,6 +26,10 @@ use super::engine;
 /// Newest bytes retained per session. Upstream keeps the whole capture in a
 /// file; the tail is what a client renders and what the model needs.
 pub const OUTPUT_CAPACITY: usize = 8 * 1024 * 1024;
+/// How long a settled session stays listed before the next spawn reaps it.
+/// A running session never ages out: there is no completion timestamp to
+/// measure from, and its output is still being written.
+pub const SHELL_SESSION_TTL_MS: i64 = 60 * 60 * 1000;
 /// Default page size for one `output` read.
 pub const DEFAULT_PAGE_BYTES: usize = 64 * 1024;
 
@@ -133,6 +137,14 @@ impl OutputBuffer {
     /// Bytes currently retained.
     pub fn retained(&self) -> usize {
         self.bytes.len()
+    }
+
+    /// Release the slack the drain policy leaves behind. Called once at
+    /// settle: afterwards the buffer is read-mostly (paged output), so the
+    /// one realloc costs nothing and a session whose output once crossed the
+    /// capacity stops pinning 8–16MiB for its remaining lifetime.
+    pub fn shrink_to_retained(&mut self) {
+        self.bytes.shrink_to_fit();
     }
 }
 
@@ -379,6 +391,7 @@ impl ShellSessions {
         if let Ok(mut table) = self.sessions.lock() {
             table.insert(session.id.clone(), Arc::clone(&session));
         }
+        self.evict_idle(ox_schema::id::now_millis());
         let _ = events.send(ShellEvent {
             kind: "shell.created",
             id: session.id.clone(),
@@ -418,6 +431,21 @@ impl ShellSessions {
             Some(_) => table.remove(id).is_some(),
             None => false,
         }
+    }
+
+    /// Reap settled sessions whose completion is older than
+    /// [`SHELL_SESSION_TTL_MS`]. Running sessions never age out: `Exit.completed`
+    /// only exists once a session settles. Called from [`Self::spawn`] so the
+    /// table is bounded by live work plus an hour of recent history instead of
+    /// the process lifetime.
+    pub fn evict_idle(&self, now_ms: i64) {
+        let Ok(mut table) = self.sessions.lock() else {
+            return;
+        };
+        table.retain(|_, session| match session.exit().completed {
+            Some(completed) => now_ms.saturating_sub(completed) <= SHELL_SESSION_TTL_MS,
+            None => true,
+        });
     }
 
     /// Subscribe to lifecycle changes instead of polling.
@@ -537,5 +565,35 @@ async fn drive(session: Arc<ShellSession>, timeout_ms: Option<u64>) {
             status: exit.status.unwrap_or(Status::Exited),
             exit: exit.code,
         });
+    }
+    // The forwarder is gone, so no one appends from here on; give back the
+    // slack the drain policy left in a buffer that once crossed the capacity.
+    if let Ok(mut buffer) = session.output.lock() {
+        buffer.shrink_to_retained();
+    }
+}
+
+#[cfg(test)]
+mod output_buffer_tests {
+    use super::*;
+
+    #[test]
+    fn shrinking_releases_the_drain_slack() {
+        let capacity = 1 << 20;
+        let mut buffer = OutputBuffer::with_capacity(capacity);
+        // Fill the buffer exactly, then cross it with a small chunk: extend
+        // doubles the Vec, the drain drops the front, and the capacity stays
+        // at the doubled size (the slack the drain policy leaves behind).
+        buffer.append(&vec![b'x'; capacity]);
+        buffer.append(&[b'y'; 4096]);
+        assert_eq!(buffer.retained(), capacity);
+        let bloated = buffer.bytes.capacity();
+        assert!(bloated > buffer.retained(), "drain leaves slack behind");
+        buffer.shrink_to_retained();
+        assert!(
+            buffer.bytes.capacity() < bloated,
+            "shrinking gives the slack back"
+        );
+        assert_eq!(buffer.retained(), capacity, "the retained tail is intact");
     }
 }

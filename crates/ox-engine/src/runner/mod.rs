@@ -136,6 +136,10 @@ struct SessionHandle {
     /// at a time, and a running compaction row that belongs to it is not
     /// stale (drain entry must not settle it out from under the live task).
     fold_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// The last time dispatch or park touched this session (millis). The idle
+    /// sweep's clock: an entry with no work in flight or scheduled that has
+    /// been silent past [`RUNNER_IDLE_TTL_MS`] is reaped.
+    last_used: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// The working-tree root of the repository containing `directory`, or `None`
@@ -208,6 +212,35 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
+
+/// Whether the entry has work scheduled or in flight (`scheduled` covers
+/// the enqueue-to-busy gap, `cancel` the busy period itself). The idle
+/// sweep and the public `Runner::is_active` must answer this identically.
+fn handle_is_active(handle: &SessionHandle) -> bool {
+    *lock(&handle.scheduled) || lock(&handle.cancel).is_some()
+}
+
+/// A fresh registry entry: channels and flags only, idle-clock current.
+fn new_session_handle() -> SessionHandle {
+    let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
+    SessionHandle {
+        tx,
+        parked: Arc::new(tokio::sync::Mutex::new(Some(rx))),
+        cancel: Arc::new(Mutex::new(None)),
+        scheduled: Arc::new(Mutex::new(false)),
+        instruction_root: InstructionRootCache::default(),
+        fold_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        last_used: Arc::new(std::sync::atomic::AtomicU64::new(
+            ox_schema::id::now_millis() as u64,
+        )),
+    }
+}
+
+/// How long a registry entry may sit silent (no dispatch, no park) before
+/// the idle sweep reaps it. A pause between turns of one conversation is
+/// minutes at most; half an hour never reaps a live session, and the cost
+/// of a reap is only the next dispatch's rebuild + re-baseline.
+const RUNNER_IDLE_TTL_MS: u64 = 30 * 60 * 1000;
 
 impl Runner {
     /// A runner over the given bus/db/config rooted at `directory`, with the
@@ -311,18 +344,35 @@ impl Runner {
         self.inner
             .sessions
             .get(session_id)
-            .is_some_and(|handle| *lock(&handle.scheduled) || lock(&handle.cancel).is_some())
+            .is_some_and(|handle| handle_is_active(&handle))
     }
 
     /// Wake the session's actor for a drain: spawn one if parked, otherwise
     /// join the live task's mailbox. Safe to call repeatedly; the actor
     /// coalesces enqueues into one busy period.
     pub async fn dispatch(&self, session_id: &str, inbox_id: &str) -> Result<()> {
-        let handle = self.handle(session_id);
-        // Mark scheduled BEFORE the send: once the message is in the mailbox
-        // the actor may install the busy period at any point, and `is_active`
-        // must hold continuously from here until the terminal settles.
-        *lock(&handle.scheduled) = true;
+        // Opportunistic idle sweep: dispatch is the one regular entry, so the
+        // per-session tables stay bounded by live work (the sweep's own O(n)
+        // is dozens of entries at most).
+        self.sweep_idle(ox_schema::id::now_millis() as u64);
+        // Stamp and mark while holding the entry's shard lock: a concurrent
+        // sweep's retain serializes behind this guard, so it can never evict
+        // an entry this dispatch is about to use. Marking scheduled after the
+        // guard used to leave exactly that window open.
+        let handle = {
+            let entry = self.inner.sessions.entry(session_id.to_owned());
+            let slot = entry.or_insert_with(new_session_handle);
+            slot.last_used.store(
+                ox_schema::id::now_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            // Mark scheduled BEFORE the send: once the message is in the
+            // mailbox the actor may install the busy period at any point, and
+            // `is_active` must hold continuously from here until the terminal
+            // settles.
+            *lock(&slot.scheduled) = true;
+            slot.clone()
+        };
         // Send BEFORE taking the parked receiver: a task parking concurrently
         // re-checks the channel under the slot lock, so a message that beat
         // the send is picked up by exactly one side.
@@ -370,23 +420,32 @@ impl Runner {
         }
     }
 
-    /// Registry entry for `session_id`, creating (parked) when absent.
-    fn handle(&self, session_id: &str) -> SessionHandle {
-        self.inner
-            .sessions
-            .entry(session_id.to_owned())
-            .or_insert_with(|| {
-                let (tx, rx) = mpsc::channel(MAILBOX_CAPACITY);
-                SessionHandle {
-                    tx,
-                    parked: Arc::new(tokio::sync::Mutex::new(Some(rx))),
-                    cancel: Arc::new(Mutex::new(None)),
-                    scheduled: Arc::new(Mutex::new(false)),
-                    instruction_root: InstructionRootCache::default(),
-                    fold_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                }
-            })
-            .clone()
+    /// Reap registry entries idle past [`RUNNER_IDLE_TTL_MS`]: the runner-side
+    /// only-grows tables (`sessions`, one entry per session ever dispatched —
+    /// subagent children included — and `instruction_baselines`, one frozen
+    /// render per such session). A parked entry has no live task (the actor
+    /// handed the receiver back and exited), so removal drops only channels
+    /// and flags; the next dispatch rebuilds and re-baselines exactly as the
+    /// existing shutdown path does. A busy entry is never touched, whatever
+    /// its timestamp says.
+    fn sweep_idle(&self, now_ms: u64) {
+        let mut evicted: Vec<String> = Vec::new();
+        self.inner.sessions.retain(|id, handle| {
+            let idle =
+                now_ms.saturating_sub(handle.last_used.load(std::sync::atomic::Ordering::Relaxed));
+            if idle > RUNNER_IDLE_TTL_MS && !handle_is_active(handle) {
+                evicted.push(id.clone());
+                return false;
+            }
+            true
+        });
+        if evicted.is_empty() {
+            return;
+        }
+        let mut baselines = lock(&self.inner.instruction_baselines);
+        for id in &evicted {
+            baselines.remove(id);
+        }
     }
 
     /// Take the parked receiver and hand it to a freshly spawned actor task.
@@ -703,6 +762,12 @@ impl ActorTask {
     /// zero tasks). Returns true to re-enter the absorb loop when a message
     /// was already waiting.
     async fn park(&self, rx: &mut mpsc::Receiver<ActorMsg>) -> bool {
+        // The turn truly ended here: the idle clock restarts from this point,
+        // not from the dispatch that started the (possibly long) busy period.
+        self.handle.last_used.store(
+            ox_schema::id::now_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         let mut slot = self.handle.parked.lock().await;
         if !rx.is_empty() {
             return true;
@@ -838,5 +903,162 @@ impl ox_tools::subagent::SubagentSpawner for Runner {
             &self.inner.db,
             session_id,
         ))
+    }
+}
+
+#[cfg(test)]
+mod idle_sweep_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// A chat the sweep tests never call: the registry-level semantics are
+    /// what is under test, not turn execution.
+    struct UnusedChat;
+
+    impl crate::cardinal::chat::Chat for UnusedChat {
+        fn stream_chat<'a>(
+            &'a self,
+            _request: &'a crate::cardinal::wire::ChatRequest,
+        ) -> crate::cardinal::chat::ChatFuture<'a> {
+            Box::pin(async { panic!("sweep tests never chat") })
+        }
+    }
+
+    async fn runner() -> Runner {
+        let db = Db::open_in_memory().await.unwrap();
+        let bus = EventBus::new(db.clone());
+        Runner::new(
+            std::sync::Arc::new(Config::default()),
+            std::env::temp_dir(),
+            db,
+            bus,
+            std::sync::Arc::new(UnusedChat),
+            std::sync::Arc::new(ToolRegistry::new()),
+            std::sync::Arc::new(ox_core::model_catalog::ModelCatalog::from_entries(vec![])),
+        )
+    }
+
+    fn seed_baseline(runner: &Runner, session_id: &str) {
+        lock(&runner.inner.instruction_baselines).insert(
+            session_id.to_owned(),
+            instructions::Baseline {
+                initial_render: String::new(),
+                sources: Default::default(),
+            },
+        );
+    }
+
+    fn baseline_gone(runner: &Runner, session_id: &str) -> bool {
+        lock(&runner.inner.instruction_baselines)
+            .get(session_id)
+            .is_none()
+    }
+
+    /// Insert a fresh registry entry directly (dispatch's own creation path,
+    /// minus the dispatch).
+    fn insert_handle(runner: &Runner, session_id: &str) -> SessionHandle {
+        let handle = new_session_handle();
+        runner
+            .inner
+            .sessions
+            .insert(session_id.to_owned(), handle.clone());
+        handle
+    }
+
+    /// A dispatch arriving at an entry the sweep is about to reap must still
+    /// work: the entry is re-created, the message delivered, and the entry
+    /// the sweep had evicted never strands the dispatch (the µs race this
+    /// closes: clone → scheduled-mark used to sit outside the map's shard
+    /// lock, where a concurrent retain could evict in between).
+    #[tokio::test]
+    async fn a_dispatch_on_an_expired_entry_recreates_and_delivers() {
+        let runner = runner().await;
+        let handle = insert_handle(&runner, "ses_expired");
+        seed_baseline(&runner, "ses_expired");
+        handle.last_used.store(0, Ordering::Relaxed);
+
+        runner.dispatch("ses_expired", "inbox_1").await.unwrap();
+
+        let entry = runner.inner.sessions.get("ses_expired").expect("entry");
+        assert!(*lock(&entry.scheduled), "scheduled is marked");
+        let now = ox_schema::id::now_millis() as u64;
+        assert!(
+            now.saturating_sub(entry.last_used.load(Ordering::Relaxed)) < 60_000,
+            "the re-created entry's idle clock is fresh"
+        );
+        // The old handle must be orphaned-by-replacement, not live alongside:
+        // its receiver was taken, so a second actor cannot also spawn from it.
+        assert!(
+            entry
+                .parked
+                .try_lock()
+                .map(|slot| slot.is_none())
+                .unwrap_or(true),
+            "the receiver is owned by the live actor"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_entry_idle_past_the_ttl_is_reaped_with_its_baseline() {
+        let runner = runner().await;
+        let handle = insert_handle(&runner, "ses_stale");
+        seed_baseline(&runner, "ses_stale");
+        handle.last_used.store(
+            (ox_schema::id::now_millis() - RUNNER_IDLE_TTL_MS as i64 - 1_000) as u64,
+            Ordering::Relaxed,
+        );
+
+        runner.sweep_idle(ox_schema::id::now_millis() as u64);
+
+        assert!(
+            runner.inner.sessions.get("ses_stale").is_none(),
+            "the idle entry is reaped"
+        );
+        assert!(
+            baseline_gone(&runner, "ses_stale"),
+            "the frozen baseline goes with it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fresh_entry_survives_the_sweep() {
+        let runner = runner().await;
+        let handle = insert_handle(&runner, "ses_fresh");
+        seed_baseline(&runner, "ses_fresh");
+
+        runner.sweep_idle(ox_schema::id::now_millis() as u64);
+
+        assert!(runner.inner.sessions.get("ses_fresh").is_some());
+        assert!(!baseline_gone(&runner, "ses_fresh"));
+        let _ = handle; // the map entry is what matters
+    }
+
+    #[tokio::test]
+    async fn a_busy_entry_is_never_reaped_whatever_its_timestamp_says() {
+        let runner = runner().await;
+        let handle = insert_handle(&runner, "ses_busy");
+        seed_baseline(&runner, "ses_busy");
+        *lock(&handle.scheduled) = true;
+        handle.last_used.store(0, Ordering::Relaxed);
+
+        runner.sweep_idle(u64::MAX);
+
+        assert!(
+            runner.inner.sessions.get("ses_busy").is_some(),
+            "scheduled work survives any sweep"
+        );
+        assert!(!baseline_gone(&runner, "ses_busy"));
+        *lock(&handle.scheduled) = false;
+    }
+
+    #[tokio::test]
+    async fn a_fresh_handle_carries_a_current_timestamp() {
+        let runner = runner().await;
+        let handle = insert_handle(&runner, "ses_new");
+        let now = ox_schema::id::now_millis() as u64;
+        assert!(
+            now.saturating_sub(handle.last_used.load(Ordering::Relaxed)) < 60_000,
+            "the entry starts idle-clock fresh"
+        );
     }
 }
