@@ -59,7 +59,7 @@ impl ChatRequest {
     pub fn new(model: impl Into<String>, messages: Vec<ChatMessage>) -> Self {
         Self {
             model: model.into(),
-            messages,
+            messages: pair_tool_results(messages),
             tools: Vec::new(),
             tool_choice: ToolChoice::default(),
             temperature: None,
@@ -354,4 +354,184 @@ pub struct FunctionCall {
     pub name: String,
     /// The arguments as a JSON *string* (not a JSON object).
     pub arguments: String,
+}
+
+/// Placeholder content for a synthesized tool result: tells the model the
+/// tool produced nothing usable, so it can retry instead of hallucinating
+/// an outcome.
+pub(crate) const NO_RESULT_CONTENT: &str = "[no result recorded: interrupted or folded]";
+
+/// Make the history wire-safe for strict providers (Moonshot/OpenAI/DeepSeek
+/// all 400 the exact shape this guards): every assistant `tool_calls` entry
+/// must be answered by a `role:"tool"` message **after** it. ox can emit a
+/// call without a result when a crash or kill lands mid-tool-execution — the
+/// part stays `Streaming`/`Running`, which renders no result message. Each
+/// unanswered id gets a placeholder result spliced in directly after its
+/// call-bearing message, the adjacency those providers require. An answer
+/// that arrives later (a split turn) already counts as answered — joining it
+/// closer is the relay's dialect fixup's business, not ours. A fully paired
+/// history passes through untouched: the scan is borrow-only and allocates
+/// nothing beyond the (normally empty) missing list.
+pub(crate) fn pair_tool_results(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    // First pass, borrowed: which call ids lack a later answer.
+    let mut missing: Vec<(usize, String)> = Vec::new();
+    for (index, message) in messages.iter().enumerate() {
+        let ChatMessage::Assistant {
+            tool_calls: Some(calls),
+            ..
+        } = message
+        else {
+            continue;
+        };
+        for call in calls {
+            let answered = messages[index + 1..].iter().any(|later| {
+                matches!(later, ChatMessage::Tool { tool_call_id, .. } if tool_call_id == &call.id)
+            });
+            if !answered {
+                missing.push((index, call.id.clone()));
+            }
+        }
+    }
+    if missing.is_empty() {
+        return messages;
+    }
+    // Second pass, owned: splice the placeholders in right after their
+    // assistant message. `missing` is already ordered by (index, call order)
+    // because both loops walk forward.
+    let mut spliced = Vec::with_capacity(messages.len() + missing.len());
+    let mut missing = missing.into_iter().peekable();
+    for (index, message) in messages.into_iter().enumerate() {
+        spliced.push(message);
+        while missing.peek().is_some_and(|(at, _)| *at == index) {
+            let (_, id) = missing.next().expect("peeked");
+            spliced.push(ChatMessage::Tool {
+                tool_call_id: id,
+                content: NO_RESULT_CONTENT.to_owned(),
+            });
+        }
+    }
+    spliced
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assistant_with_calls(ids: &[&str]) -> ChatMessage {
+        ChatMessage::assistant_tool_calls(
+            ids.iter()
+                .map(|id| ToolCall {
+                    id: (*id).to_owned(),
+                    kind: FunctionType::Function,
+                    function: FunctionCall {
+                        name: "shell".to_owned(),
+                        arguments: "{}".to_owned(),
+                    },
+                })
+                .collect(),
+        )
+    }
+
+    fn tool_result(id: &str) -> ChatMessage {
+        ChatMessage::tool(id, "{}")
+    }
+
+    fn user(text: &str) -> ChatMessage {
+        ChatMessage::User {
+            content: UserContent::from(text),
+        }
+    }
+
+    fn tool_ids(messages: &[ChatMessage]) -> Vec<Option<String>> {
+        messages
+            .iter()
+            .map(|message| match message {
+                ChatMessage::Tool { tool_call_id, .. } => Some(tool_call_id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unpaired_calls_get_synthesized_results_right_after_the_call() {
+        let out = pair_tool_results(vec![
+            user("go"),
+            assistant_with_calls(&["a1", "a2"]),
+            user("next"),
+        ]);
+        assert_eq!(out.len(), 5);
+        assert_eq!(
+            tool_ids(&out),
+            vec![None, None, Some("a1".into()), Some("a2".into()), None]
+        );
+        // Placeholder shape: consecutive, immediately after the assistant,
+        // telling the model nothing usable came back.
+        for (slot, id) in out[2..4].iter().zip(["a1", "a2"]) {
+            let ChatMessage::Tool {
+                tool_call_id,
+                content,
+            } = slot
+            else {
+                panic!("expected tool message");
+            };
+            assert_eq!(tool_call_id, id);
+            assert_eq!(content, NO_RESULT_CONTENT);
+        }
+    }
+
+    #[test]
+    fn paired_history_passes_through_untouched() {
+        let history = vec![
+            user("go"),
+            assistant_with_calls(&["a1"]),
+            tool_result("a1"),
+            user("next"),
+        ];
+        assert_eq!(pair_tool_results(history.clone()), history);
+    }
+
+    #[test]
+    fn a_later_answer_counts_so_split_turns_are_not_touched() {
+        let history = vec![
+            assistant_with_calls(&["a1"]),
+            ChatMessage::Assistant {
+                content: Some("thinking".to_owned()),
+                tool_calls: None,
+                reasoning_content: None,
+            },
+            tool_result("a1"),
+        ];
+        assert_eq!(pair_tool_results(history.clone()), history);
+    }
+
+    #[test]
+    fn a_result_before_the_call_does_not_answer_it() {
+        let out = pair_tool_results(vec![tool_result("a1"), assistant_with_calls(&["a1"])]);
+        assert_eq!(out.len(), 3);
+        assert_eq!(
+            tool_ids(&out),
+            vec![Some("a1".into()), None, Some("a1".into())]
+        );
+    }
+
+    #[test]
+    fn chat_request_new_applies_the_pairing_guard() {
+        let request = ChatRequest::new(
+            "k3-256k",
+            vec![user("go"), assistant_with_calls(&["a1"]), user("next")],
+        );
+        assert_eq!(request.messages.len(), 4);
+        assert!(matches!(
+            &request.messages[2],
+            ChatMessage::Tool { tool_call_id, .. } if tool_call_id == "a1"
+        ));
+    }
+
+    #[test]
+    fn requests_without_tool_calls_are_untouched() {
+        let history = vec![ChatMessage::System {
+            content: "s".to_owned(),
+        }];
+        assert_eq!(pair_tool_results(history.clone()), history);
+    }
 }
