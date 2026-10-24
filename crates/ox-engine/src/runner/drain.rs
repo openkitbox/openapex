@@ -113,6 +113,10 @@ pub(crate) struct DrainCtx {
     /// The session's cached git-toplevel anchor, cloned from the session
     /// handle so step and generate share the same per-directory slot.
     pub instruction_root: super::InstructionRootCache,
+    /// The session's idle-fold slot (plan D3): shared with the handle so the
+    /// drain entry knows a running compaction row is alive, and so a manual
+    /// compaction never runs beside a fold.
+    pub fold_in_flight: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Run drains until the inbox is quiet, a control interrupts, or a turn
@@ -126,7 +130,14 @@ pub(crate) async fn drain(
     // A process death skips compaction/tool finalizers; settle orphans
     // first (upstream settleStaleCompactions + settleStaleToolCalls).
     // Failures only warn: a broken settle must not wedge the turn.
-    if let Err(error) = settle_stale_compactions(&ctx.bus, &ctx.db, &ctx.session_id).await {
+    // A running row that belongs to a live idle fold is NOT an orphan — the
+    // flag is the difference between "crashed mid-fold" and "folding now".
+    if ctx
+        .fold_in_flight
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        tracing::debug!(session = %ctx.session_id, "compaction row running for a live fold; not settling");
+    } else if let Err(error) = settle_stale_compactions(&ctx.bus, &ctx.db, &ctx.session_id).await {
         tracing::warn!(session = %ctx.session_id, error = %error, "settleStaleCompactions failed");
     }
     if let Err(error) = settle_stale_tool_calls(&ctx.bus, &ctx.db, &ctx.session_id).await {
@@ -175,7 +186,19 @@ pub(crate) async fn drain(
                 if let Err(error) = deliver(ctx, &next.id).await {
                     return DrainOutcome::Failed(unknown_error(error.to_string()));
                 }
-                if let Err(error) =
+                // Single flight (plan D3): an in-flight fold owns the
+                // session's one compaction slot. Skipping (not queueing)
+                // keeps two running rows from ever crossing — the fold will
+                // land the checkpoint in seconds anyway.
+                if ctx
+                    .fold_in_flight
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    tracing::info!(
+                        session = %ctx.session_id,
+                        "manual compaction skipped: an idle fold is running"
+                    );
+                } else if let Err(error) =
                     compaction::compact(ctx, CompactionReason::Manual, Some(next.id.clone())).await
                 {
                     tracing::warn!(session = %ctx.session_id, error = %error.message, "compaction failed");

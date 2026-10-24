@@ -54,6 +54,10 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
             Some(handle) => handle.instruction_root.clone(),
             None => super::InstructionRootCache::default(),
         },
+        fold_in_flight: match inner.sessions.get(session_id) {
+            Some(handle) => Arc::clone(&handle.fold_in_flight),
+            None => Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
     };
 
     let budget = crate::mctx::budget_for(&ctx.config, &ctx.model_catalog, &model.id);

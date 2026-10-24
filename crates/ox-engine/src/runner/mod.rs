@@ -131,6 +131,10 @@ struct SessionHandle {
     /// session's directory, computed at most once per distinct directory
     /// (a `/cd` invalidates it by keying on the directory itself).
     instruction_root: InstructionRootCache,
+    /// An idle fold is running for this session (plan D3): at most one fold
+    /// at a time, and a running compaction row that belongs to it is not
+    /// stale (drain entry must not settle it out from under the live task).
+    fold_in_flight: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// The working-tree root of the repository containing `directory`, or `None`
@@ -378,6 +382,7 @@ impl Runner {
                     cancel: Arc::new(Mutex::new(None)),
                     scheduled: Arc::new(Mutex::new(false)),
                     instruction_root: InstructionRootCache::default(),
+                    fold_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 }
             })
             .clone()
@@ -492,6 +497,7 @@ impl ActorTask {
                 mcp: self.inner.mcp.clone(),
                 instruction_baselines: self.inner.instruction_baselines.clone(),
                 instruction_root: self.handle.instruction_root.clone(),
+                fold_in_flight: Arc::clone(&self.handle.fold_in_flight),
             };
             let mut scope = drain::Promotable::Input;
             loop {
@@ -557,6 +563,11 @@ impl ActorTask {
                                     "execution.succeeded failed to publish"
                                 );
                             }
+                            // Upstream fires the fold on this same event
+                            // (`session.execution.succeeded` → idle()): the
+                            // busy period is over, the tail may fold in the
+                            // background.
+                            compaction::spawn_idle_fold(&ctx);
                             break;
                         }
                         // Fresh work: the next pass starts at an input boundary.

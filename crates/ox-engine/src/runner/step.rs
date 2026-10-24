@@ -1875,6 +1875,25 @@ pub(crate) async fn last_assistant_text(
     })
 }
 
+/// Load a session transcript at or below `upper`: rows with a smaller or
+/// equal ordinal. The idle fold snapshots the transcript this way (plan D4):
+/// the summary must describe only rows that existed when the fold started,
+/// so rows written while the fold streams stay out of its input and are
+/// carried verbatim in `recent` instead.
+pub(crate) async fn load_history_through(
+    db: &ox_db::Db,
+    session_id: &str,
+    upper: i64,
+) -> Result<Vec<Message>> {
+    let rows: Vec<serde_json::Value> = rows_after_with_seq(db, session_id, i64::MIN)
+        .await?
+        .into_iter()
+        .filter(|(seq, _)| *seq <= upper)
+        .map(|(_, value)| value)
+        .collect();
+    rows.into_iter().map(|row| decode_row(&row)).collect()
+}
+
 /// Load a session transcript above `floor`: rows with a greater ordinal. The
 /// magic-context head stands in for everything at or below the floor it
 /// reports, so the request carries only the live tail.
