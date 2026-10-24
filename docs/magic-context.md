@@ -76,6 +76,11 @@ text (`turso`, `ox.db`, `Tantivy`, `fts` all absent) — returned that memory as
   number from `[[models]]`: add `context = 262144` (and optionally
   `output = 32768`). Without it the client shows the token count and no
   percentage — never a guessed one.
+- **Window caps.** ox.toml `[context_caps]` lowers a model's window for the
+  compaction geometry: `min(reported, cap)` — e.g. treat an advertised-1M
+  model as 256k by adding `"model-id" = 262144`. Caps never raise a window;
+  a cap on a model the gateway reports no context for is inert, and inert or
+  unknown caps warn at each catalogue refresh.
 - **Memory-operation notice lines.** When a historian run publishes
   compartments, ox appends a `synthetic` message with an empty `text` and a
   `description` such as `historian folded 99..155 · 1 compartment`. The TUI

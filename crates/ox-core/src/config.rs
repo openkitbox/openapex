@@ -284,6 +284,14 @@ pub struct Config {
     /// refused (`NoRoute`) instead of silently hitting it.
     #[serde(default)]
     pub models: BTreeMap<String, ModelRouteConfig>,
+    /// Per-model context-window caps (`[context_caps]`, `model id = tokens`).
+    /// A cap never *raises* a window: the compaction geometry runs on
+    /// `min(catalogue-reported, cap)`, so an over-typed cap can only fold
+    /// earlier, never overflow the model. A cap for a model the catalogue
+    /// reports no context for does nothing (the unknown-window fallback
+    /// stands); inert or unknown caps warn at catalogue refresh.
+    #[serde(default)]
+    pub context_caps: BTreeMap<String, u32>,
     /// Path to the SQLite database file.
     #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
@@ -332,6 +340,7 @@ impl Default for Config {
             cardinal_key: None,
             providers: BTreeMap::new(),
             models: BTreeMap::new(),
+            context_caps: BTreeMap::new(),
             db_path: default_db_path(),
             listen: default_listen(),
             default_model: None,
@@ -411,6 +420,7 @@ impl Config {
         config.magic_context = config.magic_context.validated();
         config.mcp.validate()?;
         config.validate_providers()?;
+        config.validate_context_caps()?;
         Ok(config)
     }
 
@@ -448,6 +458,16 @@ impl Config {
                         candidate.provider
                     );
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// `[context_caps]`: every value is a positive token count.
+    fn validate_context_caps(&self) -> Result<()> {
+        for (id, cap) in &self.context_caps {
+            if *cap == 0 {
+                anyhow::bail!("context_caps.{id} must be a positive token count, got 0");
             }
         }
         Ok(())
@@ -727,6 +747,7 @@ mod tests {
     fn parse(toml_src: &str) -> Result<Config> {
         let config: Config = toml::from_str(toml_src)?;
         config.validate_providers()?;
+        config.validate_context_caps()?;
         Ok(config)
     }
 
@@ -744,6 +765,41 @@ candidates = [
     { provider = "glm", model = "glm-4.6" },
 ]
 "#;
+
+    #[test]
+    fn context_caps_round_trip() {
+        let config = parse(
+            r#"
+[context_caps]
+"kimi-k2-0905-preview" = 262144
+deepseek-chat = 131072
+"#,
+        )
+        .expect("valid caps");
+        assert_eq!(
+            config.context_caps.get("kimi-k2-0905-preview"),
+            Some(&262_144)
+        );
+        assert_eq!(config.context_caps.get("deepseek-chat"), Some(&131_072));
+    }
+
+    #[test]
+    fn context_caps_zero_is_rejected() {
+        let error = parse(
+            r#"
+[context_caps]
+kimi = 0
+"#,
+        )
+        .expect_err("a zero cap must be rejected");
+        assert!(error.to_string().contains("positive"), "{error}");
+    }
+
+    #[test]
+    fn context_caps_default_empty() {
+        let config = parse("").expect("empty config");
+        assert!(config.context_caps.is_empty());
+    }
 
     #[test]
     fn providers_and_models_round_trip() {

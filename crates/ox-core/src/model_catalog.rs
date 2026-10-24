@@ -47,6 +47,10 @@ pub struct ModelCatalog {
     /// `[models]` route table; non-empty switches the served surface from the
     /// endpoints' raw lists to the route keys.
     routes: BTreeMap<String, Vec<CandidateConfig>>,
+    /// `[context_caps]` by model id. Applied where the window is read
+    /// ([`Self::window_of`]) as `min(reported, cap)` — a cap lowers, never
+    /// raises. Inert or unsatisfiable caps warn once per refresh.
+    context_caps: BTreeMap<String, u32>,
     cache: RwLock<Snapshot>,
 }
 
@@ -94,6 +98,7 @@ impl ModelCatalog {
                 .iter()
                 .map(|(id, route)| (id.clone(), route.candidates.clone()))
                 .collect(),
+            context_caps: config.context_caps.clone(),
             cache: RwLock::new(Snapshot::default()),
         })
     }
@@ -105,6 +110,7 @@ impl ModelCatalog {
             client: crate::http_client().build().unwrap_or_default(),
             endpoints: Vec::new(),
             routes: BTreeMap::new(),
+            context_caps: BTreeMap::new(),
             cache: RwLock::new(Snapshot {
                 entries: Arc::new(entries),
                 fetched_at: Some(Instant::now()),
@@ -172,16 +178,22 @@ impl ModelCatalog {
     }
 
     /// The context window the gateway reports for `id` (the bare model id, as
-    /// the reporting endpoint states it), or `None` when the catalogue does
-    /// not know the model or was never fetched. Never refreshes: callers on a
-    /// step boundary must not wait on the network.
+    /// the reporting endpoint states it), lowered by the model's
+    /// `[context_caps]` entry when one exists: `min(reported, cap)`. A cap
+    /// never raises the window, and a cap on a model without a reported
+    /// context does nothing — the unknown-window fallback downstream stands.
+    /// The min happens in `i64` space before the `u32` conversion, so a cap
+    /// stays effective even when the report exceeds `u32::MAX`. `None` when
+    /// the catalogue does not know the model or reports no usable context.
+    /// Never refreshes: callers on a step boundary must not wait on the
+    /// network.
     pub fn window_of(&self, id: &str) -> Option<u32> {
-        self.cached()
-            .iter()
-            .find(|entry| entry.id == id)?
-            .context
-            .and_then(|context| u32::try_from(context).ok())
-            .filter(|window| *window > 0)
+        let context = self.cached().iter().find(|entry| entry.id == id)?.context?;
+        let context = match self.context_caps.get(id) {
+            Some(cap) => context.min(i64::from(*cap)),
+            None => context,
+        };
+        u32::try_from(context).ok().filter(|window| *window > 0)
     }
 
     /// Fetch `GET /v1/models` from every endpoint and replace the snapshot.
@@ -219,6 +231,27 @@ impl ModelCatalog {
         entries.dedup_by(|left, right| left.id == right.id && left.provider == right.provider);
         if !self.routes.is_empty() {
             entries = Self::project_routes(&self.routes, &entries);
+        }
+        // Caps that cannot bite are configuration drift the operator should
+        // see: at or over the reported window (inert), or on a model with no
+        // reported context at all (inactive — the unknown-window fallback
+        // governs, not the cap).
+        for (id, cap) in &self.context_caps {
+            match entries
+                .iter()
+                .find(|entry| &entry.id == id)
+                .and_then(|entry| entry.context)
+            {
+                Some(reported) if reported < i64::from(*cap) => {}
+                Some(reported) => tracing::warn!(
+                    model = %id, cap = cap, reported = reported,
+                    "context cap is inert: the catalogue reports at least this much"
+                ),
+                None => tracing::warn!(
+                    model = %id, cap = cap,
+                    "context cap is inactive: the catalogue reports no context length for this model"
+                ),
+            }
         }
         let count = entries.len();
         {
@@ -342,7 +375,7 @@ impl ModelRow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::CandidateConfig;
+    use crate::config::{CandidateConfig, Config};
 
     fn entry(provider: &str, id: &str, context: Option<i64>) -> ModelEntry {
         ModelEntry {
@@ -367,6 +400,37 @@ mod tests {
                 })
                 .collect(),
         )
+    }
+
+    #[test]
+    fn context_cap_lowers_window() {
+        let mut catalog =
+            ModelCatalog::from_entries(vec![entry("cardinal", "big", Some(1_000_000))]);
+        catalog.context_caps.insert("big".to_owned(), 262_144);
+        assert_eq!(catalog.window_of("big"), Some(262_144));
+    }
+
+    #[test]
+    fn context_cap_above_reported_never_raises() {
+        let mut catalog =
+            ModelCatalog::from_entries(vec![entry("cardinal", "small", Some(128_000))]);
+        catalog.context_caps.insert("small".to_owned(), 262_144);
+        assert_eq!(catalog.window_of("small"), Some(128_000));
+    }
+
+    #[test]
+    fn context_cap_without_reported_context_does_nothing() {
+        let mut catalog = ModelCatalog::from_entries(vec![entry("cardinal", "mystery", None)]);
+        catalog.context_caps.insert("mystery".to_owned(), 262_144);
+        assert_eq!(catalog.window_of("mystery"), None);
+    }
+
+    #[test]
+    fn new_reads_config_context_caps() {
+        let mut config = Config::default();
+        config.context_caps.insert("big".to_owned(), 262_144);
+        let catalog = ModelCatalog::new(&config);
+        assert!(catalog.context_caps.contains_key("big"));
     }
 
     #[test]
