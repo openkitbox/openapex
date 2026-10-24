@@ -339,6 +339,26 @@ pub(crate) async fn run(
         let stream = match ctx.chat.stream_chat(&request).await {
             Ok(stream) => stream,
             Err(error) => {
+                // The flight recorder for the pairing-400 class
+                // (docs/tool-call-pairing-400.md): what ox put on the wire
+                // (post pairing-guard) beside what the upstream named as
+                // unanswered. One log line decides ox-vs-downstream on the
+                // next recurrence — the id the upstream complained about
+                // cannot be in `sent` if the fault is not ours.
+                if let CardinalError::Http { status: 400, body } = &error {
+                    let complained = pairing_rejection_ids(body);
+                    let rejected = complained.is_some()
+                        || body.contains("tool_call_id")
+                        || body.contains("tool_calls");
+                    if rejected {
+                        tracing::warn!(
+                            session = %ctx.session_id,
+                            upstream_unanswered = ?complained,
+                            sent_tool_calls = %tool_call_digest(&request),
+                            "upstream rejected tool-call pairing"
+                        );
+                    }
+                }
                 // Context overflow → the drain compacts and retries the step
                 // once (upstream Outcome.Compacted); connect errors never
                 // carry published output.
@@ -1284,6 +1304,58 @@ fn map_finish(raw: &str) -> FinishReason {
     }
 }
 
+/// The ids an upstream named as unanswered in a tool-call pairing rejection,
+/// when the body lists any (Moonshot names them after the marker; DeepSeek's
+/// phrasing names none). None for any other body — the digest is what the
+/// caller logs then.
+fn pairing_rejection_ids(body: &str) -> Option<Vec<String>> {
+    const MARKER: &str = "did not have response messages:";
+    let at = body.find(MARKER)?;
+    let rest = body[at + MARKER.len()..].lines().next().unwrap_or("");
+    // The listed ids end where the enclosing JSON string does — a backslash
+    // begins the escaped closing quote (verbatim upstream body, or wrapped
+    // by cardinal into `\",\"`); provider ids never carry one, so cutting at
+    // the first is safe. The plain `","` shape covers a non-escaped tail.
+    let end = rest.find('\\').unwrap_or(rest.len());
+    let rest = rest[..end].split("\",\"").next().unwrap_or(rest);
+    let ids: Vec<String> = rest
+        .split(|c: char| c == ',' || c == ' ')
+        .map(str::trim)
+        .map(|id| id.trim_matches(|c: char| c == '"' || c == '\\' || c == '\''))
+        .filter(|id| !id.is_empty() && *id != "...")
+        .map(str::to_owned)
+        .take(20)
+        .collect();
+    Some(ids)
+}
+
+/// The request's tool-call ids in wire order, capped for one log line. The
+/// request is post pairing-guard: an id the upstream names that is absent
+/// here was never sent by ox.
+fn tool_call_digest(request: &ChatRequest) -> String {
+    const CAP: usize = 60;
+    let mut ids = Vec::new();
+    let mut total = 0usize;
+    for message in &request.messages {
+        if let ChatMessage::Assistant {
+            tool_calls: Some(calls),
+            ..
+        } = message
+        {
+            for call in calls {
+                total += 1;
+                if ids.len() < CAP {
+                    ids.push(call.id.clone());
+                }
+            }
+        }
+    }
+    if total > CAP {
+        ids.push(format!("…(+{} more)", total - CAP));
+    }
+    ids.join(",")
+}
+
 /// Map a cardinal failure to a session error (upstream `toSessionError`):
 /// the provider taxonomy for HTTP/stream failures, upstream's transport
 /// family for connection-level faults.
@@ -2206,5 +2278,84 @@ mod recall_tests {
             append_recall(String::new(), "<recall></recall>"),
             "<recall></recall>"
         );
+    }
+}
+
+#[cfg(test)]
+mod pairing_recorder_tests {
+    use super::*;
+    use crate::cardinal::wire::{FunctionCall, FunctionType, ToolCall};
+
+    #[test]
+    fn pairing_ids_extracted_from_the_moonshot_body() {
+        // The live 400 (docs/tool-call-pairing-400.md), verbatim.
+        let body = r#"{"error":{"message":"an assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. The following tool_call_ids did not have response messages: shell:47","type":"invalid_request_error"}}"#;
+        assert_eq!(
+            pairing_rejection_ids(body),
+            Some(vec!["shell:47".to_owned()])
+        );
+    }
+
+    #[test]
+    fn pairing_ids_extracted_from_the_wrapped_double_escaped_body() {
+        // The live shape: cardinal wraps the upstream body, so quotes are
+        // escaped twice and the JSON tail rides the same line.
+        let body = "cardinal returned HTTP 400: upstream HTTP 400: {\\\"error\\\":{\\\"message\\\":\\\"an assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id'. The following tool_call_ids did not have response messages: shell:47\\\",\\\"type\\\":\\\"invalid_request_error\\\"}}";
+        assert_eq!(
+            pairing_rejection_ids(body),
+            Some(vec!["shell:47".to_owned()])
+        );
+    }
+
+    #[test]
+    fn pairing_ids_extracts_every_listed_id() {
+        let body = "The following tool_call_ids did not have response messages: a1, a2, a3";
+        assert_eq!(
+            pairing_rejection_ids(body),
+            Some(vec!["a1".to_owned(), "a2".to_owned(), "a3".to_owned()])
+        );
+    }
+
+    #[test]
+    fn deepseek_phrasing_names_no_ids_so_the_body_yields_none() {
+        // cardinal/relay/dialects.rs records DeepSeek's wording verbatim: it
+        // blames the pairing but lists nothing.
+        let body = "an assistant message with 'tool_calls' must be followed by tool messages responding to each 'tool_call_id' (insufficient tool messages following tool_calls message)";
+        assert_eq!(pairing_rejection_ids(body), None);
+        assert_eq!(pairing_rejection_ids("quota exceeded"), None);
+    }
+
+    #[test]
+    fn digest_lists_call_ids_in_wire_order_and_caps() {
+        let calls = |ids: &[&str]| {
+            ids.iter()
+                .map(|id| ToolCall {
+                    id: (*id).to_owned(),
+                    kind: FunctionType::Function,
+                    function: FunctionCall {
+                        name: "shell".to_owned(),
+                        arguments: "{}".to_owned(),
+                    },
+                })
+                .collect()
+        };
+        let messages = vec![
+            ChatMessage::assistant_tool_calls(calls(&["a1", "a2"])),
+            ChatMessage::User {
+                content: "go".to_owned().into(),
+            },
+            ChatMessage::assistant_tool_calls(calls(&["a3"])),
+        ];
+        let request = ChatRequest::new("k3-256k", messages);
+        assert_eq!(tool_call_digest(&request), "a1,a2,a3");
+
+        let many: Vec<String> = (0..70).map(|i| format!("c{i}")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let request = ChatRequest::new(
+            "k3-256k",
+            vec![ChatMessage::assistant_tool_calls(calls(&refs))],
+        );
+        let digest = tool_call_digest(&request);
+        assert!(digest.starts_with("c0,c1,") && digest.ends_with("…(+10 more)"));
     }
 }
