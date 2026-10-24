@@ -23,14 +23,19 @@ use ox_core::config::Config;
 use ox_core::event_bus::EventBus;
 use ox_db::Db;
 use ox_engine::cardinal::client::CardinalClient;
+use ox_engine::cardinal::router::EndpointRouter;
 use ox_engine::runner::{Runner, ToolRegistryExt};
 
-/// One client constructor shared by [`build_state`] and [`run`], so both map
-/// init failures identically.
-fn cardinal_chat(config: &Config) -> Result<Arc<dyn runner::Chat>> {
+/// One transport constructor shared by [`build_state`] and [`run`], so both
+/// map init failures identically. `[models.<id>]` routes through ordered
+/// candidates; with no `[providers]`/`[models]` configured the router is a
+/// pass-through to the `cardinal_url` endpoint (previous behavior).
+fn chat_transport(config: &Config) -> Result<Arc<dyn runner::Chat>> {
     let cardinal = CardinalClient::from_config(config)
         .map_err(|error| anyhow::anyhow!("cardinal client init failed: {error}"))?;
-    Ok(Arc::new(cardinal))
+    let router = EndpointRouter::from_config(config, cardinal)
+        .map_err(|error| anyhow::anyhow!("chat endpoint router init failed: {error}"))?;
+    Ok(Arc::new(router))
 }
 
 /// Build application state: open the DB, run migrations, canonicalize the
@@ -42,7 +47,7 @@ fn cardinal_chat(config: &Config) -> Result<Arc<dyn runner::Chat>> {
 /// `codebase-memory-mcp` binary is probed at the composition root ([`run`]),
 /// so tests get a deterministic toolset regardless of the host's `PATH`.
 pub async fn build_state(config: Config) -> Result<AppState> {
-    let chat = cardinal_chat(&config)?;
+    let chat = chat_transport(&config)?;
     build_state_with(config, chat, runner::ToolRegistry::with_builtins()).await
 }
 
@@ -191,7 +196,7 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
     let bus = EventBus::new(db.clone());
     tools.register_todowrite(db.clone());
     tools.register_subagent(db.clone(), bus.clone(), config.subagent.depth);
-    let chat = cardinal_chat(&config)?;
+    let chat = chat_transport(&config)?;
     let state =
         build_state_on_with_bus(config, chat, tools, db, bus, ox_core::config::ox_home()).await?;
     // Fetch the model list before serving, so the first client that asks

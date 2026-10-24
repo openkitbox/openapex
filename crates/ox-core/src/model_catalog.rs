@@ -1,42 +1,52 @@
-//! The model catalogue: cardinal's `GET /v1/models`, not ox's config file.
+//! The model catalogue: every configured endpoint's `GET /v1/models`, not ox's
+//! config file.
 //!
-//! cardinal is ox's only model source and it already reports what a client
-//! needs — the id, the provider (`owned_by`) and the context window
-//! (`context_length` / `context_window` / `max_input_tokens`) — so keeping a
-//! `[[models]]` list in `ox.toml` was a second source of truth that drifted the
-//! moment a model was added upstream. The file now names at most a *default*
-//! (`default_model`); everything the client lists comes from here.
+//! The endpoints already report what a client needs — the id, the provider
+//! (`owned_by`) and the context window (`context_length` / `context_window` /
+//! `max_input_tokens`) — so keeping a `[[models]]` list in `ox.toml` was a
+//! second source of truth that drifted the moment a model was added upstream.
+//! The file now names at most a *default* (`default_model`) and, once `[models]`
+//! routes exist, the logical ids the client sees; the metadata behind them
+//! still comes from here.
 //!
 //! The cache is deliberately simple: one snapshot, refreshed when older than
 //! [`CATALOG_TTL`], served stale if a refresh fails — the previous list is far
 //! more useful than an empty one, and the failure is logged once per attempt,
 //! not per request.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
 
-use crate::config::{Config, ModelEntry};
+use crate::config::{CandidateConfig, Config, DEFAULT_PROVIDER_NAME, ModelEntry};
 
 /// How long a fetched catalogue is considered fresh. Model lists change when
 /// someone adds a provider upstream, so minutes rather than seconds; a client
 /// that wants a fresh list after a change restarts or waits one TTL.
 const CATALOG_TTL: Duration = Duration::from_secs(300);
 
-/// `GET /v1/models` — the OpenAI list shape cardinal serves.
+/// `GET /v1/models` — the OpenAI list shape each endpoint serves.
 const MODELS_PATH: &str = "/v1/models";
 
-/// The provider id used when the gateway does not report `owned_by`.
-const FALLBACK_PROVIDER: &str = "cardinal";
+/// One endpoint to list models from.
+struct CatalogEndpoint {
+    /// Configured provider name; also the `owned_by` fallback label.
+    name: String,
+    base_url: String,
+    api_key: Option<String>,
+}
 
 /// A fetched model catalogue with a TTL cache.
 pub struct ModelCatalog {
     client: reqwest::Client,
-    /// Base URL of the gateway (no trailing slash).
-    base_url: String,
-    api_key: Option<String>,
+    /// The implicit `cardinal_url` endpoint plus every `[providers]` entry.
+    endpoints: Vec<CatalogEndpoint>,
+    /// `[models]` route table; non-empty switches the served surface from the
+    /// endpoints' raw lists to the route keys.
+    routes: BTreeMap<String, Vec<CandidateConfig>>,
     cache: RwLock<Snapshot>,
 }
 
@@ -47,17 +57,43 @@ struct Snapshot {
 }
 
 impl ModelCatalog {
-    /// A catalogue for `config`'s gateway. Nothing is fetched yet: [`Self::warm`]
-    /// does that, so building state never blocks on the network.
+    /// A catalogue for `config`'s endpoints. Nothing is fetched yet:
+    /// [`Self::warm`] does that, so building state never blocks on the network.
+    /// The config must have passed provider validation ([`Config::load_from`]
+    /// runs it): candidate lists are non-empty and their providers resolve.
     pub fn new(config: &Config) -> Arc<Self> {
         let client = crate::http_client()
             .timeout(Duration::from_secs(10))
             .build()
             .unwrap_or_default();
+        let mut endpoints: BTreeMap<String, CatalogEndpoint> = BTreeMap::new();
+        endpoints.insert(
+            DEFAULT_PROVIDER_NAME.to_owned(),
+            CatalogEndpoint {
+                name: DEFAULT_PROVIDER_NAME.to_owned(),
+                base_url: config.cardinal_url.trim_end_matches('/').to_owned(),
+                api_key: config.cardinal_key.clone().filter(|key| !key.is_empty()),
+            },
+        );
+        // A [providers.cardinal] section overrides the implicit endpoint.
+        for (name, provider) in &config.providers {
+            endpoints.insert(
+                name.clone(),
+                CatalogEndpoint {
+                    name: name.clone(),
+                    base_url: provider.base_url.trim_end_matches('/').to_owned(),
+                    api_key: provider.api_key.clone().filter(|key| !key.is_empty()),
+                },
+            );
+        }
         Arc::new(Self {
             client,
-            base_url: config.cardinal_url.trim_end_matches('/').to_owned(),
-            api_key: config.cardinal_key.clone().filter(|key| !key.is_empty()),
+            endpoints: endpoints.into_values().collect(),
+            routes: config
+                .models
+                .iter()
+                .map(|(id, route)| (id.clone(), route.candidates.clone()))
+                .collect(),
             cache: RwLock::new(Snapshot::default()),
         })
     }
@@ -67,8 +103,8 @@ impl ModelCatalog {
     pub fn from_entries(entries: Vec<ModelEntry>) -> Self {
         Self {
             client: crate::http_client().build().unwrap_or_default(),
-            base_url: String::new(),
-            api_key: None,
+            endpoints: Vec::new(),
+            routes: BTreeMap::new(),
             cache: RwLock::new(Snapshot {
                 entries: Arc::new(entries),
                 fetched_at: Some(Instant::now()),
@@ -115,7 +151,7 @@ impl ModelCatalog {
         if let Some(qualified) = &config.default_model {
             let (provider, id) = qualified
                 .split_once('/')
-                .unwrap_or((FALLBACK_PROVIDER, qualified.as_str()));
+                .unwrap_or((DEFAULT_PROVIDER_NAME, qualified.as_str()));
             if let Some(found) = entries
                 .iter()
                 .find(|entry| entry.id == id && entry.provider == provider)
@@ -136,9 +172,9 @@ impl ModelCatalog {
     }
 
     /// The context window the gateway reports for `id` (the bare model id, as
-    /// cardinal reports it), or `None` when the catalogue does not know the
-    /// model or was never fetched. Never refreshes: callers on a step boundary
-    /// must not wait on the network.
+    /// the reporting endpoint states it), or `None` when the catalogue does
+    /// not know the model or was never fetched. Never refreshes: callers on a
+    /// step boundary must not wait on the network.
     pub fn window_of(&self, id: &str) -> Option<u32> {
         self.cached()
             .iter()
@@ -148,10 +184,58 @@ impl ModelCatalog {
             .filter(|window| *window > 0)
     }
 
-    /// Fetch `GET /v1/models` and replace the snapshot.
+    /// Fetch `GET /v1/models` from every endpoint and replace the snapshot.
+    /// One failing endpoint only warns; the others still serve. When every
+    /// endpoint fails the refresh errors, so the previous list is kept
+    /// (legacy single-endpoint behavior included). A catalogue with no
+    /// endpoints (the [`Self::from_entries`] seed) is returned untouched.
     async fn refresh(&self) -> Result<()> {
-        let mut request = self.client.get(format!("{}{MODELS_PATH}", self.base_url));
-        if let Some(key) = &self.api_key {
+        if self.endpoints.is_empty() {
+            // `from_entries` seeds a fetchless catalogue; a TTL refresh must
+            // not replace the seed with an empty snapshot.
+            return Ok(());
+        }
+        let mut entries: Vec<ModelEntry> = Vec::new();
+        let mut failures = 0usize;
+        for endpoint in &self.endpoints {
+            match self.fetch_endpoint(endpoint).await {
+                Ok(mut fetched) => entries.append(&mut fetched),
+                Err(error) => {
+                    failures += 1;
+                    tracing::warn!(
+                        provider = %endpoint.name,
+                        error = %error,
+                        "model list fetch failed; other endpoints are unaffected"
+                    );
+                }
+            }
+        }
+        if failures == self.endpoints.len() {
+            anyhow::bail!("all {} model-list endpoints failed", failures);
+        }
+        // A stable order: the default falls back to the first entry, so the
+        // order must not depend on how the gateway happened to serialise.
+        entries.sort_by(|left, right| left.id.cmp(&right.id));
+        entries.dedup_by(|left, right| left.id == right.id && left.provider == right.provider);
+        if !self.routes.is_empty() {
+            entries = Self::project_routes(&self.routes, &entries);
+        }
+        let count = entries.len();
+        {
+            let mut cache = self.cache.write().expect("catalog lock");
+            cache.entries = Arc::new(entries);
+            cache.fetched_at = Some(Instant::now());
+        }
+        tracing::debug!(models = count, "model catalogue refreshed");
+        Ok(())
+    }
+
+    /// Fetch and parse one endpoint's model list.
+    async fn fetch_endpoint(&self, endpoint: &CatalogEndpoint) -> Result<Vec<ModelEntry>> {
+        let mut request = self
+            .client
+            .get(format!("{}{MODELS_PATH}", endpoint.base_url));
+        if let Some(key) = &endpoint.api_key {
             request = request.bearer_auth(key);
         }
         let response = request.send().await.context("call GET /v1/models")?;
@@ -164,20 +248,48 @@ impl ModelCatalog {
             );
         }
         let list: ModelList = serde_json::from_str(&body).context("parse the model list")?;
-        let mut entries: Vec<ModelEntry> =
-            list.data.into_iter().map(ModelRow::into_entry).collect();
-        // A stable order: the default falls back to the first entry, so the
-        // order must not depend on how the gateway happened to serialise.
-        entries.sort_by(|left, right| left.id.cmp(&right.id));
-        entries.dedup_by(|left, right| left.id == right.id && left.provider == right.provider);
-        let count = entries.len();
-        {
-            let mut cache = self.cache.write().expect("catalog lock");
-            cache.entries = Arc::new(entries);
-            cache.fetched_at = Some(Instant::now());
-        }
-        tracing::debug!(models = count, "model catalogue refreshed");
-        Ok(())
+        Ok(list
+            .data
+            .into_iter()
+            .map(|row| row.into_entry(&endpoint.name))
+            .collect())
+    }
+
+    /// The served model face when `[models]` is configured: one entry per
+    /// route key, provider = the first candidate's provider (the routing
+    /// truth). The first candidate donates `context`/`reasoning`/levels from
+    /// the endpoint-reported entry of its wire model, but only when exactly
+    /// one entry has that id — an id reported by several endpoints is
+    /// ambiguous and donates nothing. Best effort: a missing donor leaves a
+    /// usable entry with unknown context.
+    fn project_routes(
+        routes: &BTreeMap<String, Vec<CandidateConfig>>,
+        raw: &[ModelEntry],
+    ) -> Vec<ModelEntry> {
+        routes
+            .iter()
+            .map(|(id, route)| {
+                let first = route.first();
+                let donor = first.and_then(|candidate| {
+                    let mut matches = raw.iter().filter(|entry| entry.id == candidate.model);
+                    let first_match = matches.next()?;
+                    matches.next().is_none().then_some(first_match)
+                });
+                ModelEntry {
+                    id: id.clone(),
+                    provider: first
+                        .map(|candidate| candidate.provider.clone())
+                        .unwrap_or_else(|| DEFAULT_PROVIDER_NAME.to_owned()),
+                    context: donor.and_then(|entry| entry.context),
+                    output: None,
+                    name: None,
+                    reasoning: donor.map(|entry| entry.reasoning).unwrap_or(false),
+                    supported_reasoning_levels: donor
+                        .map(|entry| entry.supported_reasoning_levels.clone())
+                        .unwrap_or_default(),
+                }
+            })
+            .collect()
     }
 }
 
@@ -209,11 +321,11 @@ struct ModelRow {
 }
 
 impl ModelRow {
-    fn into_entry(self) -> ModelEntry {
+    fn into_entry(self, fallback_provider: &str) -> ModelEntry {
         ModelEntry {
             provider: self
                 .owned_by
-                .unwrap_or_else(|| FALLBACK_PROVIDER.to_owned()),
+                .unwrap_or_else(|| fallback_provider.to_owned()),
             name: None,
             context: self
                 .context_length
@@ -224,5 +336,94 @@ impl ModelRow {
             reasoning: self.reasoning,
             supported_reasoning_levels: self.supported_reasoning_levels,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::CandidateConfig;
+
+    fn entry(provider: &str, id: &str, context: Option<i64>) -> ModelEntry {
+        ModelEntry {
+            provider: provider.to_owned(),
+            name: None,
+            context,
+            output: None,
+            id: id.to_owned(),
+            reasoning: false,
+            supported_reasoning_levels: Vec::new(),
+        }
+    }
+
+    fn route(id: &str, candidates: Vec<(&str, &str)>) -> (String, Vec<CandidateConfig>) {
+        (
+            id.to_owned(),
+            candidates
+                .into_iter()
+                .map(|(provider, model)| CandidateConfig {
+                    provider: provider.to_owned(),
+                    model: model.to_owned(),
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn routes_surface_donor_context_from_a_unique_id() {
+        let routes = BTreeMap::from([route("kimi", vec![("moonshot", "kimi-k2-0905-preview")])]);
+        let raw = vec![
+            entry("moonshot", "kimi-k2-0905-preview", Some(131072)),
+            entry("cardinal", "glm-code", Some(200000)),
+        ];
+        let projected = ModelCatalog::project_routes(&routes, &raw);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].id, "kimi");
+        assert_eq!(projected[0].provider, "moonshot");
+        assert_eq!(projected[0].context, Some(131072));
+    }
+
+    #[test]
+    fn routes_without_a_donor_entry_still_surface() {
+        let routes = BTreeMap::from([route("kimi", vec![("moonshot", "kimi-k2-0905-preview")])]);
+        let projected = ModelCatalog::project_routes(&routes, &[]);
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].id, "kimi");
+        assert_eq!(projected[0].context, None);
+        assert_eq!(projected[0].provider, "moonshot");
+    }
+
+    #[test]
+    fn ambiguous_ids_have_no_donor() {
+        let routes = BTreeMap::from([route("kimi", vec![("moonshot", "kimi-k2")])]);
+        let raw = vec![
+            entry("other", "kimi-k2", Some(1)),
+            entry("moonshot", "kimi-k2", Some(2)),
+        ];
+        let projected = ModelCatalog::project_routes(&routes, &raw);
+        assert_eq!(projected[0].context, None, "ambiguous id: no donor");
+    }
+
+    #[test]
+    fn donor_matching_is_provider_agnostic() {
+        // owned_by labels are fallback-prone, so the donor search matches on
+        // the wire model id alone: a candidate on `cardinal` takes context
+        // from whatever endpoint actually reported `k2`.
+        let routes = BTreeMap::from([route("kimi", vec![("cardinal", "k2")])]);
+        let raw = vec![entry("moonshot", "k2", Some(777))];
+        let projected = ModelCatalog::project_routes(&routes, &raw);
+        assert_eq!(projected[0].provider, "cardinal", "route's own provider");
+        assert_eq!(projected[0].context, Some(777), "donor from any endpoint");
+    }
+
+    #[test]
+    fn route_keys_sort_by_id() {
+        let routes = BTreeMap::from([
+            route("b-model", vec![("cardinal", "b")]),
+            route("a-model", vec![("cardinal", "a")]),
+        ]);
+        let projected = ModelCatalog::project_routes(&routes, &[]);
+        let ids: Vec<&str> = projected.iter().map(|entry| entry.id.as_str()).collect();
+        assert_eq!(ids, ["a-model", "b-model"]);
     }
 }

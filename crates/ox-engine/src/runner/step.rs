@@ -164,9 +164,12 @@ impl AttemptFailure {
             AttemptFailure::Transport(
                 CardinalError::EarlyClose | CardinalError::Sse(_) | CardinalError::Transport(_),
             ) => true,
-            AttemptFailure::Transport(CardinalError::Http { .. } | CardinalError::Upstream(_)) => {
-                false
-            }
+            AttemptFailure::Transport(
+                CardinalError::Http { .. }
+                | CardinalError::Upstream(_)
+                // A configuration error, not a stream event.
+                | CardinalError::NoRoute { .. },
+            ) => false,
             AttemptFailure::IncompleteStream => true,
         }
     }
@@ -1393,6 +1396,14 @@ fn to_session_error(error: &CardinalError) -> SessionError {
             "provider.unknown",
             None,
             Some(SessionErrorResponse { body: body.clone() }),
+        ),
+        CardinalError::NoRoute { .. } => (
+            // A routing configuration error: deterministic, request-shaped,
+            // and independent of any endpoint, so it recurs identically on
+            // retry — the same bucket as a 4xx rejection.
+            "provider.invalid-request",
+            None,
+            None,
         ),
         CardinalError::EarlyClose | CardinalError::Sse(_) | CardinalError::Transport(_) => {
             ("provider.transport", None, None)

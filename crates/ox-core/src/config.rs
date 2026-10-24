@@ -29,6 +29,42 @@ fn default_db_path() -> PathBuf {
     ox_home().join("ox.db")
 }
 
+/// The name of the implicit endpoint built from `cardinal_url`/`cardinal_key`.
+/// Route candidates may reference it like any `[providers]` name; a
+/// `[providers.cardinal]` section overrides the implicit endpoint.
+pub const DEFAULT_PROVIDER_NAME: &str = "cardinal";
+
+/// One configured outbound endpoint (`[providers.<name>]`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ProviderConfig {
+    /// OpenAI-compatible base URL **without** the `/v1` suffix: ox appends
+    /// `/v1/chat/completions` and `/v1/models` itself. For vendors publishing
+    /// `…/v1` or `…/v4` bases, configure the part before the suffix
+    /// (`https://api.moonshot.ai`, `https://open.bigmodel.cn/api/paas`).
+    pub base_url: String,
+    /// Bearer key for `Authorization`; omitted for gateways that need none.
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+/// One ordered fallback target inside a `[models.<id>]` route.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct CandidateConfig {
+    /// A `[providers]` key, or [`DEFAULT_PROVIDER_NAME`] for the implicit
+    /// `cardinal_url` endpoint.
+    pub provider: String,
+    /// The wire model id to request on that endpoint.
+    pub model: String,
+}
+
+/// One logical model's ordered candidate routes (`[models.<id>]`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ModelRouteConfig {
+    /// Tried in order; the first endpoint whose stream opens serves the turn.
+    #[serde(default)]
+    pub candidates: Vec<CandidateConfig>,
+}
+
 /// One model as the client sees it, built from the gateway's model list
 /// ([`crate::model_catalog`]).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -238,6 +274,16 @@ pub struct Config {
     /// cardinal runs with auth disabled.
     #[serde(default)]
     pub cardinal_key: Option<String>,
+    /// Additional OpenAI-compatible endpoints (`[providers.<name>]`). Empty:
+    /// the implicit `cardinal_url` endpoint serves everything (legacy mode).
+    #[serde(default)]
+    pub providers: BTreeMap<String, ProviderConfig>,
+    /// ox's logical model surface with ordered candidate routes
+    /// (`[models.<id>]`). Explicit candidates win over the implicit
+    /// endpoint; once `[providers]` is non-empty, unrouted models are
+    /// refused (`NoRoute`) instead of silently hitting it.
+    #[serde(default)]
+    pub models: BTreeMap<String, ModelRouteConfig>,
     /// Path to the SQLite database file.
     #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
@@ -284,6 +330,8 @@ impl Default for Config {
         Self {
             cardinal_url: default_cardinal_url(),
             cardinal_key: None,
+            providers: BTreeMap::new(),
+            models: BTreeMap::new(),
             db_path: default_db_path(),
             listen: default_listen(),
             default_model: None,
@@ -362,7 +410,47 @@ impl Config {
 
         config.magic_context = config.magic_context.validated();
         config.mcp.validate()?;
+        config.validate_providers()?;
         Ok(config)
+    }
+
+    /// `[providers]`/`[models]` consistency: usable base URLs, non-empty
+    /// candidate lists, every candidate provider resolvable.
+    fn validate_providers(&self) -> Result<()> {
+        for (name, provider) in &self.providers {
+            if provider.base_url.is_empty() {
+                anyhow::bail!("providers.{name}.base_url is empty");
+            }
+            if provider.base_url.ends_with("/v1") {
+                anyhow::bail!(
+                    "providers.{name}.base_url must not end with /v1: ox appends /v1/chat/completions itself"
+                );
+            }
+            if !provider.base_url.starts_with("http://")
+                && !provider.base_url.starts_with("https://")
+            {
+                anyhow::bail!("providers.{name}.base_url must be an http(s) URL");
+            }
+        }
+        for (id, route) in &self.models {
+            if route.candidates.is_empty() {
+                anyhow::bail!("models.{id}.candidates is empty: list at least one candidate");
+            }
+            for candidate in &route.candidates {
+                if candidate.model.is_empty() {
+                    anyhow::bail!("models.{id}: candidate model must not be empty");
+                }
+                if candidate.provider != DEFAULT_PROVIDER_NAME
+                    && !self.providers.contains_key(&candidate.provider)
+                {
+                    anyhow::bail!(
+                        "models.{id}: candidate provider `{}` is not configured under [providers]",
+                        candidate.provider
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -628,4 +716,119 @@ pub enum EmbeddingProvider {
     /// split into `open-ai-compatible`.
     #[serde(rename = "openai-compatible")]
     OpenAiCompatible,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse + validate the way `load_from` does, without reading the
+    /// environment (machine env must not leak into tests).
+    fn parse(toml_src: &str) -> Result<Config> {
+        let config: Config = toml::from_str(toml_src)?;
+        config.validate_providers()?;
+        Ok(config)
+    }
+
+    const SAMPLE: &str = r#"
+[providers.moonshot]
+base_url = "https://api.moonshot.ai"
+api_key = "sk-moon"
+
+[providers.glm]
+base_url = "https://open.bigmodel.cn/api/paas"
+
+[models.kimi]
+candidates = [
+    { provider = "moonshot", model = "kimi-k2-0905-preview" },
+    { provider = "glm", model = "glm-4.6" },
+]
+"#;
+
+    #[test]
+    fn providers_and_models_round_trip() {
+        let config = parse(SAMPLE).expect("valid sample");
+        assert_eq!(
+            config.providers["moonshot"].base_url,
+            "https://api.moonshot.ai"
+        );
+        assert_eq!(
+            config.providers["moonshot"].api_key.as_deref(),
+            Some("sk-moon")
+        );
+        assert_eq!(config.providers["glm"].api_key, None);
+        let route = &config.models["kimi"];
+        assert_eq!(route.candidates.len(), 2);
+        assert_eq!(route.candidates[0].provider, "moonshot");
+        assert_eq!(route.candidates[0].model, "kimi-k2-0905-preview");
+        assert_eq!(route.candidates[1].provider, "glm");
+    }
+
+    #[test]
+    fn default_config_has_no_providers() {
+        let config = Config::default();
+        assert!(config.providers.is_empty());
+        assert!(config.models.is_empty());
+    }
+
+    #[test]
+    fn unknown_candidate_provider_is_rejected() {
+        let err = parse(
+            r#"
+[providers.moonshot]
+base_url = "https://api.moonshot.ai"
+
+[models.kimi]
+candidates = [{ provider = "nope", model = "k2" }]
+"#,
+        )
+        .expect_err("unknown provider must be rejected");
+        assert!(err.to_string().contains("not configured under [providers]"));
+    }
+
+    #[test]
+    fn implicit_cardinal_provider_needs_no_section() {
+        let config = parse(
+            r#"
+[models.kimi]
+candidates = [{ provider = "cardinal", model = "kimi-k2-0905-preview" }]
+"#,
+        )
+        .expect("cardinal is always a valid provider name");
+        assert!(config.providers.is_empty());
+        assert_eq!(config.models["kimi"].candidates[0].provider, "cardinal");
+    }
+
+    #[test]
+    fn empty_candidates_are_rejected() {
+        let err = parse(
+            r#"
+[models.kimi]
+candidates = []
+"#,
+        )
+        .expect_err("empty candidates must be rejected");
+        assert!(err.to_string().contains("candidates is empty"));
+    }
+
+    #[test]
+    fn base_url_must_be_http_and_not_end_in_v1() {
+        let err = parse(
+            r#"
+[providers.moonshot]
+base_url = "https://api.moonshot.ai/v1"
+"#,
+        )
+        .expect_err("/v1 suffix must be rejected");
+        assert!(err.to_string().contains("must not end with /v1"));
+
+        let err = parse(
+            r#"
+[providers.moonshot]
+base_url = "ftp://api.moonshot.ai"
+"#,
+        )
+        .expect_err("non-http scheme must be rejected");
+        assert!(err.to_string().contains("http(s) URL"));
+    }
 }

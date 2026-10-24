@@ -19,7 +19,8 @@
 //!   reasoning token details, extracted exactly like cardinal's decoder.
 //!
 //! Layout: [`wire`] (request types), [`stream`] (SSE framing, chunk decoding,
-//! delta assembly), [`client`] (HTTP + the [`client::ChatStream`]).
+//! delta assembly), [`client`] (HTTP + the [`client::ChatStream`]), [`chat`]
+//! (the transport seam), and [`router`] (multi-endpoint candidate routing).
 //!
 //! Errors: [`CardinalError`] — an HTTP error carries the status and a body
 //! snippet; framing-level junk lines are skipped per the SSE spec, while a
@@ -28,10 +29,12 @@
 
 pub mod chat;
 pub mod client;
+pub mod router;
 pub mod stream;
 pub mod wire;
 
 pub use client::{CardinalClient, ChatStream};
+pub use router::EndpointRouter;
 pub use stream::{AssembledMessage, AssembledToolCall, Assembler, ChunkDecoder, StreamEvent};
 pub use wire::{ChatMessage, ChatRequest, ToolCall, ToolDef, Usage};
 
@@ -67,6 +70,14 @@ pub enum CardinalError {
     /// Transport-level failure (connect, read, body decode).
     #[error("cardinal transport error: {0}")]
     Transport(#[from] reqwest::Error),
+    /// The requested model has no candidates: no `[models]` route names it
+    /// and `[providers]` is configured, so the implicit passthrough endpoint
+    /// is disabled.
+    #[error("no candidates configured for model `{model}`: add a [models.\"{model}\"] route")]
+    NoRoute {
+        /// The logical model id ox could not route.
+        model: String,
+    },
 }
 
 /// Maximum bytes of a non-2xx response body kept in [`CardinalError::Http`].
