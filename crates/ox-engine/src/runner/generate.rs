@@ -61,7 +61,7 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
     };
 
     let budget = crate::mctx::budget_for(&ctx.config, &ctx.model_catalog, &model.id);
-    let (head_m0, head_m1, floor) = super::step::mctx_head(&ctx, budget).await;
+    let (head_m0, head_m1, floor) = super::step::mctx_head(&ctx, budget, &model.id).await;
     let rows = if ctx.config.magic_context.enabled {
         super::step::load_overlaid_tail(&ctx.db, &ctx.session_id, floor).await?
     } else {

@@ -96,6 +96,9 @@ pub struct PassRequest<'a> {
     pub forced: bool,
     /// A new run/episode started.
     pub run_started: bool,
+    /// The session's model id: which family's token counter the pass budgets
+    /// its guards with (unknown families fall back to the heuristic).
+    pub model_id: &'a str,
 }
 
 /// Run one transform pass for a session.
@@ -108,7 +111,10 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
         budget,
         forced,
         run_started,
+        model_id,
     } = request;
+    let count = crate::mctx::tokens::counter_for_model(model_id);
+    let count_tokens = move |s: &str| count.count(s);
 
     let compartments = compartments::load(db, session_id).await?;
     let memories = active_memories(db, project).await?;
@@ -137,7 +143,14 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
     // model. This is upstream's "reconcile" case: rebuild and re-anchor.
     let stale = claimed > last_seq;
 
-    let plan = plan_units(&compartments, &memories, &notes, coverage, budget.history);
+    let plan = plan_units(
+        &compartments,
+        &memories,
+        &notes,
+        coverage,
+        budget.history,
+        &count_tokens,
+    );
 
     // Queued drops ride the planned units, not the kernel's defer queue: our
     // durable `mc_drop` rows are the carrier ("queued, not immediate" — the
@@ -293,6 +306,7 @@ fn plan_units(
     notes: &[ReadyNote],
     coverage: i64,
     history_budget_tokens: u32,
+    count_tokens: &dyn Fn(&str) -> usize,
 ) -> Plan {
     let covered: Vec<_> = compartments
         .iter()
@@ -303,12 +317,17 @@ fn plan_units(
     let m0 = render_m0(&M0Inputs {
         compartments: &covered,
         history_budget_tokens: f64::from(history_budget_tokens),
+        count_tokens,
     });
     // The pinboard rides the volatile half: a memory write must not rebuild the
     // provider's cache anchor. It is also the one section that grows with the
     // project's lifetime, so it is selected under its own budget first — a
     // memory that does not fit is skipped, the rest of the list still renders.
-    let selected = select_memories(memories, memory_budget(f64::from(history_budget_tokens)));
+    let selected = select_memories(
+        memories,
+        memory_budget(f64::from(history_budget_tokens)),
+        count_tokens,
+    );
     let m1_body = assemble_m1(
         &render_memory_block(&selected),
         &render_ready_notes_block(notes),
@@ -476,6 +495,7 @@ mod tests {
         let m0 = render_m0(&M0Inputs {
             compartments: &[],
             history_budget_tokens: 0.0,
+            count_tokens: &|s: &str| s.len().div_ceil(4),
         });
         let notes = "<ready-notes>\n#7: Migrate — then run\n</ready-notes>";
         let pinboard =

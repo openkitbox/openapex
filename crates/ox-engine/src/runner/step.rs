@@ -80,6 +80,7 @@ use super::ToolContext;
 use super::compaction;
 use super::drain::DrainCtx;
 use super::instructions;
+use super::output_budget::bound_tool_output;
 
 /// Upstream `STEP_INTERRUPTED` (runner/step.ts).
 const STEP_INTERRUPTED: &str = "Step interrupted";
@@ -208,7 +209,7 @@ pub(crate) async fn run(
         // the frozen bytes and reports the ordinal floor, so the transcript
         // starts after the covered range.
         let budget = crate::mctx::budget_for(&ctx.config, &ctx.model_catalog, &params.model.id);
-        let (head_m0, head_m1, floor) = mctx_head(ctx, budget).await;
+        let (head_m0, head_m1, floor) = mctx_head(ctx, budget, &params.model.id).await;
         // Pressure is checked after the pass: the floor it reports is what the
         // live tail is measured above. Both windows were resolved once, when
         // the budget was derived.
@@ -1416,6 +1417,7 @@ fn to_session_error(error: &CardinalError) -> SessionError {
 pub(crate) async fn mctx_head(
     ctx: &DrainCtx,
     budget: crate::mctx::budget::Budget,
+    model_id: &str,
 ) -> (Option<String>, Option<String>, i64) {
     if !ctx.config.magic_context.enabled {
         return (None, None, 0);
@@ -1436,6 +1438,7 @@ pub(crate) async fn mctx_head(
         budget,
         forced: false,
         run_started: false,
+        model_id,
     };
     match crate::mctx::pass::run(request).await {
         Ok(result) => (result.head_m0, result.head_m1, result.floor),
@@ -1854,7 +1857,9 @@ pub(crate) fn tool_input(state: &ToolState) -> Record {
 /// The `{role: "tool"}` result for a settled tool part (upstream
 /// `toolResult`): joined text content for completed calls, `{error: …}` for
 /// failed ones. A `streaming`/`running` part yields `None` — its own row's
-/// result lands in the next request.
+/// result lands in the next request. Completed text is bounded for the wire
+/// ([`bound_tool_output`]): the stored row keeps the full text, only this
+/// request's view is head + marker + tail.
 ///
 /// Attachments cannot ride inside a `tool` message: providers accept an image
 /// only as user content. They are returned separately so the caller can append
@@ -1879,7 +1884,7 @@ fn tool_result_message(id: &str, state: &ToolState) -> Option<(ChatMessage, Vec<
                 })
                 .collect::<Vec<_>>()
                 .join("");
-            serde_json::to_string(&json!({ "output": text })).ok()?
+            serde_json::to_string(&json!({ "output": bound_tool_output(&text) })).ok()?
         }
         ToolState::Error { error, .. } => serde_json::to_string(&json!({ "error": error })).ok()?,
         ToolState::Streaming { .. } | ToolState::Running { .. } => return None,
@@ -1979,25 +1984,6 @@ pub(crate) async fn last_assistant_text(
         ),
         _ => None,
     })
-}
-
-/// Load a session transcript at or below `upper`: rows with a smaller or
-/// equal ordinal. The background fold snapshots the transcript this way (plan D4):
-/// the summary must describe only rows that existed when the fold started,
-/// so rows written while the fold streams stay out of its input and are
-/// carried verbatim in `recent` instead.
-pub(crate) async fn load_history_through(
-    db: &ox_db::Db,
-    session_id: &str,
-    upper: i64,
-) -> Result<Vec<Message>> {
-    let rows: Vec<serde_json::Value> = rows_after_with_seq(db, session_id, i64::MIN)
-        .await?
-        .into_iter()
-        .filter(|(seq, _)| *seq <= upper)
-        .map(|(_, value)| value)
-        .collect();
-    rows.into_iter().map(|row| decode_row(&row)).collect()
 }
 
 /// Load a session transcript above `floor`: rows with a greater ordinal. The
@@ -2487,5 +2473,105 @@ mod token_parity_tests {
         let usage = prompt_tokens(&raw);
         assert_eq!(assistant_tokens(&decoded), usage);
         assert_eq!(usage, None);
+    }
+}
+
+// The wire's view-only output budget (plan ox-context-accuracy Task 3): an
+// oversized completed tool part is bounded on the wire (head + marker + tail)
+// while the stored row keeps the full text — the budget exists so one unbound
+// tool cannot blow the request's context window, and costs storage nothing.
+#[cfg(test)]
+mod tool_output_budget_tests {
+    use super::*;
+    use ox_schema::message::{AssistantMessage, AssistantTime, ToolTime};
+
+    fn assistant_with_tool_output(text: String) -> Message {
+        Message::Assistant(Box::new(AssistantMessage {
+            id: "a1".to_owned(),
+            metadata: None,
+            time: AssistantTime {
+                created: 1,
+                streamed: None,
+                completed: Some(2),
+            },
+            agent: "build".to_owned(),
+            model: ModelRef {
+                id: "test-model".to_owned(),
+                provider_id: "test".to_owned(),
+                variant: None,
+            },
+            content: vec![AssistantContent::Tool {
+                id: "call_1".to_owned(),
+                name: "webfetch".to_owned(),
+                executed: None,
+                provider_state: None,
+                provider_result_state: None,
+                state: Box::new(ToolState::Completed {
+                    input: Record::new(),
+                    content: vec![Content::Text { text }],
+                    metadata: None,
+                }),
+                time: ToolTime {
+                    created: 1,
+                    ran: None,
+                    completed: Some(2),
+                },
+            }],
+            snapshot: None,
+            finish: None,
+            raw_finish: None,
+            provider_state: None,
+            cost: None,
+            tokens: None,
+            error: None,
+            retry: None,
+        }))
+    }
+
+    fn tool_result(chat: &[ChatMessage]) -> &str {
+        chat.iter()
+            .find_map(|message| match message {
+                ChatMessage::Tool { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .expect("tool result on the wire")
+    }
+
+    #[test]
+    fn oversized_tool_output_is_bounded_in_wire_but_not_in_storage() {
+        let big = "X".repeat(100 * 1024);
+        let message = assistant_with_tool_output(big.clone());
+        let chat = build_chat_messages("system", "", &[], std::slice::from_ref(&message));
+
+        let content = tool_result(&chat);
+        assert!(content.contains("output"));
+        assert!(content.contains("[output truncated: 102400 bytes total"));
+        assert!(content.len() < 40 * 1024);
+
+        // Storage is untouched: the original row still carries every byte.
+        let Message::Assistant(assistant) = &message else {
+            panic!("assistant row");
+        };
+        let AssistantContent::Tool { state, .. } = &assistant.content[0] else {
+            panic!("tool part");
+        };
+        let ToolState::Completed { content, .. } = &**state else {
+            panic!("completed tool state");
+        };
+        let Some(Content::Text { text }) = content.first() else {
+            panic!("text content");
+        };
+        assert_eq!(text, &big);
+    }
+
+    #[test]
+    fn small_tool_output_keeps_today_s_wire_bytes() {
+        let message = assistant_with_tool_output("X".repeat(1024));
+        let chat = build_chat_messages("system", "", &[], std::slice::from_ref(&message));
+
+        let content = tool_result(chat.as_slice());
+        let expected = serde_json::to_string(&json!({ "output": "X".repeat(1024) })).unwrap();
+        assert_eq!(content, expected);
+        assert!(!content.contains("[output truncated"));
     }
 }

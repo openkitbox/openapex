@@ -60,6 +60,15 @@ rand = "0.10"
 ratatui = "0.29"
 regex = "1"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls", "json", "stream"] }
+# mctx/tokens.rs: the Kimi BPE is built through tiktoken-rs' public
+# CoreBPE::new (patched_tiktoken.rs @ v0.12.1); `rustc-hash` must match the
+# version tiktoken-rs 0.12 uses — its FxHashMap is the constructor's parameter
+# type. tokenizers is pinned to the onig backend: the only feature that
+# selects a non-onig regex engine is `unstable_wasm`, and onig is the engine
+# the golden oracle was generated with.
+rustc-hash = "2"
+tiktoken-rs = "0.12.1"
+tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
 salvo = "1.0.1"
 serde = "1.0.229"
 serde_json = "1.0.154"

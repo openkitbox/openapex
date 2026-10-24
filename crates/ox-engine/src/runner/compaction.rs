@@ -228,15 +228,13 @@ pub(crate) async fn summarize(
     summarize_transcript(ctx, model, &rows, true).await
 }
 
-/// The summarization proper over a given transcript: build the request,
-/// stream it, re-ask once when the reply skipped the template. Split from
-/// [`summarize`] so the background fold can feed its snapshot (plan D4).
-/// `emit_deltas` is the blocking path's wire contract (`started → delta →
-/// ended`); the fold passes `false` — its deltas must not broadcast.
-async fn summarize_transcript(
+/// The hidden-completion core every summarization shares (upstream
+/// `summarize`'s reply handling): stream the request, re-ask once when the
+/// reply skipped the summary template, then fail with the upstream
+/// classification when it still did not fill.
+async fn summarized_reply(
     ctx: &DrainCtx,
-    model: &ModelRef,
-    rows: &[ox_schema::message::Message],
+    mut request: ChatRequest,
     emit_deltas: bool,
 ) -> std::result::Result<String, SessionError> {
     let failure = |kind: &str, message: String| SessionError {
@@ -245,12 +243,6 @@ async fn summarize_transcript(
         status: None,
         response: None,
     };
-
-    let mut request = summarization_request(
-        // Same cardinal routing rule as step.rs: bare model id.
-        &model.id,
-        &super::step::build_chat_messages("", "", &[], rows),
-    );
     let mut summary = stream_summary(ctx, &request, emit_deltas).await?;
     // Upstream `send` (compaction.ts): a reply that ignores the summary
     // template gets one nudge before it counts as a failure. (Upstream's
@@ -274,6 +266,100 @@ async fn summarize_transcript(
         }
     }
     Ok(summary)
+}
+
+/// The summarization proper over a given transcript: build the request,
+/// stream it, re-ask once when the reply skipped the template. Split from
+/// [`summarize`] so the background fold can feed its snapshot (plan D4).
+/// `emit_deltas` is the blocking path's wire contract (`started → delta →
+/// ended`); the fold passes `false` — its deltas must not broadcast.
+async fn summarize_transcript(
+    ctx: &DrainCtx,
+    model: &ModelRef,
+    rows: &[ox_schema::message::Message],
+    emit_deltas: bool,
+) -> std::result::Result<String, SessionError> {
+    let request = summarization_request(
+        // Same cardinal routing rule as step.rs: bare model id.
+        &model.id,
+        &super::step::build_chat_messages("", "", &[], rows),
+    );
+    summarized_reply(ctx, request, emit_deltas).await
+}
+
+/// The checkpoint's `## Segment details` section heading (plan W3).
+const SEGMENT_DETAILS_HEADING: &str = "## Segment details";
+
+/// The per-segment half of a hierarchical checkpoint: one `[seq a..b]` head
+/// per segment with its summary beneath, blank-line separated.
+fn segment_details(segments: &[(i64, i64, String)]) -> String {
+    segments
+        .iter()
+        .map(|(start, end, summary)| format!("[seq {start}..{end}]\n{summary}"))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// The template fallback's summarization, hierarchical when the snapshot
+/// needs more than one chunk (plan W3): every [`chunk_rows`] segment is
+/// summarized by the same hidden completion the flat path pays
+/// ([`summarize_transcript`]), then one final completion renders the global
+/// summary from the segment summaries under the verbatim [`SUMMARY_PROMPT`].
+/// The result is the global summary followed by the per-segment summaries
+/// under [`SEGMENT_DETAILS_HEADING`], each headed `[seq <first>..<last>]`
+/// over its rows. Atomic: any segment failing fails the whole
+/// summarization, so no partial text ever reaches a checkpoint. A single
+/// chunk is the flat path verbatim — one completion, no section, no extra
+/// call. Silent like the fold it serves: `emit_deltas` stays `false`.
+async fn summarize_hierarchical(
+    ctx: &DrainCtx,
+    model: &ModelRef,
+    rows: &[(i64, serde_json::Value)],
+    count_tokens: &(impl Fn(&str) -> usize + Sync),
+) -> std::result::Result<String, SessionError> {
+    let failure = |message: String| SessionError {
+        kind: "unknown".to_owned(),
+        message,
+        status: None,
+        response: None,
+    };
+    let decode = |chunk: &[(i64, serde_json::Value)]| {
+        chunk
+            .iter()
+            .map(|(_, value)| super::step::decode_row(value))
+            .collect::<Result<Vec<_>>>()
+            .map_err(|error| failure(error.to_string()))
+    };
+    let chunks = chunk_rows(rows, count_tokens);
+    if chunks.len() <= 1 {
+        let messages = decode(chunks.first().copied().unwrap_or(&[]))?;
+        return summarize_transcript(ctx, model, &messages, false).await;
+    }
+    let mut segments: Vec<(i64, i64, String)> = Vec::with_capacity(chunks.len());
+    for chunk in &chunks {
+        let messages = decode(chunk)?;
+        let summary = summarize_transcript(ctx, model, &messages, false).await?;
+        let start = chunk.first().map_or(0, |(seq, _)| *seq);
+        let end = chunk.last().map_or(0, |(seq, _)| *seq);
+        segments.push((start, end, summary));
+    }
+    let details = segment_details(&segments);
+    // The global pass: the segment summaries are the transcript; the summary
+    // instruction is the same verbatim SUMMARY_PROMPT the flat path asks.
+    let request = summarization_request(
+        &model.id,
+        &[ChatMessage::User {
+            content: details.clone().into(),
+        }],
+    );
+    let global = summarized_reply(ctx, request, false).await?;
+    let mut out = String::with_capacity(global.len() + details.len() + 24);
+    out.push_str(&global);
+    out.push_str("\n\n");
+    out.push_str(SEGMENT_DETAILS_HEADING);
+    out.push('\n');
+    out.push_str(&details);
+    Ok(out)
 }
 
 /// The lifecycle head of one compaction: `session.compaction.started` makes
@@ -353,8 +439,10 @@ pub(crate) async fn publish_outcome(
 // ---------------------------------------------------------------------------
 
 /// Upstream's verbatim summary-keep budget (`settings.keep`, compaction.ts:255):
-/// the newest tail kept verbatim beside the summary, estimated at the
-/// historian's chars/4 convention. Deliberately a constant, not a config knob.
+/// the newest tail kept verbatim beside the summary, measured in tokens by
+/// the session model family's counter (the bytes/4 estimate was the stand-in
+/// the heuristic fallback still renders as). Deliberately a constant, not a
+/// config knob.
 const RECENT_KEEP_TOKENS: i64 = 15_000;
 
 /// Upstream `TOOL_OUTPUT_MAX_CHARS` (recent-text.ts): one tool result's
@@ -536,9 +624,11 @@ fn truncate_chars(value: &str, max: usize) -> String {
 /// keep budget (plan D4): everything the checkpoint would otherwise hide,
 /// because the fold's summary only saw rows at or before the snapshot. Rows
 /// render oldest-first; the budget is spent newest-first, dropping whole
-/// rows from the oldest end (upstream `oldestToDrop`).
-fn recent_text(tail: &[(i64, serde_json::Value)]) -> String {
-    let budget_chars = (RECENT_KEEP_TOKENS * 4) as usize;
+/// rows from the oldest end (upstream `oldestToDrop`). The budget is
+/// counted with the injected token counter — one over per row's trailing
+/// newline.
+fn recent_text(tail: &[(i64, serde_json::Value)], count_tokens: &dyn Fn(&str) -> usize) -> String {
+    let budget_tokens = RECENT_KEEP_TOKENS as usize;
     let mut kept: Vec<String> = Vec::new();
     let mut spent = 0usize;
     for (_, row) in tail.iter().rev() {
@@ -546,8 +636,8 @@ fn recent_text(tail: &[(i64, serde_json::Value)]) -> String {
         if text.is_empty() {
             continue;
         }
-        let cost = text.len() + 1;
-        if spent + cost > budget_chars {
+        let cost = count_tokens(&text) + 1;
+        if spent + cost > budget_tokens {
             break;
         }
         spent += cost;
@@ -559,20 +649,23 @@ fn recent_text(tail: &[(i64, serde_json::Value)]) -> String {
 
 /// Whether the recent budget carries the whole tail row-by-row (plan D6):
 /// [`recent_text`]'s exact cost walk — `recent_row_text` plus one newline
-/// byte per row against `RECENT_KEEP_TOKENS * 4` chars — answering "every
+/// token per row against `RECENT_KEEP_TOKENS` tokens — answering "every
 /// row is kept" instead of "keep the newest that fit". An empty tail fits.
 /// The silent fold refuses a checkpoint whose recent part would silently
 /// drop rows the summary never saw.
-fn tail_fits_recent(tail: &[(i64, serde_json::Value)]) -> bool {
-    let budget_chars = (RECENT_KEEP_TOKENS * 4) as usize;
+fn tail_fits_recent(
+    tail: &[(i64, serde_json::Value)],
+    count_tokens: &dyn Fn(&str) -> usize,
+) -> bool {
+    let budget_tokens = RECENT_KEEP_TOKENS as usize;
     let mut spent = 0usize;
     for (_, row) in tail.iter().rev() {
         let text = recent_row_text(row);
         if text.is_empty() {
             continue;
         }
-        let cost = text.len() + 1;
-        if spent + cost > budget_chars {
+        let cost = count_tokens(&text) + 1;
+        if spent + cost > budget_tokens {
             return false;
         }
         spent += cost;
@@ -585,8 +678,46 @@ fn tail_fits_recent(tail: &[(i64, serde_json::Value)]) -> bool {
 /// the checkpoint may only take the head path when `recent` carries every
 /// row past the floor; an overrun — a mid-fold burst — sends the caller to
 /// the template instead of silently dropping rows.
-fn head_recent(tail: &[(i64, serde_json::Value)]) -> Option<String> {
-    tail_fits_recent(tail).then(|| recent_text(tail))
+fn head_recent(
+    tail: &[(i64, serde_json::Value)],
+    count_tokens: &dyn Fn(&str) -> usize,
+) -> Option<String> {
+    tail_fits_recent(tail, count_tokens).then(|| recent_text(tail, count_tokens))
+}
+
+/// The hierarchical fallback's per-segment budget (plan W3): one segment
+/// summary covers at most this many tokens of row text. Deliberately a
+/// constant, not a config knob.
+const SEGMENT_TOKENS: usize = 24_000;
+
+/// Split fold rows into consecutive chunks of at most [`SEGMENT_TOKENS`]
+/// tokens of row text (plan Task 7). Deterministic greedy fill: the same rows
+/// always produce the same boundaries. A chunk's cost is the sum of
+/// [`recent_row_text`] sizes counted by the injected counter; a row is added
+/// to the current chunk unless it would bust the budget of a non-empty chunk,
+/// so a row whose own text exceeds the cap starts — and forms — its own
+/// chunk: never dropped, never split mid-row. Rows that render empty cost
+/// nothing and never force a split. At least one chunk is always returned
+/// (an empty input yields one empty chunk — the degenerate single-chunk
+/// fold); the chunks borrow `rows`, zero copies.
+fn chunk_rows<'a>(
+    rows: &'a [(i64, serde_json::Value)],
+    count_tokens: &dyn Fn(&str) -> usize,
+) -> Vec<&'a [(i64, serde_json::Value)]> {
+    let mut chunks: Vec<&'a [(i64, serde_json::Value)]> = Vec::new();
+    let mut start = 0usize;
+    let mut spent = 0usize;
+    for (index, (_, row)) in rows.iter().enumerate() {
+        let cost = count_tokens(&recent_row_text(row));
+        if spent > 0 && spent + cost > SEGMENT_TOKENS {
+            chunks.push(&rows[start..index]);
+            start = index;
+            spent = 0;
+        }
+        spent += cost;
+    }
+    chunks.push(&rows[start..]);
+    chunks
 }
 
 /// One finished fold, for the outcome log (upstream `policy.ts` carries the
@@ -704,6 +835,10 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
     let (_, model) = resolve_selection(&ctx.db, &ctx.session_id, &ctx.config, &ctx.model_catalog)
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    // One counter resolution per fold: the session model's family decides
+    // the token counting for every budget walk below.
+    let count = crate::mctx::tokens::counter_for_model(&model.id);
+    let count_tokens = move |s: &str| count.count(s);
 
     let latest = latest_seq(&ctx.db, &ctx.session_id).await?;
     let checkpoint = last_checkpoint_seq(&ctx.db, &ctx.session_id).await?;
@@ -722,7 +857,7 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
     // both the coverage reading for the decision and the fast-path summary
     // candidate. It is never called a second time without a patch in between.
     let (head_m0, head_floor) = if ctx.config.magic_context.enabled {
-        let (head_m0, _head_m1, floor) = super::step::mctx_head(ctx, budget).await;
+        let (head_m0, _head_m1, floor) = super::step::mctx_head(ctx, budget, &model.id).await;
         (head_m0, floor)
     } else {
         (None, 0)
@@ -738,7 +873,9 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
         tracing::debug!(session = %ctx.session_id, ?decision, "background fold skipped");
         return Ok(None);
     }
-    match select_checkpoint_source(ctx, budget, head_m0, head_floor).await? {
+    match select_checkpoint_source(ctx, budget, head_m0, head_floor, &count_tokens, &model.id)
+        .await?
+    {
         CheckpointPlan::Head { summary, floor } => {
             // D7: this is the SECOND tail read past the floor (the first was
             // the gate's fit check in `select_checkpoint_source`) — semantic,
@@ -747,7 +884,7 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
             // saw none of the tail, so the checkpoint must carry every row
             // past the floor verbatim.
             let tail = super::step::rows_after_with_seq(&ctx.db, &ctx.session_id, floor).await?;
-            if let Some(recent) = head_recent(&tail) {
+            if let Some(recent) = head_recent(&tail, &count_tokens) {
                 let stats = FoldStats {
                     source: FoldSource::Head,
                     rows_before: floor.saturating_sub(checkpoint),
@@ -763,10 +900,10 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
                 floor,
                 "background fold tail outgrew the recent budget mid-fold; template fallback"
             );
-            template_fold(ctx, &model, latest, checkpoint, started_at).await
+            template_fold(ctx, &model, latest, checkpoint, started_at, &count_tokens).await
         }
         CheckpointPlan::Template => {
-            template_fold(ctx, &model, latest, checkpoint, started_at).await
+            template_fold(ctx, &model, latest, checkpoint, started_at, &count_tokens).await
         }
     }
 }
@@ -782,6 +919,8 @@ async fn select_checkpoint_source(
     budget: crate::mctx::budget::Budget,
     head_m0: Option<String>,
     floor: i64,
+    count_tokens: &(impl Fn(&str) -> usize + Sync),
+    model_id: &str,
 ) -> Result<CheckpointPlan> {
     let Some(summary) = head_m0 else {
         // The pass produced no head (off above, or failed): the template is
@@ -789,7 +928,7 @@ async fn select_checkpoint_source(
         return Ok(CheckpointPlan::Template);
     };
     let tail = super::step::rows_after_with_seq(&ctx.db, &ctx.session_id, floor).await?;
-    if tail_fits_recent(&tail) {
+    if tail_fits_recent(&tail, count_tokens) {
         return Ok(CheckpointPlan::Head { summary, floor });
     }
     // The head is real but its tail busts the budget. The baseline is about
@@ -809,12 +948,12 @@ async fn select_checkpoint_source(
             return Ok(CheckpointPlan::Template);
         }
     }
-    let (head_m0, _head_m1, floor) = super::step::mctx_head(ctx, budget).await;
+    let (head_m0, _head_m1, floor) = super::step::mctx_head(ctx, budget, model_id).await;
     let Some(summary) = head_m0 else {
         return Ok(CheckpointPlan::Template);
     };
     let tail = super::step::rows_after_with_seq(&ctx.db, &ctx.session_id, floor).await?;
-    if tail_fits_recent(&tail) {
+    if tail_fits_recent(&tail, count_tokens) {
         Ok(CheckpointPlan::Head { summary, floor })
     } else {
         // Still busting — the fence held the tail back, or the patch could
@@ -833,11 +972,20 @@ async fn template_fold(
     snapshot: i64,
     checkpoint: i64,
     started_at: std::time::Instant,
+    count_tokens: &(impl Fn(&str) -> usize + Sync),
 ) -> Result<Option<FoldStats>> {
     // D4: snapshot. The summary describes only rows that existed now; rows
     // that land while it streams are carried verbatim in `recent` (I5).
-    let rows = super::step::load_history_through(&ctx.db, &ctx.session_id, snapshot).await?;
-    let run = summarize_transcript(ctx, model, &rows, false).await;
+    // Loaded raw with seqs: the hierarchical summarizer chunks over the raw
+    // rows (its budget walk reads the same text `recent_row_text` renders)
+    // and decodes per chunk.
+    let rows: Vec<(i64, serde_json::Value)> =
+        super::step::rows_after_with_seq(&ctx.db, &ctx.session_id, i64::MIN)
+            .await?
+            .into_iter()
+            .filter(|(seq, _)| *seq <= snapshot)
+            .collect();
+    let run = summarize_hierarchical(ctx, model, &rows, count_tokens).await;
     let stats = FoldStats {
         source: FoldSource::Template,
         rows_before: snapshot.saturating_sub(checkpoint),
@@ -847,7 +995,7 @@ async fn template_fold(
     // land after it and before the checkpoint appends is one publish wide.
     let recent = if run.is_ok() {
         let tail = super::step::rows_after_with_seq(&ctx.db, &ctx.session_id, snapshot).await?;
-        recent_text(&tail)
+        recent_text(&tail, count_tokens)
     } else {
         String::new()
     };
@@ -914,6 +1062,12 @@ mod tests {
     use ox_core::event_bus::EventBus;
     use ox_db::Db;
     use ox_mcp::Hub;
+
+    /// The old chars/4 estimator as a counter closure — the parity anchor
+    /// every pre-existing recent-tail test pins.
+    fn heuristic(s: &str) -> usize {
+        s.len().div_ceil(4)
+    }
 
     /// A session row, so event projection and model resolution have their
     /// aggregate (same seed shape as ox-core's projector tests).
@@ -1202,7 +1356,7 @@ mod tests {
                                    "status": "completed", "summary": "old"}),
             ),
         ];
-        let recent = recent_text(&tail);
+        let recent = recent_text(&tail, &heuristic);
         // Chronological; reasoning and compaction rows left out; the tool
         // call shows its input and result.
         assert_eq!(
@@ -1214,7 +1368,7 @@ mod tests {
     #[test]
     fn recent_text_keeps_the_newest_rows_within_the_budget() {
         let tail: Vec<_> = (0..50).map(|i| user_row(i, &"x".repeat(400))).collect();
-        let recent = recent_text(&tail);
+        let recent = recent_text(&tail, &heuristic);
         // ~60k chars budget: the newest ~140 rows would fit, but only 50
         // exist — everything is kept.
         assert!(recent.contains("[User]: x"));
@@ -1224,7 +1378,7 @@ mod tests {
         // Over budget: newest kept whole, oldest dropped — never truncated
         // mid-row.
         let tail: Vec<_> = (0..300).map(|i| user_row(i, &"y".repeat(400))).collect();
-        let recent = recent_text(&tail);
+        let recent = recent_text(&tail, &heuristic);
         let lines: Vec<&str> = recent.lines().collect();
         assert!(lines.len() < 300);
         assert!(lines[0].contains("[User]: y"));
@@ -1245,7 +1399,7 @@ mod tests {
                 ]
             }),
         )];
-        let recent = recent_text(&tail);
+        let recent = recent_text(&tail, &heuristic);
         let result = recent.split_once("[Tool result]: ").unwrap().1;
         assert!(result.chars().count() <= RECENT_TOOL_OUTPUT_MAX_CHARS + 1);
     }
@@ -1258,7 +1412,7 @@ mod tests {
         // 50 rows × ~409 chars ≈ 20k of the ~60k budget — the shape
         // `recent_text` keeps whole, so the fit check agrees.
         let tail: Vec<_> = (0..50).map(|i| user_row(i, &"x".repeat(400))).collect();
-        assert!(tail_fits_recent(&tail));
+        assert!(tail_fits_recent(&tail, &heuristic));
     }
 
     #[test]
@@ -1266,12 +1420,12 @@ mod tests {
         // 300 rows × ~409 chars overruns the budget — the shape where
         // `recent_text` drops rows from the oldest end.
         let tail: Vec<_> = (0..300).map(|i| user_row(i, &"y".repeat(400))).collect();
-        assert!(!tail_fits_recent(&tail));
+        assert!(!tail_fits_recent(&tail, &heuristic));
     }
 
     #[test]
     fn tail_fits_recent_true_for_an_empty_tail() {
-        assert!(tail_fits_recent(&[]));
+        assert!(tail_fits_recent(&[], &heuristic));
     }
 
     /// A catalogue with one known-window model: the usage criterion needs a
@@ -2389,7 +2543,7 @@ mod tests {
         // The checkpoint is the baseline verbatim, and its recent part is
         // the whole tail the floor leaves.
         let budget = crate::mctx::budget_for(&ctx.config, &ctx.model_catalog, "big");
-        let (head_m0, _head_m1, floor) = crate::runner::step::mctx_head(&ctx, budget).await;
+        let (head_m0, _head_m1, floor) = crate::runner::step::mctx_head(&ctx, budget, "big").await;
         assert_eq!(floor, 1000, "the floor is the seeded compartment's end");
         let head_m0 = head_m0.unwrap();
         let row = checkpoint_row(&db, "ses_head").await;
@@ -2398,7 +2552,10 @@ mod tests {
         let tail = crate::runner::step::rows_after_with_seq(&db, "ses_head", floor)
             .await
             .unwrap();
-        assert_eq!(row["recent"], serde_json::json!(recent_text(&tail)));
+        assert_eq!(
+            row["recent"],
+            serde_json::json!(recent_text(&tail, &heuristic))
+        );
         assert!(row["recent"].as_str().unwrap().contains("[User]: row 1001"));
 
         // Silence held, and the slot came back.
@@ -2436,7 +2593,7 @@ mod tests {
         // The checkpoint is the RE-rendered baseline — it carries the
         // patch's compartment — with the remaining tail as its recent part.
         let budget = crate::mctx::budget_for(&ctx.config, &ctx.model_catalog, "big");
-        let (head_m0, _head_m1, _floor) = crate::runner::step::mctx_head(&ctx, budget).await;
+        let (head_m0, _head_m1, _floor) = crate::runner::step::mctx_head(&ctx, budget, "big").await;
         let head_m0 = head_m0.unwrap();
         assert!(
             head_m0.contains("Folded tail"),
@@ -2518,12 +2675,434 @@ mod tests {
     fn head_recent_carries_a_fitting_tail_and_refuses_an_overrun() {
         let tail: Vec<_> = (0..50).map(|i| user_row(i, &"x".repeat(400))).collect();
         assert_eq!(
-            head_recent(&tail).as_deref(),
-            Some(recent_text(&tail).as_str())
+            head_recent(&tail, &heuristic).as_deref(),
+            Some(recent_text(&tail, &heuristic).as_str())
         );
 
         let tail: Vec<_> = (0..300).map(|i| user_row(i, &"y".repeat(400))).collect();
-        assert_eq!(head_recent(&tail), None);
-        assert_eq!(head_recent(&[]), Some(String::new()));
+        assert_eq!(head_recent(&tail, &heuristic), None);
+        assert_eq!(head_recent(&[], &heuristic), Some(String::new()));
+    }
+
+    // Task 6: the recent-tail budget is RECENT_KEEP_TOKENS *tokens* counted
+    // by the session family's counter, not that times 4 in bytes.
+
+    #[test]
+    fn recent_text_counts_tokens_not_bytes() {
+        // One CJK row: 54,008 bytes read as 13,503 under bytes/4 and fit the
+        // 15,000 budget; counted per character (18,009 + 1) the row busts and
+        // is dropped whole.
+        let tail = vec![(
+            1,
+            serde_json::json!({"type": "user", "text": "记".repeat(18_000)}),
+        )];
+        let exact = |s: &str| s.chars().count();
+        assert_eq!(recent_text(&tail, &exact), "");
+    }
+
+    #[test]
+    fn tail_fits_recent_refuses_what_exact_counting_cannot_carry() {
+        let tail = vec![(
+            1,
+            serde_json::json!({"type": "user", "text": "记".repeat(18_000)}),
+        )];
+        let exact = |s: &str| s.chars().count();
+        assert!(!tail_fits_recent(&tail, &exact));
+        assert!(tail_fits_recent(&[], &exact));
+    }
+
+    #[test]
+    fn heuristic_injection_reproduces_the_old_bytes_budget_decisions() {
+        // The production fallback for unknown models is Counter::Heuristic —
+        // the old chars/4 estimator. Injecting it must reproduce the old
+        // byte-budget walk's decision exactly, so unknown-model sessions
+        // behave as before.
+        let tail: Vec<_> = [
+            ("a".repeat(8_000), 1),
+            ("b".repeat(6_000), 2),
+            ("c".repeat(34_000), 3),
+            ("d".repeat(20_000), 4),
+        ]
+        .into_iter()
+        .map(|(text, seq)| (seq, serde_json::json!({"type": "user", "text": text})))
+        .collect();
+        let counter = crate::mctx::tokens::counter_for_model("qwen3-max");
+        let recent = recent_text(&tail, &|s: &str| counter.count(s));
+        // Both walks spend newest-first and break at the 6k row: the 34k and
+        // 20k rows survive, the older two are dropped whole.
+        let expected = format!(
+            "[User]: {}\n[User]: {}",
+            "c".repeat(34_000),
+            "d".repeat(20_000)
+        );
+        assert_eq!(recent, expected);
+    }
+
+    // Task 7 (plan W3): the deterministic chunking the hierarchical fallback
+    // splits its snapshot into.
+
+    #[test]
+    fn chunk_rows_covers_every_row_exactly_once() {
+        let mut rows: Vec<_> = (0..40)
+            .map(|i| user_row(i, &format!("row {i} {}", "x".repeat(i as usize * 100))))
+            .collect();
+        // Hidden rows cost nothing but must still be covered exactly once.
+        rows.push((
+            40,
+            serde_json::json!({"id": "msg_40", "type": "compaction",
+                               "status": "completed", "summary": "old"}),
+        ));
+        rows.push((
+            41,
+            serde_json::json!({"id": "msg_41", "type": "assistant",
+                               "content": [{"type": "reasoning", "text": "thinking"}]}),
+        ));
+
+        let chunks = chunk_rows(&rows, &heuristic);
+        assert!(!chunks.is_empty(), "at least one chunk always exists");
+        let mut flat: Vec<i64> = Vec::new();
+        for chunk in &chunks {
+            assert!(!chunk.is_empty(), "no chunk may be empty");
+            flat.extend(chunk.iter().map(|(seq, _)| *seq));
+        }
+        let all: Vec<i64> = rows.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(flat, all, "chunks concatenate back to the original rows");
+    }
+
+    #[test]
+    fn chunk_rows_is_deterministic() {
+        let rows: Vec<_> = (0..60)
+            .map(|i| user_row(i, &"y".repeat(((i * 7919) % 5_000) as usize)))
+            .collect();
+        let boundaries = |chunks: &[&[(i64, serde_json::Value)]]| -> Vec<Vec<i64>> {
+            chunks
+                .iter()
+                .map(|chunk| chunk.iter().map(|(seq, _)| *seq).collect())
+                .collect()
+        };
+        assert_eq!(
+            boundaries(&chunk_rows(&rows, &heuristic)),
+            boundaries(&chunk_rows(&rows, &heuristic)),
+            "the same rows always produce the same boundaries"
+        );
+    }
+
+    #[test]
+    fn chunk_rows_respects_the_token_budget() {
+        // A 24_008-char row renders as ~6_002 tokens: three fill one chunk,
+        // the fourth busts the budget and starts the next one.
+        let rows: Vec<_> = (0..20).map(|i| user_row(i, &"x".repeat(24_000))).collect();
+        let chunks = chunk_rows(&rows, &heuristic);
+        assert!(chunks.len() > 1, "the rows must not all fit one chunk");
+        for chunk in &chunks {
+            let spent: usize = chunk
+                .iter()
+                .map(|(_, row)| heuristic(&recent_row_text(row)))
+                .sum();
+            assert!(
+                spent <= SEGMENT_TOKENS,
+                "a {}-row chunk spent {spent} tokens",
+                chunk.len()
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_rows_gives_an_oversize_row_its_own_chunk() {
+        let rows = vec![
+            user_row(1, "small"),
+            user_row(2, &"big".repeat(40_000)), // ≈30k tokens: over the cap alone
+            user_row(3, "small"),
+        ];
+        let chunks = chunk_rows(&rows, &heuristic);
+        assert_eq!(chunks.len(), 3, "each row lands in its own chunk");
+        assert_eq!(chunks[0][0].0, 1);
+        assert_eq!(
+            chunks[1][0].0, 2,
+            "the oversize row is never split or dropped"
+        );
+        assert_eq!(chunks[2][0].0, 3);
+    }
+
+    #[test]
+    fn chunk_rows_keeps_a_single_row_in_a_single_chunk() {
+        let rows = vec![user_row(7, "only")];
+        let chunks = chunk_rows(&rows, &heuristic);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].len(), 1);
+
+        // Even one oversize row: its own chunk, never dropped.
+        let rows = vec![user_row(7, &"big".repeat(40_000))];
+        let chunks = chunk_rows(&rows, &heuristic);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0][0].0, 7);
+    }
+
+    // Task 8 (plan W3): the hierarchical fallback — segments + global state.
+
+    /// A chat for the hierarchical tests: every fold request is recorded and
+    /// answered with a template-filled line numbered by arrival order
+    /// (`## Objective\n- part {n}`), so tests can tell the segment calls from
+    /// the global call and pin the summaries fed back into it. `fail_on`
+    /// (1-based) turns that one request into a transport failure.
+    struct HierarchicalChat {
+        requests: std::sync::Mutex<Vec<ChatRequest>>,
+        fail_on: Option<usize>,
+    }
+
+    impl HierarchicalChat {
+        fn fold_request_count(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+    }
+
+    impl crate::cardinal::chat::Chat for HierarchicalChat {
+        fn stream_chat<'a>(
+            &'a self,
+            request: &'a ChatRequest,
+        ) -> crate::cardinal::chat::ChatFuture<'a> {
+            use crate::cardinal::chat::BoxChatStream;
+            let index = {
+                let mut requests = self.requests.lock().unwrap();
+                requests.push(request.clone());
+                requests.len()
+            };
+            let fail = self.fail_on == Some(index);
+            Box::pin(async move {
+                if fail {
+                    return Err(crate::cardinal::CardinalError::Upstream(
+                        "segment exploded".to_owned(),
+                    ));
+                }
+                Ok(Box::pin(ScriptedStream {
+                    events: template_events(&format!("## Objective\n- part {index}")).into_iter(),
+                }) as BoxChatStream)
+            })
+        }
+    }
+
+    /// The hierarchical tests' context: mctx off (the template path is the
+    /// subject), the windowed `big` model, the chat above.
+    async fn hierarchical_ctx(
+        session_id: &'static str,
+        fail_on: Option<usize>,
+    ) -> (Db, EventBus, DrainCtx, Arc<HierarchicalChat>) {
+        let db = Db::open_in_memory().await.unwrap();
+        seed_session(&db, session_id).await;
+        let bus = EventBus::new(db.clone());
+        let config = ox_core::config::Config {
+            magic_context: ox_core::config::MctxConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            ..ox_core::config::Config::default()
+        };
+        let chat = Arc::new(HierarchicalChat {
+            requests: std::sync::Mutex::default(),
+            fail_on,
+        });
+        let ctx = DrainCtx {
+            session_id: session_id.to_owned(),
+            directory: std::path::PathBuf::from("/tmp/project"),
+            home: std::path::PathBuf::from("/tmp"),
+            config: std::sync::Arc::new(config.clone()),
+            db: db.clone(),
+            bus: bus.clone(),
+            chat: chat.clone(),
+            tools: std::sync::Arc::new(crate::runner::ToolRegistry::new()),
+            model_catalog: windowed_catalog(),
+            mcp: std::sync::Arc::new(Hub::empty()),
+            instruction_baselines: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            instruction_root: crate::runner::InstructionRootCache::default(),
+            fold_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        (db, bus, ctx, chat)
+    }
+
+    /// A decodable raw user row (the shape `rows_after_with_seq` returns).
+    fn raw_user_row(seq: i64, text: &str) -> (i64, serde_json::Value) {
+        (
+            seq,
+            serde_json::json!({"id": format!("msg_{seq}"), "type": "user",
+                               "time": {"created": 1}, "files": [], "agents": [],
+                               "text": text}),
+        )
+    }
+
+    /// The single-chunk degeneration (the U gate): one chunk is the flat
+    /// template verbatim — one completion, the reply untouched, no details
+    /// section, no extra call.
+    #[tokio::test]
+    async fn hierarchical_single_chunk_degenerates_to_the_flat_template() {
+        let (_db, bus, ctx, chat) = hierarchical_ctx("ses_hierone", None).await;
+        let mut events = bus.subscribe();
+        let rows = vec![raw_user_row(1, "hello"), raw_user_row(2, "world")];
+        let model = ModelRef {
+            id: "big".to_owned(),
+            provider_id: "test".to_owned(),
+            variant: None,
+        };
+
+        let summary = summarize_hierarchical(&ctx, &model, &rows, &heuristic)
+            .await
+            .unwrap();
+
+        assert_eq!(summary, "## Objective\n- part 1");
+        assert!(!summary.contains(SEGMENT_DETAILS_HEADING));
+        assert_eq!(chat.fold_request_count(), 1);
+        assert!(
+            events.try_recv().is_err(),
+            "no frame may reach a subscriber"
+        );
+    }
+
+    /// End to end through the fold: a snapshot that fits one chunk lands
+    /// exactly the flat template's checkpoint — byte for byte the pre-W3
+    /// output, one completion.
+    #[tokio::test]
+    async fn a_single_chunk_fold_is_the_flat_template_byte_for_byte() {
+        let (db, bus, ctx, chat) = hierarchical_ctx("ses_hierflat", None).await;
+        seed_user_row(&db, "ses_hierflat", 100, "hello").await;
+        seed_user_row(&db, "ses_hierflat", 101, "world").await;
+        seed_assistant_turn(&db, "ses_hierflat", 1_100, 70_000).await;
+        let mut events = bus.subscribe();
+
+        let stats = run_background_fold(&ctx)
+            .await
+            .unwrap()
+            .expect("the fold folds");
+        assert_eq!(stats.source, FoldSource::Template);
+
+        assert_eq!(chat.fold_request_count(), 1);
+        let row = checkpoint_row(&db, "ses_hierflat").await;
+        assert_eq!(row["reason"], "idle");
+        assert_eq!(row["summary"], "## Objective\n- part 1");
+        assert!(
+            !row["summary"]
+                .as_str()
+                .unwrap()
+                .contains("## Segment details")
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "no frame may reach a subscriber"
+        );
+    }
+
+    /// The hierarchical shape: 7×24k-token rows chunk 3/3/1 (the newest
+    /// assistant turn costs nothing and rides the last chunk) → three
+    /// segment completions plus one global completion, and the checkpoint is
+    /// the global summary followed by the fixed `## Segment details` section.
+    #[tokio::test]
+    async fn a_multi_chunk_fold_pays_n_plus_one_completions_and_appends_segment_details() {
+        let (db, bus, ctx, chat) = hierarchical_ctx("ses_hier", None).await;
+        for i in 0..7 {
+            // ~24_005 chars ≈ 6_002 tokens a row; the index keeps the
+            // segments tellable apart in the recorded requests.
+            seed_user_row(
+                &db,
+                "ses_hier",
+                100 + i,
+                &format!("r{i}{}", "x".repeat(23_995)),
+            )
+            .await;
+        }
+        seed_assistant_turn(&db, "ses_hier", 1_100, 70_000).await;
+        let mut events = bus.subscribe();
+
+        let stats = run_background_fold(&ctx)
+            .await
+            .unwrap()
+            .expect("the fold folds");
+        assert_eq!(stats.source, FoldSource::Template);
+
+        // N segments + one global call: 3 chunks → 4 completions. Each
+        // segment carried only its own rows; the global one is fed the
+        // segment summaries and asks with the verbatim SUMMARY_PROMPT.
+        {
+            let requests = chat.requests.lock().unwrap();
+            assert_eq!(requests.len(), 4, "3 segments + 1 global");
+            let segment = |i: usize| serde_json::to_string(&requests[i]).unwrap();
+            assert!(segment(0).contains("r0xxx") && segment(0).contains("r2xxx"));
+            assert!(!segment(0).contains("r3xxx"));
+            assert!(segment(1).contains("r3xxx") && !segment(1).contains("r0xxx"));
+            assert!(segment(2).contains("r6xxx"));
+            let global = requests.last().unwrap();
+            assert!(serde_json::to_string(global).unwrap().contains("part 1"));
+            assert!(!serde_json::to_string(global).unwrap().contains("xxx"));
+            assert!(matches!(
+                &global.messages[0],
+                ChatMessage::System { content } if content == COMPACTION_SYSTEM
+            ));
+            let ChatMessage::User { content } = &global.messages[2] else {
+                panic!("the summary instruction must be the final user turn");
+            };
+            assert_eq!(
+                serde_json::to_value(content).unwrap(),
+                serde_json::to_value(SUMMARY_PROMPT).unwrap(),
+                "the global pass asks with the verbatim SUMMARY_PROMPT"
+            );
+        }
+
+        // The checkpoint: global summary + the fixed details section, every
+        // segment under its `[seq a..b]` head.
+        let row = checkpoint_row(&db, "ses_hier").await;
+        assert_eq!(row["reason"], "idle");
+        assert_eq!(
+            row["summary"],
+            "## Objective\n- part 4\n\n## Segment details\n\
+             [seq 100..102]\n## Objective\n- part 1\n\n\
+             [seq 103..105]\n## Objective\n- part 2\n\n\
+             [seq 106..1100]\n## Objective\n- part 3"
+        );
+
+        // Silence held.
+        assert!(
+            events.try_recv().is_err(),
+            "no frame may reach a subscriber"
+        );
+    }
+
+    /// Atomicity: a segment completion failing fails the whole fold — no
+    /// global call after it, and no checkpoint row is ever written.
+    #[tokio::test]
+    async fn a_failed_segment_fails_the_whole_fold_without_a_checkpoint() {
+        let (db, bus, ctx, chat) = hierarchical_ctx("ses_hierfail", Some(2)).await;
+        for i in 0..7 {
+            seed_user_row(
+                &db,
+                "ses_hierfail",
+                100 + i,
+                &format!("r{i}{}", "x".repeat(23_995)),
+            )
+            .await;
+        }
+        seed_assistant_turn(&db, "ses_hierfail", 1_100, 70_000).await;
+        let mut events = bus.subscribe();
+
+        let outcome = run_background_fold(&ctx).await.unwrap();
+        assert!(outcome.is_none(), "a failed fold publishes nothing");
+
+        assert_eq!(
+            chat.fold_request_count(),
+            2,
+            "the fold stops at the failed segment"
+        );
+        let conn = db.acquire().await.unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT COUNT(*) FROM session_message
+                 WHERE session_id = ?1 AND type = 'compaction'",
+            )
+            .await
+            .unwrap();
+        let row = stmt.query_row(["ses_hierfail"]).await.unwrap();
+        assert_eq!(row.get::<i64>(0).unwrap(), 0, "no partial checkpoint");
+        assert!(
+            events.try_recv().is_err(),
+            "no frame may reach a subscriber"
+        );
     }
 }

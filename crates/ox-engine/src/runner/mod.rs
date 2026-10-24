@@ -29,6 +29,7 @@ pub mod drain;
 pub(crate) mod generate;
 mod historian_trigger;
 pub(crate) mod instructions;
+mod output_budget;
 pub(crate) mod provider_error;
 pub mod step;
 pub mod title;

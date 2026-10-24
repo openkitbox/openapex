@@ -68,6 +68,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 
+#[cfg(test)]
 use crate::mctx::decay_render::estimate_tokens;
 use crate::runner::{Tool, ToolContext, ToolOutput};
 use ox_db::{Db, optional};
@@ -451,14 +452,18 @@ pub(crate) async fn active_memories(db: &Db, project: &str) -> Result<Vec<Memory
 ///
 /// Pure: no IO, no DB, and no content copy — the selection is a list of
 /// borrows.
-pub(crate) fn select_memories(memories: &[MemoryRow], budget_tokens: usize) -> Vec<&MemoryRow> {
+pub(crate) fn select_memories<'a>(
+    memories: &'a [MemoryRow],
+    budget_tokens: usize,
+    count_tokens: &dyn Fn(&str) -> usize,
+) -> Vec<&'a MemoryRow> {
     let mut ordered: Vec<&MemoryRow> = memories.iter().collect();
     ordered.sort_by(|left, right| selection_order(left, right));
 
     let mut used = 0usize;
     let mut selected = Vec::new();
     for memory in ordered {
-        let cost = estimate_tokens(&memory.content);
+        let cost = count_tokens(&memory.content);
         if used + cost > budget_tokens {
             continue;
         }
@@ -1750,7 +1755,25 @@ mod tests {
             row("2", "b".repeat(800), 1.0, 10),
             row("3", "c".repeat(40), 0.0, 10),
         ];
-        assert_eq!(ids(&select_memories(&memories, 120)), ["1", "3"]);
+        assert_eq!(
+            ids(&select_memories(&memories, 120, &estimate_tokens)),
+            ["1", "3"]
+        );
+    }
+
+    #[test]
+    fn select_memories_uses_the_injected_counter() {
+        // 300 CJK bytes: under bytes/4 the row reads as 75 tokens and fits a
+        // 76-token budget; counted per character (100) it does not.
+        let memories = [row("1", "记".repeat(100), 1.0, 10)];
+        assert_eq!(
+            ids(&select_memories(&memories, 76, &estimate_tokens)),
+            ["1"]
+        );
+        assert!(
+            select_memories(&memories, 76, &|s: &str| s.chars().count()).is_empty(),
+            "exact counting must leave the row out"
+        );
     }
 
     #[test]
@@ -1760,7 +1783,7 @@ mod tests {
             row("10", "a".repeat(40), 0.0, 5),
             row("9", "b".repeat(40), 0.0, 5),
         ];
-        let selected = select_memories(&memories, 10);
+        let selected = select_memories(&memories, 10, &estimate_tokens);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, "9");
     }
@@ -1771,7 +1794,7 @@ mod tests {
             row("1", "a".repeat(40), 5.0, 1),
             row("2", "b".repeat(40), 1.0, 99),
         ];
-        let selected = select_memories(&memories, 10);
+        let selected = select_memories(&memories, 10, &estimate_tokens);
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].id, "1");
     }
@@ -1784,7 +1807,7 @@ mod tests {
             row("1", "a".repeat(40), 1.0, 1),
             row("2", "b".repeat(40), 1.0, 2),
         ];
-        let selected = select_memories(&memories, 10);
+        let selected = select_memories(&memories, 10, &estimate_tokens);
         assert_eq!(ids(&selected), ["2"]);
     }
 

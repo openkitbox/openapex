@@ -44,12 +44,14 @@
 //!   changes: the delta's bytes shift from the pinboard onwards, one turn.
 //! - **No workspace memory union** (the reference's `source_name_by_id` /
 //!   `WorkspaceMembership`): ox memories are scoped to one project directory.
-//! - **The token estimator is [`crate::mctx::decay_render::estimate_tokens`]**
-//!   (see that module's docs).
+//! - **The token estimator is injected** ([`crate::mctx::tokens::Counter`]):
+//!   the pass resolves the session family's exact counter once and threads it
+//!   through [`M0Inputs`]; [`crate::mctx::decay_render::estimate_tokens`] (the
+//!   bytes/4 stand-in) remains as the heuristic fallback shape.
 
-use crate::mctx::decay_render::{
-    DecayRenderCompartment, estimate_tokens, render_decayed_compartments,
-};
+#[cfg(test)]
+use crate::mctx::decay_render::estimate_tokens;
+use crate::mctx::decay_render::{DecayRenderCompartment, render_decayed_compartments};
 use crate::mctx::memory::{MemoryRow, ReadyNote, numeric_id};
 
 /// The m0 body when no compartment exists. The `<session-history>` tag is
@@ -223,6 +225,9 @@ pub(crate) struct M0Inputs<'a> {
     pub compartments: &'a [DecayRenderCompartment],
     /// The history budget in tokens, before pressure.
     pub history_budget_tokens: f64,
+    /// The session model family's token counter: what the decay guard's
+    /// budget honesty is measured in.
+    pub count_tokens: &'a dyn Fn(&str) -> usize,
 }
 
 /// Compose the m0 baseline: `<session-history>` alone. The history section is
@@ -232,7 +237,7 @@ pub(crate) fn render_m0(inputs: &M0Inputs<'_>) -> String {
     let history = render_decayed_compartments(
         inputs.compartments,
         inputs.history_budget_tokens,
-        estimate_tokens,
+        inputs.count_tokens,
     );
     if history.is_empty() {
         return M0_EMPTY_BODY.to_string();
@@ -265,7 +270,7 @@ mod tests {
             memory("1", "PROJECT_RULES", "Rule A & <x>"),
         ];
         // A budget every row fits under keeps the whole set...
-        let selected = select_memories(&rows, 1_000);
+        let selected = select_memories(&rows, 1_000, &estimate_tokens);
         assert_eq!(selected.len(), rows.len());
         let expected = "<project-memory>\n\
                         <PROJECT_RULES>\n\
@@ -275,6 +280,42 @@ mod tests {
                         </project-memory>";
         // ...and its rendering is byte-identical to the pre-budget output.
         assert_eq!(render_memory_block(&selected), expected);
+    }
+
+    #[test]
+    fn m0_decay_guard_counts_with_the_injected_counter() {
+        // The guard measures the rendered body with the injected counter. A
+        // CJK P1 body is 3 bytes/char: under bytes/4 the 311-byte body reads
+        // as 78 tokens and fits the 80-token budget; counted per character
+        // (311) it busts and the guard demotes the compartment to its P2
+        // paraphrase.
+        let compartment = DecayRenderCompartment {
+            start_message: 1,
+            end_message: 2,
+            title: "t".into(),
+            p1: Some("记".repeat(100)),
+            p2: Some("short".into()),
+            importance: Some(50),
+            ..Default::default()
+        };
+        let heuristic = |s: &str| s.len().div_ceil(4);
+        let kept = render_m0(&M0Inputs {
+            compartments: std::slice::from_ref(&compartment),
+            history_budget_tokens: 80.0,
+            count_tokens: &heuristic,
+        });
+        assert!(kept.contains("记"), "heuristic keeps the P1 body: {kept}");
+
+        let exact = |s: &str| s.chars().count();
+        let demoted = render_m0(&M0Inputs {
+            compartments: &[compartment],
+            history_budget_tokens: 80.0,
+            count_tokens: &exact,
+        });
+        assert!(
+            demoted.contains("short") && !demoted.contains("记"),
+            "exact counting demotes to P2: {demoted}"
+        );
     }
 
     // -- ready notes --------------------------------------------------------

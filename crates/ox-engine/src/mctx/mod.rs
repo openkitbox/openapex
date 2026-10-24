@@ -66,6 +66,10 @@ pub mod decay_render;
 /// Decay rendering and `m[0]`/`m[1]` synthetic-message composition.
 pub mod render;
 
+/// Per-family exact token counters (GLM/Kimi/DeepSeek) and the bytes/4
+/// heuristic fallback.
+pub mod tokens;
+
 /// Temporal awareness: the per-message gap markers (`<!-- +1h 5m -->`).
 pub mod temporal;
 
