@@ -47,6 +47,26 @@ pub(crate) const COMPACTION_SYSTEM: &str = "You summarize conversations so anoth
 /// Upstream `buildPrompt(false)` (compaction.ts:145) verbatim: the
 /// first-time summary instruction appended as the final user message.
 pub(crate) const SUMMARY_PROMPT: &str = "You MUST summarize the conversation above into a structured summary that will be given to another agent to resume the work.\n\nSummarize only what the user and the assistant said and did. Leave out instructions and setup the assistant was given rather than told by the user: repository conventions, instruction files such as AGENTS.md, and environment details like the session ID. The next agent receives current versions of all of these separately.\n\nYou MUST use this format for your response (you may omit sections that aren't applicable). Do not include the <template> tags in your response.\n<template>\n## Objective\n- [one or two brief sentences describing what the user is trying to accomplish]\n\n## Requirements\n- [constraints, preferences, requirements, and scope boundaries stated by the user, or \"(none)\"]\n\n## Decisions\n- [decisions already made and why, or \"(none)\"]\n\n## Work State\nBreak the objective into smaller goals and report which are completed, which are being worked on, and which are blocked.\n### Completed\n- [goals that have been completed; otherwise \"(none)\"]\n\n### Active\n- [goals currently being worked on; otherwise \"(none)\"]\n\n### Blocked\n- [anything blocking progress, and why; otherwise \"(none)\"]\n\n## Next Move\n1. [ordered list of next actions, or \"(none)\"]\n\n## Relevant Files\nList the files and directories, other than the current working directory, that another agent would need to open to continue this work. Include at most 15, most important first. Do not list every file that was read or changed. Include paths outside the current working directory when relevant. If none, write \"(none)\".\n- `[file or directory path]`: [brief reason it matters]\n\n## Important Context\n- [facts the next agent cannot continue without and cannot easily find on its own; or \"(none)\"]\n</template>\n\nRules:\n- Keep each section concise. Use terse, single-line bullets, not prose paragraphs or nested lists.\n- Prefer short references over detailed restatement. It is fine to leave out information the next agent can recover from the code or the files listed above.\n- Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers.\n- Carry forward only user questions or requests that remain unanswered or require further action. Do not repeat ones that newer history has answered or resolved. Preserve exact wording when carrying one forward.\n- Preserve consequential workflow state, including whether changes are uncommitted, committed, pushed, under review, or merged.\n- Do not mention the summary process or that context was compacted.\n\nDo not continue the task or call tools.\n\nReturn only the structured summary in the requested format. Do not include a preamble, explanation, or other commentary.";
+/// Upstream `buildPrompt(true)` (compaction.ts:214-230, shared 201-207)
+/// verbatim: the checkpoint-update instruction used when the transcript
+/// already contains a `<conversation-checkpoint>` — the previous summary is
+/// the baseline to update, and newer history always takes precedence.
+pub(crate) const UPDATE_PROMPT: &str = "Update the existing checkpoint in the conversation above into one consolidated summary.\n\nNewer history always takes precedence over the existing checkpoint. Preserve previous information unless newer history clearly contradicts, supersedes, resolves, or makes it stale. If something is no longer relevant to continuing the work, you may remove it.\n\nIncorporate newer requirements, decisions, progress, and context. Reconcile Work State and Next Move: move completed work out of Active, remove resolved blockers and answered questions, and preserve unresolved or pending work.\n\nReturn only the updated Markdown sections. Do not reproduce the `<conversation-checkpoint>`, `<summary>`, or `<recent-context>` wrapper tags from the previous checkpoint.\n\nSummarize only what the user and the assistant said and did. Leave out instructions and setup the assistant was given rather than told by the user: repository conventions, instruction files such as AGENTS.md, and environment details like the session ID. The next agent receives current versions of all of these separately.\n\nYou MUST use this format for your response (you may omit sections that aren't applicable). Do not include the <template> tags in your response.\n<template>\n## Objective\n- [one or two brief sentences describing what the user is trying to accomplish]\n\n## Requirements\n- [constraints, preferences, requirements, and scope boundaries stated by the user, or \"(none)\"]\n\n## Decisions\n- [decisions already made and why, or \"(none)\"]\n\n## Work State\nBreak the objective into smaller goals and report which are completed, which are being worked on, and which are blocked.\n### Completed\n- [goals that have been completed; otherwise \"(none)\"]\n\n### Active\n- [goals currently being worked on; otherwise \"(none)\"]\n\n### Blocked\n- [anything blocking progress, and why; otherwise \"(none)\"]\n\n## Next Move\n1. [ordered list of next actions, or \"(none)\"]\n\n## Relevant Files\nList the files and directories, other than the current working directory, that another agent would need to open to continue this work. Include at most 15, most important first. Do not list every file that was read or changed. Include paths outside the current working directory when relevant. If none, write \"(none)\".\n- `[file or directory path]`: [brief reason it matters]\n\n## Important Context\n- [facts the next agent cannot continue without and cannot easily find on its own; or \"(none)\"]\n</template>\n\nRules:\n- Keep each section concise. Use terse, single-line bullets, not prose paragraphs or nested lists.\n- Prefer short references over detailed restatement. It is fine to leave out information the next agent can recover from the code or the files listed above.\n- Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers.\n- Carry forward only user questions or requests that remain unanswered or require further action. Do not repeat ones that newer history has answered or resolved. Preserve exact wording when carrying one forward.\n- Preserve consequential workflow state, including whether changes are uncommitted, committed, pushed, under review, or merged.\n- Do not mention the summary process or that context was compacted.\n\nDo not continue the task or call tools.\n\nReturn only the structured summary in the requested format. Do not include a preamble, explanation, or other commentary.";
+
+/// Pick the summary instruction for this transcript: first-time template for
+/// fresh history, update template once a checkpoint is present (plan
+/// 2026-10-24-ox-prompt-uplift Task 4; upstream buildPrompt's two variants).
+fn summary_prompt_for(transcript: &[ChatMessage]) -> &'static str {
+    let has_checkpoint = transcript.iter().any(|message| {
+        matches!(message, ChatMessage::User { content }
+            if content.as_str().starts_with("<conversation-checkpoint>"))
+    });
+    if has_checkpoint {
+        UPDATE_PROMPT
+    } else {
+        SUMMARY_PROMPT
+    }
+}
 
 /// The post-compaction checkpoint user message (upstream
 /// `to-llm-message.ts` `compaction` arm), so tests and the context mapping
@@ -111,7 +131,7 @@ pub(crate) fn summarization_request(model: &str, transcript: &[ChatMessage]) -> 
         .collect();
     messages.extend(body);
     messages.push(ChatMessage::User {
-        content: SUMMARY_PROMPT.to_owned().into(),
+        content: summary_prompt_for(transcript).to_owned().into(),
     });
     // `tools` stays empty → omitted from the wire; upstream disables tools
     // for compaction (`input.tools` defaults to a rejecting definition set).
@@ -3104,5 +3124,33 @@ mod tests {
             events.try_recv().is_err(),
             "no frame may reach a subscriber"
         );
+    }
+}
+
+#[cfg(test)]
+mod update_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_transcript_gets_the_first_time_prompt() {
+        let transcript = [ChatMessage::user("hello"), ChatMessage::assistant("hi")];
+        assert_eq!(summary_prompt_for(&transcript), SUMMARY_PROMPT);
+    }
+
+    #[test]
+    fn transcript_with_a_checkpoint_gets_the_update_prompt() {
+        let transcript = [
+            ChatMessage::user("hello"),
+            ChatMessage::user(checkpoint_message("earlier summary", "")),
+            ChatMessage::user("keep going"),
+        ];
+        assert_eq!(summary_prompt_for(&transcript), UPDATE_PROMPT);
+    }
+
+    #[test]
+    fn update_prompt_differs_and_preserves_the_template_contract() {
+        assert_ne!(UPDATE_PROMPT, SUMMARY_PROMPT);
+        assert!(UPDATE_PROMPT.contains("<template>"));
+        assert!(UPDATE_PROMPT.contains("## Objective"));
     }
 }
