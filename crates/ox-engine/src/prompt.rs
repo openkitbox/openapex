@@ -98,26 +98,44 @@ pub(crate) const KEY_INSTRUCTIONS: &str = "core/instructions";
 pub(crate) const KEY_DATE: &str = "core/date";
 pub(crate) const KEY_ENVIRONMENT: &str = "core/environment";
 
-/// How the skills catalog renders when its byte size crosses
-/// [`SKILLS_CATALOG_BUDGET_BYTES`]. The policy rides inside the observed
-/// `skills` value, so crossing the threshold mid-session hashes differently
-/// and the keyed framework fires exactly one delta — there is no second
-/// delivery path to keep in sync.
+/// How the skills catalog renders at its current byte size against
+/// [`SKILLS_CATALOG_BUDGET_BYTES`]: three tiers, graded after the mainstream
+/// ladder (codex `render.rs` / CodeWhale `skills/mod.rs` / dimcode's greedy
+/// description fill — survey 2026-10-25, `.ox/tmp/survey-catalog-handling.md`).
+/// The policy rides inside the observed `skills` value, so a tier change
+/// mid-session hashes differently and the keyed framework fires exactly one
+/// delta — there is no second delivery path to keep in sync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CatalogPolicy {
     /// Every entry's id, name, and description (upstream's only form).
     Full,
-    /// id + name, plus the frozen hint line; descriptions are omitted.
+    /// Every entry keeps its name; the entries whose description fits the
+    /// budget render it, the rest render the name-only line. `admitted` is
+    /// the count of descriptions that fit (part of the hash, so an admission
+    /// change re-asserts the catalog).
+    Shrunk { admitted: usize },
+    /// id + name lines only, plus the frozen hint line; descriptions are
+    /// omitted. Fail-closed last tier: even the name-only lines overflow.
     Compact,
 }
 
-/// The catalog's byte budget: at or under it the catalog renders in full,
-/// past it in [`CatalogPolicy::Compact`] (documented deviation from upstream,
-/// which always injects the full catalog — `.ox/plans/
-/// ox-injection-hardening.md` §2-F). Fixed, not a config knob: one threshold
-/// keeps the wire and the goldens testable without a configuration surface.
+/// The catalog's byte budget for the rendered `<available_skills>` block: at
+/// or under it the catalog renders in full, past it descriptions are
+/// admitted greedily ([`CatalogPolicy::Shrunk`]) and only a catalog whose
+/// name-only lines alone overflow drops to [`CatalogPolicy::Compact`]
+/// (documented deviation from upstream, which always injects the full
+/// catalog — `.ox/plans/ox-injection-hardening.md` §2-F, refined by
+/// `.ox/plans/2026-10-25-catalog-budget-ladder-design.md`). Fixed, not a
+/// config knob: one threshold keeps the wire and the goldens testable
+/// without a configuration surface.
 pub(crate) const SKILLS_CATALOG_BUDGET_BYTES: usize = 8 * 1024;
+
+/// Per-entry cap on a description's rendered characters in a shrunk catalog
+/// (codex `truncate_catalog_skill_description` / fx `skillDescriptionPrefix`
+/// parity). Longer descriptions render as the first `1021` characters plus
+/// an ASCII `...` so the admitted line stays at `1024` characters.
+const MAX_CATALOG_DESCRIPTION_CHARS: usize = 1024;
 
 /// Per-file budget for instruction files in the rendered system layer
 /// (plan 2026-10-24-ox-prompt-uplift-p1.md Unit F). Over budget, a file
@@ -131,13 +149,85 @@ pub(crate) const INSTRUCTION_FILE_BUDGET_BYTES: usize = 16 * 1024;
 const INSTRUCTION_FILE_HEAD_BYTES: usize = 12 * 1024;
 const INSTRUCTION_FILE_TAIL_BYTES: usize = 4 * 1024;
 
-/// The policy for a catalog of `bytes` bytes (see [`catalog_bytes`]).
-pub(crate) fn catalog_policy(bytes: usize) -> CatalogPolicy {
-    if bytes <= SKILLS_CATALOG_BUDGET_BYTES {
-        CatalogPolicy::Full
+/// The tier for `skills` against the budget: Full when the full catalog
+/// fits; otherwise the greedy admission plan decides how many descriptions
+/// fit ([`CatalogPolicy::Shrunk`]); a catalog whose name-only lines alone
+/// overflow the budget falls to [`CatalogPolicy::Compact`].
+pub(crate) fn catalog_policy(skills: &[SkillSummary]) -> CatalogPolicy {
+    if catalog_bytes(skills) <= SKILLS_CATALOG_BUDGET_BYTES {
+        return CatalogPolicy::Full;
+    }
+    let admitted = admission_plan(skills)
+        .iter()
+        .filter(|admitted| **admitted)
+        .count();
+    if admitted > 0 {
+        CatalogPolicy::Shrunk { admitted }
     } else {
         CatalogPolicy::Compact
     }
+}
+
+/// The frozen one-line explanation a shrunk catalog carries (pinned by the
+/// `skills-shrunk.txt` golden; changing it is a wire change).
+const SKILLS_SHRUNK_HINT: &str =
+    "Some descriptions omitted (catalog over budget); use capability_search to find skills.";
+
+/// Which entries' descriptions render within the budget: dimcode's greedy
+/// fill (`bunfs/chunk-3k4429e7.js:20321-20365`, survey 2026-10-25). Name-only
+/// lines for every entry are affordable by construction — [`CatalogPolicy::
+/// Compact`] exists for the pathological catalog where they are not — and the
+/// leftover budget admits descriptions cheapest-first (cost ascending, ties
+/// in id order). Entries are never dropped.
+///
+/// The renderer consumes the same plan, so the tier decision and the rendered
+/// bytes cannot disagree.
+fn admission_plan(skills: &[SkillSummary]) -> Vec<bool> {
+    let name_only_len =
+        |skill: &SkillSummary| format!("- {}: {}\n", escape(&skill.id), escape(&skill.name)).len();
+    let full_len = |skill: &SkillSummary| {
+        let mut bytes = "  <skill>\n".len() + "  </skill>\n".len();
+        bytes += "    <id></id>\n".len() + escaped_len(&skill.id);
+        bytes += "    <name></name>\n".len() + escaped_len(&skill.name);
+        if let Some(description) = &skill.description {
+            bytes += "    <description></description>\n".len()
+                + escaped_len(&clamped_description(description));
+        }
+        bytes
+    };
+    let fixed = "<available_skills>\n".len() + "</available_skills>".len();
+    let names_bytes: usize = skills.iter().map(&name_only_len).sum();
+    let mut remaining = SKILLS_CATALOG_BUDGET_BYTES.saturating_sub(fixed + names_bytes);
+    let costs: Vec<usize> = skills
+        .iter()
+        .map(|skill| full_len(skill).saturating_sub(name_only_len(skill)))
+        .collect();
+    let mut order: Vec<usize> = (0..skills.len()).collect();
+    // Discovery delivers id-ascending (`ox-tools/src/skills.rs` dedup), so
+    // the index tie-break is the id order.
+    order.sort_by(|&a, &b| costs[a].cmp(&costs[b]).then(a.cmp(&b)));
+    let mut plan = vec![false; skills.len()];
+    for &index in &order {
+        // An entry without a description has nothing to admit: it renders
+        // the name-only line either way and must not join the count.
+        if skills[index].description.is_some() && costs[index] <= remaining {
+            plan[index] = true;
+            remaining -= costs[index];
+        }
+    }
+    plan
+}
+
+/// A description's rendered form in a shrunk catalog: the first
+/// [`MAX_CATALOG_DESCRIPTION_CHARS`] characters, an ASCII `...` standing in
+/// for the dropped tail when clipping applies (codex
+/// `truncate_catalog_skill_description` parity).
+fn clamped_description(description: &str) -> std::borrow::Cow<'_, str> {
+    if description.chars().count() <= MAX_CATALOG_DESCRIPTION_CHARS {
+        return std::borrow::Cow::Borrowed(description);
+    }
+    let keep = MAX_CATALOG_DESCRIPTION_CHARS - 3;
+    std::borrow::Cow::Owned(description.chars().take(keep).collect::<String>() + "...")
 }
 
 /// Byte size of the catalog block [`render_skills`] with
@@ -267,7 +357,7 @@ pub(crate) fn gather(
             value: if skills.is_empty() {
                 ObservedValue::Removed
             } else {
-                let policy = catalog_policy(catalog_bytes(&skills));
+                let policy = catalog_policy(&skills);
                 ObservedValue::Present(SourceValue::Skills { skills, policy })
             },
         },
@@ -706,6 +796,10 @@ fn render_skills(skills: &[SkillSummary], policy: CatalogPolicy) -> String {
         out.push_str(SKILLS_COMPACT_HINT);
         out.push('\n');
     }
+    if matches!(policy, CatalogPolicy::Shrunk { .. }) {
+        out.push_str(SKILLS_SHRUNK_HINT);
+        out.push('\n');
+    }
     out.push_str("<available_skills>\n");
     push_skill_entries(&mut out, skills, policy);
     out.push_str("</available_skills>");
@@ -721,21 +815,17 @@ fn push_skill_entries(out: &mut String, skills: &[SkillSummary], policy: Catalog
     // `escape` already turns `<` into `&lt;`, so a skill id/name/description
     // carrying `<system-reminder>` is inert here: no reminder-tag neutralization
     // on top (that would double-escape an already-inert catalog).
-    for skill in skills {
-        match policy {
-            CatalogPolicy::Full => {
-                out.push_str("  <skill>\n");
-                out.push_str(&format!("    <id>{}</id>\n", escape(&skill.id)));
-                out.push_str(&format!("    <name>{}</name>\n", escape(&skill.name)));
-                if let Some(description) = &skill.description {
-                    out.push_str(&format!(
-                        "    <description>{}</description>\n",
-                        escape(description)
-                    ));
-                }
-                out.push_str("  </skill>\n");
-            }
-            CatalogPolicy::Compact => {
+    if let CatalogPolicy::Shrunk { .. } = policy {
+        // The tier renders the whole catalog through the admission plan —
+        // the same plan [`catalog_policy`] decided with, so the rendered
+        // bytes and the tier cannot disagree. Entries never reorder: the
+        // admitted ones carry their (clamped) description, the rest fall to
+        // the name-only line.
+        let plan = admission_plan(skills);
+        for (skill, admitted) in skills.iter().zip(plan) {
+            if admitted {
+                push_full_entry(out, skill, true);
+            } else {
                 out.push_str(&format!(
                     "- {}: {}\n",
                     escape(&skill.id),
@@ -743,13 +833,58 @@ fn push_skill_entries(out: &mut String, skills: &[SkillSummary], policy: Catalog
                 ));
             }
         }
+        return;
     }
+    for skill in skills {
+        match policy {
+            CatalogPolicy::Full => push_full_entry(out, skill, false),
+            CatalogPolicy::Compact => {
+                out.push_str(&format!(
+                    "- {}: {}\n",
+                    escape(&skill.id),
+                    escape(&skill.name)
+                ));
+            }
+            CatalogPolicy::Shrunk { .. } => unreachable!("handled before the loop"),
+        }
+    }
+}
+
+/// One `<skill>` block. `clamp` clips the description to
+/// [`MAX_CATALOG_DESCRIPTION_CHARS`] (the shrunk tier's admitted entries);
+/// the Full tier renders descriptions verbatim.
+fn push_full_entry(out: &mut String, skill: &SkillSummary, clamp: bool) {
+    out.push_str("  <skill>\n");
+    out.push_str(&format!("    <id>{}</id>\n", escape(&skill.id)));
+    out.push_str(&format!("    <name>{}</name>\n", escape(&skill.name)));
+    if let Some(description) = &skill.description {
+        let rendered = if clamp {
+            clamped_description(description)
+        } else {
+            std::borrow::Cow::Borrowed(description.as_str())
+        };
+        out.push_str(&format!(
+            "    <description>{}</description>\n",
+            escape(&rendered)
+        ));
+    }
+    out.push_str("  </skill>\n");
 }
 
 /// Upstream `skill/instructions.ts:update` — per-id added/changed/removed,
 /// full restatement only when no entry differs. `policy` is the *current*
 /// catalog's policy: it shapes the rendered lists, never the notice wording.
 fn skills_update(before: &[SkillSummary], after: &[SkillSummary], policy: CatalogPolicy) -> String {
+    // A shrunk catalog never diff-ports: whether an entry carries a
+    // description depends on the whole-catalog budget arithmetic, so any
+    // change (or a tier flip itself) can silently revoke another entry's
+    // description. Restate the full catalog instead of listing deltas.
+    if matches!(policy, CatalogPolicy::Shrunk { .. }) {
+        return format!(
+            "The available skills have changed. This list supersedes the previous available skills list.\n{}",
+            render_skills(after, policy)
+        );
+    }
     let added: Vec<&SkillSummary> = after
         .iter()
         .filter(|s| !before.iter().any(|b| b.id == s.id))
@@ -1729,22 +1864,159 @@ mod tests {
         ]
     }
 
-    /// Full up to and including the budget; Compact one byte past it.
+    /// Full fits; a single over-budget description lands in Shrunk with the
+    /// description admitted; a name-lines-only overflow falls to Compact.
     #[test]
-    fn catalog_policy_flips_just_over_the_budget() {
+    fn catalog_policy_picks_the_tier_from_the_skills() {
         assert_eq!(SKILLS_CATALOG_BUDGET_BYTES, 8 * 1024);
+        assert_eq!(catalog_policy(&catalog_sample()), CatalogPolicy::Full);
+
+        let mut over = catalog_sample();
+        over[0].description = Some("x".repeat(9000));
+        assert!(catalog_bytes(&over) > SKILLS_CATALOG_BUDGET_BYTES);
+        assert_eq!(catalog_policy(&over), CatalogPolicy::Shrunk { admitted: 1 });
+
+        // 900 entries with 9000-char descriptions: the name-only lines alone
+        // exceed the budget, so no description is admitted.
+        let huge: Vec<SkillSummary> = (0..900)
+            .map(|index| SkillSummary {
+                id: format!("s{index:03}"),
+                name: format!("s{index:03}"),
+                description: Some("x".repeat(9000)),
+            })
+            .collect();
+        assert_eq!(catalog_policy(&huge), CatalogPolicy::Compact);
+    }
+
+    /// Descriptions clip to the per-entry cap with an ASCII marker; the cap
+    /// counts characters, not bytes.
+    #[test]
+    fn clamped_description_keeps_the_marker_within_the_cap() {
+        assert_eq!(clamped_description("short"), "short");
+        let exactly: String = "x".repeat(MAX_CATALOG_DESCRIPTION_CHARS);
+        assert_eq!(clamped_description(&exactly), exactly);
+        let long = "y".repeat(5000);
+        let clamped = clamped_description(&long);
         assert_eq!(
-            catalog_policy(SKILLS_CATALOG_BUDGET_BYTES - 1),
-            CatalogPolicy::Full
+            clamped.chars().count(),
+            MAX_CATALOG_DESCRIPTION_CHARS,
+            "{clamped}"
         );
+        assert!(clamped.ends_with("..."));
         assert_eq!(
-            catalog_policy(SKILLS_CATALOG_BUDGET_BYTES),
-            CatalogPolicy::Full
+            clamped_description(&"字".repeat(2000)).chars().count(),
+            MAX_CATALOG_DESCRIPTION_CHARS
         );
-        assert_eq!(
-            catalog_policy(SKILLS_CATALOG_BUDGET_BYTES + 1),
-            CatalogPolicy::Compact
+    }
+
+    /// Eight long-description skills: the full block overflows, the clamped
+    /// costs admit the cheapest seven, and `theta` (the last index among
+    /// equal costs) falls to the name-only line — the mixed rendering the
+    /// [`CatalogPolicy::Shrunk`] tier exists for.
+    fn shrunk_sample() -> Vec<SkillSummary> {
+        [
+            "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta",
+        ]
+        .iter()
+        .zip([
+            "Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta", "Eta", "Theta",
+        ])
+        .zip(["a", "b", "c", "d", "e", "f", "g", "h"])
+        .map(|((id, name), fill)| SkillSummary {
+            id: (*id).into(),
+            name: name.into(),
+            description: Some(fill.repeat(3500)),
+        })
+        .collect()
+    }
+
+    /// The shrunk tier renders admitted descriptions (clamped) and name-only
+    /// lines for the rest, keeping the block within the budget.
+    #[test]
+    fn shrunk_render_admits_descriptions_within_the_budget() {
+        let policy = catalog_policy(&shrunk_sample());
+        let CatalogPolicy::Shrunk { admitted } = policy else {
+            panic!("expected Shrunk, got {policy:?}")
+        };
+        assert_eq!(admitted, 7);
+        let rendered = render_skills(&shrunk_sample(), policy);
+        assert!(rendered.contains(SKILLS_SHRUNK_HINT), "{rendered}");
+        let block_at = rendered.find("<available_skills>").expect("block");
+        assert!(
+            rendered.len() - block_at <= SKILLS_CATALOG_BUDGET_BYTES,
+            "block is {} bytes",
+            rendered.len() - block_at
         );
+        let clamped_alpha = format!("    <description>{}...</description>", "a".repeat(1021));
+        assert!(
+            rendered.contains(&clamped_alpha),
+            "alpha admitted with the clamped description"
+        );
+        assert!(rendered.contains("- theta: Theta\n"), "{rendered}");
+        assert!(
+            !rendered.contains(&"h".repeat(100)),
+            "theta's description stays omitted"
+        );
+    }
+
+    /// Both descriptions fit the leftover budget: both render, clamped.
+    #[test]
+    fn shrunk_render_admits_every_description_that_fits() {
+        let skills = vec![
+            SkillSummary {
+                id: "alpha".into(),
+                name: "Alpha".into(),
+                description: Some("x".repeat(9000)),
+            },
+            SkillSummary {
+                id: "beta".into(),
+                name: "Beta".into(),
+                description: Some("y".repeat(5000)),
+            },
+        ];
+        let policy = catalog_policy(&skills);
+        assert_eq!(policy, CatalogPolicy::Shrunk { admitted: 2 });
+        let rendered = render_skills(&skills, policy);
+        assert!(rendered.contains(&format!(
+            "    <description>{}...</description>",
+            "x".repeat(1021)
+        )));
+        assert!(rendered.contains(&format!(
+            "    <description>{}...</description>",
+            "y".repeat(1021)
+        )));
+    }
+
+    /// A shrunk catalog never diff-ports: whether an entry carries a
+    /// description depends on the whole-catalog budget arithmetic, so any
+    /// change restates the full catalog instead of listing deltas.
+    #[test]
+    fn a_shrunk_delta_restates_the_full_catalog() {
+        let before = SourceValue::Skills {
+            skills: vec![],
+            policy: CatalogPolicy::Full,
+        };
+        let after = SourceValue::Skills {
+            skills: vec![SkillSummary {
+                id: "new".into(),
+                name: "New".into(),
+                description: Some("a long description".into()),
+            }],
+            policy: CatalogPolicy::Shrunk { admitted: 1 },
+        };
+        let text = changed_text(&after, Some(&before));
+        assert!(
+            text.contains("This list supersedes the previous available skills list."),
+            "{text}"
+        );
+        // The restated catalog renders through the shrunk tier: the one
+        // skill's description fits, so it carries it as a full entry.
+        assert!(
+            text.contains("<description>a long description</description>"),
+            "{text}"
+        );
+        assert!(!text.contains("New skills are available"), "{text}");
+        assert!(!text.contains("- new: New"), "{text}");
     }
 
     /// `catalog_bytes` must count exactly the bytes `render_skills(.., Full)`
@@ -1781,6 +2053,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn g5_shrunk_catalog_matches_the_frozen_fixture() {
+        // Fixture: hand-written from the 2026-10-25 budget-ladder design
+        // (`.ox/plans/2026-10-25-catalog-budget-ladder-design.md` §4.3): the
+        // shared preamble, the frozen shrunk hint, then the admitted entry
+        // (`alpha`, description clamped to the per-entry cap with an ASCII
+        // `...`) followed by the name-only lines for the rest.
+        assert_eq!(
+            catalog_policy(&shrunk_sample()),
+            CatalogPolicy::Shrunk { admitted: 7 }
+        );
+        assert_eq!(
+            render_skills(&shrunk_sample(), CatalogPolicy::Shrunk { admitted: 7 }),
+            SKILLS_SHRUNK_TXT
+        );
+    }
+
     /// The policy only changes the rendering; a delta against a compact
     /// catalog still reports added/changed/removed, but its entry lines carry
     /// no descriptions.
@@ -1812,6 +2101,14 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&value).unwrap(),
             r#"{"kind":"skills","skills":[],"policy":"compact"}"#
+        );
+        let shrunk = SourceValue::Skills {
+            skills: vec![],
+            policy: CatalogPolicy::Shrunk { admitted: 3 },
+        };
+        assert_eq!(
+            serde_json::to_string(&shrunk).unwrap(),
+            r#"{"kind":"skills","skills":[],"policy":{"shrunk":{"admitted":3}}}"#
         );
     }
 
@@ -1845,6 +2142,27 @@ mod tests {
             let observed = gather(dir.path(), home.path(), None, None);
             assert_eq!(skills_policy(&observed), CatalogPolicy::Full);
             write(&"x".repeat(9000));
+            let observed = gather(dir.path(), home.path(), None, None);
+            assert_eq!(
+                skills_policy(&observed),
+                CatalogPolicy::Shrunk { admitted: 1 }
+            );
+            for index in 0..900 {
+                let deep = dir
+                    .path()
+                    .join(".ox")
+                    .join("skills")
+                    .join(format!("s{index:03}"));
+                std::fs::create_dir_all(&deep).unwrap();
+                std::fs::write(
+                    deep.join("SKILL.md"),
+                    format!(
+                        "---\nname: s{index:03}\ndescription: {}\n---\nbody\n",
+                        "x".repeat(9000)
+                    ),
+                )
+                .unwrap();
+            }
             let observed = gather(dir.path(), home.path(), None, None);
             assert_eq!(skills_policy(&observed), CatalogPolicy::Compact);
         });
@@ -2030,6 +2348,10 @@ mod tests {
     const SKILLS_COMPACT_TXT: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/prompt/skills-compact.txt"
+    ));
+    const SKILLS_SHRUNK_TXT: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/prompt/skills-shrunk.txt"
     ));
     const INSTRUCTION_FILES_TXT: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
