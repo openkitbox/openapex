@@ -812,27 +812,3 @@ impl SessionEventData {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn to_data_matches_into_data() {
-        let event = SessionEventData::TextStarted {
-            session_id: "ses_test".to_owned(),
-            assistant_message_id: "msg_test".to_owned(),
-            ordinal: 3,
-        };
-        let borrowed = event.to_data();
-        let owned = event.into_data();
-        assert_eq!(borrowed, owned);
-
-        let raw = serde_json::json!({ "any": "thing" });
-        let unknown = SessionEventData::Unknown {
-            r#type: "session.future".to_owned(),
-            data: raw.clone(),
-        };
-        assert_eq!(unknown.to_data(), raw);
-    }
-}

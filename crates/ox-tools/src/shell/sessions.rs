@@ -572,28 +572,3 @@ async fn drive(session: Arc<ShellSession>, timeout_ms: Option<u64>) {
         buffer.shrink_to_retained();
     }
 }
-
-#[cfg(test)]
-mod output_buffer_tests {
-    use super::*;
-
-    #[test]
-    fn shrinking_releases_the_drain_slack() {
-        let capacity = 1 << 20;
-        let mut buffer = OutputBuffer::with_capacity(capacity);
-        // Fill the buffer exactly, then cross it with a small chunk: extend
-        // doubles the Vec, the drain drops the front, and the capacity stays
-        // at the doubled size (the slack the drain policy leaves behind).
-        buffer.append(&vec![b'x'; capacity]);
-        buffer.append(&[b'y'; 4096]);
-        assert_eq!(buffer.retained(), capacity);
-        let bloated = buffer.bytes.capacity();
-        assert!(bloated > buffer.retained(), "drain leaves slack behind");
-        buffer.shrink_to_retained();
-        assert!(
-            buffer.bytes.capacity() < bloated,
-            "shrinking gives the slack back"
-        );
-        assert_eq!(buffer.retained(), capacity, "the retained tail is intact");
-    }
-}

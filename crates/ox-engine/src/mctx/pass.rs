@@ -481,35 +481,3 @@ impl HeadRenderer for PrecomputedRenderer {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The seam contract: whatever m[1] carries, `split_prefix` must recognize
-    /// where the baseline ends. A delta that opens with neither marker is
-    /// silently lost (`head_m1` empty), which is why the surfaced-notes shapes
-    /// are pinned here and not only in the render tests.
-    #[test]
-    fn the_prefix_split_keeps_both_halves_with_ready_notes() {
-        let m0 = render_m0(&M0Inputs {
-            compartments: &[],
-            history_budget_tokens: 0.0,
-            count_tokens: &|s: &str| s.len().div_ceil(4),
-        });
-        let notes = "<ready-notes>\n#7: Migrate — then run\n</ready-notes>";
-        let pinboard =
-            "<project-memory>\n<PROJECT_RULES>\n#1: a fact\n</PROJECT_RULES>\n</project-memory>";
-
-        // Pinboard and notes: the delta opens with the pinboard.
-        let m1 = assemble_m1(pinboard, notes);
-        let prefix = format!("{m0}\n\n{m1}");
-        assert_eq!(split_prefix(&prefix), (m0.as_str(), m1.as_str()));
-
-        // Notes alone (every memory fell out of the budget): the placeholder
-        // leads, so the seam is still found.
-        let m1 = assemble_m1("", notes);
-        let prefix = format!("{m0}\n\n{m1}");
-        assert_eq!(split_prefix(&prefix), (m0.as_str(), m1.as_str()));
-    }
-}

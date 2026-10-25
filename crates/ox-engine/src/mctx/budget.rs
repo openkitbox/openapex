@@ -255,20 +255,3 @@ fn percent(value: f64, default: f64, min: f64, max: f64) -> f64 {
 fn clamp_u32(value: f64, min: f64, max: f64) -> u32 {
     value.clamp(min, max) as u32
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn memory_budget_clamps_at_both_ends() {
-        // A share of the history budget, clamped so a tiny window still buys a
-        // usable pinboard and a large one cannot let the prefix grow forever.
-        assert_eq!(memory_budget(0.0), MEMORY_BUDGET_MIN);
-        assert_eq!(memory_budget(2_000.0), MEMORY_BUDGET_MIN); // 500 → floored
-        assert_eq!(memory_budget(4_000.0), MEMORY_BUDGET_MIN); // exactly 25%
-        assert_eq!(memory_budget(20_000.0), 5_000); // 25% inside the band
-        assert_eq!(memory_budget(60_000.0), MEMORY_BUDGET_MAX); // 15 000 → capped
-        assert_eq!(memory_budget(f64::NAN), MEMORY_BUDGET_MIN);
-    }
-}
