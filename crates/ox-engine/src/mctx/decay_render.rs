@@ -42,29 +42,29 @@ use crate::mctx::decay::{DecayInput, compute_budget_pressure, rendered_tier};
 /// The minimal compartment shape the renderer needs. `p1..p4` are the
 /// paraphrase tiers (None / empty = not a v2-tiered row); `legacy = Some(1)`
 /// marks a pre-v2 flat-content row; `importance` defaults to 50 when absent.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 #[cfg_attr(test, derive(serde::Deserialize))]
-pub struct DecayRenderCompartment {
+pub struct DecayRenderCompartment<'a> {
     /// First message index the compartment covers.
     pub start_message: i64,
     /// Last message index the compartment covers.
     pub end_message: i64,
     /// Historian-authored heading title.
-    pub title: String,
+    pub title: &'a str,
     /// Flat body (legacy rows, and the fallback for malformed tier rows).
-    pub content: String,
+    pub content: &'a str,
     /// Start date (YYYY-MM-DD) of the covered span.
-    pub start_date: Option<String>,
+    pub start_date: Option<&'a str>,
     /// End date (YYYY-MM-DD) of the covered span.
-    pub end_date: Option<String>,
+    pub end_date: Option<&'a str>,
     /// Paraphrase tier P1 (most verbose).
-    pub p1: Option<String>,
+    pub p1: Option<&'a str>,
     /// Paraphrase tier P2.
-    pub p2: Option<String>,
+    pub p2: Option<&'a str>,
     /// Paraphrase tier P3.
-    pub p3: Option<String>,
+    pub p3: Option<&'a str>,
     /// Paraphrase tier P4 (most compressed body).
-    pub p4: Option<String>,
+    pub p4: Option<&'a str>,
     /// 1..100 emitted importance (decay rate); 50 when absent.
     pub importance: Option<i32>,
     /// `Some(1)` marks a pre-v2 flat-content row (deterministic truncation
@@ -72,15 +72,15 @@ pub struct DecayRenderCompartment {
     pub legacy: Option<i32>,
 }
 
-impl DecayRenderCompartment {
+impl DecayRenderCompartment<'_> {
     /// Empty payload rows advance coverage but are not summaries or decay
     /// inputs.
     pub fn is_no_content(&self) -> bool {
         self.title.is_empty()
             && self.content.is_empty()
-            && [&self.p1, &self.p2, &self.p3, &self.p4]
+            && [self.p1, self.p2, self.p3, self.p4]
                 .iter()
-                .all(|p| p.as_deref().unwrap_or("").is_empty())
+                .all(|p| p.unwrap_or("").is_empty())
     }
 }
 
@@ -139,8 +139,8 @@ fn sanitize_compartment_title(title: &str) -> String {
     escape_xml_content(&single_line)
 }
 
-fn compartment_heading(c: &DecayRenderCompartment) -> String {
-    let date_range = format_date_range(c.start_date.as_deref(), c.end_date.as_deref());
+fn compartment_heading(c: &DecayRenderCompartment<'_>) -> String {
+    let date_range = format_date_range(c.start_date, c.end_date);
     let date_segment = if date_range.is_empty() {
         String::new()
     } else {
@@ -150,7 +150,7 @@ fn compartment_heading(c: &DecayRenderCompartment) -> String {
         "## {}-{}{date_segment} · {}",
         c.start_message,
         c.end_message,
-        sanitize_compartment_title(&c.title)
+        sanitize_compartment_title(c.title)
     )
 }
 
@@ -172,20 +172,15 @@ fn guard_compartment_body(body: &str) -> String {
 /// `content`, never as an empty tier body. A VALID v2 row can still have an
 /// empty `p4` (a legitimate title-only heading); that is handled by the
 /// tier-body path, since such a row has a non-empty `p1`.
-fn is_tiered_row(c: &DecayRenderCompartment) -> bool {
-    c.p1.as_deref().is_some_and(|p| !p.is_empty())
+fn is_tiered_row(c: &DecayRenderCompartment<'_>) -> bool {
+    c.p1.is_some_and(|p| !p.is_empty())
 }
 
 /// The v2 paraphrase tier body, with denser-tier and content fallbacks: the
 /// requested tier if present, else the densest populated denser tier, else
 /// flat content.
-fn tier_body(c: &DecayRenderCompartment, tier: u8) -> String {
-    let tiers = [
-        c.p1.as_deref(),
-        c.p2.as_deref(),
-        c.p3.as_deref(),
-        c.p4.as_deref(),
-    ];
+fn tier_body(c: &DecayRenderCompartment<'_>, tier: u8) -> String {
+    let tiers = [c.p1, c.p2, c.p3, c.p4];
     let idx = (tier as usize).saturating_sub(1);
     if let Some(requested) = tiers.get(idx).copied().flatten() {
         return requested.trim().to_string();
@@ -206,21 +201,20 @@ fn tier_body(c: &DecayRenderCompartment, tier: u8) -> String {
 /// scalar: a cut inside an astral scalar drops the whole scalar instead of
 /// keeping a lone surrogate (see the module docs).
 fn truncate_with_ellipsis(content: &str, max: usize) -> String {
-    let units = content.encode_utf16().collect::<Vec<_>>();
+    let mut units = content.encode_utf16().collect::<Vec<_>>();
     if units.len() <= max {
         return content.to_string();
     }
-    let mut prefix_units = units[..max].to_vec();
+    units.truncate(max);
     // `encode_utf16` only ever pairs a low surrogate after a high one, so a cut
     // can leave a high surrogate (never a lone low) at the end.
-    if prefix_units
+    if units
         .last()
         .is_some_and(|unit| (0xD800..=0xDBFF).contains(unit))
     {
-        prefix_units.pop();
+        units.pop();
     }
-    let prefix = String::from_utf16(&prefix_units)
-        .unwrap_or_else(|_| String::from_utf16_lossy(&prefix_units));
+    let prefix = String::from_utf16(&units).unwrap_or_else(|_| String::from_utf16_lossy(&units));
     format!("{}…", prefix.trim_end())
 }
 
@@ -237,7 +231,7 @@ fn legacy_body_for_tier(content: &str, tier: u8) -> String {
 }
 
 /// Legacy compartments start at P3 if the body has a `U:` line, else P4.
-fn legacy_tier(c: &DecayRenderCompartment) -> u8 {
+fn legacy_tier(c: &DecayRenderCompartment<'_>) -> u8 {
     if c.content.lines().any(|l| l.starts_with("U:")) {
         3
     } else {
@@ -248,11 +242,11 @@ fn legacy_tier(c: &DecayRenderCompartment) -> u8 {
 /// Render a single compartment at an explicit tier. Exposed for the m1 "new
 /// compartments" block, which always renders newest compartments at P1 (full
 /// fidelity — no decay applies to brand-new deltas).
-pub fn render_compartment_at_tier(c: &DecayRenderCompartment, tier: u8) -> String {
+pub fn render_compartment_at_tier(c: &DecayRenderCompartment<'_>, tier: u8) -> String {
     render_one_compartment(c, tier)
 }
 
-fn render_one_compartment(c: &DecayRenderCompartment, tier: u8) -> String {
+fn render_one_compartment(c: &DecayRenderCompartment<'_>, tier: u8) -> String {
     if c.is_no_content() || tier >= 5 {
         return String::new(); // archived
     }
@@ -287,7 +281,7 @@ fn render_one_compartment(c: &DecayRenderCompartment, tier: u8) -> String {
 /// governed by deterministic truncation, not the curve, and are EXCLUDED from
 /// the pressure inputs so unrelated legacy cost can't demote v2 paraphrases
 /// (budget honesty for mixed sessions).
-fn compute_tiers(compartments: &[DecayRenderCompartment], history_budget: f64) -> Vec<u8> {
+fn compute_tiers(compartments: &[DecayRenderCompartment<'_>], history_budget: f64) -> Vec<u8> {
     let v2_indices: Vec<usize> = compartments
         .iter()
         .enumerate()
@@ -340,7 +334,7 @@ fn compute_tiers(compartments: &[DecayRenderCompartment], history_budget: f64) -
 /// a drift guard, measured by the injected `estimate_tokens`. Never renders
 /// session facts (v2 faithful).
 pub fn render_decayed_compartments(
-    compartments: &[DecayRenderCompartment],
+    compartments: &[DecayRenderCompartment<'_>],
     history_budget_tokens: f64,
     estimate_tokens: impl Fn(&str) -> usize,
 ) -> String {
@@ -355,7 +349,7 @@ pub fn render_decayed_compartments(
         filtered = compartments
             .iter()
             .filter(|c| !c.is_no_content())
-            .cloned()
+            .copied()
             .collect::<Vec<_>>();
         filtered.as_slice()
     } else {

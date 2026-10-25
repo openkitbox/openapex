@@ -235,6 +235,15 @@ pub struct CompactionMessage {
     pub compaction: Compaction,
 }
 
+impl CompactionMessage {
+    /// Encode for the `session_message.data` column without re-wrapping the
+    /// value in [`Message`]; byte-identical to
+    /// `Message::Compaction(msg).to_row_data()`.
+    pub fn row_data(&self) -> serde_json::Value {
+        row_data_of(self)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Location-switch blocks
 // ---------------------------------------------------------------------------
@@ -386,6 +395,27 @@ pub struct AssistantMessage {
     pub error: Option<SessionError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<AssistantRetry>,
+}
+
+impl AssistantMessage {
+    /// Encode for the `session_message.data` column without re-wrapping the
+    /// value in [`Message`] (which would require a full clone); byte-identical
+    /// to `Message::Assistant(Box::new(msg.clone())).to_row_data()`.
+    pub fn row_data(&self) -> serde_json::Value {
+        row_data_of(self)
+    }
+}
+
+/// Serialize a concrete message variant into the `session_message.data`
+/// shape: the variant's own JSON minus `id`. The `type` tag lives on the
+/// [`Message`] union (`#[serde(tag = "type")]`), so a concrete variant
+/// never carries it.
+fn row_data_of<T: Serialize>(message: &T) -> serde_json::Value {
+    let mut value = serde_json::to_value(message).unwrap_or(serde_json::Value::Null);
+    if let serde_json::Value::Object(map) = &mut value {
+        map.remove("id");
+    }
+    value
 }
 
 /// Upstream `Session.Message.Idle` `outcome` literal union.

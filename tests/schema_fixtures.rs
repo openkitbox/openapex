@@ -318,6 +318,74 @@ fn message_row_data_split_matches_upstream() {
     });
 }
 
+#[test]
+fn borrowed_row_data_matches_union_encoding() {
+    // `row_data()` on the concrete variants must encode exactly what the
+    // tagged union's `to_row_data()` produces (message JSON minus `id` and
+    // `type`), so the projector can encode a message it already owns
+    // instead of cloning it back into the union first.
+    let fixtures = [
+        // message_assistant_full(), reduced to the fields that matter here.
+        json!({
+            "type": "assistant",
+            "id": "msg_10",
+            "time": { "created": 1700000000000_i64, "streamed": 1700000001000_i64, "completed": 1700000002000_i64 },
+            "agent": "orchestrator",
+            "model": { "id": "k3-256k", "providerID": "cardinal" },
+            "content": [
+                { "type": "text", "text": "thinking...", "state": { "anthropic": { "signature": "sig" } } },
+                { "type": "reasoning", "text": "hmm", "time": { "created": 1700000000100_i64, "completed": 1700000000500_i64 } },
+                {
+                    "type": "tool",
+                    "id": "tool_01",
+                    "name": "shell",
+                    "executed": true,
+                    "state": { "status": "completed", "input": { "command": "ls" }, "content": [], "metadata": {} },
+                    "time": { "created": 1700000000600_i64, "ran": 1700000000700_i64, "completed": 1700000000800_i64 }
+                }
+            ],
+            "finish": "tool-calls",
+            "rawFinish": "tool_calls",
+            "cost": 0.0123,
+            "tokens": { "input": 100, "output": 50, "reasoning": 25, "cache": { "read": 10, "write": 5 } }
+        }),
+        // message_compaction_completed()
+        json!({
+            "type": "compaction",
+            "id": "msg_12",
+            "time": { "created": 1700000000000_i64 },
+            "status": "completed",
+            "reason": "manual",
+            "model": { "id": "k3-256k", "providerID": "cardinal", "variant": "high" },
+            "summary": "conversation so far...",
+            "recent": "[]",
+            "cost": 0.001,
+            "tokens": { "input": 1, "output": 2, "reasoning": 0, "cache": { "read": 0, "write": 0 } }
+        }),
+    ];
+
+    for fixture in fixtures {
+        let message: Message = serde_json::from_value(fixture).unwrap();
+        let borrowed = match &message {
+            Message::Assistant(msg) => msg.row_data(),
+            Message::Compaction(msg) => msg.row_data(),
+            other => panic!("unexpected variant: {}", other.kind()),
+        };
+        assert_eq!(
+            borrowed,
+            message.to_row_data(),
+            "borrowed row_data differs from union encoding"
+        );
+
+        // The row split must still round-trip through id + type + data.
+        let restored = Message::from_row_data(message.id(), message.kind(), borrowed).unwrap();
+        assert_eq!(
+            serde_json::to_value(&restored).unwrap(),
+            serde_json::to_value(&message).unwrap()
+        );
+    }
+}
+
 // ===========================================================================
 // Inbox — Item + Info
 // ===========================================================================

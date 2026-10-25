@@ -903,18 +903,18 @@ pub struct ReferenceSeed {
 /// The compartment fields the reference block renders
 /// (`historian_prompt.rs::ReferenceCompartment`). Task 6b/9 maps ox's
 /// [`Compartment`](crate::mctx::compartments::Compartment) onto this.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ReferenceCompartment {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReferenceCompartment<'a> {
     pub start_message: i64,
     pub end_message: i64,
-    pub title: String,
-    pub content: String,
-    pub p1: Option<String>,
-    pub p2: Option<String>,
-    pub p3: Option<String>,
-    pub p4: Option<String>,
+    pub title: &'a str,
+    pub content: &'a str,
+    pub p1: Option<&'a str>,
+    pub p2: Option<&'a str>,
+    pub p3: Option<&'a str>,
+    pub p4: Option<&'a str>,
     pub importance: Option<i32>,
-    pub episode_type: Option<String>,
+    pub episode_type: Option<&'a str>,
 }
 
 /// The two calibration blocks of the historian prompt
@@ -1087,11 +1087,10 @@ pub fn render_seed_examples_block(seeds: &[ReferenceSeed]) -> String {
 /// `historian_prompt.rs::render_session_ref_compartment`: episode type is
 /// always shown, importance only on the diverse (older) examples — the newest
 /// scores cause anchoring in one-compartment runs.
-pub fn render_session_ref_compartment(c: &ReferenceCompartment, show_importance: bool) -> String {
+pub fn render_session_ref_compartment(c: &ReferenceCompartment<'_>, show_importance: bool) -> String {
     let importance = c.importance.unwrap_or(50);
     let episode_type = c
         .episode_type
-        .as_deref()
         .filter(|value| !value.is_empty())
         .map(|value| format!(" episode_type=\"{}\"", escape_xml_attr(value)))
         .unwrap_or_default();
@@ -1099,7 +1098,7 @@ pub fn render_session_ref_compartment(c: &ReferenceCompartment, show_importance:
         "start=\"{}\" end=\"{}\" title=\"{}\"{}{}",
         c.start_message,
         c.end_message,
-        escape_xml_attr(&c.title),
+        escape_xml_attr(c.title),
         episode_type,
         if show_importance {
             format!(" importance=\"{importance}\"")
@@ -1108,9 +1107,9 @@ pub fn render_session_ref_compartment(c: &ReferenceCompartment, show_importance:
         }
     );
 
-    if c.p1.as_deref().is_some_and(|p1| !p1.is_empty()) {
+    if c.p1.is_some_and(|p1| !p1.is_empty()) {
         let p4 =
-            c.p4.as_deref()
+            c.p4
                 .filter(|p4| !p4.is_empty())
                 .map(|p4| format!("<p4>\n{}\n</p4>", escape_xml_content(p4)))
                 .unwrap_or_else(|| "<p4/>".to_string());
@@ -1118,15 +1117,15 @@ pub fn render_session_ref_compartment(c: &ReferenceCompartment, show_importance:
             format!("<compartment {attrs}>"),
             format!(
                 "<p1>\n{}\n</p1>",
-                escape_xml_content(c.p1.as_deref().unwrap_or_default())
+                escape_xml_content(c.p1.unwrap_or_default())
             ),
             format!(
                 "<p2>\n{}\n</p2>",
-                escape_xml_content(c.p2.as_deref().unwrap_or_default())
+                escape_xml_content(c.p2.unwrap_or_default())
             ),
             format!(
                 "<p3>\n{}\n</p3>",
-                escape_xml_content(c.p3.as_deref().unwrap_or_default())
+                escape_xml_content(c.p3.unwrap_or_default())
             ),
             p4,
             "</compartment>".to_string(),
@@ -1136,28 +1135,28 @@ pub fn render_session_ref_compartment(c: &ReferenceCompartment, show_importance:
 
     format!(
         "<compartment {attrs}>\n{}\n</compartment>",
-        escape_xml_content(&c.content)
+        escape_xml_content(c.content)
     )
 }
 
 /// `historian_prompt.rs::is_no_content_compartment`.
-fn is_no_content_compartment(c: &ReferenceCompartment) -> bool {
+fn is_no_content_compartment(c: &ReferenceCompartment<'_>) -> bool {
     c.title.is_empty()
         && c.content.is_empty()
-        && [&c.p1, &c.p2, &c.p3, &c.p4]
+        && [c.p1, c.p2, c.p3, c.p4]
             .iter()
-            .all(|p| p.as_deref().unwrap_or("").is_empty())
+            .all(|p| p.unwrap_or("").is_empty())
 }
 
 /// `historian_prompt.rs::select_session_references`: the recent window first
 /// (chronological), then the least-represented older bands. The input must be
 /// chronological.
-pub fn select_session_references(
-    all_compartments: &[ReferenceCompartment],
+pub fn select_session_references<'a>(
+    all_compartments: &[ReferenceCompartment<'a>],
     seeds: &[ReferenceSeed],
     session_id: &str,
     chunk_start: i64,
-) -> Vec<ReferenceCompartment> {
+) -> Vec<ReferenceCompartment<'a>> {
     let eligible: Vec<_> = all_compartments
         .iter()
         .filter(|c| !is_no_content_compartment(c))
@@ -1191,8 +1190,8 @@ pub fn select_session_references(
     picks.sort_unstable();
     picks
         .into_iter()
-        .map(|i| eligible[i].clone())
-        .chain(recent.iter().map(|c| (*c).clone()))
+        .map(|i| *eligible[i])
+        .chain(recent.iter().map(|c| **c))
         .collect()
 }
 
@@ -1200,7 +1199,7 @@ pub fn select_session_references(
 /// examples before recent ones, then the oldest recent first. Select once
 /// before fitting so trimming never reshuffles the examples.
 pub fn render_session_references_block_window(
-    selected: &[ReferenceCompartment],
+    selected: &[ReferenceCompartment<'_>],
     window: usize,
 ) -> String {
     let window = window.min(SESSION_REF_LIMIT);
@@ -1228,7 +1227,7 @@ pub fn render_session_references_block_window(
 }
 
 /// `historian_prompt.rs::render_session_references_block`.
-pub fn render_session_references_block(selected: &[ReferenceCompartment]) -> String {
+pub fn render_session_references_block(selected: &[ReferenceCompartment<'_>]) -> String {
     render_session_references_block_window(selected, SESSION_REF_LIMIT)
 }
 
@@ -1237,7 +1236,7 @@ pub fn render_session_references_block(selected: &[ReferenceCompartment]) -> Str
 pub fn build_reference_blocks(
     session_id: &str,
     chunk_start: i64,
-    session_compartments: &[ReferenceCompartment],
+    session_compartments: &[ReferenceCompartment<'_>],
 ) -> ReferenceBlocks {
     let seeds = select_seeds(session_id, chunk_start, SEED_FLOOR);
     ReferenceBlocks {

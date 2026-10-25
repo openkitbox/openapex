@@ -19,7 +19,7 @@ use ox_schema::message::{
 };
 use ox_schema::support::{FinishReason, ModelRef, Record};
 
-use super::{apply_usage, insert_message, touch};
+use super::{apply_usage, insert_message, insert_message_row, touch};
 
 /// One optional row: rusqlite's `query_row(..).optional()` shape, on turso.
 /// `QueryReturnedNoRows` is the only error mapped to `None`, so a real failure
@@ -51,13 +51,11 @@ async fn close_assistant_in_place(
     session_id: &str,
     msg: &AssistantMessage,
 ) -> Result<()> {
-    let data = Message::Assistant(Box::new(msg.clone()))
-        .to_row_data()
-        .to_string();
+    let data = msg.row_data().to_string();
     tx.execute(
         "UPDATE session_message SET data = ?3, time_updated = ?4
          WHERE id = ?1 AND session_id = ?2",
-        (msg.id.as_str(), session_id, data, msg.time.created),
+        (msg.id.as_str(), session_id, data.as_str(), msg.time.created),
     )
     .await?;
     Ok(())
@@ -129,20 +127,26 @@ async fn store_assistant(
     message_id: &str,
     msg: &AssistantMessage,
 ) -> Result<()> {
-    let data = Message::Assistant(Box::new(msg.clone()))
-        .to_row_data()
-        .to_string();
+    let data = msg.row_data().to_string();
     // UPDATE existing; INSERT if absent (mirrors upstream upsert behaviour).
     let n = tx
         .execute(
             "UPDATE session_message SET seq = ?3, data = ?4, time_updated = ?5
              WHERE id = ?1 AND session_id = ?2",
-            (message_id, session_id, seq, data, msg.time.created),
+            (message_id, session_id, seq, data.as_str(), msg.time.created),
         )
         .await?;
     if n == 0 {
-        let m = Message::Assistant(Box::new(msg.clone()));
-        insert_message(tx, session_id, seq, &m).await?;
+        insert_message_row(
+            tx,
+            session_id,
+            seq,
+            message_id,
+            "assistant",
+            msg.time.created,
+            &data,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -236,16 +240,25 @@ async fn store_compaction(
     seq: i64,
     msg: &CompactionMessage,
 ) -> Result<()> {
-    let data = Message::Compaction(msg.clone()).to_row_data().to_string();
+    let data = msg.row_data().to_string();
     let n = tx
         .execute(
             "UPDATE session_message SET seq = ?3, data = ?4, time_updated = ?5
              WHERE id = ?1 AND session_id = ?2",
-            (msg.id.as_str(), session_id, seq, data, msg.time.created),
+            (msg.id.as_str(), session_id, seq, data.as_str(), msg.time.created),
         )
         .await?;
     if n == 0 {
-        insert_message(tx, session_id, seq, &Message::Compaction(msg.clone())).await?;
+        insert_message_row(
+            tx,
+            session_id,
+            seq,
+            &msg.id,
+            "compaction",
+            msg.time.created,
+            &data,
+        )
+        .await?;
     }
     Ok(())
 }

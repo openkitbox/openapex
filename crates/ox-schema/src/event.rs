@@ -660,6 +660,15 @@ pub enum SessionEventData {
     },
 }
 
+/// Take the `data` member out of an internally-tagged adapter object without
+/// cloning the subtree (`{"type": .., "data": ..}` → the `data` value).
+fn take_data(mut adapter: Value) -> Value {
+    match &mut adapter {
+        Value::Object(map) => map.remove("data").unwrap_or(Value::Null),
+        _ => Value::Null,
+    }
+}
+
 impl SessionEventData {
     /// Parse a typed event from the envelope parts (`type` string + `data`).
     ///
@@ -744,7 +753,7 @@ impl SessionEventData {
             return data;
         }
         let adapter = serde_json::to_value(&self).unwrap_or(Value::Null);
-        adapter.get("data").cloned().unwrap_or(Value::Null)
+        take_data(adapter)
     }
 
     /// The borrowed twin of [`Self::into_data`]: publishers that keep the
@@ -755,7 +764,7 @@ impl SessionEventData {
             return data.clone();
         }
         let adapter = serde_json::to_value(self).unwrap_or(Value::Null);
-        adapter.get("data").cloned().unwrap_or(Value::Null)
+        take_data(adapter)
     }
 
     /// The session this event belongs to, when the variant carries it.

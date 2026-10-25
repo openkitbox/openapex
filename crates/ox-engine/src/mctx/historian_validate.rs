@@ -426,7 +426,7 @@ pub fn validate_historian_output(
         )));
     }
     if let Some(last) = prior_compartments.last()
-        && let Some(expected_start) = next_present_after(&present_ordinals, last.end)
+        && let Some(expected_start) = next_present_after(present_ordinals, last.end)
         && chunk.start_ordinal != expected_start
     {
         return Err(validation_error(format!(
@@ -445,13 +445,13 @@ pub fn validate_historian_output(
     heal_compartment_gaps(
         &mut parsed.compartments,
         chunk.tool_only_ranges,
-        &present_ordinals,
+        present_ordinals,
     );
     heal_terminal_completed_tool_arc(
         &mut parsed.compartments,
         &mut parsed.unprocessed_from,
         chunk.completed_tool_arcs,
-        &present_ordinals,
+        present_ordinals,
         chunk.end_ordinal,
     );
 
@@ -466,7 +466,7 @@ pub fn validate_historian_output(
         &parsed.compartments,
         chunk.start_ordinal,
         chunk.end_ordinal,
-        &present_ordinals,
+        present_ordinals,
         parsed.unprocessed_from,
     ) {
         return Err(validation_error(format!(
@@ -590,11 +590,14 @@ pub fn validate_stored_compartments(compartments: &[MessageRange]) -> Option<Str
     None
 }
 
-fn chunk_present_ordinals(chunk: &ChunkView<'_>) -> Vec<i64> {
+/// Every ordinal the chunk must cover, borrowed from the chunk view: the
+/// present set when the caller knows it, otherwise the dense line set.
+fn chunk_present_ordinals<'a>(chunk: &ChunkView<'a>) -> &'a [i64] {
     if !chunk.present_ordinals.is_empty() {
-        return chunk.present_ordinals.to_vec();
+        chunk.present_ordinals
+    } else {
+        chunk.line_ordinals
     }
-    chunk.line_ordinals.to_vec()
 }
 
 fn validate_strictly_increasing_ordinals(ordinals: &[i64], label: &str) -> Option<String> {
@@ -629,8 +632,8 @@ fn validate_chunk_coverage(chunk: &ChunkView<'_>) -> Option<String> {
 }
 
 fn validate_dense_chunk_coverage(chunk: &ChunkView<'_>) -> Option<String> {
-    let line_ordinals: Vec<i64> = chunk.line_ordinals.to_vec();
-    if let Some(error) = validate_strictly_increasing_ordinals(&line_ordinals, "chunk lines") {
+    let line_ordinals = chunk.line_ordinals;
+    if let Some(error) = validate_strictly_increasing_ordinals(line_ordinals, "chunk lines") {
         return Some(error);
     }
     if line_ordinals.is_empty() {
@@ -638,7 +641,7 @@ fn validate_dense_chunk_coverage(chunk: &ChunkView<'_>) -> Option<String> {
     }
 
     let mut expected_ordinal = chunk.start_ordinal;
-    for ordinal in &line_ordinals {
+    for ordinal in line_ordinals {
         if *ordinal != expected_ordinal {
             return Some(format!(
                 "chunk omits raw message {expected_ordinal} while still claiming coverage through {}",
@@ -666,8 +669,8 @@ fn validate_chunk_coverage_against(
         return Some(error);
     }
 
-    let line_ordinals: Vec<i64> = chunk.line_ordinals.to_vec();
-    if let Some(error) = validate_strictly_increasing_ordinals(&line_ordinals, "chunk lines") {
+    let line_ordinals = chunk.line_ordinals;
+    if let Some(error) = validate_strictly_increasing_ordinals(line_ordinals, "chunk lines") {
         return Some(error);
     }
 

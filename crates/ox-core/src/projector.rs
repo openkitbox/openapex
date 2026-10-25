@@ -600,18 +600,35 @@ pub(crate) async fn insert_message(
     message: &Message,
 ) -> Result<()> {
     let data = message.to_row_data().to_string();
+    insert_message_row(
+        tx,
+        session_id,
+        seq,
+        message.id(),
+        message.kind(),
+        message.time_created(),
+        &data,
+    )
+    .await
+}
+
+/// Insert a message row from values the caller already has, so a caller
+/// holding a concrete variant can avoid re-wrapping it in [`Message`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn insert_message_row(
+    tx: &Connection,
+    session_id: &str,
+    seq: i64,
+    id: &str,
+    kind: &str,
+    time_created: i64,
+    data: &str,
+) -> Result<()> {
     tx.execute(
         "INSERT INTO session_message
          (id, session_id, type, seq, time_created, time_updated, data)
          VALUES (?1,?2,?3,?4,?5,?5,?6)",
-        (
-            message.id(),
-            session_id,
-            message.kind(),
-            seq,
-            message.time_created(),
-            data,
-        ),
+        (id, session_id, kind, seq, time_created, data),
     )
     .await?;
     Ok(())

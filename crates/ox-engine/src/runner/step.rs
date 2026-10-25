@@ -1849,7 +1849,7 @@ async fn sync_instructions(
     }
     let mut baselines = super::lock(&ctx.instruction_baselines);
     if let Some(baseline) = baselines.get_mut(&ctx.session_id) {
-        instructions::apply(&deltas, baseline);
+        instructions::apply(deltas, baseline);
     }
     Some(text)
 }

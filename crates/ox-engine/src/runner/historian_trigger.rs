@@ -502,7 +502,7 @@ impl Firing<'_> {
             ..
         } = self;
         let compartments = compartments::load(db, session_id).await?;
-        let references: Vec<historian::ReferenceCompartment> = compartments
+        let references: Vec<historian::ReferenceCompartment<'_>> = compartments
             .iter()
             .map(Compartment::reference_input)
             .collect();

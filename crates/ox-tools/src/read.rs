@@ -409,10 +409,12 @@ fn list_page(path: &str, absolute: &Path, page: &Page) -> ToolOutput {
         // Upstream locale-compares; plain byte order for the ASCII case.
         _ => left.0.cmp(&right.0),
     });
-    let start = page.offset.saturating_sub(1);
-    let selected: Vec<&(String, bool)> = visible.iter().skip(start).take(page.limit).collect();
-    let truncated = start + selected.len() < visible.len();
-    let next = truncated.then(|| page.offset + selected.len());
+    let start = page.offset.saturating_sub(1).min(visible.len());
+    let end = start.saturating_add(page.limit).min(visible.len());
+    let selected_len = end - start;
+    let truncated = end < visible.len();
+    let next = truncated.then(|| page.offset + selected_len);
+    let selected: Vec<(String, bool)> = visible.drain(start..end).collect();
     let mut content = Vec::new();
     if selected.is_empty() {
         content.push(format!("Read directory {path}, 0 entries"));
@@ -423,8 +425,8 @@ fn list_page(path: &str, absolute: &Path, page: &Page) -> ToolOutput {
             page.offset + selected.len() - 1
         ));
     }
-    for (display, _) in &selected {
-        content.push(display.clone());
+    for (display, _) in selected {
+        content.push(display);
     }
     if truncated && let Some(next) = next {
         content.push(format!(

@@ -220,7 +220,7 @@ pub(crate) fn assemble_m1(memories: &str, notes: &str) -> String {
 /// show. This renderer only assembles them in order with framing.
 pub(crate) struct M0Inputs<'a> {
     /// The compartment history, chronological (oldest first).
-    pub compartments: &'a [DecayRenderCompartment],
+    pub compartments: &'a [DecayRenderCompartment<'a>],
     /// The history budget in tokens, before pressure.
     pub history_budget_tokens: f64,
     /// The session model family's token counter: what the decay guard's

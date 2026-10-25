@@ -275,7 +275,7 @@ fn apply(ctx: &ToolContext, hunks: Vec<Hunk>) -> ToolOutput {
             }
             "update" => match &change.move_to {
                 Some((move_target, move_resource)) => {
-                    let content = change.content.clone().unwrap_or_default();
+                    let content = change.content.as_deref().unwrap_or_default();
                     if let Err(error) = std::fs::write(move_target, content.as_bytes()) {
                         return failure(
                             format!("Failed to write {move_resource}"),
@@ -456,7 +456,7 @@ fn write_change(change: &Prepared) -> std::io::Result<()> {
     if let Some(parent) = change.target.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let content = change.content.clone().unwrap_or_default();
+    let content = change.content.as_deref().unwrap_or_default();
     std::fs::write(&change.target, content.as_bytes())
 }
 

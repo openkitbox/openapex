@@ -3,6 +3,7 @@
 //! baseline lives in memory per session and the wire window is folded from
 //! system-row metadata each step (a compacted-away delta re-delivers).
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use serde_json::Value;
@@ -127,12 +128,14 @@ pub(crate) fn diff(
         // What the model is believed to hold: the visible wire delta when one
         // survives in the window, else the frozen initial render.
         let believed_hash = match wire.get(source.key) {
-            Some(wire_hash) => wire_hash.clone().unwrap_or_else(|| hash(&None)),
-            None => state
-                .map(|s| s.initial_hash.clone())
-                .unwrap_or_else(|| hash(&None)),
+            Some(Some(wire_hash)) => Cow::Borrowed(wire_hash.as_str()),
+            Some(None) => Cow::Owned(hash(&None)),
+            None => match state {
+                Some(state) => Cow::Borrowed(state.initial_hash.as_str()),
+                None => Cow::Owned(hash(&None)),
+            },
         };
-        if current_hash == believed_hash {
+        if current_hash.as_str() == believed_hash.as_ref() {
             continue;
         }
         let (text, hash) = match &current {
@@ -234,7 +237,7 @@ pub(crate) fn source_records(deltas: &[Delta]) -> Vec<ox_schema::event::Instruct
 
 /// Record the emitted deltas into the baseline (delivered only; the frozen
 /// initial state never moves).
-pub(crate) fn apply(deltas: &[Delta], baseline: &mut Baseline) {
+pub(crate) fn apply(deltas: Vec<Delta>, baseline: &mut Baseline) {
     for delta in deltas {
         let state = baseline
             .sources
@@ -245,7 +248,7 @@ pub(crate) fn apply(deltas: &[Delta], baseline: &mut Baseline) {
                 delivered_hash: hash(&None),
                 delivered_value: None,
             });
-        state.delivered_hash = delta.hash.clone().unwrap_or_else(|| hash(&None));
-        state.delivered_value = delta.value.clone();
+        state.delivered_hash = delta.hash.unwrap_or_else(|| hash(&None));
+        state.delivered_value = delta.value;
     }
 }
