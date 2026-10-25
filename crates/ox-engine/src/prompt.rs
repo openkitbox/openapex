@@ -517,8 +517,7 @@ pub(crate) fn initial_text(value: &SourceValue) -> String {
 
 /// Byte accounting of one step's injection surface. Tokens are estimated with
 /// the historian's convention (`bytes / 4`, rounded up — see
-/// `crate::mctx::decay_render::estimate_tokens`); they are a scale signal, not
-/// billing.
+/// `crate::mctx::tokens::heuristic`); they are a scale signal, not billing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InjectionSizes {
     pub system0_bytes: usize,

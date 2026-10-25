@@ -46,8 +46,8 @@
 //!   `WorkspaceMembership`): ox memories are scoped to one project directory.
 //! - **The token estimator is injected** ([`crate::mctx::tokens::Counter`]):
 //!   the pass resolves the session family's exact counter once and threads it
-//!   through [`M0Inputs`]; [`crate::mctx::decay_render::estimate_tokens`] (the
-//!   bytes/4 stand-in) remains as the heuristic fallback shape.
+//!   through [`M0Inputs`]; [`crate::mctx::tokens::heuristic`] (the bytes/4
+//!   stand-in) remains as the heuristic fallback shape.
 
 use crate::mctx::decay_render::{DecayRenderCompartment, render_decayed_compartments};
 use crate::mctx::memory::{MemoryRow, ReadyNote, numeric_id};

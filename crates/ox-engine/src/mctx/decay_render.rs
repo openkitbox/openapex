@@ -30,12 +30,13 @@
 //!   allowance by a per-model prose ratio (`history_local_budget`). ox's model
 //!   catalog carries no such ratio, so the provider budget is used directly —
 //!   the reference's own `ratio == 1.0` path.
-//! - **The token estimator is injected** ([`estimate_tokens`] is ox's MVP
-//!   stand-in): the reference's real Claude-BPE estimator is its own subsystem
-//!   (a 600-line crate plus a BPE vocabulary) and a later port. With a budget
-//!   loose enough that the guard never fires, the output is
-//!   estimator-independent and purely curve-driven — which is what the golden
-//!   exercises.
+//! - **The token estimator is injected** ([`crate::mctx::tokens::Counter`]):
+//!   the pass resolves the session family's exact counter once and threads it
+//!   through [`M0Inputs`]. [`crate::mctx::tokens::heuristic`] (the bytes/4
+//!   stand-in) covers unknown families and the call sites that count text the
+//!   wire never sends verbatim. With a budget loose enough that the guard never
+//!   fires, the output is estimator-independent and purely curve-driven — which
+//!   is what the golden exercises.
 
 use crate::mctx::decay::{DecayInput, compute_budget_pressure, rendered_tier};
 
@@ -82,17 +83,6 @@ impl DecayRenderCompartment<'_> {
                 .iter()
                 .all(|p| p.unwrap_or("").is_empty())
     }
-}
-
-/// Count the tokens in `text` — ox's MVP stand-in for the reference's Claude
-/// BPE estimator (see the module docs): four bytes per token, rounded up,
-/// which is the usual English-text approximation.
-///
-/// Only [`render_decayed_compartments`]'s budget guard consumes this, and the
-/// reference's own docs note the guard is the one place a budget can be
-/// overshot — the curve itself is estimator-independent.
-pub fn estimate_tokens(text: &str) -> usize {
-    text.len().div_ceil(4)
 }
 
 fn escape_xml_content(s: &str) -> String {

@@ -135,13 +135,24 @@ impl Counter {
                 // heuristic keeps them running. Deviation from the plan
                 // sketch: no per-call warn — this is hot-path work and the
                 // failure would repeat on every row.
-                .unwrap_or_else(|_| text.len().div_ceil(4)),
+                .unwrap_or_else(|_| heuristic(text)),
             // `count_ordinary` is the golden oracle's `encode_ordinary`:
             // ordinary text only, special tokens never match.
             Counter::Exact(Backend::Tiktoken(bpe)) => bpe.count_ordinary(text),
-            Counter::Heuristic => text.len().div_ceil(4),
+            Counter::Heuristic => heuristic(text),
         }
     }
+}
+
+/// The pre-existing estimate: four bytes per token, rounded up.
+///
+/// This is the single owner of the fallback shape. [`Counter::Heuristic`] uses
+/// it for unknown families and failed loads, and the call sites that count text
+/// the wire never sends verbatim (the historian's chunk fence, the prompt
+/// injection sizes) use it directly — they have no vocab to resolve, and their
+/// numbers are a scale signal rather than billing.
+pub(crate) fn heuristic(text: &str) -> usize {
+    text.len().div_ceil(4)
 }
 
 /// One cache slot per family: the counter is built at most once per process
@@ -172,6 +183,19 @@ pub(crate) fn counter_for_model(model_id: &str) -> &'static Counter {
         Some(family) => counter_for(family),
         None => &HEURISTIC,
     }
+}
+
+/// The model's counter in the shape the budget walks already take.
+///
+/// Every walk is written against `impl Fn(&str) -> usize` (or `&dyn Fn`) and
+/// resolves its counter once at the boundary, so the two-line
+/// resolve-then-close dance was spelled out at every such call site. This is
+/// that shape: the borrow is `'static` (the counter lives in its family slot or
+/// is [`HEURISTIC`]), no text is copied, and the closure is `Sync` so it can be
+/// shared across the walks of one pass.
+pub(crate) fn counter_fn_for_model(model_id: &str) -> impl Fn(&str) -> usize + Sync + 'static {
+    let counter = counter_for_model(model_id);
+    move |text| counter.count(text)
 }
 
 /// Load the family's vocab from its `ox_home()` asset directory.

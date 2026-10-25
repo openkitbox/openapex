@@ -113,8 +113,9 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
         run_started,
         model_id,
     } = request;
-    let count = crate::mctx::tokens::counter_for_model(model_id);
-    let count_tokens = move |s: &str| count.count(s);
+    // One counter resolution per pass: the session model's family decides the
+    // token counting for every budget walk below.
+    let count_tokens = crate::mctx::tokens::counter_fn_for_model(model_id);
 
     let compartments = compartments::load(db, session_id).await?;
     let memories = active_memories(db, project).await?;

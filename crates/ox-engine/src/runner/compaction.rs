@@ -859,8 +859,7 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     // One counter resolution per fold: the session model's family decides
     // the token counting for every budget walk below.
-    let count = crate::mctx::tokens::counter_for_model(&model.id);
-    let count_tokens = move |s: &str| count.count(s);
+    let count_tokens = crate::mctx::tokens::counter_fn_for_model(&model.id);
 
     let latest = latest_seq(&ctx.db, &ctx.session_id).await?;
     let checkpoint = last_checkpoint_seq(&ctx.db, &ctx.session_id).await?;

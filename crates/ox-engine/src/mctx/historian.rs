@@ -136,9 +136,9 @@ use crate::cardinal::stream::StreamEvent;
 use crate::cardinal::wire::{ChatMessage, ChatRequest};
 use crate::mctx::budget::Budget;
 use crate::mctx::compartments::{self, NewCompartment, Tiers};
-use crate::mctx::decay_render::estimate_tokens;
 use crate::mctx::historian_validate::{self, ValidateOptions};
 use crate::mctx::memory::MemoryRow;
+use crate::mctx::tokens::heuristic;
 use ox_core::config::Config;
 use ox_schema::id::{id, now_millis};
 use ox_schema::message::{AssistantContent, Message, ToolState};
@@ -457,9 +457,9 @@ impl Builder {
         let separator_tokens = if self.lines.is_empty() {
             0
         } else {
-            estimate_tokens("\n")
+            heuristic("\n")
         };
-        let block_tokens = estimate_tokens(&text) + separator_tokens;
+        let block_tokens = heuristic(&text) + separator_tokens;
         let block_context = block_tokens + block.result_tokens;
         // The fence is absolute — it is what the model working on the tail keeps
         // verbatim — so it is tested before the oversize-first-block allowance
@@ -617,7 +617,7 @@ fn tool_state_tokens(state: &ToolState) -> usize {
         content
             .iter()
             .map(|part| match part {
-                Content::Text { text } => estimate_tokens(text),
+                Content::Text { text } => heuristic(text),
                 // A file part rides the next request as a user message, not as
                 // this message's text: counting its uri would be noise.
                 Content::File { .. } => 0,
