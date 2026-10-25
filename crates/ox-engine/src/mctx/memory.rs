@@ -1355,7 +1355,7 @@ async fn embed_inline(
     let Some(embedder) = embedder else {
         return;
     };
-    match embedder.embed_documents(&[content.to_owned()]).await {
+    match embedder.embed_documents(&[content]).await {
         Ok(mut vectors) => {
             if let Some(vector) = vectors.pop()
                 && let Err(error) = store_embedding(db, id, embedder.identity(), &vector).await

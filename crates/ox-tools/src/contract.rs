@@ -110,6 +110,11 @@ pub trait Tool: Send + Sync {
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: std::collections::BTreeMap<String, Arc<dyn Tool>>,
+    /// The advertised definitions, built on first use and invalidated by every
+    /// registration change. Definitions are pure functions of the registered
+    /// tools, and a request is assembled on every model step, so rebuilding
+    /// them per step only re-copies identical schemas.
+    definitions_cache: std::sync::OnceLock<Arc<Vec<ToolDef>>>,
     /// The handle the registered `subagent` tool shares with the runner, so
     /// the runner can attach itself the moment it exists.
     pub subagent_handle: SubagentSlot,
@@ -124,6 +129,7 @@ impl ToolRegistry {
     /// Register a tool; duplicate names are a programming error.
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<()> {
         let name = tool.name().to_owned();
+        self.definitions_cache = std::sync::OnceLock::new();
         if self.tools.insert(name.clone(), tool).is_some() {
             bail!("tool `{name}` is already registered");
         }
@@ -139,6 +145,7 @@ impl ToolRegistry {
     /// pin a toolset after `build_state_with` attaches the wiring-dependent
     /// ones (`subagent`).
     pub fn remove(&mut self, name: &str) -> bool {
+        self.definitions_cache = std::sync::OnceLock::new();
         self.tools.remove(name).is_some()
     }
 
@@ -154,6 +161,7 @@ impl ToolRegistry {
             .collect();
         Self {
             tools,
+            definitions_cache: std::sync::OnceLock::new(),
             subagent_handle: self.subagent_handle.clone(),
         }
     }
@@ -161,6 +169,7 @@ impl ToolRegistry {
     /// Bulk-register pre-built tools. Names must be unique; a duplicate is a
     /// programming error caught by debug builds (built-ins have fixed names).
     pub fn register_all(&mut self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) {
+        self.definitions_cache = std::sync::OnceLock::new();
         for tool in tools {
             let name = tool.name().to_owned();
             if self.tools.insert(name, tool.clone()).is_some() {
@@ -177,6 +186,16 @@ impl ToolRegistry {
     /// The OpenAI `tools` array in name order.
     pub fn definitions(&self) -> Vec<ToolDef> {
         self.tools.values().map(|tool| tool.definition()).collect()
+    }
+
+    /// The same array, shared rather than rebuilt. A step hands this to the
+    /// chat request by `Arc` clone, so advertising the tools costs no schema
+    /// copies once the first request has been built.
+    pub fn definitions_shared(&self) -> Arc<Vec<ToolDef>> {
+        Arc::clone(
+            self.definitions_cache
+                .get_or_init(|| Arc::new(self.definitions())),
+        )
     }
 
     /// Each registered tool's name with the guidance it contributes, in name

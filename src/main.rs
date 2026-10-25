@@ -10,7 +10,7 @@
 //! Cargo.toml so the declaration can live here.
 
 #[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+static GLOBAL: rustfs_mimalloc::MiMalloc = rustfs_mimalloc::MiMalloc;
 
 use anyhow::Result;
 #[tokio::main]

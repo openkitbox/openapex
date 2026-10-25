@@ -167,17 +167,25 @@ fn walk(root: &std::path::Path, limit: usize) -> Vec<(String, &'static str)> {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            // Skipped directories are recognised by basename, before `name` is
+            // consumed building the relative path.
+            if is_dir && FS_SKIP.contains(&name.as_str()) {
+                continue;
+            }
+            // `name` moves into the path at the top level; deeper entries have
+            // to format it into `parent/name`.
             let path = if relative.as_os_str().is_empty() {
-                name.clone()
+                name
             } else {
                 format!("{}/{name}", relative.display())
             };
             if is_dir {
-                if FS_SKIP.contains(&name.as_str()) {
-                    continue;
-                }
+                // The same string has to live in both the frontier (an owned
+                // `PathBuf` for the next `root.join`) and the result, so one
+                // copy is unavoidable: `PathBuf::from(&path)` builds the
+                // frontier's copy, the original moves into `found`.
                 frontier.push(std::path::PathBuf::from(&path));
-                found.push((path.clone(), "directory"));
+                found.push((path, "directory"));
             } else {
                 found.push((path, "file"));
             }

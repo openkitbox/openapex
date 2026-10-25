@@ -1060,17 +1060,23 @@ fn select_seed_indices(
     picks
 }
 
-/// The seeds for one run (`historian_prompt.rs::select_seeds`).
-pub fn select_seeds(session_id: &str, chunk_start: i64, count: usize) -> Vec<ReferenceSeed> {
+/// The seeds for one run (`historian_prompt.rs::select_seeds`). Borrowed from
+/// the process-wide static corpus: the examples are read-only and the run only
+/// renders them, so no seed block is copied per run.
+pub fn select_seeds(
+    session_id: &str,
+    chunk_start: i64,
+    count: usize,
+) -> Vec<&'static ReferenceSeed> {
     let corpus = reference_seeds();
     select_seed_indices(corpus, session_id, chunk_start, count)
         .into_iter()
-        .map(|idx| corpus[idx].clone())
+        .map(|idx| &corpus[idx])
         .collect()
 }
 
 /// `historian_prompt.rs::render_seed_examples_block`.
-pub fn render_seed_examples_block(seeds: &[ReferenceSeed]) -> String {
+pub fn render_seed_examples_block(seeds: &[&ReferenceSeed]) -> String {
     if seeds.is_empty() {
         return String::new();
     }
@@ -1087,7 +1093,10 @@ pub fn render_seed_examples_block(seeds: &[ReferenceSeed]) -> String {
 /// `historian_prompt.rs::render_session_ref_compartment`: episode type is
 /// always shown, importance only on the diverse (older) examples — the newest
 /// scores cause anchoring in one-compartment runs.
-pub fn render_session_ref_compartment(c: &ReferenceCompartment<'_>, show_importance: bool) -> String {
+pub fn render_session_ref_compartment(
+    c: &ReferenceCompartment<'_>,
+    show_importance: bool,
+) -> String {
     let importance = c.importance.unwrap_or(50);
     let episode_type = c
         .episode_type
@@ -1109,8 +1118,7 @@ pub fn render_session_ref_compartment(c: &ReferenceCompartment<'_>, show_importa
 
     if c.p1.is_some_and(|p1| !p1.is_empty()) {
         let p4 =
-            c.p4
-                .filter(|p4| !p4.is_empty())
+            c.p4.filter(|p4| !p4.is_empty())
                 .map(|p4| format!("<p4>\n{}\n</p4>", escape_xml_content(p4)))
                 .unwrap_or_else(|| "<p4/>".to_string());
         return [
@@ -1153,7 +1161,7 @@ fn is_no_content_compartment(c: &ReferenceCompartment<'_>) -> bool {
 /// chronological.
 pub fn select_session_references<'a>(
     all_compartments: &[ReferenceCompartment<'a>],
-    seeds: &[ReferenceSeed],
+    seeds: &[&ReferenceSeed],
     session_id: &str,
     chunk_start: i64,
 ) -> Vec<ReferenceCompartment<'a>> {
@@ -1520,11 +1528,15 @@ pub async fn run(ctx: &RunCtx<'_>, plan: &RunPlan<'_>) -> Result<Option<RunOutco
     // the next attempt's repair prompt.
     let mut repair: Option<(String, String)> = None;
     loop {
+        // The first attempt reuses the built prompt by reference; only a repair
+        // attempt has to synthesize a new one.
         let user_prompt = match &repair {
-            Some((previous, error)) => {
-                build_historian_repair_prompt(&request_prompt, previous, error)
-            }
-            None => request_prompt.clone(),
+            Some((previous, error)) => std::borrow::Cow::Owned(build_historian_repair_prompt(
+                &request_prompt,
+                previous,
+                error,
+            )),
+            None => std::borrow::Cow::Borrowed(request_prompt.as_str()),
         };
         let request = historian_request_with_prompt(&model, &user_prompt);
 
@@ -1538,18 +1550,24 @@ pub async fn run(ctx: &RunCtx<'_>, plan: &RunPlan<'_>) -> Result<Option<RunOutco
 
         match validate_text(&text, plan.chunk, &prior) {
             Ok(validated) => {
+                // The publish plan is single use: its compartment strings move
+                // into the store rows and its side channels into the run
+                // outcome, so nothing is cloned out of the validated plan.
+                let historian_validate::ValidatedChunk {
+                    mut compartments,
+                    facts,
+                    events,
+                    ..
+                } = validated;
                 let compartment_ids =
-                    match publish_compartments(ctx.db, plan.session_id, &validated).await {
+                    match publish_compartments(ctx.db, plan.session_id, &mut compartments).await {
                         Ok(ids) => ids,
                         Err(error) => {
                             settle_failed(ctx.db, &run_id, &error).await;
                             return Err(error);
                         }
                     };
-                let side_channels = SideChannels {
-                    facts: validated.facts.clone(),
-                    events: validated.events.clone(),
-                };
+                let side_channels = SideChannels { facts, events };
                 settle_run(
                     ctx.db,
                     &run_id,
@@ -1627,27 +1645,30 @@ async fn stored_ranges(
 /// advances the floor a later pass reads. The rows go in one transaction: a
 /// partial publish would advance coverage past content that was never
 /// summarized.
+///
+/// Consumes the compartments' strings (`&mut` is ownership transfer here):
+/// validation already produced them and the publish plan is not read again.
 async fn publish_compartments(
     db: &ox_db::Db,
     session_id: &str,
-    validated: &historian_validate::ValidatedChunk,
+    compartments: &mut [historian_validate::ValidatedCompartment],
 ) -> Result<Vec<String>> {
-    let mut pending: Vec<(String, Tiers, f64)> = Vec::with_capacity(validated.compartments.len());
-    for compartment in &validated.compartments {
+    let mut pending: Vec<(String, Tiers, f64)> = Vec::with_capacity(compartments.len());
+    for compartment in compartments {
         pending.push((
             id("mc"),
             Tiers {
-                title: compartment.title.clone(),
+                title: std::mem::take(&mut compartment.title),
                 start_message: compartment.start_message,
                 end_message: compartment.end_message,
                 // The historian output carries no dates and ox's chunk tracks
                 // none, so the decay renderer gets no span for a live row.
                 start_date: None,
                 end_date: None,
-                p1: compartment.p1.clone(),
-                p2: compartment.p2.clone(),
-                p3: compartment.p3.clone(),
-                p4: compartment.p4.clone(),
+                p1: compartment.p1.take(),
+                p2: compartment.p2.take(),
+                p3: compartment.p3.take(),
+                p4: compartment.p4.take(),
             },
             importance_of(compartment.importance),
         ));

@@ -19,8 +19,11 @@
 //! - the helpers each rule needs: `validate_dense_chunk_coverage` ~787,
 //!   `validate_chunk_coverage_against` ~817, `validate_strictly_increasing_ordinals`
 //!   ~755, `next_present_after` ~773, `heal_compartment_gaps` ~961,
-//!   `heal_terminal_completed_tool_arc` ~926, `map_parsed_compartments_to_chunk`
-//!   ~996, `validate_parsed_compartments` ~1045, `parse_events` ~879.
+//!   `heal_terminal_completed_tool_arc` ~926, `validate_compartment_mapping`
+//!   ~996 (the ordinal-endpoint half of the reference's
+//!   `map_parsed_compartments_to_chunk`; the conversion is
+//!   `From<ParsedCompartment> for ValidatedCompartment`),
+//!   `validate_parsed_compartments` ~1045, `parse_events` ~879.
 //!   [`completed_tool_arc_crosses_boundary`] ← `boundary.rs` line ~1265.
 //!
 //! ## Deviations from the reference (all forced by ox's data model)
@@ -54,6 +57,7 @@
 //!   message text.
 //! - **The `debug_assert` on the emitted count is dropped** with the count.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
@@ -251,15 +255,14 @@ pub fn parse_compartment_output(
             continue;
         };
         let title = match capture_string(attr_title_regex(), attrs) {
-            Some(value) if !value.is_empty() => unescape_xml(&value),
+            Some(value) if !value.is_empty() => unescape_xml(value),
             _ => continue,
         };
         if title.is_empty() {
             continue;
         }
 
-        let episode_type =
-            capture_string(attr_episode_regex(), attrs).map(|value| unescape_xml(&value));
+        let episode_type = capture_string(attr_episode_regex(), attrs).map(unescape_xml);
         let importance = capture_i64(attr_importance_regex(), attrs);
 
         let mut tiers = extract_tiers(inner);
@@ -267,10 +270,11 @@ pub fn parse_compartment_output(
             let p2 = tiers.remove(&2);
             let p3 = tiers.remove(&3);
             let p4 = tiers.remove(&4);
-            let p2_value = p2.clone().unwrap_or_else(|| p1_value.clone());
-            let p3_value = p3
-                .clone()
-                .unwrap_or_else(|| p2.clone().unwrap_or_else(|| p1_value.clone()));
+            // Each missing tier is densified from its parent, so the copy only
+            // happens when the tier is actually absent: a present tier moves
+            // into its own value and is never cloned.
+            let p2_value = p2.unwrap_or_else(|| p1_value.clone());
+            let p3_value = p3.unwrap_or_else(|| p2_value.clone());
             let p4_value = p4.unwrap_or_default();
             compartments.push(ParsedCompartment {
                 start_message,
@@ -307,16 +311,18 @@ pub fn parse_compartment_output(
     // Every side channel is read outside the compartment elements, so a body
     // that mentions `<facts>` or `<events>` cannot be mistaken for the real block.
     let outside = text_outside_compartments(text, &elements);
-    let facts_scope = if let Some(caps) = facts_block_regex().captures(&outside) {
-        caps.get(1)
-            .map(|m| m.as_str().to_string())
-            .unwrap_or_default()
+    // A `<facts>` block is read in place; only the no-block fallback has to
+    // synthesize a stripped copy of the remaining text.
+    let facts_scope: Cow<'_, str> = if let Some(caps) = facts_block_regex().captures(&outside) {
+        Cow::Borrowed(caps.get(1).map_or("", |m| m.as_str()))
     } else {
         let without_events = events_block_regex().replace_all(&outside, "");
         let without_side_channels = facts_side_channel_regex().replace_all(&without_events, "");
-        facts_envelope_regex()
-            .replace_all(&without_side_channels, "")
-            .to_string()
+        Cow::Owned(
+            facts_envelope_regex()
+                .replace_all(&without_side_channels, "")
+                .into_owned(),
+        )
     };
 
     let mut facts = Vec::new();
@@ -455,12 +461,11 @@ pub fn validate_historian_output(
         chunk.end_ordinal,
     );
 
-    let emitted =
-        map_parsed_compartments_to_chunk(&parsed.compartments, chunk).map_err(|error| {
-            validation_error(format!(
-                "Historian returned invalid compartment output: {error}"
-            ))
-        })?;
+    validate_compartment_mapping(&parsed.compartments, chunk).map_err(|error| {
+        validation_error(format!(
+            "Historian returned invalid compartment output: {error}"
+        ))
+    })?;
 
     if let Some(error) = validate_parsed_compartments(
         &parsed.compartments,
@@ -484,7 +489,13 @@ pub fn validate_historian_output(
         ));
     }
 
-    let mut compartments = emitted;
+    // Every borrow-only rule has passed; the parse tree's strings now move into
+    // the publish plan.
+    let mut compartments: Vec<ValidatedCompartment> = parsed
+        .compartments
+        .into_iter()
+        .map(ValidatedCompartment::from)
+        .collect();
     let mut discarded_last = false;
     if !options.in_emergency && !options.force_keep_last_compartment && compartments.len() >= 2 {
         let last_end = compartments
@@ -826,23 +837,31 @@ fn heal_compartment_gaps(
         if gap_end < gap_start {
             continue;
         }
-        let omitted_present: Vec<i64> = present_ordinals
-            .iter()
-            .copied()
-            .filter(|ordinal| *ordinal >= gap_start && *ordinal <= gap_end)
-            .collect();
-        if omitted_present.is_empty() {
-            continue;
+        // One pass over the present ordinals: the last omitted ordinal and
+        // whether every omitted one is tool-only noise, without materializing
+        // the filtered set.
+        let mut last_omitted: Option<i64> = None;
+        let mut fully_inside_tool_only = true;
+        for &ordinal in present_ordinals {
+            if ordinal < gap_start || ordinal > gap_end {
+                continue;
+            }
+            last_omitted = Some(ordinal);
+            if fully_inside_tool_only
+                && !tool_only_ranges
+                    .iter()
+                    .any(|range| range.start <= ordinal && range.end >= ordinal)
+            {
+                fully_inside_tool_only = false;
+            }
         }
-        let fully_inside_tool_only = omitted_present.iter().all(|ordinal| {
-            tool_only_ranges
-                .iter()
-                .any(|range| range.start <= *ordinal && range.end >= *ordinal)
-        });
+        let Some(last) = last_omitted else {
+            continue;
+        };
         // Production replay showed contiguous narrative coverage; tool-only noise
         // is therefore the sole safe gap to absorb.
-        if fully_inside_tool_only && let Some(last) = omitted_present.last() {
-            compartments[i - 1].end_message = *last;
+        if fully_inside_tool_only {
+            compartments[i - 1].end_message = last;
         }
     }
 }
@@ -850,11 +869,14 @@ fn heal_compartment_gaps(
 /// Map parsed ranges onto the chunk's covered ordinals
 /// (`historian_validate.rs::map_parsed_compartments_to_chunk`, minus the
 /// message-id resolution ox does not have).
-fn map_parsed_compartments_to_chunk(
+///
+/// Split from the conversion so the rule can run — in its original position, and
+/// so with its error precedence intact — against a borrow of the parse tree,
+/// while [`ValidatedCompartment::from`] later moves the strings out of it.
+fn validate_compartment_mapping(
     compartments: &[ParsedCompartment],
     chunk: &ChunkView<'_>,
-) -> Result<Vec<ValidatedCompartment>, String> {
-    let mut mapped = Vec::with_capacity(compartments.len());
+) -> Result<(), String> {
     for compartment in compartments {
         let both_lines = chunk.line_ordinals.contains(&compartment.start_message)
             && chunk.line_ordinals.contains(&compartment.end_message);
@@ -867,20 +889,27 @@ fn map_parsed_compartments_to_chunk(
                 chunk.end_ordinal
             ));
         }
-        mapped.push(ValidatedCompartment {
+    }
+    Ok(())
+}
+
+/// The publish plan owns the parse tree's strings: conversion moves every field
+/// instead of cloning it.
+impl From<ParsedCompartment> for ValidatedCompartment {
+    fn from(compartment: ParsedCompartment) -> Self {
+        Self {
             start_message: compartment.start_message,
             end_message: compartment.end_message,
-            title: compartment.title.clone(),
-            content: compartment.content.clone(),
-            p1: compartment.p1.clone(),
-            p2: compartment.p2.clone(),
-            p3: compartment.p3.clone(),
-            p4: compartment.p4.clone(),
+            title: compartment.title,
+            content: compartment.content,
+            p1: compartment.p1,
+            p2: compartment.p2,
+            p3: compartment.p3,
+            p4: compartment.p4,
             importance: compartment.importance,
-            episode_type: compartment.episode_type.clone(),
-        });
+            episode_type: compartment.episode_type,
+        }
     }
-    Ok(mapped)
 }
 
 /// Enforce the per-compartment rules: tiered paraphrase present, range inside
@@ -1003,10 +1032,13 @@ fn keep_side_channel(
     }
 }
 
-fn capture_string(regex: &Regex, haystack: &str) -> Option<String> {
+/// Capture group 1 as a slice of the haystack: the callers either unescape it
+/// (which allocates) or copy it into an owned field, so an intermediate
+/// `String` here would be a second copy of the same bytes.
+fn capture_string<'h>(regex: &Regex, haystack: &'h str) -> Option<&'h str> {
     regex
         .captures(haystack)
-        .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
+        .and_then(|caps| caps.get(1).map(|m| m.as_str()))
 }
 
 fn capture_i64(regex: &Regex, haystack: &str) -> Option<i64> {

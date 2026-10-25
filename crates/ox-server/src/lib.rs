@@ -199,6 +199,7 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
     let chat = chat_transport(&config)?;
     let state =
         build_state_on_with_bus(config, chat, tools, db, bus, ox_core::config::ox_home()).await?;
+    spawn_runner_memory_stats(state.runner.clone());
     // Fetch the model list before serving, so the first client that asks
     // (`/api/model` at TUI startup) gets models instead of an empty list. A
     // failure only warns: the request path retries on its own TTL.
@@ -233,6 +234,28 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
     event_bus::spawn_pruner(state.db.clone(), state.config.events.retention_days);
     let router = build_router(state.clone());
     Ok((state, router))
+}
+
+/// Emit runner-owned table sizes alongside the binary's allocator statistics.
+/// Disabled unless `OX_MEMORY_STATS_MS` selects a positive interval.
+fn spawn_runner_memory_stats(runner: Runner) {
+    let Ok(raw) = std::env::var("OX_MEMORY_STATS_MS") else {
+        return;
+    };
+    let Ok(milliseconds) = raw.parse::<u64>() else {
+        return;
+    };
+    if milliseconds == 0 {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(milliseconds));
+        loop {
+            interval.tick().await;
+            let (sessions, baselines) = runner.diagnostic_table_sizes();
+            println!("OX_RUNNER_STATS sessions={sessions} baselines={baselines}");
+        }
+    });
 }
 
 /// Serve the composed router on an already-bound listener — the `ox acp`

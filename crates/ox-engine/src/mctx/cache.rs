@@ -367,7 +367,7 @@ pub async fn run_pass(
 ) -> Result<PassOutcome, McCacheError> {
     let mut attempt: u32 = 0;
     loop {
-        let loaded = cache.load().await?;
+        let mut loaded = cache.load().await?;
         let action = classify(loaded.as_ref(), signals);
         // The CAS guard is the version we loaded (see `save_cas`).
         let expected_version = loaded.as_ref().map_or(0, |s| s.version);
@@ -387,7 +387,10 @@ pub async fn run_pass(
             // internal concern.
             let rendered = renderer.render(loaded.as_ref(), signals);
             let input = build_pass_input(action, rendered, signals);
-            let mut state = loaded.clone().unwrap_or_default();
+            // The loaded state is single use: hand it to the kernel by value
+            // instead of deep-cloning it (a CoreState carries the cached head
+            // bytes, and every pass pays for that copy otherwise).
+            let mut state = loaded.take().unwrap_or_default();
             let result: StepResult = state.step(input);
             let prefix = state.cached_prefix_bytes();
             let outcome = match result.action {

@@ -161,8 +161,10 @@ pub(crate) async fn drain(
         };
 
         let Some(next) = next else {
+            tracing::debug!(session = %ctx.session_id, input_scope, "inbox scan: nothing promotable");
             return DrainOutcome::Complete;
         };
+        tracing::debug!(session = %ctx.session_id, inbox = %next.id, input_scope, continuing, "inbox scan: head");
 
         // llm.ts:109-112: a non-steer pending head re-opens the entry
         // boundary, so queued items chain across turns within one busy
@@ -229,6 +231,7 @@ pub(crate) async fn drain(
                     Ok(count) => count,
                     Err(error) => return DrainOutcome::Failed(unknown_error(error.to_string())),
                 };
+                tracing::debug!(session = %ctx.session_id, promoted, "promote returned");
                 if promoted == 0 {
                     // Nothing delivered: at a re-opened entry boundary the
                     // scanned row raced away between scan and promote

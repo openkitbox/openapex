@@ -577,9 +577,11 @@ fn recent_row_text(row: &serde_json::Value) -> String {
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or_default();
                         let input = match part.pointer("/state/input") {
-                            Some(serde_json::Value::String(text)) => text.clone(),
-                            Some(other) => other.to_string(),
-                            None => String::new(),
+                            Some(serde_json::Value::String(text)) => {
+                                std::borrow::Cow::Borrowed(text.as_str())
+                            }
+                            Some(other) => std::borrow::Cow::Owned(other.to_string()),
+                            None => std::borrow::Cow::Borrowed(""),
                         };
                         parts.push(format!("[Assistant tool call]: {name}({input})"));
                         match part

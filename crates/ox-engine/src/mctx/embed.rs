@@ -87,15 +87,17 @@ impl Embedder {
     }
 
     /// Embed stored texts (with the document prefix, when configured).
-    /// Batched; the returned vectors are in input order.
-    pub async fn embed_documents(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    /// Batched; the returned vectors are in input order. Borrowed slices: the
+    /// caller already owns the texts, and only the endpoint request needs an
+    /// owned copy.
+    pub async fn embed_documents(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         let mut out = Vec::with_capacity(texts.len());
         for batch in texts.chunks(BATCH_SIZE) {
             let prepared: Vec<String> = batch
                 .iter()
                 .map(|text| match &self.document_prefix {
                     Some(prefix) => format!("{prefix}{text}"),
-                    None => text.clone(),
+                    None => (*text).to_owned(),
                 })
                 .collect();
             out.extend(self.embed(&prepared).await?);

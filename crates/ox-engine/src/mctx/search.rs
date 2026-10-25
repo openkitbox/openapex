@@ -522,7 +522,10 @@ async fn backfill_embeddings(db: &Db, embedder: &super::embed::Embedder, project
     if pending.is_empty() {
         return;
     }
-    let texts: Vec<String> = pending.iter().map(|(_, content)| content.clone()).collect();
+    let texts: Vec<&str> = pending
+        .iter()
+        .map(|(_, content)| content.as_str())
+        .collect();
     let vectors = match embedder.embed_documents(&texts).await {
         Ok(vectors) => vectors,
         Err(error) => {

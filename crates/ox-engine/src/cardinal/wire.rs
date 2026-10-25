@@ -28,7 +28,7 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     /// Tools the model may call; omitted from the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tools: Vec<ToolDef>,
+    pub tools: std::sync::Arc<Vec<ToolDef>>,
     /// Tool selection policy; defaults to [`ToolChoice::Auto`]. Serialized
     /// only alongside a non-empty `tools` array — `tool_choice` without
     /// tools is meaningless on the wire.
@@ -60,7 +60,7 @@ impl ChatRequest {
         Self {
             model: model.into(),
             messages: pair_tool_results(messages),
-            tools: Vec::new(),
+            tools: std::sync::Arc::new(Vec::new()),
             tool_choice: ToolChoice::default(),
             temperature: None,
             max_tokens: None,
@@ -80,7 +80,7 @@ impl Serialize for ChatRequest {
         state.serialize_field("model", &self.model)?;
         state.serialize_field("messages", &self.messages)?;
         if !self.tools.is_empty() {
-            state.serialize_field("tools", &self.tools)?;
+            state.serialize_field("tools", self.tools.as_slice())?;
             state.serialize_field("tool_choice", &self.tool_choice)?;
         }
         if let Some(temperature) = &self.temperature {

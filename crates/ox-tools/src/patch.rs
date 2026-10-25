@@ -504,8 +504,8 @@ fn parse_update(
     let mut index = start;
     let mut after_end_of_file = false;
     while index < end {
-        let line = lines[index as usize].clone();
-        let update_line = line.trim_end().to_owned();
+        let line = &lines[index as usize];
+        let update_line = line.trim_end();
         if after_end_of_file {
             if update_line.is_empty() {
                 index += 1;
@@ -513,11 +513,11 @@ fn parse_update(
             }
             if update_line == "@@" || update_line.starts_with("@@ ") {
                 after_end_of_file = false;
-            } else if is_boundary(&update_line) {
+            } else if is_boundary(update_line) {
                 break;
             } else {
                 return Err(invalid_hunk(
-                    &line,
+                    line,
                     index + 1,
                     Some(format!(
                         "Expected update hunk to start with a @@ context marker, got: '{line}'"
@@ -531,7 +531,7 @@ fn parse_update(
                 && chunk.new_lines.is_empty()
             {
                 return Err(invalid_hunk(
-                    &update_line,
+                    update_line,
                     index + 1,
                     Some("Update hunk does not contain any lines".to_owned()),
                 ));
@@ -543,7 +543,7 @@ fn parse_update(
             index += 1;
             continue;
         }
-        if is_boundary(&update_line) {
+        if is_boundary(update_line) {
             break;
         }
         if update_line == "@@" || update_line.starts_with("@@ ") {
@@ -552,7 +552,7 @@ fn parse_update(
                 && chunk.new_lines.is_empty()
             {
                 return Err(invalid_hunk(
-                    &line,
+                    line,
                     index + 1,
                     Some(format!(
                         "Unexpected line found in update hunk: '{line}'. Every line should start with ' ' (context line), '+' (added line), or '-' (removed line)"
@@ -603,7 +603,7 @@ fn parse_update(
         let populated = !chunk.old_lines.is_empty() || !chunk.new_lines.is_empty();
         return Err(if populated {
             invalid_hunk(
-                &line,
+                line,
                 index + 1,
                 Some(format!(
                     "Expected update hunk to start with a @@ context marker, got: '{line}'"
@@ -611,7 +611,7 @@ fn parse_update(
             )
         } else {
             invalid_hunk(
-                &line,
+                line,
                 index + 1,
                 Some(format!(
                     "Unexpected line found in update hunk: '{line}'. Every line should start with ' ' (context line), '+' (added line), or '-' (removed line)"
@@ -705,8 +705,8 @@ fn derive(path: &str, chunks: &[Chunk], original: &str) -> Result<(String, bool)
     }
     let mut replacements = compute_replacements(&lines, path, chunks)?;
     replacements.sort_by_key(|(start, _, _)| *start);
-    for (start, remove, insert) in replacements.iter().rev() {
-        lines.splice(*start..*start + *remove, insert.iter().cloned());
+    for (start, remove, insert) in replacements.into_iter().rev() {
+        lines.splice(start..start + remove, insert);
     }
     if lines.last().is_some_and(|line| !line.is_empty()) || lines.is_empty() {
         lines.push(String::new());

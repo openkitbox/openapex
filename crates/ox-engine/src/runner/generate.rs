@@ -90,7 +90,7 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
     messages.push(ChatMessage::user(prompt));
 
     let mut request = ChatRequest::new(model.id.clone(), messages);
-    request.tools = ctx.tools.definitions();
+    request.tools = ctx.tools.definitions_shared();
     request.reasoning_effort = reasoning_effort_of(model.variant.as_deref());
     crate::mctx::historian::collect_completion(&ctx.chat, &request).await
 }

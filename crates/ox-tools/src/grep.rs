@@ -374,10 +374,10 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
 /// `output_mode=files`: one path per matching file, in first-match order.
 fn files_content(matches: &[GrepMatch], truncated: bool) -> String {
     let mut lines: Vec<String> = Vec::new();
-    let mut current = String::new();
+    let mut current: &str = "";
     for matcher in matches {
-        if current != matcher.path {
-            current = matcher.path.clone();
+        if current != matcher.path.as_str() {
+            current = &matcher.path;
             lines.push(matcher.path.clone());
         }
     }

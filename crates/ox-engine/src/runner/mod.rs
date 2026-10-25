@@ -350,6 +350,12 @@ impl Runner {
     /// Wake the session's actor for a drain: spawn one if parked, otherwise
     /// join the live task's mailbox. Safe to call repeatedly; the actor
     /// coalesces enqueues into one busy period.
+    /// Process-local memory tables, exposed for isolated allocator profiling.
+    pub fn diagnostic_table_sizes(&self) -> (usize, usize) {
+        let baselines = lock(&self.inner.instruction_baselines).len();
+        (self.inner.sessions.len(), baselines)
+    }
+
     pub async fn dispatch(&self, session_id: &str, inbox_id: &str) -> Result<()> {
         // Opportunistic idle sweep: dispatch is the one regular entry, so the
         // per-session tables stay bounded by live work (the sweep's own O(n)
@@ -383,7 +389,10 @@ impl Runner {
             })
             .await;
         if sent.is_err() {
+            tracing::debug!(session = %session_id, "dispatch enqueue failed; mailbox closed");
             *lock(&handle.scheduled) = false;
+        } else {
+            tracing::debug!(session = %session_id, inbox = %inbox_id, "dispatch enqueued");
         }
         self.spawn_if_parked(session_id, handle).await;
         Ok(())
@@ -494,6 +503,7 @@ impl ActorTask {
             loop {
                 match rx.try_recv() {
                     Ok(ActorMsg::Enqueue { .. }) if token.is_none() => {
+                        tracing::debug!(session = %self.session_id, "actor opened busy period");
                         let period = CancellationToken::new();
                         *lock(&self.handle.cancel) = Some(period.clone());
                         // Upstream: the started hook publishes exactly once per
@@ -567,10 +577,12 @@ impl ActorTask {
                 }
                 match drain::drain(&ctx, &period, scope).await {
                     drain::DrainOutcome::Interrupted => {
+                        tracing::debug!(session = %self.session_id, "drain interrupted");
                         self.terminal_interrupted().await;
                         break;
                     }
                     drain::DrainOutcome::Failed(error) => {
+                        tracing::debug!(session = %self.session_id, error = ?error, "drain failed");
                         if let Err(publish_error) = self
                             .inner
                             .bus
@@ -589,6 +601,7 @@ impl ActorTask {
                         break;
                     }
                     drain::DrainOutcome::Complete => {
+                        tracing::debug!(session = %self.session_id, "drain complete; doorbell check");
                         // Doorbell: work admitted during the drain keeps the
                         // busy period open instead of publishing a terminal.
                         let mut more = false;
@@ -609,6 +622,7 @@ impl ActorTask {
                             break;
                         }
                         if !more {
+                            tracing::debug!(session = %self.session_id, "publishing execution.succeeded");
                             if let Err(error) = self
                                 .inner
                                 .bus
@@ -623,6 +637,7 @@ impl ActorTask {
                                     "execution.succeeded failed to publish"
                                 );
                             }
+                            tracing::debug!(session = %self.session_id, "execution.succeeded published");
                             // Upstream fires the fold on this same event
                             // (`session.execution.succeeded` → idle()): the
                             // busy period is over, the tail may fold in the
@@ -631,6 +646,7 @@ impl ActorTask {
                             break;
                         }
                         // Fresh work: the next pass starts at an input boundary.
+                        tracing::debug!(session = %self.session_id, "doorbell saw new work; draining again");
                         scope = drain::Promotable::Input;
                     }
                 }

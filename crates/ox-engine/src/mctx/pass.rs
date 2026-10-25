@@ -176,12 +176,31 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
         delta_changed: plan.m1 != frozen_m1,
     };
 
-    let mut units = plan.units();
+    // The plan is single use: its rendered halves (potentially hundreds of KB)
+    // move straight into the frozen units instead of being cloned.
+    let Plan {
+        m0,
+        m1,
+        boundary_id,
+    } = plan;
+    let mut units = vec![
+        FrozenUnit {
+            key: "m0".to_string(),
+            kind: "synthesized-region".to_string(),
+            frozen_payload: m0,
+            durability_class: DurabilityClass::Lineage,
+            reset_rule: String::new(),
+        },
+        FrozenUnit {
+            key: "m1".to_string(),
+            kind: "synthesized-region".to_string(),
+            frozen_payload: m1,
+            durability_class: DurabilityClass::Lineage,
+            reset_rule: String::new(),
+        },
+    ];
     units.extend(drop_units(&drops));
-    let renderer = PrecomputedRenderer {
-        units,
-        boundary_id: plan.boundary_id.clone(),
-    };
+    let renderer = PrecomputedRenderer { units, boundary_id };
 
     let outcome = run_pass(&cache, &renderer, &signals).await?;
     // The prefix is taken by value (it can be hundreds of KB; the outcome
@@ -275,27 +294,6 @@ struct Plan {
     m0: String,
     m1: String,
     boundary_id: String,
-}
-
-impl Plan {
-    fn units(&self) -> Vec<FrozenUnit> {
-        vec![
-            FrozenUnit {
-                key: "m0".to_string(),
-                kind: "synthesized-region".to_string(),
-                frozen_payload: self.m0.clone(),
-                durability_class: DurabilityClass::Lineage,
-                reset_rule: String::new(),
-            },
-            FrozenUnit {
-                key: "m1".to_string(),
-                kind: "synthesized-region".to_string(),
-                frozen_payload: self.m1.clone(),
-                durability_class: DurabilityClass::Lineage,
-                reset_rule: String::new(),
-            },
-        ]
-    }
 }
 
 /// Render the two head halves: m[0] over every compartment the head covers,

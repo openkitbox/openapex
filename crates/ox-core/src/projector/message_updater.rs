@@ -245,7 +245,13 @@ async fn store_compaction(
         .execute(
             "UPDATE session_message SET seq = ?3, data = ?4, time_updated = ?5
              WHERE id = ?1 AND session_id = ?2",
-            (msg.id.as_str(), session_id, seq, data.as_str(), msg.time.created),
+            (
+                msg.id.as_str(),
+                session_id,
+                seq,
+                data.as_str(),
+                msg.time.created,
+            ),
         )
         .await?;
     if n == 0 {
@@ -809,10 +815,20 @@ pub async fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Resu
         } => {
             update_owned_assistant(tx, session_id, seq, assistant_message_id, |msg| {
                 if let Some(tool) = find_tool_mut(msg, id)
-                    && let ToolState::Running { input, .. } = &*tool.state
+                    && matches!(&*tool.state, ToolState::Running { .. })
                 {
-                    // Only promote when currently `running`.
-                    let input = input.clone();
+                    // Only promote when currently `running`. The old state is
+                    // replaced wholesale below, so its `input` has exactly one
+                    // owner: move it out rather than cloning the call record.
+                    let input = match std::mem::replace(
+                        &mut *tool.state,
+                        ToolState::Streaming {
+                            input: String::new(),
+                        },
+                    ) {
+                        ToolState::Running { input, .. } => input,
+                        _ => Record::new(),
+                    };
                     *tool.executed = Some(*executed || (*tool.executed).unwrap_or(false));
                     *tool.provider_result_state = result_state.clone();
                     tool.time.completed = Some(created);
@@ -844,12 +860,18 @@ pub async fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Resu
                     )
                 {
                     // Error input: `{}` when the prior input was a raw string,
-                    // else the structured input record.
-                    let input = match &*tool.state {
-                        ToolState::Running { input, .. } => input.clone(),
+                    // else the structured input record, moved out of the old
+                    // state (which is replaced wholesale below).
+                    let input = match std::mem::replace(
+                        &mut *tool.state,
+                        ToolState::Streaming {
+                            input: String::new(),
+                        },
+                    ) {
                         ToolState::Streaming { .. } => Record::new(),
-                        ToolState::Completed { input, .. } => input.clone(),
-                        ToolState::Error { input, .. } => input.clone(),
+                        ToolState::Running { input, .. }
+                        | ToolState::Completed { input, .. }
+                        | ToolState::Error { input, .. } => input,
                     };
                     *tool.executed = Some(*executed || (*tool.executed).unwrap_or(false));
                     *tool.provider_result_state = result_state.clone();

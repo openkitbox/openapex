@@ -46,6 +46,7 @@
 //! The context assembly lives in one named function
 //! ([`build_chat_messages`]) so the e2e suite can trust the mapping.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::future::poll_fn;
 use std::sync::Arc;
@@ -350,7 +351,7 @@ pub(crate) async fn run(
             params.model.id.clone(),
             chat_messages,
         );
-        request.tools = ctx.tools.definitions();
+        request.tools = ctx.tools.definitions_shared();
         // The session's selected reasoning level (model variant) rides every
         // chat turn; no selection leaves the field off the wire.
         request.reasoning_effort = reasoning_effort_of(params.model.variant.as_deref());
@@ -1013,7 +1014,12 @@ async fn settle_tool_calls(
                 }
             }
         };
-        let input_value = Value::Object(input_record.clone().into_iter().collect());
+        let input_value = Value::Object(
+            input_record
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        );
         ctx.bus
             .publish(SessionEventData::ToolCalled {
                 session_id: ctx.session_id.clone(),
@@ -1855,13 +1861,19 @@ async fn sync_instructions(
 }
 
 /// A tool part's call input for the wire: parsed from the streaming state's
-/// string, verbatim from the settled states (upstream `toolInput`).
-pub(crate) fn tool_input(state: &ToolState) -> Record {
+/// string, borrowed verbatim from the settled states (upstream `toolInput`).
+///
+/// Borrowed rather than cloned: every caller serializes or formats the record
+/// immediately, and a settled part's input is the whole call (a `write` hunk
+/// can be a file's worth of text), so the copy is one per tool part per request.
+pub(crate) fn tool_input(state: &ToolState) -> Cow<'_, Record> {
     match state {
-        ToolState::Streaming { input } => serde_json::from_str(input).unwrap_or_default(),
+        ToolState::Streaming { input } => {
+            Cow::Owned(serde_json::from_str(input).unwrap_or_default())
+        }
         ToolState::Running { input, .. }
         | ToolState::Completed { input, .. }
-        | ToolState::Error { input, .. } => input.clone(),
+        | ToolState::Error { input, .. } => Cow::Borrowed(input),
     }
 }
 
@@ -1879,18 +1891,20 @@ fn tool_result_message(id: &str, state: &ToolState) -> Option<(ChatMessage, Vec<
     let mut media: Vec<UserPart> = Vec::new();
     let content = match state {
         ToolState::Completed { content, .. } => {
+            // Borrow the completed text parts and join once: cloning each part
+            // only to concatenate it would copy the whole result twice.
             let text = content
                 .iter()
                 .map(|content| match content {
-                    Content::Text { text } => text.clone(),
+                    Content::Text { text } => Cow::Borrowed(text.as_str()),
                     Content::File { uri, mime, name } => {
                         media.push(UserPart::Image {
                             image_url: ImageUrl { url: uri.clone() },
                         });
-                        format!(
+                        Cow::Owned(format!(
                             "[attached {} ({mime})]",
-                            name.clone().unwrap_or_else(|| "file".to_owned())
-                        )
+                            name.as_deref().unwrap_or("file")
+                        ))
                     }
                 })
                 .collect::<Vec<_>>()
@@ -1920,7 +1934,7 @@ pub(crate) fn user_prompt_text(prompt: &Prompt) -> String {
     let mut text = prompt.text.clone();
     if let Some(files) = &prompt.files {
         for file in files {
-            let name = file.name.clone().unwrap_or_else(|| "file".to_owned());
+            let name = file.name.as_deref().unwrap_or("file");
             text.push_str(&format!("\n[attached file: {name} ({})]", file.mime));
         }
     }

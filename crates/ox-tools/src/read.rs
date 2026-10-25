@@ -250,9 +250,8 @@ fn read_text(path: &str, absolute: &Path, resource: &str, page: &Page) -> ToolOu
         carry.drain(..consumed);
         if eof {
             if !carry.is_empty() {
-                let line = carry.clone();
                 let _ = handle_line(
-                    &line,
+                    &carry,
                     line_number,
                     path,
                     page,
