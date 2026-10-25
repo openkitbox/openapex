@@ -53,7 +53,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -213,7 +213,7 @@ pub(crate) async fn run(
         // the frozen bytes and reports the ordinal floor, so the transcript
         // starts after the covered range.
         let budget = crate::mctx::budget_for(&ctx.config, &ctx.model_catalog, &params.model.id);
-        let (head_m0, head_m1, floor) = mctx_head(ctx, budget, &params.model.id).await;
+        let (head_m0, head_m1, floor) = mctx_head(ctx, budget).await;
         // Pressure is checked after the pass: the floor it reports is what the
         // live tail is measured above. Both windows were resolved once, when
         // the budget was derived.
@@ -405,7 +405,7 @@ pub(crate) async fn run(
                 return fail_step(ctx, params, to_session_error(&error), None, started).await;
             }
         };
-        match consume(ctx, token, params, dispatch, &mut started, stream).await? {
+        match consume(ctx, token, params, &request, dispatch, &mut started, stream).await? {
             Attempt::Done(outcome) => return Ok(outcome),
             Attempt::Failed {
                 failure,
@@ -597,6 +597,7 @@ async fn consume(
     ctx: &DrainCtx,
     token: &CancellationToken,
     params: &StepParams<'_>,
+    request: &ChatRequest,
     dispatch: i64,
     started: &mut bool,
     mut stream: BoxChatStream,
@@ -814,7 +815,10 @@ async fn consume(
                     )
                     .await?;
                 }
-                StreamEvent::Usage(seen) => usage = Some(seen),
+                StreamEvent::Usage(seen) => {
+                    usage = Some(seen);
+                    observe_request_cost(ctx, &params.model.id, request, seen.prompt_tokens);
+                }
                 StreamEvent::Done => break,
             },
         }
@@ -1354,6 +1358,38 @@ fn pairing_rejection_ids(body: &str) -> Option<Vec<String>> {
     Some(ids)
 }
 
+/// Fold the provider's own count for this request into the session's token
+/// calibration ([`crate::mctx::calibration`]).
+///
+/// The local side is `bytes / 4` over the exact JSON the wire carried, so the
+/// ratio absorbs everything a local counter cannot see: the chat template, the
+/// tool framing, the vendor's own tokenizer and the cache accounting. The
+/// request is post pairing-guard and post every message push, i.e. the bytes the
+/// provider was billed for.
+///
+/// Best effort, and only while it can still move the ratio: the session asks
+/// for at most [`crate::mctx::calibration`]'s freeze window of samples, so the
+/// per-chunk usage events after that cost a map lookup and nothing else. A
+/// serialization failure only skips the sample; the observation never fails or
+/// blocks the step.
+fn observe_request_cost(ctx: &DrainCtx, model_id: &str, request: &ChatRequest, prompt_tokens: u64) {
+    if !crate::mctx::calibration::wants_sample(&ctx.calibrations, &ctx.session_id, model_id) {
+        return;
+    }
+    // Only the body's size is needed, so it is measured rather than built: a
+    // transcript-sized copy per sampled step buys nothing here.
+    let Ok(body_len) = crate::cardinal::wire::serialized_len(request) else {
+        return;
+    };
+    crate::mctx::calibration::observe(
+        &ctx.calibrations,
+        &ctx.session_id,
+        model_id,
+        prompt_tokens,
+        crate::mctx::tokens::heuristic_bytes(body_len),
+    );
+}
+
 /// The request's tool-call ids in wire order, capped for one log line. The
 /// request is post pairing-guard: an id the upstream names that is absent
 /// here was never sent by ox.
@@ -1434,7 +1470,6 @@ fn to_session_error(error: &CardinalError) -> SessionError {
 pub(crate) async fn mctx_head(
     ctx: &DrainCtx,
     budget: crate::mctx::budget::Budget,
-    model_id: &str,
 ) -> (Option<String>, Option<String>, i64) {
     if !ctx.config.magic_context.enabled {
         return (None, None, 0);
@@ -1455,7 +1490,9 @@ pub(crate) async fn mctx_head(
         budget,
         forced: false,
         run_started: false,
-        model_id,
+        // The session's measured provider ÷ local ratio: the pass fills `m[0]`
+        // in the units its budget is written in.
+        calibration: crate::mctx::calibration::ratio_for(&ctx.calibrations, &ctx.session_id),
     };
     match crate::mctx::pass::run(request).await {
         Ok(result) => (result.head_m0, result.head_m1, result.floor),
@@ -1638,8 +1675,12 @@ pub(crate) fn build_chat_messages(
                 content: text.clone(),
             }),
             Message::Assistant(assistant) => {
-                let mut parts: Vec<String> = Vec::new();
-                let mut reasoning: Vec<String> = Vec::new();
+                // Joined in place: the rows are borrowed, so one copy is the
+                // floor, and collecting parts to `join` would copy each of them
+                // a second time (replayed reasoning is the bulk of a long
+                // session's wire text).
+                let mut parts = String::new();
+                let mut reasoning = String::new();
                 let mut tool_calls: Vec<ToolCall> = Vec::new();
                 let mut tool_results: Vec<ChatMessage> = Vec::new();
                 // Upstream `reasoningInterrupted` (to-llm-message.ts:158): a
@@ -1661,7 +1702,7 @@ pub(crate) fn build_chat_messages(
                         // Upstream `meaningful`: an empty text part carries
                         // nothing and is filtered (to-llm-message.ts:202-206).
                         AssistantContent::Text { text, .. } if !text.is_empty() => {
-                            parts.push(text.clone())
+                            parts.push_str(text)
                         }
                         AssistantContent::Text { .. } => {}
                         // Replayed as `reasoning_content`: thinking vendors
@@ -1673,9 +1714,11 @@ pub(crate) fn build_chat_messages(
                         // per-provider gate, cardinal owns dialects.
                         AssistantContent::Reasoning { text, .. } if text.is_empty() => {}
                         AssistantContent::Reasoning { text, .. } if replay_reasoning => {
-                            reasoning.push(text.clone())
+                            reasoning.push_str(text)
                         }
-                        AssistantContent::Reasoning { text, .. } => parts.push(text.clone()),
+                        AssistantContent::Reasoning { text, .. } => {
+                            parts.push_str(text);
+                        }
                         AssistantContent::Tool {
                             id,
                             name,
@@ -1726,11 +1769,7 @@ pub(crate) fn build_chat_messages(
                     // Upstream sends `null` only for a tool-call-only turn
                     // (openai-chat.ts:491); any other row carries its joined
                     // text, which is non-empty by the guard above.
-                    content: if parts.is_empty() {
-                        None
-                    } else {
-                        Some(parts.join(""))
-                    },
+                    content: if parts.is_empty() { None } else { Some(parts) },
                     tool_calls: if tool_calls.is_empty() {
                         None
                     } else {
@@ -1739,7 +1778,7 @@ pub(crate) fn build_chat_messages(
                     reasoning_content: if reasoning.is_empty() {
                         None
                     } else {
-                        Some(reasoning.join(""))
+                        Some(reasoning)
                     },
                 });
                 out.extend(tool_results);
@@ -1891,9 +1930,10 @@ fn tool_result_message(id: &str, state: &ToolState) -> Option<(ChatMessage, Vec<
     let mut media: Vec<UserPart> = Vec::new();
     let content = match state {
         ToolState::Completed { content, .. } => {
-            // Borrow the completed text parts and join once: cloning each part
-            // only to concatenate it would copy the whole result twice.
-            let text = content
+            // Borrow the completed text parts; join only when the result really
+            // is several parts (a `File` part contributes a marker), so one
+            // output part reaches the envelope without a copy.
+            let parts: Vec<Cow<'_, str>> = content
                 .iter()
                 .map(|content| match content {
                     Content::Text { text } => Cow::Borrowed(text.as_str()),
@@ -1907,11 +1947,21 @@ fn tool_result_message(id: &str, state: &ToolState) -> Option<(ChatMessage, Vec<
                         ))
                     }
                 })
-                .collect::<Vec<_>>()
-                .join("");
-            serde_json::to_string(&json!({ "output": bound_tool_output(&text) })).ok()?
+                .collect();
+            let text: Cow<'_, str> = match parts.as_slice() {
+                [] => Cow::Borrowed(""),
+                [one] => Cow::Borrowed(one.as_ref()),
+                _ => Cow::Owned(parts.iter().map(|part| part.as_ref()).collect()),
+            };
+            // Straight into the envelope: an intermediate `json!` value would
+            // own a second copy of the text before it is escaped.
+            let bounded = bound_tool_output(&text);
+            serde_json::to_string(&ToolOutput {
+                output: bounded.as_ref(),
+            })
+            .ok()?
         }
-        ToolState::Error { error, .. } => serde_json::to_string(&json!({ "error": error })).ok()?,
+        ToolState::Error { error, .. } => serde_json::to_string(&ToolError { error }).ok()?,
         ToolState::Streaming { .. } | ToolState::Running { .. } => return None,
     };
     Some((
@@ -1921,6 +1971,19 @@ fn tool_result_message(id: &str, state: &ToolState) -> Option<(ChatMessage, Vec<
         },
         media,
     ))
+}
+
+/// The `{"output": …}` envelope of a completed tool result. Serialized from a
+/// borrowed view so the result text is escaped exactly once.
+#[derive(serde::Serialize)]
+struct ToolOutput<'a> {
+    output: &'a str,
+}
+
+/// The `{"error": …}` envelope of a failed tool result.
+#[derive(serde::Serialize)]
+struct ToolError<'a> {
+    error: &'a SessionError,
 }
 
 /// A user prompt's wire text: the typed text plus attachment markers.
@@ -2048,7 +2111,7 @@ pub(crate) async fn load_overlaid_tail(
         &drops,
         crate::mctx::tagger::OverlayMode::Request,
     );
-    rows.into_iter().map(|row| decode_row(&row)).collect()
+    rows.into_iter().map(decode_row_owned).collect()
 }
 
 /// One `session_message` row as the decoded message JSON: the row's `data`
@@ -2083,32 +2146,48 @@ pub(crate) async fn rows_after_with_seq(
         )
         .await?;
     let mut rows = stmt.query((session_id, floor)).await?;
-    let mut raw = Vec::new();
+    let mut values = Vec::new();
     while let Some(row) = rows.next().await? {
-        raw.push((
-            row.get::<String>(0)?,
-            row.get::<String>(1)?,
-            row.get::<String>(2)?,
-            row.get::<i64>(3)?,
-        ));
+        let id: String = row.get(0)?;
+        let kind: String = row.get(1)?;
+        let data: String = row.get(2)?;
+        let seq: i64 = row.get(3)?;
+        // Parsed inside the loop, not after collecting the raw JSON: holding
+        // every row's string and every row's value at once would double the
+        // tail's footprint for the whole load.
+        let mut value: serde_json::Value =
+            serde_json::from_str(&data).context("decode session_message.data")?;
+        Message::merge_row_columns(&id, &kind, &mut value);
+        values.push((seq, value));
     }
-    raw.into_iter()
-        .map(|(id, kind, data, seq)| {
-            let mut value: serde_json::Value = serde_json::from_str(&data)?;
-            Message::merge_row_columns(&id, &kind, &mut value);
-            Ok((seq, value))
-        })
-        .collect()
+    Ok(values)
 }
 
 pub(crate) fn decode_row(value: &serde_json::Value) -> Result<Message> {
-    let id = value
+    decode_row_owned(value.clone())
+}
+
+/// [`decode_row`] without the row copy.
+///
+/// Both tail loaders hold the whole transcript as JSON values already (the §N§
+/// overlay is applied across rows before anything is decoded), so each row's
+/// value is dead the moment it is decoded: merging `id`/`type` in place and
+/// deserializing from the moved value keeps the tail from being copied a second
+/// time on the way into [`Message`]s.
+pub(crate) fn decode_row_owned(value: serde_json::Value) -> Result<Message> {
+    if value
         .get("id")
         .and_then(serde_json::Value::as_str)
-        .context("session_message row without an id")?;
-    let kind = value
+        .is_none()
+    {
+        anyhow::bail!("session_message row without an id");
+    }
+    if value
         .get("type")
         .and_then(serde_json::Value::as_str)
-        .context("session_message row without a type")?;
-    Ok(Message::from_row_data(id, kind, value.clone())?)
+        .is_none()
+    {
+        anyhow::bail!("session_message row without a type");
+    }
+    Ok(Message::from_merged_row(value)?)
 }

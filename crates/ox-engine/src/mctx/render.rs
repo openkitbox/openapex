@@ -44,10 +44,10 @@
 //!   changes: the delta's bytes shift from the pinboard onwards, one turn.
 //! - **No workspace memory union** (the reference's `source_name_by_id` /
 //!   `WorkspaceMembership`): ox memories are scoped to one project directory.
-//! - **The token estimator is injected** ([`crate::mctx::tokens::Counter`]):
-//!   the pass resolves the session family's exact counter once and threads it
-//!   through [`M0Inputs`]; [`crate::mctx::tokens::heuristic`] (the bytes/4
-//!   stand-in) remains as the heuristic fallback shape.
+//! - **The token estimator is injected** (`impl Fn(&str) -> usize`): the pass
+//!   resolves the session's counter once — [`crate::mctx::tokens::heuristic`]
+//!   scaled by the measured provider ratio ([`crate::mctx::calibration`]) — and
+//!   threads it through [`M0Inputs`], so no vocabulary is ever loaded.
 
 use crate::mctx::decay_render::{DecayRenderCompartment, render_decayed_compartments};
 use crate::mctx::memory::{MemoryRow, ReadyNote, numeric_id};

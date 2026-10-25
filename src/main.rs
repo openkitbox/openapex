@@ -8,7 +8,28 @@
 //! ox owns the process-wide allocator: turso's default `mimalloc` feature
 //! (which would install its own `#[global_allocator]`) is disabled in
 //! Cargo.toml so the declaration can live here.
+//!
+//! macOS deliberately uses the system allocator. mimalloc's arena keeps pages
+//! it has returned to the OS counted in the process footprint there, because
+//! macOS `madvise` uses `MADV_FREE` (a mark-reusable hint) where Linux uses
+//! `MADV_DONTNEED` (an immediate return). A/B on a real 9.4 MiB transcript,
+//! identical source, one prompt per turn:
+//!
+//! - mimalloc 3.6: footprint starts at 101 MiB, peaks at 119 MiB after the
+//!   first turn, then never drops below 100 MiB (100 -> 109 MiB over six
+//!   turns); RSS climbs monotonically 118 -> 163 MiB.
+//! - system allocator: footprint starts at 33 MiB, reaches 52-53 MiB by turn
+//!   four and then stays there — twenty turns end at 40 MiB, i.e. it rises and
+//!   gives the pages back; RSS 113 -> 140 MiB and flat from turn four on.
+//!
+//! CPU is unchanged (6.68 s vs 6.69 s over 60 turns). Linux keeps mimalloc —
+//! that is where `MADV_DONTNEED` makes it behave.
 
+#[cfg(target_os = "macos")]
+#[global_allocator]
+static GLOBAL: std::alloc::System = std::alloc::System;
+
+#[cfg(not(target_os = "macos"))]
 #[global_allocator]
 static GLOBAL: rustfs_mimalloc::MiMalloc = rustfs_mimalloc::MiMalloc;
 

@@ -26,39 +26,37 @@
 //!   cache because its retry loop re-renders the same compartments at
 //!   different pressures. ox renders one pass per drain, so the cache is pure
 //!   overhead; [`render_decayed_compartments`] is the single entry point.
-//! - **No model-keyed budget calibration.** The reference scales the provider
-//!   allowance by a per-model prose ratio (`history_local_budget`). ox's model
-//!   catalog carries no such ratio, so the provider budget is used directly —
-//!   the reference's own `ratio == 1.0` path.
-//! - **The token estimator is injected** ([`crate::mctx::tokens::Counter`]):
-//!   the pass resolves the session family's exact counter once and threads it
-//!   through [`M0Inputs`]. [`crate::mctx::tokens::heuristic`] (the bytes/4
-//!   stand-in) covers unknown families and the call sites that count text the
-//!   wire never sends verbatim. With a budget loose enough that the guard never
-//!   fires, the output is estimator-independent and purely curve-driven — which
-//!   is what the golden exercises.
+//! - **The unit correction is applied to the estimate, not to the allowance.**
+//!   The reference scales its per-model provider allowance down to its local
+//!   estimator with a prose ratio (`history_local_budget`). ox runs the same
+//!   correction the other way round: the budget stays in provider tokens and
+//!   [`crate::mctx::tokens::counter_fn`] scales the local `bytes / 4` estimate up
+//!   by the session's measured provider ÷ local ratio
+//!   ([`crate::mctx::calibration`]). Both make the two units meet; the difference
+//!   is only which side carries the multiplication.
+//! - **The token estimator is injected** (`impl Fn(&str) -> usize`, resolved once
+//!   per pass and threaded through [`M0Inputs`]), so this module never picks a
+//!   vocabulary. With a budget loose enough that the guard never fires, the
+//!   output is estimator-independent and purely curve-driven — which is what the
+//!   golden exercises.
 //! - **The budget guard is accounted per compartment, not per body.** The
 //!   reference re-renders and re-measures the whole joined body on every
-//!   demotion; that is one full tokenization per demotion, and a full
-//!   tokenization of a 76 KB history allocates ~50 MB (the `tokenizers`
-//!   pipeline costs ~2.6 KB of allocation per token). [`render_decayed_compartments`]
-//!   instead renders and measures each compartment once and re-measures only
-//!   the demoted one, summing the pieces plus one [`COMPARTMENT_SEAM`] per
-//!   join.
+//!   demotion (one full estimation per demotion, and the number of demotions
+//!   scales with the compartment count). [`render_decayed_compartments`] instead
+//!   renders and measures each compartment once and re-measures only the demoted
+//!   one, summing the pieces plus one [`COMPARTMENT_SEAM`] per join.
 //!
-//!   The sum is not bit-equal to the count of the joined string: BPE merges run
-//!   across the seam, so the pieces cost a little more than their join. Measured
-//!   on the deepseek vocabulary over 98 joins of real compartment-sized text
-//!   (pairwise plus 5/8/12/20-piece histories): the sum exceeds the joined count
-//!   by 0 to +6 tokens per join, mean +0.79, and never fell below it. So the
-//!   drift is always an *over*-estimate — the guard can demote one tier earlier
-//!   than the reference at a budget boundary (a smaller history, never a larger
-//!   prompt), and it can never conclude "fits" for a body that does not. On a
-//!   40-case differential (5 corpora × 8 budgets, exact and heuristic counters)
-//!   the demoted tiers and the rendered bytes were identical to the reference
-//!   in every case; a divergence needs the body to sit within ~6 tokens/join of
-//!   the budget. The rendered bytes at a fixed tier set are unaffected — the
-//!   same tiers always produce the same body.
+//!   The sum is not bit-equal to the count of the joined string, and the drift is
+//!   one-sided by construction: `bytes / 4` rounds each piece *up*, so the sum of
+//!   the pieces plus the seams is always at least the count of their join. The
+//!   guard can therefore demote one tier earlier than a whole-body measurement
+//!   would at a budget boundary — a smaller history, never a larger prompt — and
+//!   it can never conclude "fits" for a body that does not. (Measured over 98
+//!   joins of real compartment-sized text when the estimator was an exact BPE
+//!   counter: 0 to +6 tokens per join, mean +0.79, never below zero; on a 40-case
+//!   differential the demoted tiers and the rendered bytes were identical to the
+//!   reference in every case.) The rendered bytes at a fixed tier set are
+//!   unaffected — the same tiers always produce the same body.
 
 use crate::mctx::decay::{DecayInput, compute_budget_pressure, rendered_tier};
 

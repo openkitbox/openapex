@@ -96,9 +96,10 @@ pub struct PassRequest<'a> {
     pub forced: bool,
     /// A new run/episode started.
     pub run_started: bool,
-    /// The session's model id: which family's token counter the pass budgets
-    /// its guards with (unknown families fall back to the heuristic).
-    pub model_id: &'a str,
+    /// The session's measured provider ÷ local token ratio
+    /// ([`crate::mctx::calibration`]): what every local count below is scaled by
+    /// before it meets a budget. `1.0` before the session has a measurement.
+    pub calibration: f64,
 }
 
 /// Run one transform pass for a session.
@@ -111,11 +112,11 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
         budget,
         forced,
         run_started,
-        model_id,
+        calibration,
     } = request;
-    // One counter resolution per pass: the session model's family decides the
-    // token counting for every budget walk below.
-    let count_tokens = crate::mctx::tokens::counter_fn_for_model(model_id);
+    // One counter resolution per pass: the session's measured ratio scales every
+    // local count into the budget's units for every walk below.
+    let count_tokens = crate::mctx::tokens::counter_fn(calibration);
 
     let compartments = compartments::load(db, session_id).await?;
     let memories = active_memories(db, project).await?;

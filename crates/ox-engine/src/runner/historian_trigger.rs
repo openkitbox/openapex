@@ -24,9 +24,11 @@ use anyhow::Result;
 
 use crate::cardinal::chat::Chat;
 use crate::mctx::budget::Budget;
+use crate::mctx::calibration;
 use crate::mctx::compartments::{self, Compartment};
 use crate::mctx::historian::{self, ChunkLimits};
 use crate::mctx::memory;
+use crate::mctx::tokens;
 use crate::runner::drain::DrainCtx;
 use crate::runner::step::rows_after_with_seq;
 use ox_core::config::Config;
@@ -56,6 +58,9 @@ pub(crate) fn mctx_historian(ctx: &DrainCtx, budget: Budget, floor: i64) {
     let catalog = Arc::clone(&ctx.model_catalog);
     let session_id = ctx.session_id.clone();
     let project = ctx.directory.to_string_lossy().into_owned();
+    // Resolved here, not inside the detached task: the measurement is the
+    // session's current value at the step boundary that decided to fire.
+    let ratio = calibration::ratio_for(&ctx.calibrations, &ctx.session_id);
     tokio::spawn(async move {
         let firing = Firing {
             db: &db,
@@ -65,6 +70,7 @@ pub(crate) fn mctx_historian(ctx: &DrainCtx, budget: Budget, floor: i64) {
             budget,
             session_id: &session_id,
             project: &project,
+            ratio,
         };
         match firing.run(floor).await {
             Ok(Some(published)) => {
@@ -208,11 +214,12 @@ async fn newest_reported_usage(db: &Db, session_id: &str, floor: i64) -> Result<
 /// decides Speculative/Forced, and the chunk selection and fence math need
 /// the rows). Otherwise the tail's raw JSON byte length decides: it embeds
 /// every byte the rendered text carries plus keys and escaping, so the
-/// chunker's estimate — bytes of rendered text over four — is bounded above
-/// by `tail_bytes / 4`. Strictly below the trigger budget, the estimate
-/// cannot exceed the trigger and the decision is No; the bound is
-/// deliberately strict so a tail at the budget still loads.
-fn tail_load_skippable(usage: NewestUsage, tail_bytes: i64, budget: &Budget) -> bool {
+/// chunker's estimate — bytes of rendered text over four, scaled by the
+/// session's provider ratio — is bounded above by `ratio × tail_bytes / 4`.
+/// Strictly below the trigger budget, the estimate cannot exceed the trigger
+/// and the decision is No; the bound is deliberately strict so a tail at the
+/// budget still loads.
+fn tail_load_skippable(usage: NewestUsage, tail_bytes: i64, budget: &Budget, ratio: f64) -> bool {
     match usage {
         NewestUsage::Ambiguous => return false,
         NewestUsage::Reported(tokens) => {
@@ -225,7 +232,7 @@ fn tail_load_skippable(usage: NewestUsage, tail_bytes: i64, budget: &Budget) -> 
         }
         NewestUsage::NoneReported => {}
     }
-    tail_bytes / 4 < i64::from(budget.trigger)
+    (tail_bytes as f64) / 4.0 * ratio < f64::from(budget.trigger)
 }
 
 /// The background fold's synchronous patch (plan D6): at most one historian
@@ -244,6 +251,7 @@ pub(crate) async fn patch_fold(ctx: &DrainCtx, budget: Budget, floor: i64) -> Re
         budget,
         session_id: &ctx.session_id,
         project: &project,
+        ratio: calibration::ratio_for(&ctx.calibrations, &ctx.session_id),
     };
     match firing.patch(floor).await {
         Ok(Some(published)) => {
@@ -272,6 +280,10 @@ struct Firing<'a> {
     budget: Budget,
     session_id: &'a str,
     project: &'a str,
+    /// The session's provider ÷ local token ratio
+    /// ([`crate::mctx::calibration`]): every count this decision takes is scaled
+    /// by it, because both `ChunkLimits` ceilings are in provider tokens.
+    ratio: f64,
 }
 
 impl Firing<'_> {
@@ -281,6 +293,7 @@ impl Firing<'_> {
             db,
             budget,
             session_id,
+            ratio,
             ..
         } = self;
         // One pending run per session: a second step in the same burst must not
@@ -302,7 +315,7 @@ impl Firing<'_> {
             tail_bytes(db, session_id, floor),
             newest_reported_usage(db, session_id, floor)
         )?;
-        if tail_load_skippable(gate_usage, tail_bytes, &budget) {
+        if tail_load_skippable(gate_usage, tail_bytes, &budget, ratio) {
             tracing::debug!(
                 session = %session_id,
                 tail_bytes,
@@ -320,7 +333,9 @@ impl Firing<'_> {
         let usage_pct = usage.and_then(|tokens| budget.usage_percentage(tokens));
         // The whole tail's estimate, measured by the chunker itself so the pressure
         // and the budget speak the same units.
-        let Some(whole) = historian::chunk(&rows, floor + 1, i64::MAX, ChunkLimits::unbounded())
+        let count = tokens::counter_fn(ratio);
+        let Some(whole) =
+            historian::chunk(&rows, floor + 1, i64::MAX, ChunkLimits::unbounded(), &count)
         else {
             return Ok(None);
         };
@@ -387,6 +402,7 @@ impl Firing<'_> {
                 request: budget.historian_chunk as usize,
                 context: foldable,
             },
+            &count,
         ) else {
             // Under real pressure this is the one shape mctx cannot resolve by
             // itself, so it is an operator signal, not just a trace: a tail
@@ -429,6 +445,7 @@ impl Firing<'_> {
             db,
             budget,
             session_id,
+            ratio,
             ..
         } = self;
         // Shortcut, not the authority: the claim below is one statement, so a
@@ -449,7 +466,9 @@ impl Firing<'_> {
         // tail becomes the checkpoint's recent part rather than the model's
         // verbatim budget, but the guard is the same — never fold a session
         // down to nothing verbatim.
-        let Some(whole) = historian::chunk(&rows, floor + 1, i64::MAX, ChunkLimits::unbounded())
+        let count = tokens::counter_fn(ratio);
+        let Some(whole) =
+            historian::chunk(&rows, floor + 1, i64::MAX, ChunkLimits::unbounded(), &count)
         else {
             return Ok(None);
         };
@@ -472,6 +491,7 @@ impl Firing<'_> {
                 request: budget.historian_chunk as usize,
                 context: foldable,
             },
+            &count,
         ) else {
             tracing::debug!(
                 session = %session_id,

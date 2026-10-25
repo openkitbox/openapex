@@ -113,6 +113,9 @@ struct Inner {
     /// delta rows).
     instruction_baselines:
         std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, instructions::Baseline>>>,
+    /// Per-session provider ÷ local token ratio (the budget's unit correction).
+    /// Process memory only: a restart re-measures in one turn.
+    calibrations: crate::mctx::calibration::Store,
     sessions: DashMap<String, SessionHandle>,
 }
 
@@ -242,6 +245,23 @@ fn new_session_handle() -> SessionHandle {
 /// of a reap is only the next dispatch's rebuild + re-baseline.
 const RUNNER_IDLE_TTL_MS: u64 = 30 * 60 * 1000;
 
+impl Inner {
+    /// Drop every runner-side table entry for one session: the registry entry
+    /// (channels and flags), its keyed-instruction baseline and its token
+    /// calibration. The single owner of "what is kept per session", shared by
+    /// the actor's shutdown, the idle sweep and a session delete — a new
+    /// per-session table must be forgotten here or it outlives its session.
+    ///
+    /// Only process state goes: the session's rows, events and compartments are
+    /// the database's, and a later dispatch of an evicted session rebuilds the
+    /// entry and re-baselines exactly as the existing shutdown path does.
+    fn forget(&self, session_id: &str) {
+        self.sessions.remove(session_id);
+        lock(&self.instruction_baselines).remove(session_id);
+        crate::mctx::calibration::forget(&self.calibrations, session_id);
+    }
+}
+
 impl Runner {
     /// A runner over the given bus/db/config rooted at `directory`, with the
     /// given chat transport and (initially empty or test-populated) tools.
@@ -321,6 +341,7 @@ impl Runner {
             model_catalog,
             mcp,
             instruction_baselines: Default::default(),
+            calibrations: Default::default(),
             sessions: DashMap::new(),
         });
         if let Some(handle) = inner.tools.subagent_handle.clone() {
@@ -347,15 +368,17 @@ impl Runner {
             .is_some_and(|handle| handle_is_active(&handle))
     }
 
-    /// Wake the session's actor for a drain: spawn one if parked, otherwise
-    /// join the live task's mailbox. Safe to call repeatedly; the actor
-    /// coalesces enqueues into one busy period.
-    /// Process-local memory tables, exposed for isolated allocator profiling.
+    /// Process-local per-session table sizes (registry entries, keyed-instruction
+    /// baselines), for isolated allocator profiling and for tests that need to
+    /// see eviction — no HTTP surface exposes what a session costs the process.
     pub fn diagnostic_table_sizes(&self) -> (usize, usize) {
         let baselines = lock(&self.inner.instruction_baselines).len();
         (self.inner.sessions.len(), baselines)
     }
 
+    /// Wake the session's actor for a drain: spawn one if parked, otherwise
+    /// join the live task's mailbox. Safe to call repeatedly; the actor
+    /// coalesces enqueues into one busy period.
     pub async fn dispatch(&self, session_id: &str, inbox_id: &str) -> Result<()> {
         // Opportunistic idle sweep: dispatch is the one regular entry, so the
         // per-session tables stay bounded by live work (the sweep's own O(n)
@@ -429,6 +452,22 @@ impl Runner {
         }
     }
 
+    /// Forget one session's process-local state: the API's delete path calls
+    /// this once the session and its descendants are gone.
+    ///
+    /// Without it the entry waits for [`Runner::sweep_idle`], which only runs
+    /// inside a *dispatch* and only past [`RUNNER_IDLE_TTL_MS`] — a deleted
+    /// session's channels, baseline render and calibration would then outlive
+    /// the session by up to half an hour, and indefinitely in a process that
+    /// dispatches nothing else. A busy entry is forgotten too: the actor holds
+    /// its own handle clone, so its turn keeps running and settles into a task
+    /// that exits, while nothing can dispatch the deleted session again
+    /// (`resolve_selection` rejects a row that no longer exists).
+    pub fn forget_session(&self, session_id: &str) {
+        tracing::debug!(session = %session_id, "forgetting runner state for a deleted session");
+        self.inner.forget(session_id);
+    }
+
     /// Reap registry entries idle past [`RUNNER_IDLE_TTL_MS`]: the runner-side
     /// only-grows tables (`sessions`, one entry per session ever dispatched —
     /// subagent children included — and `instruction_baselines`, one frozen
@@ -451,9 +490,10 @@ impl Runner {
         if evicted.is_empty() {
             return;
         }
-        let mut baselines = lock(&self.inner.instruction_baselines);
         for id in &evicted {
-            baselines.remove(id);
+            // Already removed from the registry by `retain`; the baseline and
+            // the calibration are what still has to go.
+            self.inner.forget(id);
         }
     }
 
@@ -566,6 +606,7 @@ impl ActorTask {
                 model_catalog: Arc::clone(&self.inner.model_catalog),
                 mcp: self.inner.mcp.clone(),
                 instruction_baselines: self.inner.instruction_baselines.clone(),
+                calibrations: self.inner.calibrations.clone(),
                 instruction_root: self.handle.instruction_root.clone(),
                 fold_in_flight: Arc::clone(&self.handle.fold_in_flight),
             };
@@ -660,11 +701,9 @@ impl ActorTask {
     fn handle_shutdown(&self) {
         // The actor is done for good; drop the registry entry so a later
         // dispatch builds a fresh handle instead of messaging a dead mailbox.
-        self.inner.sessions.remove(&self.session_id);
-        // Same for the keyed-instruction baseline: its frozen initial render
-        // would otherwise live (and grow) with every session the process
-        // ever saw. A later dispatch simply re-baselines from the sources.
-        lock(&self.inner.instruction_baselines).remove(&self.session_id);
+        // The baseline and the calibration go with it: a later dispatch simply
+        // re-baselines from the sources and re-measures in one turn.
+        self.inner.forget(&self.session_id);
     }
 
     /// The registry this session's turns advertise and dispatch against: the

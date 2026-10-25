@@ -455,6 +455,24 @@ const MAX_CONNECTIONS: usize = 8;
 /// this server exists).
 const MAX_IDLE: usize = 2;
 
+/// Page-cache size in 4 KiB pages, per connection (`PRAGMA cache_size`).
+///
+/// turso's default is 2000 pages (8 MiB) per connection, and every pooled
+/// connection carries its own copy — up to `MAX_CONNECTIONS` of them. Measured
+/// on the real 671 MiB database replaying one turn's read set (11.9 MiB of
+/// rows, sequential scan plus 500 point lookups): the default cost +12 MiB of
+/// footprint, this value costs +4 MiB, and **the two are indistinguishable in
+/// time** (21-25 ms for the scan, 4-5 ms for the lookups) because the pages
+/// being read stay in the OS file cache either way. ox is a single-user agent
+/// with a small working set, so the large cache buys nothing and costs
+/// megabytes per connection.
+///
+/// This is turso's floor, not a preference: `update_cache_size` in
+/// `turso_core/translate/pragma.rs` rewrites anything below
+/// `CacheSize::MIN` (`MINIMUM_PAGE_CACHE_SIZE_IN_PAGES = 200`) to 200, so a
+/// smaller number here would silently read back as 200 anyway.
+pub const PAGE_CACHE_PAGES: i64 = 200;
+
 impl Db {
     /// Open (creating if needed) the database at `path` and apply migrations.
     /// Parent directories are created automatically.
@@ -548,6 +566,10 @@ impl Db {
         conn.pragma_update("journal_mode", "'wal'").await?;
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         conn.pragma_update("foreign_keys", "ON").await?;
+        // Per connection, like the pragmas above: turso's 2000-page default is
+        // 8 MiB that each pooled connection would otherwise keep resident.
+        // See [`PAGE_CACHE_PAGES`] for the measurement.
+        conn.pragma_update("cache_size", PAGE_CACHE_PAGES).await?;
         Ok(conn)
     }
 

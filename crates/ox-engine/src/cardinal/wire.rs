@@ -98,6 +98,33 @@ impl Serialize for ChatRequest {
     }
 }
 
+/// The byte length of the request's serialized body, without building it.
+///
+/// The calibration observation (`super::super::runner::step`) divides the
+/// provider's prompt tokens by the local estimate of the body it just sent, and
+/// all it needs from that body is its size. Serializing into a counting writer
+/// produces the same bytes as `serde_json::to_string` — same serializer, same
+/// field order — while skipping a copy the size of the whole transcript.
+pub(crate) fn serialized_len(request: &ChatRequest) -> Result<usize, serde_json::Error> {
+    /// `std::io::Write` that keeps only the count.
+    struct Counter(usize);
+
+    impl std::io::Write for Counter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 += buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, request)?;
+    Ok(counter.0)
+}
+
 /// The chat-wire `reasoning_effort` for a session's model variant.
 /// `None`/`""`/`"default"` mean "no selection" — the field is omitted and the
 /// gateway applies its own default. The accepted wire names are

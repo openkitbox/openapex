@@ -242,10 +242,12 @@ impl ModelCatalog {
                 .find(|entry| &entry.id == id)
                 .and_then(|entry| entry.context)
             {
-                Some(reported) if reported < i64::from(*cap) => {}
+                // The cap lowers the window (`window_of` takes the minimum), so
+                // it bites exactly when the catalogue reports more than it.
+                Some(reported) if reported > i64::from(*cap) => {}
                 Some(reported) => tracing::warn!(
                     model = %id, cap = cap, reported = reported,
-                    "context cap is inert: the catalogue reports at least this much"
+                    "context cap is inert: the catalogue reports no more than this"
                 ),
                 None => tracing::warn!(
                     model = %id, cap = cap,

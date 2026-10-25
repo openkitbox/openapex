@@ -1457,3 +1457,28 @@ async fn an_applied_drop_reads_back_as_the_placeholder_the_model_saw() {
         "the content is still stored"
     );
 }
+
+/// Every pooled connection must come back with the small page cache: turso's
+/// 2000-page default is 8 MiB resident per connection, and ox keeps up to
+/// eight (`MAX_CONNECTIONS`, two idle). A regression here is invisible in
+/// behaviour and only shows up as megabytes of footprint, so it is pinned.
+#[tokio::test]
+async fn pooled_connections_open_with_the_capped_page_cache() {
+    let dir = TempDir::new().expect("tempdir");
+    let db = Db::open(&dir.path().join("ox.db")).await.expect("open db");
+
+    // Three acquisitions with the guard dropped in between: the first creates a
+    // connection, the rest may reuse it or open another — all must be capped.
+    for _ in 0..3 {
+        let conn = db.acquire().await.expect("acquire");
+        let mut stmt = conn.prepare("PRAGMA cache_size").await.expect("pragma");
+        let mut rows = stmt.query(()).await.expect("pragma query");
+        let row = rows.next().await.expect("pragma row").expect("a row");
+        let pages: i64 = row.get(0).expect("cache_size");
+        assert_eq!(
+            pages,
+            ox::db::PAGE_CACHE_PAGES,
+            "a pooled connection opened with turso's default page cache"
+        );
+    }
+}

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use ox_core::config::Config;
 use ox_core::event_bus::EventBus;
+use ox_core::model_catalog::ModelCatalog;
 use ox_db::Db;
 use ox_engine::runner::Runner;
 use ox_schema::id::now_millis;
@@ -449,7 +450,10 @@ async fn model_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
         return;
     };
     let entries = state.model_catalog.entries().await;
-    let data = entries.iter().map(model_info).collect();
+    let data = entries
+        .iter()
+        .map(|entry| model_info(entry, &state.model_catalog))
+        .collect();
     res.render(Json(ModelList {
         location: LocationRef {
             directory: compat::directory_of(req),
@@ -466,7 +470,14 @@ async fn model_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
 /// levels cardinal advertises become `{id}` variants in catalog order
 /// (upstream `Model.Variant` is `{id}` on the wire); a model without
 /// advertised levels gets none.
-fn model_info(m: &ox_core::config::ModelEntry) -> ModelInfo {
+///
+/// `limit.context` is the window the *runner* budgets against
+/// (`ModelCatalog::window_of`: the report lowered by `[context_caps]`), not the
+/// raw report: a client divides its context percentage by this value, so
+/// advertising the uncapped window makes the footer disagree with ox's own
+/// pressure. `window_of` answers `None` exactly when the entry carries no
+/// usable context, which stays zero on the wire.
+fn model_info(m: &ox_core::config::ModelEntry, catalog: &ModelCatalog) -> ModelInfo {
     ModelInfo {
         id: m.id.clone(),
         model_id: m.id.clone(),
@@ -492,7 +503,9 @@ fn model_info(m: &ox_core::config::ModelEntry) -> ModelInfo {
         status: "active",
         enabled: true,
         limit: ModelLimit {
-            context: m.context.unwrap_or(0),
+            context: catalog
+                .window_of(&m.id)
+                .map_or_else(|| m.context.unwrap_or(0), i64::from),
             output: m.output.unwrap_or(0),
         },
     }
@@ -515,7 +528,7 @@ async fn model_default(req: &mut Request, depot: &mut Depot, res: &mut Response)
     let data = state
         .model_catalog
         .default_entry(&state.config)
-        .map(|entry| model_info(&entry));
+        .map(|entry| model_info(&entry, &state.model_catalog));
     res.render(Json(ModelDefault {
         location: LocationRef {
             directory: compat::directory_of(req),

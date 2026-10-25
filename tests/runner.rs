@@ -24,7 +24,7 @@ use ox::cardinal::chat::{BoxChatStream, ChatFuture};
 use ox::cardinal::stream::StreamEvent;
 use ox::cardinal::wire::{ChatMessage, ChatRequest, FunctionDef, FunctionType, ToolDef, Usage};
 use ox::config::Config;
-use ox::runner::{Chat, Tool, ToolContext, ToolOutput, ToolRegistry};
+use ox::runner::{Chat, Runner, Tool, ToolContext, ToolOutput, ToolRegistry};
 use salvo::prelude::*;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -414,6 +414,9 @@ struct Harness {
     client: reqwest::Client,
     db: ox::db::Db,
     bus: ox::event_bus::EventBus,
+    /// The server's runner handle: shared process state (the per-session
+    /// tables) that no HTTP endpoint exposes.
+    runner: Runner,
     chat: Arc<MockChat>,
     events: Arc<AsyncMutex<Vec<(String, Value)>>>,
     handle: JoinHandle<()>,
@@ -497,6 +500,7 @@ impl Harness {
             .expect("build state");
         let db = state.db.clone();
         let bus = state.bus.clone();
+        let runner = state.runner.clone();
         let mut events = bus.subscribe();
         let collected = Arc::new(AsyncMutex::new(Vec::<(String, Value)>::new()));
         let sink = collected.clone();
@@ -530,6 +534,7 @@ impl Harness {
             client,
             db,
             bus,
+            runner,
             chat,
             events: collected,
             handle,
@@ -1671,6 +1676,16 @@ async fn tool_flow_executes_and_continues_with_results() {
         tool_messages[0].1.contains("hi"),
         "output should carry the echoed input: {}",
         tool_messages[0].1
+    );
+    // The result's envelope is `{"output": …}` and nothing else: the wire
+    // serializes it straight from a borrowed view, so this pins the bytes
+    // (single key, compact form) rather than only the decoded structure.
+    let envelope: Value = serde_json::from_str(&tool_messages[0].1).expect("tool result JSON");
+    let keys: Vec<&String> = envelope.as_object().expect("object").keys().collect();
+    assert_eq!(keys, vec!["output"], "envelope carries the output key only");
+    assert_eq!(
+        tool_messages[0].1,
+        serde_json::to_string(&envelope).expect("canonical form")
     );
 
     // The assistant row's tool part completed with the parsed input/output.
@@ -3835,4 +3850,58 @@ async fn move_rejects_unknown_sessions_and_bad_destinations() {
         )
         .await;
     assert_eq!(response.status(), 400, "file destination");
+}
+
+// ---------------------------------------------------------------------------
+// Session delete → runner state eviction
+// ---------------------------------------------------------------------------
+
+/// A deleted session's runner-side tables go at once, not whenever the idle
+/// sweep next runs (it only runs inside a dispatch, and only past a 30-minute
+/// TTL — so a deleted session's entry could outlive it indefinitely).
+#[tokio::test]
+async fn deleting_a_session_forgets_its_runner_tables() {
+    let harness = Harness::spawn(vec![MockChat::text("noted")]).await;
+    let session_id = harness.create_session().await;
+    let response = harness
+        .post(
+            &format!("/api/session/{session_id}/prompt"),
+            json!({ "text": "hello", "delivery": "queue" }),
+        )
+        .await;
+    assert_eq!(response.status(), 200, "prompt accepted");
+    harness
+        .wait_for(&session_id, "assistant completion", |messages| {
+            messages
+                .iter()
+                .any(|m| m["type"] == "assistant" && m["time"]["completed"].is_number())
+        })
+        .await;
+
+    // One dispatched session: its registry entry and its keyed-instruction
+    // baseline, both process memory only.
+    for _ in 0..100 {
+        if harness.runner.diagnostic_table_sizes() == (1, 1) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        harness.runner.diagnostic_table_sizes(),
+        (1, 1),
+        "the turn left one session entry and one baseline"
+    );
+
+    let response = harness
+        .client
+        .delete(format!("{}/api/session/{session_id}", harness.base))
+        .send()
+        .await
+        .expect("DELETE request");
+    assert_eq!(response.status(), 204, "delete accepted");
+    assert_eq!(
+        harness.runner.diagnostic_table_sizes(),
+        (0, 0),
+        "the delete forgot the registry entry and the baseline"
+    );
 }

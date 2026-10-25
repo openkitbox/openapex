@@ -285,6 +285,79 @@ async fn model_catalog_comes_from_the_gateway_not_the_config_file() {
     handle.abort();
 }
 
+/// `limit.context` is what a client's context percentage divides by, so the
+/// projection carries the *effective* window: the reported value lowered by
+/// `[context_caps]` (`ModelCatalog::window_of`, the number the runner budgets
+/// against). Advertising the uncapped value made the opencode footer read 17%
+/// while ox was at 70% of its window and already folding (cap 256K against a
+/// reported 1M). A cap larger than the report never raises the window.
+#[tokio::test]
+async fn model_limit_context_carries_the_effective_window() {
+    use std::collections::BTreeMap;
+
+    let gateway = spawn_gateway(
+        r#"{"data":[
+            {"id":"k3-256k","owned_by":"cardinal","context_length":262144},
+            {"id":"glm-5","owned_by":"cardinal","context_length":131072}
+        ]}"#,
+    )
+    .await;
+    let mut context_caps = BTreeMap::new();
+    context_caps.insert("glm-5".to_owned(), 65_536u32);
+    // Larger than the reported window: inert, and must not raise it.
+    context_caps.insert("k3-256k".to_owned(), 1_000_000u32);
+    let (base, handle, _dir) = spawn_server_with(Config {
+        cardinal_url: gateway,
+        default_model: Some("cardinal/glm-5".to_owned()),
+        context_caps,
+        ..Config::default()
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    let models: serde_json::Value = client
+        .get(format!("{base}/api/model"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let data = models.get("data").unwrap().as_array().unwrap();
+    let context_of = |id: &str| -> Option<i64> {
+        let model = data
+            .iter()
+            .find(|m| m.get("id").unwrap().as_str() == Some(id))?;
+        model.get("limit")?.get("context")?.as_i64()
+    };
+    assert_eq!(context_of("glm-5"), Some(65_536), "{models}");
+    assert_eq!(context_of("k3-256k"), Some(262_144), "{models}");
+
+    // The default resolves through the same projection.
+    let default: serde_json::Value = client
+        .get(format!("{base}/api/model/default"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        default
+            .get("data")
+            .unwrap()
+            .get("limit")
+            .unwrap()
+            .get("context")
+            .unwrap()
+            .as_i64(),
+        Some(65_536),
+        "{default}"
+    );
+
+    handle.abort();
+}
+
 #[tokio::test]
 async fn project_list_reads_upstream_project_table() {
     // Simulate a shared upstream DB: create the `project` table per

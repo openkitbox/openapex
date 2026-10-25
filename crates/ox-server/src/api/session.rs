@@ -1091,6 +1091,10 @@ pub(crate) async fn remove(req: &mut Request, depot: &mut Depot, res: &mut Respo
             unknown_error(res, &error);
             return;
         }
+        // Drop the runner's per-session tables now rather than waiting for the
+        // idle sweep's 30-minute TTL (the sweep only runs inside a dispatch, so
+        // a deleted session's entry could otherwise outlive it indefinitely).
+        app.runner.forget_session(&target);
     }
 
     no_content(res);

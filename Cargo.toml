@@ -55,18 +55,11 @@ ox-tools = { path = "crates/ox-tools" }
 ox-tui = { path = "crates/ox-tui" }
 # Shell engine: omp's pi-shell (brush-based). The pinned rev is the only
 # supported update path; bump it deliberately and re-run the shell corpus A/B.
-pi-shell = { git = "https://github.com/openkitbox/oh-my-pi", rev = "2220e58146ebe31508e7a216242840d373e082d0" }
+pi-shell = { git = "https://github.com/openkitbox/oh-my-pi", branch = "ox" }
 rand = "0.10"
 ratatui = "0.29"
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
-# mctx/tokens.rs: the Kimi BPE is built through tiktoken-rs' public
-# CoreBPE::new (patched_tiktoken.rs @ v0.12.1); `rustc-hash` must match the
-# version tiktoken-rs 0.12 uses — its FxHashMap is the constructor's parameter
-# type. tokenizers is pinned to the onig backend: the only feature that
-# selects a non-onig regex engine is `unstable_wasm`, and onig is the engine
-# the golden oracle was generated with.
-rustc-hash = "2"
 salvo = "1.0"
 serde = "1.0"
 serde_json = "1.0"
@@ -89,8 +82,10 @@ unicode-width = "0.2"
 # Patches are only honored from the top-level workspace, so ox must repeat them
 # or the graph would mix the crates.io brush with the fork.
 [patch.crates-io]
-brush-core = { git = "https://github.com/openkitbox/oh-my-pi", rev = "2220e58146ebe31508e7a216242840d373e082d0" }
-brush-parser = { git = "https://github.com/openkitbox/oh-my-pi", rev = "2220e58146ebe31508e7a216242840d373e082d0" }
+turso_core = { git = "https://github.com/openkitbox/turso", branch = "ox" }
+turso_ext = { git = "https://github.com/openkitbox/turso", branch = "ox" }
+brush-core = { git = "https://github.com/openkitbox/oh-my-pi", branch = "ox" }
+brush-parser = { git = "https://github.com/openkitbox/oh-my-pi", branch = "ox" }
 
 [package]
 name = "ox"

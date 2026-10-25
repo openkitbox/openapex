@@ -813,6 +813,7 @@ pub(crate) fn spawn_background_fold(ctx: &DrainCtx) {
         model_catalog: Arc::clone(&ctx.model_catalog),
         mcp: ctx.mcp.clone(),
         instruction_baselines: ctx.instruction_baselines.clone(),
+        calibrations: ctx.calibrations.clone(),
         instruction_root: ctx.instruction_root.clone(),
         fold_in_flight: Arc::clone(&ctx.fold_in_flight),
     };
@@ -857,9 +858,12 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
     let (_, model) = resolve_selection(&ctx.db, &ctx.session_id, &ctx.config, &ctx.model_catalog)
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    // One counter resolution per fold: the session model's family decides
-    // the token counting for every budget walk below.
-    let count_tokens = crate::mctx::tokens::counter_fn_for_model(&model.id);
+    // One counter resolution per fold: the session's measured provider ÷ local
+    // ratio scales every local count into the budget's units below.
+    let count_tokens = crate::mctx::tokens::counter_fn(crate::mctx::calibration::ratio_for(
+        &ctx.calibrations,
+        &ctx.session_id,
+    ));
 
     let latest = latest_seq(&ctx.db, &ctx.session_id).await?;
     let checkpoint = last_checkpoint_seq(&ctx.db, &ctx.session_id).await?;
@@ -878,7 +882,7 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
     // both the coverage reading for the decision and the fast-path summary
     // candidate. It is never called a second time without a patch in between.
     let (head_m0, head_floor) = if ctx.config.magic_context.enabled {
-        let (head_m0, _head_m1, floor) = super::step::mctx_head(ctx, budget, &model.id).await;
+        let (head_m0, _head_m1, floor) = super::step::mctx_head(ctx, budget).await;
         (head_m0, floor)
     } else {
         (None, 0)
@@ -894,9 +898,7 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
         tracing::debug!(session = %ctx.session_id, ?decision, "background fold skipped");
         return Ok(None);
     }
-    match select_checkpoint_source(ctx, budget, head_m0, head_floor, &count_tokens, &model.id)
-        .await?
-    {
+    match select_checkpoint_source(ctx, budget, head_m0, head_floor, &count_tokens).await? {
         CheckpointPlan::Head { summary, floor } => {
             // D7: this is the SECOND tail read past the floor (the first was
             // the gate's fit check in `select_checkpoint_source`) — semantic,
@@ -941,7 +943,6 @@ async fn select_checkpoint_source(
     head_m0: Option<String>,
     floor: i64,
     count_tokens: &(impl Fn(&str) -> usize + Sync),
-    model_id: &str,
 ) -> Result<CheckpointPlan> {
     let Some(summary) = head_m0 else {
         // The pass produced no head (off above, or failed): the template is
@@ -969,7 +970,7 @@ async fn select_checkpoint_source(
             return Ok(CheckpointPlan::Template);
         }
     }
-    let (head_m0, _head_m1, floor) = super::step::mctx_head(ctx, budget, model_id).await;
+    let (head_m0, _head_m1, floor) = super::step::mctx_head(ctx, budget).await;
     let Some(summary) = head_m0 else {
         return Ok(CheckpointPlan::Template);
     };

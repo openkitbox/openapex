@@ -138,7 +138,6 @@ use crate::mctx::budget::Budget;
 use crate::mctx::compartments::{self, NewCompartment, Tiers};
 use crate::mctx::historian_validate::{self, ValidateOptions};
 use crate::mctx::memory::MemoryRow;
-use crate::mctx::tokens::heuristic;
 use ox_core::config::Config;
 use ox_schema::id::{id, now_millis};
 use ox_schema::message::{AssistantContent, Message, ToolState};
@@ -294,11 +293,18 @@ impl ChunkLimits {
 ///
 /// See [`ChunkLimits`] for the two ceilings. The context one is absolute: a
 /// block that would cross it is never admitted, not even as the first one.
+///
+/// `count_tokens` is the session's calibrated counter
+/// ([`crate::mctx::tokens::counter_fn`]). Both ceilings come from the model
+/// window — provider tokens — so the rendered text and the collapsed tool
+/// bodies must be measured in the same unit; counting them with the raw
+/// `bytes / 4` estimate would compare two different scales.
 pub fn chunk(
     rows: &[(i64, serde_json::Value)],
     start_ordinal: i64,
     eligible_end_ordinal: i64,
     limits: ChunkLimits,
+    count_tokens: &dyn Fn(&str) -> usize,
 ) -> Option<Chunk> {
     // The reference sorts before building (`ordered.sort_by_key`); the query
     // already orders by `seq`, so this only guards against a caller that did
@@ -306,7 +312,7 @@ pub fn chunk(
     let mut ordered: Vec<&(i64, serde_json::Value)> = rows.iter().collect();
     ordered.sort_by_key(|(ordinal, _)| *ordinal);
 
-    let mut builder = Builder::new(limits);
+    let mut builder = Builder::new(limits, count_tokens);
     for (ordinal, row) in ordered {
         if *ordinal < start_ordinal {
             continue;
@@ -360,8 +366,11 @@ struct Block {
 /// without the reference-only bookkeeping (tool-result boundaries, snapshot
 /// identity, and the `tool_expansions` map — which has no producer anywhere in
 /// the tree this was ported from, so ox always renders the call summary).
-struct Builder {
+struct Builder<'a> {
     limits: ChunkLimits,
+    /// The session's calibrated counter, so the rendered text and the collapsed
+    /// tool bodies are measured in the same unit as [`ChunkLimits`].
+    count_tokens: &'a dyn Fn(&str) -> usize,
     total_tokens: usize,
     /// Tool-result body tokens over the emitted blocks, kept apart from
     /// `total_tokens` because only that one is what the request costs.
@@ -380,10 +389,11 @@ struct Builder {
     present_ordinals: Vec<i64>,
 }
 
-impl Builder {
-    fn new(limits: ChunkLimits) -> Self {
+impl<'a> Builder<'a> {
+    fn new(limits: ChunkLimits, count_tokens: &'a dyn Fn(&str) -> usize) -> Self {
         Self {
             limits,
+            count_tokens,
             total_tokens: 0,
             total_result_tokens: 0,
             lines: Vec::new(),
@@ -401,7 +411,7 @@ impl Builder {
     fn push(&mut self, ordinal: i64, message: &Message) -> bool {
         let role = role_of(message);
         let (parts, commit_hashes) = render_parts(role, message);
-        let result_tokens = tool_result_tokens(message);
+        let result_tokens = tool_result_tokens(message, self.count_tokens);
         let compact_role = compact_role(role);
         // A message with nothing to render (a system note, a switch marker)
         // carries no content for the model but still occupies an ordinal, so it
@@ -454,12 +464,13 @@ impl Builder {
             return true;
         };
         let text = format_block(&block);
+        let count = self.count_tokens;
         let separator_tokens = if self.lines.is_empty() {
             0
         } else {
-            heuristic("\n")
+            count("\n")
         };
-        let block_tokens = heuristic(&text) + separator_tokens;
+        let block_tokens = count(&text) + separator_tokens;
         let block_context = block_tokens + block.result_tokens;
         // The fence is absolute — it is what the model working on the tail keeps
         // verbatim — so it is tested before the oversize-first-block allowance
@@ -591,7 +602,7 @@ fn render_parts(role: &str, message: &Message) -> (Vec<String>, Vec<String>) {
 /// [`Chunk::token_estimate`], the conversation paid this too. Ported from the
 /// reference's `tool_result_body_tokens` (its consumer there is the result
 /// boundary; ox's is the pressure reading).
-fn tool_result_tokens(message: &Message) -> usize {
+fn tool_result_tokens(message: &Message, count_tokens: &dyn Fn(&str) -> usize) -> usize {
     let Message::Assistant(message) = message else {
         return 0;
     };
@@ -599,7 +610,7 @@ fn tool_result_tokens(message: &Message) -> usize {
         .content
         .iter()
         .map(|part| match part {
-            AssistantContent::Tool { state, .. } => tool_state_tokens(state),
+            AssistantContent::Tool { state, .. } => tool_state_tokens(state, count_tokens),
             _ => 0,
         })
         .sum()
@@ -607,7 +618,7 @@ fn tool_result_tokens(message: &Message) -> usize {
 
 /// [`ToolState`]'s settled bodies, in tokens. A call that is still streaming or
 /// running has no body yet (its result lands in a later row).
-fn tool_state_tokens(state: &ToolState) -> usize {
+fn tool_state_tokens(state: &ToolState, count_tokens: &dyn Fn(&str) -> usize) -> usize {
     let content = match state {
         ToolState::Completed { content, .. } => Some(content.as_slice()),
         ToolState::Error { content, .. } => content.as_deref(),
@@ -617,7 +628,7 @@ fn tool_state_tokens(state: &ToolState) -> usize {
         content
             .iter()
             .map(|part| match part {
-                Content::Text { text } => heuristic(text),
+                Content::Text { text } => count_tokens(text),
                 // A file part rides the next request as a user message, not as
                 // this message's text: counting its uri would be noise.
                 Content::File { .. } => 0,

@@ -516,8 +516,9 @@ pub(crate) fn initial_text(value: &SourceValue) -> String {
 }
 
 /// Byte accounting of one step's injection surface. Tokens are estimated with
-/// the historian's convention (`bytes / 4`, rounded up — see
-/// `crate::mctx::tokens::heuristic`); they are a scale signal, not billing.
+/// the local convention (`bytes / 4`, rounded up — see
+/// `crate::mctx::tokens::heuristic`); they are a scale signal, not billing, so
+/// no calibration ratio is applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InjectionSizes {
     pub system0_bytes: usize,

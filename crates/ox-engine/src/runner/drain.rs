@@ -110,6 +110,9 @@ pub(crate) struct DrainCtx {
     pub instruction_baselines: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, super::instructions::Baseline>>,
     >,
+    /// Per-session provider ÷ local token ratio (see
+    /// [`crate::mctx::calibration`]): the unit every budget walk is measured in.
+    pub calibrations: crate::mctx::calibration::Store,
     /// The session's cached git-toplevel anchor, cloned from the session
     /// handle so step and generate share the same per-directory slot.
     pub instruction_root: super::InstructionRootCache,
