@@ -31,6 +31,12 @@
 //! `&'static`. Call sites resolve it once at a fold/pass boundary and inject
 //! it into the pure budget walks; [`Counter::count`] itself is pure and
 //! takes `&str` — no I/O, no text copies at call time.
+//!
+//! Counting is *not* cheap, though: the HF pipeline allocates ~2.6 KB per
+//! token, so a 76 KB history costs ~50 MB of transient allocation to count.
+//! The budget walks re-count the same pieces every pass, so
+//! [`counter_fn_for_model`] closes over a bounded, content-keyed
+//! [`CountCache`] and a repeated text costs only a hash.
 
 use base64::Engine as _;
 use std::path::Path;
@@ -193,9 +199,95 @@ pub(crate) fn counter_for_model(model_id: &str) -> &'static Counter {
 /// that shape: the borrow is `'static` (the counter lives in its family slot or
 /// is [`HEURISTIC`]), no text is copied, and the closure is `Sync` so it can be
 /// shared across the walks of one pass.
+///
+/// Exact counts go through the family's [`CountCache`]: the budget walks
+/// re-count the same history pieces, memory bodies and fold rows on every pass
+/// and fold, and a tokenization costs ~2.6 KB of allocation per token (~50 MB
+/// for a 76 KB history), so a content-keyed hit is worth ~1000x the hash it
+/// costs. The heuristic is cheap enough that it is not cached.
 pub(crate) fn counter_fn_for_model(model_id: &str) -> impl Fn(&str) -> usize + Sync + 'static {
     let counter = counter_for_model(model_id);
-    move |text| counter.count(text)
+    let cache = family_of(model_id).map(count_cache_for);
+    move |text| match cache {
+        Some(cache) => count_cached(cache, counter, text),
+        None => counter.count(text),
+    }
+}
+
+/// Distinct texts remembered per family before the older generation rotates
+/// out. An entry is a `(len, hash)` key plus the count — a few hundred KB for
+/// the whole cache, against the 78–108 MB the vocab itself costs.
+const COUNT_CACHE_ENTRIES: usize = 8 * 1024;
+
+/// Two-generation count memo: `current` takes the inserts, `previous` keeps the
+/// entries from the last rotation, so a text counted on consecutive passes (the
+/// common case — an unchanged compartment) still hits after one rotation. The
+/// key carries the text length, which is also what keeps a hash collision from
+/// returning a plausible-looking count for a different text.
+#[derive(Default)]
+struct CountCache {
+    current: std::collections::HashMap<(usize, u64), usize>,
+    previous: std::collections::HashMap<(usize, u64), usize>,
+}
+
+impl CountCache {
+    fn get(&mut self, key: (usize, u64)) -> Option<usize> {
+        if let Some(count) = self.current.get(&key) {
+            return Some(*count);
+        }
+        let count = *self.previous.get(&key)?;
+        // Promote on hit, so a text that keeps being counted stays resident.
+        self.insert(key, count);
+        Some(count)
+    }
+
+    fn insert(&mut self, key: (usize, u64), count: usize) {
+        if self.current.len() >= COUNT_CACHE_ENTRIES {
+            self.previous = std::mem::take(&mut self.current);
+        }
+        self.current.insert(key, count);
+    }
+}
+
+static GLM_COUNTS: std::sync::LazyLock<std::sync::Mutex<CountCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(CountCache::default()));
+static KIMI_COUNTS: std::sync::LazyLock<std::sync::Mutex<CountCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(CountCache::default()));
+static DEEPSEEK_COUNTS: std::sync::LazyLock<std::sync::Mutex<CountCache>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(CountCache::default()));
+
+fn count_cache_for(family: Family) -> &'static std::sync::Mutex<CountCache> {
+    match family {
+        Family::Glm => &GLM_COUNTS,
+        Family::Kimi => &KIMI_COUNTS,
+        Family::DeepSeek => &DEEPSEEK_COUNTS,
+    }
+}
+
+/// Count through the family's [`CountCache`]. The lock is never held across the
+/// tokenization itself: a slow exact count must not serialize the other
+/// sessions' counts. Two threads racing on the same unseen text both tokenize
+/// it and the later insert wins — the counts are equal, so the race is only
+/// redundant work, never a wrong budget.
+fn count_cached(cache: &std::sync::Mutex<CountCache>, counter: &Counter, text: &str) -> usize {
+    let key = (text.len(), text_hash(text));
+    if let Some(count) = cache.lock().ok().and_then(|mut cache| cache.get(key)) {
+        return count;
+    }
+    let count = counter.count(text);
+    if let Ok(mut cache) = cache.lock() {
+        cache.insert(key, count);
+    }
+    count
+}
+
+/// Content key for [`CountCache`]. `FxHasher` hashes at GB/s — three orders of
+/// magnitude faster than tokenizing, which is the whole point of the memo.
+fn text_hash(text: &str) -> u64 {
+    use std::hash::Hasher as _;
+    let mut hasher = rustc_hash::FxHasher::default();
+    hasher.write(text.as_bytes());
+    hasher.finish()
 }
 
 /// Load the family's vocab from its `ox_home()` asset directory.

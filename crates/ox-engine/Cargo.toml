@@ -22,13 +22,15 @@ rustc-hash.workspace = true
 serde = { workspace = true, features = ["derive", "rc"] }
 serde_json.workspace = true
 sha2.workspace = true
-tiktoken-rs.workspace = true
-tokenizers.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["compat", "rt"] }
 toml.workspace = true
 tracing.workspace = true
+
+tiktoken-rs = "0.12"
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+
 
 [dev-dependencies]
 tempfile.workspace = true
