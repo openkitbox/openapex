@@ -747,6 +747,17 @@ impl SessionEventData {
         adapter.get("data").cloned().unwrap_or(Value::Null)
     }
 
+    /// The borrowed twin of [`Self::into_data`]: publishers that keep the
+    /// typed event (the envelope) need the `data` subtree without giving up
+    /// ownership. Same output, no clone of the union.
+    pub fn to_data(&self) -> Value {
+        if let SessionEventData::Unknown { data, .. } = self {
+            return data.clone();
+        }
+        let adapter = serde_json::to_value(self).unwrap_or(Value::Null);
+        adapter.get("data").cloned().unwrap_or(Value::Null)
+    }
+
     /// The session this event belongs to, when the variant carries it.
     pub fn session_id(&self) -> Option<&str> {
         match self {
@@ -799,5 +810,29 @@ impl SessionEventData {
             | SessionEventData::CompactionFailed { session_id, .. } => Some(session_id),
             SessionEventData::Unknown { .. } => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_data_matches_into_data() {
+        let event = SessionEventData::TextStarted {
+            session_id: "ses_test".to_owned(),
+            assistant_message_id: "msg_test".to_owned(),
+            ordinal: 3,
+        };
+        let borrowed = event.to_data();
+        let owned = event.into_data();
+        assert_eq!(borrowed, owned);
+
+        let raw = serde_json::json!({ "any": "thing" });
+        let unknown = SessionEventData::Unknown {
+            r#type: "session.future".to_owned(),
+            data: raw.clone(),
+        };
+        assert_eq!(unknown.to_data(), raw);
     }
 }

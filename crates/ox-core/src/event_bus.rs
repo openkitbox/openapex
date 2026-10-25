@@ -203,9 +203,10 @@ impl EventBus {
     }
 
     /// Publish an event. Durable events commit via in-transaction projection;
-    /// ephemeral events only broadcast. Returns the constructed (typed)
-    /// envelope.
-    pub async fn publish(&self, data: SessionEventData) -> Result<EventEnvelope<SessionEventData>> {
+    /// ephemeral events only broadcast. The envelope is moved to the
+    /// broadcast channel (never cloned): callers observe the event through
+    /// the bus, not through the return value.
+    pub async fn publish(&self, data: SessionEventData) -> Result<()> {
         self.publish_durable(data, true).await
     }
 
@@ -223,10 +224,7 @@ impl EventBus {
     /// broadcast channel, so active SSE subscribers receive nothing, while a
     /// reconnecting client replaying the event log still sees the event
     /// (deliberate: sequence integrity is never sacrificed for silence).
-    pub async fn publish_quiet(
-        &self,
-        data: SessionEventData,
-    ) -> Result<EventEnvelope<SessionEventData>> {
+    pub async fn publish_quiet(&self, data: SessionEventData) -> Result<()> {
         self.publish_durable(data, false).await
     }
 
@@ -234,11 +232,7 @@ impl EventBus {
     /// broadcast of the published envelope itself; the post-commit secondary
     /// effects below are shared verbatim (they fire only when the projector
     /// reports recorded usage, which no quiet caller produces).
-    async fn publish_durable(
-        &self,
-        data: SessionEventData,
-        fanout: bool,
-    ) -> Result<EventEnvelope<SessionEventData>> {
+    async fn publish_durable(&self, data: SessionEventData, fanout: bool) -> Result<()> {
         let kind = data.kind().to_string();
         let created = now_millis();
 
@@ -253,8 +247,8 @@ impl EventBus {
                 metadata: None,
             };
             // Ignore SendError: no subscribers is fine.
-            let _ = self.tx.send(env.clone().into_generic());
-            return Ok(env);
+            let _ = self.tx.send(env.into_generic());
+            return Ok(());
         }
 
         let aggregate_id = session_id_of(&data)
@@ -271,7 +265,7 @@ impl EventBus {
 
         let env_id = self.next_evt_id();
         let version = durable_version(&kind) as i64;
-        let data_value = data.clone().into_data();
+        let data_value = data.to_data();
         let type_str = format!("{kind}@v{version}");
 
         // One transaction, projector included: the event log and the read
@@ -290,11 +284,16 @@ impl EventBus {
         };
         let seq = latest.map_or(0, |s| s + 1);
 
+        // Built once, with the payload moved in: `project` borrows it, the
+        // INSERT below uses the originals (`env_id`/`aggregate_id` — only
+        // their clones went into the envelope), and after COMMIT the
+        // envelope moves to the broadcast channel. No clone of `data` or
+        // `kind` anywhere on this path.
         let env = EventEnvelope {
             id: env_id.clone(),
             created,
-            kind: kind.clone(),
-            data: data.clone(),
+            kind,
+            data,
             durable: Some(DurableEnvelope {
                 aggregate_id: aggregate_id.clone(),
                 seq,
@@ -331,21 +330,8 @@ impl EventBus {
 
         tx.commit().await.context("commit durable event")?;
 
-        let env = EventEnvelope {
-            id: env_id,
-            created,
-            kind,
-            data,
-            durable: Some(DurableEnvelope {
-                aggregate_id,
-                seq,
-                version,
-            }),
-            location: None,
-            metadata: None,
-        };
         if fanout {
-            let _ = self.tx.send(env.clone().into_generic());
+            let _ = self.tx.send(env.into_generic());
         }
 
         // Post-commit secondary effects (ephemeral usage broadcasts).
@@ -373,7 +359,7 @@ impl EventBus {
             }
         }
 
-        Ok(env)
+        Ok(())
     }
 
     /// The database handle (read-only fixtures in tests).
@@ -637,15 +623,23 @@ mod tests {
         create_session(&bus, "s-quiet").await;
         let mut rx = bus.subscribe();
 
-        let env = bus
-            .publish_quiet(compaction_ended("s-quiet", "quiet checkpoint"))
+        bus.publish_quiet(compaction_ended("s-quiet", "quiet checkpoint"))
             .await
             .expect("quiet publish");
-        let seq = env.durable.as_ref().expect("durable envelope").seq;
 
         let conn = bus.db().acquire().await.expect("conn");
 
-        // The event row is persisted …
+        // The event row is persisted; its seq/id come from the log (the
+        // publisher no longer hands the envelope back).
+        let row = one_row(
+            &conn,
+            "SELECT seq, id FROM event WHERE aggregate_id = 's-quiet'
+              AND type LIKE 'session.compaction.ended%'",
+            (),
+        )
+        .await;
+        let seq = row.get::<i64>(0).unwrap();
+        let event_id = row.get::<String>(1).unwrap();
         let persisted = one_row(
             &conn,
             "SELECT count(*) FROM event WHERE aggregate_id = 's-quiet'
@@ -673,7 +667,7 @@ mod tests {
             &conn,
             "SELECT json_extract(data, '$.status'), json_extract(data, '$.summary')
               FROM session_message WHERE id = ?1 AND type = 'compaction'",
-            [ox_schema::id::from_event(&env.id)],
+            [ox_schema::id::from_event(&event_id)],
         )
         .await;
         assert_eq!(row.get::<String>(0).unwrap(), "completed");
@@ -686,7 +680,7 @@ mod tests {
             .expect("event log");
         assert_eq!(
             log.last().map(|e| e.id.as_str()),
-            Some(env.id.as_str()),
+            Some(event_id.as_str()),
             "reconnect replay still sees the quiet event"
         );
         assert!(
@@ -704,32 +698,33 @@ mod tests {
         create_session(&bus, "s-mix").await;
         let mut rx = bus.subscribe();
 
-        let a = bus
-            .publish(compaction_ended("s-mix", "loud a"))
+        bus.publish(compaction_ended("s-mix", "loud a"))
             .await
             .expect("publish");
-        let b = bus
-            .publish_quiet(compaction_ended("s-mix", "quiet b"))
+        bus.publish_quiet(compaction_ended("s-mix", "quiet b"))
             .await
             .expect("publish_quiet");
-        let c = bus
-            .publish(compaction_ended("s-mix", "loud c"))
+        bus.publish(compaction_ended("s-mix", "loud c"))
             .await
             .expect("publish");
 
-        // created = 0, then 1..=3 with no gap or reuse across the two paths.
-        let seqs = [
-            a.durable.as_ref().unwrap().seq,
-            b.durable.as_ref().unwrap().seq,
-            c.durable.as_ref().unwrap().seq,
-        ];
+        // created = 0, then 1..=3 with no gap or reuse across the two paths;
+        // seqs and ids come from the durable log, not a return handle.
+        let log = bus
+            .event_log("s-mix", 0, i64::MAX)
+            .await
+            .expect("event log");
+        let seqs: Vec<i64> = log
+            .iter()
+            .map(|e| e.durable.as_ref().unwrap().seq)
+            .collect();
         assert_eq!(seqs, [1, 2, 3], "one sequence counter for both paths");
 
         let frames = drain(&mut rx);
         let ids: Vec<&str> = frames.iter().map(|f| f.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec![a.id.as_str(), c.id.as_str()],
+            vec![log[0].id.as_str(), log[2].id.as_str()],
             "publish fans out, publish_quiet does not, commit order preserved"
         );
     }

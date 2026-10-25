@@ -89,32 +89,36 @@ async fn monotonic_seq_per_aggregate() {
     create(&bus, "s1").await;
     create(&bus, "s2").await;
 
-    let e1 = bus
-        .publish(SessionEventData::SessionRenamed {
-            session_id: "s1".to_string(),
-            title: "a".to_string(),
-        })
-        .await
-        .unwrap();
-    let e2 = bus
-        .publish(SessionEventData::SessionRenamed {
-            session_id: "s1".to_string(),
-            title: "b".to_string(),
-        })
-        .await
-        .unwrap();
-    let e3 = bus
-        .publish(SessionEventData::SessionRenamed {
-            session_id: "s2".to_string(),
-            title: "c".to_string(),
-        })
-        .await
-        .unwrap();
+    bus.publish(SessionEventData::SessionRenamed {
+        session_id: "s1".to_string(),
+        title: "a".to_string(),
+    })
+    .await
+    .unwrap();
+    bus.publish(SessionEventData::SessionRenamed {
+        session_id: "s1".to_string(),
+        title: "b".to_string(),
+    })
+    .await
+    .unwrap();
+    bus.publish(SessionEventData::SessionRenamed {
+        session_id: "s2".to_string(),
+        title: "c".to_string(),
+    })
+    .await
+    .unwrap();
 
-    // s1: created=0, rename=1, rename=2. s2: created=0, rename=1.
-    assert_eq!(e1.durable.as_ref().unwrap().seq, 1);
-    assert_eq!(e2.durable.as_ref().unwrap().seq, 2);
-    assert_eq!(e3.durable.as_ref().unwrap().seq, 1);
+    // s1: rename=1, rename=2 (after=0 excludes created). s2: rename=1.
+    async fn seqs_of(bus: &EventBus, session: &str) -> Vec<i64> {
+        bus.event_log(session, 0, i64::MAX)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.durable.as_ref().unwrap().seq)
+            .collect()
+    }
+    assert_eq!(seqs_of(&bus, "s1").await, [1, 2]);
+    assert_eq!(seqs_of(&bus, "s2").await, [1]);
 }
 
 #[tokio::test]
@@ -132,18 +136,22 @@ async fn concurrent_publishes_serialize() {
                 title: format!("t{i}"),
             })
             .await
-            .unwrap()
-            .durable
-            .unwrap()
-            .seq
+            .unwrap();
         }));
     }
-    let mut seqs: Vec<i64> = Vec::new();
     for h in handles {
-        seqs.push(h.await.unwrap());
+        h.await.unwrap();
     }
+    // The after=0 cursor skips created; renames are seqs 1..=n, no duplicate
+    // or missing seq.
+    let mut seqs: Vec<i64> = bus
+        .event_log("s1", 0, i64::MAX)
+        .await
+        .unwrap()
+        .iter()
+        .map(|e| e.durable.as_ref().unwrap().seq)
+        .collect();
     seqs.sort_unstable();
-    // created is seq 0, so renames are seqs 1..=n.
     let expected: Vec<i64> = (1..=n as i64).collect();
     assert_eq!(seqs, expected, "no duplicate or missing seqs");
 }
@@ -168,15 +176,25 @@ async fn concurrent_publishes_on_different_aggregates_queue() {
                 title: format!("t{i}"),
             })
             .await
-            .map(|env| env.durable.unwrap().seq)
+            .expect("publish");
         }));
     }
-    let mut seqs = Vec::new();
     for handle in handles {
-        seqs.push(handle.await.unwrap().expect("publish"));
+        handle.await.unwrap();
+    }
+    // Each session is its own aggregate, so the two interleave; the after=0
+    // cursor skips each session's created row, leaving the 8 renames.
+    let mut seqs = Vec::new();
+    for session in ["s1", "s2"] {
+        seqs.extend(
+            bus.event_log(session, 0, i64::MAX)
+                .await
+                .unwrap()
+                .iter()
+                .map(|e| e.durable.as_ref().unwrap().seq),
+        );
     }
     seqs.sort_unstable();
-    // Each session is its own aggregate, so the two interleave 1..=8.
     let expected: Vec<i64> = (1..=8).flat_map(|seq| [seq, seq]).collect();
     assert_eq!(
         seqs, expected,
@@ -204,15 +222,15 @@ async fn a_failed_publish_leaves_no_open_transaction() {
         "a missing inbox row is a lifecycle conflict"
     );
 
-    let env = bus
-        .publish(SessionEventData::SessionRenamed {
-            session_id: "s1".to_string(),
-            title: "after".to_string(),
-        })
-        .await
-        .expect("publish after a rolled-back one");
+    bus.publish(SessionEventData::SessionRenamed {
+        session_id: "s1".to_string(),
+        title: "after".to_string(),
+    })
+    .await
+    .expect("publish after a rolled-back one");
+    let log = bus.event_log("s1", 0, i64::MAX).await.unwrap();
     assert_eq!(
-        env.durable.unwrap().seq,
+        log.last().unwrap().durable.as_ref().unwrap().seq,
         1,
         "the conflict did not consume a seq"
     );
@@ -279,16 +297,23 @@ async fn happy_path_projection() {
     .unwrap();
 
     // inbox.delivered → user message row.
-    let del = bus
-        .publish(SessionEventData::InboxDelivered {
-            session_id: "s1".to_string(),
-            inbox_id: "ib1".to_string(),
-        })
-        .await
-        .unwrap();
-    let del_seq = del.durable.as_ref().unwrap().seq;
+    bus.publish(SessionEventData::InboxDelivered {
+        session_id: "s1".to_string(),
+        inbox_id: "ib1".to_string(),
+    })
+    .await
+    .unwrap();
 
     let conn = bus.db().acquire().await.unwrap();
+    let del_seq = one_row(
+        &conn,
+        "SELECT seq FROM event WHERE aggregate_id = 's1'
+          AND type LIKE 'session.inbox.delivered@%'",
+        (),
+    )
+    .await
+    .get::<i64>(0)
+    .unwrap();
     let row = one_row(
         &conn,
         "SELECT type, seq FROM session_message WHERE id = 'ib1'",
@@ -552,16 +577,14 @@ async fn ephemeral_events_broadcast_not_persisted() {
     .unwrap();
 
     // text.delta is ephemeral: no durable envelope, but broadcast.
-    let env = bus
-        .publish(SessionEventData::TextDelta {
-            session_id: "s1".to_string(),
-            assistant_message_id: "am1".to_string(),
-            ordinal: 0,
-            delta: "d".to_string(),
-        })
-        .await
-        .unwrap();
-    assert!(env.durable.is_none());
+    bus.publish(SessionEventData::TextDelta {
+        session_id: "s1".to_string(),
+        assistant_message_id: "am1".to_string(),
+        ordinal: 0,
+        delta: "d".to_string(),
+    })
+    .await
+    .unwrap();
 
     // It should arrive on the subscriber stream.
     let mut got = None;
@@ -570,7 +593,8 @@ async fn ephemeral_events_broadcast_not_persisted() {
             got = Some(ev);
         }
     }
-    assert!(got.is_some(), "ephemeral event broadcast");
+    let got = got.expect("ephemeral event broadcast");
+    assert!(got.durable.is_none());
 
     // And not persisted.
     let conn = bus.db().acquire().await.unwrap();
@@ -690,20 +714,23 @@ async fn projected_message_ids_derive_from_event_id() {
     let bus = bus().await;
     create(&bus, "s1").await;
 
-    let first = bus
-        .publish(SessionEventData::ExecutionSucceeded {
-            session_id: "s1".to_string(),
-        })
-        .await
-        .unwrap();
-    let second = bus
-        .publish(SessionEventData::ExecutionSucceeded {
-            session_id: "s1".to_string(),
-        })
-        .await
-        .unwrap();
+    bus.publish(SessionEventData::ExecutionSucceeded {
+        session_id: "s1".to_string(),
+    })
+    .await
+    .unwrap();
+    bus.publish(SessionEventData::ExecutionSucceeded {
+        session_id: "s1".to_string(),
+    })
+    .await
+    .unwrap();
 
-    assert!(first.id.starts_with("evt_"));
+    // The two idle rows derive from the last two events in the log.
+    let log = bus.event_log("s1", 0, i64::MAX).await.unwrap();
+    let n = log.len();
+    let first_id = log[n - 2].id.as_str();
+    let second_id = log[n - 1].id.as_str();
+    assert!(first_id.starts_with("evt_"));
     let conn = bus.db().acquire().await.unwrap();
     let mut stmt = conn
         .prepare(
@@ -720,16 +747,13 @@ async fn projected_message_ids_derive_from_event_id() {
 
     assert_eq!(
         ids,
-        vec![
-            ox::id::from_event(&first.id),
-            ox::id::from_event(&second.id)
-        ]
+        vec![ox::id::from_event(first_id), ox::id::from_event(second_id)]
     );
     assert!(ids.iter().all(|id| id.starts_with("msg_")));
     // Determinism: the derivation is a pure prefix swap.
     assert_eq!(
-        ox::id::from_event(&first.id),
-        format!("msg_{}", &first.id[4..])
+        ox::id::from_event(first_id),
+        format!("msg_{}", &first_id[4..])
     );
 }
 
@@ -740,22 +764,24 @@ async fn session_moved_projects_location_and_message() {
     let bus = bus().await;
     create(&bus, "s1").await;
 
-    let moved = bus
-        .publish(SessionEventData::SessionMoved {
-            session_id: "s1".to_string(),
-            payload: ox::schema::inbox::MovePayload {
-                location: LocationRef {
-                    directory: "/tmp/moved".to_string(),
-                    workspace_id: Some("ws1".to_string()),
-                },
-                project_id: "proj2".to_string(),
-                subpath: Some("packages/app".to_string()),
+    bus.publish(SessionEventData::SessionMoved {
+        session_id: "s1".to_string(),
+        payload: ox::schema::inbox::MovePayload {
+            location: LocationRef {
+                directory: "/tmp/moved".to_string(),
+                workspace_id: Some("ws1".to_string()),
             },
-        })
-        .await
-        .unwrap();
-    let moved_id = ox::id::from_event(&moved.id);
+            project_id: "proj2".to_string(),
+            subpath: Some("packages/app".to_string()),
+        },
+    })
+    .await
+    .unwrap();
 
+    // The moved event's id/created come from the durable log.
+    let log = bus.event_log("s1", 0, i64::MAX).await.unwrap();
+    let moved = log.last().unwrap();
+    let moved_id = ox::id::from_event(&moved.id);
     let created = moved.created;
     let conn = bus.db().acquire().await.unwrap();
     let row = one_row(
