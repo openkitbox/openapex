@@ -48,7 +48,7 @@
 //! re-derives what it will not freeze away).
 
 use anyhow::{Context as _, Result};
-use cortexkit_cache_core::{CoreState, DurabilityClass, FrozenUnit};
+use super::cache_core::{CoreState, DurabilityClass, FrozenUnit};
 
 use crate::mctx::budget::{Budget, memory_budget};
 use crate::mctx::cache::{HeadRenderer, McCache, PassOutcome, RenderedPass, Signals, run_pass};

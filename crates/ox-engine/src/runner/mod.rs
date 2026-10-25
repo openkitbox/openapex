@@ -24,7 +24,10 @@
 
 pub use crate::cardinal::chat::Chat;
 
-pub(crate) mod compaction;
+/// `pub` for the same reason as `drain` and `step`: the checkpoint-bound
+/// helpers are exercised from `tests/` (the crate carries no `#[cfg(test)]`
+/// modules).
+pub mod compaction;
 pub mod drain;
 pub(crate) mod generate;
 mod historian_trigger;

@@ -1131,15 +1131,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cortexkit-cache-core"
-version = "0.1.0"
-source = "git+https://github.com/openkitbox/commons?rev=067701f1ab61cd2c81aa58fb66b0cb65fbaef9e7#067701f1ab61cd2c81aa58fb66b0cb65fbaef9e7"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4995,7 +4986,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
- "cortexkit-cache-core",
  "dashmap",
  "futures-core",
  "git2",

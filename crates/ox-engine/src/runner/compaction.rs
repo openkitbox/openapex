@@ -307,11 +307,19 @@ async fn summarize_transcript(
     summarized_reply(ctx, request, emit_deltas).await
 }
 
-/// The checkpoint's `## Segment details` section heading (plan W3).
-const SEGMENT_DETAILS_HEADING: &str = "## Segment details";
-
-/// The per-segment half of a hierarchical checkpoint: one `[seq a..b]` head
-/// per segment with its summary beneath, blank-line separated.
+/// The global pass's input: every segment's summary under one `[seq a..b]`
+/// head, blank-line separated. The consolidation completion is the only
+/// reader, and it must see all of them to write one summary of the whole
+/// range — the segments themselves never reach the checkpoint. Publishing them
+/// made the checkpoint grow with the session: a hierarchical fold over the
+/// whole session appended every segment's summary to the summary it published,
+/// which is the head of every later request, which raised the usage reading
+/// that opened the next fold. Measured on a real session, that took checkpoints
+/// from 23 KB / 2 segments to 267 KB / 33 segments in one day, 97% of it
+/// segment text (179 KB summary, global part 6–8 KB) — ~57k tokens of a 262k
+/// window resident in the checkpoint alone. The model reads the global summary
+/// and, for the newest rows, the verbatim `recent` tail; anything older is
+/// consolidated, not replayed.
 fn segment_details(segments: &[(i64, i64, String)]) -> String {
     segments
         .iter()
@@ -323,14 +331,13 @@ fn segment_details(segments: &[(i64, i64, String)]) -> String {
 /// The template fallback's summarization, hierarchical when the snapshot
 /// needs more than one chunk (plan W3): every [`chunk_rows`] segment is
 /// summarized by the same hidden completion the flat path pays
-/// ([`summarize_transcript`]), then one final completion renders the global
-/// summary from the segment summaries under the verbatim [`SUMMARY_PROMPT`].
-/// The result is the global summary followed by the per-segment summaries
-/// under [`SEGMENT_DETAILS_HEADING`], each headed `[seq <first>..<last>]`
-/// over its rows. Atomic: any segment failing fails the whole
-/// summarization, so no partial text ever reaches a checkpoint. A single
-/// chunk is the flat path verbatim — one completion, no section, no extra
-/// call. Silent like the fold it serves: `emit_deltas` stays `false`.
+/// ([`summarize_transcript`]), then one final completion consolidates the
+/// segment summaries into the checkpoint under the verbatim [`SUMMARY_PROMPT`].
+/// Only that consolidation is published — see [`segment_details`] for why the
+/// segments stay internal. Atomic: any segment failing fails the whole
+/// summarization, so no partial text ever reaches a checkpoint. A single chunk
+/// is the flat path verbatim — one completion, no extra call. Silent like the
+/// fold it serves: `emit_deltas` stays `false`.
 async fn summarize_hierarchical(
     ctx: &DrainCtx,
     model: &ModelRef,
@@ -363,23 +370,29 @@ async fn summarize_hierarchical(
         let end = chunk.last().map_or(0, |(seq, _)| *seq);
         segments.push((start, end, summary));
     }
-    let details = segment_details(&segments);
+    let input = segment_details(&segments);
+    let segment_tokens = count_tokens(&input);
     // The global pass: the segment summaries are the transcript; the summary
     // instruction is the same verbatim SUMMARY_PROMPT the flat path asks.
     let request = summarization_request(
         &model.id,
         &[ChatMessage::User {
-            content: details.clone().into(),
+            content: input.into(),
         }],
     );
     let global = summarized_reply(ctx, request, false).await?;
-    let mut out = String::with_capacity(global.len() + details.len() + 24);
-    out.push_str(&global);
-    out.push_str("\n\n");
-    out.push_str(SEGMENT_DETAILS_HEADING);
-    out.push('\n');
-    out.push_str(&details);
-    Ok(out)
+    // The consolidation is the checkpoint. The segment count is the one number
+    // that says whether the fold's input range was right: an incremental fold
+    // sees one or two segments, and a rising count means it is re-reading rows
+    // an earlier fold already folded.
+    tracing::debug!(
+        session = %ctx.session_id,
+        segments = segments.len(),
+        segment_tokens,
+        summary_tokens = count_tokens(&global),
+        "hierarchical fold consolidated"
+    );
+    Ok(global)
 }
 
 /// The lifecycle head of one compaction: `session.compaction.started` makes
@@ -712,17 +725,37 @@ fn head_recent(
 /// constant, not a config knob.
 const SEGMENT_TOKENS: usize = 24_000;
 
+/// One fold row's contribution to a segment's cost: [`recent_row_text`] for
+/// the rows that render into `recent`, the checkpoint message for a compaction
+/// row. The compaction arm matters because the fold is incremental — the
+/// previous checkpoint is its first input row — and a checkpoint that cost
+/// nothing would ride a segment for free, letting one completion see far more
+/// than [`SEGMENT_TOKENS`].
+fn fold_row_text(row: &serde_json::Value) -> String {
+    match row.get("type").and_then(serde_json::Value::as_str) {
+        Some("compaction") => checkpoint_message(
+            row.get("summary")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+            row.get("recent")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+        ),
+        _ => recent_row_text(row),
+    }
+}
+
 /// Split fold rows into consecutive chunks of at most [`SEGMENT_TOKENS`]
 /// tokens of row text (plan Task 7). Deterministic greedy fill: the same rows
 /// always produce the same boundaries. A chunk's cost is the sum of
-/// [`recent_row_text`] sizes counted by the injected counter; a row is added
+/// [`fold_row_text`] sizes counted by the injected counter; a row is added
 /// to the current chunk unless it would bust the budget of a non-empty chunk,
 /// so a row whose own text exceeds the cap starts — and forms — its own
 /// chunk: never dropped, never split mid-row. Rows that render empty cost
 /// nothing and never force a split. At least one chunk is always returned
 /// (an empty input yields one empty chunk — the degenerate single-chunk
 /// fold); the chunks borrow `rows`, zero copies.
-fn chunk_rows<'a>(
+pub fn chunk_rows<'a>(
     rows: &'a [(i64, serde_json::Value)],
     count_tokens: &dyn Fn(&str) -> usize,
 ) -> Vec<&'a [(i64, serde_json::Value)]> {
@@ -730,7 +763,7 @@ fn chunk_rows<'a>(
     let mut start = 0usize;
     let mut spent = 0usize;
     for (index, (_, row)) in rows.iter().enumerate() {
-        let cost = count_tokens(&recent_row_text(row));
+        let cost = count_tokens(&fold_row_text(row));
         if spent > 0 && spent + cost > SEGMENT_TOKENS {
             chunks.push(&rows[start..index]);
             start = index;
@@ -984,10 +1017,20 @@ async fn select_checkpoint_source(
     }
 }
 
-/// The fold's template path (plan D6 item 4 — the pre-D6 behavior verbatim):
-/// summarize the snapshot, carry the mid-fold tail in `recent`, settle the
+/// The fold's template path (plan D6 item 4): summarize the snapshot from the
+/// previous checkpoint onward, carry the mid-fold tail in `recent`, settle the
 /// row quietly. Every fallback lands here — mctx off, a failed head pass, a
 /// failed or insufficient historian patch, a mid-fold budget bust.
+///
+/// The input is incremental: the read starts at the newest completed
+/// checkpoint row (`checkpoint - 1`, so the row itself is included) and stops
+/// at the snapshot. That row renders as the `<conversation-checkpoint>` user
+/// message — the previous summary plus its verbatim tail — exactly the
+/// transcript the *next* step would send, and exactly upstream's `[S1 + tail]`
+/// shape (its `previous` argument is the same thing). Loading from the
+/// beginning of the session instead re-summarized content that was already
+/// folded: one hidden completion per re-covered segment, and a checkpoint that
+/// published every segment's summary for ever (see [`segment_details`]).
 async fn template_fold(
     ctx: &DrainCtx,
     model: &ModelRef,
@@ -999,10 +1042,11 @@ async fn template_fold(
     // D4: snapshot. The summary describes only rows that existed now; rows
     // that land while it streams are carried verbatim in `recent` (I5).
     // Loaded raw with seqs: the hierarchical summarizer chunks over the raw
-    // rows (its budget walk reads the same text `recent_row_text` renders)
-    // and decodes per chunk.
+    // rows (its budget walk reads the same text the request will render) and
+    // decodes per chunk. `checkpoint` is the negative sentinel when the
+    // session has none, and the subtraction stays exact for any real ordinal.
     let rows: Vec<(i64, serde_json::Value)> =
-        super::step::rows_after_with_seq(&ctx.db, &ctx.session_id, i64::MIN)
+        super::step::rows_after_with_seq(&ctx.db, &ctx.session_id, checkpoint - 1)
             .await?
             .into_iter()
             .filter(|(seq, _)| *seq <= snapshot)

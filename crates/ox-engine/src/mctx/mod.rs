@@ -45,6 +45,7 @@ pub mod embed;
 /// cache-core integration: classification predicates, render handoff,
 /// whole-value CAS state and LKG.
 pub mod cache;
+mod cache_core;
 
 /// §N§ part tagging, `[dropped §N§]` placeholders and `ctx_expand` recovery.
 pub mod tagger;

@@ -20,8 +20,8 @@
 //!   `mctx_lkg:{session_id}`) backing the refuse-turn semantics wired up by
 //!   the integration tasks.
 
+use super::cache_core::{Action, CoreState, DurabilityClass, FrozenUnit, PassInput, StepResult};
 use anyhow::Context as _;
-use cortexkit_cache_core::{Action, CoreState, DurabilityClass, FrozenUnit, PassInput, StepResult};
 
 use ox_db::{Db, optional};
 use ox_schema::id::now_millis;

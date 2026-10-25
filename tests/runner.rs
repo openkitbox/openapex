@@ -99,6 +99,23 @@ impl MockChat {
         ])
     }
 
+    /// Text turn reporting `prompt_tokens` of usage: the number the fold gate
+    /// divides by the model window.
+    fn text_filling(delta: &'static str, prompt_tokens: u64) -> Script {
+        Script::Events(vec![
+            StreamEvent::TextDelta(delta.to_owned()),
+            StreamEvent::Finish {
+                reason: "stop".to_owned(),
+            },
+            StreamEvent::Usage(Usage {
+                prompt_tokens,
+                completion_tokens: 10,
+                cached_tokens: None,
+                reasoning_tokens: None,
+            }),
+        ])
+    }
+
     /// One tool call streamed in two fragments plus
     /// `finish_reason: tool_calls`.
     fn tool_events(id: &str, name: &str, arguments: &str) -> Vec<StreamEvent> {
@@ -397,6 +414,38 @@ fn registry_with(tool: Arc<dyn Tool>) -> ToolRegistry {
     registry
 }
 
+/// Every message of a recorded chat request as one string — what the model
+/// would actually read, so an assertion can ask "did this text reach it?".
+fn request_text(request: &ChatRequest) -> String {
+    request
+        .messages
+        .iter()
+        .map(|message| match message {
+            ChatMessage::System { content } => content.clone(),
+            ChatMessage::User { content } => content.as_str().to_owned(),
+            ChatMessage::Assistant {
+                content,
+                reasoning_content,
+                ..
+            } => [content.as_deref(), reasoning_content.as_deref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("\n"),
+            ChatMessage::Tool { content, .. } => content.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// How many settled checkpoints the session's transcript carries.
+fn settled_checkpoints(messages: &[Value]) -> usize {
+    messages
+        .iter()
+        .filter(|message| message["type"] == "compaction" && message["status"] == "completed")
+        .count()
+}
+
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
@@ -407,6 +456,38 @@ fn free_port() -> u16 {
         .local_addr()
         .expect("local addr")
         .port()
+}
+
+/// A stand-in gateway answering every request with one catalogue entry whose
+/// window is `context`, so budget arithmetic has real numbers to work with.
+async fn spawn_catalog_gateway(context: u32) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gateway");
+    let addr = listener.local_addr().expect("gateway addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut buffer = [0u8; 4096];
+                let _ = socket.read(&mut buffer).await;
+                let body = format!(
+                    r#"{{"object":"list","data":[{{"id":"deepseek-flash","object":"model",
+                       "owned_by":"cardinal","context_length":{context}}}]}}"#
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    format!("http://{addr}")
 }
 
 struct Harness {
@@ -451,17 +532,27 @@ impl Harness {
 
     /// Spawn the server with the given chat scripts and an empty registry.
     async fn spawn(scripts: Vec<Script>) -> Self {
-        Self::spawn_inner(scripts, ToolRegistry::new(), false, None).await
+        Self::spawn_inner(scripts, ToolRegistry::new(), false, None, None).await
     }
 
     /// Spawn the server with the given chat scripts and tool registry.
     async fn spawn_with(scripts: Vec<Script>, tools: ToolRegistry) -> Self {
-        Self::spawn_inner(scripts, tools, false, None).await
+        Self::spawn_inner(scripts, tools, false, None, None).await
     }
 
     /// Spawn with `[magic_context] enabled` (the pinboard tail is rendered).
     async fn spawn_mctx(scripts: Vec<Script>) -> Self {
-        Self::spawn_inner(scripts, ToolRegistry::new(), true, None).await
+        Self::spawn_inner(scripts, ToolRegistry::new(), true, None, None).await
+    }
+
+    /// Spawn against a stub gateway reporting a `window`-token context.
+    ///
+    /// The background fold's gate reads the provider's usage as a share of the
+    /// model window; without a catalogue entry the window is unknown, the share
+    /// is `None`, and the gate never opens — so a test of the fold needs this.
+    async fn spawn_folding(scripts: Vec<Script>, window: u32) -> Self {
+        let gateway = spawn_catalog_gateway(window).await;
+        Self::spawn_inner(scripts, ToolRegistry::new(), false, None, Some(gateway)).await
     }
 
     /// Spawn against an explicit database file: a "restart" over state a
@@ -472,6 +563,7 @@ impl Harness {
             ToolRegistry::new(),
             false,
             Some(db_path.to_path_buf()),
+            None,
         )
         .await
     }
@@ -481,6 +573,7 @@ impl Harness {
         tools: ToolRegistry,
         magic_context: bool,
         db_path: Option<std::path::PathBuf>,
+        catalog: Option<String>,
     ) -> Self {
         let port = free_port();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -494,10 +587,19 @@ impl Harness {
             ..Config::default()
         };
         config.magic_context.enabled = magic_context;
+        let with_catalog = catalog.is_some();
+        if let Some(url) = catalog {
+            config.cardinal_url = url;
+        }
         let chat = Arc::new(MockChat::new(scripts));
         let state = ox::build_state_with_home(config.clone(), chat.clone(), tools, home.clone())
             .await
             .expect("build state");
+        if with_catalog {
+            // The composition root warms the catalogue before serving; this
+            // test seam does not, and the fold gate needs the model window.
+            state.model_catalog.warm().await;
+        }
         let db = state.db.clone();
         let bus = state.bus.clone();
         let runner = state.runner.clone();
@@ -1942,6 +2044,160 @@ async fn interrupt_aborts_in_flight_tool() {
     assert_eq!(part["state"]["status"], "error");
     assert_eq!(part["state"]["error"]["type"], "aborted");
     harness.wait_event("session.step.failed").await;
+}
+
+#[tokio::test]
+async fn a_fold_resumes_from_the_previous_checkpoint() {
+    // A fold's input is the transcript from the newest settled checkpoint
+    // onward, not the whole session. Reading from row 0 instead chunks the
+    // *folded* rows too, and a chunk that carries no checkpoint row renders its
+    // rows verbatim — so every fold re-summarized history an earlier fold had
+    // already folded, appending each segment's summary again: 23 KB / 2
+    // segments grew to 267 KB / 33 in one day on a real session, and the
+    // checkpoint is the head of every later request.
+    //
+    // One blocking compaction lays down the checkpoint (the `Overflow` path
+    // needs no window), then the retry's usage — 100k of a 131072-token window,
+    // 76% — opens the 60% fold gate. magic_context is off, so the fold takes
+    // the template path: exactly the one that used to re-read everything.
+    //
+    // The prompt is large on purpose: past the 24k-token segment cap, so a
+    // whole-session read cannot hide it inside the checkpoint's chunk.
+    let folded = format!("folded-marker {}", "filler ".repeat(25_000));
+    let harness = Harness::spawn_folding(
+        vec![
+            Script::Overflow,
+            MockChat::summary("S1 summary"),
+            MockChat::text_filling("resumed", 100_000),
+            // Spare summaries: a fold that re-reads the whole session chunks it
+            // into several segments and asks for one completion per segment, so
+            // the red case must still reach the assertions instead of running
+            // out of script (an exhausted script fails the request outright).
+            MockChat::summary("S2 summary"),
+            MockChat::summary("S3 summary"),
+            MockChat::summary("S4 summary"),
+            MockChat::summary("S5 summary"),
+        ],
+        131_072,
+    )
+    .await;
+    let session_id = harness.create_session().await;
+    let response = harness
+        .post(
+            &format!("/api/session/{session_id}/prompt"),
+            json!({ "text": folded }),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    harness.wait_event("session.execution.succeeded").await;
+    harness
+        .wait_for(&session_id, "the fold's checkpoint", |messages| {
+            settled_checkpoints(messages) == 2
+        })
+        .await;
+
+    let requests = harness.chat.requests();
+    assert!(
+        requests.len() >= 4,
+        "overflow attempt + blocking summary + retry + the fold: {:?}",
+        requests.len()
+    );
+    // The published checkpoint carries no segment text: the per-segment
+    // summaries are the consolidation completion's input only.
+    let messages = harness.messages(&session_id).await;
+    let newest = messages
+        .iter()
+        .rev()
+        .find(|message| message["type"] == "compaction" && message["status"] == "completed")
+        .expect("the fold's checkpoint");
+    let summary = newest["summary"].as_str().expect("summary text");
+    assert!(
+        !summary.contains("[seq ") && !summary.contains("## Segment details"),
+        "segment text in the checkpoint: {summary}"
+    );
+    // The blocking compaction resumes from nothing: the folded prompt is its
+    // transcript, and it still asks for a full summary.
+    let blocking = request_text(&requests[1]);
+    assert!(blocking.contains("folded-marker"), "{blocking}");
+    assert!(
+        !blocking.contains("<conversation-checkpoint>"),
+        "{blocking}"
+    );
+    // The fold resumes: the checkpoint is its only input besides the tail, the
+    // folded prompt is not re-read, and the instruction is the update shape.
+    let fold = request_text(&requests[3]);
+    assert!(fold.contains("<conversation-checkpoint>"), "{fold}");
+    assert!(fold.contains("S1 summary"), "previous summary: {fold}");
+    assert!(fold.contains("resumed"), "the tail rides along: {fold}");
+    assert!(
+        !fold.contains("folded-marker"),
+        "re-read the folded part: {fold}"
+    );
+    assert!(
+        matches!(
+            requests[3].messages.last(),
+            Some(ChatMessage::User { content })
+                if content.as_str().starts_with("Update the existing checkpoint")
+        ),
+        "the checkpoint-update prompt: {:?}",
+        requests[3].messages.last()
+    );
+}
+
+#[tokio::test]
+async fn a_hierarchical_fold_publishes_only_the_consolidation() {
+    // A fold whose input is past the 24k-token segment cap is summarized per
+    // segment and then consolidated. Only the consolidation is the checkpoint:
+    // publishing the segments too made every later request carry them, and
+    // every fold appended them again (23 KB / 2 segments → 267 KB / 33 in one
+    // day on a real session).
+    //
+    // ~120 KB of prompt is ~30k tokens uncalibrated; the turn reports
+    // `prompt_tokens` 100,000, so the calibration ratio clamps to its 2.0
+    // ceiling and the fold measures ~60k tokens — three segments at the cap.
+    let harness = Harness::spawn_folding(
+        vec![
+            MockChat::text_filling("chatted", 100_000),
+            MockChat::summary("CONSOLIDATED"),
+            MockChat::summary("CONSOLIDATED"),
+            MockChat::summary("CONSOLIDATED"),
+            MockChat::summary("CONSOLIDATED"),
+            MockChat::summary("CONSOLIDATED"),
+        ],
+        131_072,
+    )
+    .await;
+    let session_id = harness.create_session().await;
+    let response = harness
+        .post(
+            &format!("/api/session/{session_id}/prompt"),
+            json!({ "text": format!("long-marker {}", "filler ".repeat(17_000)) }),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    harness.wait_event("session.execution.succeeded").await;
+    harness
+        .wait_for(&session_id, "the fold's checkpoint", |messages| {
+            settled_checkpoints(messages) == 1
+        })
+        .await;
+
+    // The turn, then one completion per segment, then the consolidation.
+    let requests = harness.chat.requests().len();
+    assert!(
+        requests >= 4,
+        "the fold's input was split into segments: {requests} requests"
+    );
+    let messages = harness.messages(&session_id).await;
+    let checkpoint = messages
+        .iter()
+        .find(|message| message["type"] == "compaction" && message["status"] == "completed")
+        .expect("checkpoint");
+    assert_eq!(
+        checkpoint["summary"].as_str(),
+        Some("## Objective\n- CONSOLIDATED"),
+        "the consolidation alone, no `## Segment details`"
+    );
 }
 
 #[tokio::test]
