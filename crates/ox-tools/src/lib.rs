@@ -36,7 +36,6 @@ pub mod skill;
 pub mod skills;
 pub mod subagent;
 pub mod todowrite;
-pub mod web_search;
 pub mod webfetch;
 pub mod write;
 
@@ -62,7 +61,6 @@ impl ToolRegistry {
             Arc::new(question::QuestionTool),
             Arc::new(skill::SkillTool),
             Arc::new(capability_search::CapabilitySearchTool),
-            Arc::new(web_search::WebSearchTool::new()),
             Arc::new(read::ReadTool),
             Arc::new(shell::ShellTool::new()),
             Arc::new(webfetch::WebFetchTool::new()),

@@ -242,9 +242,10 @@ impl ShellSession {
     /// Whether this session still owns the brush interpreter it ran in.
     /// `false` once the run settled and no background child is left running.
     pub fn retains_interpreter(&self) -> bool {
-        self.shell
-            .lock()
-            .map_or_else(|poisoned| poisoned.into_inner().is_some(), |slot| slot.is_some())
+        self.shell.lock().map_or_else(
+            |poisoned| poisoned.into_inner().is_some(),
+            |slot| slot.is_some(),
+        )
     }
 
     /// Wait until output arrives or `timeout` passes, so an `interact` call
@@ -293,10 +294,10 @@ impl ShellSession {
                 completed: Some(ox_schema::id::now_millis()),
             };
         }
-        let shell = self
-            .shell
-            .lock()
-            .map_or_else(|poisoned| poisoned.into_inner().clone(), |slot| slot.clone());
+        let shell = self.shell.lock().map_or_else(
+            |poisoned| poisoned.into_inner().clone(),
+            |slot| slot.clone(),
+        );
         if let Some(shell) = shell {
             shell.abort().await;
         }
@@ -336,7 +337,10 @@ impl ShellSession {
     fn interpreter_pid(&self) -> Option<u32> {
         let slot = self.shell.lock().ok()?;
         let shell = slot.as_ref()?;
-        shell.pids().first().and_then(|pid| u32::try_from(*pid).ok())
+        shell
+            .pids()
+            .first()
+            .and_then(|pid| u32::try_from(*pid).ok())
     }
 }
 
