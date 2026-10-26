@@ -10,9 +10,9 @@
 //!   process env at session spawn and passes it as `session_env`, preserving
 //!   the old `sh -c` behaviour where the agent shares the user's PATH,
 //!   version managers, and credentials.
-//! - **Minimizer**: enabled by default. The streamed chunks and the
-//!   `/api/shell` pages stay raw; only the model-facing settled text is the
-//!   minimized rendering when the engine produced one.
+//! - **Output compression**: none in the engine. ox rewrites commands through
+//!   RTK before they run (`crate::rtk`), so pi-shell's minimizer stays off
+//!   and the capture is the only copy of the output.
 //! - **Smart worktree (`PI_SMART_GIT`)**: on by default unless the host env
 //!   says otherwise. `git worktree add` then copy-on-write clones the source
 //!   checkout through pi-vcs — ignored build caches (target/, node_modules/)
@@ -28,7 +28,6 @@ use std::collections::HashMap;
 pub fn shell() -> pi_shell::Shell {
     pi_shell::Shell::new(Some(pi_shell::ShellOptions {
         session_env: Some(env_snapshot()),
-        minimizer: Some(minimizer_options()),
         ..Default::default()
     }))
 }
@@ -44,13 +43,4 @@ fn env_snapshot() -> HashMap<String, String> {
     env.entry("PI_SMART_GIT".to_owned())
         .or_insert_with(|| "1".to_owned());
     env
-}
-
-/// Default-on minimizer: every built-in filter active, engine defaults for
-/// capture caps and outline levels.
-fn minimizer_options() -> pi_shell::minimizer::MinimizerOptions {
-    pi_shell::minimizer::MinimizerOptions {
-        enabled: Some(true),
-        ..Default::default()
-    }
 }

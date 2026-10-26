@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use ox::config::Config;
 use ox::runner::{Tool, ToolContext, ToolRegistry};
+use ox::tool::rtk::RtkRewriter;
 use ox::tool::shell::ShellTool;
 use salvo::Listener;
 
@@ -68,7 +69,7 @@ async fn start_session() -> String {
         cancellation: CancellationToken::new(),
         registry: std::sync::Arc::new(ox::runner::ToolRegistry::new()),
     };
-    let tool = ShellTool::new();
+    let tool = ShellTool::new().with_rewriter(RtkRewriter::disabled());
     let output = tool
         .execute(
             ctx,

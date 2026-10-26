@@ -9,17 +9,24 @@
 //! lives in [`sessions`], shared with the `/api/shell` endpoints.
 //!
 //! The engine underneath is pi-shell (pinned oh-my-pi rev): the model writes
-//! `bash`, not the host login shell, and the minimizer compacts the settled
-//! output the model reads while the paged capture stays raw. Commands run
-//! with stdin at `/dev/null` — pi-shell has no writer for a running command,
-//! so the old `chars` parameter is gone and interactive commands fail fast
-//! on EOF instead of hanging.
+//! `bash`, not the host login shell. Output compression is RTK's job, done
+//! BEFORE execution: [`RtkRewriter`] rewrites the command itself
+//! (`git status` → `rtk git status`), so the capture, the paged output and
+//! the model-facing text are all the same bytes — there is no second,
+//! minimized copy. RTK buffers a wrapped command's output until it exits, so
+//! commands that return an owned session at once (`background=true` or
+//! `yield_time_ms=0`) are never rewritten; a rewritten foreground command
+//! that outlives its yield window says so in its "still running" notice.
+//! Commands run with stdin at `/dev/null` — pi-shell has no writer for a
+//! running command, so the old `chars` parameter is gone and interactive
+//! commands fail fast on EOF instead of hanging.
 
 pub mod sessions;
 
 mod engine;
 
 use crate::contract::{Tool, ToolContext, ToolOutput};
+use crate::rtk::RtkRewriter;
 use ox_schema::wire::ToolDef;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -49,19 +56,32 @@ const SHELL_NAME: &str = "bash";
 pub struct ShellTool {
     /// Live sessions started by `run`, shared with the `/api/shell` handlers.
     sessions: Arc<sessions::ShellSessions>,
+    /// Optional pre-execution RTK rewrite; a disabled rewriter is a no-op.
+    rtk: Arc<RtkRewriter>,
 }
 
 impl ShellTool {
     pub fn new() -> Self {
         Self {
             sessions: sessions::shared(),
+            rtk: Arc::new(RtkRewriter::new()),
         }
     }
 
     /// A shell tool over a caller-provided session table, so a test can
     /// inspect the sessions it started.
     pub fn with_sessions(sessions: Arc<sessions::ShellSessions>) -> Self {
-        Self { sessions }
+        Self {
+            sessions,
+            rtk: Arc::new(RtkRewriter::new()),
+        }
+    }
+
+    /// Swap the RTK rewriter. Tests inject [`RtkRewriter::disabled`] (host
+    /// independence) or [`RtkRewriter::with_binary`] (a mock rtk).
+    pub fn with_rewriter(mut self, rtk: RtkRewriter) -> Self {
+        self.rtk = Arc::new(rtk);
+        self
     }
 }
 
@@ -294,8 +314,24 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
     // A background request starts a session and returns at once; a foreground
     // request waits out its yield window.
     let yield_ms = if background { 0 } else { yield_time_ms };
+    // RTK rewrites the command itself before execution; any failure leaves it
+    // unchanged. Commands that return an owned session at once are exempt
+    // (`background=true` or `yield_time_ms=0`): their value is streaming
+    // output, which RTK would buffer until the command exits.
+    let mut rewritten = false;
+    let command = if yield_ms == 0 {
+        command.to_owned()
+    } else {
+        match tool.rtk.rewrite(command).await {
+            Some(text) => {
+                rewritten = true;
+                text
+            }
+            None => command.to_owned(),
+        }
+    };
     let session = match tool.sessions.spawn(sessions::SpawnRequest {
-        command: command.to_owned(),
+        command,
         cwd: workdir,
         timeout_ms: Some(timeout_ms).filter(|timeout| *timeout > 0),
     }) {
@@ -318,11 +354,10 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
         .status
         .is_some_and(|status| status != sessions::Status::Running)
     {
-        // Settled: this is the ordinary one-shot result. The model reads the
-        // minimizer's rendering when the engine produced one; the paged
-        // capture stays raw either way.
-        let text = session.minimized_text().unwrap_or(page.output);
-        return settled_output(&session.id, timeout_ms, &text, exit).with_metadata(json!({
+        // Settled: this is the ordinary one-shot result. Compression already
+        // happened upstream (RTK rewrote the command), so the model reads the
+        // same capture the paged output serves.
+        return settled_output(&session.id, timeout_ms, &page.output, exit).with_metadata(json!({
             "status": "completed",
             "shellID": session.id,
             "truncated": false,
@@ -342,6 +377,12 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
          terminate it. Do not start the same command again.",
         session.id, session.id
     ));
+    if rewritten {
+        text.push_str(
+            "\n\nThis command runs through rtk, which buffers its output until it exits; \
+             interact returns that output once the command completes.",
+        );
+    }
     ok_text(text).with_metadata(json!({
         "status": "running",
         "shellID": session.id,

@@ -173,9 +173,6 @@ pub struct ShellSession {
     exit: Mutex<Exit>,
     /// The embedded brush session this command runs in.
     shell: pi_shell::Shell,
-    /// The minimizer's rendering of the settled run, when the engine produced
-    /// one. Only the model-facing result reads this; paged output stays raw.
-    minimized: Mutex<Option<pi_shell::MinimizerResult>>,
     /// Fires when output is appended or the session settles, so a waiter
     /// needs no polling interval of its own.
     changed: Notify,
@@ -230,15 +227,6 @@ impl ShellSession {
     /// Whether the command has settled (exited, timed out, or been killed).
     pub fn settled(&self) -> bool {
         self.exit().is_settled()
-    }
-
-    /// The minimizer's rendering of the finished run, if the engine produced
-    /// one. Only meaningful once settled.
-    pub fn minimized_text(&self) -> Option<String> {
-        self.minimized
-            .lock()
-            .ok()
-            .and_then(|slot| slot.as_ref().map(|result| result.text.clone()))
     }
 
     /// Wait until output arrives or `timeout` passes, so an `interact` call
@@ -381,7 +369,6 @@ impl ShellSessions {
             output: Mutex::new(OutputBuffer::default()),
             exit: Mutex::new(Exit::default()),
             shell: engine::shell(),
-            minimized: Mutex::new(None),
             changed: Notify::new(),
             events: events.clone(),
         });
@@ -509,11 +496,6 @@ async fn drive(session: Arc<ShellSession>, timeout_ms: Option<u64>) {
     let now = ox_schema::id::now_millis();
     let exit = match result {
         Ok(result) => {
-            if let Some(minimized) = result.minimized
-                && let Ok(mut slot) = session.minimized.lock()
-            {
-                *slot = Some(minimized);
-            }
             Exit {
                 status: Some(if result.timed_out {
                     Status::Timeout

@@ -14,6 +14,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use ox::runner::{Tool, ToolContext};
+use ox::tool::rtk::RtkRewriter;
 use ox::tool::shell::ShellTool;
 
 /// The fixture as `(command, exit code under the host shell)` pairs.
@@ -36,7 +37,7 @@ async fn every_corpus_command_settles_without_an_engine_error() {
     let corpus = corpus();
     assert!(corpus.len() >= 40, "corpus shrank: {}", corpus.len());
     let directory = tempfile::tempdir().expect("tempdir");
-    let tool = ShellTool::new();
+    let tool = ShellTool::new().with_rewriter(RtkRewriter::disabled());
     for (command, _zsh_exit) in corpus {
         let ctx = ToolContext {
             session_id: "ses_corpus".to_owned(),

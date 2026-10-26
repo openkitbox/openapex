@@ -30,6 +30,7 @@ pub mod grep;
 pub mod patch;
 pub mod question;
 pub mod read;
+pub mod rtk;
 pub mod shell;
 pub mod skill;
 pub mod skills;

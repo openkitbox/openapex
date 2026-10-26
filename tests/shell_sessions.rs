@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use ox::runner::ToolContext;
+use ox::tool::rtk::RtkRewriter;
 use ox::tool::shell::ShellTool;
 
 /// Run one tool call against a temp workspace.
@@ -38,7 +39,7 @@ fn session_id(output: &ox::runner::ToolOutput) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_fast_command_settles_within_one_call() {
     let directory = tempfile::tempdir().unwrap();
-    let tool = ShellTool::new();
+    let tool = ShellTool::new().with_rewriter(RtkRewriter::disabled());
     let ctx = context(directory.path());
     let output = call(&tool, &ctx, json!({ "command": "echo hello" })).await;
     assert_eq!(output.error, None);
@@ -51,7 +52,7 @@ async fn a_fast_command_settles_within_one_call() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_long_command_returns_a_session_that_interact_observes() {
     let directory = tempfile::tempdir().unwrap();
-    let tool = ShellTool::new();
+    let tool = ShellTool::new().with_rewriter(RtkRewriter::disabled());
     let ctx = context(directory.path());
     let output = call(
         &tool,
@@ -103,7 +104,7 @@ async fn interactive_commands_see_eof_not_a_hang() {
     // a command that would block on input fails fast instead. This is the
     // documented replacement for the old `interact.chars` feeding.
     let directory = tempfile::tempdir().unwrap();
-    let tool = ShellTool::new();
+    let tool = ShellTool::new().with_rewriter(RtkRewriter::disabled());
     let ctx = context(directory.path());
     let output = call(
         &tool,
@@ -123,7 +124,7 @@ async fn interactive_commands_see_eof_not_a_hang() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn interact_without_a_session_fails_cleanly() {
     let directory = tempfile::tempdir().unwrap();
-    let tool = ShellTool::new();
+    let tool = ShellTool::new().with_rewriter(RtkRewriter::disabled());
     let ctx = context(directory.path());
     let output = call(
         &tool,
@@ -140,7 +141,7 @@ async fn interact_without_a_session_fails_cleanly() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_without_a_session_fails_cleanly() {
     let directory = tempfile::tempdir().unwrap();
-    let tool = ShellTool::new();
+    let tool = ShellTool::new().with_rewriter(RtkRewriter::disabled());
     let ctx = context(directory.path());
     let output = call(
         &tool,
@@ -157,7 +158,7 @@ async fn stop_without_a_session_fails_cleanly() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_timeout_settles_the_session() {
     let directory = tempfile::tempdir().unwrap();
-    let tool = ShellTool::new();
+    let tool = ShellTool::new().with_rewriter(RtkRewriter::disabled());
     let ctx = context(directory.path());
     let output = call(
         &tool,
@@ -176,7 +177,7 @@ async fn a_timeout_settles_the_session() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_action_is_an_input_error() {
     let directory = tempfile::tempdir().unwrap();
-    let tool = ShellTool::new();
+    let tool = ShellTool::new().with_rewriter(RtkRewriter::disabled());
     let ctx = context(directory.path());
     let output = call(&tool, &ctx, json!({ "action": "resume" })).await;
     assert!(
@@ -191,7 +192,7 @@ async fn an_unknown_action_is_an_input_error() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancelled_call_stops_its_session() {
     let directory = tempfile::tempdir().unwrap();
-    let tool = ShellTool::new();
+    let tool = ShellTool::new().with_rewriter(RtkRewriter::disabled());
     let ctx = context(directory.path());
     let token = ctx.cancellation.clone();
     let task =
