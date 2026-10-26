@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::cardinal::wire::{ChatMessage, ChatRequest, reasoning_effort_of};
+use crate::cardinal::wire::{ChatMessage, ChatRequest};
 
 use super::Inner;
 use super::drain::DrainCtx;
@@ -94,6 +94,6 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
 
     let mut request = ChatRequest::new(model.id.clone(), messages);
     request.tools = ctx.tools.definitions_shared();
-    request.reasoning_effort = reasoning_effort_of(model.variant.as_deref());
+    request.apply_reasoning_effort(model.variant.as_deref());
     crate::mctx::historian::collect_completion(&ctx.chat, &request).await
 }

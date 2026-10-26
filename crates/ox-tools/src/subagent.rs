@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::contract::{Tool, ToolContext, ToolOutput};
 use ox_schema::event::SessionEventData;
-use ox_schema::support::{LocationRef, SessionMetadata};
+use ox_schema::support::{LocationRef, ModelRef, SessionMetadata};
 use ox_schema::wire::ToolDef;
 use std::path::Path;
 
@@ -260,7 +260,7 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
             Err(error) => return fail(format!("Unable to load subagent session: {error}")),
         }
     } else {
-        let (child_id, project_id, directory, workspace_id, subpath) =
+        let (child_id, project_id, directory, workspace_id, subpath, model) =
             match load_parent(&tool.handle.db, &ctx.session_id).await {
                 Ok(Some(parent)) => (
                     ox_schema::id::id("ses"),
@@ -268,6 +268,7 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
                     parent.1,
                     parent.2,
                     parent.3,
+                    parent.4,
                 ),
                 Ok(None) => {
                     return fail(format!("Unknown parent session: {}", ctx.session_id));
@@ -289,7 +290,7 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
             slug: ox_schema::slug::create(),
             title: Some(description.clone()),
             agent: None,
-            model: None,
+            model,
             metadata: Some(SessionMetadata::default()),
             permissions: None,
             version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -412,8 +413,14 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
     }
 }
 
-/// `(project_id, directory, workspace_id, subpath)` of a session row.
-type ParentTuple = (String, String, Option<String>, Option<String>);
+/// `(project_id, directory, workspace_id, subpath, model)` of a session row.
+type ParentTuple = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<ModelRef>,
+);
 
 /// Watch a background child and, when it settles, hand its result to the
 /// parent as a synthetic message — which also wakes the parent for a new turn
@@ -550,7 +557,7 @@ async fn load_parent(db: &ox_db::Db, session_id: &str) -> Result<Option<ParentTu
     let conn = db.acquire().await.map_err(|error| error.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT project_id, directory, workspace_id, path
+            "SELECT project_id, directory, workspace_id, path, model
              FROM session_v2 WHERE id = ?1",
         )
         .await
@@ -561,6 +568,13 @@ async fn load_parent(db: &ox_db::Db, session_id: &str) -> Result<Option<ParentTu
     let Some(row) = row else {
         return Ok(None);
     };
+    let model = row
+        .get::<Option<String>>(4)
+        .map_err(|error| error.to_string())?
+        .as_deref()
+        .map(serde_json::from_str::<ModelRef>)
+        .transpose()
+        .map_err(|error| error.to_string())?;
     Ok(Some((
         row.get::<String>(0).map_err(|error| error.to_string())?,
         row.get::<String>(1).map_err(|error| error.to_string())?,
@@ -568,6 +582,7 @@ async fn load_parent(db: &ox_db::Db, session_id: &str) -> Result<Option<ParentTu
             .map_err(|error| error.to_string())?,
         row.get::<Option<String>>(3)
             .map_err(|error| error.to_string())?,
+        model,
     )))
 }
 

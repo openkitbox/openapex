@@ -688,6 +688,8 @@ impl ActorTask {
                             // (`session.execution.succeeded` → idle()): the
                             // busy period is over, the tail may fold in the
                             // background.
+                            // The fold resolves its own selection once, so the
+                            // model and its reasoning policy cannot diverge.
                             compaction::spawn_background_fold(&ctx);
                             break;
                         }

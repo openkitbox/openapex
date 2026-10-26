@@ -117,7 +117,7 @@ pub(crate) async fn has_running_compaction(db: &Db, session_id: &str) -> Result<
 /// Build the summarization request: system prompt + transcript (no working
 /// system prompt, no tools) + the summary instruction as the last user
 /// turn. Upstream `summarize`: `prepared.request` + `Message.user(prompt)`.
-pub(crate) fn summarization_request(model: &str, transcript: &[ChatMessage]) -> ChatRequest {
+pub(crate) fn summarization_request(model: &ModelRef, transcript: &[ChatMessage]) -> ChatRequest {
     let mut messages = Vec::with_capacity(transcript.len() + 2);
     messages.push(ChatMessage::System {
         content: COMPACTION_SYSTEM.to_owned(),
@@ -135,7 +135,9 @@ pub(crate) fn summarization_request(model: &str, transcript: &[ChatMessage]) -> 
     });
     // `tools` stays empty → omitted from the wire; upstream disables tools
     // for compaction (`input.tools` defaults to a rejecting definition set).
-    ChatRequest::new(model.to_owned(), messages)
+    let mut request = ChatRequest::new(model.id.clone(), messages);
+    request.apply_reasoning_effort(model.variant.as_deref());
+    request
 }
 
 /// Upstream `NUDGE` (compaction.ts): the one re-ask sent when the reply
@@ -299,11 +301,8 @@ async fn summarize_transcript(
     rows: &[ox_schema::message::Message],
     emit_deltas: bool,
 ) -> std::result::Result<String, SessionError> {
-    let request = summarization_request(
-        // Same cardinal routing rule as step.rs: bare model id.
-        &model.id,
-        &super::step::build_chat_messages("", "", &[], rows),
-    );
+    let request =
+        summarization_request(model, &super::step::build_chat_messages("", "", &[], rows));
     summarized_reply(ctx, request, emit_deltas).await
 }
 
@@ -375,7 +374,7 @@ async fn summarize_hierarchical(
     // The global pass: the segment summaries are the transcript; the summary
     // instruction is the same verbatim SUMMARY_PROMPT the flat path asks.
     let request = summarization_request(
-        &model.id,
+        model,
         &[ChatMessage::User {
             content: input.into(),
         }],
@@ -892,6 +891,9 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
     let (_, model) = resolve_selection(&ctx.db, &ctx.session_id, &ctx.config, &ctx.model_catalog)
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    // One selection serves both the model and the policy: re-resolving either
+    // inside the fold could pair a model with another selection's variant.
+    let reasoning_effort = model.variant.clone();
     // One counter resolution per fold: the session's measured provider ÷ local
     // ratio scales every local count into the budget's units below.
     let count_tokens = crate::mctx::tokens::counter_fn(crate::mctx::calibration::ratio_for(
@@ -932,7 +934,16 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
         tracing::debug!(session = %ctx.session_id, ?decision, "background fold skipped");
         return Ok(None);
     }
-    match select_checkpoint_source(ctx, budget, head_m0, head_floor, &count_tokens).await? {
+    match select_checkpoint_source(
+        ctx,
+        budget,
+        head_m0,
+        head_floor,
+        &count_tokens,
+        reasoning_effort,
+    )
+    .await?
+    {
         CheckpointPlan::Head { summary, floor } => {
             // D7: this is the SECOND tail read past the floor (the first was
             // the gate's fit check in `select_checkpoint_source`) — semantic,
@@ -977,6 +988,7 @@ async fn select_checkpoint_source(
     head_m0: Option<String>,
     floor: i64,
     count_tokens: &(impl Fn(&str) -> usize + Sync),
+    reasoning_effort: Option<String>,
 ) -> Result<CheckpointPlan> {
     let Some(summary) = head_m0 else {
         // The pass produced no head (off above, or failed): the template is
@@ -992,7 +1004,7 @@ async fn select_checkpoint_source(
     // rather than hold it across the await.
     drop(tail);
     drop(summary);
-    match super::historian_trigger::patch_fold(ctx, budget, floor).await {
+    match super::historian_trigger::patch_fold(ctx, budget, floor, reasoning_effort).await {
         Ok(true) => {}
         Ok(false) => return Ok(CheckpointPlan::Template),
         Err(error) => {

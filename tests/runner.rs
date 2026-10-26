@@ -63,6 +63,7 @@ enum Script {
 struct MockChat {
     scripts: Mutex<VecDeque<Script>>,
     requests: Mutex<Vec<ChatRequest>>,
+    request_notify: Arc<Notify>,
 }
 
 impl MockChat {
@@ -70,6 +71,7 @@ impl MockChat {
         Self {
             scripts: Mutex::new(scripts.into_iter().collect()),
             requests: Mutex::new(Vec::new()),
+            request_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -192,6 +194,16 @@ impl MockChat {
     fn requests(&self) -> Vec<ChatRequest> {
         self.requests.lock().expect("requests lock").clone()
     }
+
+    async fn wait_for_requests(&self, count: usize) {
+        loop {
+            let notified = self.request_notify.notified();
+            if self.requests.lock().expect("requests lock").len() >= count {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 impl Chat for MockChat {
@@ -200,6 +212,7 @@ impl Chat for MockChat {
             .lock()
             .expect("requests lock")
             .push(request.clone());
+        self.request_notify.notify_waiters();
         let script = self
             .scripts
             .lock()
@@ -530,7 +543,6 @@ impl Harness {
         let _ = (&mut self.collector).await;
     }
 
-    /// Spawn the server with the given chat scripts and an empty registry.
     async fn spawn(scripts: Vec<Script>) -> Self {
         Self::spawn_inner(scripts, ToolRegistry::new(), false, None, None).await
     }
@@ -538,21 +550,6 @@ impl Harness {
     /// Spawn the server with the given chat scripts and tool registry.
     async fn spawn_with(scripts: Vec<Script>, tools: ToolRegistry) -> Self {
         Self::spawn_inner(scripts, tools, false, None, None).await
-    }
-
-    /// Spawn with `[magic_context] enabled` (the pinboard tail is rendered).
-    async fn spawn_mctx(scripts: Vec<Script>) -> Self {
-        Self::spawn_inner(scripts, ToolRegistry::new(), true, None, None).await
-    }
-
-    /// Spawn against a stub gateway reporting a `window`-token context.
-    ///
-    /// The background fold's gate reads the provider's usage as a share of the
-    /// model window; without a catalogue entry the window is unknown, the share
-    /// is `None`, and the gate never opens — so a test of the fold needs this.
-    async fn spawn_folding(scripts: Vec<Script>, window: u32) -> Self {
-        let gateway = spawn_catalog_gateway(window).await;
-        Self::spawn_inner(scripts, ToolRegistry::new(), false, None, Some(gateway)).await
     }
 
     /// Spawn against an explicit database file: a "restart" over state a
@@ -566,6 +563,27 @@ impl Harness {
             None,
         )
         .await
+    }
+
+    /// Spawn with `[magic_context] enabled` (the pinboard tail is rendered).
+    async fn spawn_mctx(scripts: Vec<Script>) -> Self {
+        Self::spawn_inner(scripts, ToolRegistry::new(), true, None, None).await
+    }
+
+    /// Spawn with `[magic_context]` enabled and a catalog window for historian pressure tests.
+    async fn spawn_mctx_folding(scripts: Vec<Script>, window: u32) -> Self {
+        let gateway = spawn_catalog_gateway(window).await;
+        Self::spawn_inner(scripts, ToolRegistry::new(), true, None, Some(gateway)).await
+    }
+
+    /// Spawn against a stub gateway reporting a `window`-token context.
+    ///
+    /// The background fold's gate reads the provider's usage as a share of the
+    /// model window; without a catalogue entry the window is unknown, the share
+    /// is `None`, and the gate never opens — so a test of the fold needs this.
+    async fn spawn_folding(scripts: Vec<Script>, window: u32) -> Self {
+        let gateway = spawn_catalog_gateway(window).await;
+        Self::spawn_inner(scripts, ToolRegistry::new(), false, None, Some(gateway)).await
     }
 
     async fn spawn_inner(
@@ -644,6 +662,18 @@ impl Harness {
             home,
             _dir: dir,
         }
+    }
+
+    async fn post_model(&self, session_id: &str, variant: &str) {
+        let response = self
+            .post(
+                &format!("/api/session/{session_id}/model"),
+                json!({
+                    "model": {"id": "deepseek-flash", "providerID": "cardinal", "variant": variant}
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), 204, "model switch");
     }
 
     async fn post(&self, path: &str, body: Value) -> reqwest::Response {
@@ -800,9 +830,74 @@ async fn model_variant_reaches_the_chat_request_as_reasoning_effort() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Session title generation
-// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn historian_request_uses_the_triggered_session_policy() {
+    let harness = Harness::spawn_mctx_folding(
+        vec![
+            MockChat::text_filling("turn", 100_000),
+            MockChat::summary("fold"),
+        ],
+        131_072,
+    )
+    .await;
+    let session_id = harness.create_session().await;
+    harness.post_model(&session_id, "high").await;
+    harness
+        .post(
+            &format!("/api/session/{session_id}/prompt"),
+            json!({ "text": format!("fold-marker {}", "x ".repeat(18_000)) }),
+        )
+        .await;
+    harness.wait_event("session.execution.succeeded").await;
+    harness.chat.wait_for_requests(2).await;
+
+    let requests = harness.chat.requests();
+    let historian = requests
+        .iter()
+        .find(|request| request.model == "deepseek-flash")
+        .expect("historian request");
+    assert_eq!(historian.model, "deepseek-flash");
+    assert_eq!(historian.reasoning_effort.as_deref(), Some("high"));
+}
+
+#[tokio::test]
+async fn detached_historian_uses_the_trigger_snapshot_after_model_switch() {
+    let stream_gate = Arc::new(Notify::new());
+    let harness = Harness::spawn_mctx_folding(
+        vec![
+            MockChat::text_filling("turn", 100_000),
+            Script::TextThenHang("<output>", stream_gate.clone()),
+        ],
+        131_072,
+    )
+    .await;
+    let session_id = harness.create_session().await;
+    harness.post_model(&session_id, "high").await;
+    harness
+        .post(
+            &format!("/api/session/{session_id}/prompt"),
+            json!({ "text": format!("snapshot-marker {}", "x ".repeat(18_000)) }),
+        )
+        .await;
+    // The pressure trigger runs at step start, before the main completion is
+    // dispatched: observing the first request proves the policy snapshot was
+    // taken. The switch below therefore happens after the snapshot, and the
+    // detached historian must still send the trigger-time value.
+    harness.chat.wait_for_requests(1).await;
+    harness.post_model(&session_id, "low").await;
+    harness.chat.wait_for_requests(2).await;
+    stream_gate.notify_waiters();
+    harness.wait_event("session.execution.succeeded").await;
+
+    let historian = harness
+        .chat
+        .requests()
+        .into_iter()
+        .find(|request| request.model == "deepseek-flash")
+        .expect("detached historian request");
+    assert_eq!(historian.model, "deepseek-flash");
+    assert_eq!(historian.reasoning_effort.as_deref(), Some("high"));
+}
 
 /// `session.update` with an empty title asks for a generated one (upstream
 /// handlers/session.ts:234). The request itself is a 204 — generation is
@@ -816,7 +911,14 @@ async fn an_empty_title_update_generates_a_title() {
     ])
     .await;
     // Untitled at creation: this session has to reach the untitled branch.
-    let response = harness.post("/api/session", json!({})).await;
+    let response = harness
+        .post(
+            "/api/session",
+            json!({
+                "model": {"id": "k3-256k", "providerID": "cardinal", "variant": "high"},
+            }),
+        )
+        .await;
     assert_eq!(response.status(), 200);
     let body: Value = response.json().await.unwrap();
     let session_id = body["data"]["id"].as_str().unwrap().to_owned();
@@ -860,6 +962,13 @@ async fn an_empty_title_update_generates_a_title() {
         })
         .expect("a title-generation request");
     assert!(title_request.tools.is_empty(), "tools-free completion");
+    assert_eq!(
+        title_request.reasoning_effort.as_deref(),
+        Some("high"),
+        "title completion preserves the selected model variant"
+    );
+    let wire = serde_json::to_value(title_request).expect("wire");
+    assert_eq!(wire["reasoning_effort"], json!("high"));
     let user = serde_json::to_value(&title_request.messages[1]).unwrap();
     assert_eq!(user["content"], json!("debug 500 errors in production"));
 }
@@ -884,6 +993,33 @@ async fn the_first_turn_of_an_untitled_session_generates_a_title() {
         )
         .await;
     harness.wait_event("session.execution.succeeded").await;
+
+    let requests = harness.chat.requests();
+    let title_request = requests
+        .iter()
+        .find(|request| {
+            serde_json::to_value(&request.messages[0])
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .is_some_and(|content| content.starts_with("You are a title generator."))
+        })
+        .expect("a title-generation request");
+    assert_eq!(
+        title_request.reasoning_effort.as_deref(),
+        None,
+        "title completion without a model variant omits reasoning_effort"
+    );
+    assert!(
+        serde_json::to_value(title_request)
+            .expect("wire")
+            .get("reasoning_effort")
+            .is_none()
+    );
 
     let title = wait_for_title(&harness, &session_id).await;
     assert_eq!(title.as_deref(), Some("Fixing the flaky test"));
@@ -2208,7 +2344,22 @@ async fn overflow_compacts_and_retries_once() {
         MockChat::text("resumed"),
     ])
     .await;
-    let session_id = harness.create_session().await;
+    let session_id = {
+        let response = harness
+            .post(
+                "/api/session",
+                json!({
+                    "title": "runner test",
+                    "model": {"id": "k3-256k", "providerID": "cardinal", "variant": "high"},
+                }),
+            )
+            .await;
+        assert_eq!(response.status(), 200, "session create with model");
+        response.json::<Value>().await.expect("json")["data"]["id"]
+            .as_str()
+            .expect("session id")
+            .to_owned()
+    };
     let response = harness
         .post(
             &format!("/api/session/{session_id}/prompt"),
@@ -2233,6 +2384,11 @@ async fn overflow_compacts_and_retries_once() {
     // The summarization request: compaction system prompt, no tools, the
     // summary instruction last.
     let summary = &requests[1];
+    assert_eq!(
+        summary.reasoning_effort.as_deref(),
+        Some("high"),
+        "compaction preserves the selected model variant"
+    );
     assert!(matches!(
         &summary.messages[0],
         ox::cardinal::wire::ChatMessage::System { content } if content.contains("summarize conversations")
@@ -2334,6 +2490,11 @@ async fn compaction_item_summarizes_and_checkpoints_context() {
     let requests = harness.chat.requests();
     assert_eq!(requests.len(), 2, "summary + wake turn");
     let summary = &requests[0];
+    assert_eq!(
+        summary.reasoning_effort.as_deref(),
+        None,
+        "compaction without a model variant omits reasoning_effort"
+    );
     assert!(matches!(
         &summary.messages[0],
         ox::cardinal::wire::ChatMessage::System { content } if content.contains("summarize conversations")

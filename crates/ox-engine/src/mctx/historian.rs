@@ -1336,8 +1336,12 @@ pub fn build_compartment_agent_prompt(inputs: &CompartmentPromptInputs<'_>) -> S
 /// The historian's hidden completion request with an already-assembled user
 /// prompt: the system prompt role-scoped, plus `user_prompt` verbatim. No tools —
 /// a hidden sub-completion has none.
-pub fn historian_request_with_prompt(model: &str, user_prompt: &str) -> ChatRequest {
-    ChatRequest::new(
+pub fn historian_request_with_prompt(
+    model: &str,
+    user_prompt: &str,
+    reasoning_effort: Option<&str>,
+) -> ChatRequest {
+    let mut request = ChatRequest::new(
         model.to_owned(),
         vec![
             ChatMessage::System {
@@ -1347,7 +1351,9 @@ pub fn historian_request_with_prompt(model: &str, user_prompt: &str) -> ChatRequ
                 content: user_prompt.to_owned().into(),
             },
         ],
-    )
+    );
+    request.apply_reasoning_effort(reasoning_effort);
+    request
 }
 
 /// [`historian_request_with_prompt`] with the user prompt assembled from the
@@ -1356,12 +1362,13 @@ pub fn historian_request(
     model: &str,
     chunk_text: &str,
     inputs: &CompartmentPromptInputs<'_>,
+    reasoning_effort: Option<&str>,
 ) -> ChatRequest {
     let user_prompt = build_compartment_agent_prompt(&CompartmentPromptInputs {
         input_source: chunk_text,
         ..*inputs
     });
-    historian_request_with_prompt(model, &user_prompt)
+    historian_request_with_prompt(model, &user_prompt, reasoning_effort)
 }
 
 /// The re-prompt used after a completion that could not be parsed or did not
@@ -1434,6 +1441,9 @@ pub struct RunCtx<'a> {
     pub chat: &'a Arc<dyn Chat>,
     /// Default-model resolution for the hidden completion.
     pub catalog: &'a ox_core::model_catalog::ModelCatalog,
+    /// The session's policy captured at trigger time; detached runs never
+    /// re-read a mutable session selection.
+    pub reasoning_effort: Option<String>,
 }
 
 /// One run's inputs. The caller (Task 9) resolves the chunk and the context
@@ -1549,7 +1559,8 @@ pub async fn run(ctx: &RunCtx<'_>, plan: &RunPlan<'_>) -> Result<Option<RunOutco
             )),
             None => std::borrow::Cow::Borrowed(request_prompt.as_str()),
         };
-        let request = historian_request_with_prompt(&model, &user_prompt);
+        let request =
+            historian_request_with_prompt(&model, &user_prompt, ctx.reasoning_effort.as_deref());
 
         let text = match collect_completion(ctx.chat, &request).await {
             Ok(text) => text,

@@ -47,7 +47,12 @@ use ox_db::Db;
 ///
 /// Every failure here is logged and swallowed: context assembly must never fail
 /// a turn (upstream's transform has the same contract).
-pub(crate) fn mctx_historian(ctx: &DrainCtx, budget: Budget, floor: i64) {
+pub(crate) fn mctx_historian(
+    ctx: &DrainCtx,
+    budget: Budget,
+    floor: i64,
+    reasoning_effort: Option<String>,
+) {
     if !ctx.config.magic_context.enabled {
         return;
     }
@@ -71,6 +76,7 @@ pub(crate) fn mctx_historian(ctx: &DrainCtx, budget: Budget, floor: i64) {
             session_id: &session_id,
             project: &project,
             ratio,
+            reasoning_effort,
         };
         match firing.run(floor).await {
             Ok(Some(published)) => {
@@ -241,7 +247,12 @@ fn tail_load_skippable(usage: NewestUsage, tail_bytes: i64, budget: &Budget, rat
 /// compartments (the floor advanced); `Ok(false)` covers every benign skip —
 /// a run already in flight, an empty tail, the fence. Errors are the
 /// caller's cue to fall back (the template path), not retried here.
-pub(crate) async fn patch_fold(ctx: &DrainCtx, budget: Budget, floor: i64) -> Result<bool> {
+pub(crate) async fn patch_fold(
+    ctx: &DrainCtx,
+    budget: Budget,
+    floor: i64,
+    reasoning_effort: Option<String>,
+) -> Result<bool> {
     let project = ctx.directory.to_string_lossy();
     let firing = Firing {
         db: &ctx.db,
@@ -252,6 +263,7 @@ pub(crate) async fn patch_fold(ctx: &DrainCtx, budget: Budget, floor: i64) -> Re
         session_id: &ctx.session_id,
         project: &project,
         ratio: calibration::ratio_for(&ctx.calibrations, &ctx.session_id),
+        reasoning_effort,
     };
     match firing.patch(floor).await {
         Ok(Some(published)) => {
@@ -284,6 +296,8 @@ struct Firing<'a> {
     /// ([`crate::mctx::calibration`]): every count this decision takes is scaled
     /// by it, because both `ChunkLimits` ceilings are in provider tokens.
     ratio: f64,
+    /// Snapshot of the owning session's reasoning policy for this firing.
+    reasoning_effort: Option<String>,
 }
 
 impl Firing<'_> {
@@ -519,6 +533,7 @@ impl Firing<'_> {
             catalog,
             session_id,
             project,
+            reasoning_effort,
             ..
         } = self;
         let compartments = compartments::load(db, session_id).await?;
@@ -546,6 +561,7 @@ impl Firing<'_> {
             config,
             chat,
             catalog,
+            reasoning_effort,
         };
         let plan = historian::RunPlan {
             session_id,

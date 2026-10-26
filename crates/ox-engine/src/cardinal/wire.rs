@@ -69,6 +69,14 @@ impl ChatRequest {
             stream_options: IncludeUsage,
         }
     }
+
+    /// Apply the selected model variant to this request's wire policy.
+    ///
+    /// Construction deliberately leaves reasoning unset; callers opt into the
+    /// shared compatibility mapping at the request boundary.
+    pub fn apply_reasoning_effort(&mut self, variant: Option<&str>) {
+        self.reasoning_effort = reasoning_effort_of(variant);
+    }
 }
 
 impl Serialize for ChatRequest {

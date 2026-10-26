@@ -62,7 +62,7 @@ use crate::cardinal::chat::BoxChatStream;
 use crate::cardinal::stream::StreamEvent;
 use crate::cardinal::wire::{
     ChatMessage, ChatRequest, FunctionCall, FunctionType, ImageUrl, ToolCall, Usage, UserContent,
-    UserPart, reasoning_effort_of,
+    UserPart,
 };
 use crate::mctx::{search, temporal};
 use crate::prompt;
@@ -217,7 +217,7 @@ pub(crate) async fn run(
         // Pressure is checked after the pass: the floor it reports is what the
         // live tail is measured above. Both windows were resolved once, when
         // the budget was derived.
-        super::historian_trigger::mctx_historian(ctx, budget, floor);
+        super::historian_trigger::mctx_historian(ctx, budget, floor, params.model.variant.clone());
         let rows = if ctx.config.magic_context.enabled {
             // The §N§ overlay (tag prefixes + drop placeholders) is part of the
             // integration: with it off the request must stay byte-identical to
@@ -359,7 +359,7 @@ pub(crate) async fn run(
         request.tools = ctx.tools.definitions_shared();
         // The session's selected reasoning level (model variant) rides every
         // chat turn; no selection leaves the field off the wire.
-        request.reasoning_effort = reasoning_effort_of(params.model.variant.as_deref());
+        request.apply_reasoning_effort(params.model.variant.as_deref());
 
         let stream = match ctx.chat.stream_chat(&request).await {
             Ok(stream) => stream,

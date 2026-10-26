@@ -312,10 +312,13 @@ async fn generate_inner(
     let model = title_model(db, session_id, config, catalog).await?;
     // Upstream's request is tools-free and single-shot (the agent's deny-all
     // permissions); `ChatRequest::new` already advertises no tools.
-    let request = ChatRequest::new(
+    // The session's primary model generates the title (the same selection
+    // `drain.rs` resolves), so the variant rides the hidden completion too.
+    let mut request = ChatRequest::new(
         model.id.clone(),
         vec![ChatMessage::system(PROMPT_TITLE), ChatMessage::user(text)],
     );
+    request.apply_reasoning_effort(model.variant.as_deref());
     let response = crate::mctx::historian::collect_completion(&chat, &request).await?;
     let Some(title) = extract_title(&response) else {
         return Ok(());

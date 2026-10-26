@@ -203,7 +203,11 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
         slug: ox::slug::create(),
         title: Some("parent".to_owned()),
         agent: None,
-        model: None,
+        model: Some(ox::schema::support::ModelRef {
+            id: "parent-model".to_owned(),
+            provider_id: "parent-provider".to_owned(),
+            variant: Some("high".to_owned()),
+        }),
         metadata: None,
         permissions: None,
         version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -292,6 +296,19 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
         .unwrap()
         .expect("child row");
     assert_eq!(row.get::<String>(0).unwrap(), parent_id);
+
+    let mut stmt = conn
+        .prepare("SELECT model FROM session_v2 WHERE id = ?1")
+        .await
+        .unwrap();
+    let row = ox::db::optional(&mut stmt, (child_id,))
+        .await
+        .unwrap()
+        .expect("child model row");
+    assert_eq!(
+        row.get::<String>(0).unwrap(),
+        r#"{"id":"parent-model","providerID":"parent-provider","variant":"high"}"#
+    );
 
     // --- resume: `sessionID` continues the same child conversation --------
     // The resumed child needs a script for its second turn; queue it before

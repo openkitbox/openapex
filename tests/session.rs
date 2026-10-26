@@ -618,6 +618,71 @@ async fn session_form_list_answers_empty_for_unknown_sessions() {
 }
 
 #[tokio::test]
+async fn child_session_model_inherits_once_and_explicit_model_wins() {
+    let h = Harness::spawn().await;
+    let parent = h
+        .create(json!({
+            "title": "parent",
+            "model": {"id": "parent-model", "providerID": "provider", "variant": "high"}
+        }))
+        .await;
+
+    let inherited = h
+        .create(json!({"parentID": parent, "title": "inherited"}))
+        .await;
+    assert_eq!(
+        h.session_info(&inherited).await["model"],
+        json!({"id": "parent-model", "providerID": "provider", "variant": "high"})
+    );
+
+    let explicit = h
+        .create(json!({
+            "parentID": parent,
+            "title": "explicit",
+            "model": {"id": "child-model", "providerID": "provider", "variant": "low"}
+        }))
+        .await;
+    assert_eq!(
+        h.session_info(&explicit).await["model"],
+        json!({"id": "child-model", "providerID": "provider", "variant": "low"})
+    );
+
+    // A later parent switch does not rewrite either already-created child.
+    let response = h
+        .post(
+            &format!("/api/session/{parent}/model"),
+            json!({"model": {"id": "parent-model", "providerID": "provider", "variant": "medium"}}),
+        )
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        h.session_info(&inherited).await["model"]["variant"],
+        json!("high")
+    );
+    assert_eq!(
+        h.session_info(&explicit).await["model"]["variant"],
+        json!("low")
+    );
+
+    // Idempotent recreation of an existing child never overwrites its model.
+    let response = h
+        .post(
+            "/api/session",
+            json!({
+                "id": inherited,
+                "parentID": parent,
+                "model": {"id": "replacement", "providerID": "provider", "variant": "low"}
+            }),
+        )
+        .await;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        h.session_info(&inherited).await["model"],
+        json!({"id": "parent-model", "providerID": "provider", "variant": "high"})
+    );
+}
+
+#[tokio::test]
 async fn switch_agent_and_model_mutate_session_and_append_messages() {
     let h = Harness::spawn().await;
     let session_id = h.create(json!({"title": "switch"})).await;

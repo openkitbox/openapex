@@ -445,6 +445,22 @@ impl DreamTask {
     }
 }
 
+/// Build a dreamer's hidden completion request. Dreamer has no parent session,
+/// so the request deliberately leaves reasoning effort unset.
+pub fn dreamer_request(model: &str, system: &str, user_prompt: &str) -> ChatRequest {
+    ChatRequest::new(
+        model.to_owned(),
+        vec![
+            ChatMessage::System {
+                content: system.to_owned(),
+            },
+            ChatMessage::User {
+                content: user_prompt.to_owned().into(),
+            },
+        ],
+    )
+}
+
 /// Why a dream run failed, in the reference's vocabulary
 /// (`provider-output-failure.ts`, `dreamer.md` "Failure records"). Recorded on
 /// the state row so a stuck task is diagnosable from the database alone.
@@ -834,17 +850,9 @@ impl Dreamer {
             class: FailureClass::NoModels,
             message: error.root_cause().to_string(),
         })?;
-        let request = ChatRequest::new(
-            model,
-            vec![
-                ChatMessage::System {
-                    content: system.to_owned(),
-                },
-                ChatMessage::User {
-                    content: user_prompt.to_owned().into(),
-                },
-            ],
-        );
+        let request = dreamer_request(&model, system, user_prompt);
+        // Dreamer has no parent session policy; the request carries no
+        // reasoning effort deliberately, leaving the provider's default.
         let text = collect_completion(&self.chat, &request)
             .await
             .map_err(|error| TaskFailure {
