@@ -74,16 +74,36 @@ const DEVELOPMENT_WORKFLOW: &str = concat!(
     "\nSubagents execute only their assigned task. They do not create worktrees, change the plan, or restart this orchestration. Read-only questions need no pipeline. Single-step or simple changes may edit the main checkout directly and remain uncommitted unless the user asks for a commit.\n",
 );
 
+/// The compact workflow a subagent needs. The parent owns planning, worktree
+/// creation, task sequencing, progress reporting, review orchestration and
+/// landing; a child only executes its assigned slice.
+const SUBAGENT_WORKFLOW: &str = concat!(
+    "\n# Subagent workflow\n",
+    "\nExecute only the assigned task. Do not create a plan or worktree, change scope, maintain a separate todo list, or restart parent orchestration. Work only within the assigned scope; in a worktree use absolute paths and do not use codegraph there. Review or exploration: edit and commit nothing; report findings. Implementation: make the focused change, add tests, run fmt/clippy and the relevant tests with CARGO_TARGET_DIR=<worktree>/target, and commit only that task's files. Report outcome, evidence, and caveats. Do not build, deploy, or restart.\n",
+);
+
+/// Which workflow contract the static system layer should carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorkflowProfile {
+    /// A top-level session that owns the full development workflow.
+    Parent,
+    /// A child session that executes one assigned task.
+    Subagent,
+}
+
 /// Build the static system layer from the registered tools: their names drive
 /// the upstream bullets, and any guidance they contribute (see
 /// [`ox_tools::contract::Tool::guidance`]) follows them. The two built-in
-/// sections — engineering standards and the development workflow — follow the
-/// harness template unconditionally (`.ox/plans/2026-10-26-built-in-development-workflow-analysis.md`).
-pub fn system_static(tools: &[(&str, Option<&'static str>)]) -> String {
+/// sections — engineering standards and the profile's workflow — follow the
+/// harness template (`.ox/plans/2026-10-26-built-in-development-workflow-analysis.md`).
+pub fn system_static(tools: &[(&str, Option<&'static str>)], profile: WorkflowProfile) -> String {
     let mut static_layer =
         HARNESS_TEMPLATE.replace("${OPENCODE_TOOL_GUIDANCE}", &tool_guidance(tools));
     static_layer.push_str(ENGINEERING_STANDARDS);
-    static_layer.push_str(DEVELOPMENT_WORKFLOW);
+    static_layer.push_str(match profile {
+        WorkflowProfile::Parent => DEVELOPMENT_WORKFLOW,
+        WorkflowProfile::Subagent => SUBAGENT_WORKFLOW,
+    });
     static_layer
 }
 

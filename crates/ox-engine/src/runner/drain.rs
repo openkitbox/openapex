@@ -94,6 +94,10 @@ impl InboxRow {
 /// Everything one busy period's drains and steps share.
 pub(crate) struct DrainCtx {
     pub session_id: String,
+    /// Whether this session was spawned by another session. Resolved once
+    /// when the actor starts, so prompt assembly does not query the DB per
+    /// step.
+    pub is_subagent: bool,
     pub directory: std::path::PathBuf,
     /// The ox home directory (`~/.ox`) the global AGENTS.md lives in.
     pub home: std::path::PathBuf,

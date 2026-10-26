@@ -53,6 +53,9 @@ struct Recorded {
     subagent_prompt: bool,
     /// The output-contract lines the spawn prefix must carry.
     spawn_contract: bool,
+    /// The static system layer's workflow profile.
+    parent_workflow: bool,
+    subagent_workflow: bool,
     tools: Vec<String>,
     question_guidance: bool,
 }
@@ -65,6 +68,12 @@ impl Recorded {
                 ox::cardinal::wire::ChatMessage::System { content } => {
                     if content.contains("Use the question tool for preferences") {
                         recorded.question_guidance = true;
+                    }
+                    if content.contains("# Development workflow") {
+                        recorded.parent_workflow = true;
+                    }
+                    if content.contains("# Subagent workflow") {
+                        recorded.subagent_workflow = true;
                     }
                 }
                 ox::cardinal::wire::ChatMessage::User { content } => {
@@ -254,6 +263,10 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
         assert!(
             child.spawn_contract,
             "the child prompt is missing the output-contract lines"
+        );
+        assert!(
+            child.subagent_workflow && !child.parent_workflow,
+            "child system layer must use the compact subagent workflow"
         );
         // Everything else survives: the exclusion is exactly one tool.
         assert!(

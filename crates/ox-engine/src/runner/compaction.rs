@@ -836,6 +836,7 @@ pub(crate) fn spawn_background_fold(ctx: &DrainCtx) {
     }
     let ctx = DrainCtx {
         session_id: ctx.session_id.clone(),
+        is_subagent: ctx.is_subagent,
         directory: ctx.directory.clone(),
         home: ctx.home.clone(),
         config: ctx.config.clone(),

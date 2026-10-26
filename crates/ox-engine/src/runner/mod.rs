@@ -536,10 +536,11 @@ impl ActorTask {
         let Some(mut rx) = self.rx.take() else {
             return;
         };
-        // Resolve the toolset once per actor task: a session's parent link
+        // Resolve the toolset and prompt profile once per actor task: a session's parent link
         // never changes, so the child registry (no `question`) is built at
         // most once per spawn, not per step.
-        let tools = self.session_tools().await;
+        let is_subagent = self.session_is_subagent().await;
+        let tools = self.session_tools(is_subagent);
         loop {
             // Absorb the backlog; the first Enqueue opens a busy period.
             let mut token: Option<CancellationToken> = None;
@@ -599,6 +600,7 @@ impl ActorTask {
             // operate where the session lives.
             let ctx = drain::DrainCtx {
                 session_id: self.session_id.clone(),
+                is_subagent,
                 directory: self.session_directory().await,
                 home: self.inner.home.clone(),
                 config: self.inner.config.clone(),
@@ -714,8 +716,8 @@ impl ActorTask {
     /// A form opened by a child has no UI behind it, and ox has no foreground
     /// tool timeout, so `question` there would wait forever and hang the
     /// parent's `subagent` call with it. Resolved once per actor task.
-    async fn session_tools(&self) -> Arc<ToolRegistry> {
-        if self.session_is_subagent().await {
+    fn session_tools(&self, is_subagent: bool) -> Arc<ToolRegistry> {
+        if is_subagent {
             Arc::new(self.inner.tools.without(SUBAGENT_EXCLUDED_TOOLS))
         } else {
             Arc::clone(&self.inner.tools)

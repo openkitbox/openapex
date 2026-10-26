@@ -256,7 +256,12 @@ pub(crate) async fn run(
             // The baseline log's tool count is the registry size; the names
             // iterate in the same order the definitions do.
             let count = guidance.len();
-            (prompt::system_static(&guidance), count)
+            let profile = if ctx.is_subagent {
+                prompt::WorkflowProfile::Subagent
+            } else {
+                prompt::WorkflowProfile::Parent
+            };
+            (prompt::system_static(&guidance, profile), count)
         };
         // The baseline log needs the static layer's size, so it is built
         // before the sync: assembling it is pure string work over the

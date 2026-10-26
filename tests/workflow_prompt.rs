@@ -5,7 +5,7 @@
 //! tests assert the rendered prompt — not the constants — and they pin stable
 //! behavioral phrases rather than the whole prompt byte for byte.
 
-use ox_engine::prompt::system_static;
+use ox_engine::prompt::{WorkflowProfile, system_static};
 
 /// Assert every `needle` appears in `haystack`, naming the first missing one.
 fn assert_contains_all(haystack: &str, needles: &[&str]) {
@@ -21,7 +21,7 @@ fn assert_contains_all(haystack: &str, needles: &[&str]) {
 /// are unconditional harness rules, not a tool-guidance side effect.
 #[test]
 fn engineering_standards_render_in_the_static_layer() {
-    let prompt = system_static(&[]);
+    let prompt = system_static(&[], WorkflowProfile::Parent);
     assert_contains_all(
         &prompt,
         &[
@@ -52,7 +52,7 @@ fn engineering_standards_render_in_the_static_layer() {
 /// reach the model.
 #[test]
 fn development_workflow_renders_the_approved_pipeline() {
-    let prompt = system_static(&[]);
+    let prompt = system_static(&[], WorkflowProfile::Parent);
     assert_contains_all(
         &prompt,
         &[
@@ -106,7 +106,7 @@ fn development_workflow_renders_the_approved_pipeline() {
 /// so the workflow's per-task commits are not contradicted.
 #[test]
 fn commit_rule_is_scoped_to_the_workflow() {
-    let prompt = system_static(&[]);
+    let prompt = system_static(&[], WorkflowProfile::Parent);
     assert!(
         prompt.contains(
             "- Outside the built-in development workflow, do not commit unless the user asks. Within an active worktree workflow, per-task commits and the final squash commit are expected."
@@ -123,7 +123,7 @@ fn commit_rule_is_scoped_to_the_workflow() {
 /// consumed.
 #[test]
 fn tool_guidance_still_renders_and_the_placeholder_is_gone() {
-    let prompt = system_static(&[("shell", None)]);
+    let prompt = system_static(&[("shell", None)], WorkflowProfile::Parent);
     assert_contains_all(
         &prompt,
         &[
@@ -142,4 +142,68 @@ fn tool_guidance_still_renders_and_the_placeholder_is_gone() {
     let workflow = prompt.find("# Development workflow").unwrap();
     assert!(harness < standards, "standards must follow the harness");
     assert!(standards < workflow, "workflow must follow the standards");
+}
+
+/// A subagent gets only the delegated-work contract: it must not plan,
+/// create worktrees, report parent progress, review siblings, or land.
+#[test]
+fn subagent_workflow_replaces_parent_orchestration() {
+    let prompt = system_static(&[], WorkflowProfile::Subagent);
+    assert_contains_all(
+        &prompt,
+        &[
+            "# Subagent workflow",
+            "Execute only the assigned task.",
+            "Do not create a plan or worktree",
+            "change scope",
+            "maintain a separate todo list",
+            "restart parent orchestration",
+            "Work only within the assigned scope",
+            "do not use codegraph there",
+            "Review or exploration: edit and commit nothing; report findings.",
+            "Implementation: make the focused change",
+            "CARGO_TARGET_DIR=<worktree>/target",
+            "commit only that task's files",
+            "Do not build, deploy, or restart.",
+        ],
+    );
+    for parent_only in [
+        "# Development workflow",
+        "Execute todo items serially",
+        "rebase onto the default branch",
+        "Maintain the conversation's native todo list",
+    ] {
+        assert!(
+            !prompt.contains(parent_only),
+            "subagent prompt must not contain parent-only text: {parent_only:?}"
+        );
+    }
+}
+
+/// Engineering standards apply to delegated implementation and review too;
+/// the compact workflow must actually be smaller than the parent contract.
+#[test]
+fn subagent_workflow_keeps_standards_and_is_shorter() {
+    let parent = system_static(&[], WorkflowProfile::Parent);
+    let subagent = system_static(&[], WorkflowProfile::Subagent);
+    assert_contains_all(
+        &subagent,
+        &[
+            "# Engineering standards",
+            "Strictly limit deep copies",
+            "Prefer borrows (`&str`, `&[T]`)",
+        ],
+    );
+    assert!(
+        subagent.len() < parent.len(),
+        "subagent prompt must be shorter: {} vs {}",
+        subagent.len(),
+        parent.len()
+    );
+    assert!(
+        parent.len() - subagent.len() > 2000,
+        "subagent workflow should save at least 2KB: {} vs {}",
+        subagent.len(),
+        parent.len()
+    );
 }
