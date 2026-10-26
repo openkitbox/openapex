@@ -11,6 +11,11 @@
 //! and remembers how many it dropped, so a long-running server cannot grow the
 //! process without limit and a reader can still tell that it missed output.
 //! Output pages are built from one slice, never by copying the whole buffer.
+//!
+//! A settled session releases its interpreter (`shell` becomes `None`), so a
+//! finished entry costs its capture instead of a brush session; a live
+//! background child keeps it, because dropping the interpreter would kill the
+//! child.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -171,8 +176,13 @@ pub struct ShellSession {
     pub started: i64,
     output: Mutex<OutputBuffer>,
     exit: Mutex<Exit>,
-    /// The embedded brush session this command runs in.
-    shell: pi_shell::Shell,
+    /// The embedded brush session this command runs in. `None` once the run
+    /// settled and nothing is left running in it: an interpreter is shell
+    /// state (variables, functions, job table) and the table keeps a finished
+    /// session for an hour, so pinning one per tool call is the table's
+    /// largest resident cost. Dropping it SIGKILLs its background children
+    /// (pi-shell's kill-on-drop), which is why a live `&` child keeps it.
+    shell: Mutex<Option<Arc<pi_shell::Shell>>>,
     /// Fires when output is appended or the session settles, so a waiter
     /// needs no polling interval of its own.
     changed: Notify,
@@ -229,6 +239,14 @@ impl ShellSession {
         self.exit().is_settled()
     }
 
+    /// Whether this session still owns the brush interpreter it ran in.
+    /// `false` once the run settled and no background child is left running.
+    pub fn retains_interpreter(&self) -> bool {
+        self.shell
+            .lock()
+            .map_or_else(|poisoned| poisoned.into_inner().is_some(), |slot| slot.is_some())
+    }
+
     /// Wait until output arrives or `timeout` passes, so an `interact` call
     /// returns as soon as the command reacts instead of after a fixed delay.
     pub async fn wait_change(&self, timeout: std::time::Duration) {
@@ -275,7 +293,13 @@ impl ShellSession {
                 completed: Some(ox_schema::id::now_millis()),
             };
         }
-        self.shell.abort().await;
+        let shell = self
+            .shell
+            .lock()
+            .map_or_else(|poisoned| poisoned.into_inner().clone(), |slot| slot.clone());
+        if let Some(shell) = shell {
+            shell.abort().await;
+        }
         self.changed.notify_waiters();
         let _ = self.events.send(ShellEvent {
             kind: "shell.exited",
@@ -296,11 +320,7 @@ impl ShellSession {
             shell: "bash".to_owned(),
             // Capture lives in memory; the URL names the paging endpoint.
             file: format!("ox-shell://{}", self.id),
-            pid: self
-                .shell
-                .pids()
-                .first()
-                .and_then(|pid| u32::try_from(*pid).ok()),
+            pid: self.interpreter_pid(),
             exit: exit.code,
             signal: exit.signal.map(|signal| signal.to_string()),
             metadata: HashMap::new(),
@@ -309,6 +329,14 @@ impl ShellSession {
                 completed: exit.completed,
             },
         }
+    }
+
+    /// The live pid of the run, when this session still owns an interpreter.
+    /// `None` after release: the process is already gone.
+    fn interpreter_pid(&self) -> Option<u32> {
+        let slot = self.shell.lock().ok()?;
+        let shell = slot.as_ref()?;
+        shell.pids().first().and_then(|pid| u32::try_from(*pid).ok())
     }
 }
 
@@ -361,6 +389,7 @@ impl ShellSessions {
     /// how long to wait before returning control to the model.
     pub fn spawn(&self, request: SpawnRequest) -> std::io::Result<Arc<ShellSession>> {
         let (events, _) = broadcast::channel(32);
+        let shell = Arc::new(engine::shell());
         let session = Arc::new(ShellSession {
             id: ox_schema::id::id("sh"),
             command: request.command,
@@ -368,12 +397,12 @@ impl ShellSessions {
             started: ox_schema::id::now_millis(),
             output: Mutex::new(OutputBuffer::default()),
             exit: Mutex::new(Exit::default()),
-            shell: engine::shell(),
+            shell: Mutex::new(Some(Arc::clone(&shell))),
             changed: Notify::new(),
             events: events.clone(),
         });
 
-        tokio::spawn(drive(Arc::clone(&session), request.timeout_ms));
+        tokio::spawn(drive(Arc::clone(&session), shell, request.timeout_ms));
 
         if let Ok(mut table) = self.sessions.lock() {
             table.insert(session.id.clone(), Arc::clone(&session));
@@ -458,7 +487,7 @@ pub fn shared() -> Arc<ShellSessions> {
 /// `current_thread` a pipe buffer's worth of output deadlocks the runtime.
 /// Production is `#[tokio::main]` (multi-threaded); tests use the
 /// `multi_thread` flavor for the same reason (as `tests/acp.rs` does).
-async fn drive(session: Arc<ShellSession>, timeout_ms: Option<u64>) {
+async fn drive(session: Arc<ShellSession>, shell: Arc<pi_shell::Shell>, timeout_ms: Option<u64>) {
     // pi-shell decodes each stream's bytes and forwards them on this channel;
     // the forwarder is the only writer of the capture buffer. The channel is
     // unbounded on purpose: pi-shell emits with `send_async` from inside a
@@ -485,13 +514,27 @@ async fn drive(session: Arc<ShellSession>, timeout_ms: Option<u64>) {
     // result's `timed_out` flag, while an external `stop` lands as
     // `cancelled`.
     let timeout = timeout_ms.map(|ms| u32::try_from(ms).unwrap_or(u32::MAX));
-    let result = session
-        .shell
+    let result = shell
         .run(options, Some(chunk_tx), CancelToken::new(timeout))
         .await;
     // The sender dropped with the run: drain whatever is still queued before
     // settling so no tail output is lost.
     let _ = forwarder.await;
+
+    // Decide the interpreter's fate *before* the terminal state is published, so
+    // a waiter that observes the settle also observes the final ownership: a
+    // settled run no longer needs its interpreter (the brush session core is
+    // per-call state, the table keeps the finished entry for an hour, and every
+    // tool call spawns one). A live background child is the one exception —
+    // dropping the interpreter SIGKILLs it (pi-shell's kill-on-drop), which is
+    // what `live_background_job_count` exists to tell the host. That count
+    // covers child processes only; a background *builtin* (`sleep 5 &` runs
+    // in-process) has no pid and is therefore not protected.
+    if shell.live_background_job_count().await == 0
+        && let Ok(mut slot) = session.shell.lock()
+    {
+        *slot = None;
+    }
 
     let now = ox_schema::id::now_millis();
     let exit = match result {

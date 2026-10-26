@@ -257,3 +257,88 @@ mod eviction {
         let _ = session.wait_settled(Duration::from_secs(5)).await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Interpreter retention: a finished command must not pin its brush
+// interpreter, because every tool call spawns one and the table keeps the
+// entry for the TTL.
+// ---------------------------------------------------------------------------
+
+mod retention {
+    use super::*;
+
+    use ox::tool::shell::sessions::{ShellSessions, SpawnRequest};
+
+    fn request(command: &str) -> SpawnRequest {
+        SpawnRequest {
+            command: command.to_owned(),
+            cwd: std::env::temp_dir(),
+            timeout_ms: Some(10_000),
+        }
+    }
+
+    /// The release decision precedes the settle notification, so ownership is
+    /// already final when `wait_settled` returns.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_settled_session_releases_its_interpreter() {
+        let table = ShellSessions::new();
+        let session = table.spawn(request("echo hi")).unwrap();
+        assert!(
+            session.wait_settled(Duration::from_secs(5)).await,
+            "the command settles"
+        );
+        assert!(
+            !session.retains_interpreter(),
+            "a settled session releases its interpreter instead of pinning it for the TTL"
+        );
+        // The capture outlives the interpreter: paging and the model-facing
+        // tail read the buffer, never the shell.
+        assert_eq!(session.tail(), "hi\n");
+        assert_eq!(session.info().exit, Some(0));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_running_session_keeps_its_interpreter() {
+        let table = ShellSessions::new();
+        let session = table.spawn(request("sleep 30")).unwrap();
+        assert!(
+            session.retains_interpreter(),
+            "a running session still owns the interpreter it is executing in"
+        );
+        session.stop(true).await;
+    }
+
+    /// Absolute path on purpose: `sleep` is a brush builtin, and a background
+    /// builtin has no pid, so pi-shell's `live_background_job_count` cannot see
+    /// it (the retention guard covers child processes only).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_live_background_child_keeps_its_interpreter() {
+        let table = ShellSessions::new();
+        let session = table.spawn(request("/bin/sleep 5 &")).unwrap();
+        assert!(
+            session.wait_settled(Duration::from_secs(5)).await,
+            "the command settles"
+        );
+        assert!(
+            session.retains_interpreter(),
+            "dropping the interpreter would SIGKILL a live `&` child"
+        );
+    }
+
+    /// The counter's blind spot, pinned so it is a documented limitation
+    /// rather than a surprise: a background *builtin* is not counted, so the
+    /// interpreter is released and the job dies with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_background_builtin_does_not_pin_the_interpreter() {
+        let table = ShellSessions::new();
+        let session = table.spawn(request("sleep 5 &")).unwrap();
+        assert!(
+            session.wait_settled(Duration::from_secs(5)).await,
+            "the command settles"
+        );
+        assert!(
+            !session.retains_interpreter(),
+            "pi-shell tracks background child processes, not background builtins"
+        );
+    }
+}
