@@ -10,12 +10,6 @@
 //! carries the display `name` and `description`; everything after it is the
 //! body the `skill` tool loads into the conversation.
 //!
-//! The roots are ox-native `.ox` skill dirs first, then upstream's ecosystem
-//! roots (`config/plugin/compatibility.ts:42-43`: `.claude/skills`,
-//! `.agents/skills`) appended read-only after the native roots at each level
-//! — project before global. First root wins on id collisions, so a native
-//! skill always shades an ecosystem twin of the same id.
-//!
 //! The model-facing catalog is stricter than discovery (upstream
 //! `skill/instructions.ts:81-84`): a skill without a description, or with
 //! auto-invocation off, is never listed in `<available_skills>` — but stays
@@ -88,23 +82,14 @@ fn skipped_scan_entry(name: &OsStr) -> bool {
 }
 
 /// The directories skills are discovered under, in precedence order: the
-/// project-local roots, then the global ones, each level native-first (`.ox`)
-/// with upstream's ecosystem roots (`.claude/skills`, `.agents/skills`,
-/// `compatibility.ts:42-43`) appended read-only after the native ones. Each
-/// root is walked recursively to [`MAX_DEPTH`] levels (a skill directory does
-/// not contain skills).
+/// project-local `.ox/skills`, then the global `~/.ox/skills`. ox-native only —
+/// upstream's ecosystem roots (`.claude/skills`, `.agents/skills`) are not
+/// consulted. Each root is walked recursively to [`MAX_DEPTH`] levels (a skill
+/// directory does not contain skills).
 fn roots(directory: &Path) -> Vec<PathBuf> {
-    let mut roots = vec![
-        directory.join(".ox").join("skill"),
-        directory.join(".ox").join("skills"),
-        directory.join(".claude").join("skills"),
-        directory.join(".agents").join("skills"),
-    ];
+    let mut roots = vec![directory.join(".ox").join("skills")];
     if let Some(home) = dirs_home() {
-        roots.push(home.join(".ox").join("skill"));
         roots.push(home.join(".ox").join("skills"));
-        roots.push(home.join(".claude").join("skills"));
-        roots.push(home.join(".agents").join("skills"));
     }
     roots
 }
@@ -358,24 +343,122 @@ fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
     }
 }
 
-/// One `key: value` line of frontmatter. A deliberate subset — skills use
+/// One `key: value` entry of frontmatter. A deliberate subset — skills use
 /// `name`, `description` and the auto-invoke keys, and a YAML parser
 /// dependency is not justified. A line without a colon says nothing about
 /// any key; it must not stop the scan (upstream parses real YAML, where such
 /// lines are ordinary).
+///
+/// Beside single-line scalars, YAML block scalars are supported: a header such
+/// as `description: >-` followed by indented continuation lines is the common
+/// way to write a long description, and reading the header as the literal
+/// value `">-"` would silently blank the skill's catalog entry. The folded
+/// style joins lines with spaces, the literal style keeps line breaks, and the
+/// `-`/default/`+` chomping indicators control the trailing newline. Lines
+/// belonging to another key's block are skipped while scanning, so a
+/// `name:`-looking line inside a description is never mistaken for the real
+/// key. Explicit indentation indicators (`>2`) and header comments are outside
+/// the subset and read as plain scalars.
 fn value(frontmatter: &str, key: &str) -> Option<String> {
-    for line in frontmatter.lines() {
+    let lines: Vec<&str> = frontmatter.lines().collect();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
         let Some((head, tail)) = line.split_once(':') else {
+            index += 1;
             continue;
         };
+        let text = tail.trim();
+        if let Some((folded, chomp)) = block_style(text) {
+            let end = index + 1 + block_span(&lines[index + 1..], indentation(line));
+            if head.trim() == key {
+                return render_block(&lines[index + 1..end], folded, chomp);
+            }
+            index = end;
+            continue;
+        }
         if head.trim() == key {
-            let text = tail.trim().trim_matches('"').trim_matches('\'');
+            let text = text.trim_matches('"').trim_matches('\'');
             if !text.is_empty() {
                 return Some(text.to_owned());
             }
         }
+        index += 1;
     }
     None
+}
+
+/// Leading spaces, in bytes. Block scalar indentation is spaces by contract;
+/// a tab-indented continuation simply fails the deeper-than-the-key test.
+fn indentation(line: &str) -> usize {
+    line.len() - line.trim_start_matches(' ').len()
+}
+
+/// A block scalar header: `>` (folded) or `|` (literal), optionally followed
+/// by a chomping indicator (`-` strip, `+` keep; absent means clip). Returns
+/// `(folded, chomp)` — `chomp` is `' '` for clip.
+fn block_style(header: &str) -> Option<(bool, char)> {
+    let mut chars = header.chars();
+    let folded = match chars.next() {
+        Some('>') => true,
+        Some('|') => false,
+        _ => return None,
+    };
+    let chomp = match (chars.next(), chars.next()) {
+        (None, None) => ' ',
+        (Some(chomp @ ('-' | '+')), None) => chomp,
+        _ => return None,
+    };
+    Some((folded, chomp))
+}
+
+/// How many lines after a block scalar header belong to the scalar: blank
+/// lines and lines indented deeper than the key. The first non-blank line at
+/// or below the key's indentation starts the next entry.
+fn block_span(lines: &[&str], key_indent: usize) -> usize {
+    lines
+        .iter()
+        .position(|line| !line.trim().is_empty() && indentation(line) <= key_indent)
+        .unwrap_or(lines.len())
+}
+
+/// Render a block scalar's content lines. The content indentation is that of
+/// the first non-blank line, per YAML; later lines are stripped by that many
+/// columns. Folding joins adjacent non-blank lines with one space and turns
+/// each blank line into a newline, so paragraphs survive a `>` scalar.
+fn render_block(lines: &[&str], folded: bool, chomp: char) -> Option<String> {
+    let content_indent = lines
+        .iter()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| indentation(line))?;
+    let mut out = String::new();
+    for line in lines {
+        if line.trim().is_empty() {
+            out.push('\n');
+            continue;
+        }
+        let text = line.get(content_indent..).unwrap_or_else(|| line.trim());
+        if folded && !out.is_empty() && !out.ends_with('\n') {
+            out.push(' ');
+        }
+        out.push_str(text);
+        if !folded {
+            out.push('\n');
+        }
+    }
+    // A folded scalar's last line still ends at its line break; chomping
+    // below decides how much of the trailing newline run survives.
+    if folded && !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if chomp != '+' {
+        out.truncate(out.trim_end_matches('\n').len());
+        if chomp == ' ' && !out.is_empty() {
+            // Clip: exactly one trailing newline.
+            out.push('\n');
+        }
+    }
+    if out.is_empty() { None } else { Some(out) }
 }
 
 /// A frontmatter boolean, upstream `booleanValue` (`skill-file.ts:28-36`):

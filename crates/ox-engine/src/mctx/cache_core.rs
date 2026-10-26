@@ -224,10 +224,11 @@ impl CoreState {
     /// a shared cache-stability primitive, so the guard is enforced in the core, not assumed.
     fn step_soft(&mut self, input: PassInput, boundary_match: bool) -> StepResult {
         self.apply_units(input.rendered_units);
-        if boundary_match && !self.reconcile_pending {
-            if let Some(new_boundary) = input.new_boundary_id {
-                self.boundary_id = new_boundary;
-            }
+        if boundary_match
+            && !self.reconcile_pending
+            && let Some(new_boundary) = input.new_boundary_id
+        {
+            self.boundary_id = new_boundary;
         }
         self.version += 1;
         StepResult {

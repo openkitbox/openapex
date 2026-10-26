@@ -47,8 +47,8 @@
 //! replays the frozen bytes verbatim and this module only plans (it never
 //! re-derives what it will not freeze away).
 
-use anyhow::{Context as _, Result};
 use super::cache_core::{CoreState, DurabilityClass, FrozenUnit};
+use anyhow::{Context as _, Result};
 
 use crate::mctx::budget::{Budget, memory_budget};
 use crate::mctx::cache::{HeadRenderer, McCache, PassOutcome, RenderedPass, Signals, run_pass};
