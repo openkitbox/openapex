@@ -412,6 +412,8 @@ struct ModelInfo {
     #[serde(rename = "providerID")]
     provider_id: String,
     name: String,
+    #[serde(rename = "type")]
+    model_type: String,
     capabilities: ModelCapabilities,
     variants: Vec<ModelVariant>,
     time: ModelTime,
@@ -424,6 +426,7 @@ struct ModelInfo {
 #[derive(Serialize)]
 struct ModelCapabilities {
     tools: bool,
+    temperature: bool,
     input: Vec<&'static str>,
     output: Vec<&'static str>,
 }
@@ -441,6 +444,7 @@ struct ModelTime {
 #[derive(Serialize)]
 struct ModelLimit {
     context: i64,
+    input: i64,
     output: i64,
 }
 
@@ -450,8 +454,10 @@ async fn model_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
         return;
     };
     let entries = state.model_catalog.entries().await;
+    let types = model_type_filter(req);
     let data = entries
         .iter()
+        .filter(|entry| model_type_matches(entry, types.as_deref()))
         .map(|entry| model_info(entry, &state.model_catalog))
         .collect();
     res.render(Json(ModelList {
@@ -460,6 +466,23 @@ async fn model_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
         },
         data,
     }));
+}
+
+fn model_type_filter(req: &Request) -> Option<Vec<String>> {
+    let mut types = req.query::<Vec<String>>("types").unwrap_or_default();
+    types.extend(req.query::<Vec<String>>("type").unwrap_or_default());
+    (!types.is_empty()).then_some(types)
+}
+
+fn model_type_matches(entry: &ox_core::config::ModelEntry, types: Option<&[String]>) -> bool {
+    let model_type = entry.model_type.as_deref().unwrap_or("chat");
+    let Some(types) = types else {
+        return matches!(model_type, "chat" | "text");
+    };
+    types
+        .iter()
+        .flat_map(|value| value.split(','))
+        .any(|requested| !requested.is_empty() && requested.trim() == model_type)
 }
 
 /// The `Model.Info` projection of a configured model (required upstream
@@ -483,8 +506,10 @@ fn model_info(m: &ox_core::config::ModelEntry, catalog: &ModelCatalog) -> ModelI
         model_id: m.id.clone(),
         provider_id: m.provider.clone(),
         name: m.name.clone().unwrap_or_else(|| m.id.clone()),
+        model_type: m.model_type.clone().unwrap_or_else(|| "chat".to_owned()),
         capabilities: ModelCapabilities {
             tools: true,
+            temperature: m.temperature.unwrap_or(false),
             input: vec!["text"],
             output: vec!["text"],
         },
@@ -506,6 +531,7 @@ fn model_info(m: &ox_core::config::ModelEntry, catalog: &ModelCatalog) -> ModelI
             context: catalog
                 .window_of(&m.id)
                 .map_or_else(|| m.context.unwrap_or(0), i64::from),
+            input: m.input.unwrap_or(0),
             output: m.output.unwrap_or(0),
         },
     }

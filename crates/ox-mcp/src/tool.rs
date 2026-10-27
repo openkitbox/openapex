@@ -15,7 +15,7 @@ use ox_tools::contract::{Attachment, Tool, ToolContext, ToolOutput};
 use ox_tools::fail;
 
 use super::client::ToolInfo;
-use super::transport::{CallError, Rpc};
+use super::transport::{CallError, RequestMetadata, Rpc};
 
 /// `<sanitized server>_<sanitized tool>`, the upstream `McpTool.name` rule.
 pub(crate) fn qualified_name(server: &str, tool: &str) -> String {
@@ -108,21 +108,21 @@ impl Tool for McpTool {
         let rpc = Arc::clone(&self.rpc);
         let remote_name = self.remote_name.clone();
         let server = self.server.clone();
-        let output_schema = self.output_schema.clone();
+        let has_output_schema = self.output_schema.is_some();
         let execution = self.execution;
         let cancel = ctx.cancellation.clone();
         Box::pin(async move {
             let arguments = if input.is_object() { input } else { json!({}) };
             let result = rpc
                 .request(
-                    "tools/call",
+                    RequestMetadata::new("tools/call").tool(&remote_name),
                     Some(json!({ "name": remote_name, "arguments": arguments })),
                     execution,
                     &cancel,
                 )
                 .await;
             match result {
-                Ok(value) => render_result(value, output_schema.as_ref()),
+                Ok(value) => render_result(value, has_output_schema),
                 Err(error) => {
                     let message = match &error {
                         CallError::Closed => format!("MCP server \"{server}\" is not available"),
@@ -136,6 +136,9 @@ impl Tool for McpTool {
                         CallError::Transport(message) => format!(
                             "MCP tool \"{remote_name}\" on server \"{server}\" failed: {message}"
                         ),
+                        CallError::Unsupported(message) => format!(
+                            "MCP tool \"{remote_name}\" on server \"{server}\" failed: {message}"
+                        ),
                     };
                     fail(message)
                 }
@@ -145,15 +148,15 @@ impl Tool for McpTool {
 }
 
 /// Map one `tools/call` result object to `ToolOutput`.
-fn render_result(value: Value, output_schema: Option<&Value>) -> ToolOutput {
+fn render_result(value: Value, has_output_schema: bool) -> ToolOutput {
     let content = value
         .get("content")
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
     let mut texts = Vec::new();
     let mut attachments = Vec::new();
-    for part in &content {
+    for part in content {
         match part.get("type").and_then(Value::as_str) {
             Some("text") => {
                 if let Some(text) = part.get("text").and_then(Value::as_str) {
@@ -227,11 +230,14 @@ fn render_result(value: Value, output_schema: Option<&Value>) -> ToolOutput {
         return fail(message);
     }
 
-    let output = value.get("structuredContent").cloned();
+    let output = value
+        .get("structuredContent")
+        .filter(|value| value.is_object())
+        .cloned();
     let content = match output {
         Some(structured) if !structured.is_null() => structured,
         _ if text.is_empty() => Value::Null,
-        _ if output_schema.is_none() && (text.starts_with('{') || text.starts_with('[')) => {
+        _ if !has_output_schema && (text.starts_with('{') || text.starts_with('[')) => {
             serde_json::from_str(&text).unwrap_or(Value::String(text))
         }
         _ => Value::String(text),
@@ -246,4 +252,92 @@ fn render_result(value: Value, output_schema: Option<&Value>) -> ToolOutput {
         output.attachments = Some(attachments);
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn structured_content_takes_precedence_over_text() {
+        let output = render_result(
+            json!({
+                "content": [{"type": "text", "text": "stale text"}],
+                "structuredContent": {"answer": 42}
+            }),
+            true,
+        );
+
+        assert_eq!(output.content, json!({"answer": 42}));
+    }
+
+    #[test]
+    fn non_object_structured_content_does_not_replace_text() {
+        let output = render_result(
+            json!({
+                "content": [{"type": "text", "text": "fallback"}],
+                "structuredContent": ["not", "an", "object"]
+            }),
+            true,
+        );
+
+        assert_eq!(output.content, json!("fallback"));
+    }
+
+    #[test]
+    fn resource_links_text_and_supported_media_are_mapped() {
+        let output = render_result(
+            json!({
+                "content": [
+                    {"type": "text", "text": "hello"},
+                    {"type": "resource", "resource": {"text": "resource text"}},
+                    {"type": "resource_link", "uri": "https://example.test/file"},
+                    {"type": "image", "data": "aW1hZ2U=", "mimeType": "image/png"}
+                ]
+            }),
+            false,
+        );
+
+        assert_eq!(
+            output.content,
+            json!("hello\nresource text\nhttps://example.test/file")
+        );
+        assert_eq!(
+            output.attachments,
+            Some(vec![Attachment {
+                uri: "data:image/png;base64,aW1hZ2U=".to_owned(),
+                mime: "image/png".to_owned(),
+                name: None,
+            }])
+        );
+    }
+
+    #[test]
+    fn unsupported_media_stays_text_instead_of_attachment() {
+        let output = render_result(
+            json!({
+                "content": [{"type": "audio", "data": "AAAA", "mimeType": "audio/wav"}]
+            }),
+            false,
+        );
+
+        assert!(output.attachments.is_none());
+        assert_eq!(
+            output.content,
+            json!("[Binary content (audio/wav) omitted: unsupported inline media]")
+        );
+    }
+
+    #[test]
+    fn is_error_returns_failed_output() {
+        let output = render_result(
+            json!({
+                "isError": true,
+                "content": [{"type": "text", "text": "nope"}]
+            }),
+            false,
+        );
+
+        assert_eq!(output.error.as_deref(), Some("nope"));
+    }
 }

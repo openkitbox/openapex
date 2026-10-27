@@ -162,19 +162,43 @@ impl ModelCatalog {
                 .iter()
                 .find(|entry| entry.id == id && entry.provider == provider)
             {
-                return Some(found.clone());
+                if Self::is_chat_compatible(found) {
+                    return Some(found.clone());
+                }
+                return entries
+                    .iter()
+                    .find(|entry| Self::is_chat_compatible(entry))
+                    .cloned();
             }
             return Some(ModelEntry {
                 provider: provider.to_owned(),
                 id: id.to_owned(),
                 name: None,
+                model_type: None,
                 context: None,
+                input: None,
                 output: None,
+                temperature: None,
                 reasoning: false,
                 supported_reasoning_levels: Vec::new(),
             });
         }
-        entries.first().cloned()
+        entries
+            .iter()
+            .find(|entry| {
+                matches!(
+                    entry.model_type.as_deref().unwrap_or("chat"),
+                    "chat" | "text"
+                )
+            })
+            .cloned()
+    }
+
+    fn is_chat_compatible(entry: &ModelEntry) -> bool {
+        matches!(
+            entry.model_type.as_deref().unwrap_or("chat"),
+            "chat" | "text"
+        )
     }
 
     /// The context window the gateway reports for `id` (the bare model id, as
@@ -316,8 +340,11 @@ impl ModelCatalog {
                         .map(|candidate| candidate.provider.clone())
                         .unwrap_or_else(|| DEFAULT_PROVIDER_NAME.to_owned()),
                     context: donor.and_then(|entry| entry.context),
-                    output: None,
-                    name: None,
+                    input: donor.and_then(|entry| entry.input),
+                    output: donor.and_then(|entry| entry.output),
+                    name: donor.and_then(|entry| entry.name.clone()),
+                    model_type: donor.and_then(|entry| entry.model_type.clone()),
+                    temperature: donor.and_then(|entry| entry.temperature),
                     reasoning: donor.map(|entry| entry.reasoning).unwrap_or(false),
                     supported_reasoning_levels: donor
                         .map(|entry| entry.supported_reasoning_levels.clone())
@@ -338,6 +365,8 @@ struct ModelList {
 #[derive(Deserialize)]
 struct ModelRow {
     id: String,
+    #[serde(default, rename = "type")]
+    model_type: Option<String>,
     #[serde(default)]
     owned_by: Option<String>,
     /// cardinal reports all three; other gateways may report one.
@@ -347,6 +376,8 @@ struct ModelRow {
     context_window: Option<i64>,
     #[serde(default)]
     max_input_tokens: Option<i64>,
+    #[serde(default)]
+    temperature: Option<bool>,
     /// Reasoning metadata, present only on rows whose upstream members
     /// advertise effort levels (cardinal `models.rs`).
     #[serde(default)]
@@ -362,11 +393,14 @@ impl ModelRow {
                 .owned_by
                 .unwrap_or_else(|| fallback_provider.to_owned()),
             name: None,
+            model_type: self.model_type,
             context: self
                 .context_length
                 .or(self.context_window)
                 .or(self.max_input_tokens),
+            input: self.max_input_tokens,
             output: None,
+            temperature: self.temperature,
             id: self.id,
             reasoning: self.reasoning,
             supported_reasoning_levels: self.supported_reasoning_levels,

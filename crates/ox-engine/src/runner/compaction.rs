@@ -30,7 +30,7 @@ use crate::cardinal::wire::{ChatMessage, ChatRequest};
 use anyhow::Result;
 use ox_db::Db;
 use ox_schema::event::SessionEventData;
-use ox_schema::message::CompactionReason;
+use ox_schema::message::{CompactionReason, Message};
 use ox_schema::support::{ModelRef, SessionError};
 use std::sync::Arc;
 
@@ -114,6 +114,75 @@ pub(crate) async fn has_running_compaction(db: &Db, session_id: &str) -> Result<
     Ok(row.get::<i64>(0)? > 0)
 }
 
+/// Compute a bounded completion budget from the provider's measured prompt
+/// usage when available, falling back to the local request estimate. The
+/// ladder is intentionally finite: overflow recovery owns retrying the turn,
+/// while compaction must make one bounded request rather than loop on sizing.
+/// When the catalogue has no context window, the local/measured prompt itself
+/// is the bound; there is no project-wide output-cap constant to invent.
+pub(crate) fn compaction_max_tokens(
+    measured_prompt_tokens: Option<u64>,
+    local_prompt_tokens: u64,
+    context_limit: Option<u64>,
+    output_cap: Option<u64>,
+    shrink_step: usize,
+) -> u64 {
+    const SHRINK_LADDER: [u64; 4] = [85, 70, 50, 35];
+    let prompt = measured_prompt_tokens.unwrap_or(local_prompt_tokens);
+    let available = context_limit
+        .map(|limit| limit.saturating_sub(prompt))
+        .unwrap_or(prompt)
+        .max(1);
+    let shrink = SHRINK_LADDER[shrink_step.min(SHRINK_LADDER.len() - 1)];
+    let bounded = available.saturating_mul(shrink) / 100;
+    bounded
+        .max(1)
+        .min(output_cap.filter(|cap| *cap > 0).unwrap_or(u64::MAX))
+}
+
+fn model_limits(ctx: &DrainCtx, model: &ModelRef) -> (Option<u64>, Option<u64>) {
+    let entries = ctx.model_catalog.cached();
+    let Some(entry) = entries
+        .iter()
+        .find(|entry| entry.id == model.id && entry.provider == model.provider_id)
+    else {
+        return (None, None);
+    };
+    (
+        ctx.model_catalog.window_of(&entry.id).map(u64::from),
+        entry.output.and_then(|value| u64::try_from(value).ok()),
+    )
+}
+
+fn measured_prompt_tokens(messages: &[Message]) -> Option<u64> {
+    messages.iter().rev().find_map(|message| {
+        let Message::Assistant(assistant) = message else {
+            return None;
+        };
+        let tokens = assistant.tokens.as_ref()?;
+        u64::try_from(tokens.input.saturating_add(tokens.cache.read)).ok()
+    })
+}
+
+fn apply_compaction_budget(
+    ctx: &DrainCtx,
+    model: &ModelRef,
+    request: &mut ChatRequest,
+    measured_prompt: Option<u64>,
+) {
+    let local_prompt = crate::mctx::tokens::heuristic_bytes(
+        crate::cardinal::wire::serialized_len(request).unwrap_or_default(),
+    ) as u64;
+    let (context_limit, output_cap) = model_limits(ctx, model);
+    request.max_tokens = Some(compaction_max_tokens(
+        measured_prompt,
+        local_prompt,
+        context_limit,
+        output_cap,
+        0,
+    ));
+}
+
 /// Build the summarization request: system prompt + transcript (no working
 /// system prompt, no tools) + the summary instruction as the last user
 /// turn. Upstream `summarize`: `prepared.request` + `Message.user(prompt)`.
@@ -143,6 +212,12 @@ pub(crate) fn summarization_request(model: &ModelRef, transcript: &[ChatMessage]
 /// Upstream `NUDGE` (compaction.ts): the one re-ask sent when the reply
 /// skips the summary template.
 const NUDGE: &str = "The previous response did not fill in the required summary template. Do not call tools. Return the summary as text using the exact section headings from the template.";
+
+fn append_nudge(request: &mut ChatRequest) {
+    request.messages.push(ChatMessage::User {
+        content: NUDGE.to_owned().into(),
+    });
+}
 
 /// Upstream `filled`: the reply mentions at least one template heading on a
 /// line of its own. The headings come from the template embedded in the
@@ -174,10 +249,12 @@ async fn stream_summary(
     let mut stream = match ctx.chat.stream_chat(request).await {
         Ok(stream) => stream,
         Err(error) => {
-            return Err(failure(
-                "compaction.failed",
-                format!("compaction request failed: {error}"),
-            ));
+            let kind = if super::provider_error::is_overflow_error(&error) {
+                "compaction.overflow"
+            } else {
+                "compaction.failed"
+            };
+            return Err(failure(kind, format!("compaction request failed: {error}")));
         }
     };
     let mut summary = String::new();
@@ -200,10 +277,12 @@ async fn stream_summary(
             }
             Some(Ok(_)) => {}
             Some(Err(error)) => {
-                return Err(failure(
-                    "compaction.failed",
-                    format!("compaction stream failed: {error}"),
-                ));
+                let kind = if super::provider_error::is_overflow_error(&error) {
+                    "compaction.overflow"
+                } else {
+                    "compaction.failed"
+                };
+                return Err(failure(kind, format!("compaction stream failed: {error}")));
             }
             None => break,
         }
@@ -265,16 +344,54 @@ async fn summarized_reply(
         status: None,
         response: None,
     };
-    let mut summary = stream_summary(ctx, &request, emit_deltas).await?;
+    let base_max_tokens = request.max_tokens;
+    let mut shrink_step = 0;
+    let mut summary = loop {
+        match stream_summary(ctx, &request, emit_deltas).await {
+            Ok(summary) => break summary,
+            Err(error)
+                if error.kind == "compaction.overflow"
+                    && shrink_step < 4
+                    && request.max_tokens.is_some() =>
+            {
+                shrink_step += 1;
+                request.max_tokens = Some(compaction_max_tokens(
+                    base_max_tokens,
+                    base_max_tokens.unwrap_or(1),
+                    None,
+                    None,
+                    shrink_step,
+                ));
+            }
+            Err(error) => return Err(error),
+        }
+    };
     // Upstream `send` (compaction.ts): a reply that ignores the summary
-    // template gets one nudge before it counts as a failure. (Upstream's
-    // budget shrink ladder is out of scope — the request is never
-    // refitted smaller here.)
+    // template gets one nudge before it counts as a failure. The nudge is a
+    // content-only re-ask: preserve the already-derived positive `max_tokens`
+    // instead of recalculating the budget for the extra user turn.
     if !filled(&summary) {
-        request.messages.push(ChatMessage::User {
-            content: NUDGE.to_owned().into(),
-        });
-        summary = stream_summary(ctx, &request, emit_deltas).await?;
+        append_nudge(&mut request);
+        summary = loop {
+            match stream_summary(ctx, &request, emit_deltas).await {
+                Ok(summary) => break summary,
+                Err(error)
+                    if error.kind == "compaction.overflow"
+                        && shrink_step < 4
+                        && request.max_tokens.is_some() =>
+                {
+                    shrink_step += 1;
+                    request.max_tokens = Some(compaction_max_tokens(
+                        base_max_tokens,
+                        base_max_tokens.unwrap_or(1),
+                        None,
+                        None,
+                        shrink_step,
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+        };
         if !filled(&summary) {
             return Err(failure(
                 "compaction.failed",
@@ -301,8 +418,10 @@ async fn summarize_transcript(
     rows: &[ox_schema::message::Message],
     emit_deltas: bool,
 ) -> std::result::Result<String, SessionError> {
-    let request =
-        summarization_request(model, &super::step::build_chat_messages("", "", &[], rows));
+    let messages = super::step::build_chat_messages("", "", &[], rows);
+    let measured_prompt = measured_prompt_tokens(rows);
+    let mut request = summarization_request(model, &messages);
+    apply_compaction_budget(ctx, model, &mut request, measured_prompt);
     summarized_reply(ctx, request, emit_deltas).await
 }
 
@@ -373,12 +492,13 @@ async fn summarize_hierarchical(
     let segment_tokens = count_tokens(&input);
     // The global pass: the segment summaries are the transcript; the summary
     // instruction is the same verbatim SUMMARY_PROMPT the flat path asks.
-    let request = summarization_request(
+    let mut request = summarization_request(
         model,
         &[ChatMessage::User {
             content: input.into(),
         }],
     );
+    apply_compaction_budget(ctx, model, &mut request, None);
     let global = summarized_reply(ctx, request, false).await?;
     // The consolidation is the checkpoint. The segment count is the one number
     // that says whether the fold's input range was right: an incremental fold
@@ -1132,5 +1252,64 @@ async fn settle_quiet_outcome(
             );
             Ok(false)
         }
+    }
+}
+
+#[cfg(test)]
+mod compaction_budget_tests {
+    use super::{append_nudge, compaction_max_tokens};
+    use crate::cardinal::wire::{ChatMessage, ChatRequest};
+
+    #[test]
+    fn measured_prompt_usage_is_preferred() {
+        assert_eq!(compaction_max_tokens(Some(80), 20, Some(200), None, 0), 102);
+    }
+
+    #[test]
+    fn local_estimate_is_used_without_measured_usage() {
+        assert_eq!(compaction_max_tokens(None, 40, Some(100), None, 0), 51);
+    }
+
+    #[test]
+    fn output_and_context_caps_bound_the_result() {
+        assert_eq!(
+            compaction_max_tokens(Some(90), 20, Some(200), Some(30), 0),
+            30
+        );
+        assert_eq!(compaction_max_tokens(Some(90), 20, Some(80), None, 0), 1);
+    }
+
+    #[test]
+    fn non_positive_output_cap_is_unavailable() {
+        assert_eq!(
+            compaction_max_tokens(Some(80), 20, Some(200), Some(0), 0),
+            102
+        );
+    }
+
+    #[test]
+    fn nudge_reuses_existing_positive_max_tokens() {
+        let mut request = ChatRequest::new(
+            "model".to_owned(),
+            vec![ChatMessage::User {
+                content: "initial".to_owned().into(),
+            }],
+        );
+        request.max_tokens = Some(42);
+
+        append_nudge(&mut request);
+
+        assert_eq!(request.max_tokens, Some(42));
+        assert_eq!(request.messages.len(), 2);
+    }
+
+    #[test]
+    fn shrink_ladder_is_finite_and_does_not_loop() {
+        let values: Vec<_> = (0..=5)
+            .map(|step| compaction_max_tokens(Some(100), 1, Some(200), None, step))
+            .collect();
+        assert_eq!(&values[..4], &[85, 70, 50, 35]);
+        assert_eq!(values[4], 35);
+        assert_eq!(values[5], 35);
     }
 }

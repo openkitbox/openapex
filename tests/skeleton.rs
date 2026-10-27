@@ -34,6 +34,7 @@ async fn spawn_server_with(mut config: Config) -> (String, JoinHandle<()>, TempD
     config.db_path = db_path;
     config.listen = format!("127.0.0.1:{port}");
     let state = ox::build_state(config.clone()).await.unwrap();
+    state.model_catalog.warm().await;
     let router = ox::build_router(state);
     let listen: String = config.listen.clone();
     let handle = tokio::spawn(async move {
@@ -195,6 +196,120 @@ async fn spawn_gateway(body: &'static str) -> String {
         }
     });
     format!("http://{addr}")
+}
+
+#[tokio::test]
+async fn model_metadata_and_types_filter_are_preserved() {
+    let gateway = spawn_gateway(
+        r#"{"data":[
+            {"id":"chat-model","owned_by":"cardinal","type":"chat","context_length":262144,"max_input_tokens":131072,"temperature":true},
+            {"id":"image-model","owned_by":"cardinal","type":"image","context_length":65536,"max_input_tokens":32768,"temperature":false}
+        ]}"#,
+    )
+    .await;
+    let (base, handle, _dir) = spawn_server_with(Config {
+        cardinal_url: gateway,
+        ..Config::default()
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    let models: serde_json::Value = client
+        .get(format!("{base}/api/model"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let data = models.get("data").unwrap().as_array().unwrap();
+    assert_eq!(
+        data.len(),
+        1,
+        "unfiltered model list defaults to chat-compatible entries: {models}"
+    );
+    let chat = data
+        .iter()
+        .find(|model| model["id"] == "chat-model")
+        .unwrap();
+    assert_eq!(chat["type"], "chat");
+    assert_eq!(chat["capabilities"]["temperature"], true);
+    assert_eq!(chat["limit"]["input"], 131072);
+
+    let image: serde_json::Value = client
+        .get(format!("{base}/api/model?types=image"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let image_data = image["data"].as_array().unwrap();
+    assert_eq!(image_data.len(), 1, "{image}");
+    assert_eq!(image_data[0]["id"], "image-model");
+    assert_eq!(image_data[0]["type"], "image");
+    assert_eq!(image_data[0]["capabilities"]["temperature"], false);
+    assert_eq!(image_data[0]["limit"]["input"], 32768);
+
+    let both: serde_json::Value = client
+        .get(format!("{base}/api/model?types=chat,image"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(both["data"].as_array().unwrap().len(), 2, "{both}");
+
+    let repeated: serde_json::Value = client
+        .get(format!("{base}/api/model?type=chat&type=image"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(repeated["data"].as_array().unwrap().len(), 2, "{repeated}");
+
+    let filtered: serde_json::Value = client
+        .get(format!("{base}/api/model?types=chat"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let filtered_data = filtered["data"].as_array().unwrap();
+    assert_eq!(filtered_data.len(), 1, "{filtered}");
+    assert_eq!(filtered_data[0]["id"], "chat-model");
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn model_default_prefers_chat_compatible_entries() {
+    let gateway = spawn_gateway(
+        r#"{"data":[
+            {"id":"image-model","owned_by":"cardinal","type":"image"},
+            {"id":"chat-model","owned_by":"cardinal"}
+        ]}"#,
+    )
+    .await;
+    let (base, handle, _dir) = spawn_server_with(Config {
+        cardinal_url: gateway,
+        ..Config::default()
+    })
+    .await;
+    let default: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/api/model/default"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(default["data"]["id"], "chat-model", "{default}");
+    handle.abort();
 }
 
 #[tokio::test]

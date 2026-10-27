@@ -45,6 +45,8 @@ pub enum Status {
 pub struct ServerView {
     pub name: String,
     pub status: Status,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// One entry of `GET /api/mcp/resource`'s `resources` array.
@@ -74,13 +76,19 @@ pub struct TemplateInfo {
 
 pub struct Hub {
     servers: RwLock<BTreeMap<String, Status>>,
+    metadata: RwLock<BTreeMap<String, ConnectionMetadata>>,
     /// Live connections, kept alive independently of their tools: a server
     /// that exposes no tools must not be torn down (its resources and
     /// instructions are still part of the session).
     connections: RwLock<BTreeMap<String, Arc<dyn Rpc>>>,
-    instructions: RwLock<Vec<(String, String)>>,
     resources: RwLock<Vec<ResourceInfo>>,
     templates: RwLock<Vec<TemplateInfo>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ConnectionMetadata {
+    title: Option<String>,
+    instructions: Option<String>,
 }
 
 /// Appended after the upstream-rendered `<mcp_instructions>` block: upstream
@@ -98,8 +106,8 @@ impl Hub {
     pub fn empty() -> Self {
         Self {
             servers: RwLock::new(BTreeMap::new()),
+            metadata: RwLock::new(BTreeMap::new()),
             connections: RwLock::new(BTreeMap::new()),
-            instructions: RwLock::new(Vec::new()),
             resources: RwLock::new(Vec::new()),
             templates: RwLock::new(Vec::new()),
         }
@@ -122,16 +130,16 @@ impl Hub {
         let mut seen = HashSet::new();
         for outcome in outcomes {
             let name = outcome.name.clone();
-            if let Some(instructions) = outcome.instructions {
-                self.instructions
-                    .write()
-                    .unwrap()
-                    .push((name.clone(), instructions));
-            }
             self.servers
                 .write()
                 .unwrap()
                 .insert(name.clone(), outcome.status);
+            if let Some(metadata) = outcome.metadata {
+                self.metadata
+                    .write()
+                    .unwrap()
+                    .insert(name.clone(), metadata);
+            }
             self.resources.write().unwrap().extend(outcome.resources);
             self.templates.write().unwrap().extend(outcome.templates);
             if let Some(rpc) = outcome.rpc {
@@ -154,13 +162,17 @@ impl Hub {
     }
 
     pub fn servers(&self) -> Vec<ServerView> {
-        self.servers
-            .read()
-            .unwrap()
+        let servers = self.servers.read().unwrap();
+        let metadata = self.metadata.read().unwrap();
+        servers
             .iter()
-            .map(|(name, status)| ServerView {
-                name: name.clone(),
-                status: status.clone(),
+            .map(|(name, status)| {
+                let connection = metadata.get(name);
+                ServerView {
+                    name: name.clone(),
+                    status: status.clone(),
+                    title: connection.and_then(|m| m.title.clone()),
+                }
             })
             .collect()
     }
@@ -177,12 +189,17 @@ impl Hub {
     /// The upstream block bytes are a strict prefix; [`TOOL_NAMING_LINE`]
     /// follows as the one documented deviation.
     pub fn instructions_block(&self) -> Option<String> {
-        let instructions = self.instructions.read().unwrap();
-        if instructions.is_empty() {
-            return None;
-        }
+        let metadata = self.metadata.read().unwrap();
+        let instructions = metadata.iter().filter_map(|(name, connection)| {
+            connection
+                .instructions
+                .as_deref()
+                .map(|text| (name.as_str(), text))
+        });
         let mut block = String::from("<mcp_instructions>");
-        for (name, text) in instructions.iter() {
+        let mut found = false;
+        for (name, text) in instructions {
+            found = true;
             block.push_str(&format!("\n  <server name=\"{}\">\n", escape(name)));
             for line in text.lines() {
                 block.push_str("    ");
@@ -190,6 +207,9 @@ impl Hub {
                 block.push('\n');
             }
             block.push_str("  </server>");
+        }
+        if !found {
+            return None;
         }
         block.push_str("\n</mcp_instructions>");
         block.push('\n');
@@ -208,10 +228,10 @@ struct Connected {
     name: String,
     status: Status,
     rpc: Option<Arc<dyn Rpc>>,
-    instructions: Option<String>,
     tools: Vec<Arc<dyn Tool>>,
     resources: Vec<ResourceInfo>,
     templates: Vec<TemplateInfo>,
+    metadata: Option<ConnectionMetadata>,
 }
 
 impl Connected {
@@ -220,10 +240,10 @@ impl Connected {
             name: name.to_owned(),
             status: Status::Disabled,
             rpc: None,
-            instructions: None,
             tools: Vec::new(),
             resources: Vec::new(),
             templates: Vec::new(),
+            metadata: None,
         }
     }
 
@@ -232,21 +252,27 @@ impl Connected {
             name: name.to_owned(),
             status: Status::Failed { error },
             rpc: None,
-            instructions: None,
             tools: Vec::new(),
             resources: Vec::new(),
             templates: Vec::new(),
+            metadata: None,
         }
     }
 
     fn from_client(name: &str, client: Client, execution: Option<Duration>) -> Self {
         let Client {
             rpc,
+            title,
             instructions,
             tools,
             resources,
             templates,
+            ..
         } = client;
+        let metadata = ConnectionMetadata {
+            title,
+            instructions,
+        };
         let tools = tools
             .into_iter()
             .map(|info| {
@@ -282,10 +308,10 @@ impl Connected {
             name: name.to_owned(),
             status: Status::Connected,
             rpc: Some(rpc),
-            instructions,
             tools,
             resources,
             templates,
+            metadata: Some(metadata),
         }
     }
 }
@@ -307,7 +333,7 @@ async fn connect_one(name: &str, server: &McpServerConfig, directory: &Path) -> 
             });
             let environment = local.environment.clone().unwrap_or_default();
             match stdio::StdioRpc::spawn(&local.command, &environment, cwd.as_deref()) {
-                Ok(rpc) => handshake(name, Arc::new(rpc), timeout).await,
+                Ok(rpc) => handshake(name, Arc::new(rpc), timeout, server.protocol()).await,
                 Err(error) => Connected::failed(
                     name,
                     format!("failed to start MCP server `{name}`: {error}"),
@@ -315,17 +341,27 @@ async fn connect_one(name: &str, server: &McpServerConfig, directory: &Path) -> 
             }
         }
         McpServerConfig::Remote(remote) => match http::HttpRpc::new(remote) {
-            Ok(rpc) => handshake(name, Arc::new(rpc), timeout).await,
+            Ok(rpc) => handshake(name, Arc::new(rpc), timeout, server.protocol()).await,
             Err(error) => Connected::failed(name, error),
         },
     }
 }
 
-async fn handshake(name: &str, rpc: Arc<dyn Rpc>, timeout: &McpTimeout) -> Connected {
+async fn handshake(
+    name: &str,
+    rpc: Arc<dyn Rpc>,
+    timeout: &McpTimeout,
+    protocol: ox_core::config::McpProtocol,
+) -> Connected {
     let cancel = CancellationToken::new();
     let catalog = Duration::from_millis(timeout.catalog);
     let startup = Duration::from_millis(timeout.startup);
-    match tokio::time::timeout(startup, Client::connect(Arc::clone(&rpc), catalog, &cancel)).await {
+    match tokio::time::timeout(
+        startup,
+        Client::connect(Arc::clone(&rpc), catalog, &cancel, protocol),
+    )
+    .await
+    {
         Ok(Ok(client)) => {
             Connected::from_client(name, client, timeout.execution.map(Duration::from_millis))
         }
@@ -350,5 +386,6 @@ fn friendly(name: &str, error: &CallError) -> String {
         CallError::Cancelled => format!("MCP server `{name}` startup was cancelled"),
         CallError::Rpc(error) => format!("MCP server `{name}` rejected the handshake: {error}"),
         CallError::Transport(message) => format!("MCP server `{name}`: {message}"),
+        CallError::Unsupported(message) => format!("MCP server `{name}`: {message}"),
     }
 }

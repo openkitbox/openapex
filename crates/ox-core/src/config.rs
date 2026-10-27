@@ -75,15 +75,25 @@ pub struct ModelEntry {
     pub id: String,
     /// Human-readable display name.
     pub name: Option<String>,
+    /// Wire model type (`chat`, `text`, `image`, or an unknown provider value).
+    /// Missing gateway metadata is treated as `chat` by the API projection.
+    #[serde(default, rename = "type")]
+    pub model_type: Option<String>,
     /// Context window in tokens. Drives the client's context-usage
     /// percentage (it divides the last assistant turn's tokens by this), so a
     /// missing value means the client shows a raw token count with no
     /// percentage rather than a wrong one.
     #[serde(default)]
     pub context: Option<i64>,
+    /// Input token limit, when the provider states one.
+    #[serde(default)]
+    pub input: Option<i64>,
     /// Maximum output tokens, when the provider states one.
     #[serde(default)]
     pub output: Option<i64>,
+    /// Whether the model accepts a sampling temperature parameter.
+    #[serde(default)]
+    pub temperature: Option<bool>,
     /// Whether the gateway advertises reasoning effort levels for this model.
     #[serde(default)]
     pub reasoning: bool,
@@ -119,6 +129,19 @@ pub enum McpServerConfig {
     Remote(McpRemoteConfig),
 }
 
+/// MCP protocol negotiation mode. `legacy` is the compatibility default;
+/// modern discovery is opt-in or selected by `auto`.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+pub enum McpProtocol {
+    #[default]
+    #[serde(rename = "legacy")]
+    Legacy,
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "2026-07-28")]
+    Modern,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct McpLocalConfig {
     /// argv, not a shell string: no quoting rules, no injection surface.
@@ -131,6 +154,8 @@ pub struct McpLocalConfig {
     #[serde(default)]
     pub disabled: bool,
     #[serde(default)]
+    pub protocol: McpProtocol,
+    #[serde(default)]
     pub timeout: McpTimeout,
 }
 
@@ -141,6 +166,8 @@ pub struct McpRemoteConfig {
     pub headers: Option<BTreeMap<String, String>>,
     #[serde(default)]
     pub disabled: bool,
+    #[serde(default)]
+    pub protocol: McpProtocol,
     #[serde(default)]
     pub timeout: McpTimeout,
 }
@@ -188,6 +215,13 @@ impl McpServerConfig {
         match self {
             Self::Local(local) => &local.timeout,
             Self::Remote(remote) => &remote.timeout,
+        }
+    }
+
+    pub fn protocol(&self) -> McpProtocol {
+        match self {
+            Self::Local(local) => local.protocol,
+            Self::Remote(remote) => remote.protocol,
         }
     }
 }
