@@ -25,6 +25,46 @@ while IFS= read -r line; do
 done
 "#;
 
+const LEGACY_ONLY_STUB: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"server/discover"'*)
+      exit 1
+      ;;
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"legacy-only","version":"0"}}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[]}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+const DEFAULT_LEGACY_STUB: &str = r#"#!/bin/sh
+seen_modern=0
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"server/discover"'*)
+      seen_modern=1
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32601,"message":"Method not found"}}\n' "$id"
+      ;;
+    *'"method":"initialize"'*)
+      if [ "$seen_modern" -eq 1 ]; then
+        printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"stub","version":"0"}}}\n' "$id"
+      else
+        printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32001,"message":"modern discovery was not attempted"}}\n' "$id"
+      fi
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[]}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
 const MODERN_STUB: &str = r#"#!/bin/sh
 while IFS= read -r line; do
   id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
@@ -100,6 +140,20 @@ fn stub(directory: &std::path::Path) -> String {
     path.display().to_string()
 }
 
+fn legacy_only_stub(directory: &std::path::Path) -> String {
+    let path = directory.join("legacy-only-server.sh");
+    std::fs::write(&path, LEGACY_ONLY_STUB).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path.display().to_string()
+}
+
+fn default_legacy_stub(directory: &std::path::Path) -> String {
+    let path = directory.join("default-legacy-server.sh");
+    std::fs::write(&path, DEFAULT_LEGACY_STUB).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path.display().to_string()
+}
+
 fn modern_stub(directory: &std::path::Path) -> String {
     let path = directory.join("modern-server.sh");
     std::fs::write(&path, MODERN_STUB).unwrap();
@@ -129,9 +183,16 @@ fn auto_unsupported_success_stub(directory: &std::path::Path) -> String {
 }
 
 #[test]
-fn mcp_protocol_defaults_to_legacy_and_parses_modern_modes() {
+fn mcp_protocol_defaults_to_auto_and_parses_explicit_modes() {
+    let default: McpLocalConfig = serde_json::from_value(json!({
+        "command": ["server"],
+    }))
+    .unwrap();
+    assert_eq!(default.protocol, McpProtocol::Auto);
+
     let legacy: McpLocalConfig = serde_json::from_value(json!({
         "command": ["server"],
+        "protocol": "legacy",
     }))
     .unwrap();
     assert_eq!(legacy.protocol, McpProtocol::Legacy);
@@ -151,7 +212,7 @@ async fn mcp_catalogs_report_a_connected_server() {
     servers.insert(
         "stub".to_owned(),
         McpServerConfig::Local(McpLocalConfig {
-            command: vec![stub(directory.path())],
+            command: vec![legacy_only_stub(directory.path())],
             cwd: None,
             environment: None,
             protocol: McpProtocol::Legacy,
@@ -227,14 +288,12 @@ async fn mcp_modern_discovery_propagates_server_metadata() {
     let mut servers = BTreeMap::new();
     servers.insert(
         "modern".to_owned(),
-        McpServerConfig::Local(McpLocalConfig {
-            command: vec![modern_stub(directory.path())],
-            cwd: None,
-            environment: None,
-            protocol: McpProtocol::Modern,
-            disabled: false,
-            timeout: McpTimeout::default(),
-        }),
+        McpServerConfig::Local(
+            serde_json::from_value(json!({
+                "command": [modern_stub(directory.path())],
+            }))
+            .unwrap(),
+        ),
     );
     let config = Config {
         mcp: McpConfig { servers },
@@ -280,14 +339,12 @@ async fn mcp_auto_falls_back_to_legacy_only_on_unsupported_discovery() {
     let mut servers = BTreeMap::new();
     servers.insert(
         "legacy".to_owned(),
-        McpServerConfig::Local(McpLocalConfig {
-            command: vec![stub(directory.path())],
-            cwd: None,
-            environment: None,
-            protocol: McpProtocol::Auto,
-            disabled: false,
-            timeout: McpTimeout::default(),
-        }),
+        McpServerConfig::Local(
+            serde_json::from_value(json!({
+                "command": [default_legacy_stub(directory.path())],
+            }))
+            .unwrap(),
+        ),
     );
     let config = Config {
         mcp: McpConfig { servers },

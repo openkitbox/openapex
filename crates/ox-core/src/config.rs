@@ -129,15 +129,15 @@ pub enum McpServerConfig {
     Remote(McpRemoteConfig),
 }
 
-/// MCP protocol negotiation mode. `legacy` is the compatibility default;
-/// modern discovery is opt-in or selected by `auto`.
+/// MCP protocol negotiation mode. `auto` is the default: try modern discovery
+/// first, then fall back to legacy only when modern is unsupported.
 #[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
 pub enum McpProtocol {
     #[default]
-    #[serde(rename = "legacy")]
-    Legacy,
     #[serde(rename = "auto")]
     Auto,
+    #[serde(rename = "legacy")]
+    Legacy,
     #[serde(rename = "2026-07-28")]
     Modern,
 }
