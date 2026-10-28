@@ -34,10 +34,14 @@ static GLOBAL: std::alloc::System = std::alloc::System;
 static GLOBAL: rustfs_mimalloc::MiMalloc = rustfs_mimalloc::MiMalloc;
 
 use anyhow::{Context, Result};
-use std::fs::{File, OpenOptions};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
+use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriterExt};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+
+static LOG_GUARDS: OnceLock<Vec<WorkerGuard>> = OnceLock::new();
 
 #[derive(Debug, Eq, PartialEq)]
 struct LogOutputs {
@@ -131,12 +135,24 @@ fn set_stdout_flag(
     Ok(())
 }
 
-fn open_log_file(path: &std::path::Path) -> Result<File> {
-    OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("failed to open log file `{}`", path.display()))
+fn split_log_path(path: &Path) -> (PathBuf, String) {
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("ox.log")
+        .to_owned();
+    (directory.to_owned(), filename)
+}
+
+fn rolling_log_writer(path: &Path) -> Result<(NonBlocking, WorkerGuard)> {
+    let (directory, filename) = split_log_path(path);
+    let appender = tracing_appender::rolling::Builder::new()
+        .rotation(tracing_appender::rolling::Rotation::HOURLY)
+        .filename_prefix(filename)
+        .build(&directory)
+        .with_context(|| format!("failed to open log file `{}`", path.display()))?;
+    Ok(tracing_appender::non_blocking(appender))
 }
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -185,39 +201,39 @@ async fn main() -> Result<()> {
 fn init_tracing(outputs: &LogOutputs, acp: bool) -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    if acp {
-        let stderr = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
-        let subscriber = tracing_subscriber::registry().with(filter).with(stderr);
-        if let Some(path) = &outputs.log_file {
-            let file = open_log_file(path)?;
-            subscriber
-                .with(tracing_subscriber::fmt::layer().with_writer(file))
-                .try_init()
-                .context("failed to initialize tracing")?;
-        } else {
-            subscriber
-                .try_init()
-                .context("failed to initialize tracing")?;
-        }
-        return Ok(());
+    let mut guards = Vec::new();
+    let mut writer = if acp {
+        Some(BoxMakeWriter::new(std::io::stderr))
+    } else if outputs.stdout {
+        Some(BoxMakeWriter::new(std::io::stdout))
+    } else {
+        None
+    };
+
+    if let Some(path) = &outputs.log_file {
+        let (file_writer, guard) = rolling_log_writer(path)?;
+        guards.push(guard);
+        let file_writer = BoxMakeWriter::new(file_writer);
+        writer = Some(match writer {
+            Some(writer) => BoxMakeWriter::new(writer.and(file_writer)),
+            None => file_writer,
+        });
     }
 
-    let file = outputs.log_file.as_deref().map(open_log_file).transpose()?;
     let subscriber = tracing_subscriber::registry().with(filter);
-    match (outputs.stdout, file) {
-        (true, Some(file)) => subscriber
-            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
-            .with(tracing_subscriber::fmt::layer().with_writer(file))
-            .try_init(),
-        (true, None) => subscriber
-            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stdout))
-            .try_init(),
-        (false, Some(file)) => subscriber
-            .with(tracing_subscriber::fmt::layer().with_writer(file))
-            .try_init(),
-        (false, None) => subscriber.try_init(),
+    if let Some(writer) = writer {
+        subscriber
+            .with(tracing_subscriber::fmt::layer().with_writer(writer))
+            .try_init()
+            .context("failed to initialize tracing")?;
+    } else {
+        subscriber
+            .try_init()
+            .context("failed to initialize tracing")?;
     }
-    .context("failed to initialize tracing")?;
+    LOG_GUARDS
+        .set(guards)
+        .map_err(|_| anyhow::anyhow!("tracing guards already initialized"))?;
     Ok(())
 }
 
@@ -225,6 +241,7 @@ fn init_tracing(outputs: &LogOutputs, acp: bool) -> Result<()> {
 mod tests {
     use super::{LogOutputs, parse_acp_args, parse_server_args};
     use std::io::Write;
+    use tracing_subscriber::fmt::MakeWriter;
 
     #[test]
     fn server_defaults_to_stdout_without_file() {
@@ -288,18 +305,42 @@ mod tests {
     }
 
     #[test]
-    fn log_file_is_created_and_appended() {
+    fn log_path_is_split_into_parent_and_filename() {
+        let path = std::path::Path::new("/tmp/logs/ox.log");
+        assert_eq!(
+            super::split_log_path(path),
+            (std::path::PathBuf::from("/tmp/logs"), "ox.log".to_owned())
+        );
+    }
+
+    #[test]
+    fn rolling_log_writes_standard_hourly_filename() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("ox.log");
-        {
-            let mut file = super::open_log_file(&path).unwrap();
-            writeln!(file, "first").unwrap();
-        }
-        {
-            let mut file = super::open_log_file(&path).unwrap();
-            writeln!(file, "second").unwrap();
-        }
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "first\nsecond\n");
+        let (writer, guard) = super::rolling_log_writer(&path).unwrap();
+        let mut file = writer.make_writer();
+        writeln!(file, "rolling smoke").unwrap();
+        drop(file);
+        drop(writer);
+        drop(guard);
+        let files = std::fs::read_dir(directory.path())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(files.len(), 1);
+        let filename = files[0].file_name();
+        assert!(filename.to_string_lossy().starts_with("ox.log."));
+        assert_eq!(
+            std::fs::read_to_string(directory.path().join(filename)).unwrap(),
+            "rolling smoke\n"
+        );
+    }
+
+    #[test]
+    fn rolling_log_error_contains_original_path() {
+        let path = std::path::Path::new("/definitely/missing/ox.log");
+        let error = super::rolling_log_writer(path).unwrap_err();
+        assert!(error.to_string().contains("/definitely/missing/ox.log"));
     }
 
     #[test]
