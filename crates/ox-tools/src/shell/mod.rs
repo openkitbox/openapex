@@ -21,6 +21,8 @@
 //! running command, so the old `chars` parameter is gone and interactive
 //! commands fail fast on EOF instead of hanging.
 
+pub mod completion;
+pub mod events;
 pub mod sessions;
 
 mod engine;
@@ -39,7 +41,15 @@ use super::{
 };
 
 /// Upstream `ShellTool.DEFAULT_TIMEOUT_MS`.
-pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 2 * 60 * 1_000;
+pub const DEFAULT_TIMEOUT_MS: u64 = 2 * 60 * 1_000;
+
+/// The timeout a call gets when it passes none. Upstream: `background === true
+/// ? (timeout ?? 0) : (timeout ?? DEFAULT_TIMEOUT_MS)`. An `owned` run is
+/// handed back at once (`background=true` or `yield_time_ms=0`) and has no
+/// deadline unless the caller asks for one; a foreground run keeps the default.
+pub fn default_timeout_ms(owned: bool) -> u64 {
+    if owned { 0 } else { DEFAULT_TIMEOUT_MS }
+}
 
 /// How long `run` observes before handing back an owned session.
 const DEFAULT_YIELD_MS: u64 = 30_000;
@@ -48,7 +58,10 @@ const DEFAULT_INTERACT_YIELD_MS: u64 = 5_000;
 
 /// Upstream `ToolOutput.MAX_LINES` / `MAX_BYTES`.
 const MAX_LINES: usize = 2_000;
-const MAX_BYTES: usize = 50 * 1024;
+pub(crate) const MAX_BYTES: usize = 50 * 1024;
+
+/// Upstream `BACKGROUND_INSTRUCTION` (tool/plugin/shell.ts).
+const BACKGROUND_INSTRUCTION: &str = "You will be notified automatically when the command finishes. The notification will include the command's output. Unless the user explicitly asks otherwise, DO NOT poll for completion, even if you need the final result to continue. Repeatedly sleeping and reading or searching the output file is polling, not useful work. You may read the current output if it lets you do useful work now, but do not repeatedly check it while waiting for the command to finish. Keep working on anything that does not depend on the result. If you have nothing else to do, end your response; you will be resumed automatically when the command finishes.";
 
 /// The dialect the model should write: brush implements `bash`.
 const SHELL_NAME: &str = "bash";
@@ -56,6 +69,8 @@ const SHELL_NAME: &str = "bash";
 pub struct ShellTool {
     /// Live sessions started by `run`, shared with the `/api/shell` handlers.
     sessions: Arc<sessions::ShellSessions>,
+    /// Optional completion delivery; background runs fail closed without it.
+    completion: Option<completion::SessionSink>,
     /// Optional pre-execution RTK rewrite; a disabled rewriter is a no-op.
     rtk: Arc<RtkRewriter>,
 }
@@ -64,6 +79,7 @@ impl ShellTool {
     pub fn new() -> Self {
         Self {
             sessions: sessions::shared(),
+            completion: None,
             rtk: Arc::new(RtkRewriter::new()),
         }
     }
@@ -73,6 +89,7 @@ impl ShellTool {
     pub fn with_sessions(sessions: Arc<sessions::ShellSessions>) -> Self {
         Self {
             sessions,
+            completion: None,
             rtk: Arc::new(RtkRewriter::new()),
         }
     }
@@ -81,6 +98,12 @@ impl ShellTool {
     /// independence) or [`RtkRewriter::with_binary`] (a mock rtk).
     pub fn with_rewriter(mut self, rtk: RtkRewriter) -> Self {
         self.rtk = Arc::new(rtk);
+        self
+    }
+
+    /// Install the sink background runs report their terminal state through.
+    pub fn with_completion(mut self, completion: completion::SessionSink) -> Self {
+        self.completion = Some(completion);
         self
     }
 }
@@ -112,10 +135,17 @@ impl Tool for ShellTool {
             "Commands accept an optional timeout, background commands have no timeout by default."
                 .to_owned(),
         );
-        lines.push(
-            "Background commands return immediately, and you will be notified when they complete."
-                .to_owned(),
-        );
+        if self.completion.is_some() {
+            lines.push(
+                "Background commands return immediately, and you will be notified when they complete."
+                    .to_owned(),
+            );
+        } else {
+            lines.push(
+                "Background completion notifications are unavailable in this runtime; use a foreground command or an existing session."
+                    .to_owned(),
+            );
+        }
         lines.push(
             "When to use: run builds, tests, formatters, and version control, or any command no dedicated tool covers."
                 .to_owned(),
@@ -155,7 +185,7 @@ impl Tool for ShellTool {
                         "timeout",
                         super::int_param(
                             0,
-                            "Timeout in milliseconds for the whole session. Set to 0 to disable the timeout. Defaults to 120000. A command that outlives its yield window keeps running under this deadline.",
+                            "Timeout in milliseconds for the whole session. Set to 0 to disable the timeout. Defaults to 120000 for foreground commands and to 0 (no timeout) for background commands (background=true or yield_time_ms=0). A foreground command that outlives its yield window and moves to the background loses its timeout and runs until it exits or is stopped.",
                         ),
                     ),
                     (
@@ -273,8 +303,8 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
         Ok(workdir) => workdir,
         Err(output) => return output,
     };
-    let timeout_ms = match optional_nonneg_int("shell", input, "timeout") {
-        Ok(value) => value.unwrap_or(DEFAULT_TIMEOUT_MS),
+    let timeout = match optional_nonneg_int("shell", input, "timeout") {
+        Ok(value) => value,
         Err(output) => return output,
     };
     let yield_time_ms = match optional_nonneg_int("shell", input, "yield_time_ms") {
@@ -314,6 +344,12 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
     // A background request starts a session and returns at once; a foreground
     // request waits out its yield window.
     let yield_ms = if background { 0 } else { yield_time_ms };
+    let timeout_ms = timeout.unwrap_or_else(|| default_timeout_ms(yield_ms == 0));
+    if yield_ms == 0 && tool.completion.is_none() {
+        return fail(
+            "Background shell completion notification is unavailable; run in the foreground or configure a completion sink.".to_owned(),
+        );
+    }
     // RTK rewrites the command itself before execution; any failure leaves it
     // unchanged. Commands that return an owned session at once are exempt
     // (`background=true` or `yield_time_ms=0`): their value is streaming
@@ -330,10 +366,25 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
             None => command.to_owned(),
         }
     };
+    // Every owned run carries the sink. A run handed back at once is armed
+    // from the start; a foreground run is gated until `hand_back`, so a
+    // command that settles inside its window returns inline and never
+    // notifies, while one that overflows is notified exactly once.
+    let completion = tool.completion.as_ref().map(|sink| {
+        let sink = Arc::clone(sink);
+        let session_id = ctx.session_id.clone();
+        Arc::new(move |completion| sink(&session_id, completion)) as sessions::CompletionCallback
+    });
     let session = match tool.sessions.spawn(sessions::SpawnRequest {
         command,
         cwd: workdir,
         timeout_ms: Some(timeout_ms).filter(|timeout| *timeout > 0),
+        completion,
+        foreground: yield_ms > 0,
+        owner: Some(sessions::Owner {
+            session_id: ctx.session_id.clone(),
+            directory: ctx.directory.to_string_lossy().into_owned(),
+        }),
     }) {
         Ok(session) => session,
         Err(_) => return wrap("spawn failed".to_owned()),
@@ -348,6 +399,20 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
     if ctx.cancellation.is_cancelled() {
         session.stop(true).await;
         return wrap("command cancelled".to_owned());
+    }
+    if yield_ms == 0 {
+        // Handed back at once, whatever the process has done since: the
+        // completion notice carries the outcome, so this response must not
+        // also carry it (upstream `backgroundResult`).
+        return background_result(&session.id, false);
+    }
+    // Past the window: settle the hand-back race under the session's gate. A
+    // run that settled first is returned inline (and never notifies); one
+    // still running becomes a background job whose settle notifies once.
+    // Without a sink there is nothing to notify through, so the run stays an
+    // `interact`-addressed session.
+    if tool.completion.is_some() && session.hand_back() == sessions::HandBack::Background {
+        return background_result(&session.id, rewritten);
     }
     let (page, exit) = session.poll(0, usize::MAX);
     if exit
@@ -364,7 +429,8 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
             "exit": exit.code,
         }));
     }
-    // Still running: hand the model an owned handle.
+    // Still running and no sink to notify through: hand the model an owned
+    // handle to observe with `interact`; its timeout still applies.
     let tail = truncate_for_model(&page.output);
     let mut text = if tail.is_empty() {
         "(no output yet)".to_owned()
@@ -387,6 +453,34 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
         "status": "running",
         "shellID": session.id,
     }))
+}
+
+/// The `running` response of a run handed back to the background (upstream
+/// `backgroundResult`). `rewritten` adds the RTK buffering caveat: RTK emits a
+/// wrapped command's output only when it exits.
+fn background_result(session_id: &str, rewritten: bool) -> ToolOutput {
+    let mut text = format!(
+        "Command moved to the background (shell ID: {session_id}).\n{BACKGROUND_INSTRUCTION}"
+    );
+    if rewritten {
+        text.push_str(
+            "\n\nThis command runs through rtk, which buffers its output until it exits; \
+             the completion notification carries that output.",
+        );
+    }
+    ok_text(text).with_metadata(json!({
+        "status": "running",
+        "shellID": session_id,
+    }))
+}
+
+/// The `interact` reply for a running session whose completion is delivered
+/// automatically: the same no-poll guidance as a background hand-back.
+fn still_running_notice(session_id: &str) -> String {
+    format!(
+        "\n\nstatus: running (shell ID: {session_id}).\n{BACKGROUND_INSTRUCTION} \
+         To terminate it, call shell with action=\"stop\" and session_id={session_id}."
+    )
 }
 
 /// The model-facing text for a settled session.
@@ -475,6 +569,10 @@ async fn interact(tool: &ShellTool, input: &Value) -> ToolOutput {
         if let Some(notice) = exit_notice_parts(exit.code, exit.signal) {
             text.push_str(&format!("\n\n{notice}"));
         }
+    } else if session.notifies_on_completion() {
+        // The completion is delivered automatically, so this reply must not
+        // invite another observe; the output above stays available.
+        text.push_str(&still_running_notice(session_id));
     } else {
         text.push_str(&format!(
             "\n\nCommand is still running as shell session {session_id}. Interact again to \
@@ -517,7 +615,7 @@ async fn stop(tool: &ShellTool, input: &Value) -> ToolOutput {
 
 /// Upstream `notice` (shell/result.ts), from the recorded exit instead of a
 /// live `ExitStatus` (the watcher owns the child).
-fn exit_notice_parts(code: Option<i32>, signal: Option<i32>) -> Option<String> {
+pub(crate) fn exit_notice_parts(code: Option<i32>, signal: Option<i32>) -> Option<String> {
     if let Some(signal) = signal.and_then(signal_name_of) {
         return Some(format!("Killed by {signal}"));
     }
@@ -550,7 +648,7 @@ fn truncate_for_model(raw: &str) -> String {
 /// truncation flag, the total line count (newlines across the WHOLE capture,
 /// +1 when the page doesn't end with a newline), and the number of shown
 /// lines (page-relative, capped at `MAX_LINES`).
-fn truncate_output(raw: &str) -> (String, bool, usize, usize) {
+pub(crate) fn truncate_output(raw: &str) -> (String, bool, usize, usize) {
     let bytes = raw.as_bytes();
     let page = if bytes.len() > MAX_BYTES {
         let mut start = bytes.len() - MAX_BYTES;

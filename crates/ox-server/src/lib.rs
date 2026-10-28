@@ -138,6 +138,9 @@ pub async fn build_state_on_with_bus(
     // process-wide form registry must broadcast on this same bus (the one
     // `GET /api/event` serves).
     ox_tools::form::init(bus.clone());
+    // Same for `shell.created|exited|deleted`: the TUI marks a background
+    // shell running by its presence in a store those frames fill.
+    ox_tools::shell::events::init(bus.clone());
     // One read-only config behind an `Arc`: every actor and spawned task clones
     // the handle, never the struct.
     let config = std::sync::Arc::new(config);
@@ -196,6 +199,9 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
     let bus = EventBus::new(db.clone());
     tools.register_todowrite(db.clone());
     tools.register_subagent(db.clone(), bus.clone(), config.subagent.depth);
+    // Background `shell` completions need the same db/bus; the runner attaches
+    // its waker when it is built below.
+    tools.register_shell_completion(db.clone(), bus.clone());
     let chat = chat_transport(&config)?;
     let state =
         build_state_on_with_bus(config, chat, tools, db, bus, ox_core::config::ox_home()).await?;

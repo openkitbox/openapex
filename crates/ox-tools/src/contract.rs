@@ -118,6 +118,9 @@ pub struct ToolRegistry {
     /// The handle the registered `subagent` tool shares with the runner, so
     /// the runner can attach itself the moment it exists.
     pub subagent_handle: SubagentSlot,
+    /// The completion sink the registered `shell` tool reports through, so the
+    /// runner can attach its waker the moment it exists.
+    pub shell_completion: Option<std::sync::Arc<crate::shell::completion::ShellCompletion>>,
 }
 
 impl ToolRegistry {
@@ -163,6 +166,7 @@ impl ToolRegistry {
             tools,
             definitions_cache: std::sync::OnceLock::new(),
             subagent_handle: self.subagent_handle.clone(),
+            shell_completion: self.shell_completion.clone(),
         }
     }
 

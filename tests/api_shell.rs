@@ -12,7 +12,14 @@ use ox::tool::shell::ShellTool;
 use salvo::Listener;
 
 /// Boot the server with the real built-in toolset on a free port.
-async fn server() -> (String, tempfile::TempDir) {
+async fn server() -> (String, tempfile::TempDir, BootGuard) {
+    // The shell table is process-wide and its event bridge is (re)pointed at
+    // the newest bus by every boot, so tests in this binary boot one at a
+    // time; the guard keeps the lock until the test ends.
+    static BOOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let guard = BootGuard {
+        _lock: BOOT.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+    };
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .expect("ephemeral port")
         .local_addr()
@@ -37,11 +44,16 @@ async fn server() -> (String, tempfile::TempDir) {
     let client = reqwest::Client::new();
     for _ in 0..100 {
         if client.get(format!("{base}/api/info")).send().await.is_ok() {
-            return (base, dir);
+            return (base, dir, guard);
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     panic!("server did not start");
+}
+
+/// Holds the boot lock for the lifetime of one test.
+struct BootGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 /// The shell endpoints never call the model, so an empty chat transport is
@@ -62,9 +74,13 @@ impl ox::runner::Chat for UnusedChat {
 }
 
 async fn start_session() -> String {
+    start_session_in("ses_api", std::env::temp_dir()).await
+}
+
+async fn start_session_in(session_id: &str, directory: std::path::PathBuf) -> String {
     let ctx = ToolContext {
-        session_id: "ses_api".to_owned(),
-        directory: std::env::temp_dir(),
+        session_id: session_id.to_owned(),
+        directory,
         call_id: "call_api".to_owned(),
         cancellation: CancellationToken::new(),
         registry: std::sync::Arc::new(ox::runner::ToolRegistry::new()),
@@ -86,7 +102,7 @@ async fn start_session() -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn lists_and_pages_a_live_session() {
-    let (base, _dir) = server().await;
+    let (base, _dir, _guard) = server().await;
     let client = reqwest::Client::new();
     let id = start_session().await;
 
@@ -156,45 +172,26 @@ async fn lists_and_pages_a_live_session() {
     assert_eq!(next["data"]["output"], "");
     assert!(next["data"]["cursor"].as_u64().unwrap() >= cursor);
 
-    // A running session is not deletable.
-    let refused = client
+    // Upstream `shell.remove` ends a running shell as killed, then forgets
+    // it: 204, and the id is gone afterwards.
+    let removed = client
         .delete(format!("{base}/api/shell/{id}"))
         .send()
         .await
         .expect("delete");
-    assert_eq!(refused.status(), 409);
-
-    // Stop it, then it goes away.
-    ox::tool::shell::sessions::shared()
-        .get(&id)
-        .expect("session")
-        .stop(true)
-        .await;
-    // The watcher records the exit on its next tick.
-    for _ in 0..100 {
-        if ox::tool::shell::sessions::shared()
-            .get(&id)
-            .is_some_and(|session| session.settled())
-        {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    let deleted = client
-        .delete(format!("{base}/api/shell/{id}"))
+    assert_eq!(removed.status(), 204);
+    assert!(ox::tool::shell::sessions::shared().get(&id).is_none());
+    let gone = client
+        .get(format!("{base}/api/shell/{id}"))
         .send()
         .await
-        .expect("delete");
-    assert!(
-        deleted.status() == 204 || deleted.status() == 409,
-        "unexpected status {}",
-        deleted.status()
-    );
+        .expect("get");
+    assert_eq!(gone.status(), 404);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unknown_sessions_answer_404() {
-    let (base, _dir) = server().await;
+async fn unknown_sessions_answer_404_except_idempotent_delete() {
+    let (base, _dir, _guard) = server().await;
     let client = reqwest::Client::new();
     for path in ["/api/shell/sh_missing", "/api/shell/sh_missing/output"] {
         let response = client
@@ -206,10 +203,190 @@ async fn unknown_sessions_answer_404() {
         let body: Value = response.json().await.expect("json");
         assert_eq!(body["_tag"], "ShellNotFoundError");
     }
+    // Unlike get/output, upstream `shell.remove` is idempotent: its handler
+    // (packages/server/src/handlers/shell.ts, `shell.remove`) maps
+    // `Shell.NotFoundError` to `Effect.void` and the endpoint declares no
+    // error, so an unknown id answers 204.
     let deleted = client
         .delete(format!("{base}/api/shell/sh_missing"))
         .send()
         .await
         .expect("delete");
-    assert_eq!(deleted.status(), 404);
+    assert_eq!(deleted.status(), 204);
+}
+
+/// Read SSE frames until one satisfies `matches`, bounded by a deadline.
+async fn next_frame(
+    response: &mut reqwest::Response,
+    buffer: &mut String,
+    matches: impl Fn(&Value) -> bool,
+) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
+        while let Some(boundary) = buffer.find("\n\n") {
+            let frame: String = buffer.drain(..boundary + 2).collect();
+            if let Ok(event) =
+                serde_json::from_str::<Value>(frame.trim().trim_start_matches("data: "))
+                && matches(&event)
+            {
+                return event;
+            }
+        }
+        let Some(chunk) = response.chunk().await.expect("chunk") else {
+            break;
+        };
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    panic!("expected SSE frame never arrived");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_started_shells_reach_the_tui_store_over_sse() {
+    let (base, _dir, _guard) = server().await;
+    let client = reqwest::Client::new();
+    let workspace = tempfile::tempdir().expect("workspace");
+    let directory = workspace.path().to_string_lossy().into_owned();
+
+    let mut sse = client
+        .get(format!("{base}/api/event"))
+        .send()
+        .await
+        .expect("sse");
+    assert_eq!(sse.status(), 200);
+    let mut buffer = String::new();
+
+    let id = start_session_in("ses_events", workspace.path().to_path_buf()).await;
+    let is = |kind: &'static str, id: String| {
+        move |event: &Value| {
+            event["type"] == kind
+                && (event["data"]["id"] == id.as_str()
+                    || event["data"]["info"]["id"] == id.as_str())
+        }
+    };
+
+    // shell.created { info } with the composer's sessionID tag and a location.
+    let created = next_frame(&mut sse, &mut buffer, is("shell.created", id.clone())).await;
+    assert_eq!(created["location"]["directory"], directory.as_str());
+    assert_eq!(created["data"]["info"]["status"], "running");
+    assert_eq!(
+        created["data"]["info"]["metadata"]["sessionID"],
+        "ses_events"
+    );
+
+    // The running shell is listed; it carries the same tag.
+    let listed: Value = client
+        .get(format!("{base}/api/shell"))
+        .send()
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("json");
+    let entry = listed["data"]
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|item| item["id"] == id.as_str())
+        .expect("running shell listed");
+    assert_eq!(entry["metadata"]["sessionID"], "ses_events");
+
+    // shell.exited { id, exit?, status } once stopped.
+    ox::tool::shell::sessions::shared()
+        .get(&id)
+        .expect("session")
+        .stop(true)
+        .await;
+    let exited = next_frame(&mut sse, &mut buffer, is("shell.exited", id.clone())).await;
+    assert_eq!(exited["location"]["directory"], directory.as_str());
+    assert_eq!(exited["data"]["status"], "killed");
+    assert!(exited["data"].get("info").is_none());
+
+    // A settled shell is no longer listed but is still readable.
+    let listed: Value = client
+        .get(format!("{base}/api/shell"))
+        .send()
+        .await
+        .expect("list")
+        .json()
+        .await
+        .expect("json");
+    assert!(
+        !listed["data"]
+            .as_array()
+            .expect("array")
+            .iter()
+            .any(|item| item["id"] == id.as_str()),
+        "settled shell must not be listed: {listed}"
+    );
+    let got: Value = client
+        .get(format!("{base}/api/shell/{id}"))
+        .send()
+        .await
+        .expect("get")
+        .json()
+        .await
+        .expect("json");
+    assert_ne!(got["data"]["status"], "running");
+
+    // DELETE announces shell.deleted { id } with the same location.
+    let deleted = client
+        .delete(format!("{base}/api/shell/{id}"))
+        .send()
+        .await
+        .expect("delete");
+    assert_eq!(deleted.status(), 204);
+    let frame = next_frame(&mut sse, &mut buffer, is("shell.deleted", id.clone())).await;
+    assert_eq!(frame["location"]["directory"], directory.as_str());
+    assert_eq!(frame["data"], json!({ "id": id }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_running_shell_kills_it_and_announces_exited_then_deleted() {
+    let (base, _dir, _guard) = server().await;
+    let client = reqwest::Client::new();
+    let workspace = tempfile::tempdir().expect("workspace");
+    let directory = workspace.path().to_string_lossy().into_owned();
+
+    let mut sse = client
+        .get(format!("{base}/api/event"))
+        .send()
+        .await
+        .expect("sse");
+    assert_eq!(sse.status(), 200);
+    let mut buffer = String::new();
+
+    let id = start_session_in("ses_kill", workspace.path().to_path_buf()).await;
+    let is = |kind: &'static str, id: String| {
+        move |event: &Value| {
+            event["type"] == kind
+                && (event["data"]["id"] == id.as_str()
+                    || event["data"]["info"]["id"] == id.as_str())
+        }
+    };
+    let created = next_frame(&mut sse, &mut buffer, is("shell.created", id.clone())).await;
+    assert_eq!(created["location"]["directory"], directory.as_str());
+
+    // The composer's kill key (shell-tab.tsx) calls shell.remove on a
+    // running shell; upstream answers 204.
+    let removed = client
+        .delete(format!("{base}/api/shell/{id}"))
+        .send()
+        .await
+        .expect("delete");
+    assert_eq!(removed.status(), 204);
+
+    let exited = next_frame(&mut sse, &mut buffer, is("shell.exited", id.clone())).await;
+    assert_eq!(exited["location"]["directory"], directory.as_str());
+    assert_eq!(exited["data"], json!({ "id": id, "status": "killed" }));
+    let deleted = next_frame(&mut sse, &mut buffer, is("shell.deleted", id.clone())).await;
+    assert_eq!(deleted["location"]["directory"], directory.as_str());
+    assert_eq!(deleted["data"], json!({ "id": id }));
+
+    // Deleting again is a quiet no-op: no second deleted announcement.
+    let again = client
+        .delete(format!("{base}/api/shell/{id}"))
+        .send()
+        .await
+        .expect("delete");
+    assert_eq!(again.status(), 204);
 }

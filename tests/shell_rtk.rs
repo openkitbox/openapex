@@ -16,6 +16,7 @@ use ox::tool::shell::ShellTool;
 use ox::tool::shell::sessions::ShellSessions;
 use serde_json::json;
 
+#[cfg(unix)]
 /// The mock's behaviour table, keyed by the command ox hands it.
 const MOCK: &str = r#"#!/bin/sh
 if [ "$1" != "hook" ] || [ "$2" != "opencode" ]; then
@@ -35,6 +36,7 @@ case "$cmd" in
 esac
 "#;
 
+#[cfg(unix)]
 /// Write the mock rtk and return `(binary, log)` paths.
 fn mock_rtk(dir: &Path) -> (PathBuf, PathBuf) {
     let binary = dir.join("rtk-mock.sh");
@@ -75,6 +77,7 @@ async fn run_text(tool: &ShellTool, dir: &Path, command: &str) -> String {
     output.content.as_str().expect("text content").to_owned()
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn rewritten_command_is_what_runs() {
     let dir = tempfile::tempdir().unwrap();
@@ -90,6 +93,7 @@ async fn rewritten_command_is_what_runs() {
     assert_eq!(logged.trim(), "git status", "hook saw the original command");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn no_op_answer_runs_the_original_command() {
     let dir = tempfile::tempdir().unwrap();
@@ -101,6 +105,7 @@ async fn no_op_answer_runs_the_original_command() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn every_bad_answer_fails_open() {
     let dir = tempfile::tempdir().unwrap();
@@ -113,6 +118,7 @@ async fn every_bad_answer_fails_open() {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn hook_timeout_fails_open_without_blocking_the_command() {
     let dir = tempfile::tempdir().unwrap();
@@ -136,6 +142,7 @@ async fn missing_binary_fails_open() {
     assert_eq!(run_text(&tool, dir.path(), "echo hi").await.trim(), "hi");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn commands_reach_the_hook_verbatim() {
     let dir = tempfile::tempdir().unwrap();
@@ -153,13 +160,15 @@ async fn commands_reach_the_hook_verbatim() {
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn background_commands_are_never_rewritten() {
     let dir = tempfile::tempdir().unwrap();
     let (binary, _) = mock_rtk(dir.path());
     let sessions = Arc::new(ShellSessions::default());
     let tool = ShellTool::with_sessions(Arc::clone(&sessions))
-        .with_rewriter(RtkRewriter::with_binary(binary));
+        .with_rewriter(RtkRewriter::with_binary(binary))
+        .with_completion(Arc::new(|_, _| {}));
 
     // Both routes to an immediately-owned session: the legacy `background`
     // flag and the documented `yield_time_ms=0`.
@@ -182,6 +191,7 @@ async fn background_commands_are_never_rewritten() {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn rewritten_running_session_says_output_is_buffered() {
     let dir = tempfile::tempdir().unwrap();

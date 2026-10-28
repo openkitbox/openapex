@@ -106,6 +106,24 @@ impl ToolRegistry {
     }
 }
 
+/// Background `shell` completion, wired at app-wiring time for the same reason
+/// as `subagent`: the notice needs the database and the runner.
+impl ToolRegistry {
+    /// Replace the built-in `shell` tool with one that reports background
+    /// completions into the session that started them. The runner attaches
+    /// itself as the waker in `Runner::new`; until then a completion is dropped
+    /// with a warning. A registry that never calls this keeps a `shell` tool
+    /// whose background requests fail closed.
+    pub fn register_shell_completion(&mut self, db: ox_db::Db, bus: ox_core::event_bus::EventBus) {
+        let completion = Arc::new(shell::completion::ShellCompletion::new(db, bus));
+        self.remove("shell");
+        self.register_all(vec![
+            Arc::new(shell::ShellTool::new().with_completion(completion.sink())) as Arc<dyn Tool>,
+        ]);
+        self.shell_completion = Some(completion);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Shared model-facing error/output helpers
 // ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
-//! `shell.*` endpoints: list sessions, read one, page its output, delete it.
+//! `shell.*` endpoints: list sessions, read one, page its output, remove it.
 //!
 //! Mirrors upstream `packages/server` `shell.list` / `shell.get` /
-//! `shell.output` / `shell.delete`, over the same in-memory table the `shell`
+//! `shell.output` / `shell.remove`, over the same in-memory table the `shell`
 //! tool writes to ([`ox_tools::shell::sessions`]). Capture lives in memory,
 //! so these handlers only read the retained tail: no database round trip and
 //! no file I/O on the request path.
@@ -18,8 +18,9 @@ fn sessions() -> std::sync::Arc<ShellSessions> {
     sessions::shared()
 }
 
-/// `GET /api/shell` — upstream `shell.list`: every session in this process,
-/// oldest first.
+/// `GET /api/shell` — upstream `shell.list`: every running session in this
+/// process, oldest first. Settled sessions stay readable through `get` and
+/// `output`.
 #[handler] // operation_id: shell.list
 pub(crate) async fn list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let Some(_app) = state(depot, res) else {
@@ -101,9 +102,12 @@ pub(crate) async fn output(req: &mut Request, depot: &mut Depot, res: &mut Respo
     )));
 }
 
-/// `DELETE /api/shell/{id}` — upstream `shell.delete`: forget a settled
-/// session. A running one is refused so its process is never orphaned.
-#[handler] // operation_id: shell.delete
+/// `DELETE /api/shell/{id}` — upstream `shell.remove`: forget a session. A
+/// running one is stopped first (it settles as killed and announces
+/// `shell.exited`), then the table announces `shell.deleted` with the owning
+/// session's location. An unknown id is a no-op: upstream maps
+/// `Shell.NotFoundError` to success, so the answer is 204 either way.
+#[handler] // operation_id: shell.remove
 pub(crate) async fn remove(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let Some(_app) = state(depot, res) else {
         return;
@@ -116,27 +120,14 @@ pub(crate) async fn remove(req: &mut Request, depot: &mut Depot, res: &mut Respo
         })));
         return;
     };
-    if sessions().remove(&id) {
-        res.status_code(StatusCode::NO_CONTENT);
-        return;
+    let table = sessions();
+    // Always `stop`, even for a settled session: `settled()` flips before the
+    // exited notice goes out, and `stop` on a settled session only releases
+    // the interpreter and waits for the announcement, so `deleted` below can
+    // never overtake `exited`. No table lock is held across the await.
+    if let Some(session) = table.get(&id) {
+        session.stop(true).await;
     }
-    match sessions().get(&id) {
-        Some(session) if !session.settled() => {
-            res.status_code(StatusCode::CONFLICT);
-            res.render(Json(json!({
-                "_tag": "ShellRunningError",
-                "message": format!("Shell session {id} is still running; stop it first"),
-            })));
-        }
-        Some(_) => {
-            res.status_code(StatusCode::NO_CONTENT);
-        }
-        None => {
-            res.status_code(StatusCode::NOT_FOUND);
-            res.render(Json(json!({
-                "_tag": "ShellNotFoundError",
-                "message": format!("Shell session not found: {id}"),
-            })));
-        }
-    }
+    table.remove(&id);
+    res.status_code(StatusCode::NO_CONTENT);
 }

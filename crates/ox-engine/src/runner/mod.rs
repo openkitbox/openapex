@@ -352,6 +352,11 @@ impl Runner {
                 inner: Arc::clone(&inner),
             }));
         }
+        if let Some(completion) = inner.tools.shell_completion.clone() {
+            completion.attach(Arc::new(Self {
+                inner: Arc::clone(&inner),
+            }));
+        }
         Self { inner }
     }
 
@@ -937,6 +942,17 @@ impl ToolRegistryExt for ToolRegistry {
             Arc::new(crate::mctx::memory::CtxNoteTool::new(db.clone())),
             Arc::new(crate::mctx::search::CtxSearchTool::new(db, embedder)),
         ]);
+    }
+}
+
+/// Wakes a session for a background `shell` completion.
+impl ox_tools::shell::completion::ShellWaker for Runner {
+    fn dispatch<'a>(
+        &'a self,
+        session_id: &'a str,
+        inbox_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async move { Runner::dispatch(self, session_id, inbox_id).await })
     }
 }
 
