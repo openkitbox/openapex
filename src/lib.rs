@@ -5,9 +5,12 @@
 //! the binary can keep naming the assembled system the way they always have.
 
 pub use ox_acp as acp;
-pub use ox_core::{USER_AGENT, config, event_bus, model_catalog, projector};
+pub use ox_core::{USER_AGENT, config, event_bus, projector};
 pub use ox_db as db;
-pub use ox_engine::{cardinal, mctx, prompt, runner};
+pub use ox_engine::{mctx, prompt, runner};
+pub use ox_llm as llm;
+pub use ox_llm::cardinal;
+pub use ox_llm::model_catalog;
 pub use ox_mcp as mcp;
 pub use ox_schema as schema;
 pub use ox_schema::{id, slug};

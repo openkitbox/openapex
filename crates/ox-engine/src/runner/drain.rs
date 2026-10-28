@@ -33,10 +33,10 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
-use crate::cardinal::chat::Chat;
 use ox_core::config::Config;
 use ox_core::event_bus::EventBus;
 use ox_db::Db;
+use ox_llm::cardinal::chat::Chat;
 use ox_schema::event::SessionEventData;
 use ox_schema::id;
 use ox_schema::inbox::{Delivery, Item};
@@ -106,7 +106,7 @@ pub(crate) struct DrainCtx {
     pub bus: EventBus,
     pub chat: Arc<dyn Chat>,
     pub tools: Arc<ToolRegistry>,
-    pub model_catalog: Arc<ox_core::model_catalog::ModelCatalog>,
+    pub model_catalog: Arc<ox_llm::model_catalog::ModelCatalog>,
     /// MCP servers whose instructions join the system prompt.
     pub mcp: Arc<ox_mcp::Hub>,
     /// Per-session keyed-instruction baselines, shared by every actor of the

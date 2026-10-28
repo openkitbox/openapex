@@ -30,10 +30,10 @@
 
 use anyhow::Result;
 
-use crate::cardinal::wire::{ChatMessage, ChatRequest};
 use crate::runner::Chat;
 use ox_core::event_bus::EventBus;
 use ox_db::Db;
+use ox_llm::cardinal::wire::{ChatMessage, ChatRequest};
 use ox_schema::event::SessionEventData;
 use ox_schema::message::{AssistantContent, Message};
 use ox_schema::support::ModelRef;
@@ -149,7 +149,7 @@ async fn title_model(
     db: &Db,
     session_id: &str,
     config: &ox_core::config::Config,
-    catalog: &ox_core::model_catalog::ModelCatalog,
+    catalog: &ox_llm::model_catalog::ModelCatalog,
 ) -> Result<ModelRef> {
     let (_, model) = super::resolve_selection(db, session_id, config, catalog).await?;
     Ok(model)
@@ -288,7 +288,7 @@ pub async fn generate(
     bus: EventBus,
     chat: Arc<dyn Chat>,
     config: Arc<ox_core::config::Config>,
-    catalog: Arc<ox_core::model_catalog::ModelCatalog>,
+    catalog: Arc<ox_llm::model_catalog::ModelCatalog>,
     session_id: String,
 ) {
     if let Err(error) = generate_inner(&db, &bus, chat, &config, &catalog, &session_id).await {
@@ -301,7 +301,7 @@ async fn generate_inner(
     bus: &EventBus,
     chat: Arc<dyn Chat>,
     config: &ox_core::config::Config,
-    catalog: &Arc<ox_core::model_catalog::ModelCatalog>,
+    catalog: &Arc<ox_llm::model_catalog::ModelCatalog>,
     session_id: &str,
 ) -> Result<()> {
     let snapshot = load_title(db, session_id).await?;

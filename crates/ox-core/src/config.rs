@@ -6,20 +6,17 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-const DEFAULT_CARDINAL_URL: &str = "http://127.0.0.1:10202";
+pub use ox_llm::config::{
+    CandidateConfig, DEFAULT_PROVIDER_NAME, LlmConfig, ModelRouteConfig, ProviderConfig,
+};
+pub use ox_llm::model_catalog::{ModelEntry, ReasoningLevel};
+
 const DEFAULT_LISTEN: &str = "127.0.0.1:8787";
 
 /// Environment variable overrides.
-pub const ENV_CARDINAL_URL: &str = "OX_CARDINAL_URL";
-pub const ENV_CARDINAL_KEY: &str = "OX_CARDINAL_KEY";
 pub const ENV_DB_PATH: &str = "OX_DB_PATH";
 pub const ENV_LISTEN: &str = "OX_LISTEN";
-pub const ENV_DEFAULT_MODEL: &str = "OX_DEFAULT_MODEL";
 pub const ENV_SUBAGENT_DEPTH: &str = "OX_SUBAGENT_DEPTH";
-
-fn default_cardinal_url() -> String {
-    DEFAULT_CARDINAL_URL.to_owned()
-}
 
 fn default_listen() -> String {
     DEFAULT_LISTEN.to_owned()
@@ -27,87 +24,6 @@ fn default_listen() -> String {
 
 fn default_db_path() -> PathBuf {
     ox_home().join("ox.db")
-}
-
-/// The name of the implicit endpoint built from `cardinal_url`/`cardinal_key`.
-/// Route candidates may reference it like any `[providers]` name; a
-/// `[providers.cardinal]` section overrides the implicit endpoint.
-pub const DEFAULT_PROVIDER_NAME: &str = "cardinal";
-
-/// One configured outbound endpoint (`[providers.<name>]`).
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct ProviderConfig {
-    /// OpenAI-compatible base URL **without** the `/v1` suffix: ox appends
-    /// `/v1/chat/completions` and `/v1/models` itself. For vendors publishing
-    /// `…/v1` or `…/v4` bases, configure the part before the suffix
-    /// (`https://api.moonshot.ai`, `https://open.bigmodel.cn/api/paas`).
-    pub base_url: String,
-    /// Bearer key for `Authorization`; omitted for gateways that need none.
-    #[serde(default)]
-    pub api_key: Option<String>,
-}
-
-/// One ordered fallback target inside a `[models.<id>]` route.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct CandidateConfig {
-    /// A `[providers]` key, or [`DEFAULT_PROVIDER_NAME`] for the implicit
-    /// `cardinal_url` endpoint.
-    pub provider: String,
-    /// The wire model id to request on that endpoint.
-    pub model: String,
-}
-
-/// One logical model's ordered candidate routes (`[models.<id>]`).
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct ModelRouteConfig {
-    /// Tried in order; the first endpoint whose stream opens serves the turn.
-    #[serde(default)]
-    pub candidates: Vec<CandidateConfig>,
-}
-
-/// One model as the client sees it, built from the gateway's model list
-/// ([`crate::model_catalog`]).
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct ModelEntry {
-    /// Provider identifier, e.g. `anthropic`.
-    pub provider: String,
-    /// Model identifier, e.g. `claude-sonnet-4-5`.
-    pub id: String,
-    /// Human-readable display name.
-    pub name: Option<String>,
-    /// Wire model type (`chat`, `text`, `image`, or an unknown provider value).
-    /// Missing gateway metadata is treated as `chat` by the API projection.
-    #[serde(default, rename = "type")]
-    pub model_type: Option<String>,
-    /// Context window in tokens. Drives the client's context-usage
-    /// percentage (it divides the last assistant turn's tokens by this), so a
-    /// missing value means the client shows a raw token count with no
-    /// percentage rather than a wrong one.
-    #[serde(default)]
-    pub context: Option<i64>,
-    /// Input token limit, when the provider states one.
-    #[serde(default)]
-    pub input: Option<i64>,
-    /// Maximum output tokens, when the provider states one.
-    #[serde(default)]
-    pub output: Option<i64>,
-    /// Whether the model accepts a sampling temperature parameter.
-    #[serde(default)]
-    pub temperature: Option<bool>,
-    /// Whether the gateway advertises reasoning effort levels for this model.
-    #[serde(default)]
-    pub reasoning: bool,
-    /// Advertised levels, each as `{ "effort": "<name>" }` in catalog order
-    /// (cardinal `models.rs` row shape). Empty unless [`ModelEntry::reasoning`].
-    #[serde(default)]
-    pub supported_reasoning_levels: Vec<ReasoningLevel>,
-}
-
-/// One entry of cardinal's `supported_reasoning_levels` (`{effort}` only).
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-pub struct ReasoningLevel {
-    /// The level name as the chat wire accepts it (`low`, `high`, …).
-    pub effort: String,
 }
 
 /// MCP integration (`[mcp]` section). Servers are keyed by name; the name is
@@ -300,46 +216,17 @@ impl Default for EventsConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    /// Base URL of the cardinal LLM gateway (cardinal's `listen`, e.g.
-    /// `http://127.0.0.1:10202`).
-    #[serde(default = "default_cardinal_url")]
-    pub cardinal_url: String,
-    /// API key for the cardinal gateway (its `gateway_key`). Required unless
-    /// cardinal runs with auth disabled.
-    #[serde(default)]
-    pub cardinal_key: Option<String>,
-    /// Additional OpenAI-compatible endpoints (`[providers.<name>]`). Empty:
-    /// the implicit `cardinal_url` endpoint serves everything (legacy mode).
-    #[serde(default)]
-    pub providers: BTreeMap<String, ProviderConfig>,
-    /// ox's logical model surface with ordered candidate routes
-    /// (`[models.<id>]`). Explicit candidates win over the implicit
-    /// endpoint; once `[providers]` is non-empty, unrouted models are
-    /// refused (`NoRoute`) instead of silently hitting it.
-    #[serde(default)]
-    pub models: BTreeMap<String, ModelRouteConfig>,
-    /// Per-model context-window caps (`[context_caps]`, `model id = tokens`).
-    /// A cap never *raises* a window: the compaction geometry runs on
-    /// `min(catalogue-reported, cap)`, so an over-typed cap can only fold
-    /// earlier, never overflow the model. A cap for a model the catalogue
-    /// reports no context for does nothing (the unknown-window fallback
-    /// stands); inert or unknown caps warn at catalogue refresh.
-    #[serde(default)]
-    pub context_caps: BTreeMap<String, u32>,
+    /// LLM endpoint configuration. Flattened: its keys (`cardinal_url`,
+    /// `[providers]`, `[models]`, `[context_caps]`, `default_model`, …) stay
+    /// at the top level of `ox.toml`.
+    #[serde(flatten)]
+    pub llm: LlmConfig,
     /// Path to the SQLite database file.
     #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
     /// Address the HTTP server listens on.
     #[serde(default = "default_listen")]
     pub listen: String,
-    /// Qualified model reference (`provider/id`, e.g. `cardinal/k3-256k`)
-    /// backing sessions without an explicit selection. The catalogue itself is
-    /// fetched from the gateway (`GET /v1/models`); this pins only which entry
-    /// to use by default, and a name the gateway does not report is sent
-    /// verbatim rather than rejected. When unset the first catalogue entry is
-    /// the default.
-    #[serde(default)]
-    pub default_model: Option<String>,
     /// Heartbeat interval for the `event.subscribe` SSE stream, in
     /// milliseconds. Upstream hardcodes 15 seconds
     /// (`Stream.tick("15 seconds")`); the default matches. Exposed for
@@ -370,14 +257,9 @@ fn default_event_heartbeat_ms() -> u64 {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            cardinal_url: default_cardinal_url(),
-            cardinal_key: None,
-            providers: BTreeMap::new(),
-            models: BTreeMap::new(),
-            context_caps: BTreeMap::new(),
+            llm: LlmConfig::default(),
             db_path: default_db_path(),
             listen: default_listen(),
-            default_model: None,
             event_heartbeat_ms: default_event_heartbeat_ms(),
             magic_context: MctxConfig::default(),
             mcp: McpConfig::default(),
@@ -426,20 +308,12 @@ impl Config {
             Config::default()
         };
 
-        if let Ok(url) = std::env::var(ENV_CARDINAL_URL) {
-            config.cardinal_url = url;
-        }
-        if let Ok(key) = std::env::var(ENV_CARDINAL_KEY) {
-            config.cardinal_key = Some(key);
-        }
+        config.llm.apply_env();
         if let Ok(db) = std::env::var(ENV_DB_PATH) {
             config.db_path = PathBuf::from(db);
         }
         if let Ok(listen) = std::env::var(ENV_LISTEN) {
             config.listen = listen;
-        }
-        if let Ok(model) = std::env::var(ENV_DEFAULT_MODEL) {
-            config.default_model = Some(model);
         }
         if let Ok(raw) = std::env::var(ENV_SUBAGENT_DEPTH) {
             match raw.trim().parse::<usize>() {
@@ -453,58 +327,8 @@ impl Config {
 
         config.magic_context = config.magic_context.validated();
         config.mcp.validate()?;
-        config.validate_providers()?;
-        config.validate_context_caps()?;
+        config.llm.validate()?;
         Ok(config)
-    }
-
-    /// `[providers]`/`[models]` consistency: usable base URLs, non-empty
-    /// candidate lists, every candidate provider resolvable.
-    fn validate_providers(&self) -> Result<()> {
-        for (name, provider) in &self.providers {
-            if provider.base_url.is_empty() {
-                anyhow::bail!("providers.{name}.base_url is empty");
-            }
-            if provider.base_url.ends_with("/v1") {
-                anyhow::bail!(
-                    "providers.{name}.base_url must not end with /v1: ox appends /v1/chat/completions itself"
-                );
-            }
-            if !provider.base_url.starts_with("http://")
-                && !provider.base_url.starts_with("https://")
-            {
-                anyhow::bail!("providers.{name}.base_url must be an http(s) URL");
-            }
-        }
-        for (id, route) in &self.models {
-            if route.candidates.is_empty() {
-                anyhow::bail!("models.{id}.candidates is empty: list at least one candidate");
-            }
-            for candidate in &route.candidates {
-                if candidate.model.is_empty() {
-                    anyhow::bail!("models.{id}: candidate model must not be empty");
-                }
-                if candidate.provider != DEFAULT_PROVIDER_NAME
-                    && !self.providers.contains_key(&candidate.provider)
-                {
-                    anyhow::bail!(
-                        "models.{id}: candidate provider `{}` is not configured under [providers]",
-                        candidate.provider
-                    );
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// `[context_caps]`: every value is a positive token count.
-    fn validate_context_caps(&self) -> Result<()> {
-        for (id, cap) in &self.context_caps {
-            if *cap == 0 {
-                anyhow::bail!("context_caps.{id} must be a positive token count, got 0");
-            }
-        }
-        Ok(())
     }
 }
 

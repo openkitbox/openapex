@@ -12,6 +12,7 @@ jiff.workspace = true
 ox-core.workspace = true
 ox-db.workspace = true
 ox-engine.workspace = true
+ox-llm.workspace = true
 ox-mcp.workspace = true
 ox-schema.workspace = true
 ox-tools.workspace = true

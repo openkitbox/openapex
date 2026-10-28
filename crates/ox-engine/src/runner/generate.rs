@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::cardinal::wire::{ChatMessage, ChatRequest};
+use ox_llm::cardinal::wire::{ChatMessage, ChatRequest};
 
 use super::Inner;
 use super::drain::DrainCtx;

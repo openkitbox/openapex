@@ -12,7 +12,7 @@ use ox::cardinal::chat::Chat;
 use ox::cardinal::client::CardinalClient;
 use ox::cardinal::router::EndpointRouter;
 use ox::cardinal::wire::ChatRequest;
-use ox::config::{CandidateConfig, Config, ModelRouteConfig, ProviderConfig};
+use ox::config::{CandidateConfig, Config, LlmConfig, ModelRouteConfig, ProviderConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -90,7 +90,7 @@ fn request_body(captured: &str) -> &str {
 fn config_with(providers: &[(&str, SocketAddr)], routes: &[(&str, &[(&str, &str)])]) -> Config {
     let mut config = Config::default();
     for (name, addr) in providers {
-        config.providers.insert(
+        config.llm.providers.insert(
             (*name).to_owned(),
             ProviderConfig {
                 base_url: format!("http://{addr}"),
@@ -99,7 +99,7 @@ fn config_with(providers: &[(&str, SocketAddr)], routes: &[(&str, &[(&str, &str)
         );
     }
     for (id, candidates) in routes {
-        config.models.insert(
+        config.llm.models.insert(
             (*id).to_owned(),
             ModelRouteConfig {
                 candidates: candidates
@@ -119,7 +119,7 @@ fn router_with(config: &Config) -> EndpointRouter {
     // The implicit endpoint is never contacted in these tests (explicit
     // routes + configured providers disable the passthrough).
     let cardinal = CardinalClient::new("http://127.0.0.1:9", None).unwrap();
-    EndpointRouter::from_config(config, cardinal).unwrap()
+    EndpointRouter::from_config(&config.llm, cardinal).unwrap()
 }
 
 fn request(model: &str) -> ChatRequest {
@@ -263,11 +263,14 @@ async fn passthrough_sends_the_logical_model_unchanged() {
 
     // No [providers]: the implicit endpoint is the passthrough target.
     let config = Config {
-        cardinal_url: format!("http://{addr}"),
+        llm: LlmConfig {
+            cardinal_url: format!("http://{addr}"),
+            ..Default::default()
+        },
         ..Default::default()
     };
-    let cardinal = CardinalClient::new(config.cardinal_url.clone(), None).unwrap();
-    let router = EndpointRouter::from_config(&config, cardinal).unwrap();
+    let cardinal = CardinalClient::new(config.llm.cardinal_url.clone(), None).unwrap();
+    let router = EndpointRouter::from_config(&config.llm, cardinal).unwrap();
 
     let _ = router
         .stream_chat(&request("k3-256k"))

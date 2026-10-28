@@ -57,16 +57,16 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::cardinal::CardinalError;
-use crate::cardinal::chat::BoxChatStream;
-use crate::cardinal::stream::StreamEvent;
-use crate::cardinal::wire::{
-    ChatMessage, ChatRequest, FunctionCall, FunctionType, ImageUrl, ToolCall, Usage, UserContent,
-    UserPart,
-};
 use crate::mctx::{search, temporal};
 use crate::prompt;
 use ox_core::copied_tags::strip_copied_tag_notation;
+use ox_llm::cardinal::CardinalError;
+use ox_llm::cardinal::chat::BoxChatStream;
+use ox_llm::cardinal::stream::StreamEvent;
+use ox_llm::cardinal::wire::{
+    ChatMessage, ChatRequest, FunctionCall, FunctionType, ImageUrl, ToolCall, Usage, UserContent,
+    UserPart,
+};
 use ox_schema::event::SessionEventData;
 use ox_schema::id;
 use ox_schema::message::{
@@ -1383,7 +1383,7 @@ fn observe_request_cost(ctx: &DrainCtx, model_id: &str, request: &ChatRequest, p
     }
     // Only the body's size is needed, so it is measured rather than built: a
     // transcript-sized copy per sampled step buys nothing here.
-    let Ok(body_len) = crate::cardinal::wire::serialized_len(request) else {
+    let Ok(body_len) = ox_llm::cardinal::wire::serialized_len(request) else {
         return;
     };
     crate::mctx::calibration::observe(

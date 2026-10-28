@@ -21,7 +21,52 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
 
-use crate::config::{CandidateConfig, Config, DEFAULT_PROVIDER_NAME, ModelEntry};
+use crate::config::{CandidateConfig, DEFAULT_PROVIDER_NAME, LlmConfig};
+
+/// One model as the client sees it, built from the gateway's model list
+/// ([`crate::model_catalog`]).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ModelEntry {
+    /// Provider identifier, e.g. `anthropic`.
+    pub provider: String,
+    /// Model identifier, e.g. `claude-sonnet-4-5`.
+    pub id: String,
+    /// Human-readable display name.
+    pub name: Option<String>,
+    /// Wire model type (`chat`, `text`, `image`, or an unknown provider value).
+    /// Missing gateway metadata is treated as `chat` by the API projection.
+    #[serde(default, rename = "type")]
+    pub model_type: Option<String>,
+    /// Context window in tokens. Drives the client's context-usage
+    /// percentage (it divides the last assistant turn's tokens by this), so a
+    /// missing value means the client shows a raw token count with no
+    /// percentage rather than a wrong one.
+    #[serde(default)]
+    pub context: Option<i64>,
+    /// Input token limit, when the provider states one.
+    #[serde(default)]
+    pub input: Option<i64>,
+    /// Maximum output tokens, when the provider states one.
+    #[serde(default)]
+    pub output: Option<i64>,
+    /// Whether the model accepts a sampling temperature parameter.
+    #[serde(default)]
+    pub temperature: Option<bool>,
+    /// Whether the gateway advertises reasoning effort levels for this model.
+    #[serde(default)]
+    pub reasoning: bool,
+    /// Advertised levels, each as `{ "effort": "<name>" }` in catalog order
+    /// (cardinal `models.rs` row shape). Empty unless [`ModelEntry::reasoning`].
+    #[serde(default)]
+    pub supported_reasoning_levels: Vec<ReasoningLevel>,
+}
+
+/// One entry of cardinal's `supported_reasoning_levels` (`{effort}` only).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct ReasoningLevel {
+    /// The level name as the chat wire accepts it (`low`, `high`, …).
+    pub effort: String,
+}
 
 /// How long a fetched catalogue is considered fresh. Model lists change when
 /// someone adds a provider upstream, so minutes rather than seconds; a client
@@ -63,9 +108,9 @@ struct Snapshot {
 impl ModelCatalog {
     /// A catalogue for `config`'s endpoints. Nothing is fetched yet:
     /// [`Self::warm`] does that, so building state never blocks on the network.
-    /// The config must have passed provider validation ([`Config::load_from`]
+    /// The config must have passed provider validation ([`crate::config::LlmConfig::validate`]
     /// runs it): candidate lists are non-empty and their providers resolve.
-    pub fn new(config: &Config) -> Arc<Self> {
+    pub fn new(config: &LlmConfig) -> Arc<Self> {
         let client = crate::http_client()
             .timeout(Duration::from_secs(10))
             .build()
@@ -152,7 +197,7 @@ impl ModelCatalog {
     /// configured reference verbatim when the catalogue does not know it (the
     /// gateway decides), else the first model by id. `None` only when the
     /// catalogue is empty and nothing is configured.
-    pub fn default_entry(&self, config: &Config) -> Option<ModelEntry> {
+    pub fn default_entry(&self, config: &LlmConfig) -> Option<ModelEntry> {
         let entries = self.cached();
         if let Some(qualified) = &config.default_model {
             let (provider, id) = qualified
@@ -383,7 +428,7 @@ struct ModelRow {
     #[serde(default)]
     reasoning: bool,
     #[serde(default)]
-    supported_reasoning_levels: Vec<crate::config::ReasoningLevel>,
+    supported_reasoning_levels: Vec<ReasoningLevel>,
 }
 
 impl ModelRow {

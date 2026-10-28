@@ -113,7 +113,7 @@ impl Serialize for ChatRequest {
 /// all it needs from that body is its size. Serializing into a counting writer
 /// produces the same bytes as `serde_json::to_string` — same serializer, same
 /// field order — while skipping a copy the size of the whole transcript.
-pub(crate) fn serialized_len(request: &ChatRequest) -> Result<usize, serde_json::Error> {
+pub fn serialized_len(request: &ChatRequest) -> Result<usize, serde_json::Error> {
     /// `std::io::Write` that keeps only the count.
     struct Counter(usize);
 

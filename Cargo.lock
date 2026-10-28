@@ -4903,6 +4903,7 @@ dependencies = [
  "ox-core",
  "ox-db",
  "ox-engine",
+ "ox-llm",
  "ox-mcp",
  "ox-schema",
  "ox-server",
@@ -4959,9 +4960,9 @@ dependencies = [
  "dashmap",
  "dirs",
  "ox-db",
+ "ox-llm",
  "ox-schema",
  "regex",
- "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -4988,11 +4989,11 @@ dependencies = [
  "anyhow",
  "base64 0.23.1",
  "dashmap",
- "futures-core",
  "git2",
  "jiff",
  "ox-core",
  "ox-db",
+ "ox-llm",
  "ox-mcp",
  "ox-schema",
  "ox-tools",
@@ -5006,6 +5007,21 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "tracing",
+]
+
+[[package]]
+name = "ox-llm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-core",
+ "ox-schema",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio-util",
  "tracing",
 ]
 
@@ -5050,6 +5066,7 @@ dependencies = [
  "ox-core",
  "ox-db",
  "ox-engine",
+ "ox-llm",
  "ox-mcp",
  "ox-schema",
  "ox-tools",

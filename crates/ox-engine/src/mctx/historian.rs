@@ -131,14 +131,14 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use serde::Deserialize;
 
-use crate::cardinal::chat::Chat;
-use crate::cardinal::stream::StreamEvent;
-use crate::cardinal::wire::{ChatMessage, ChatRequest};
 use crate::mctx::budget::Budget;
 use crate::mctx::compartments::{self, NewCompartment, Tiers};
 use crate::mctx::historian_validate::{self, ValidateOptions};
 use crate::mctx::memory::MemoryRow;
 use ox_core::config::Config;
+use ox_llm::cardinal::chat::Chat;
+use ox_llm::cardinal::stream::StreamEvent;
+use ox_llm::cardinal::wire::{ChatMessage, ChatRequest};
 use ox_schema::id::{id, now_millis};
 use ox_schema::message::{AssistantContent, Message, ToolState};
 use ox_schema::support::{Content, Record};
@@ -1440,7 +1440,7 @@ pub struct RunCtx<'a> {
     pub config: &'a Config,
     pub chat: &'a Arc<dyn Chat>,
     /// Default-model resolution for the hidden completion.
-    pub catalog: &'a ox_core::model_catalog::ModelCatalog,
+    pub catalog: &'a ox_llm::model_catalog::ModelCatalog,
     /// The session's policy captured at trigger time; detached runs never
     /// re-read a mutable session selection.
     pub reasoning_effort: Option<String>,
@@ -1904,12 +1904,12 @@ pub struct SideChannels {
 /// to the model, not two.
 pub(crate) fn historian_model(
     config: &Config,
-    catalog: &ox_core::model_catalog::ModelCatalog,
+    catalog: &ox_llm::model_catalog::ModelCatalog,
 ) -> Result<String> {
     if let Some(qualified) = &config.magic_context.historian_model {
         return Ok(bare_model_id(qualified));
     }
-    match catalog.default_entry(config) {
+    match catalog.default_entry(&config.llm) {
         Some(entry) => Ok(entry.id),
         None => anyhow::bail!(
             "no model configured for the historian completion: set magic_context.historian_model or a default model"

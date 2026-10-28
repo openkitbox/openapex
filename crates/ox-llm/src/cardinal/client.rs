@@ -34,6 +34,7 @@ use tokio_util::sync::CancellationToken;
 use super::stream::{AssembledMessage, Assembler, ChunkDecoder, SseFramer, StreamEvent};
 use super::wire::ChatRequest;
 use super::{CardinalError, HTTP_BODY_SNIPPET_BYTES};
+use crate::config::LlmConfig;
 
 /// Cardinal's chat completions route, appended to the configured base URL.
 pub const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
@@ -53,7 +54,7 @@ impl CardinalClient {
         base_url: impl Into<String>,
         api_key: Option<String>,
     ) -> Result<Self, CardinalError> {
-        let http = ox_core::http_client()
+        let http = crate::http_client()
             // Long-lived streams must never hit an idle/read timeout, but a
             // dead gateway should fail fast instead of hanging the runner.
             .connect_timeout(Duration::from_secs(10))
@@ -66,7 +67,7 @@ impl CardinalClient {
     }
 
     /// A client configured from ox's config (`cardinal_url` + `cardinal_key`).
-    pub fn from_config(config: &ox_core::config::Config) -> Result<Self, CardinalError> {
+    pub fn from_config(config: &LlmConfig) -> Result<Self, CardinalError> {
         Self::new(config.cardinal_url.clone(), config.cardinal_key.clone())
     }
 

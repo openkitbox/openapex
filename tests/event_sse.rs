@@ -48,11 +48,11 @@ async fn spawn_server(heartbeat_ms: u64) -> TestServer {
     let db = ox::db::Db::open(&config.db_path).await.unwrap();
     let bus = EventBus::new(db.clone());
     let cardinal = ox::cardinal::client::CardinalClient::new(
-        config.cardinal_url.clone(),
-        config.cardinal_key.clone(),
+        config.llm.cardinal_url.clone(),
+        config.llm.cardinal_key.clone(),
     )
     .unwrap();
-    let model_catalog = ox::model_catalog::ModelCatalog::new(&config);
+    let model_catalog = ox::model_catalog::ModelCatalog::new(&config.llm);
     let config = std::sync::Arc::new(config);
     let runner = ox::runner::Runner::new(
         std::sync::Arc::clone(&config),

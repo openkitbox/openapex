@@ -22,7 +22,6 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::cardinal::chat::Chat;
 use crate::mctx::budget::Budget;
 use crate::mctx::calibration;
 use crate::mctx::compartments::{self, Compartment};
@@ -33,6 +32,7 @@ use crate::runner::drain::DrainCtx;
 use crate::runner::step::rows_after_with_seq;
 use ox_core::config::Config;
 use ox_db::Db;
+use ox_llm::cardinal::chat::Chat;
 
 // ---------------------------------------------------------------------------
 // Historian trigger (step boundary)
@@ -288,7 +288,7 @@ struct Firing<'a> {
     db: &'a Db,
     config: &'a Config,
     chat: &'a Arc<dyn Chat>,
-    catalog: &'a ox_core::model_catalog::ModelCatalog,
+    catalog: &'a ox_llm::model_catalog::ModelCatalog,
     budget: Budget,
     session_id: &'a str,
     project: &'a str,

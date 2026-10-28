@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 
 use ox_core::config::Config;
 use ox_core::event_bus::EventBus;
-use ox_core::model_catalog::ModelCatalog;
 use ox_db::Db;
 use ox_engine::runner::Runner;
+use ox_llm::model_catalog::ModelCatalog;
 use ox_schema::id::now_millis;
 
 pub mod compat;
@@ -42,7 +42,7 @@ pub struct AppState {
     /// Per-session execution actor registry (task 6).
     pub runner: Runner,
     /// The model catalogue the client lists (`GET /v1/models` on the gateway).
-    pub model_catalog: Arc<ox_core::model_catalog::ModelCatalog>,
+    pub model_catalog: Arc<ox_llm::model_catalog::ModelCatalog>,
     /// Connected MCP servers: status, resources and prompt instructions.
     /// Shared with `Runner` so the system prompt and the API read the same
     /// snapshot.
@@ -474,7 +474,7 @@ fn model_type_filter(req: &Request) -> Option<Vec<String>> {
     (!types.is_empty()).then_some(types)
 }
 
-fn model_type_matches(entry: &ox_core::config::ModelEntry, types: Option<&[String]>) -> bool {
+fn model_type_matches(entry: &ox_llm::model_catalog::ModelEntry, types: Option<&[String]>) -> bool {
     let model_type = entry.model_type.as_deref().unwrap_or("chat");
     let Some(types) = types else {
         return matches!(model_type, "chat" | "text");
@@ -500,7 +500,7 @@ fn model_type_matches(entry: &ox_core::config::ModelEntry, types: Option<&[Strin
 /// advertising the uncapped window makes the footer disagree with ox's own
 /// pressure. `window_of` answers `None` exactly when the entry carries no
 /// usable context, which stays zero on the wire.
-fn model_info(m: &ox_core::config::ModelEntry, catalog: &ModelCatalog) -> ModelInfo {
+fn model_info(m: &ox_llm::model_catalog::ModelEntry, catalog: &ModelCatalog) -> ModelInfo {
     ModelInfo {
         id: m.id.clone(),
         model_id: m.id.clone(),
@@ -553,7 +553,7 @@ async fn model_default(req: &mut Request, depot: &mut Depot, res: &mut Response)
     };
     let data = state
         .model_catalog
-        .default_entry(&state.config)
+        .default_entry(&state.config.llm)
         .map(|entry| model_info(&entry, &state.model_catalog));
     res.render(Json(ModelDefault {
         location: LocationRef {

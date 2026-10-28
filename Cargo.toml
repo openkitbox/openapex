@@ -5,6 +5,7 @@ members = [
   "crates/ox-core",
   "crates/ox-db",
   "crates/ox-engine",
+  "crates/ox-llm",
   "crates/ox-mcp",
   "crates/ox-schema",
   "crates/ox-server",
@@ -47,6 +48,7 @@ ox-acp = { path = "crates/ox-acp" }
 ox-core = { path = "crates/ox-core" }
 ox-db = { path = "crates/ox-db" }
 ox-engine = { path = "crates/ox-engine" }
+ox-llm = { path = "crates/ox-llm" }
 ox-mcp = { path = "crates/ox-mcp" }
 ox-schema = { path = "crates/ox-schema" }
 ox-server = { path = "crates/ox-server" }
@@ -112,6 +114,7 @@ ox-acp.workspace = true
 ox-core.workspace = true
 ox-db.workspace = true
 ox-engine.workspace = true
+ox-llm.workspace = true
 ox-mcp.workspace = true
 ox-schema.workspace = true
 ox-server.workspace = true

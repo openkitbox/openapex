@@ -22,7 +22,7 @@
 //! The [`Tool`] trait + [`ToolRegistry`] here are the seam task 7 fills with
 //! real tools; the registry ships empty until task 7 fills it.
 
-pub use crate::cardinal::chat::Chat;
+pub use ox_llm::cardinal::chat::Chat;
 
 /// `pub` for the same reason as `drain` and `step`: the checkpoint-bound
 /// helpers are exercised from `tests/` (the crate carries no `#[cfg(test)]`
@@ -107,7 +107,7 @@ struct Inner {
     chat: Arc<dyn Chat>,
     tools: Arc<ToolRegistry>,
     /// The model catalogue (default-model resolution); shared with the API.
-    model_catalog: Arc<ox_core::model_catalog::ModelCatalog>,
+    model_catalog: Arc<ox_llm::model_catalog::ModelCatalog>,
     /// Connected MCP servers: tools (registered before the runner was built)
     /// plus the instruction block the system prompt carries.
     mcp: Arc<ox_mcp::Hub>,
@@ -276,7 +276,7 @@ impl Runner {
         bus: EventBus,
         chat: Arc<dyn Chat>,
         tools: Arc<ToolRegistry>,
-        model_catalog: Arc<ox_core::model_catalog::ModelCatalog>,
+        model_catalog: Arc<ox_llm::model_catalog::ModelCatalog>,
     ) -> Self {
         Self::new_with_mcp(
             config,
@@ -301,7 +301,7 @@ impl Runner {
         bus: EventBus,
         chat: Arc<dyn Chat>,
         tools: Arc<ToolRegistry>,
-        model_catalog: Arc<ox_core::model_catalog::ModelCatalog>,
+        model_catalog: Arc<ox_llm::model_catalog::ModelCatalog>,
         mcp: Arc<ox_mcp::Hub>,
     ) -> Self {
         Self::new_with_mcp_and_home(
@@ -329,7 +329,7 @@ impl Runner {
         bus: EventBus,
         chat: Arc<dyn Chat>,
         tools: Arc<ToolRegistry>,
-        model_catalog: Arc<ox_core::model_catalog::ModelCatalog>,
+        model_catalog: Arc<ox_llm::model_catalog::ModelCatalog>,
         mcp: Arc<ox_mcp::Hub>,
         home: PathBuf,
     ) -> Self {
@@ -870,7 +870,7 @@ pub(crate) async fn resolve_selection(
     db: &Db,
     session_id: &str,
     config: &Config,
-    model_catalog: &ox_core::model_catalog::ModelCatalog,
+    model_catalog: &ox_llm::model_catalog::ModelCatalog,
 ) -> Result<(String, ox_schema::support::ModelRef)> {
     let row: Option<(Option<String>, Option<String>)> = {
         let conn = db.acquire().await?;
@@ -889,7 +889,7 @@ pub(crate) async fn resolve_selection(
     };
     let model = match model.and_then(|raw| serde_json::from_str(&raw).ok()) {
         Some(model) => model,
-        None => match model_catalog.default_entry(config) {
+        None => match model_catalog.default_entry(&config.llm) {
             Some(configured) => ox_schema::support::ModelRef {
                 id: configured.id.clone(),
                 provider_id: configured.provider.clone(),

@@ -20,7 +20,7 @@ pub use ox_core::config::{EmbeddingConfig, EmbeddingProvider, MctxConfig};
 /// runner passes what it has and reads the [`Budget`] fields.
 pub(crate) fn budget_for(
     config: &ox_core::config::Config,
-    catalog: &ox_core::model_catalog::ModelCatalog,
+    catalog: &ox_llm::model_catalog::ModelCatalog,
     model_id: &str,
 ) -> budget::Budget {
     let historian = historian::historian_model(config, catalog)

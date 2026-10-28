@@ -25,10 +25,10 @@
 //! `SessionHistory` boundary), so later requests open with the checkpoint
 //! user message instead of the compacted transcript.
 
-use crate::cardinal::stream::StreamEvent;
-use crate::cardinal::wire::{ChatMessage, ChatRequest};
 use anyhow::Result;
 use ox_db::Db;
+use ox_llm::cardinal::stream::StreamEvent;
+use ox_llm::cardinal::wire::{ChatMessage, ChatRequest};
 use ox_schema::event::SessionEventData;
 use ox_schema::message::{CompactionReason, Message};
 use ox_schema::support::{ModelRef, SessionError};
@@ -171,7 +171,7 @@ fn apply_compaction_budget(
     measured_prompt: Option<u64>,
 ) {
     let local_prompt = crate::mctx::tokens::heuristic_bytes(
-        crate::cardinal::wire::serialized_len(request).unwrap_or_default(),
+        ox_llm::cardinal::wire::serialized_len(request).unwrap_or_default(),
     ) as u64;
     let (context_limit, output_cap) = model_limits(ctx, model);
     request.max_tokens = Some(compaction_max_tokens(
@@ -1258,7 +1258,7 @@ async fn settle_quiet_outcome(
 #[cfg(test)]
 mod compaction_budget_tests {
     use super::{append_nudge, compaction_max_tokens};
-    use crate::cardinal::wire::{ChatMessage, ChatRequest};
+    use ox_llm::cardinal::wire::{ChatMessage, ChatRequest};
 
     #[test]
     fn measured_prompt_usage_is_preferred() {

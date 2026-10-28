@@ -4,7 +4,7 @@
 use std::net::TcpListener as StdTcpListener;
 
 use ox::api::AppState;
-use ox::config::Config;
+use ox::config::{Config, LlmConfig};
 use salvo::prelude::*;
 use tempfile::TempDir;
 use tokio::task::JoinHandle;
@@ -208,7 +208,10 @@ async fn model_metadata_and_types_filter_are_preserved() {
     )
     .await;
     let (base, handle, _dir) = spawn_server_with(Config {
-        cardinal_url: gateway,
+        llm: LlmConfig {
+            cardinal_url: gateway,
+            ..LlmConfig::default()
+        },
         ..Config::default()
     })
     .await;
@@ -296,7 +299,10 @@ async fn model_default_prefers_chat_compatible_entries() {
     )
     .await;
     let (base, handle, _dir) = spawn_server_with(Config {
-        cardinal_url: gateway,
+        llm: LlmConfig {
+            cardinal_url: gateway,
+            ..LlmConfig::default()
+        },
         ..Config::default()
     })
     .await;
@@ -322,8 +328,11 @@ async fn model_catalog_comes_from_the_gateway_not_the_config_file() {
     )
     .await;
     let (base, handle, _dir) = spawn_server_with(Config {
-        cardinal_url: gateway,
-        default_model: Some("cardinal/glm-5".to_owned()),
+        llm: LlmConfig {
+            cardinal_url: gateway,
+            default_model: Some("cardinal/glm-5".to_owned()),
+            ..LlmConfig::default()
+        },
         ..Config::default()
     })
     .await;
@@ -422,9 +431,12 @@ async fn model_limit_context_carries_the_effective_window() {
     // Larger than the reported window: inert, and must not raise it.
     context_caps.insert("k3-256k".to_owned(), 1_000_000u32);
     let (base, handle, _dir) = spawn_server_with(Config {
-        cardinal_url: gateway,
-        default_model: Some("cardinal/glm-5".to_owned()),
-        context_caps,
+        llm: LlmConfig {
+            cardinal_url: gateway,
+            default_model: Some("cardinal/glm-5".to_owned()),
+            context_caps,
+            ..LlmConfig::default()
+        },
         ..Config::default()
     })
     .await;
@@ -515,11 +527,11 @@ async fn project_list_reads_upstream_project_table() {
 
     let bus = ox::event_bus::EventBus::new(db.clone());
     let cardinal = ox::cardinal::client::CardinalClient::new(
-        config.cardinal_url.clone(),
-        config.cardinal_key.clone(),
+        config.llm.cardinal_url.clone(),
+        config.llm.cardinal_key.clone(),
     )
     .unwrap();
-    let model_catalog = ox::model_catalog::ModelCatalog::new(&config);
+    let model_catalog = ox::model_catalog::ModelCatalog::new(&config.llm);
     let config = std::sync::Arc::new(config);
     let runner = ox::runner::Runner::new(
         std::sync::Arc::clone(&config),

@@ -38,7 +38,7 @@ The following tool_call_ids did not have response messages: shell:47", ...}}
 
 ## 3. ox 侧：悬空调用从哪里来
 
-发送给上游的 wire 消息在 `crates/ox-engine/src/cardinal/wire.rs` 组装
+发送给上游的 wire 消息在 `crates/ox-llm/src/cardinal/wire.rs` 组装
 （`assistant_tool_calls()` 产出带 tool_calls 的 assistant 消息，`tool()` 产出结果消息，
 `wire.rs:302/311`）。历史折叠在 `crates/ox-engine/src/mctx/`（historian/pass/render/decay）。
 
@@ -58,7 +58,7 @@ results，完整 tool arc 不会跨越消息边界"，并提到 terminal-arc hea
 
 ### A. 发送前配对保障（必做，兜底，provider 无关）
 
-在 `crates/ox-engine/src/cardinal/wire.rs` 的请求组装出口加一次校验/修复：
+在 `crates/ox-llm/src/cardinal/wire.rs` 的请求组装出口加一次校验/修复：
 
 - 顺序扫描 `messages`；收集每条 assistant 消息的 `tool_calls[*].id`；
 - 对照其后所有 `role:"tool"` 消息的 `tool_call_id`；

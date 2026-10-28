@@ -176,7 +176,7 @@ async fn main() -> Result<()> {
             tracing::info!(
                 listen = %config.listen,
                 db = %config.db_path.display(),
-                cardinal_url = %config.cardinal_url,
+                cardinal_url = %config.llm.cardinal_url,
                 "starting ox"
             );
             ox::run(config).await
@@ -189,7 +189,7 @@ async fn main() -> Result<()> {
             tracing::info!(
                 listen = %config.listen,
                 db = %config.db_path.display(),
-                cardinal_url = %config.cardinal_url,
+                cardinal_url = %config.llm.cardinal_url,
                 "starting ox"
             );
             ox::run(config).await

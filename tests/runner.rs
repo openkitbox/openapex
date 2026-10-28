@@ -607,7 +607,7 @@ impl Harness {
         config.magic_context.enabled = magic_context;
         let with_catalog = catalog.is_some();
         if let Some(url) = catalog {
-            config.cardinal_url = url;
+            config.llm.cardinal_url = url;
         }
         let chat = Arc::new(MockChat::new(scripts));
         let state = ox::build_state_with_home(config.clone(), chat.clone(), tools, home.clone())

@@ -1,7 +1,7 @@
 //! Multi-endpoint chat routing over the [`Chat`] seam.
 //!
 //! `cardinal_url`/`cardinal_key` stay the implicit endpoint (named
-//! [`ox_core::config::DEFAULT_PROVIDER_NAME`]); `[providers.<name>]` adds
+//! [`crate::config::DEFAULT_PROVIDER_NAME`]); `[providers.<name>]` adds
 //! more, `[models.<id>]` gives a logical model an ordered candidate list.
 //! Routing is explicit: once `[providers]` is configured, unrouted models
 //! are [`CardinalError::NoRoute`] instead of silently hitting the implicit
@@ -15,7 +15,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use ox_core::config::{Config, DEFAULT_PROVIDER_NAME};
+use crate::config::{DEFAULT_PROVIDER_NAME, LlmConfig};
 
 use super::CardinalError;
 use super::chat::{Chat, ChatFuture};
@@ -47,7 +47,10 @@ impl EndpointRouter {
     /// Build the router from config. `cardinal` is the implicit endpoint
     /// client (from `cardinal_url`/`cardinal_key`), built by the caller so
     /// init failures surface at the composition root with one message.
-    pub fn from_config(config: &Config, cardinal: CardinalClient) -> Result<Self, CardinalError> {
+    pub fn from_config(
+        config: &LlmConfig,
+        cardinal: CardinalClient,
+    ) -> Result<Self, CardinalError> {
         let mut clients: BTreeMap<String, Arc<dyn Chat>> = BTreeMap::new();
         clients.insert(DEFAULT_PROVIDER_NAME.to_owned(), Arc::new(cardinal));
         for (name, provider) in &config.providers {
@@ -56,7 +59,7 @@ impl EndpointRouter {
         }
         let resolve = |provider: &str, model: &str| -> Candidate {
             let chat = clients.get(provider).unwrap_or_else(|| {
-                panic!("candidate provider `{provider}` missing despite Config::validate_providers")
+                panic!("candidate provider `{provider}` missing despite LlmConfig::validate")
             });
             Candidate {
                 chat: Arc::clone(chat),

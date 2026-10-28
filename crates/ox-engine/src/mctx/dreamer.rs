@@ -222,12 +222,12 @@ use std::time::{Duration, UNIX_EPOCH};
 use anyhow::{Context as _, Result};
 use regex::Regex;
 
-use crate::cardinal::chat::Chat;
-use crate::cardinal::wire::{ChatMessage, ChatRequest};
 use crate::mctx::historian::{collect_completion, historian_model};
 use crate::mctx::memory::{self, CATEGORIES};
 use ox_core::config::Config;
 use ox_db::Db;
+use ox_llm::cardinal::chat::Chat;
+use ox_llm::cardinal::wire::{ChatMessage, ChatRequest};
 use ox_schema::id::now_millis;
 
 /// Consecutive failures of one `(project, task)` after which the task stops
@@ -595,7 +595,7 @@ pub struct Dreamer {
     config: Arc<Config>,
     chat: Arc<dyn Chat>,
     /// Default-model resolution for the hidden completion.
-    catalog: Arc<ox_core::model_catalog::ModelCatalog>,
+    catalog: Arc<ox_llm::model_catalog::ModelCatalog>,
     /// The `(project, task)` pairs currently running in this process. The
     /// re-entrancy guard: a tick that fires while another is still inside a
     /// task sees the key and leaves it alone. See the module docs for why this
@@ -632,7 +632,7 @@ impl Dreamer {
         db: Db,
         config: Arc<Config>,
         chat: Arc<dyn Chat>,
-        catalog: Arc<ox_core::model_catalog::ModelCatalog>,
+        catalog: Arc<ox_llm::model_catalog::ModelCatalog>,
     ) -> Arc<Self> {
         Arc::new(Self {
             db,

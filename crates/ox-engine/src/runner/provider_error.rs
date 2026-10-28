@@ -12,7 +12,7 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
-use crate::cardinal::CardinalError;
+use ox_llm::cardinal::CardinalError;
 
 /// Upstream `patterns`: one [`Regex`] source per line, all case-insensitive.
 const PATTERN_SOURCES: &[&str] = &[
