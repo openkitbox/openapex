@@ -209,7 +209,8 @@ pub(crate) async fn drain(
                         "manual compaction skipped: a background fold is running"
                     );
                 } else if let Err(error) =
-                    compaction::compact(ctx, CompactionReason::Manual, Some(next.id.clone())).await
+                    compaction::compact(ctx, token, CompactionReason::Manual, Some(next.id.clone()))
+                        .await
                 {
                     tracing::warn!(session = %ctx.session_id, error = %error.message, "compaction failed");
                 }
@@ -311,7 +312,7 @@ async fn run_turn(ctx: &DrainCtx, token: &CancellationToken) -> Result<TurnOutco
                     // The step settled its tool parts (success/failed rows);
                     // steer items that arrived mid-turn join before the
                     // continuation step (upstream step boundary: steer-only).
-                    deliver_pending_steers(ctx).await?;
+                    deliver_pending_steers(ctx, token).await?;
                     continue;
                 }
                 if finish != FinishReason::Length {
@@ -325,7 +326,7 @@ async fn run_turn(ctx: &DrainCtx, token: &CancellationToken) -> Result<TurnOutco
                 // Upstream Outcome.OutputLimit (llm.ts): a tool-call length
                 // truncation continues without a prompt (`needsContinuation`).
                 if needs_continuation {
-                    deliver_pending_steers(ctx).await?;
+                    deliver_pending_steers(ctx, token).await?;
                     continue;
                 }
                 // A text truncation continues via a synthetic user prompt;
@@ -369,8 +370,13 @@ async fn run_turn(ctx: &DrainCtx, token: &CancellationToken) -> Result<TurnOutco
                 // overflow error (llm.ts:221 — compaction failures carry
                 // only compaction.failed + execution.failed, no step.failed).
                 if let Err(compact_error) =
-                    compaction::compact(ctx, CompactionReason::Auto, None).await
+                    compaction::compact(ctx, token, CompactionReason::Auto, None).await
                 {
+                    // An interrupt cancelled the compaction: report that, not
+                    // the overflow that triggered it.
+                    if token.is_cancelled() {
+                        return Ok(TurnOutcome::Interrupted);
+                    }
                     tracing::warn!(
                         session = %ctx.session_id,
                         error = %compact_error.message,
@@ -461,7 +467,7 @@ async fn maybe_spawn_title_generation(ctx: &DrainCtx) {
 /// items wait for the next turn entry. A compaction control at the steer
 /// head owns the boundary — it runs before the continuation step; a move
 /// still bounds it (handled at drain level after the turn).
-async fn deliver_pending_steers(ctx: &DrainCtx) -> Result<()> {
+async fn deliver_pending_steers(ctx: &DrainCtx, token: &CancellationToken) -> Result<()> {
     let steers: Vec<InboxRow> = list_rows(&ctx.db, &ctx.session_id)
         .await?
         .into_iter()
@@ -474,7 +480,8 @@ async fn deliver_pending_steers(ctx: &DrainCtx) -> Result<()> {
     if matches!(head.item, Item::Compaction { .. }) {
         let inbox_id = head.id.clone();
         deliver(ctx, &inbox_id).await?;
-        if let Err(error) = compaction::compact(ctx, CompactionReason::Manual, Some(inbox_id)).await
+        if let Err(error) =
+            compaction::compact(ctx, token, CompactionReason::Manual, Some(inbox_id)).await
         {
             tracing::warn!(session = %ctx.session_id, error = %error.message, "mid-turn compaction failed");
         }

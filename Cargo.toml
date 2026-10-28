@@ -135,8 +135,10 @@ ox-db.workspace = true
 salvo = { workspace = true, features = ["server", "http1", "http2", "sse", "affix-state", "logging"] }
 serde_json.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "test-util"] }
 tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 [workspace.lints.clippy]
 result_large_err = "allow"

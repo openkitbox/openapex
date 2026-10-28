@@ -95,6 +95,7 @@ fn config_with(providers: &[(&str, SocketAddr)], routes: &[(&str, &[(&str, &str)
             ProviderConfig {
                 base_url: format!("http://{addr}"),
                 api_key: None,
+                limits: Default::default(),
             },
         );
     }

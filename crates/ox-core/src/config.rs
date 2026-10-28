@@ -7,7 +7,8 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 pub use ox_llm::config::{
-    CandidateConfig, DEFAULT_PROVIDER_NAME, LlmConfig, ModelRouteConfig, ProviderConfig,
+    CandidateConfig, DEFAULT_LIMITED_STALL, DEFAULT_PROVIDER_NAME, EndpointLimits, LlmConfig,
+    ModelRouteConfig, ProviderConfig,
 };
 pub use ox_llm::model_catalog::{ModelEntry, ReasoningLevel};
 

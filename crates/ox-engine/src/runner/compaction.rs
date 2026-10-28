@@ -33,6 +33,7 @@ use ox_schema::event::SessionEventData;
 use ox_schema::message::{CompactionReason, Message};
 use ox_schema::support::{ModelRef, SessionError};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 use super::drain::DrainCtx;
 use super::historian_trigger::prompt_tokens;
@@ -297,6 +298,7 @@ async fn stream_summary(
 /// the failure error after publishing `compaction.failed` otherwise.
 pub(crate) async fn compact(
     ctx: &DrainCtx,
+    token: &CancellationToken,
     reason: CompactionReason,
     input_id: Option<String>,
 ) -> std::result::Result<String, SessionError> {
@@ -305,7 +307,18 @@ pub(crate) async fn compact(
         .map_err(|error| unknown_error(error.to_string()))?;
 
     publish_started(ctx, reason, input_id.clone()).await?;
-    let run = summarize(ctx, &model).await;
+    // An interrupt cancels the summarization here, inside `compact`, so the
+    // `running` row opened above still settles (as failed/interrupted)
+    // through `publish_outcome` instead of dangling until the next start.
+    let run = tokio::select! {
+        run = summarize(ctx, &model) => run,
+        () = token.cancelled() => Err(SessionError {
+            kind: "compaction.interrupted".to_owned(),
+            message: "Compaction was interrupted".to_owned(),
+            status: None,
+            response: None,
+        }),
+    };
     publish_outcome(ctx, reason, input_id, model, run, String::new()).await
 }
 

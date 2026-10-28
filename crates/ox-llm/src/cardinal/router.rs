@@ -15,11 +15,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::config::{DEFAULT_PROVIDER_NAME, LlmConfig};
+use crate::config::{DEFAULT_PROVIDER_NAME, EndpointLimits, LlmConfig};
 
 use super::CardinalError;
 use super::chat::{Chat, ChatFuture};
 use super::client::CardinalClient;
+use super::limit::LimitedChat;
 use super::wire::ChatRequest;
 
 /// One resolved fallback target: a chat transport plus the wire model to
@@ -52,10 +53,24 @@ impl EndpointRouter {
         cardinal: CardinalClient,
     ) -> Result<Self, CardinalError> {
         let mut clients: BTreeMap<String, Arc<dyn Chat>> = BTreeMap::new();
-        clients.insert(DEFAULT_PROVIDER_NAME.to_owned(), Arc::new(cardinal));
+        clients.insert(
+            DEFAULT_PROVIDER_NAME.to_owned(),
+            gated(
+                Arc::new(cardinal),
+                &config.cardinal_limits,
+                DEFAULT_PROVIDER_NAME,
+            ),
+        );
         for (name, provider) in &config.providers {
-            let client = CardinalClient::new(provider.base_url.clone(), provider.api_key.clone())?;
-            clients.insert(name.clone(), Arc::new(client));
+            let client = CardinalClient::with_stall_timeout(
+                provider.base_url.clone(),
+                provider.api_key.clone(),
+                provider.limits.stall_timeout(),
+            )?;
+            clients.insert(
+                name.clone(),
+                gated(Arc::new(client), &provider.limits, name),
+            );
         }
         let resolve = |provider: &str, model: &str| -> Candidate {
             let chat = clients.get(provider).unwrap_or_else(|| {
@@ -150,6 +165,26 @@ impl Chat for EndpointRouter {
             }
             Err(last.expect("candidates_for never returns an empty list"))
         })
+    }
+}
+
+/// `chat` behind its endpoint's concurrency gate when `limits` set one;
+/// otherwise `chat` itself, so an unlimited endpoint gains no wrapper object.
+/// Logs the effective limits once per limited endpoint (a misspelled key is
+/// silently "no limit", and this line is how an operator notices).
+fn gated(chat: Arc<dyn Chat>, limits: &EndpointLimits, provider: &str) -> Arc<dyn Chat> {
+    let stall = limits.stall_timeout();
+    if limits.max_concurrent.is_some() || stall.is_some() {
+        tracing::info!(
+            provider,
+            max_concurrent = limits.max_concurrent.map(|max| max.get()),
+            stall_timeout_secs = stall.map(|stall| stall.as_secs()),
+            "endpoint limits active"
+        );
+    }
+    match limits.max_concurrent {
+        Some(max) => Arc::new(LimitedChat::new(chat, max, provider)),
+        None => chat,
     }
 }
 

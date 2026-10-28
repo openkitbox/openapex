@@ -8,9 +8,10 @@
 //! held mid-turn and the parent is notified on completion, and a completion
 //! whose parent was deleted meanwhile is dropped without panicking.
 //!
-//! This binary deliberately holds ONE `#[tokio::test]` covering all
-//! scenarios in sequence: they share one database and one state (the runner
-//! that dispatches child turns), which is the shape a sequential walk needs.
+//! Each `#[tokio::test]` here runs ALL scenarios in sequence (once plain,
+//! once behind a limit-1 `LimitedChat`): they share one database and one
+//! state (the runner that dispatches child turns), which is the shape a
+//! sequential walk needs.
 //! The subagent handle is per-registry now, so each registry attaches to the
 //! runner it is handed; scenario 2 (depth zero) needs no runner because the
 //! depth guard rejects before any dispatch.
@@ -161,6 +162,25 @@ fn child_reply(text: &'static str) -> Vec<ox::cardinal::stream::StreamEvent> {
 
 #[tokio::test]
 async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
+    delegation_scenarios(None).await;
+}
+
+/// The same walk with the transport behind a limit-1 endpoint gate: the
+/// foreground delegation holds the parent's stream open (finished, but alive)
+/// while the child needs a permit, so a gate that held its permit until the
+/// stream dropped would deadlock here. The 60s bound turns a hang into a
+/// failure instead of a stuck suite.
+#[tokio::test]
+async fn subagent_scenarios_complete_behind_a_limit_one_endpoint_gate() {
+    tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        delegation_scenarios(Some(1)),
+    )
+    .await
+    .expect("delegation behind a concurrency gate must not deadlock");
+}
+
+async fn delegation_scenarios(limit: Option<usize>) {
     let dir = tempfile::tempdir().unwrap();
     let config = Config {
         db_path: dir.path().join("ox.db"),
@@ -185,7 +205,15 @@ async fn subagent_delegation_folds_reply_and_depth_zero_rejects() {
     // see the SAME registry: `Runner::new` attaches itself to the subagent
     // handle the registry holds (no process-global slot any more).
     let tool = tools.get("subagent").expect("subagent registered");
-    let _state = ox::build_state_with(config.clone(), chat.clone(), tools)
+    let transport: Arc<dyn ox::runner::Chat> = match limit {
+        Some(max) => Arc::new(ox::cardinal::limit::LimitedChat::new(
+            chat.clone(),
+            std::num::NonZeroUsize::new(max).expect("non-zero limit"),
+            "gate",
+        )),
+        None => chat.clone(),
+    };
+    let _state = ox::build_state_with(config.clone(), transport, tools)
         .await
         .expect("build state");
 

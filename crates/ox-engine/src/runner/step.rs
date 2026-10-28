@@ -361,7 +361,17 @@ pub(crate) async fn run(
         // chat turn; no selection leaves the field off the wire.
         request.apply_reasoning_effort(params.model.variant.as_deref());
 
-        let stream = match ctx.chat.stream_chat(&request).await {
+        // The connect / endpoint-queue phase is interruptible too: a request
+        // parked behind a concurrency gate (or a hung connect) must not pin
+        // the turn past an interrupt. Dropping the open future abandons the
+        // queue slot or half-open connection.
+        let opened = tokio::select! {
+            opened = ctx.chat.stream_chat(&request) => opened,
+            () = token.cancelled() => {
+                return settle_interrupted(ctx, params, started, None).await;
+            }
+        };
+        let stream = match opened {
             Ok(stream) => stream,
             Err(error) => {
                 // The flight recorder for the pairing-400 class

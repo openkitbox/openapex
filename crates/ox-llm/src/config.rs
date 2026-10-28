@@ -5,6 +5,8 @@
 //! at the top level of `ox.toml`.
 
 use std::collections::BTreeMap;
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::time::Duration;
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -25,6 +27,62 @@ fn default_cardinal_url() -> String {
 /// `[providers.cardinal]` section overrides the implicit endpoint.
 pub const DEFAULT_PROVIDER_NAME: &str = "cardinal";
 
+/// The stall timeout applied to an endpoint that sets `max_concurrent` but no
+/// `stall_timeout_secs`: a concurrency limit without a liveness bound lets a
+/// hung stream hold a permit forever. Generous because reasoning models can
+/// stay silent for minutes before their first byte.
+pub const DEFAULT_LIMITED_STALL: Duration = Duration::from_secs(600);
+
+/// Per-endpoint traffic limits, shared by `[providers.<name>]` (flattened
+/// into [`ProviderConfig`]) and `[cardinal_limits]` (the implicit
+/// `cardinal_url` endpoint, which `[providers.cardinal]` cannot configure
+/// without replacing it).
+///
+/// Both keys are optional and, when present, must be integers `>= 1`
+/// (`0`, negatives and non-integers fail at load). With neither set the
+/// endpoint behaves exactly as before: no queue, no timeout.
+///
+/// Operational notes:
+/// - Queueing is FIFO and per endpoint; every model route that names the same
+///   endpoint shares its limit.
+/// - Values are read once at startup; changing them needs a restart.
+/// - Misspelled keys are silently ignored (no `deny_unknown_fields`), which
+///   means "no limit". The startup log lists each endpoint's effective limits.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct EndpointLimits {
+    /// Maximum requests in flight to this endpoint; further requests wait in
+    /// FIFO order instead of failing. Unset = unlimited.
+    ///
+    /// Recommend `>= 2`: with `1`, a long background fold (historian,
+    /// dreamer) can block the foreground turn. An endpoint that is down holds
+    /// each permit for up to the 10s connect timeout, so queued requests wait
+    /// up to `ceil(queued / max_concurrent) * 10s` before failing over to a
+    /// backup candidate.
+    #[serde(default)]
+    pub max_concurrent: Option<NonZeroUsize>,
+    /// Maximum silence, in seconds, between bytes from this endpoint (while
+    /// waiting for response headers and between body reads). It is **not** a
+    /// total deadline: a stream that keeps producing bytes lives forever. A
+    /// stall surfaces as a transport error (retried / failed over like any
+    /// other). Unset: [`DEFAULT_LIMITED_STALL`] (600s) when `max_concurrent`
+    /// is set, otherwise no timeout.
+    #[serde(default)]
+    pub stall_timeout_secs: Option<NonZeroU64>,
+}
+
+impl EndpointLimits {
+    /// The silence bound to install on the endpoint's HTTP client: the
+    /// explicit value if given, else [`DEFAULT_LIMITED_STALL`] when a
+    /// concurrency limit is set, else `None`.
+    pub fn stall_timeout(&self) -> Option<Duration> {
+        match (self.stall_timeout_secs, self.max_concurrent) {
+            (Some(secs), _) => Some(Duration::from_secs(secs.get())),
+            (None, Some(_)) => Some(DEFAULT_LIMITED_STALL),
+            (None, None) => None,
+        }
+    }
+}
+
 /// One configured outbound endpoint (`[providers.<name>]`).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ProviderConfig {
@@ -36,6 +94,10 @@ pub struct ProviderConfig {
     /// Bearer key for `Authorization`; omitted for gateways that need none.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// `max_concurrent` / `stall_timeout_secs` for this endpoint; see
+    /// [`EndpointLimits`].
+    #[serde(default, flatten)]
+    pub limits: EndpointLimits,
 }
 
 /// One ordered fallback target inside a `[models.<id>]` route.
@@ -67,6 +129,11 @@ pub struct LlmConfig {
     /// cardinal runs with auth disabled.
     #[serde(default)]
     pub cardinal_key: Option<String>,
+    /// `max_concurrent` / `stall_timeout_secs` for the implicit
+    /// `cardinal_url` endpoint (`[cardinal_limits]` table); see
+    /// [`EndpointLimits`].
+    #[serde(default)]
+    pub cardinal_limits: EndpointLimits,
     /// Additional OpenAI-compatible endpoints (`[providers.<name>]`). Empty:
     /// the implicit `cardinal_url` endpoint serves everything (legacy mode).
     #[serde(default)]
@@ -100,6 +167,7 @@ impl Default for LlmConfig {
         Self {
             cardinal_url: default_cardinal_url(),
             cardinal_key: None,
+            cardinal_limits: EndpointLimits::default(),
             providers: BTreeMap::new(),
             models: BTreeMap::new(),
             context_caps: BTreeMap::new(),

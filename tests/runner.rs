@@ -56,6 +56,9 @@ enum Script {
     /// Emit the head events, then the stream dies mid-flight (transport
     /// read failure after published output — the interrupted-stream class).
     Die(Vec<StreamEvent>),
+    /// `stream_chat` itself never resolves (the connect / endpoint-queue
+    /// phase hangs before any stream exists).
+    PendOpen,
 }
 
 /// A [`Chat`] implementation handing out scripts in order and recording
@@ -222,6 +225,7 @@ impl Chat for MockChat {
         Box::pin(async move {
             match script {
                 Script::Fail => Err(CardinalError::EarlyClose),
+                Script::PendOpen => std::future::pending().await,
                 Script::Overflow => Err(CardinalError::Http {
                     status: 400,
                     body: "This model's maximum context length is 4097 tokens".to_owned(),
@@ -1360,6 +1364,107 @@ async fn interrupt_aborts_stream_and_settles_step_failed() {
     assert_eq!(second["interrupted"], false, "idle interrupt is a no-op");
 
     gate.notify_waiters();
+}
+
+/// The connect / endpoint-queue phase is interruptible: a `stream_chat`
+/// that never resolves must not pin the turn past an interrupt.
+#[tokio::test]
+async fn interrupt_during_chat_open_settles_interrupted() {
+    let harness = Harness::spawn(vec![Script::PendOpen]).await;
+    let session_id = harness.create_session().await;
+
+    let response = harness
+        .post(
+            &format!("/api/session/{session_id}/prompt"),
+            json!({ "text": "stuck at connect" }),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+
+    // The turn is now inside `stream_chat` (no stream, no assistant output).
+    tokio::time::timeout(Duration::from_secs(5), harness.chat.wait_for_requests(1))
+        .await
+        .expect("the turn issued its chat request");
+
+    let response = harness
+        .post(&format!("/api/session/{session_id}/interrupt"), json!({}))
+        .await;
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["interrupted"], true, "busy period was interrupted");
+
+    harness.wait_event("session.execution.interrupted").await;
+    assert!(!log_contains(&harness, "session.execution.failed").await);
+}
+
+/// Interrupting a compaction mid-request stops it at once and settles the
+/// running row as failed/interrupted; the overflow that triggered it is not
+/// reported as the turn's failure.
+#[tokio::test]
+async fn interrupt_during_compaction_settles_failed_interrupted() {
+    let harness = Harness::spawn(vec![Script::Overflow, Script::PendOpen]).await;
+    let session_id = harness.create_session().await;
+
+    let response = harness
+        .post(
+            &format!("/api/session/{session_id}/prompt"),
+            json!({ "text": "trigger overflow" }),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+
+    // Overflow attempt + the compaction's summary request (hanging).
+    tokio::time::timeout(Duration::from_secs(5), harness.chat.wait_for_requests(2))
+        .await
+        .expect("the compaction issued its chat request");
+    harness
+        .wait_for(&session_id, "running compaction row", |messages| {
+            messages
+                .iter()
+                .any(|m| m["type"] == "compaction" && m["status"] == "running")
+        })
+        .await;
+
+    let response = harness
+        .post(&format!("/api/session/{session_id}/interrupt"), json!({}))
+        .await;
+    assert_eq!(response.status(), 200);
+    let body: Value = response.json().await.expect("json");
+    assert_eq!(body["interrupted"], true, "busy period was interrupted");
+
+    harness.wait_event("session.execution.interrupted").await;
+    harness.wait_event("session.compaction.failed").await;
+    let log = harness.event_log().await;
+    let failed = log
+        .iter()
+        .find(|(k, _)| k == "session.compaction.failed")
+        .expect("compaction failed event");
+    assert_eq!(
+        failed.1["error"]["type"], "compaction.interrupted",
+        "failed event: {:?}",
+        failed.1
+    );
+    assert!(
+        !log.iter().any(|(k, _)| k == "session.execution.failed"),
+        "an interrupt is not the original overflow failure"
+    );
+
+    let messages = harness.messages(&session_id).await;
+    let compactions: Vec<&Value> = messages
+        .iter()
+        .filter(|m| m["type"] == "compaction")
+        .collect();
+    assert_eq!(compactions.len(), 1, "one compaction row: {messages:?}");
+    assert_eq!(
+        compactions[0]["status"], "failed",
+        "row: {:?}",
+        compactions[0]
+    );
+    assert_eq!(
+        harness.chat.requests().len(),
+        2,
+        "no retry after the interrupted compaction"
+    );
 }
 
 // ---------------------------------------------------------------------------

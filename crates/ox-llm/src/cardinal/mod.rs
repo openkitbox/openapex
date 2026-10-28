@@ -20,7 +20,8 @@
 //!
 //! Layout: [`wire`] (request types), [`stream`] (SSE framing, chunk decoding,
 //! delta assembly), [`client`] (HTTP + the [`client::ChatStream`]), [`chat`]
-//! (the transport seam), and [`router`] (multi-endpoint candidate routing).
+//! (the transport seam), [`limit`] (per-endpoint concurrency gate), and
+//! [`router`] (multi-endpoint candidate routing).
 //!
 //! Errors: [`CardinalError`] — an HTTP error carries the status and a body
 //! snippet; framing-level junk lines are skipped per the SSE spec, while a
@@ -29,6 +30,7 @@
 
 pub mod chat;
 pub mod client;
+pub mod limit;
 pub mod router;
 pub mod stream;
 pub mod wire;

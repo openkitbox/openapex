@@ -54,11 +54,26 @@ impl CardinalClient {
         base_url: impl Into<String>,
         api_key: Option<String>,
     ) -> Result<Self, CardinalError> {
-        let http = crate::http_client()
-            // Long-lived streams must never hit an idle/read timeout, but a
-            // dead gateway should fail fast instead of hanging the runner.
-            .connect_timeout(Duration::from_secs(10))
-            .build()?;
+        Self::with_stall_timeout(base_url, api_key, None)
+    }
+
+    /// Like [`Self::new`], with an optional silence bound: when `Some`, a
+    /// request fails with [`CardinalError::Transport`] after that long
+    /// without receiving a byte (response headers or any body read).
+    pub fn with_stall_timeout(
+        base_url: impl Into<String>,
+        api_key: Option<String>,
+        stall_timeout: Option<Duration>,
+    ) -> Result<Self, CardinalError> {
+        // A dead gateway should fail fast instead of hanging the runner.
+        let mut builder = crate::http_client().connect_timeout(Duration::from_secs(10));
+        // There is never a total deadline: long-lived streams are fine. The
+        // read timeout only fires after that much silence (it resets on
+        // every successful read) and only when configured.
+        if let Some(stall) = stall_timeout {
+            builder = builder.read_timeout(stall);
+        }
+        let http = builder.build()?;
         Ok(Self {
             http,
             base_url: base_url.into().trim_end_matches('/').to_owned(),
@@ -68,7 +83,11 @@ impl CardinalClient {
 
     /// A client configured from ox's config (`cardinal_url` + `cardinal_key`).
     pub fn from_config(config: &LlmConfig) -> Result<Self, CardinalError> {
-        Self::new(config.cardinal_url.clone(), config.cardinal_key.clone())
+        Self::with_stall_timeout(
+            config.cardinal_url.clone(),
+            config.cardinal_key.clone(),
+            config.cardinal_limits.stall_timeout(),
+        )
     }
 
     /// Start a streaming chat completion. The request is sent wire-exact as

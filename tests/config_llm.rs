@@ -3,9 +3,11 @@
 //! config moves into its own crate. Behavior here must survive the move
 //! byte-for-byte: key names, defaults and fail-closed messages.
 
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
+use std::time::Duration;
 
-use ox::config::{Config, DEFAULT_PROVIDER_NAME};
+use ox::config::{Config, DEFAULT_LIMITED_STALL, DEFAULT_PROVIDER_NAME, EndpointLimits};
 
 fn load(toml: &str) -> anyhow::Result<Config> {
     let dir = tempfile::tempdir().unwrap();
@@ -127,4 +129,85 @@ fn context_caps_must_be_positive_integers() {
             .contains("context_caps.m must be a positive token count, got 0")
     );
     assert!(load_err("[context_caps]\nm = \"x\"\n").contains("invalid type"));
+}
+
+#[test]
+fn endpoint_limits_default_to_unset() {
+    let config = load("[providers.p]\nbase_url = \"http://h\"\n").unwrap();
+    let limits = &config.llm.providers["p"].limits;
+    assert_eq!(limits.max_concurrent, None);
+    assert_eq!(limits.stall_timeout_secs, None);
+    assert_eq!(limits.stall_timeout(), None);
+    assert_eq!(config.llm.cardinal_limits, EndpointLimits::default());
+    assert_eq!(config.llm.cardinal_limits.stall_timeout(), None);
+}
+
+#[test]
+fn endpoint_limits_parse_for_providers_and_the_implicit_endpoint() {
+    let config = load(
+        r#"
+[providers.p]
+base_url = "http://h"
+max_concurrent = 4
+stall_timeout_secs = 90
+
+[cardinal_limits]
+max_concurrent = 8
+"#,
+    )
+    .unwrap();
+    let p = &config.llm.providers["p"].limits;
+    assert_eq!(p.max_concurrent, NonZeroUsize::new(4));
+    assert_eq!(p.stall_timeout_secs, NonZeroU64::new(90));
+    let c = &config.llm.cardinal_limits;
+    assert_eq!(c.max_concurrent, NonZeroUsize::new(8));
+    assert_eq!(c.stall_timeout_secs, None);
+}
+
+#[test]
+fn endpoint_limits_reject_zero_negative_and_non_integers() {
+    for key in ["max_concurrent", "stall_timeout_secs"] {
+        for bad in ["0", "-1", "\"x\""] {
+            let provider = load_err(&format!(
+                "[providers.p]\nbase_url = \"http://h\"\n{key} = {bad}\n"
+            ));
+            assert!(
+                provider.contains("nonzero") || provider.contains("invalid type"),
+                "providers.p.{key} = {bad}: {provider}"
+            );
+            let cardinal = load_err(&format!("[cardinal_limits]\n{key} = {bad}\n"));
+            assert!(
+                cardinal.contains("nonzero") || cardinal.contains("invalid type"),
+                "cardinal_limits.{key} = {bad}: {cardinal}"
+            );
+        }
+    }
+    // 0 and -1 must be rejected by the NonZero deserializer itself.
+    assert!(load_err("[cardinal_limits]\nmax_concurrent = 0\n").contains("nonzero"));
+    assert!(load_err("[cardinal_limits]\nstall_timeout_secs = -1\n").contains("nonzero"));
+}
+
+#[test]
+fn stall_timeout_derivation_covers_all_four_quadrants() {
+    let none = EndpointLimits::default();
+    assert_eq!(none.stall_timeout(), None);
+
+    let only_limit = EndpointLimits {
+        max_concurrent: NonZeroUsize::new(2),
+        stall_timeout_secs: None,
+    };
+    assert_eq!(only_limit.stall_timeout(), Some(DEFAULT_LIMITED_STALL));
+    assert_eq!(DEFAULT_LIMITED_STALL, Duration::from_secs(600));
+
+    let both = EndpointLimits {
+        max_concurrent: NonZeroUsize::new(2),
+        stall_timeout_secs: NonZeroU64::new(30),
+    };
+    assert_eq!(both.stall_timeout(), Some(Duration::from_secs(30)));
+
+    let only_stall = EndpointLimits {
+        max_concurrent: None,
+        stall_timeout_secs: NonZeroU64::new(45),
+    };
+    assert_eq!(only_stall.stall_timeout(), Some(Duration::from_secs(45)));
 }
