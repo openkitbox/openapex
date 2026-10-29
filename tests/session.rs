@@ -601,6 +601,40 @@ async fn list_by_project_and_empty_subpath_returns_root_sessions() {
     }
 }
 
+// ox models one synthetic `default` project for every directory, so the TUI's
+// `/sessions` filter (`project` + `subpath=`) alone matches sessions from all
+// directories. The list must additionally be scoped to the directory the
+// client is working in (`x-opencode-directory`).
+#[tokio::test]
+async fn list_by_project_is_scoped_to_the_request_directory() {
+    let h = Harness::spawn().await;
+
+    let here = h
+        .create(json!({"title": "here", "location": {"directory": "/work/here"}}))
+        .await;
+    let there = h
+        .create(json!({"title": "there", "location": {"directory": "/work/there"}}))
+        .await;
+
+    let listed: Value = h
+        .client
+        .get(h.url("/api/session?parentID=null&order=desc&project=default&subpath="))
+        .header("x-opencode-directory", "/work/here")
+        .send()
+        .await
+        .expect("GET request")
+        .json()
+        .await
+        .expect("json");
+    let ids: Vec<&str> = listed["data"]
+        .as_array()
+        .expect("data")
+        .iter()
+        .filter_map(|s| s["id"].as_str())
+        .collect();
+    assert_eq!(ids, vec![here.as_str()], "other dir leaked: {there}");
+}
+
 // Upstream's `session.form.list` filters its form cache by the raw `sessionID`
 // string without checking the session exists (`form.ts:168-174`), so the TUI's
 // bootstrap call with the literal id `"global"` gets `200 []`. It must not 404.

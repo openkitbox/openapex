@@ -261,7 +261,7 @@ fn spawn_runner_memory_stats(runner: Runner) {
         loop {
             interval.tick().await;
             let (sessions, baselines) = runner.diagnostic_table_sizes();
-            println!("OX_RUNNER_STATS sessions={sessions} baselines={baselines}");
+            tracing::info!(sessions, baselines, "OX_RUNNER_STATS");
         }
     });
 }

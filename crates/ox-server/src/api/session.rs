@@ -728,7 +728,14 @@ fn request_query(req: &Request) -> Result<CursorQuery, String> {
         order: resolve_order(req.query::<String>("order"))?,
         search: req.query("search"),
         parent_id: req.query("parentID"),
-        directory: req.query("directory"),
+        // ox maps every directory to one synthetic project, so a `project`
+        // filter (the TUI's `/sessions`) alone spans all directories. Scope it
+        // to the directory the client is working in unless `directory` is
+        // given explicitly.
+        directory: req.query("directory").or_else(|| {
+            req.query::<String>("project")
+                .and(super::compat::request_directory(req))
+        }),
         project: req.query("project"),
         subpath: req.query("subpath"),
         // Filled in by `list` so it can be validated even with a cursor.
