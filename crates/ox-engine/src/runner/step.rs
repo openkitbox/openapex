@@ -27,11 +27,14 @@
 //! - An interruption after the step started settles the step with
 //!   `session.step.failed` carrying the upstream `aborted` error, after
 //!   failing unsettled tool parts.
-//! - Transport errors before any output retry with backoff (upstream's
-//!   SessionRunnerRetry publishes `session.retry.scheduled`); capped at 3
-//!   attempts. A 400 context-length overflow before any output surfaces as
-//!   [`StepOutcome::Overflow`] so the drain can compact and retry once
-//!   (upstream `Outcome.Compacted`).
+//! - Failures retry per [`retry::classify`] / [`retry::Backoff`]
+//!   (upstream's SessionRunnerRetry publishes `session.retry.scheduled`):
+//!   network-class errors retry until recovery or interrupt, the bounded
+//!   class up to `MAX_BOUNDED_RETRIES` consecutive failures, the never
+//!   class fails immediately. The delay is computed once and used for both
+//!   the event's `at` and the sleep. A 400 context-length overflow before
+//!   any output surfaces as [`StepOutcome::Overflow`] so the drain can
+//!   compact and retry once (upstream `Outcome.Compacted`).
 //! - A mid-stream failure after published output never transparently
 //!   retries: only an *interrupted stream* continues (upstream
 //!   `Outcome.Continue`) — a transport read failure, or a stream that ends
@@ -82,15 +85,12 @@ use super::compaction;
 use super::drain::DrainCtx;
 use super::instructions;
 use super::output_budget::bound_tool_output;
+use super::retry::{self, RetryKind};
 
 /// Upstream `STEP_INTERRUPTED` (runner/step.ts).
 const STEP_INTERRUPTED: &str = "Step interrupted";
 /// Upstream `TOOLS_INTERRUPTED` (runner/step.ts).
 const TOOLS_INTERRUPTED: &str = "Tool execution interrupted";
-/// Transport attempts before the step fails (upstream policy arrives later).
-const MAX_ATTEMPTS: usize = 3;
-/// Backoff base; attempt N sleeps `base * N`.
-const RETRY_BACKOFF_BASE: Duration = Duration::from_millis(250);
 /// Upstream `CONTINUE_AFTER_INCOMPLETE_STREAM` (runner/llm.ts): the
 /// continuation prompt published after an interrupted stream so the model
 /// resumes where it left off.
@@ -154,9 +154,21 @@ enum AttemptFailure {
     /// `unknownFinish` → `InvalidProviderOutput` classified
     /// `incomplete-stream`).
     IncompleteStream,
+    /// The stream ended without a single output event. Settles exactly like
+    /// `EarlyClose` but retries bounded: a healthy connection that keeps
+    /// answering with nothing must not loop forever.
+    EmptyStream,
 }
 
 impl AttemptFailure {
+    /// How this failure is retried; an incomplete stream is bounded.
+    fn retry_kind(&self) -> RetryKind {
+        match self {
+            AttemptFailure::Transport(error) => retry::classify(error),
+            AttemptFailure::IncompleteStream | AttemptFailure::EmptyStream => RetryKind::Bounded,
+        }
+    }
+
     /// Upstream `isInterruptedStream` (step.ts): interrupted streams
     /// continue via a continuation prompt; content errors (HTTP rejections,
     /// in-band provider failures) fail the step.
@@ -172,6 +184,8 @@ impl AttemptFailure {
                 | CardinalError::NoRoute { .. },
             ) => false,
             AttemptFailure::IncompleteStream => true,
+            // Retried through the `!published` arm, never as a continuation.
+            AttemptFailure::EmptyStream => false,
         }
     }
 
@@ -180,7 +194,7 @@ impl AttemptFailure {
     fn is_overflow(&self) -> bool {
         match self {
             AttemptFailure::Transport(error) => super::provider_error::is_overflow_error(error),
-            AttemptFailure::IncompleteStream => false,
+            AttemptFailure::IncompleteStream | AttemptFailure::EmptyStream => false,
         }
     }
 
@@ -189,6 +203,7 @@ impl AttemptFailure {
         match self {
             AttemptFailure::Transport(error) => to_session_error(error),
             AttemptFailure::IncompleteStream => invalid_output_error(),
+            AttemptFailure::EmptyStream => to_session_error(&CardinalError::EarlyClose),
         }
     }
 }
@@ -204,162 +219,19 @@ pub(crate) async fn run(
     let mut started = false;
 
     let mut attempt: usize = 0;
+    // Retry delay and caps; `attempt` stays monotonic for the events.
+    let mut backoff = retry::Backoff::default();
+    // The request of the previous attempt, kept when that attempt produced no
+    // output so the retry does not re-read the transcript.
+    let mut prepared: Option<ChatRequest> = None;
     loop {
         attempt += 1;
-        // The transcript is rebuilt per attempt (upstream refreshes context
-        // on retry and continuation): a continuation attempt must observe
-        // the settled partial row plus the continuation prompt.
-        // The magic-context head replaces everything it covers: the pass mints
-        // the frozen bytes and reports the ordinal floor, so the transcript
-        // starts after the covered range.
-        let budget = crate::mctx::budget_for(&ctx.config, &ctx.model_catalog, &params.model.id);
-        let (head_m0, head_m1, floor) = mctx_head(ctx, budget).await;
-        // Pressure is checked after the pass: the floor it reports is what the
-        // live tail is measured above. Both windows were resolved once, when
-        // the budget was derived.
-        super::historian_trigger::mctx_historian(ctx, budget, floor, params.model.variant.clone());
-        let rows = if ctx.config.magic_context.enabled {
-            // The §N§ overlay (tag prefixes + drop placeholders) is part of the
-            // integration: with it off the request must stay byte-identical to
-            // the integration-free one.
-            load_overlaid_tail(&ctx.db, &ctx.session_id, floor).await?
-        } else {
-            load_history_after(&ctx.db, &ctx.session_id, floor).await?
+        // A retry whose previous attempt produced no output sends the same
+        // request: only a continuation (published failure) rebuilds context.
+        let request = match prepared.take() {
+            Some(request) => request,
+            None => build_request(ctx, params).await?,
         };
-        // Step-boundary fold trigger (plan D2): the tail is already decoded
-        // in memory, so the usage criterion costs no query — the newest
-        // assistant row's provider-reported tokens against this attempt's
-        // budget, the same reading `fold_decision` recomputes inside. At or
-        // over the threshold a detached silent fold starts; it re-runs the
-        // full gate itself, so this site stays cheap and may double-fire
-        // harmlessly (single-flight CAS + the gate).
-        let usage_pct = rows
-            .iter()
-            .rev()
-            .find_map(assistant_tokens)
-            .and_then(|tokens| budget.usage_percentage(tokens));
-        if usage_pct.is_some_and(|pct| pct >= super::compaction::FOLD_USAGE_THRESHOLD * 100.0) {
-            super::compaction::spawn_background_fold(ctx);
-        }
-        // Directory and root must share one namespace: the chain's
-        // component-wise prefix check degenerates to leaf-only when the
-        // directory still carries symlink components the canonical root lost.
-        let (directory, project_root) = ctx.instruction_root.get_or_compute(&ctx.directory);
-        let observed = prompt::gather(
-            &directory,
-            &ctx.home,
-            project_root.as_deref(),
-            ctx.mcp.instructions_block().as_deref(),
-        );
-        let (system_static, tool_count) = {
-            let guidance: Vec<(&str, Option<&'static str>)> = ctx.tools.guidances().collect();
-            // The baseline log's tool count is the registry size; the names
-            // iterate in the same order the definitions do.
-            let count = guidance.len();
-            let profile = if ctx.is_subagent {
-                prompt::WorkflowProfile::Subagent
-            } else {
-                prompt::WorkflowProfile::Parent
-            };
-            (prompt::system_static(&guidance, profile), count)
-        };
-        // The baseline log needs the static layer's size, so it is built
-        // before the sync: assembling it is pure string work over the
-        // registry's guidance, unaffected by the keyed sources.
-        let instruction_update =
-            sync_instructions(ctx, &observed, &rows, system_static.len(), tool_count).await;
-        let instructions_initial = {
-            let baselines = super::lock(&ctx.instruction_baselines);
-            baselines
-                .get(&ctx.session_id)
-                .map(|b| b.initial_render.clone())
-                .unwrap_or_default()
-        };
-        let mut chat_messages = build_chat_messages(
-            &system_static,
-            &instructions_initial,
-            &[head_m0.as_deref(), head_m1.as_deref()],
-            &rows,
-        );
-        // The delta row is durable for future steps; this step's already-loaded
-        // rows predate it, so the text rides this request in memory (upstream
-        // `generate.ts:55` places `Message.system(instructionUpdate)` after the
-        // transcript and BEFORE the current prompt).
-        if let Some(text) = instruction_update {
-            let delta = ChatMessage::System { content: text };
-            // Upstream `generate.ts:55` places the update before the current
-            // prompt (the transcript's trailing user row on the first
-            // attempt); later attempts end with tool output and tail-append.
-            match chat_messages.last() {
-                Some(ChatMessage::User { .. }) => {
-                    let at = chat_messages.len() - 1;
-                    chat_messages.insert(at, delta);
-                }
-                _ => chat_messages.push(delta),
-            }
-        }
-        // Automatic recall: the turn's opening request gets the top few
-        // memories/notes/compartments matching the prompt's own typed text, as
-        // one compact `<recall>` block appended to that user message.
-        //
-        // The hint rides only the first request of a turn: both the trailing
-        // transcript row and the trailing chat message must be that prompt (a
-        // later step ends with tool output, and any row pushed after the prompt
-        // means this request is not the opening one). So a long tool loop pays
-        // at most one extra prefill of the trailing user message — the message
-        // the block disappeared from on step 2 — and NO stored row is touched:
-        // the bytes exist for this request only, and re-rendering the same rows
-        // yields the same content again. Putting it in the tail rather than
-        // `system`/`m[0]`/`m[1]` is what keeps the cached prefix intact.
-        if ctx.config.magic_context.enabled
-            && matches!(chat_messages.last(), Some(ChatMessage::User { .. }))
-            && let Some(query) = recall_query(&rows)
-        {
-            let project = ctx.directory.to_string_lossy();
-            let request = search::SearchRequest {
-                project: project.as_ref(),
-                session_id: &ctx.session_id,
-                query: &query,
-                sources: search::SourceFilter::RECALL,
-                limit: RECALL_LIMIT,
-                from_ms: None,
-                to_ms: None,
-            };
-            // No embedder on this path (it belongs to the `ctx_search` tool), so
-            // a hint is lexical. A failed query is silent by design: a turn must
-            // never stall or fail because a hint could not be retrieved, and the
-            // request is still well-formed without it.
-            match search::search(&ctx.db, None, &request).await {
-                Ok(hits) => {
-                    if let Some(block) = search::render_recall_block(&hits)
-                        && let Some(ChatMessage::User {
-                            content: UserContent::Text(text),
-                        }) = chat_messages.last_mut()
-                    {
-                        // Move the text out and put the appended version back:
-                        // the only string this path rewrites is that one, and it
-                        // is not cloned on the way. A parts-list user turn (prompt
-                        // + media) keeps its bytes: the block is plain text.
-                        let content = std::mem::take(text);
-                        *text = append_recall(content, &block);
-                    }
-                }
-                Err(error) => {
-                    tracing::debug!(session = %ctx.session_id, error = %error, "automatic recall failed");
-                }
-            }
-        }
-        let mut request = ChatRequest::new(
-            // cardinal routes on the bare model id; the providerID/modelID
-            // qualified form is upstream's provider-adapter vocabulary and
-            // cardinal answers "no route for model cardinal/<id>" to it.
-            params.model.id.clone(),
-            chat_messages,
-        );
-        request.tools = ctx.tools.definitions_shared();
-        // The session's selected reasoning level (model variant) rides every
-        // chat turn; no selection leaves the field off the wire.
-        request.apply_reasoning_effort(params.model.variant.as_deref());
 
         // The connect / endpoint-queue phase is interruptible too: a request
         // parked behind a concurrency gate (or a hung connect) must not pin
@@ -403,18 +275,20 @@ pub(crate) async fn run(
                     });
                 }
                 // Connect failure: nothing was published for this attempt.
-                if attempt < MAX_ATTEMPTS {
+                if let Some(delay) = backoff.on_failure(retry::classify(&error), false) {
                     schedule_retry(
                         ctx,
                         params,
                         &mut started,
                         attempt,
+                        delay,
                         &to_session_error(&error),
                     )
                     .await?;
-                    if !sleep_backoff(token, attempt).await {
+                    if !sleep_backoff(token, delay).await {
                         return settle_interrupted(ctx, params, started, None).await;
                     }
+                    prepared = Some(request);
                     continue;
                 }
                 return fail_step(ctx, params, to_session_error(&error), None, started).await;
@@ -438,15 +312,18 @@ pub(crate) async fn run(
                 // Upstream retry policy (step.ts): transparent retry before
                 // any output; after it, only an interrupted stream continues
                 // (Outcome.Continue).
-                if attempt < MAX_ATTEMPTS && (failure.is_interrupted_stream() || !published) {
+                let delay = backoff.on_failure(failure.retry_kind(), published);
+                if let Some(delay) = delay
+                    && (failure.is_interrupted_stream() || !published)
+                {
                     if published {
                         // The partial assistant settles `step.failed` with
                         // the stream error first (upstream failAssistant —
                         // no step.ended, finish `error`).
                         fail_step(ctx, params, error.clone(), tokens, started).await?;
                     }
-                    schedule_retry(ctx, params, &mut started, attempt, &error).await?;
-                    if !sleep_backoff(token, attempt).await {
+                    schedule_retry(ctx, params, &mut started, attempt, delay, &error).await?;
+                    if !sleep_backoff(token, delay).await {
                         if published {
                             // The row already settled; the interrupt only
                             // ends the turn (upstream: retry.wait aborts
@@ -470,6 +347,8 @@ pub(crate) async fn run(
                         params.assistant_message_id = id::id("msg");
                         started = false;
                         dispatch = id::now_millis();
+                    } else {
+                        prepared = Some(request);
                     }
                     continue;
                 }
@@ -477,6 +356,168 @@ pub(crate) async fn run(
             }
         }
     }
+}
+
+/// Assemble the chat request for one attempt: the transcript is rebuilt from
+/// the durable rows (upstream refreshes context on retry and continuation),
+/// so a continuation attempt observes the settled partial row plus the
+/// continuation prompt.
+async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Result<ChatRequest> {
+    // The transcript is rebuilt per attempt (upstream refreshes context
+    // on retry and continuation): a continuation attempt must observe
+    // the settled partial row plus the continuation prompt.
+    // The magic-context head replaces everything it covers: the pass mints
+    // the frozen bytes and reports the ordinal floor, so the transcript
+    // starts after the covered range.
+    let budget = crate::mctx::budget_for(&ctx.config, &ctx.model_catalog, &params.model.id);
+    let (head_m0, head_m1, floor) = mctx_head(ctx, budget).await;
+    // Pressure is checked after the pass: the floor it reports is what the
+    // live tail is measured above. Both windows were resolved once, when
+    // the budget was derived.
+    super::historian_trigger::mctx_historian(ctx, budget, floor, params.model.variant.clone());
+    let rows = if ctx.config.magic_context.enabled {
+        // The §N§ overlay (tag prefixes + drop placeholders) is part of the
+        // integration: with it off the request must stay byte-identical to
+        // the integration-free one.
+        load_overlaid_tail(&ctx.db, &ctx.session_id, floor).await?
+    } else {
+        load_history_after(&ctx.db, &ctx.session_id, floor).await?
+    };
+    // Step-boundary fold trigger (plan D2): the tail is already decoded
+    // in memory, so the usage criterion costs no query — the newest
+    // assistant row's provider-reported tokens against this attempt's
+    // budget, the same reading `fold_decision` recomputes inside. At or
+    // over the threshold a detached silent fold starts; it re-runs the
+    // full gate itself, so this site stays cheap and may double-fire
+    // harmlessly (single-flight CAS + the gate).
+    let usage_pct = rows
+        .iter()
+        .rev()
+        .find_map(assistant_tokens)
+        .and_then(|tokens| budget.usage_percentage(tokens));
+    if usage_pct.is_some_and(|pct| pct >= super::compaction::FOLD_USAGE_THRESHOLD * 100.0) {
+        super::compaction::spawn_background_fold(ctx);
+    }
+    // Directory and root must share one namespace: the chain's
+    // component-wise prefix check degenerates to leaf-only when the
+    // directory still carries symlink components the canonical root lost.
+    let (directory, project_root) = ctx.instruction_root.get_or_compute(&ctx.directory);
+    let observed = prompt::gather(
+        &directory,
+        &ctx.home,
+        project_root.as_deref(),
+        ctx.mcp.instructions_block().as_deref(),
+    );
+    let (system_static, tool_count) = {
+        let guidance: Vec<(&str, Option<&'static str>)> = ctx.tools.guidances().collect();
+        // The baseline log's tool count is the registry size; the names
+        // iterate in the same order the definitions do.
+        let count = guidance.len();
+        let profile = if ctx.is_subagent {
+            prompt::WorkflowProfile::Subagent
+        } else {
+            prompt::WorkflowProfile::Parent
+        };
+        (prompt::system_static(&guidance, profile), count)
+    };
+    // The baseline log needs the static layer's size, so it is built
+    // before the sync: assembling it is pure string work over the
+    // registry's guidance, unaffected by the keyed sources.
+    let instruction_update =
+        sync_instructions(ctx, &observed, &rows, system_static.len(), tool_count).await;
+    let instructions_initial = {
+        let baselines = super::lock(&ctx.instruction_baselines);
+        baselines
+            .get(&ctx.session_id)
+            .map(|b| b.initial_render.clone())
+            .unwrap_or_default()
+    };
+    let mut chat_messages = build_chat_messages(
+        &system_static,
+        &instructions_initial,
+        &[head_m0.as_deref(), head_m1.as_deref()],
+        &rows,
+    );
+    // The delta row is durable for future steps; this step's already-loaded
+    // rows predate it, so the text rides this request in memory (upstream
+    // `generate.ts:55` places `Message.system(instructionUpdate)` after the
+    // transcript and BEFORE the current prompt).
+    if let Some(text) = instruction_update {
+        let delta = ChatMessage::System { content: text };
+        // Upstream `generate.ts:55` places the update before the current
+        // prompt (the transcript's trailing user row on the first
+        // attempt); later attempts end with tool output and tail-append.
+        match chat_messages.last() {
+            Some(ChatMessage::User { .. }) => {
+                let at = chat_messages.len() - 1;
+                chat_messages.insert(at, delta);
+            }
+            _ => chat_messages.push(delta),
+        }
+    }
+    // Automatic recall: the turn's opening request gets the top few
+    // memories/notes/compartments matching the prompt's own typed text, as
+    // one compact `<recall>` block appended to that user message.
+    //
+    // The hint rides only the first request of a turn: both the trailing
+    // transcript row and the trailing chat message must be that prompt (a
+    // later step ends with tool output, and any row pushed after the prompt
+    // means this request is not the opening one). So a long tool loop pays
+    // at most one extra prefill of the trailing user message — the message
+    // the block disappeared from on step 2 — and NO stored row is touched:
+    // the bytes exist for this request only, and re-rendering the same rows
+    // yields the same content again. Putting it in the tail rather than
+    // `system`/`m[0]`/`m[1]` is what keeps the cached prefix intact.
+    if ctx.config.magic_context.enabled
+        && matches!(chat_messages.last(), Some(ChatMessage::User { .. }))
+        && let Some(query) = recall_query(&rows)
+    {
+        let project = ctx.directory.to_string_lossy();
+        let request = search::SearchRequest {
+            project: project.as_ref(),
+            session_id: &ctx.session_id,
+            query: &query,
+            sources: search::SourceFilter::RECALL,
+            limit: RECALL_LIMIT,
+            from_ms: None,
+            to_ms: None,
+        };
+        // No embedder on this path (it belongs to the `ctx_search` tool), so
+        // a hint is lexical. A failed query is silent by design: a turn must
+        // never stall or fail because a hint could not be retrieved, and the
+        // request is still well-formed without it.
+        match search::search(&ctx.db, None, &request).await {
+            Ok(hits) => {
+                if let Some(block) = search::render_recall_block(&hits)
+                    && let Some(ChatMessage::User {
+                        content: UserContent::Text(text),
+                    }) = chat_messages.last_mut()
+                {
+                    // Move the text out and put the appended version back:
+                    // the only string this path rewrites is that one, and it
+                    // is not cloned on the way. A parts-list user turn (prompt
+                    // + media) keeps its bytes: the block is plain text.
+                    let content = std::mem::take(text);
+                    *text = append_recall(content, &block);
+                }
+            }
+            Err(error) => {
+                tracing::debug!(session = %ctx.session_id, error = %error, "automatic recall failed");
+            }
+        }
+    }
+    let mut request = ChatRequest::new(
+        // cardinal routes on the bare model id; the providerID/modelID
+        // qualified form is upstream's provider-adapter vocabulary and
+        // cardinal answers "no route for model cardinal/<id>" to it.
+        params.model.id.clone(),
+        chat_messages,
+    );
+    request.tools = ctx.tools.definitions_shared();
+    // The session's selected reasoning level (model variant) rides every
+    // chat turn; no selection leaves the field off the wire.
+    request.apply_reasoning_effort(params.model.variant.as_deref());
+    Ok(request)
 }
 
 /// Interrupted settlement: an open assistant row settles with `step.failed`
@@ -507,28 +548,27 @@ async fn settle_interrupted(
 }
 
 /// Backoff sleep, cancellable. Returns false when the token fired first.
-async fn sleep_backoff(token: &CancellationToken, attempt: usize) -> bool {
-    let delay = RETRY_BACKOFF_BASE * attempt as u32;
+async fn sleep_backoff(token: &CancellationToken, delay: Duration) -> bool {
     tokio::select! {
         () = tokio::time::sleep(delay) => true,
         () = token.cancelled() => false,
     }
 }
 
-/// Publish `session.retry.scheduled` for `attempt` (1-based), starting the
-/// assistant row first (upstream `startAssistant`).
+/// Publish `session.retry.scheduled` for `attempt` (1-based), due `delay`
+/// from now, starting the assistant row first (upstream `startAssistant`).
 async fn schedule_retry(
     ctx: &DrainCtx,
     params: &StepParams<'_>,
     started: &mut bool,
     attempt: usize,
+    delay: Duration,
     error: &SessionError,
 ) -> Result<()> {
     if !*started {
         publish_started(ctx, params, id::now_millis()).await?;
         *started = true;
     }
-    let delay = RETRY_BACKOFF_BASE * attempt as u32;
     ctx.bus
         .publish(SessionEventData::SessionRetryScheduled {
             session_id: ctx.session_id.clone(),
@@ -589,6 +629,23 @@ pub(crate) async fn fail_step(
     Ok(outcome)
 }
 
+/// Provider output arrived: mark the attempt produced and start the
+/// assistant row (`step.started`) on the first output of the step.
+async fn note_output(
+    ctx: &DrainCtx,
+    params: &StepParams<'_>,
+    dispatch: i64,
+    started: &mut bool,
+    produced: &mut bool,
+) -> Result<()> {
+    *produced = true;
+    if !*started {
+        publish_started(ctx, params, dispatch).await?;
+        *started = true;
+    }
+    Ok(())
+}
+
 /// One accumulating tool call from `ToolCallDelta` fragments.
 #[derive(Debug, Default)]
 struct ToolAccum {
@@ -607,7 +664,9 @@ struct ToolAccum {
 
 /// Consume one stream attempt, publishing streaming events as they arrive
 /// and settling the step when the stream terminates cleanly. `started` is
-/// updated when `step.started` goes out (persisted across retry attempts).
+/// updated when `step.started` goes out (persisted across retry attempts);
+/// `Attempt::Failed::published` reports whether THIS attempt received model
+/// output, which `started` cannot say once a retry has started the row.
 async fn consume(
     ctx: &DrainCtx,
     token: &CancellationToken,
@@ -632,6 +691,9 @@ async fn consume(
     // (upstream: tools run while the stream continues, and the step waits
     // for all spawned tools).
     let mut tool_tasks: Vec<(String, JoinHandle<()>)> = Vec::new();
+    // Model output was received in this attempt (unlike `started`, which a
+    // retry announcement also sets).
+    let mut produced = false;
 
     loop {
         enum Next {
@@ -681,7 +743,7 @@ async fn consume(
                 // Upstream `publisher.streamed()`: an attempt that produced
                 // output marks the row streamed even when the stream then
                 // dies before `Finish`.
-                if *started {
+                if produced {
                     ctx.bus
                         .publish(SessionEventData::StepStreamed {
                             session_id: ctx.session_id.clone(),
@@ -694,19 +756,15 @@ async fn consume(
                 // (failTools `uncalled`) and no tool part stays streaming.
                 fail_unsettled_tools(ctx, params, &mut tool_acc, to_session_error(&error)).await?;
                 join_tool_tasks(ctx, params, &mut tool_tasks, token).await?;
-                let published = *started;
                 return Ok(Attempt::Failed {
                     failure: AttemptFailure::Transport(error),
-                    published,
+                    published: produced,
                     tokens: None,
                 });
             }
             Next::Event(Some(Ok(event))) => match event {
                 StreamEvent::TextDelta(delta) => {
-                    if !*started {
-                        publish_started(ctx, params, dispatch).await?;
-                        *started = true;
-                    }
+                    note_output(ctx, params, dispatch, started, &mut produced).await?;
                     if text_ordinal.is_none() {
                         let ordinal = next_text_ordinal;
                         next_text_ordinal += 1;
@@ -731,10 +789,7 @@ async fn consume(
                         .await?;
                 }
                 StreamEvent::ReasoningDelta(delta) => {
-                    if !*started {
-                        publish_started(ctx, params, dispatch).await?;
-                        *started = true;
-                    }
+                    note_output(ctx, params, dispatch, started, &mut produced).await?;
                     if reasoning_ordinal.is_none() {
                         let ordinal = next_reasoning_ordinal;
                         next_reasoning_ordinal += 1;
@@ -765,10 +820,7 @@ async fn consume(
                     name,
                     arguments,
                 } => {
-                    if !*started {
-                        publish_started(ctx, params, dispatch).await?;
-                        *started = true;
-                    }
+                    note_output(ctx, params, dispatch, started, &mut produced).await?;
                     let entry = tool_acc.entry(index).or_default();
                     if entry.id.is_empty()
                         && let Some(seen) = id
@@ -848,11 +900,11 @@ async fn consume(
         &reasoning,
     )
     .await?;
-    if !*started {
-        // The stream produced nothing at all: a transport-grade failure so
-        // the retry loop runs (the final attempt settles as step.failed).
+    if !produced {
+        // The stream produced nothing at all: a bounded failure so the retry
+        // loop runs (the final attempt settles as step.failed).
         return Ok(Attempt::Failed {
-            failure: AttemptFailure::Transport(CardinalError::EarlyClose),
+            failure: AttemptFailure::EmptyStream,
             published: false,
             tokens: None,
         });
@@ -2395,4 +2447,29 @@ pub(crate) fn decode_row_owned(value: serde_json::Value) -> Result<Message> {
         anyhow::bail!("session_message row without a type");
     }
     Ok(Message::from_merged_row(value)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attempt_failure_retry_kind() {
+        assert_eq!(
+            AttemptFailure::IncompleteStream.retry_kind(),
+            RetryKind::Bounded
+        );
+        assert_eq!(AttemptFailure::EmptyStream.retry_kind(), RetryKind::Bounded);
+        assert!(!AttemptFailure::EmptyStream.is_interrupted_stream());
+        assert!(!AttemptFailure::EmptyStream.is_overflow());
+        assert_eq!(
+            AttemptFailure::EmptyStream.session_error(),
+            to_session_error(&CardinalError::EarlyClose)
+        );
+        let no_route = CardinalError::NoRoute { model: "m".into() };
+        assert_eq!(
+            AttemptFailure::Transport(no_route).retry_kind(),
+            RetryKind::Never
+        );
+    }
 }
