@@ -23,6 +23,7 @@
 //! real tools; the registry ships empty until task 7 fills it.
 
 pub use ox_llm::cardinal::chat::Chat;
+pub use services::{Live, ServiceSet, Services};
 
 /// `pub` for the same reason as `drain` and `step`: the checkpoint-bound
 /// helpers are exercised from `tests/` (the crate carries no `#[cfg(test)]`
@@ -34,6 +35,7 @@ mod historian_trigger;
 pub(crate) mod instructions;
 mod output_budget;
 pub(crate) mod provider_error;
+mod services;
 pub mod step;
 pub mod title;
 pub(crate) mod todo_reminder;
@@ -95,22 +97,16 @@ pub struct Runner {
 }
 
 struct Inner {
-    /// The loaded config, shared by reference: nothing reads it mutably, and
-    /// every drain/step boundary clones the handle rather than the struct.
-    config: std::sync::Arc<Config>,
     /// Canonical project working directory (system prompt + tool roots).
     directory: PathBuf,
     /// The ox home directory (`~/.ox`) the global AGENTS.md lives in.
     home: PathBuf,
     db: Db,
     bus: EventBus,
-    chat: Arc<dyn Chat>,
-    tools: Arc<ToolRegistry>,
-    /// The model catalogue (default-model resolution); shared with the API.
-    model_catalog: Arc<ox_llm::model_catalog::ModelCatalog>,
-    /// Connected MCP servers: tools (registered before the runner was built)
-    /// plus the instruction block the system prompt carries.
-    mcp: Arc<ox_mcp::Hub>,
+    /// Config-derived services (config, chat, tools, model catalogue, MCP
+    /// hub). Read through [`Live::current`]; a reload swaps the generation
+    /// and running turns pick it up at their next step boundary.
+    live: Arc<Live>,
     /// Per-session keyed-instruction baselines (process memory only; a restart
     /// re-baselines from current sources and the wire fold corrects stale
     /// delta rows).
@@ -333,26 +329,30 @@ impl Runner {
         mcp: Arc<ox_mcp::Hub>,
         home: PathBuf,
     ) -> Self {
-        let inner = Arc::new(Inner {
+        let live = Arc::new(Live::new(ServiceSet {
             config,
+            chat,
+            model_catalog,
+            mcp,
+            tools,
+        }));
+        let inner = Arc::new(Inner {
             directory,
             home,
             db,
             bus,
-            chat,
-            tools,
-            model_catalog,
-            mcp,
+            live,
             instruction_baselines: Default::default(),
             calibrations: Default::default(),
             sessions: DashMap::new(),
         });
-        if let Some(handle) = inner.tools.subagent_handle.clone() {
+        let tools = inner.live.current().tools.clone();
+        if let Some(handle) = tools.subagent_handle.clone() {
             handle.attach(Arc::new(Self {
                 inner: Arc::clone(&inner),
             }));
         }
-        if let Some(completion) = inner.tools.shell_completion.clone() {
+        if let Some(completion) = tools.shell_completion.clone() {
             completion.attach(Arc::new(Self {
                 inner: Arc::clone(&inner),
             }));
@@ -366,7 +366,13 @@ impl Runner {
     /// The chat transport this runner issues completions through. Background
     /// work that must not open a second transport (the dreamer) borrows it.
     pub fn chat(&self) -> Arc<dyn Chat> {
-        Arc::clone(&self.inner.chat)
+        Arc::clone(&self.inner.live.current().chat)
+    }
+
+    /// The holder of the current config-derived services; a reload installs
+    /// the next generation through it.
+    pub fn live(&self) -> Arc<Live> {
+        Arc::clone(&self.inner.live)
     }
 
     pub fn is_active(&self, session_id: &str) -> bool {
@@ -541,11 +547,10 @@ impl ActorTask {
         let Some(mut rx) = self.rx.take() else {
             return;
         };
-        // Resolve the toolset and prompt profile once per actor task: a session's parent link
-        // never changes, so the child registry (no `question`) is built at
-        // most once per spawn, not per step.
+        // Resolve the prompt profile once per actor task: a session's parent
+        // link never changes. Each generation precomputes the child registry
+        // (no `question`; see [`Services::child_tools`]).
         let is_subagent = self.session_is_subagent().await;
-        let tools = self.session_tools(is_subagent);
         loop {
             // Absorb the backlog; the first Enqueue opens a busy period.
             let mut token: Option<CancellationToken> = None;
@@ -603,18 +608,24 @@ impl ActorTask {
             // directory is the SESSION's directory (the client's project),
             // not the server process cwd — tools and the system prompt must
             // operate where the session lives.
-            let ctx = drain::DrainCtx {
+            // Re-pointed at the newest generation before each drain and
+            // before the background fold; `run_turn` also does so at each
+            // step boundary.
+            let svc = self.inner.live.current();
+            let mut ctx = drain::DrainCtx {
                 session_id: self.session_id.clone(),
                 is_subagent,
                 directory: self.session_directory().await,
                 home: self.inner.home.clone(),
-                config: self.inner.config.clone(),
+                config: Arc::clone(&svc.config),
                 db: self.inner.db.clone(),
                 bus: self.inner.bus.clone(),
-                chat: self.inner.chat.clone(),
-                tools: Arc::clone(&tools),
-                model_catalog: Arc::clone(&self.inner.model_catalog),
-                mcp: self.inner.mcp.clone(),
+                chat: Arc::clone(&svc.chat),
+                tools: svc.tools_for(is_subagent),
+                model_catalog: Arc::clone(&svc.model_catalog),
+                mcp: Arc::clone(&svc.mcp),
+                live: Arc::clone(&self.inner.live),
+                generation: svc.generation,
                 instruction_baselines: self.inner.instruction_baselines.clone(),
                 calibrations: self.inner.calibrations.clone(),
                 instruction_root: self.handle.instruction_root.clone(),
@@ -626,6 +637,7 @@ impl ActorTask {
                     self.terminal_interrupted().await;
                     break;
                 }
+                ctx.refresh();
                 match drain::drain(&ctx, &period, scope).await {
                     drain::DrainOutcome::Interrupted => {
                         tracing::debug!(session = %self.session_id, "drain interrupted");
@@ -695,6 +707,7 @@ impl ActorTask {
                             // background.
                             // The fold resolves its own selection once, so the
                             // model and its reasoning policy cannot diverge.
+                            ctx.refresh();
                             compaction::spawn_background_fold(&ctx);
                             break;
                         }
@@ -716,19 +729,6 @@ impl ActorTask {
         // The baseline and the calibration go with it: a later dispatch simply
         // re-baselines from the sources and re-measures in one turn.
         self.inner.forget(&self.session_id);
-    }
-
-    /// The registry this session's turns advertise and dispatch against: the
-    /// shared one, minus [`SUBAGENT_EXCLUDED_TOOLS`] for a child session.
-    /// A form opened by a child has no UI behind it, and ox has no foreground
-    /// tool timeout, so `question` there would wait forever and hang the
-    /// parent's `subagent` call with it. Resolved once per actor task.
-    fn session_tools(&self, is_subagent: bool) -> Arc<ToolRegistry> {
-        if is_subagent {
-            Arc::new(self.inner.tools.without(SUBAGENT_EXCLUDED_TOOLS))
-        } else {
-            Arc::clone(&self.inner.tools)
-        }
     }
 
     /// Whether this session is a subagent (its `parent_id` is set). A missing

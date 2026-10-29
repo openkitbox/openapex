@@ -302,7 +302,7 @@ async fn mcp_modern_discovery_propagates_server_metadata() {
     };
 
     let state = ox::build_state(config).await.unwrap();
-    let views = state.mcp.servers();
+    let views = state.services().mcp.servers();
     assert_eq!(views.len(), 1);
     assert_eq!(views[0].title.as_deref(), Some("Modern Stub"));
 }
@@ -329,7 +329,7 @@ async fn mcp_auto_does_not_fallback_for_non_method_not_found_error() {
     };
 
     let state = ox::build_state(config).await.unwrap();
-    let view = &state.mcp.servers()[0];
+    let view = &state.services().mcp.servers()[0];
     assert!(matches!(view.status, ox::mcp::Status::Failed { .. }));
 }
 
@@ -353,7 +353,7 @@ async fn mcp_auto_falls_back_to_legacy_only_on_unsupported_discovery() {
     };
 
     let state = ox::build_state(config).await.unwrap();
-    let view = &state.mcp.servers()[0];
+    let view = &state.services().mcp.servers()[0];
     assert_eq!(view.status, ox::mcp::Status::Connected);
 }
 
@@ -380,7 +380,7 @@ async fn mcp_modern_discovery_fails_closed_when_capabilities_are_missing() {
 
     let state = ox::build_state(config).await.unwrap();
     assert!(matches!(
-        state.mcp.servers()[0].status,
+        state.services().mcp.servers()[0].status,
         ox::mcp::Status::Failed { .. }
     ));
 }
@@ -407,7 +407,10 @@ async fn mcp_auto_falls_back_when_successful_discovery_does_not_offer_modern_ver
     };
 
     let state = ox::build_state(config).await.unwrap();
-    assert_eq!(state.mcp.servers()[0].status, ox::mcp::Status::Connected);
+    assert_eq!(
+        state.services().mcp.servers()[0].status,
+        ox::mcp::Status::Connected
+    );
 }
 
 #[tokio::test]
@@ -433,7 +436,7 @@ async fn mcp_modern_mode_fails_closed_for_legacy_server() {
 
     let state = ox::build_state(config).await.unwrap();
     assert!(matches!(
-        state.mcp.servers()[0].status,
+        state.services().mcp.servers()[0].status,
         ox::mcp::Status::Failed { .. }
     ));
 }

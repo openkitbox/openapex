@@ -32,7 +32,6 @@ use ox_llm::cardinal::wire::{ChatMessage, ChatRequest};
 use ox_schema::event::SessionEventData;
 use ox_schema::message::{CompactionReason, Message};
 use ox_schema::support::{ModelRef, SessionError};
-use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 use super::drain::DrainCtx;
@@ -966,23 +965,7 @@ pub(crate) fn spawn_background_fold(ctx: &DrainCtx) {
         tracing::debug!(session = %ctx.session_id, "background fold already in flight");
         return;
     }
-    let ctx = DrainCtx {
-        session_id: ctx.session_id.clone(),
-        is_subagent: ctx.is_subagent,
-        directory: ctx.directory.clone(),
-        home: ctx.home.clone(),
-        config: ctx.config.clone(),
-        db: ctx.db.clone(),
-        bus: ctx.bus.clone(),
-        chat: Arc::clone(&ctx.chat),
-        tools: Arc::clone(&ctx.tools),
-        model_catalog: Arc::clone(&ctx.model_catalog),
-        mcp: ctx.mcp.clone(),
-        instruction_baselines: ctx.instruction_baselines.clone(),
-        calibrations: ctx.calibrations.clone(),
-        instruction_root: ctx.instruction_root.clone(),
-        fold_in_flight: Arc::clone(&ctx.fold_in_flight),
-    };
+    let ctx = ctx.clone();
     tokio::spawn(async move {
         // Cleared on every exit path — including a panic unwind, so a dead
         // fold can never wedge the gate shut.

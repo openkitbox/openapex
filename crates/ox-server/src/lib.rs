@@ -4,6 +4,7 @@
 //! drive it over HTTP against an ephemeral port.
 
 pub mod api;
+pub(crate) mod reload;
 pub(crate) mod worktree;
 
 pub use ox_core::{USER_AGENT, config, event_bus, projector};
@@ -122,18 +123,7 @@ pub async fn build_state_on_with_bus(
     // HTTP layer. A server that fails to connect is a status, never a
     // startup error.
     let mcp = Arc::new(ox_mcp::Hub::empty());
-    for tool in mcp.connect_all(&config.mcp, &directory).await {
-        let name = tool.name().to_owned();
-        // `ToolRegistry::register` replaces before it reports the duplicate,
-        // so check first: a server must never shadow a builtin.
-        if tools.get(&name).is_some() {
-            tracing::warn!(tool = %name, "MCP tool collides with an existing tool; skipped");
-            continue;
-        }
-        if let Err(error) = tools.register(tool) {
-            tracing::warn!(tool = %name, %error, "MCP tool skipped");
-        }
-    }
+    register_mcp_tools(&mcp, &config.mcp, &directory, &mut tools).await;
     let model_catalog = model_catalog::ModelCatalog::new(&config.llm);
     // The TUI renders its question dialog purely from the ephemeral
     // `form.created` / `form.replied` / `form.cancelled` frames, so the
@@ -156,19 +146,46 @@ pub async fn build_state_on_with_bus(
         bus,
         chat,
         tools,
-        Arc::clone(&model_catalog),
-        Arc::clone(&mcp),
+        model_catalog,
+        mcp,
         home,
     );
     Ok(AppState {
-        config,
         db: db_handle,
         bus: bus_handle,
         directory,
+        live: runner.live(),
         runner,
-        model_catalog,
-        mcp,
+        config_path: ox_core::config::Config::default_path(),
     })
+}
+
+/// Connect every configured MCP server through `hub` and register its tools.
+/// A server that fails to connect is a status, never an error; a tool that
+/// collides with an existing one is skipped with a warning. The names
+/// actually registered are recorded on the hub, so a reload removes exactly
+/// those and never a builtin that shadowed a skipped MCP tool.
+pub(crate) async fn register_mcp_tools(
+    hub: &ox_mcp::Hub,
+    config: &ox_core::config::McpConfig,
+    directory: &std::path::Path,
+    tools: &mut runner::ToolRegistry,
+) {
+    let mut registered = Vec::new();
+    for tool in hub.connect_all(config, directory).await {
+        let name = tool.name().to_owned();
+        // `ToolRegistry::register` replaces before it reports the duplicate,
+        // so check first: a server must never shadow a builtin.
+        if tools.get(&name).is_some() {
+            tracing::warn!(tool = %name, "MCP tool collides with an existing tool; skipped");
+            continue;
+        }
+        match tools.register(tool) {
+            Ok(()) => registered.push(name),
+            Err(error) => tracing::warn!(tool = %name, %error, "MCP tool skipped"),
+        }
+    }
+    hub.record_registered_tools(registered);
 }
 
 /// Build the salvo router for the given state.
@@ -179,7 +196,7 @@ pub fn build_router(state: AppState) -> Router {
 /// Open the DB, build the router and serve on `config.listen`.
 pub async fn run(config: Config) -> Result<()> {
     let (state, router) = compose(config).await?;
-    let acceptor = TcpListener::new(state.config.listen.clone())
+    let acceptor = TcpListener::new(state.services().config.listen.clone())
         .try_bind()
         .await?;
     serve_on(acceptor, state, router).await
@@ -211,16 +228,17 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
     // Fetch the model list before serving, so the first client that asks
     // (`/api/model` at TUI startup) gets models instead of an empty list. A
     // failure only warns: the request path retries on its own TTL.
-    state.model_catalog.warm().await;
+    let svc = state.services();
+    svc.model_catalog.warm().await;
     // Background memory consolidation. Idle unless `[magic_context]` enables
     // it, and deliberately not part of `build_state_with`: tests must not
     // acquire a background loop that writes to their database.
-    if state.config.magic_context.enabled && state.config.magic_context.dreamer_enabled {
+    if svc.config.magic_context.enabled && svc.config.magic_context.dreamer_enabled {
         mctx::dreamer::Dreamer::new(
             state.db.clone(),
-            state.config.clone(),
+            Arc::clone(&svc.config),
             state.runner.chat(),
-            Arc::clone(&state.model_catalog),
+            Arc::clone(&svc.model_catalog),
         )
         .spawn();
     }
@@ -239,7 +257,7 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
     // state, so old rows are swept on a fixed window (`[events] retention_days`,
     // 0 keeps everything). Deliberately started here rather than in
     // `build_state_with`: tests must not acquire a background writer.
-    event_bus::spawn_pruner(state.db.clone(), state.config.events.retention_days);
+    event_bus::spawn_pruner(state.db.clone(), svc.config.events.retention_days);
     let router = build_router(state.clone());
     Ok((state, router))
 }

@@ -83,6 +83,9 @@ pub struct Hub {
     connections: RwLock<BTreeMap<String, Arc<dyn Rpc>>>,
     resources: RwLock<Vec<ResourceInfo>>,
     templates: RwLock<Vec<TemplateInfo>>,
+    /// Names of the tools the owner registered from this hub; see
+    /// [`Hub::record_registered_tools`].
+    tool_names: RwLock<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +113,7 @@ impl Hub {
             connections: RwLock::new(BTreeMap::new()),
             resources: RwLock::new(Vec::new()),
             templates: RwLock::new(Vec::new()),
+            tool_names: RwLock::new(Vec::new()),
         }
     }
 
@@ -159,6 +163,19 @@ impl Hub {
             }
         }
         tools
+    }
+
+    /// Record which of the tools `connect_all` returned the owner actually
+    /// registered (a name that collided with an existing tool is skipped and
+    /// must not be listed). Replaces the previous record.
+    pub fn record_registered_tools(&self, names: Vec<String>) {
+        *self.tool_names.write().unwrap() = names;
+    }
+
+    /// Names recorded by [`Self::record_registered_tools`]: exactly the tools
+    /// a reload may remove from a registry without touching a builtin.
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tool_names.read().unwrap().clone()
     }
 
     pub fn servers(&self) -> Vec<ServerView> {
@@ -387,5 +404,71 @@ fn friendly(name: &str, error: &CallError) -> String {
         CallError::Rpc(error) => format!("MCP server `{name}` rejected the handshake: {error}"),
         CallError::Transport(message) => format!("MCP server `{name}`: {message}"),
         CallError::Unsupported(message) => format!("MCP server `{name}`: {message}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    const STUB: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"stub","version":"0"}}}\n' "$id"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"Echo","inputSchema":{"type":"object","properties":{}}}]}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+    fn config(directory: &Path, names: &[&str]) -> McpConfig {
+        let script = directory.join("server.sh");
+        std::fs::write(&script, STUB).unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let servers = names
+            .iter()
+            .map(|name| {
+                let server = serde_json::json!({
+                    "type": "local",
+                    "command": [script.display().to_string()],
+                    "protocol": "legacy",
+                });
+                ((*name).to_owned(), serde_json::from_value(server).unwrap())
+            })
+            .collect();
+        McpConfig { servers }
+    }
+
+    #[tokio::test]
+    async fn tool_names_hold_only_what_the_owner_recorded() {
+        let directory = tempfile::tempdir().unwrap();
+        // "a.b" and "a_b" sanitize to the same qualified name `a_b_echo`.
+        let config = config(directory.path(), &["a.b", "a_b", "other"]);
+        let hub = Hub::empty();
+        assert!(hub.tool_names().is_empty());
+
+        let tools = hub.connect_all(&config, directory.path()).await;
+        assert_eq!(tools.len(), 2);
+        assert!(
+            hub.tool_names().is_empty(),
+            "connect_all alone records nothing: the owner decides what it registered"
+        );
+
+        // The owner skipped one tool (collision with a builtin).
+        hub.record_registered_tools(vec![tools[0].name().to_owned()]);
+        assert_eq!(hub.tool_names(), [tools[0].name()]);
+    }
+
+    #[test]
+    fn recording_replaces_the_previous_names() {
+        let hub = Hub::empty();
+        hub.record_registered_tools(vec!["one_echo".to_owned()]);
+        hub.record_registered_tools(vec!["two_echo".to_owned()]);
+        assert_eq!(hub.tool_names(), ["two_echo"]);
     }
 }

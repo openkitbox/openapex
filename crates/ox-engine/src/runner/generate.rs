@@ -32,21 +32,23 @@ use super::drain::DrainCtx;
 /// Answer `prompt` from the session's current context. Read-only: the session
 /// transcript, the instruction baseline and the event log are untouched.
 pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result<String> {
+    let svc = inner.live.current();
     let (_agent, model) =
-        super::resolve_selection(&inner.db, session_id, &inner.config, &inner.model_catalog)
-            .await?;
+        super::resolve_selection(&inner.db, session_id, &svc.config, &svc.model_catalog).await?;
     let ctx = DrainCtx {
         session_id: session_id.to_owned(),
         is_subagent: false,
         directory: inner.directory.clone(),
         home: inner.home.clone(),
-        config: Arc::clone(&inner.config),
+        config: Arc::clone(&svc.config),
         db: inner.db.clone(),
         bus: inner.bus.clone(),
-        chat: Arc::clone(&inner.chat),
-        tools: Arc::clone(&inner.tools),
-        model_catalog: Arc::clone(&inner.model_catalog),
-        mcp: Arc::clone(&inner.mcp),
+        chat: Arc::clone(&svc.chat),
+        tools: Arc::clone(&svc.tools),
+        model_catalog: Arc::clone(&svc.model_catalog),
+        mcp: Arc::clone(&svc.mcp),
+        live: Arc::clone(&inner.live),
+        generation: svc.generation,
         instruction_baselines: Arc::clone(&inner.instruction_baselines),
         calibrations: Arc::clone(&inner.calibrations),
         // The session handle's cached git-toplevel anchor (the same slot the

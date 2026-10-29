@@ -12,10 +12,9 @@ use salvo::http::StatusCode;
 use salvo::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use ox_core::config::Config;
 use ox_core::event_bus::EventBus;
 use ox_db::Db;
-use ox_engine::runner::Runner;
+use ox_engine::runner::{Live, Runner, Services};
 use ox_llm::model_catalog::ModelCatalog;
 use ox_schema::id::now_millis;
 
@@ -33,8 +32,6 @@ pub mod vcs;
 /// Shared application state, injected via `salvo::affix_state`.
 #[derive(Clone)]
 pub struct AppState {
-    /// The loaded config, shared by reference; nothing mutates it after startup.
-    pub config: Arc<Config>,
     pub db: Db,
     /// In-process event bus; every session mutation is published through it.
     pub bus: EventBus,
@@ -42,12 +39,19 @@ pub struct AppState {
     pub directory: PathBuf,
     /// Per-session execution actor registry (task 6).
     pub runner: Runner,
-    /// The model catalogue the client lists (`GET /v1/models` on the gateway).
-    pub model_catalog: Arc<ox_llm::model_catalog::ModelCatalog>,
-    /// Connected MCP servers: status, resources and prompt instructions.
-    /// Shared with `Runner` so the system prompt and the API read the same
-    /// snapshot.
-    pub mcp: Arc<ox_mcp::Hub>,
+    /// Config-derived services (config, model catalogue, MCP hub, toolset),
+    /// shared with `Runner`; read through [`AppState::services`].
+    pub live: Arc<Live>,
+    /// The `ox.toml` a reload re-reads.
+    pub config_path: PathBuf,
+}
+
+impl AppState {
+    /// The current config-derived snapshot. Take it once per request so a
+    /// handler never mixes two generations.
+    pub fn services(&self) -> Arc<Services> {
+        self.live.current()
+    }
 }
 
 /// Fetch the injected app state; on failure logs the error and renders a
@@ -94,10 +98,11 @@ async fn server_info(depot: &mut Depot, res: &mut Response) {
     let Some(state) = state(depot, res) else {
         return;
     };
+    let svc = state.services();
     res.render(Json(ServerInfo {
         version: env!("CARGO_PKG_VERSION"),
         pid: std::process::id(),
-        urls: vec![format!("http://{}", state.config.listen)],
+        urls: vec![format!("http://{}", svc.config.listen)],
         paths: ServerPaths {
             tmp: std::env::temp_dir().to_string_lossy().into_owned(),
         },
@@ -145,6 +150,31 @@ async fn location_get(req: &mut Request, depot: &mut Depot, res: &mut Response) 
         },
         directory,
     }));
+}
+
+/// `POST /api/location/reload` — re-read `ox.toml` and hot-swap the services
+/// derived from it. Any failure answers 503 `ServiceUnavailableError` and the
+/// running services stay in place.
+#[handler] // operation_id: location.reload
+async fn location_reload(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(state) = state(depot, res) else {
+        return;
+    };
+    let directory = compat::directory_of(req);
+    match crate::reload::run(state, &directory).await {
+        Ok(()) => {
+            res.status_code(StatusCode::NO_CONTENT);
+        }
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "location reload failed");
+            res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+            res.render(Json(serde_json::json!({
+                "_tag": "ServiceUnavailableError",
+                "message": format!("{error:#}"),
+                "service": "location",
+            })));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -454,12 +484,13 @@ async fn model_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let Some(state) = state(depot, res) else {
         return;
     };
-    let entries = state.model_catalog.entries().await;
+    let svc = state.services();
+    let entries = svc.model_catalog.entries().await;
     let types = model_type_filter(req);
     let data = entries
         .iter()
         .filter(|entry| model_type_matches(entry, types.as_deref()))
-        .map(|entry| model_info(entry, &state.model_catalog))
+        .map(|entry| model_info(entry, &svc.model_catalog))
         .collect();
     res.render(Json(ModelList {
         location: LocationRef {
@@ -552,10 +583,11 @@ async fn model_default(req: &mut Request, depot: &mut Depot, res: &mut Response)
     let Some(state) = state(depot, res) else {
         return;
     };
-    let data = state
+    let svc = state.services();
+    let data = svc
         .model_catalog
-        .default_entry(&state.config.llm)
-        .map(|entry| model_info(&entry, &state.model_catalog));
+        .default_entry(&svc.config.llm)
+        .map(|entry| model_info(&entry, &svc.model_catalog));
     res.render(Json(ModelDefault {
         location: LocationRef {
             directory: compat::directory_of(req),
@@ -593,7 +625,7 @@ async fn provider_list(req: &mut Request, depot: &mut Depot, res: &mut Response)
     let Some(state) = state(depot, res) else {
         return;
     };
-    let entries = state.model_catalog.entries().await;
+    let entries = state.services().model_catalog.entries().await;
     let mut data: Vec<ProviderInfo> = Vec::new();
     for m in entries.iter() {
         if data.iter().any(|p| p.id == m.provider) {
@@ -681,7 +713,11 @@ pub fn build_router(state: AppState) -> Router {
         .push(
             Router::with_path("api")
                 .push(Router::with_path("info").get(server_info))
-                .push(Router::with_path("location").get(location_get))
+                .push(
+                    Router::with_path("location")
+                        .get(location_get)
+                        .push(Router::with_path("reload").post(location_reload)),
+                )
                 .push(Router::with_path("project").get(project_list))
                 .push(
                     Router::with_path("worktree")

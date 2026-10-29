@@ -64,13 +64,12 @@ async fn spawn_server(heartbeat_ms: u64) -> TestServer {
         std::sync::Arc::clone(&model_catalog),
     );
     let state = AppState {
-        config,
         bus: bus.clone(),
         db,
         directory: std::env::current_dir().unwrap(),
+        live: runner.live(),
         runner,
-        model_catalog,
-        mcp: std::sync::Arc::new(ox::mcp::Hub::empty()),
+        config_path: dir.path().join("ox.toml"),
     };
     let router = ox::build_router(state);
     let listen = format!("127.0.0.1:{port}");

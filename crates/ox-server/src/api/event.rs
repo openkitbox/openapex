@@ -123,7 +123,7 @@ pub(crate) async fn subscribe(req: &mut Request, depot: &mut Depot, res: &mut Re
 
     let bus: EventBus = state.bus.clone();
     // Guard against a zero interval spinning the select loop.
-    let period = Duration::from_millis(state.config.event_heartbeat_ms.max(1));
+    let period = Duration::from_millis(state.services().config.event_heartbeat_ms.max(1));
     stream(res, bus, period, cursor, None, true, true).await;
 }
 
@@ -170,7 +170,7 @@ pub(crate) async fn log(req: &mut Request, depot: &mut Depot, res: &mut Response
         .map(|raw| raw == "true" || raw == "1")
         .unwrap_or(false);
     let bus: EventBus = state.bus.clone();
-    let period = Duration::from_millis(state.config.event_heartbeat_ms.max(1));
+    let period = Duration::from_millis(state.services().config.event_heartbeat_ms.max(1));
     stream(
         res,
         bus,

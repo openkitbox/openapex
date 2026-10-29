@@ -270,7 +270,8 @@ impl ModelCatalog {
     /// endpoint fails the refresh errors, so the previous list is kept
     /// (legacy single-endpoint behavior included). A catalogue with no
     /// endpoints (the [`Self::from_entries`] seed) is returned untouched.
-    async fn refresh(&self) -> Result<()> {
+    /// Reload calls this to pre-warm a new catalogue before installing it.
+    pub async fn refresh(&self) -> Result<()> {
         if self.endpoints.is_empty() {
             // `from_entries` seeds a fetchless catalogue; a TTL refresh must
             // not replace the seed with an empty snapshot.

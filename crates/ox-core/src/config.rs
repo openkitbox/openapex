@@ -1,7 +1,7 @@
 //! Configuration loaded from `~/.ox/ox.toml` with environment-variable overrides.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -286,6 +286,22 @@ pub fn ox_home() -> PathBuf {
     user_home().join(".ox")
 }
 
+/// A parse failure naming the file, the toml message and the line/column,
+/// without toml's source-line snippet (the line could hold `cardinal_key`).
+fn parse_error(path: &Path, raw: &str, error: &toml::de::Error) -> anyhow::Error {
+    let at = error.span().map_or(String::new(), |span| {
+        let before = &raw.as_bytes()[..span.start.min(raw.len())];
+        let line = before.iter().filter(|b| **b == b'\n').count() + 1;
+        let column = before.iter().rev().take_while(|b| **b != b'\n').count() + 1;
+        format!(" (line {line}, column {column})")
+    });
+    anyhow::anyhow!(
+        "failed to parse config file {}: {}{at}",
+        path.display(),
+        error.message()
+    )
+}
+
 impl Config {
     /// Default config file location: `~/.ox/ox.toml`.
     pub fn default_path() -> PathBuf {
@@ -303,8 +319,7 @@ impl Config {
         let mut config = if path.exists() {
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("failed to read config file {}", path.display()))?;
-            toml::from_str(&raw)
-                .with_context(|| format!("failed to parse config file {}", path.display()))?
+            toml::from_str(&raw).map_err(|error| parse_error(&path, &raw, &error))?
         } else {
             Config::default()
         };
@@ -330,6 +345,41 @@ impl Config {
         config.mcp.validate()?;
         config.llm.validate()?;
         Ok(config)
+    }
+
+    /// Restore every key that cannot be hot-swapped to its running value; return the
+    /// names of the keys whose new value was rejected (empty when nothing differed).
+    ///
+    /// Names come back in a fixed order: `listen`, `db_path`, `event_heartbeat_ms`,
+    /// `events`, `subagent`, `magic_context`. `llm` and `mcp` are hot-swappable and
+    /// never touched. Clones happen only for keys that differ, at a reload boundary.
+    pub fn pin_restart_only(&mut self, running: &Config) -> Vec<&'static str> {
+        let mut rejected = Vec::new();
+        if self.listen != running.listen {
+            self.listen.clone_from(&running.listen);
+            rejected.push("listen");
+        }
+        if self.db_path != running.db_path {
+            self.db_path.clone_from(&running.db_path);
+            rejected.push("db_path");
+        }
+        if self.event_heartbeat_ms != running.event_heartbeat_ms {
+            self.event_heartbeat_ms = running.event_heartbeat_ms;
+            rejected.push("event_heartbeat_ms");
+        }
+        if self.events.retention_days != running.events.retention_days {
+            self.events = running.events.clone();
+            rejected.push("events");
+        }
+        if self.subagent.depth != running.subagent.depth {
+            self.subagent = running.subagent.clone();
+            rejected.push("subagent");
+        }
+        if self.magic_context != running.magic_context {
+            self.magic_context.clone_from(&running.magic_context);
+            rejected.push("magic_context");
+        }
+        rejected
     }
 }
 
@@ -595,4 +645,102 @@ pub enum EmbeddingProvider {
     /// split into `open-ai-compatible`.
     #[serde(rename = "openai-compatible")]
     OpenAiCompatible,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A config where every restart-only key differs from `Config::default()`.
+    fn all_restart_only_changed() -> Config {
+        let base = Config::default();
+        Config {
+            listen: "127.0.0.1:1".into(),
+            db_path: PathBuf::from("/elsewhere/ox.db"),
+            event_heartbeat_ms: 1,
+            events: EventsConfig { retention_days: 99 },
+            subagent: SubagentConfig { depth: 9 },
+            magic_context: MctxConfig {
+                enabled: !base.magic_context.enabled,
+                ..base.magic_context.clone()
+            },
+            ..base
+        }
+    }
+
+    #[test]
+    fn pin_restart_only_restores_each_key_and_names_it() {
+        type Mutate = fn(&mut Config);
+        let table: [(&str, Mutate); 6] = [
+            ("listen", |c| c.listen = "127.0.0.1:1".into()),
+            ("db_path", |c| c.db_path = PathBuf::from("/elsewhere/ox.db")),
+            ("event_heartbeat_ms", |c| c.event_heartbeat_ms = 1),
+            ("events", |c| c.events.retention_days = 99),
+            ("subagent", |c| c.subagent.depth = 9),
+            ("magic_context", |c| {
+                c.magic_context.enabled = !c.magic_context.enabled
+            }),
+        ];
+        for (name, mutate) in table {
+            let running = Config::default();
+            let mut next = Config::default();
+            mutate(&mut next);
+            let rejected = next.pin_restart_only(&running);
+            assert_eq!(rejected, vec![name], "key {name}");
+            assert_eq!(next.listen, running.listen, "key {name}");
+            assert_eq!(next.db_path, running.db_path, "key {name}");
+            assert_eq!(next.event_heartbeat_ms, running.event_heartbeat_ms);
+            assert_eq!(next.events.retention_days, running.events.retention_days);
+            assert_eq!(next.subagent.depth, running.subagent.depth);
+            assert_eq!(next.magic_context, running.magic_context);
+        }
+    }
+
+    #[test]
+    fn pin_restart_only_keeps_hot_keys() {
+        let running = Config::default();
+        let mut next = Config::default();
+        next.llm.cardinal_url = "http://example.invalid:1".into();
+        next.mcp.servers.insert(
+            "s".into(),
+            McpServerConfig::Remote(McpRemoteConfig {
+                url: "https://example.invalid".into(),
+                headers: None,
+                disabled: false,
+                protocol: McpProtocol::Auto,
+                timeout: McpTimeout::default(),
+            }),
+        );
+        let rejected = next.pin_restart_only(&running);
+        assert!(rejected.is_empty());
+        assert_eq!(next.llm.cardinal_url, "http://example.invalid:1");
+        assert!(next.mcp.servers.contains_key("s"));
+    }
+
+    #[test]
+    fn pin_restart_only_identical_returns_empty() {
+        let running = Config::default();
+        let mut next = Config::default();
+        assert!(next.pin_restart_only(&running).is_empty());
+    }
+
+    #[test]
+    fn pin_restart_only_reports_all_changes_in_declared_order() {
+        let running = Config::default();
+        let mut next = all_restart_only_changed();
+        let rejected = next.pin_restart_only(&running);
+        assert_eq!(
+            rejected,
+            vec![
+                "listen",
+                "db_path",
+                "event_heartbeat_ms",
+                "events",
+                "subagent",
+                "magic_context"
+            ]
+        );
+        assert_eq!(next.listen, running.listen);
+        assert_eq!(next.magic_context, running.magic_context);
+    }
 }

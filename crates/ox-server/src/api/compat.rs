@@ -134,7 +134,7 @@ pub(crate) async fn mcp_list(req: &mut Request, depot: &mut Depot, res: &mut Res
         return;
     };
     let directory = directory_of(req);
-    let data = serde_json::to_value(state.mcp.servers()).unwrap_or_else(|_| json!([]));
+    let data = serde_json::to_value(state.services().mcp.servers()).unwrap_or_else(|_| json!([]));
     res.render(Json(envelope(&directory, data)));
 }
 
@@ -147,7 +147,7 @@ pub(crate) async fn mcp_resource_catalog(req: &mut Request, depot: &mut Depot, r
         return;
     };
     let directory = directory_of(req);
-    let (resources, templates) = state.mcp.resources();
+    let (resources, templates) = state.services().mcp.resources();
     res.render(Json(envelope(
         &directory,
         json!({ "resources": resources, "templates": templates }),

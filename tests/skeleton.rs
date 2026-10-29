@@ -34,7 +34,7 @@ async fn spawn_server_with(mut config: Config) -> (String, JoinHandle<()>, TempD
     config.db_path = db_path;
     config.listen = format!("127.0.0.1:{port}");
     let state = ox::build_state(config.clone()).await.unwrap();
-    state.model_catalog.warm().await;
+    state.services().model_catalog.warm().await;
     let router = ox::build_router(state);
     let listen: String = config.listen.clone();
     let handle = tokio::spawn(async move {
@@ -544,13 +544,12 @@ async fn project_list_reads_upstream_project_table() {
     );
     let listen: String = config.listen.clone();
     let state = AppState {
-        config,
         bus,
         db,
         directory: std::env::current_dir().unwrap(),
+        live: runner.live(),
         runner,
-        model_catalog,
-        mcp: std::sync::Arc::new(ox::mcp::Hub::empty()),
+        config_path: dir.path().join("ox.toml"),
     };
     let router = ox::build_router(state);
     let handle = tokio::spawn(async move {

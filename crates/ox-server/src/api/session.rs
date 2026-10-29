@@ -1047,9 +1047,11 @@ pub(crate) async fn update(req: &mut Request, depot: &mut Depot, res: &mut Respo
 fn spawn_title_generation(app: &crate::api::AppState, session_id: String) {
     let db = app.db.clone();
     let bus = app.bus.clone();
-    let chat = app.runner.chat();
-    let config = app.config.clone();
-    let catalog = Arc::clone(&app.model_catalog);
+    // One snapshot, so chat, catalog and config share a generation.
+    let svc = app.services();
+    let chat = Arc::clone(&svc.chat);
+    let config = Arc::clone(&svc.config);
+    let catalog = Arc::clone(&svc.model_catalog);
     tokio::spawn(async move {
         ox_engine::runner::title::generate(db, bus, chat, config, catalog, session_id).await;
     });

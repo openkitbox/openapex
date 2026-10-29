@@ -620,7 +620,7 @@ impl Harness {
         if with_catalog {
             // The composition root warms the catalogue before serving; this
             // test seam does not, and the fold gate needs the model window.
-            state.model_catalog.warm().await;
+            state.services().model_catalog.warm().await;
         }
         let db = state.db.clone();
         let bus = state.bus.clone();
@@ -4426,4 +4426,157 @@ async fn deleting_a_session_forgets_its_runner_tables() {
         (0, 0),
         "the delete forgot the registry entry and the baseline"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Location reload: services swap at a step boundary
+// ---------------------------------------------------------------------------
+
+/// A named tool holding its first execution open: it signals `entered`, then
+/// waits for `release`. Lets a test act while a step's tools are running.
+struct HandshakeTool {
+    name: &'static str,
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+impl Tool for HandshakeTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn definition(&self) -> ToolDef {
+        ToolDef {
+            kind: FunctionType::Function,
+            function: FunctionDef {
+                name: self.name.to_owned(),
+                description: "handshake test tool".to_owned(),
+                parameters: json!({ "type": "object", "properties": {} }),
+            },
+        }
+    }
+
+    fn execute(
+        &self,
+        _ctx: ToolContext,
+        _input: Value,
+    ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
+        let entered = Arc::clone(&self.entered);
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            entered.notify_one();
+            release.notified().await;
+            ToolOutput {
+                content: json!({ "ok": true }),
+                error: None,
+                metadata: None,
+                attachments: None,
+            }
+        })
+    }
+}
+
+/// Install a generation that keeps everything but the chat transport.
+async fn replace_chat(runner: &Runner, chat: Arc<dyn Chat>) {
+    runner
+        .live()
+        .replace(|old| async move {
+            Ok(ox::runner::ServiceSet {
+                config: old.config.clone(),
+                chat,
+                model_catalog: old.model_catalog.clone(),
+                mcp: old.mcp.clone(),
+                tools: old.tools.clone(),
+            })
+        })
+        .await
+        .expect("replace");
+}
+
+/// A reload that lands while a step's tool runs takes effect at the next step:
+/// the first step was issued on chat A, the continuation on chat B.
+#[tokio::test]
+async fn reload_between_steps_switches_chat() {
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let harness = Harness::spawn_with(
+        vec![MockChat::tool_turn("call_1", "test_handshake", "{}")],
+        registry_with(Arc::new(HandshakeTool {
+            name: "test_handshake",
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        })),
+    )
+    .await;
+    let chat_b = Arc::new(MockChat::new(vec![MockChat::text("from b")]));
+
+    let session_id = harness.create_session().await;
+    let response = harness
+        .post(
+            &format!("/api/session/{session_id}/prompt"),
+            json!({ "text": "go" }),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+
+    entered.notified().await;
+    replace_chat(&harness.runner, chat_b.clone()).await;
+    release.notify_one();
+    harness.wait_event("session.execution.succeeded").await;
+
+    assert_eq!(harness.chat.requests().len(), 1, "chat A saw only step one");
+    assert_eq!(chat_b.requests().len(), 1, "chat B saw only step two");
+    assert!(
+        request_text(&chat_b.requests()[0]).contains("ok"),
+        "the continuation replays the tool result"
+    );
+}
+
+/// A subagent session's toolset stays free of `question` across a reload:
+/// the child registry is re-derived with the new generation.
+#[tokio::test]
+async fn reload_keeps_question_out_of_subagent_tools() {
+    let mut tools = ToolRegistry::new();
+    for name in ["question", "test_handshake"] {
+        tools
+            .register(Arc::new(HandshakeTool {
+                name,
+                entered: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
+            }))
+            .expect("register");
+    }
+    let harness = Harness::spawn_with(vec![], tools).await;
+    let chat_b = Arc::new(MockChat::new(vec![MockChat::text("child done")]));
+    replace_chat(&harness.runner, chat_b.clone()).await;
+
+    let parent = harness.create_session().await;
+    let response = harness
+        .post(
+            "/api/session",
+            json!({ "title": "child", "parentID": parent }),
+        )
+        .await;
+    assert_eq!(response.status(), 200, "child create");
+    let body: Value = response.json().await.expect("json");
+    let child = body["data"]["id"].as_str().expect("child id").to_owned();
+
+    let response = harness
+        .post(
+            &format!("/api/session/{child}/prompt"),
+            json!({ "text": "work" }),
+        )
+        .await;
+    assert_eq!(response.status(), 200);
+    harness.wait_event("session.execution.succeeded").await;
+
+    let requests = chat_b.requests();
+    assert_eq!(requests.len(), 1, "the child ran on the new generation");
+    let names: Vec<&str> = requests[0]
+        .tools
+        .iter()
+        .map(|tool| tool.function.name.as_str())
+        .collect();
+    assert!(names.contains(&"test_handshake"), "{names:?}");
+    assert!(!names.contains(&"question"), "{names:?}");
 }

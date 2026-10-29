@@ -92,6 +92,7 @@ impl InboxRow {
 }
 
 /// Everything one busy period's drains and steps share.
+#[derive(Clone)]
 pub(crate) struct DrainCtx {
     pub session_id: String,
     /// Whether this session was spawned by another session. Resolved once
@@ -109,6 +110,10 @@ pub(crate) struct DrainCtx {
     pub model_catalog: Arc<ox_llm::model_catalog::ModelCatalog>,
     /// MCP servers whose instructions join the system prompt.
     pub mcp: Arc<ox_mcp::Hub>,
+    /// Source of the config-derived fields above, and the generation they
+    /// were taken from; [`DrainCtx::refresh`] re-points them at a newer one.
+    pub live: Arc<super::Live>,
+    pub generation: u64,
     /// Per-session keyed-instruction baselines, shared by every actor of the
     /// process (the instruction layer's frozen initial render rides system[1]).
     pub instruction_baselines: std::sync::Arc<
@@ -124,6 +129,23 @@ pub(crate) struct DrainCtx {
     /// drain entry knows a running compaction row is alive, and so a manual
     /// compaction never runs beside a fold.
     pub fold_in_flight: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DrainCtx {
+    /// Re-point the config-derived services at the newest generation. A
+    /// cheap no-op (one read lock) while the generation is unchanged.
+    pub(crate) fn refresh(&mut self) {
+        if self.live.generation() == self.generation {
+            return;
+        }
+        let svc = self.live.current();
+        self.config = Arc::clone(&svc.config);
+        self.chat = Arc::clone(&svc.chat);
+        self.model_catalog = Arc::clone(&svc.model_catalog);
+        self.mcp = Arc::clone(&svc.mcp);
+        self.tools = svc.tools_for(self.is_subagent);
+        self.generation = svc.generation;
+    }
 }
 
 /// Run drains until the inbox is quiet, a control interrupts, or a turn
@@ -287,17 +309,32 @@ enum TurnOutcome {
 /// truncated response carried tool calls (`needsContinuation`), else via a
 /// synthetic user prompt, giving up after three consecutive truncations
 /// (upstream `Outcome.OutputLimit`).
-async fn run_turn(ctx: &DrainCtx, token: &CancellationToken) -> Result<TurnOutcome> {
-    let (agent, model) =
-        match resolve_selection(&ctx.db, &ctx.session_id, &ctx.config, &ctx.model_catalog).await {
-            Ok(selection) => selection,
-            Err(error) => return Ok(TurnOutcome::Failed(unknown_error(error.to_string()))),
-        };
+///
+/// The turn works on its own copy of the busy period's context (one clone of
+/// Arc/String fields per turn) so it can follow a services reload: the copy
+/// is re-pointed at the newest generation when the turn starts and at the top
+/// of every step.
+async fn run_turn(busy: &DrainCtx, token: &CancellationToken) -> Result<TurnOutcome> {
+    let mut local = busy.clone();
+    local.refresh();
+    let (agent, model) = match resolve_selection(
+        &local.db,
+        &local.session_id,
+        &local.config,
+        &local.model_catalog,
+    )
+    .await
+    {
+        Ok(selection) => selection,
+        Err(error) => return Ok(TurnOutcome::Failed(unknown_error(error.to_string()))),
+    };
     let mut compacted = false;
     loop {
         if token.is_cancelled() {
             return Ok(TurnOutcome::Interrupted);
         }
+        local.refresh();
+        let ctx = &local;
         let mut params = super::step::StepParams {
             assistant_message_id: id::id("msg"),
             agent: &agent,
