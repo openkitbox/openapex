@@ -1581,3 +1581,93 @@ async fn pooled_connections_open_with_the_capped_page_cache() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// session.command / rpc.call (upstream endpoints with nothing registered)
+// ---------------------------------------------------------------------------
+
+/// ox registers no slash commands, so a known session answers upstream's
+/// `CommandNotFoundError` (404) with the command name echoed.
+#[tokio::test]
+async fn command_endpoint_reports_unregistered_commands() {
+    let h = Harness::spawn().await;
+    let id = h.create(json!({})).await;
+
+    let resp = h
+        .post(
+            &format!("/api/session/{id}/command"),
+            json!({ "name": "goal", "text": "ship it" }),
+        )
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["_tag"], "CommandNotFoundError");
+    assert_eq!(body["command"], "goal");
+    assert_eq!(body["message"], "Command not found: goal");
+}
+
+/// The session lookup runs before the command lookup (upstream handler order).
+#[tokio::test]
+async fn command_endpoint_checks_the_session_first() {
+    let h = Harness::spawn().await;
+    let resp = h
+        .post(
+            "/api/session/ses_missing/command",
+            json!({ "name": "goal", "text": "" }),
+        )
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["_tag"], "SessionNotFoundError");
+}
+
+/// `name` and `text` are required by the upstream payload schema.
+#[tokio::test]
+async fn command_endpoint_rejects_a_malformed_body() {
+    let h = Harness::spawn().await;
+    let id = h.create(json!({})).await;
+    let resp = h
+        .post(
+            &format!("/api/session/{id}/command"),
+            json!({ "text": "x" }),
+        )
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["_tag"], "InvalidRequestError");
+}
+
+/// No RPC is registered, so every call answers upstream's unregistered-RPC
+/// error: HTTP 400 `RpcError` with `type: "rpc.unavailable"`. The 2.2.1 TUI
+/// issues `opencode.goal/get` on every session open and ignores this reply.
+#[tokio::test]
+async fn rpc_endpoint_reports_unavailable_rpcs() {
+    let h = Harness::spawn().await;
+    let resp = h
+        .post(
+            "/api/rpc/opencode.goal/get",
+            json!({ "input": { "sessionID": "ses_x" } }),
+        )
+        .await;
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["_tag"], "RpcError");
+    assert_eq!(body["type"], "rpc.unavailable");
+    assert_eq!(body["message"], "RPC is unavailable: opencode.goal");
+}
+
+/// `input` is optional in the upstream payload, so an empty body still reaches
+/// the same answer instead of a parse error.
+#[tokio::test]
+async fn rpc_endpoint_accepts_an_empty_body() {
+    let h = Harness::spawn().await;
+    let resp = h
+        .client
+        .post(h.url("/api/rpc/x/y"))
+        .send()
+        .await
+        .expect("POST");
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.expect("json");
+    assert_eq!(body["type"], "rpc.unavailable");
+}

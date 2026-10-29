@@ -2429,6 +2429,57 @@ pub(crate) async fn move_session(req: &mut Request, depot: &mut Depot, res: &mut
 }
 
 // ---------------------------------------------------------------------------
+// session.command — POST /api/session/{sessionID}/command
+// ---------------------------------------------------------------------------
+
+/// Upstream payload: `name` plus the prompt fields and `delivery`. ox
+/// registers no commands, so only `name` is read; unknown fields are ignored.
+#[derive(Default, Deserialize)]
+struct CommandBody {
+    name: String,
+}
+
+/// Execute a slash command (upstream `session.command`). Handler order
+/// follows upstream: session lookup, then command lookup. `GET /api/command`
+/// lists no commands, so every name is unregistered and answers
+/// `CommandNotFoundError` (404) — the same reply upstream gives for a name
+/// that is not in its table.
+#[handler] // operation_id: session.command
+pub(crate) async fn command(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(app) = state(depot, res) else {
+        return;
+    };
+    let Some(session_id) = req.param::<String>("sessionID") else {
+        invalid_request(res, "Missing sessionID");
+        return;
+    };
+    let Some(body) = parse_body::<CommandBody>(req, res).await else {
+        return;
+    };
+    if body.name.is_empty() {
+        invalid_request(res, "Invalid request body");
+        return;
+    }
+    match load_session(&app.db, &session_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            session_not_found(res, &session_id);
+            return;
+        }
+        Err(error) => {
+            unknown_error(res, &error);
+            return;
+        }
+    }
+    res.status_code(StatusCode::NOT_FOUND);
+    res.render(Json(json!({
+        "_tag": "CommandNotFoundError",
+        "command": body.name,
+        "message": format!("Command not found: {}", body.name),
+    })));
+}
+
+// ---------------------------------------------------------------------------
 // session.synthetic — POST /api/session/{sessionID}/synthetic
 // ---------------------------------------------------------------------------
 

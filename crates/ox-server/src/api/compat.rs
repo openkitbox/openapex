@@ -108,6 +108,23 @@ empty_catalog!(reference_list, "reference.list");
 empty_catalog!(plugin_list, "plugin.list");
 empty_catalog!(integration_list, "integration.list");
 
+/// `POST /api/rpc/{rpcID}/{method}` — upstream `rpc.call`. ox registers no
+/// plugin RPCs, so every call gets upstream's unregistered-RPC reply
+/// (`core/src/rpc.ts`: `rpc.unavailable`, mapped by `handlers/rpc.ts` to the
+/// 400 `RpcError`). The body is never read: `input` is optional upstream, and
+/// the answer does not depend on it. The 2.2.1 TUI calls `opencode.goal/get`
+/// on every session open and treats any error as "no goal".
+#[handler] // operation_id: rpc.call
+pub(crate) async fn rpc_call(req: &mut Request, res: &mut Response) {
+    let rpc_id = req.param::<String>("rpcID").unwrap_or_default();
+    res.status_code(StatusCode::BAD_REQUEST);
+    res.render(Json(json!({
+        "_tag": "RpcError",
+        "type": "rpc.unavailable",
+        "message": format!("RPC is unavailable: {rpc_id}"),
+    })));
+}
+
 /// `GET /api/mcp` — upstream `mcp.list`: every configured server with its
 /// live status. The shape is `Mcp.Server[]`; `status` is a tagged object
 /// (`{"status":"connected"}` / `{"status":"failed","error":"..."}`).
@@ -257,6 +274,7 @@ pub(crate) fn mount(api: Router) -> Router {
         Router::new()
             .push(Router::with_path("config").get(config_get))
             .push(Router::with_path("command").get(command_list))
+            .push(Router::with_path("rpc/{rpcID}/{method}").post(rpc_call))
             .push(Router::with_path("mcp").get(mcp_list))
             .push(Router::with_path("mcp/resource").get(mcp_resource_catalog))
             .push(Router::with_path("provider").get(super::provider_list))
