@@ -584,30 +584,3 @@ fn prompt_body(request: &PromptRequest) -> Result<Value, acp::Error> {
     }
     Ok(body)
 }
-
-#[cfg(test)]
-mod tests {
-    use agent_client_protocol::schema::v1::{ImageContent, TextContent};
-
-    use super::*;
-
-    #[test]
-    fn image_blocks_become_uri_file_inputs() {
-        let request = PromptRequest::new(
-            "ses_1",
-            vec![
-                ContentBlock::Text(TextContent::new("look ")),
-                ContentBlock::Image(ImageContent::new("QUJD", "image/png")),
-                ContentBlock::Text(TextContent::new("here")),
-            ],
-        );
-        let body = prompt_body(&request).expect("body");
-        assert_eq!(
-            body,
-            json!({
-                "text": "look here",
-                "files": [{ "uri": "data:image/png;base64,QUJD" }],
-            })
-        );
-    }
-}

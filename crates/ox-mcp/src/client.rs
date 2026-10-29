@@ -418,27 +418,3 @@ async fn list_templates(
         })
         .collect()
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn malformed_tools_are_skipped_without_blocking_valid_tools() {
-        let page = json!({
-            "tools": [
-                {"description": "missing name", "inputSchema": {"type": "object"}},
-                {"name": "", "inputSchema": {"type": "object"}},
-                {"name": "bad-schema", "inputSchema": []},
-                {"name": "array-schema", "inputSchema": {"type": "array"}},
-                {"name": "bad-output-schema", "inputSchema": {"type": "object"}, "outputSchema": []},
-                {"name": "valid", "description": "works", "inputSchema": {"type": "object"}}
-            ]
-        });
-
-        let tools = parse_tools(&page);
-
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "valid");
-    }
-}

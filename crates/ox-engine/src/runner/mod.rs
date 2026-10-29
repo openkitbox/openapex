@@ -25,9 +25,6 @@
 pub use ox_llm::cardinal::chat::Chat;
 pub use services::{Live, ServiceSet, Services};
 
-/// `pub` for the same reason as `drain` and `step`: the checkpoint-bound
-/// helpers are exercised from `tests/` (the crate carries no `#[cfg(test)]`
-/// modules).
 pub mod compaction;
 pub mod drain;
 pub(crate) mod generate;
