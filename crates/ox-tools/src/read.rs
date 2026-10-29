@@ -493,12 +493,23 @@ fn media_mime_for(absolute: &Path) -> Option<&'static str> {
     })
 }
 
-/// Media detection by magic bytes for `MEDIA_MIMES` (PNG/JPEG/GIF/WebP/PDF).
+/// Media MIME by magic bytes for `MEDIA_MIMES` (PNG/JPEG/GIF/WebP/PDF).
+pub fn sniff_media(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        Some("image/webp")
+    } else if bytes.starts_with(b"%PDF") {
+        Some("application/pdf")
+    } else {
+        None
+    }
+}
+
 fn is_media(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"\x89PNG\r\n\x1a\n")
-        || bytes.starts_with(&[0xFF, 0xD8, 0xFF])
-        || bytes.starts_with(b"GIF87a")
-        || bytes.starts_with(b"GIF89a")
-        || (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"))
-        || bytes.starts_with(b"%PDF")
+    sniff_media(bytes).is_some()
 }

@@ -19,6 +19,7 @@ use ox_engine::runner::Runner;
 use ox_llm::model_catalog::ModelCatalog;
 use ox_schema::id::now_millis;
 
+mod attachment;
 pub mod compat;
 pub mod event;
 pub mod files;

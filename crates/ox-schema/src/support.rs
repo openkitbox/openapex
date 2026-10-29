@@ -8,6 +8,7 @@
 //! - `model.ts`          -> [`ModelRef`]
 //! - `money.ts`          -> [`MoneyUsd`]
 //! - `prompt.ts`         -> [`Prompt`], [`FileAttachment`], [`AgentAttachment`], [`SkillAttachment`]
+//! - `prompt-input.ts`   -> [`FileInput`]
 //! - `location.ts`       -> [`LocationRef`]
 //! - `session-fork.ts`   -> [`ForkBoundary`]
 //! - `permission.ts`     -> [`Rule`], [`Effect`]
@@ -22,6 +23,8 @@
 //!
 //! Upstream branded IDs (`Model.ID`, `Agent.ID`, `Snapshot.ID`, ...) are plain
 //! `String` here; the brands carry no wire information.
+
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -211,10 +214,27 @@ pub struct PromptMention {
     pub text: String,
 }
 
+/// Upstream `PromptInput.FileAttachment` — the request-side shape of a prompt
+/// file (`session.prompt` body). Distinct from the stored [`FileAttachment`]:
+/// the server materializes `uri` into `data`/`mime`/`source` at admission.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FileInput {
+    pub uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mention: Option<PromptMention>,
+}
+
 /// Upstream `Prompt.FileAttachment`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FileAttachment {
-    pub data: String,
+    /// Base64 payload. `Arc<str>` because the same payload is shared by the
+    /// inbox item, the event and the projected message row instead of being
+    /// deep-cloned at each hop (a 20 MiB image is ~27 MB of base64).
+    pub data: Arc<str>,
     pub mime: String,
     pub source: FileSource,
     #[serde(skip_serializing_if = "Option::is_none")]

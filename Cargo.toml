@@ -77,6 +77,7 @@ tracing-appender = "0.2.5"
 tracing-subscriber = "0.3"
 tui-textarea = { version = "0.7", default-features = false }
 unicode-width = "0.2"
+url = "2"
 
 # pi-builtins and the vendored brush-core pull brush-core/brush-parser from
 # crates.io; omp redirects those to its vendored forks at the workspace root.

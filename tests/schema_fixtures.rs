@@ -103,6 +103,31 @@ fn message_user_with_attachments() {
 }
 
 #[test]
+fn prompt_input_file_deserializes() {
+    use ox::schema::support::FileInput;
+
+    let minimal: FileInput =
+        serde_json::from_value(json!({ "uri": "data:image/png;base64,aGk=", "name": "a.png" }))
+            .expect("minimal input parses");
+    assert_eq!(minimal.uri, "data:image/png;base64,aGk=");
+    assert_eq!(minimal.name.as_deref(), Some("a.png"));
+    assert!(minimal.description.is_none());
+    assert!(minimal.mention.is_none());
+
+    // Absent optional fields are skipped on serialize.
+    round_trip::<FileInput>(json!({ "uri": "data:image/png;base64,aGk=", "name": "a.png" }));
+    round_trip::<FileInput>(json!({ "uri": "file:///tmp/x.txt" }));
+
+    // Every field present.
+    round_trip::<FileInput>(json!({
+        "uri": "file:///tmp/x.txt?start=2&end=3",
+        "name": "x.txt",
+        "description": "a note",
+        "mention": { "start": 8, "end": 17, "text": "this file" }
+    }));
+}
+
+#[test]
 fn message_synthetic() {
     round_trip::<Message>(json!({
         "type": "synthetic",

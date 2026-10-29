@@ -539,9 +539,10 @@ fn percent_encode(value: &str) -> String {
 }
 
 /// Translate an ACP prompt into ox's `PromptBody` JSON (`src/api/session.rs`):
-/// text blocks concatenate into `text`; images become ox `FileAttachment`s in
-/// the base64 data-URL shape the opencode client sends; resource links and
-/// embedded text resources ride in the text.
+/// text blocks concatenate into `text`; images become upstream `PromptInput`
+/// file inputs `{ "uri": "data:<mime>;base64,<data>" }` (the server
+/// materializes them); resource links and embedded text resources ride in the
+/// text.
 fn prompt_body(request: &PromptRequest) -> Result<Value, acp::Error> {
     let mut text = String::new();
     let mut files = Vec::new();
@@ -552,10 +553,7 @@ fn prompt_body(request: &PromptRequest) -> Result<Value, acp::Error> {
             }
             ContentBlock::Image(image) => {
                 files.push(json!({
-                    "data": format!("data:{};base64,{}", image.mime_type, image.data),
-                    "mime": image.mime_type,
-                    // ox `FileSource` is a tagged union: inline | uri.
-                    "source": { "type": "inline" },
+                    "uri": format!("data:{};base64,{}", image.mime_type, image.data),
                 }));
             }
             ContentBlock::ResourceLink(link) => {
@@ -585,4 +583,31 @@ fn prompt_body(request: &PromptRequest) -> Result<Value, acp::Error> {
         body["files"] = json!(files);
     }
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use agent_client_protocol::schema::v1::{ImageContent, TextContent};
+
+    use super::*;
+
+    #[test]
+    fn image_blocks_become_uri_file_inputs() {
+        let request = PromptRequest::new(
+            "ses_1",
+            vec![
+                ContentBlock::Text(TextContent::new("look ")),
+                ContentBlock::Image(ImageContent::new("QUJD", "image/png")),
+                ContentBlock::Text(TextContent::new("here")),
+            ],
+        );
+        let body = prompt_body(&request).expect("body");
+        assert_eq!(
+            body,
+            json!({
+                "text": "look here",
+                "files": [{ "uri": "data:image/png;base64,QUJD" }],
+            })
+        );
+    }
 }

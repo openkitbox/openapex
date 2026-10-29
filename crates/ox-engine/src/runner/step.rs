@@ -73,8 +73,8 @@ use ox_schema::message::{
     AssistantContent, Compaction, CompactionCompleted, CompactionMessage, Message, ToolState,
 };
 use ox_schema::support::{
-    Content, FinishReason, ModelRef, Prompt, Record, SessionError, SessionErrorResponse,
-    TokenCache, TokenUsage,
+    Content, FileAttachment, FileSource, FinishReason, ModelRef, Prompt, Record, SessionError,
+    SessionErrorResponse, TokenCache, TokenUsage,
 };
 
 use super::ToolContext;
@@ -1589,10 +1589,9 @@ fn effective_end_ms(message: &Message) -> i64 {
 /// instruction layer is filtered (upstream `baseTranscript`).
 ///
 /// Mapping (upstream `to-llm-message.ts`):
-/// - `user`     → `{role: "user", content: joined text parts}`, dropped
-///   entirely when the assembled content is empty (to-llm-message.ts:274);
-///   file attachments degrade to inline markers (upstream inlines resolved
-///   file content during prompt preparation, which lands in 6b).
+/// - `user`     → `{role: "user", content}` — a string, or a parts list when
+///   the prompt carries an image ([`user_message_content`]) — dropped entirely
+///   when the assembled content is empty (to-llm-message.ts:274).
 /// - `synthetic`/`skill` → user-role text.
 /// - `system`   → `{role: "system", content}` (to-llm-message.ts:291).
 /// - `assistant` → `{role: "assistant", content: text parts joined,
@@ -1656,7 +1655,7 @@ pub(crate) fn build_chat_messages(
         match message {
             Message::User { prompt, time, .. } => {
                 let content = user_message_content(prompt);
-                if content.is_empty() {
+                if content_is_blank(&content) {
                     // Upstream: a user message with no assembled content is
                     // omitted from the transcript.
                     continue;
@@ -1668,12 +1667,10 @@ pub(crate) fn build_chat_messages(
                 let content = match previous_end_ms
                     .and_then(|previous| temporal::marker_prefix((time.created - previous) / 1000))
                 {
-                    Some(prefix) => prefix + &content,
+                    Some(prefix) => prefix_content(content, prefix),
                     None => content,
                 };
-                out.push(ChatMessage::User {
-                    content: content.into(),
-                });
+                out.push(ChatMessage::User { content });
             }
             Message::Synthetic { text, .. } | Message::Skill { text, .. } => {
                 // A synthetic row with no text is display-only (a background
@@ -2010,39 +2007,232 @@ struct ToolError<'a> {
 /// wire but must stay out of the historian's serialised `message.text`.
 pub(crate) fn user_prompt_text(prompt: &Prompt) -> String {
     let mut text = prompt.text.clone();
-    if let Some(files) = &prompt.files {
-        for file in files {
-            let name = file.name.as_deref().unwrap_or("file");
-            text.push_str(&format!("\n[attached file: {name} ({})]", file.mime));
-        }
+    for file in prompt.files.iter().flatten() {
+        push_marker(&mut text, file);
     }
     text
 }
 
-/// The wire text of a user message: resolved skill bodies first, then the typed
-/// text and attachment markers — upstream `toLLMMessage`'s user content order
-/// (skills → text → files). Upstream emits one text part per skill, the typed
-/// text and each attachment, and its OpenAI-Chat lowering concatenates those
-/// parts with an empty separator
+/// The `[attached file: name (mime)]` marker line for an attachment that is
+/// not rendered into model content (and every attachment in summaries).
+fn push_marker(text: &mut String, file: &FileAttachment) {
+    let name = file.name.as_deref().unwrap_or("file");
+    text.push_str(&format!("\n[attached file: {name} ({})]", file.mime));
+}
+
+/// The wire content of a user message, in upstream `toLLMMessage` order
+/// (skills → typed text → attachments). Upstream emits one content part per
+/// skill, the typed text and each attachment piece, and its OpenAI-Chat
+/// lowering concatenates text parts with an empty separator
 /// (`packages/ai/src/protocols/openai-chat.ts:436-438`,
-/// `content.map((part) => part.text).join("")`), so ox concatenates too rather
-/// than inserting separators: byte parity, and a skill body's closing
-/// `</skill_content>` (`Skill.toModelOutput`) abuts the typed text exactly as
-/// it does upstream. A skill whose `text` is missing (unresolved or legacy
-/// payload) contributes nothing.
-pub(crate) fn user_message_content(prompt: &Prompt) -> String {
-    let mut parts: Vec<&str> = prompt
+/// `content.map((part) => part.text).join("")`), so ox concatenates adjacent
+/// text too rather than inserting separators: byte parity, and a skill body's
+/// closing `</skill_content>` abuts the typed text exactly as it does
+/// upstream. A skill whose `text` is missing contributes nothing.
+///
+/// Attachments follow upstream `attachmentContent`:
+/// - `text/plain` and `application/x-directory` are inlined as text;
+/// - `image/png|jpeg|gif|webp` become an `image_url` data-URL part (after an
+///   `Attached file: <path>` line when the source is a `file:` URI), which
+///   turns the content into a parts list;
+/// - anything else keeps the `[attached file: …]` marker of
+///   [`user_prompt_text`]. Deviation: upstream sends PDFs as media and drops
+///   unknown types; ox has no PDF content part and keeps a marker so the
+///   model knows a file existed.
+///
+/// With no image the result is a plain string, byte-identical to the
+/// pre-attachment rendering for prompts without renderable attachments.
+pub(crate) fn user_message_content(prompt: &Prompt) -> UserContent {
+    let mut out = ContentBuilder::default();
+    for text in prompt
         .skills
         .iter()
         .flatten()
         .filter_map(|skill| skill.text.as_deref())
-        .filter(|text| !text.is_empty())
-        .collect();
-    let text = user_prompt_text(prompt);
-    if !text.is_empty() {
-        parts.push(&text);
+    {
+        out.text.push_str(text);
     }
-    parts.concat()
+    out.text.push_str(&prompt.text);
+    for file in prompt.files.iter().flatten() {
+        render_attachment(&mut out, file);
+    }
+    out.finish()
+}
+
+/// Accumulates user content: text runs merge, an image closes the current run.
+#[derive(Default)]
+struct ContentBuilder {
+    parts: Vec<UserPart>,
+    text: String,
+}
+
+impl ContentBuilder {
+    /// Close the current text run as a part of its own.
+    fn flush_text(&mut self) {
+        if !self.text.is_empty() {
+            self.parts.push(UserPart::Text {
+                text: std::mem::take(&mut self.text),
+            });
+        }
+    }
+
+    fn image(&mut self, url: String) {
+        self.flush_text();
+        self.parts.push(UserPart::Image {
+            image_url: ImageUrl { url },
+        });
+    }
+
+    fn finish(mut self) -> UserContent {
+        if self.parts.is_empty() {
+            return UserContent::Text(self.text);
+        }
+        if !self.text.is_empty() {
+            self.parts.push(UserPart::Text { text: self.text });
+        }
+        UserContent::Parts(self.parts)
+    }
+}
+
+/// Nothing for the model to read: empty text, or no parts.
+fn content_is_blank(content: &UserContent) -> bool {
+    match content {
+        UserContent::Text(text) => text.is_empty(),
+        UserContent::Parts(parts) => parts.is_empty(),
+    }
+}
+
+/// Put `prefix` at the very start of the content: on the first text, or as a
+/// text part of its own when the content opens with an image.
+fn prefix_content(content: UserContent, prefix: String) -> UserContent {
+    match content {
+        UserContent::Text(mut text) => {
+            text.insert_str(0, &prefix);
+            UserContent::Text(text)
+        }
+        UserContent::Parts(mut parts) => {
+            match parts.first_mut() {
+                Some(UserPart::Text { text }) => text.insert_str(0, &prefix),
+                _ => parts.insert(0, UserPart::Text { text: prefix }),
+            }
+            UserContent::Parts(parts)
+        }
+    }
+}
+
+/// Render one attachment into `out` (upstream `attachmentContent`).
+fn render_attachment(out: &mut ContentBuilder, file: &FileAttachment) {
+    let location = match &file.source {
+        FileSource::Uri { uri } => Some(uri.as_str()),
+        FileSource::Inline => None,
+    };
+    match file.mime.as_str() {
+        "text/plain" => {
+            let label = file
+                .name
+                .as_deref()
+                .or(location)
+                .unwrap_or("inline attachment");
+            let mark = out.text.len();
+            out.text.push_str("\n\nAttached file: ");
+            out.text.push_str(label);
+            push_description(&mut out.text, file);
+            out.text.push_str("\n\n");
+            if !push_decoded_text(&mut out.text, &file.data) {
+                out.text.truncate(mark);
+                push_marker(&mut out.text, file);
+            }
+        }
+        "application/x-directory" => {
+            let label = location
+                .and_then(file_uri_path)
+                .or_else(|| file.name.clone())
+                .or_else(|| location.map(str::to_owned));
+            let mark = out.text.len();
+            out.text.push_str("\n\nAttached directory: ");
+            out.text.push_str(label.as_deref().unwrap_or("directory"));
+            push_description(&mut out.text, file);
+            let body_at = out.text.len();
+            out.text.push_str("\n\n");
+            if !push_decoded_text(&mut out.text, &file.data) {
+                out.text.truncate(mark);
+                push_marker(&mut out.text, file);
+            } else if out.text.len() == body_at + 2 {
+                out.text.truncate(body_at);
+            }
+        }
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp" => {
+            if let Some(path) = location.and_then(file_uri_path) {
+                // Upstream emits the location as a content part of its own.
+                out.flush_text();
+                out.parts.push(UserPart::Text {
+                    text: format!("Attached file: {path}"),
+                });
+            }
+            // The single unavoidable copy: the wire carries the payload inside
+            // a `data:` URL (same boundary as tool-result images).
+            out.image(format!("data:{};base64,{}", file.mime, file.data));
+        }
+        _ => push_marker(&mut out.text, file),
+    }
+}
+
+fn push_description(text: &mut String, file: &FileAttachment) {
+    if let Some(description) = &file.description {
+        text.push_str("\nDescription: ");
+        text.push_str(description);
+    }
+}
+
+/// Append a base64 text payload to `out` as UTF-8 (lossy), decoded once and
+/// copied once into `out`. `false` (with `out` untouched) when the stored
+/// payload is not valid base64; the caller then falls back to a marker.
+fn push_decoded_text(out: &mut String, data: &str) -> bool {
+    use base64::Engine as _;
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) else {
+        return false;
+    };
+    out.push_str(&String::from_utf8_lossy(&bytes));
+    true
+}
+
+/// The local path of a `file:` URI (upstream `attachmentLocation` /
+/// `fileURLToPath`): query and fragment dropped, percent-decoded. `None` for
+/// other schemes, a remote host, or a path that is not valid UTF-8. A local
+/// helper rather than the `url` crate, which ox-engine does not otherwise
+/// depend on.
+fn file_uri_path(uri: &str) -> Option<String> {
+    let scheme_end = uri.find(':')?;
+    if !uri[..scheme_end].eq_ignore_ascii_case("file") {
+        return None;
+    }
+    let rest = uri[scheme_end + 1..].strip_prefix("//")?;
+    let rest = rest.split(['?', '#']).next()?;
+    let path = match rest.find('/') {
+        Some(0) => rest,
+        Some(slash) if rest[..slash].eq_ignore_ascii_case("localhost") => &rest[slash..],
+        _ => return None,
+    };
+    let bytes = path.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = hex_digit(*bytes.get(i + 1)?)?;
+            let lo = hex_digit(*bytes.get(i + 2)?)?;
+            decoded.push(hi << 4 | lo);
+            i += 3;
+        } else {
+            decoded.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(decoded).ok()
+}
+
+/// Value of an ASCII hex digit; unlike `from_str_radix`, no sign is accepted.
+fn hex_digit(byte: u8) -> Option<u8> {
+    char::from(byte).to_digit(16).map(|digit| digit as u8)
 }
 
 /// The session transcript in `seq` order, decoded from `session_message`.
@@ -2205,4 +2395,296 @@ pub(crate) fn decode_row_owned(value: serde_json::Value) -> Result<Message> {
         anyhow::bail!("session_message row without a type");
     }
     Ok(Message::from_merged_row(value)?)
+}
+
+#[cfg(test)]
+mod attachment_content_tests {
+    use super::{build_chat_messages, file_uri_path, user_prompt_text};
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
+    use ox_schema::message::{Message, TimeCreated};
+    use ox_schema::support::{FileAttachment, FileSource, Prompt, SkillAttachment};
+    use serde_json::{Value, json};
+
+    const PNG: &str = "iVBORw0KGgo=";
+
+    fn file(mime: &str, data: &str, source: FileSource, name: Option<&str>) -> FileAttachment {
+        FileAttachment {
+            data: data.into(),
+            mime: mime.to_owned(),
+            source,
+            name: name.map(str::to_owned),
+            description: None,
+            mention: None,
+        }
+    }
+
+    fn inline(mime: &str, data: &str, name: Option<&str>) -> FileAttachment {
+        file(mime, data, FileSource::Inline, name)
+    }
+
+    fn uri(path: &str) -> FileSource {
+        FileSource::Uri {
+            uri: path.to_owned(),
+        }
+    }
+
+    fn prompt(text: &str, files: Vec<FileAttachment>) -> Prompt {
+        Prompt {
+            text: text.to_owned(),
+            files: Some(files),
+            agents: None,
+            skills: None,
+        }
+    }
+
+    fn user(id: &str, created: i64, prompt: Prompt) -> Message {
+        Message::User {
+            id: id.to_owned(),
+            metadata: None,
+            time: TimeCreated { created },
+            prompt,
+        }
+    }
+
+    /// The wire `content` of the last message for a single user row.
+    fn wire(prompt: Prompt) -> Value {
+        let out = build_chat_messages("", "", &[], &[user("u1", 0, prompt)]);
+        let last = serde_json::to_value(out.last().expect("user message")).expect("serialize");
+        assert_eq!(last["role"], "user", "{last}");
+        last["content"].clone()
+    }
+
+    fn text_file(body: &str, name: Option<&str>, description: Option<&str>) -> FileAttachment {
+        FileAttachment {
+            description: description.map(str::to_owned),
+            ..inline("text/plain", &STANDARD.encode(body), name)
+        }
+    }
+
+    #[test]
+    fn png_attachment_becomes_text_then_image_part() {
+        let content = wire(prompt(
+            "look",
+            vec![inline("image/png", PNG, Some("a.png"))],
+        ));
+        assert_eq!(
+            content,
+            json!([
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{PNG}")}},
+            ])
+        );
+    }
+
+    #[test]
+    fn text_attachment_is_inlined_after_the_typed_text() {
+        let content = wire(prompt(
+            "read",
+            vec![text_file("hello\nworld", Some("a.txt"), None)],
+        ));
+        assert_eq!(
+            content,
+            json!("read\n\nAttached file: a.txt\n\nhello\nworld")
+        );
+    }
+
+    #[test]
+    fn text_attachment_description_adds_a_line() {
+        let content = wire(prompt(
+            "read",
+            vec![text_file("body", Some("a.txt"), Some("notes"))],
+        ));
+        assert_eq!(
+            content,
+            json!("read\n\nAttached file: a.txt\nDescription: notes\n\nbody")
+        );
+    }
+
+    #[test]
+    fn text_attachment_label_falls_back_to_uri_then_inline() {
+        let body = STANDARD.encode("x");
+        let by_uri = file("text/plain", &body, uri("file:///tmp/b.txt"), None);
+        assert_eq!(
+            wire(prompt("", vec![by_uri])),
+            json!("\n\nAttached file: file:///tmp/b.txt\n\nx")
+        );
+        let anonymous = inline("text/plain", &body, None);
+        assert_eq!(
+            wire(prompt("", vec![anonymous])),
+            json!("\n\nAttached file: inline attachment\n\nx")
+        );
+    }
+
+    #[test]
+    fn directory_attachment_uses_the_local_path_and_listing() {
+        let listing = STANDARD.encode("src/\nREADME.md");
+        let dir = file(
+            "application/x-directory",
+            &listing,
+            uri("file:///tmp/my%20proj?start=1"),
+            Some("proj"),
+        );
+        assert_eq!(
+            wire(prompt("see", vec![dir])),
+            json!("see\n\nAttached directory: /tmp/my proj\n\nsrc/\nREADME.md")
+        );
+    }
+
+    #[test]
+    fn empty_directory_has_header_only_and_description() {
+        let dir = FileAttachment {
+            description: Some("the repo".to_owned()),
+            ..file(
+                "application/x-directory",
+                "",
+                uri("file:///tmp/proj"),
+                Some("proj"),
+            )
+        };
+        assert_eq!(
+            wire(prompt("", vec![dir])),
+            json!("\n\nAttached directory: /tmp/proj\nDescription: the repo")
+        );
+        let nameless = inline("application/x-directory", "", None);
+        assert_eq!(
+            wire(prompt("", vec![nameless])),
+            json!("\n\nAttached directory: directory")
+        );
+    }
+
+    #[test]
+    fn file_uri_image_is_preceded_by_its_location() {
+        let image = file(
+            "image/png",
+            PNG,
+            uri("file:///tmp/a%20b.png"),
+            Some("a b.png"),
+        );
+        assert_eq!(
+            wire(prompt("look", vec![image])),
+            json!([
+                {"type": "text", "text": "look"},
+                {"type": "text", "text": "Attached file: /tmp/a b.png"},
+                {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{PNG}")}},
+            ])
+        );
+    }
+
+    #[test]
+    fn file_uri_path_decodes_only_hex_escapes() {
+        assert_eq!(
+            file_uri_path("file:///tmp/a%20b.png").as_deref(),
+            Some("/tmp/a b.png")
+        );
+        assert_eq!(file_uri_path("file:///tmp/a%+1b.png"), None);
+        assert_eq!(file_uri_path("file:///tmp/a%-1b.png"), None);
+        assert_eq!(file_uri_path("file:///tmp/a%zzb.png"), None);
+        assert_eq!(file_uri_path("file:///tmp/a%2"), None);
+    }
+
+    #[test]
+    fn mixed_attachments_keep_order_and_merge_adjacent_text() {
+        let a = text_file("A", Some("a.txt"), None);
+        let b = text_file("B", Some("b.txt"), None);
+        let content = wire(prompt("go", vec![a, inline("image/jpeg", PNG, None), b]));
+        assert_eq!(
+            content,
+            json!([
+                {"type": "text", "text": "go\n\nAttached file: a.txt\n\nA"},
+                {"type": "image_url", "image_url": {"url": format!("data:image/jpeg;base64,{PNG}")}},
+                {"type": "text", "text": "\n\nAttached file: b.txt\n\nB"},
+            ])
+        );
+    }
+
+    #[test]
+    fn leading_image_has_no_empty_text_part() {
+        let content = wire(prompt("", vec![inline("image/webp", PNG, None)]));
+        assert_eq!(
+            content,
+            json!([{"type": "image_url", "image_url": {"url": format!("data:image/webp;base64,{PNG}")}}])
+        );
+    }
+
+    #[test]
+    fn pdf_keeps_the_marker_and_content_stays_a_string() {
+        let content = wire(prompt(
+            "see",
+            vec![inline("application/pdf", "JVBERi0=", Some("x.pdf"))],
+        ));
+        assert_eq!(
+            content,
+            json!("see\n[attached file: x.pdf (application/pdf)]")
+        );
+    }
+
+    #[test]
+    fn no_attachments_is_skills_then_text_as_a_string() {
+        let prompt = Prompt {
+            text: "typed".to_owned(),
+            files: None,
+            agents: None,
+            skills: Some(vec![
+                SkillAttachment {
+                    id: "a".to_owned(),
+                    name: Some("a".to_owned()),
+                    text: Some("<skill a/>".to_owned()),
+                    mention: None,
+                },
+                SkillAttachment {
+                    id: "b".to_owned(),
+                    name: None,
+                    text: None,
+                    mention: None,
+                },
+            ]),
+        };
+        assert_eq!(wire(prompt), json!("<skill a/>typed"));
+    }
+
+    #[test]
+    fn temporal_marker_leads_the_first_text_part() {
+        let rows = [
+            user("u1", 0, prompt("first", vec![])),
+            user(
+                "u2",
+                2 * 60 * 60 * 1000,
+                prompt("later", vec![inline("image/png", PNG, None)]),
+            ),
+        ];
+        let out = build_chat_messages("", "", &[], &rows);
+        let last = serde_json::to_value(out.last().expect("user")).expect("serialize");
+        assert_eq!(last["content"][0]["text"], "<!-- +2h -->\nlater", "{last}");
+        assert_eq!(last["content"][1]["type"], "image_url", "{last}");
+    }
+
+    #[test]
+    fn temporal_marker_gets_its_own_part_before_a_leading_image() {
+        let rows = [
+            user("u1", 0, prompt("first", vec![])),
+            user(
+                "u2",
+                2 * 60 * 60 * 1000,
+                prompt("", vec![inline("image/png", PNG, None)]),
+            ),
+        ];
+        let out = build_chat_messages("", "", &[], &rows);
+        let last = serde_json::to_value(out.last().expect("user")).expect("serialize");
+        assert_eq!(last["content"][0]["text"], "<!-- +2h -->\n", "{last}");
+        assert_eq!(last["content"][1]["type"], "image_url", "{last}");
+    }
+
+    #[test]
+    fn summary_text_never_carries_bodies_or_image_bytes() {
+        let files = vec![
+            text_file("SECRET-BODY", Some("a.txt"), None),
+            inline("image/png", PNG, Some("a.png")),
+        ];
+        let text = user_prompt_text(&prompt("look", files));
+        assert_eq!(
+            text,
+            "look\n[attached file: a.txt (text/plain)]\n[attached file: a.png (image/png)]"
+        );
+    }
 }

@@ -36,7 +36,7 @@ use ox_schema::support::{
     ForkBoundary, LocationRef, ModelRef, Rule, SessionMetadata, SkillAttachment,
 };
 
-use super::state;
+use super::{attachment, state};
 
 /// Upstream `DefaultSessionsLimit` / `DefaultMessagesLimit`.
 const DEFAULT_PAGE_LIMIT: i64 = 50;
@@ -95,6 +95,16 @@ fn invalid_request_kind(res: &mut Response, message: &str, kind: &str) {
     })));
 }
 
+/// 400 `InvalidRequestError` naming the offending request `field` (`files`).
+fn invalid_request_field(res: &mut Response, message: &str, field: &str) {
+    res.status_code(StatusCode::BAD_REQUEST);
+    res.render(Json(json!({
+        "_tag": "InvalidRequestError",
+        "message": message,
+        "field": field,
+    })));
+}
+
 /// 400 `InvalidCursorError` (protocol/src/errors.ts).
 fn invalid_cursor(res: &mut Response, message: &str) {
     res.status_code(StatusCode::BAD_REQUEST);
@@ -123,9 +133,11 @@ fn no_content(res: &mut Response) {
 ///
 /// salvo's default is 64 KB, which a single pasted message or an inline
 /// attachment exceeds — upstream has no such limit, so a client would see
-/// `InvalidRequestError` for a legal prompt. This is generous enough for a
-/// large paste while staying a bounded read (the body is buffered once).
-const MAX_JSON_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// `InvalidRequestError` for a legal prompt. A 20 MiB attachment (the
+/// materialization limit) is ~27 MB of base64 inside the JSON body, so this
+/// leaves headroom above that while staying a bounded read (the body is
+/// buffered once).
+const MAX_JSON_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 /// Parse an optional JSON request body; an empty body yields `T::default()`
 /// (every body schema here has all-optional properties except where the
@@ -1773,7 +1785,7 @@ struct PromptBody {
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
-    files: Option<Vec<ox_schema::support::FileAttachment>>,
+    files: Option<Vec<ox_schema::support::FileInput>>,
     #[serde(default)]
     agents: Option<Vec<ox_schema::support::AgentAttachment>>,
     #[serde(default)]
@@ -1928,10 +1940,30 @@ pub(crate) async fn prompt(req: &mut Request, depot: &mut Depot, res: &mut Respo
                     return;
                 }
             };
+            // Upstream materializes `uri` inputs into stored attachments at
+            // admission; file reads are blocking, so they run off the reactor.
+            let files = match body.files {
+                Some(inputs) if !inputs.is_empty() => {
+                    match tokio::task::spawn_blocking(move || attachment::materialize(inputs)).await
+                    {
+                        Ok(Ok(files)) => Some(files),
+                        Ok(Err(error)) => {
+                            tracing::debug!(label = %error.label, "prompt attachment rejected");
+                            invalid_request_field(res, &error.message, "files");
+                            return;
+                        }
+                        Err(error) => {
+                            unknown_error(res, &error.into());
+                            return;
+                        }
+                    }
+                }
+                _ => None,
+            };
             ox_schema::inbox::UserPayload {
                 prompt: ox_schema::support::Prompt {
                     text,
-                    files: body.files,
+                    files,
                     agents: body.agents,
                     skills,
                 },
@@ -1944,7 +1976,14 @@ pub(crate) async fn prompt(req: &mut Request, depot: &mut Depot, res: &mut Respo
         }
     };
 
-    let item = ox_schema::inbox::Item::User {
+    // `payload` is cloned once, for the response; the original moves into the
+    // event. Attachment data is `Arc<str>`, so the clone shares the big field.
+    let info = ox_schema::inbox::Info::User {
+        id: message_id.clone(),
+        session_id: session_id.clone(),
+        time: ox_schema::inbox::EnqueuedTime {
+            created: id::now_millis(),
+        },
         payload: payload.clone(),
         delivery,
     };
@@ -1953,7 +1992,7 @@ pub(crate) async fn prompt(req: &mut Request, depot: &mut Depot, res: &mut Respo
         .publish(SessionEventData::InboxEnqueued {
             session_id: session_id.clone(),
             inbox_id: message_id.clone(),
-            item: item.clone(),
+            item: ox_schema::inbox::Item::User { payload, delivery },
         })
         .await
     {
@@ -1967,17 +2006,14 @@ pub(crate) async fn prompt(req: &mut Request, depot: &mut Depot, res: &mut Respo
         unknown_error(res, &error);
         return;
     }
-    res.render(Json(json!({
-        "data": ox_schema::inbox::Info::User {
-            id: message_id,
-            session_id,
-            time: ox_schema::inbox::EnqueuedTime {
-                created: id::now_millis(),
-            },
-            payload,
-            delivery,
-        },
-    })));
+    res.render(Json(DataEnvelope { data: &info }));
+}
+
+/// `{"data": …}` around a borrowed value, so a prompt response does not copy
+/// the payload (attachments can be megabytes) into a `serde_json::Value`.
+#[derive(serde::Serialize)]
+struct DataEnvelope<'a, T> {
+    data: &'a T,
 }
 
 /// A pending `session_inbox` row decoded into its wire [`Info`] shape.
