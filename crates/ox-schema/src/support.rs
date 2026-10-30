@@ -150,13 +150,19 @@ pub enum FinishReason {
 // token-usage.ts
 // ---------------------------------------------------------------------------
 
-/// Upstream `TokenUsage.Info`.
+/// Upstream `TokenUsage.Info`, plus the ox-only `estimated` extension.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct TokenUsage {
     pub input: i64,
     pub output: i64,
     pub reasoning: i64,
     pub cache: TokenCache,
+    /// ox extension (not in upstream `TokenUsage.Info`): `Some(true)` when
+    /// `input` is an estimate from the sent request's size because the stream
+    /// carried no usage. Absent for provider-reported usage, so those rows
+    /// serialize exactly as upstream's shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimated: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -373,4 +379,58 @@ pub struct ProviderContext {
     pub version: u8, // upstream: Literal(1)
     pub provenance: ProviderProvenance,
     pub messages: Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MEASURED: &str = r#"{"input":1,"output":2,"reasoning":3,"cache":{"read":4,"write":5}}"#;
+    const ESTIMATED: &str =
+        r#"{"input":1,"output":2,"reasoning":3,"cache":{"read":4,"write":5},"estimated":true}"#;
+
+    fn usage(estimated: Option<bool>) -> TokenUsage {
+        TokenUsage {
+            input: 1,
+            output: 2,
+            reasoning: 3,
+            cache: TokenCache { read: 4, write: 5 },
+            estimated,
+        }
+    }
+
+    #[test]
+    fn measured_usage_serializes_without_estimated_key() {
+        assert_eq!(serde_json::to_string(&usage(None)).unwrap(), MEASURED);
+    }
+
+    #[test]
+    fn estimated_usage_serializes_the_flag() {
+        assert_eq!(
+            serde_json::to_string(&usage(Some(true))).unwrap(),
+            ESTIMATED
+        );
+    }
+
+    #[test]
+    fn missing_key_deserializes_as_none() {
+        let parsed: TokenUsage = serde_json::from_str(MEASURED).unwrap();
+        assert_eq!(parsed.estimated, None);
+        assert_eq!(parsed, usage(None));
+    }
+
+    #[test]
+    fn present_key_deserializes_as_some_true() {
+        let parsed: TokenUsage = serde_json::from_str(ESTIMATED).unwrap();
+        assert_eq!(parsed.estimated, Some(true));
+        assert_eq!(parsed, usage(Some(true)));
+    }
+
+    #[test]
+    fn both_shapes_round_trip_losslessly() {
+        for raw in [MEASURED, ESTIMATED] {
+            let parsed: TokenUsage = serde_json::from_str(raw).unwrap();
+            assert_eq!(serde_json::to_string(&parsed).unwrap(), raw);
+        }
+    }
 }

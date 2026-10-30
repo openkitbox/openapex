@@ -26,7 +26,8 @@
 //!   cached, `cache.write` = 0). When the stream carries no usage, `input`
 //!   is an estimate from the sent request's size (bytes/4 x the session
 //!   calibration ratio) and the other fields are 0. Deviation: the estimate
-//!   lives in the same field (no schema change); bytes/4 under-counts CJK,
+//!   lives in the same field; the row carries `tokens.estimated = true` (ox
+//!   extension, absent for reported usage); bytes/4 under-counts CJK,
 //!   so folds may trigger slightly late; pre-existing zero rows are not
 //!   rewritten. The estimate also lands on interrupted and incomplete-stream
 //!   rows (their usage chunk never arrives, even for models that do report
@@ -1389,6 +1390,9 @@ async fn flush_blocks(
 /// prompt tokens, cache write is not reported by cardinal's OpenAI dialect.
 /// A stream that never carried usage stores `estimate()` as `input` and
 /// zeros elsewhere; the estimate is not evaluated when usage was reported.
+/// The estimate branch sets `estimated: Some(true)` so estimated rows can be
+/// told from reported ones (`json_extract(data, '$.tokens.estimated')`); the
+/// reported branch leaves it `None`.
 fn tokens_for(usage: Option<Usage>, estimate: impl FnOnce() -> i64) -> TokenUsage {
     let Some(usage) = usage else {
         return TokenUsage {
@@ -1396,6 +1400,7 @@ fn tokens_for(usage: Option<Usage>, estimate: impl FnOnce() -> i64) -> TokenUsag
             output: 0,
             reasoning: 0,
             cache: TokenCache { read: 0, write: 0 },
+            estimated: Some(true),
         };
     };
     let cached = usage.cached_tokens.unwrap_or(0);
@@ -1407,6 +1412,7 @@ fn tokens_for(usage: Option<Usage>, estimate: impl FnOnce() -> i64) -> TokenUsag
             read: cached as i64,
             write: 0,
         },
+        estimated: None,
     }
 }
 
@@ -2550,6 +2556,7 @@ mod tests {
                     read: 200,
                     write: 0
                 },
+                estimated: None,
             }
         );
     }
@@ -2563,8 +2570,20 @@ mod tests {
                 output: 0,
                 reasoning: 0,
                 cache: TokenCache { read: 0, write: 0 },
+                estimated: Some(true),
             }
         );
+    }
+
+    #[test]
+    fn estimated_flag_survives_serialization_only_for_estimates() {
+        let estimated = serde_json::to_value(tokens_for(None, || 7)).unwrap();
+        assert_eq!(estimated["estimated"], serde_json::json!(true));
+        let reported = serde_json::to_value(tokens_for(Some(usage(1, 2, None, None)), || {
+            panic!("estimate must not be called")
+        }))
+        .unwrap();
+        assert!(reported.get("estimated").is_none(), "{reported}");
     }
 
     #[test]

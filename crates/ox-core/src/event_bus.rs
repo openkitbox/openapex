@@ -396,6 +396,7 @@ impl EventBus {
                     read: row.get::<i64>(4)?,
                     write: row.get::<i64>(5)?,
                 },
+                estimated: None,
             },
         ))
     }
