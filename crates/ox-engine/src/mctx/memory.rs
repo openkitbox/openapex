@@ -695,6 +695,10 @@ pub(crate) async fn projects_with_active_memories(db: &Db) -> Result<Vec<String>
 /// stay newer than the watermark, or that change would only be noticed after
 /// the file changed again. `updated_at` is untouched — a verification is not a
 /// write, and conflating them made an edited memory look freshly verified.
+///
+/// A memory rewritten while the verdict was in flight has `updated_at > at`
+/// (and `verified_at` already cleared to 0 by the rewrite); it is not stamped,
+/// because the verdict never saw its new text. The count excludes such rows.
 pub(crate) async fn touch_memories(
     db: &Db,
     project: &str,
@@ -709,7 +713,8 @@ pub(crate) async fn touch_memories(
             let mut stmt = tx
                 .prepare(
                     "UPDATE mc_memory SET verified_at = ?3
-                      WHERE project = ?1 AND id = ?2 AND status = 'active'",
+                      WHERE project = ?1 AND id = ?2 AND status = 'active'
+                        AND updated_at <= ?3",
                 )
                 .await?;
             for id in ids {
@@ -1720,4 +1725,64 @@ async fn active_summary(db: &Db, session_id: &str) -> Result<String> {
         }
         _ => String::new(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn set_updated_at(db: &Db, id: &str, updated_at: i64) {
+        let conn = db.acquire().await.expect("connection");
+        conn.execute(
+            "UPDATE mc_memory SET updated_at = ?2 WHERE id = ?1",
+            (id, updated_at),
+        )
+        .await
+        .expect("set updated_at");
+    }
+
+    async fn verified_at_of(db: &Db, id: &str) -> i64 {
+        let memories = active_memories_with_watermark(db, "p").await.expect("read");
+        memories
+            .iter()
+            .find(|memory| memory.id == id)
+            .expect("memory exists")
+            .verified_at
+    }
+
+    #[tokio::test]
+    async fn touch_stamps_a_memory_written_before_the_run_start() {
+        let db = Db::open_in_memory().await.expect("db");
+        let id = write_memory(&db, "p", "fact", "ARCHITECTURE")
+            .await
+            .expect("write");
+        set_updated_at(&db, &id, 100).await;
+
+        let touched = touch_memories(&db, "p", std::slice::from_ref(&id), 200)
+            .await
+            .expect("touch");
+
+        assert_eq!(touched, 1);
+        assert_eq!(verified_at_of(&db, &id).await, 200);
+    }
+
+    #[tokio::test]
+    async fn touch_skips_a_memory_rewritten_after_the_run_start() {
+        let db = Db::open_in_memory().await.expect("db");
+        let before = write_memory(&db, "p", "old fact", "ARCHITECTURE")
+            .await
+            .expect("write");
+        let rewritten = write_memory(&db, "p", "new fact", "ARCHITECTURE")
+            .await
+            .expect("write");
+        set_updated_at(&db, &before, 100).await;
+        set_updated_at(&db, &rewritten, 300).await;
+
+        let ids = [before.clone(), rewritten.clone()];
+        let touched = touch_memories(&db, "p", &ids, 200).await.expect("touch");
+
+        assert_eq!(touched, 1, "only the memory older than the run is stamped");
+        assert_eq!(verified_at_of(&db, &before).await, 200);
+        assert_eq!(verified_at_of(&db, &rewritten).await, 0);
+    }
 }

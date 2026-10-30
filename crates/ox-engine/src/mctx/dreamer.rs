@@ -27,8 +27,9 @@
 //!   (line 39, = 3) with `recordTransientFailure` (line 340): a failed run
 //!   keeps its next slot so it is retried on the following ticks, up to the
 //!   cap, then advances to the next scheduled slot. ox expresses this as
-//!   "consecutive failures past [`MAX_DREAM_FAILURES`] are not re-attempted
-//!   until the next interval has elapsed since the failed attempt".
+//!   "once [`MAX_DREAM_FAILURES`] failures are consecutive, each further
+//!   failure doubles the wait since the failed attempt (2, 4, 8 ... intervals),
+//!   capped at `MAX_DREAM_BACKOFF_MILLIS`"; a success or skip resets it.
 //! - **Idle-project cost** — `dreamer/task-gates.ts` (gates are "cheap
 //!   counts" so "an idle project costs no model calls") and
 //!   `idle-schedule-prune.ts`. ox's enumeration of projects *with active
@@ -156,10 +157,13 @@
 //!   memory look already verified, and an edit looked like a fresh check.
 //!   What is *not* ported is per-memory *resume* after a dead batch: ox
 //!   re-checks the whole remaining batch next slot, so a run's progress is
-//!   all-or-nothing at the batch level. A memory the manifest never mentions
-//!   keeps its old watermark and stays a candidate — which is also why ox has no
-//!   `skip` verdict: "keep it, do not claim verification" is already the
-//!   meaning of omission.
+//!   all-or-nothing at the batch level. The verify prompt asks for
+//!   a verdict on every id. A `skip` ("code cannot decide it") is STAMPED like
+//!   `verified`, so the memory leaves the candidate set until a cited file
+//!   changes or the memory is rewritten. This deviates from the reference,
+//!   which does not stamp `skip`: without it, undecidable memories (those that
+//!   cite a missing file) would hold the first-20 batch forever. An id the
+//!   manifest omits still keeps its old watermark and stays a candidate.
 //! - **The watermark is the run's start** ([`memory::touch_memories`]'s `at`),
 //!   not the moment the verdict lands: a file written while the completion was
 //!   in flight stays newer than the watermark and is re-checked next slot
@@ -235,6 +239,10 @@ use ox_schema::id::now_millis;
 /// (the reference's `MAX_TASK_RETRIES` in `dreamer/task-scheduler.ts`).
 pub const MAX_DREAM_FAILURES: u32 = 3;
 
+/// The longest a repeatedly failing `(project, task)` waits between attempts
+/// (24 hours): the ceiling of the exponential wait in [`failure_backoff_millis`].
+const MAX_DREAM_BACKOFF_MILLIS: i64 = 24 * 60 * 60 * 1000;
+
 /// Most memories one `verify` completion carries (the reference's
 /// `VERIFY_BATCH_SIZE` in `dreamer/verify.ts`, chosen there for prompt-token
 /// cost; ox keeps the same number so a batch stays a readable prompt).
@@ -257,16 +265,17 @@ const VERIFY_SYSTEM_PROMPT: &str = "You are a memory verifier for the magic-cont
 
 The host has already read the files each memory names and printed short excerpts below; you have no tools and must not ask for more. Judge each memory on that evidence alone.
 
-Decide ONE of three outcomes per memory:
+Decide ONE of four outcomes per memory:
 - VERIFIED — still accurate. Keep it as-is.
 - UPDATE — a CODE FACT is still true but a file-falsifiable DETAIL drifted (a renamed symbol, a moved file, a changed number or name). Provide the corrected content in terse present tense (\"X uses Y\", not \"X was changed to Y\"). Only update for genuine drift, not style. If a legitimate update intentionally consolidates the old claim into much shorter content, set consolidation=\"true\" explicitly.
 - ARCHIVE — a CODE FACT is positively falsified: the code clearly contradicts it, or the API/symbol/path it describes no longer exists.
+- SKIP — the claim is not a code fact, or code cannot decide it. Keep it unchanged and do not claim verification.
 
-UPDATE and ARCHIVE are ONLY for claims a repository file can falsify. Behavioral directives (when to act, how to work, who decides, tool-usage discipline) can only be VERIFIED — a named path inside a directive does not make the directive a code fact, and a file's failure to corroborate a behavioral rule is never grounds to update or archive it. A memory whose referenced file is simply gone is NOT automatically falsified: if the claim is behavioral, or the excerpt cannot decide it, mark it VERIFIED and leave it alone.
+UPDATE and ARCHIVE are ONLY for claims a repository file can falsify. Behavioral directives (when to act, how to work, who decides, tool-usage discipline) can only be VERIFIED or SKIPPED — a named path inside a directive does not make the directive a code fact, and a file's failure to corroborate a behavioral rule is never grounds to update or archive it. A memory whose referenced file is simply gone is NOT automatically falsified: if the claim is behavioral, or the excerpt cannot decide it, mark it VERIFIED or SKIPPED and leave it alone.
 
-BE CONSERVATIVE ABOUT ARCHIVING. Wrong archival of a TRUE memory is the worst possible outcome — far worse than leaving a slightly-stale memory. Archive ONLY with positive evidence.
+BE CONSERVATIVE ABOUT ARCHIVING. Wrong archival of a TRUE memory is the worst possible outcome — far worse than leaving a slightly-stale memory. If you are unsure, or the excerpt cannot decide it: mark it VERIFIED or SKIPPED, never archived. Archive ONLY with positive evidence the code contradicts a code fact.
 
-Memories you do not mention are left unchanged; omit rather than guess.
+Every memory below must appear in your manifest: each input memory id appears exactly once, in exactly one element.
 
 Output ONE XML manifest at the very end and NOTHING else — no narration, no per-memory commentary, no reasoning:
 <verify>
@@ -274,11 +283,12 @@ Output ONE XML manifest at the very end and NOTHING else — no narration, no pe
 <update id=\"M\">corrected present-tense content</update>
 <update id=\"C\" consolidation=\"true\">intentionally consolidated content</update>
 <archive id=\"K\" reason=\"specific evidence the code contradicts it\"/>
+<skip id=\"S\" reason=\"behavioral directive; code cannot decide it\"/>
 </verify>
 
 Rules:
-- Each id you mention must appear exactly once, in exactly one element, and must come from the list below.
-- Default to VERIFIED. UPDATE and ARCHIVE are the exceptions, not the norm.";
+- Every input memory id MUST appear exactly once, in exactly one of verified/update/archive/skip. Ids must come from the list below.
+- Default to VERIFIED. skip when code cannot decide the claim. update and archive are the exceptions, not the norm.";
 
 /// The curate task's prefixed completion prompt, adapting
 /// `dreamer/task-prompts.ts::CURATE_SYSTEM_PROMPT` to a manifest instead of
@@ -411,7 +421,7 @@ const SURFACE_TURN_CHARS: usize = 600;
 /// tick is deterministic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DreamTask {
-    /// Re-check memories whose referenced files are missing or newer.
+    /// Re-check memories whose referenced files are newer (or missing, if never verified).
     Verify,
     /// Duplicate/stale consolidation of one memory category.
     Curate,
@@ -873,8 +883,9 @@ impl Dreamer {
 
     // -- verify -------------------------------------------------------------
 
-    /// `verify`: candidates are memories whose referenced files are missing or
-    /// newer than the memory itself; only then is one completion issued.
+    /// `verify`: candidates are memories whose referenced files are newer than
+    /// the memory's last check, or missing for a never-verified memory; only
+    /// then is one completion issued.
     async fn run_verify(&self, project: &str, started_at: i64) -> TaskOutcome {
         let memories = match memory::active_memories_with_watermark(&self.db, project).await {
             Ok(memories) => memories,
@@ -1213,9 +1224,10 @@ impl Dreamer {
 /// Due means `now - last_run_at >= interval`, with `last_run_at` the start of
 /// the last *successful* run (so work landing during a run is not skipped).
 /// A row that has failed [`MAX_DREAM_FAILURES`] times in a row is not
-/// retried until the interval has elapsed *since the failed attempt*, which is
-/// the two-cadence behavior of the reference's `MAX_TASK_RETRIES` reduced to a
-/// single interval: the first retries are hot (next tick), then it waits.
+/// retried until [`failure_backoff_millis`] has elapsed *since the failed
+/// attempt*: the first retries are hot (next tick), then the wait doubles per
+/// further failure up to [`MAX_DREAM_BACKOFF_MILLIS`]. The scheduler ticks once
+/// per interval, so a flat one-interval wait would never throttle anything.
 fn is_due(state: &DreamState, now: i64, interval_millis: i64) -> bool {
     if let Some(last_run_at) = state.last_run_at
         && now - last_run_at < interval_millis
@@ -1223,11 +1235,27 @@ fn is_due(state: &DreamState, now: i64, interval_millis: i64) -> bool {
         return false;
     }
     if state.consecutive_failures >= MAX_DREAM_FAILURES
-        && now - state.last_attempt_at < interval_millis
+        && now - state.last_attempt_at
+            < failure_backoff_millis(state.consecutive_failures, interval_millis)
     {
         return false;
     }
     true
+}
+
+/// How long a row with `consecutive_failures` failures in a row waits after its
+/// last attempt: zero below [`MAX_DREAM_FAILURES`], then
+/// `interval * 2^(failures - MAX_DREAM_FAILURES + 1)`, saturating and capped at
+/// [`MAX_DREAM_BACKOFF_MILLIS`]. A non-positive interval yields no wait.
+fn failure_backoff_millis(consecutive_failures: u32, interval_millis: i64) -> i64 {
+    if consecutive_failures < MAX_DREAM_FAILURES {
+        return 0;
+    }
+    let exponent = (consecutive_failures - MAX_DREAM_FAILURES + 1).min(20);
+    interval_millis
+        .max(0)
+        .saturating_mul(1i64 << exponent)
+        .min(MAX_DREAM_BACKOFF_MILLIS)
 }
 
 // ---------------------------------------------------------------------------
@@ -1353,8 +1381,9 @@ async fn settle_failure(
 // verify: the host-side gate
 // ---------------------------------------------------------------------------
 
-/// One memory whose referenced file is missing or newer, with every path its
-/// text named and what the host found there.
+/// One memory that needs a re-check (a cited file is newer, or missing for a
+/// never-verified memory), with every path its text named and what the host
+/// found there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Candidate {
     id: String,
@@ -1375,7 +1404,8 @@ struct PathState {
     /// The path as the memory wrote it, for the prompt.
     written: String,
     /// False when the file does not exist (the reference's "was deleted"), or
-    /// when the path is outside the project.
+    /// when the path is outside the project. A missing path only makes a
+    /// never-verified memory a candidate (see [`needs_check`]).
     exists: bool,
     /// The file's mtime in epoch milliseconds, when readable.
     mtime: Option<i64>,
@@ -1387,14 +1417,14 @@ struct PathState {
 
 /// The verify gate: `Some` when this memory must be re-checked, `None` when it
 /// is free to leave alone. A memory that names no path is never a candidate
-/// (the reference's "file-independent" exclusion); a memory whose every
-/// referenced file exists and is no newer than the memory is not one either.
+/// (the reference's "file-independent" exclusion); [`needs_check`] decides the
+/// rest from what the filesystem said.
 fn candidate(project_dir: &str, memory: &memory::StoredMemory) -> Option<Candidate> {
     let paths: Vec<PathState> = referenced_paths(&memory.content)
         .into_iter()
         .map(|written| inspect(project_dir, &written, memory.verified_at))
         .collect();
-    if !paths.iter().any(|state| !state.exists || state.newer) {
+    if !needs_check(&paths, memory.verified_at) {
         return None;
     }
     Some(Candidate {
@@ -1404,6 +1434,19 @@ fn candidate(project_dir: &str, memory: &memory::StoredMemory) -> Option<Candida
         updated_at: memory.updated_at,
         paths,
     })
+}
+
+/// Whether the inspected paths make a memory worth a verify completion.
+///
+/// A stamped memory (`verified_at > 0`) has already been judged against its
+/// missing file, so re-sending it can never change the outcome, and the
+/// deletion time is not recorded. Deviation: a file deleted AFTER stamping is
+/// not re-checked until the memory is rewritten (which resets `verified_at` to
+/// 0 in memory.rs) or another cited file changes.
+fn needs_check(paths: &[PathState], verified_at: i64) -> bool {
+    paths
+        .iter()
+        .any(|state| (state.exists && state.newer) || (!state.exists && verified_at == 0))
 }
 
 /// Resolve one written path against the project directory and read the
@@ -1630,6 +1673,10 @@ struct VerifyManifest {
     verified: Vec<String>,
     updates: Vec<VerifyUpdate>,
     archives: Vec<VerifyArchive>,
+    /// `<skip>` ids ("code cannot decide it"): counted toward coverage and
+    /// duplicate checks, and stamped like `verified` so an undecidable memory
+    /// leaves the candidate set instead of holding the batch forever.
+    skipped: Vec<String>,
 }
 
 /// One `<update>`: the replacement text and the model's consolidation flag.
@@ -1650,7 +1697,8 @@ struct VerifyArchive {
 /// Parse a `<verify>` manifest, failing CLOSED: no complete root element means
 /// the output is truncated or the wrong task's, and nothing is applied (never
 /// a prefix). A well-formed but empty manifest is a format miss, a duplicate
-/// id is a rejected manifest, ids outside the batch are dropped, and a
+/// id is a rejected manifest (across verified/update/archive/skip), ids
+/// outside the batch are dropped, and a
 /// manifest covering fewer than half the batch is rejected as mostly-wrong —
 /// all four are the reference's rules (`manifest-parser.ts`, `verify.ts`).
 fn parse_verify_manifest(text: &str, batch: &[Candidate]) -> Result<VerifyManifest, String> {
@@ -1679,6 +1727,11 @@ fn parse_verify_manifest(text: &str, batch: &[Candidate]) -> Result<VerifyManife
         let id = attr_of(attrs, "id").ok_or("verify manifest <verified> is missing an id")?;
         manifest.verified.push(id);
     }
+    for captures in skip_regex().captures_iter(&body) {
+        let attrs = captures.get(1).map_or("", |m| m.as_str());
+        let id = attr_of(attrs, "id").ok_or("verify manifest <skip> is missing an id")?;
+        manifest.skipped.push(id);
+    }
 
     let batch_ids: Vec<&str> = batch.iter().map(|memory| memory.id.as_str()).collect();
     let mut known: Vec<String> = Vec::new();
@@ -1686,6 +1739,9 @@ fn parse_verify_manifest(text: &str, batch: &[Candidate]) -> Result<VerifyManife
     let mut error: Option<String> = None;
     manifest
         .verified
+        .retain(|id| keep_batch_id(id, &batch_ids, &mut known, &mut unknown, &mut error));
+    manifest
+        .skipped
         .retain(|id| keep_batch_id(id, &batch_ids, &mut known, &mut unknown, &mut error));
     manifest.updates.retain(|update| {
         keep_batch_id(&update.id, &batch_ids, &mut known, &mut unknown, &mut error)
@@ -1715,8 +1771,8 @@ fn parse_verify_manifest(text: &str, batch: &[Candidate]) -> Result<VerifyManife
         ));
     }
     // Fewer than half the batch is the shape of a manifest answered for some
-    // other prompt; a conservative run still mentions at least half, because
-    // omission is how "leave it alone" is said.
+    // other prompt; the prompt asks for every id (skip is how "leave it
+    // alone" is said), so a real answer covers at least half.
     if known.len() * 2 < batch_ids.len() {
         return Err(format!(
             "verify manifest covers {}/{} batch ids; rejecting a mostly-missing manifest",
@@ -1770,25 +1826,31 @@ async fn apply_verify_manifest(
     started_at: i64,
 ) -> Result<ApplyReport> {
     let mut report = ApplyReport::default();
-    // A `verified` verdict stamps `verified_at` with the run's START, so an
-    // unchanged pool is not re-checked on the next slot while anything written
-    // during this run stays newer and is picked up then. Memories the manifest
-    // omitted keep their old watermark and stay candidates ("omissions keep
-    // their old verified_at, the next run picks them up").
-    let banked: Vec<String> = manifest
-        .verified
-        .iter()
-        .filter(|id| batch.iter().any(|memory| &memory.id == *id))
-        // A memory the same manifest also rewrites or archives has a competing
-        // verdict; the write wins and banking it first would be noise.
-        .filter(|id| {
-            !manifest.updates.iter().any(|update| &update.id == *id)
-                && !manifest.archives.iter().any(|archive| &archive.id == *id)
-        })
-        .cloned()
-        .collect();
+    // A `verified` or `skip` verdict stamps `verified_at` with the run's START,
+    // so an unchanged pool is not re-checked on the next slot while anything
+    // written during this run stays newer and is picked up then. Memories the
+    // manifest omitted keep their old watermark and stay candidates
+    // ("omissions keep their old verified_at, the next run picks them up").
+    let bank = |ids: &[String]| -> Vec<String> {
+        ids.iter()
+            .filter(|id| batch.iter().any(|memory| &memory.id == *id))
+            // A memory the same manifest also rewrites or archives has a
+            // competing verdict; the write wins and banking it first would be
+            // noise.
+            .filter(|id| {
+                !manifest.updates.iter().any(|update| &update.id == *id)
+                    && !manifest.archives.iter().any(|archive| &archive.id == *id)
+            })
+            .cloned()
+            .collect()
+    };
+    let banked = bank(&manifest.verified);
     if !banked.is_empty() {
         report.verified = memory::touch_memories(db, project, &banked, started_at).await?;
+    }
+    let skip_banked = bank(&manifest.skipped);
+    if !skip_banked.is_empty() {
+        report.skipped = memory::touch_memories(db, project, &skip_banked, started_at).await?;
     }
     for update in &manifest.updates {
         let Some(original) = batch.iter().find(|memory| memory.id == update.id) else {
@@ -2890,6 +2952,7 @@ fn ready_element_regex() -> &'static Regex {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct ApplyReport {
     verified: usize,
+    skipped: usize,
     updated: usize,
     merged: usize,
     archived: usize,
@@ -2899,8 +2962,8 @@ struct ApplyReport {
 impl ApplyReport {
     fn describe(&self) -> String {
         format!(
-            "verified={} updated={} merged={} archived={} refused={}",
-            self.verified, self.updated, self.merged, self.archived, self.refused
+            "verified={} skipped={} updated={} merged={} archived={} refused={}",
+            self.verified, self.skipped, self.updated, self.merged, self.archived, self.refused
         )
     }
 }
@@ -2974,9 +3037,346 @@ fn archive_regex() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"(?is)<archive\b([^>]*)>").expect("archive element regex"))
 }
 
+fn skip_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"(?is)<skip\b([^>]*)>").expect("skip element regex"))
+}
+
 fn merge_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"(?is)<merge\b([^>]*?)(?:/>|>(.*?)</merge\s*>)").expect("merge element regex")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cand(id: &str) -> Candidate {
+        Candidate {
+            id: id.to_owned(),
+            category: "ARCHITECTURE".into(),
+            content: format!("memory {id}"),
+            updated_at: 0,
+            paths: Vec::new(),
+        }
+    }
+
+    fn batch(ids: &[&str]) -> Vec<Candidate> {
+        ids.iter().map(|id| cand(id)).collect()
+    }
+
+    fn verify_batch_of(ids: &[String]) -> Vec<Candidate> {
+        ids.iter().map(|id| cand(id)).collect()
+    }
+
+    #[tokio::test]
+    async fn skip_verdict_is_stamped_like_verified() {
+        let db = Db::open_in_memory().await.expect("db");
+        let mut ids = Vec::new();
+        for text in ["one", "two", "three"] {
+            ids.push(
+                memory::write_memory(&db, "p", text, "ARCHITECTURE")
+                    .await
+                    .expect("write"),
+            );
+        }
+        let batch = verify_batch_of(&ids);
+        let manifest = VerifyManifest {
+            verified: vec![ids[0].clone()],
+            skipped: vec![ids[1].clone()],
+            ..VerifyManifest::default()
+        };
+        let started_at = now_millis() + 60_000;
+
+        let report = apply_verify_manifest(&db, "p", &batch, &manifest, started_at)
+            .await
+            .expect("apply");
+
+        assert_eq!((report.verified, report.skipped), (1, 1));
+        assert!(
+            report.describe().contains("skipped=1"),
+            "{}",
+            report.describe()
+        );
+        let stored = memory::active_memories_with_watermark(&db, "p")
+            .await
+            .expect("read");
+        let stamp = |id: &String| {
+            stored
+                .iter()
+                .find(|m| &m.id == id)
+                .expect("row")
+                .verified_at
+        };
+        assert_eq!(stamp(&ids[0]), started_at);
+        assert_eq!(stamp(&ids[1]), started_at);
+        assert_eq!(stamp(&ids[2]), 0, "an omitted id keeps its old watermark");
+    }
+
+    #[test]
+    fn describe_reports_skipped_between_verified_and_updated() {
+        let report = ApplyReport {
+            skipped: 3,
+            ..ApplyReport::default()
+        };
+        assert_eq!(
+            report.describe(),
+            "verified=0 skipped=3 updated=0 merged=0 archived=0 refused=0"
+        );
+    }
+
+    #[test]
+    fn manifest_covering_every_id_with_the_three_old_verdicts_parses() {
+        let manifest = parse_verify_manifest(
+            "<verify><verified id=\"1\"/><update id=\"2\">new text</update><archive id=\"3\" reason=\"gone\"/></verify>",
+            &batch(&["1", "2", "3"]),
+        )
+        .expect("fully covered manifest parses");
+        assert_eq!(manifest.verified, vec!["1".to_owned()]);
+        assert_eq!(manifest.updates.len(), 1);
+        assert_eq!(manifest.updates[0].id, "2");
+        assert_eq!(manifest.updates[0].content, "new text");
+        assert_eq!(manifest.archives.len(), 1);
+        assert_eq!(manifest.archives[0].id, "3");
+        assert!(manifest.skipped.is_empty());
+    }
+
+    #[test]
+    fn skip_verdicts_count_toward_coverage() {
+        let manifest = parse_verify_manifest(
+            "<verify><verified id=\"1\"/><skip id=\"2\" reason=\"behavioral\"/></verify>",
+            &batch(&["1", "2", "3", "4"]),
+        )
+        .expect("2/4 is not below half");
+        assert_eq!(manifest.verified, vec!["1".to_owned()]);
+        assert_eq!(manifest.skipped, vec!["2".to_owned()]);
+    }
+
+    #[test]
+    fn skip_forms_self_closing_with_and_without_reason_parse() {
+        let manifest = parse_verify_manifest(
+            "<verify><skip id=\"1\"/><skip id=\"2\" reason=\"x\"/><skip id=\"3\" reason=\"y\"></skip></verify>",
+            &batch(&["1", "2", "3"]),
+        )
+        .expect("skip forms parse");
+        assert_eq!(
+            manifest.skipped,
+            vec!["1".to_owned(), "2".to_owned(), "3".to_owned()]
+        );
+    }
+
+    #[test]
+    fn manifest_below_half_coverage_is_rejected() {
+        let ids: Vec<String> = (1..=15).map(|n| n.to_string()).collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let err = parse_verify_manifest(
+            "<verify><verified id=\"1\"/><verified id=\"2\"/><skip id=\"3\"/></verify>",
+            &batch(&refs),
+        )
+        .unwrap_err();
+        assert!(err.contains("covers 3/15"), "{err}");
+    }
+
+    #[test]
+    fn same_id_in_verified_and_skip_is_a_duplicate() {
+        let err = parse_verify_manifest(
+            "<verify><verified id=\"1\"/><skip id=\"1\"/></verify>",
+            &batch(&["1", "2"]),
+        )
+        .unwrap_err();
+        assert!(err.contains("duplicate id"), "{err}");
+    }
+
+    #[test]
+    fn skip_outside_the_batch_is_dropped_and_not_counted() {
+        let err = parse_verify_manifest(
+            "<verify><verified id=\"1\"/><skip id=\"99\"/></verify>",
+            &batch(&["1", "2", "3", "4"]),
+        )
+        .unwrap_err();
+        assert!(err.contains("covers 1/4"), "{err}");
+    }
+
+    #[test]
+    fn skip_without_an_id_is_rejected() {
+        let err = parse_verify_manifest(
+            "<verify><verified id=\"1\"/><skip reason=\"x\"/></verify>",
+            &batch(&["1", "2"]),
+        )
+        .unwrap_err();
+        assert!(err.contains("missing an id"), "{err}");
+    }
+
+    #[test]
+    fn verify_prompt_asks_for_every_id_and_offers_skip() {
+        assert!(!VERIFY_SYSTEM_PROMPT.contains("omit rather than guess"));
+        assert!(VERIFY_SYSTEM_PROMPT.contains("<skip id="));
+        assert!(VERIFY_SYSTEM_PROMPT.contains("exactly once"));
+    }
+
+    fn st(exists: bool, newer: bool) -> PathState {
+        PathState {
+            path: None,
+            written: "x".into(),
+            exists,
+            mtime: None,
+            newer,
+        }
+    }
+
+    #[test]
+    fn an_existing_newer_file_is_checked_whether_or_not_the_memory_was_stamped() {
+        assert!(needs_check(&[st(true, true)], 0));
+        assert!(needs_check(&[st(true, true)], 500));
+    }
+
+    #[test]
+    fn an_existing_unchanged_file_is_never_checked() {
+        assert!(!needs_check(&[st(true, false)], 0));
+        assert!(!needs_check(&[st(true, false)], 500));
+    }
+
+    #[test]
+    fn a_missing_file_is_checked_only_while_the_memory_was_never_verified() {
+        assert!(needs_check(&[st(false, false)], 0));
+        assert!(!needs_check(&[st(false, false)], 500));
+    }
+
+    #[test]
+    fn an_unresolvable_path_behaves_like_a_missing_one() {
+        // `st` builds `path: None`, the shape `resolve_path` returns for a
+        // `~`-prefixed or out-of-project path.
+        let unresolvable = PathState {
+            path: None,
+            ..st(false, false)
+        };
+        assert!(needs_check(std::slice::from_ref(&unresolvable), 0));
+        assert!(!needs_check(std::slice::from_ref(&unresolvable), 500));
+    }
+
+    #[test]
+    fn mixed_paths_follow_the_existing_files_once_stamped() {
+        assert!(!needs_check(&[st(false, false), st(true, false)], 500));
+        assert!(needs_check(&[st(false, false), st(true, true)], 500));
+    }
+
+    #[test]
+    fn a_memory_with_no_paths_is_never_checked() {
+        assert!(!needs_check(&[], 0));
+        assert!(!needs_check(&[], 500));
+    }
+
+    fn stored(id: &str, content: &str, verified_at: i64) -> memory::StoredMemory {
+        memory::StoredMemory {
+            id: id.to_owned(),
+            category: "ARCHITECTURE".into(),
+            content: content.to_owned(),
+            updated_at: 0,
+            verified_at,
+        }
+    }
+
+    #[test]
+    fn candidate_stops_resending_stamped_memories_whose_file_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(dir.path().join("src")).expect("mkdir src");
+        std::fs::write(dir.path().join("src/exists.rs"), "fn main() {}").expect("write file");
+        let project = dir.path().to_str().expect("utf-8 tempdir");
+        let pick = |content: &str, verified_at: i64| {
+            candidate(project, &stored("1", content, verified_at)).is_some()
+        };
+
+        // The file was just written: its mtime is later than 0 and 1000.
+        assert!(pick("see src/exists.rs", 0), "never verified, file exists");
+        assert!(pick("see src/gone.rs", 0), "never verified, file missing");
+        assert!(!pick("see src/gone.rs", 1000), "stamped, file missing");
+        assert!(!pick("see ~/x/y.rs", 1000), "stamped, unresolvable path");
+        assert!(!pick("no file is cited here", 0), "no path at all");
+        assert!(
+            pick("see src/exists.rs", 1000),
+            "stamped, file changed since"
+        );
+    }
+
+    const INTERVAL: i64 = 15 * 60_000;
+    const HOUR: i64 = 60 * 60_000;
+    const NOW: i64 = 1_000_000_000_000;
+
+    fn failed(consecutive_failures: u32, attempted_ago: i64) -> DreamState {
+        DreamState {
+            last_attempt_at: NOW - attempted_ago,
+            last_status: Some("failed".into()),
+            consecutive_failures,
+            ..DreamState::default()
+        }
+    }
+
+    #[test]
+    fn failure_backoff_doubles_per_failure_past_the_threshold_up_to_the_cap() {
+        for failures in 0..MAX_DREAM_FAILURES {
+            assert_eq!(failure_backoff_millis(failures, INTERVAL), 0, "{failures}");
+        }
+        assert_eq!(failure_backoff_millis(3, INTERVAL), 2 * INTERVAL);
+        assert_eq!(failure_backoff_millis(4, INTERVAL), 4 * INTERVAL);
+        assert_eq!(failure_backoff_millis(5, INTERVAL), 8 * INTERVAL);
+        assert_eq!(failure_backoff_millis(6, INTERVAL), 16 * INTERVAL);
+        for failures in [9, 100, u32::MAX] {
+            assert_eq!(
+                failure_backoff_millis(failures, INTERVAL),
+                MAX_DREAM_BACKOFF_MILLIS,
+                "{failures}"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_backoff_survives_degenerate_intervals() {
+        for failures in [0, 3, 100, u32::MAX] {
+            assert!(failure_backoff_millis(failures, 0) <= MAX_DREAM_BACKOFF_MILLIS);
+            assert!(failure_backoff_millis(failures, -5) <= MAX_DREAM_BACKOFF_MILLIS);
+        }
+        assert_eq!(
+            failure_backoff_millis(3, i64::MAX),
+            MAX_DREAM_BACKOFF_MILLIS
+        );
+        assert_eq!(
+            failure_backoff_millis(u32::MAX, i64::MAX),
+            MAX_DREAM_BACKOFF_MILLIS
+        );
+    }
+
+    #[test]
+    fn is_due_gates_on_the_last_successful_run() {
+        assert!(is_due(&DreamState::default(), NOW, INTERVAL), "fresh row");
+        let ran = |ago: i64| DreamState {
+            last_run_at: Some(NOW - ago),
+            ..DreamState::default()
+        };
+        assert!(!is_due(&ran(INTERVAL - 1), NOW, INTERVAL), "too young");
+        assert!(is_due(&ran(INTERVAL), NOW, INTERVAL), "old enough");
+    }
+
+    #[test]
+    fn is_due_retries_hot_below_the_failure_threshold() {
+        assert!(is_due(&failed(2, 0), NOW, INTERVAL));
+    }
+
+    #[test]
+    fn is_due_backs_off_exponentially_once_failures_reach_the_threshold() {
+        assert!(!is_due(&failed(3, INTERVAL), NOW, INTERVAL));
+        assert!(!is_due(&failed(3, 2 * INTERVAL - 1), NOW, INTERVAL));
+        assert!(is_due(&failed(3, 2 * INTERVAL), NOW, INTERVAL));
+        assert!(!is_due(&failed(6, 3 * HOUR), NOW, INTERVAL));
+        assert!(is_due(&failed(6, 4 * HOUR), NOW, INTERVAL));
+        assert!(!is_due(&failed(50, 23 * HOUR), NOW, INTERVAL));
+        assert!(is_due(&failed(50, 24 * HOUR), NOW, INTERVAL));
+    }
+
+    #[test]
+    fn is_due_treats_a_future_attempt_stamp_as_not_yet_due() {
+        // Clock skew: `now - last_attempt_at` is negative, below any wait.
+        assert!(!is_due(&failed(3, -HOUR), NOW, INTERVAL));
+    }
 }
