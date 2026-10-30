@@ -173,7 +173,7 @@ where
 const SESSION_COLUMNS: &str = "id, project_id, workspace_id, parent_id, fork_session_id, \
      fork_boundary, agent, model, cost, tokens_input, tokens_output, tokens_reasoning, \
      tokens_cache_read, tokens_cache_write, directory, path, title, metadata, permission, \
-     revert, idle_outcome, time_created, time_updated, time_idle, time_viewed, time_archived";
+     revert, idle_outcome, time_created, time_updated, time_idle, time_viewed, time_archived, time_busy";
 
 /// The `session_v2` columns that make up upstream `Session.Info`. JSON blobs
 /// (`model`, `metadata`, `permission`, `revert`, `fork_boundary`) stay raw and
@@ -205,6 +205,7 @@ struct SessionRow {
     time_idle: Option<i64>,
     time_viewed: Option<i64>,
     time_archived: Option<i64>,
+    time_busy: Option<i64>,
 }
 
 fn map_session_row(row: &ox_db::turso::Row) -> ox_db::turso::Result<SessionRow> {
@@ -235,6 +236,7 @@ fn map_session_row(row: &ox_db::turso::Row) -> ox_db::turso::Result<SessionRow> 
         time_idle: row.get(23)?,
         time_viewed: row.get(24)?,
         time_archived: row.get(25)?,
+        time_busy: row.get(26)?,
     })
 }
 
@@ -271,6 +273,9 @@ impl SessionRow {
         let mut time = Map::new();
         time.insert("created".to_owned(), json!(self.time_created));
         time.insert("updated".to_owned(), json!(self.time_updated));
+        if let Some(busy) = self.time_busy {
+            time.insert("busy".to_owned(), json!(busy));
+        }
         if let Some(idle) = self.time_idle {
             time.insert("idle".to_owned(), json!(idle));
         }
@@ -2859,6 +2864,7 @@ pub(crate) async fn import(req: &mut Request, depot: &mut Depot, res: &mut Respo
         .unwrap_or_default();
     let created = number("/time/created").unwrap_or(imported_at);
     let idle = number("/time/idle");
+    let busy = number("/time/busy");
     let viewed = number("/time/viewed");
     let archived = number("/time/archived");
     let outcome = body
@@ -2871,7 +2877,7 @@ pub(crate) async fn import(req: &mut Request, depot: &mut Depot, res: &mut Respo
             "UPDATE session_v2 SET cost = ?2, tokens_input = ?3, tokens_output = ?4,
              tokens_reasoning = ?5, tokens_cache_read = ?6, tokens_cache_write = ?7,
              time_created = ?8, time_updated = ?9, time_idle = ?10, time_viewed = ?11,
-             idle_outcome = ?12, time_archived = ?13
+             idle_outcome = ?12, time_archived = ?13, time_busy = ?14
              WHERE id = ?1",
             (
                 session_id.as_str(),
@@ -2888,6 +2894,8 @@ pub(crate) async fn import(req: &mut Request, depot: &mut Depot, res: &mut Respo
                     .map(|idle| idle.min(viewed.unwrap_or(idle))),
                 idle.and(outcome),
                 archived,
+                // Upstream transfer: only a completed execution keeps its start.
+                idle.zip(busy).map(|(idle, busy)| idle.min(busy)),
             ),
         )
         .await

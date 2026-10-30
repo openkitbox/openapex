@@ -226,6 +226,11 @@ pub struct PromptMention {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FileInput {
     pub uri: String,
+    /// Where the bytes came from, for a `data:` upload whose original file
+    /// the server may not be able to reopen (upstream 2.2.3). Descriptive
+    /// only: the server never reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<FileSource>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -432,5 +437,25 @@ mod tests {
             let parsed: TokenUsage = serde_json::from_str(raw).unwrap();
             assert_eq!(serde_json::to_string(&parsed).unwrap(), raw);
         }
+    }
+
+    #[test]
+    fn file_input_source_is_optional_and_round_trips() {
+        let bare: FileInput =
+            serde_json::from_str(r#"{"uri":"data:text/plain;base64,YQ=="}"#).unwrap();
+        assert_eq!(bare.source, None);
+        assert_eq!(
+            serde_json::to_string(&bare).unwrap(),
+            r#"{"uri":"data:text/plain;base64,YQ=="}"#
+        );
+        let raw = r#"{"uri":"data:text/plain;base64,YQ==","source":{"type":"uri","uri":"file:///a.txt"}}"#;
+        let with: FileInput = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            with.source,
+            Some(FileSource::Uri {
+                uri: "file:///a.txt".into()
+            })
+        );
+        assert_eq!(serde_json::to_string(&with).unwrap(), raw);
     }
 }

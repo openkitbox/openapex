@@ -124,6 +124,7 @@ pub async fn project(
 
         E::ExecutionStarted { session_id } => {
             touch(tx, session_id, env.created).await?;
+            project_busy(tx, session_id, env.created).await?;
         }
         E::ExecutionSucceeded { session_id } => {
             message_updater::run(tx, env).await?;
@@ -350,6 +351,18 @@ fn to_json<T: serde::Serialize>(v: &T) -> Result<String> {
 pub(crate) async fn touch(tx: &Connection, session_id: &str, created: i64) -> Result<()> {
     tx.execute(
         "UPDATE session_v2 SET time_updated = ?2 WHERE id = ?1",
+        (session_id, created),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Upstream `Execution.Started` projection: `time_busy = created`, with
+/// `time_updated` left unchanged (self-assignment). While the execution runs,
+/// `time_idle` still holds the previous execution's end.
+async fn project_busy(tx: &Connection, session_id: &str, created: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE session_v2 SET time_busy = ?2, time_updated = time_updated WHERE id = ?1",
         (session_id, created),
     )
     .await?;
@@ -946,4 +959,67 @@ async fn project_fork(tx: &Connection, env: &EventEnvelope<SessionEventData>) ->
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ox_db::Db;
+
+    async fn seeded() -> Db {
+        let db = Db::open_in_memory().await.expect("db");
+        let tx = db.begin().await.expect("begin");
+        tx.execute(
+            "INSERT INTO session_v2 (id, project_id, slug, directory, version, time_created, time_updated)
+             VALUES ('ses_1', 'p', 's', '/d', 'v', 0, 0)",
+            (),
+        )
+        .await
+        .expect("seed");
+        tx.commit().await.expect("commit");
+        db
+    }
+
+    async fn times(db: &Db) -> (Option<i64>, Option<i64>, i64) {
+        let conn = db.acquire().await.expect("conn");
+        let mut rows = conn
+            .query(
+                "SELECT time_busy, time_idle, time_updated FROM session_v2",
+                (),
+            )
+            .await
+            .expect("query");
+        let row = rows.next().await.expect("next").expect("row");
+        (
+            row.get(0).unwrap(),
+            row.get(1).unwrap(),
+            row.get(2).unwrap(),
+        )
+    }
+
+    /// Mirrors upstream `session-projector.test.ts` "records each execution's
+    /// start": busy follows the latest start, idle the latest end, and neither
+    /// moves `time_updated`.
+    #[tokio::test]
+    async fn busy_tracks_each_execution_start() {
+        let db = seeded().await;
+        assert_eq!(times(&db).await, (None, None, 0));
+
+        let tx = db.begin().await.unwrap();
+        project_busy(&tx, "ses_1", 10).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(times(&db).await, (Some(10), None, 0));
+
+        let tx = db.begin().await.unwrap();
+        project_idle(&tx, "ses_1", 40, IdleOutcome::Succeeded)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(times(&db).await, (Some(10), Some(40), 0));
+
+        let tx = db.begin().await.unwrap();
+        project_busy(&tx, "ses_1", 50).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(times(&db).await, (Some(50), Some(40), 0));
+    }
 }

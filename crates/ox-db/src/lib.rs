@@ -406,6 +406,14 @@ const MIGRATION_V14: &str = r#"
 ALTER TABLE mc_memory ADD COLUMN importance real NOT NULL DEFAULT 0;
 "#;
 
+/// V15: `session_v2.time_busy`, the start of the session's most recent
+/// execution (upstream 2.2.3 `Session.Info.time.busy`, written by the
+/// `session.execution.started` projection). Nullable and additive, so it applies
+/// onto any V14-stamped database; sessions that never executed stay NULL.
+const MIGRATION_V15: &str = r#"
+ALTER TABLE session_v2 ADD COLUMN time_busy integer;
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
@@ -424,6 +432,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (12, MIGRATION_V12),
     (13, MIGRATION_V13),
     (14, MIGRATION_V14),
+    (15, MIGRATION_V15),
 ];
 
 /// Async handle to the database.

@@ -151,7 +151,7 @@ fn from_data_url(input: FileInput, used: &mut usize) -> Result<FileAttachment, A
     Ok(FileAttachment {
         data,
         mime,
-        source: FileSource::Inline,
+        source: input.source.unwrap_or(FileSource::Inline),
         name: input.name,
         description: input.description,
         mention: input.mention,
@@ -369,5 +369,36 @@ fn line_range(bytes: &[u8], start: usize, end: Option<usize>) -> &[u8] {
     match begin {
         Some(begin) if begin <= stop => &bytes[begin..stop],
         _ => &[],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(source: Option<FileSource>) -> FileInput {
+        FileInput {
+            uri: "data:text/plain;base64,aGk=".to_owned(),
+            source,
+            name: Some("a.txt".to_owned()),
+            description: None,
+            mention: None,
+        }
+    }
+
+    #[test]
+    fn data_url_without_source_is_inline() {
+        let out = materialize(vec![input(None)]).unwrap();
+        assert_eq!(out[0].source, FileSource::Inline);
+    }
+
+    #[test]
+    fn data_url_keeps_the_client_supplied_source() {
+        let source = FileSource::Uri {
+            uri: "file:///tmp/a.txt".to_owned(),
+        };
+        let out = materialize(vec![input(Some(source.clone()))]).unwrap();
+        assert_eq!(out[0].source, source);
+        assert_eq!(&*out[0].data, "aGk=");
     }
 }
