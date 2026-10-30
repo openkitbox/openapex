@@ -23,7 +23,16 @@
 //! - On a clean finish: `session.step.streamed`, tool settlement, then
 //!   `session.step.ended` with upstream's token shape (`input` = prompt
 //!   minus cached, `output` = completion, `reasoning`, `cache.read` =
-//!   cached, `cache.write` = 0).
+//!   cached, `cache.write` = 0). When the stream carries no usage, `input`
+//!   is an estimate from the sent request's size (bytes/4 x the session
+//!   calibration ratio) and the other fields are 0. Deviation: the estimate
+//!   lives in the same field (no schema change); bytes/4 under-counts CJK,
+//!   so folds may trigger slightly late; pre-existing zero rows are not
+//!   rewritten. The estimate also lands on interrupted and incomplete-stream
+//!   rows (their usage chunk never arrives, even for models that do report
+//!   it), so those turns now add a prompt-size estimate (no cache split) to
+//!   `session_v2.tokens_input` and the stats sums; a failed attempt that
+//!   never opened a stream keeps `tokens: None`.
 //! - An interruption after the step started settles the step with
 //!   `session.step.failed` carrying the upstream `aborted` error, after
 //!   failing unsettled tool parts.
@@ -724,7 +733,13 @@ async fn consume(
                     .await?;
                 join_tool_tasks(ctx, params, &mut tool_tasks, token).await?;
                 return Ok(Attempt::Done(
-                    settle_interrupted(ctx, params, *started, Some(map_tokens(usage))).await?,
+                    settle_interrupted(
+                        ctx,
+                        params,
+                        *started,
+                        (*started).then(|| attempt_tokens(ctx, request, usage)),
+                    )
+                    .await?,
                 ));
             }
             // `ChatStream` synthesizes `Done` before returning `None`, so an
@@ -922,7 +937,7 @@ async fn consume(
         return Ok(Attempt::Failed {
             failure: AttemptFailure::IncompleteStream,
             published: true,
-            tokens: Some(map_tokens(usage)),
+            tokens: Some(attempt_tokens(ctx, request, usage)),
         });
     };
 
@@ -954,7 +969,13 @@ async fn consume(
     // interrupted (upstream: failAssistant, no step.ended).
     if token.is_cancelled() {
         return Ok(Attempt::Done(
-            settle_interrupted(ctx, params, *started, Some(map_tokens(usage))).await?,
+            settle_interrupted(
+                ctx,
+                params,
+                *started,
+                (*started).then(|| attempt_tokens(ctx, request, usage)),
+            )
+            .await?,
         ));
     }
     ctx.bus
@@ -965,7 +986,7 @@ async fn consume(
             raw_finish: Some(raw_finish),
             provider_state: None,
             cost: ox_schema::support::Finite::Int(0),
-            tokens: map_tokens(usage),
+            tokens: attempt_tokens(ctx, request, usage),
             snapshot: None,
             files: None,
         })
@@ -1366,11 +1387,12 @@ async fn flush_blocks(
 
 /// Upstream token shape (`SessionUsage.tokens`): input excludes cached
 /// prompt tokens, cache write is not reported by cardinal's OpenAI dialect.
-/// A stream that never carried usage settles as zeros.
-fn map_tokens(usage: Option<Usage>) -> TokenUsage {
+/// A stream that never carried usage stores `estimate()` as `input` and
+/// zeros elsewhere; the estimate is not evaluated when usage was reported.
+fn tokens_for(usage: Option<Usage>, estimate: impl FnOnce() -> i64) -> TokenUsage {
     let Some(usage) = usage else {
         return TokenUsage {
-            input: 0,
+            input: estimate(),
             output: 0,
             reasoning: 0,
             cache: TokenCache { read: 0, write: 0 },
@@ -1386,6 +1408,37 @@ fn map_tokens(usage: Option<Usage>) -> TokenUsage {
             write: 0,
         },
     }
+}
+
+/// Prompt-size estimate for a request body of `body_len` bytes:
+/// `ceil(bytes / 4 * ratio)`. A non-finite or negative `ratio` counts as 1.0;
+/// the product saturates at `i64::MAX`.
+fn estimate_prompt_tokens(body_len: usize, ratio: f64) -> i64 {
+    let ratio = if ratio.is_finite() && ratio >= 0.0 {
+        ratio
+    } else {
+        1.0
+    };
+    let raw = crate::mctx::tokens::heuristic_bytes(body_len) as f64 * ratio;
+    // `as` saturates for out-of-range floats, so this clamps to i64::MAX.
+    raw.ceil() as i64
+}
+
+/// Settled token usage for one attempt. When the stream carried no usage the
+/// prompt size is estimated from the request that was sent (its serialized
+/// length is measured, not built); a serialization failure falls back to 0.
+fn attempt_tokens(ctx: &DrainCtx, request: &ChatRequest, usage: Option<Usage>) -> TokenUsage {
+    tokens_for(usage, || {
+        let body_len = match ox_llm::cardinal::wire::serialized_len(request) {
+            Ok(len) => len,
+            Err(error) => {
+                tracing::warn!(session = %ctx.session_id, error = %error, "prompt estimate skipped");
+                return 0;
+            }
+        };
+        let ratio = crate::mctx::calibration::ratio_for(&ctx.calibrations, &ctx.session_id);
+        estimate_prompt_tokens(body_len, ratio)
+    })
 }
 
 /// Map cardinal's raw `finish_reason` to the upstream literal union.
@@ -1613,7 +1666,7 @@ pub(crate) fn compaction_boundary(messages: &[Message]) -> usize {
 /// query (plan D1: one measurement, one meaning).
 ///
 /// Parity with the raw reader is pinned per row shape by
-/// `token_parity_tests::assistant_tokens_parity_with_raw_prompt_tokens`
+/// `tests::assistant_tokens_parity_with_raw_prompt_tokens`
 /// (bottom of this file) — change both readers or neither.
 fn assistant_tokens(message: &Message) -> Option<i64> {
     match message {
@@ -2471,5 +2524,108 @@ mod tests {
             AttemptFailure::Transport(no_route).retry_kind(),
             RetryKind::Never
         );
+    }
+
+    fn usage(prompt: u64, completion: u64, cached: Option<u64>, reasoning: Option<u64>) -> Usage {
+        Usage {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            cached_tokens: cached,
+            reasoning_tokens: reasoning,
+        }
+    }
+
+    #[test]
+    fn tokens_for_reported_usage_keeps_the_upstream_mapping() {
+        let got = tokens_for(Some(usage(1000, 50, Some(200), Some(7))), || {
+            panic!("estimate must not be called")
+        });
+        assert_eq!(
+            got,
+            TokenUsage {
+                input: 800,
+                output: 50,
+                reasoning: 7,
+                cache: TokenCache {
+                    read: 200,
+                    write: 0
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn tokens_for_missing_usage_stores_the_estimate_as_input() {
+        assert_eq!(
+            tokens_for(None, || 1234),
+            TokenUsage {
+                input: 1234,
+                output: 0,
+                reasoning: 0,
+                cache: TokenCache { read: 0, write: 0 },
+            }
+        );
+    }
+
+    #[test]
+    fn estimate_prompt_tokens_scales_bytes_by_the_ratio() {
+        assert_eq!(estimate_prompt_tokens(4000, 1.0), 1000);
+        assert_eq!(estimate_prompt_tokens(4000, 1.5), 1500);
+        assert_eq!(estimate_prompt_tokens(0, 1.0), 0);
+        assert_eq!(estimate_prompt_tokens(1, 1.0), 1);
+        assert_eq!(estimate_prompt_tokens(4000, f64::NAN), 1000);
+        assert_eq!(estimate_prompt_tokens(4000, f64::INFINITY), 1000);
+        assert_eq!(estimate_prompt_tokens(4000, -2.0), 1000);
+        assert_eq!(estimate_prompt_tokens(usize::MAX, 1e30), i64::MAX);
+    }
+
+    /// A decoded assistant row and the raw JSON the historian trigger reads,
+    /// both built from the same `tokens` shape.
+    fn parity_row(tokens: Option<serde_json::Value>) -> (Message, serde_json::Value) {
+        let mut json = serde_json::json!({
+            "type": "assistant",
+            "id": "msg_a",
+            "time": { "created": 1 },
+            "agent": "build",
+            "model": { "id": "m", "providerID": "p" },
+            "content": [],
+        });
+        if let Some(tokens) = tokens {
+            json["tokens"] = tokens;
+        }
+        let message: Message = serde_json::from_value(json.clone()).expect("assistant decodes");
+        (message, json)
+    }
+
+    #[test]
+    fn assistant_tokens_parity_with_raw_prompt_tokens() {
+        let full = |input: i64, read: i64| {
+            serde_json::json!({
+                "input": input,
+                "output": 5,
+                "reasoning": 0,
+                "cache": { "read": read, "write": 3 },
+            })
+        };
+        let cases = [
+            (Some(full(800, 200)), Some(1000)),
+            (Some(full(800, 0)), Some(800)),
+            (Some(full(0, 0)), Some(0)),
+            (None, None),
+        ];
+        for (tokens, expected) in cases {
+            let (message, row) = parity_row(tokens.clone());
+            assert_eq!(assistant_tokens(&message), expected, "decoded {tokens:?}");
+            assert_eq!(
+                super::super::historian_trigger::prompt_tokens(&row),
+                expected,
+                "raw {tokens:?}"
+            );
+            assert_eq!(
+                assistant_tokens(&message),
+                super::super::historian_trigger::prompt_tokens(&row),
+                "parity {tokens:?}"
+            );
+        }
     }
 }

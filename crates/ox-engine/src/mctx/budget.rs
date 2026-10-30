@@ -255,3 +255,176 @@ fn percent(value: f64, default: f64, min: f64, max: f64) -> f64 {
 fn clamp_u32(value: f64, min: f64, max: f64) -> u32 {
     value.clamp(min, max) as u32
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WINDOW: u32 = 262_144;
+
+    fn known() -> Budget {
+        Budget::derive(&MctxConfig::default(), Some(WINDOW), None)
+    }
+
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    #[test]
+    fn unknown_window_has_no_usage_percentage_and_no_protected_tail() {
+        let budget = Budget::derive(&MctxConfig::default(), None, None);
+        assert_eq!(budget.usage_percentage(150_000), None);
+        for usage in [0.0, 30.0, 60.0, 90.0] {
+            assert_eq!(budget.protected_tail(usage), 0);
+        }
+    }
+
+    #[test]
+    fn unknown_window_falls_back_to_the_pre_budget_numbers() {
+        let budget = Budget::derive(&MctxConfig::default(), None, None);
+        assert_eq!(budget.trigger, FALLBACK_TRIGGER);
+        assert_eq!(budget.history, FALLBACK_HISTORY);
+    }
+
+    #[test]
+    fn usage_percentage_is_the_share_of_the_window() {
+        let budget = known();
+        let pct = budget.usage_percentage(i64::from(WINDOW) / 2).unwrap();
+        assert_close(pct, 50.0);
+        assert_close(budget.usage_percentage(0).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn default_config_derives_the_bands_from_the_execute_threshold() {
+        let budget = known();
+        assert_close(budget.soft_pct, DEFAULT_EXECUTE_PCT - SOFT_OFFSET_PCT);
+        assert_close(
+            budget.hard_pct,
+            (DEFAULT_EXECUTE_PCT + 2.0).max(HARD_FLOOR_PCT),
+        );
+        // The same bands exist without a window.
+        let unknown = Budget::derive(&MctxConfig::default(), None, None);
+        assert_close(unknown.soft_pct, budget.soft_pct);
+        assert_close(unknown.hard_pct, budget.hard_pct);
+    }
+
+    #[test]
+    fn hard_band_follows_the_execute_threshold_above_the_floor() {
+        let config = MctxConfig {
+            execute_threshold_percentage: MAX_EXECUTE_PCT,
+            ..MctxConfig::default()
+        };
+        let budget = Budget::derive(&config, Some(WINDOW), None);
+        assert_close(budget.soft_pct, MAX_EXECUTE_PCT - SOFT_OFFSET_PCT);
+        assert_close(budget.hard_pct, MAX_EXECUTE_PCT + 2.0);
+    }
+
+    #[test]
+    fn trigger_and_history_derive_from_the_usable_window() {
+        let budget = known();
+        let usable = (f64::from(WINDOW) * DEFAULT_EXECUTE_PCT / 100.0).round();
+        let trigger = (usable * TRIGGER_SHARE).round();
+        assert_eq!(
+            f64::from(budget.trigger),
+            trigger.clamp(TRIGGER_MIN, TRIGGER_MAX)
+        );
+        let history = (usable * DEFAULT_HISTORY_SHARE).floor();
+        assert_eq!(f64::from(budget.history), history);
+    }
+
+    #[test]
+    fn historian_chunk_uses_the_historian_window_and_clamps() {
+        let config = MctxConfig::default();
+        let assumed = Budget::derive(&config, Some(WINDOW), None);
+        assert_eq!(
+            f64::from(assumed.historian_chunk),
+            (f64::from(ASSUMED_HISTORIAN_WINDOW) * HISTORIAN_CHUNK_SHARE)
+                .clamp(HISTORIAN_CHUNK_MIN, HISTORIAN_CHUNK_MAX)
+        );
+        let tiny = Budget::derive(&config, Some(WINDOW), Some(1_000));
+        assert_eq!(f64::from(tiny.historian_chunk), HISTORIAN_CHUNK_MIN);
+        let huge = Budget::derive(&config, Some(WINDOW), Some(4_000_000));
+        assert_eq!(f64::from(huge.historian_chunk), HISTORIAN_CHUNK_MAX);
+    }
+
+    #[test]
+    fn protected_tail_never_grows_as_usage_rises() {
+        let budget = known();
+        let samples: Vec<u32> = [0.0, 30.0, 60.0, 90.0]
+            .iter()
+            .map(|usage| budget.protected_tail(*usage))
+            .collect();
+        assert!(
+            samples.windows(2).all(|pair| pair[0] >= pair[1]),
+            "not non-increasing: {samples:?}"
+        );
+        assert!(samples[0] > samples[3], "pressure must shrink the target");
+    }
+
+    #[test]
+    fn protected_tail_stays_between_the_floor_and_the_absolute_cap() {
+        let budget = known();
+        for usage in [0.0, 30.0, 60.0, 90.0, 100.0] {
+            let tail = f64::from(budget.protected_tail(usage));
+            assert!(
+                (PROTECTED_FLOOR_MIN..=PROTECTED_ABS_CAP).contains(&tail),
+                "usage {usage}: {tail}"
+            );
+        }
+        // At full pressure the target is exactly the floor for this window.
+        let floor = (f64::from(budget.usable) * PROTECTED_FLOOR_RATIO)
+            .round()
+            .clamp(PROTECTED_FLOOR_MIN, PROTECTED_FLOOR_MAX);
+        assert_eq!(f64::from(budget.protected_tail(100.0)), floor);
+    }
+
+    #[test]
+    fn protected_tail_treats_out_of_range_usage_like_the_nearest_bound() {
+        let budget = known();
+        assert_eq!(budget.protected_tail(-50.0), budget.protected_tail(0.0));
+        assert_eq!(budget.protected_tail(500.0), budget.protected_tail(100.0));
+    }
+
+    #[test]
+    fn non_finite_config_percentages_fall_back_to_the_defaults() {
+        let default = known();
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let config = MctxConfig {
+                execute_threshold_percentage: bad,
+                history_budget_percentage: bad,
+                ..MctxConfig::default()
+            };
+            let budget = Budget::derive(&config, Some(WINDOW), None);
+            assert!(budget.history > 0, "zero history budget disables decay");
+            assert_eq!(budget, default);
+        }
+    }
+
+    #[test]
+    fn out_of_range_config_percentages_are_clamped() {
+        let config = MctxConfig {
+            execute_threshold_percentage: 500.0,
+            history_budget_percentage: 9.0,
+            ..MctxConfig::default()
+        };
+        let budget = Budget::derive(&config, Some(WINDOW), None);
+        let usable = (f64::from(WINDOW) * MAX_EXECUTE_PCT / 100.0).round();
+        assert_close(budget.soft_pct, MAX_EXECUTE_PCT - SOFT_OFFSET_PCT);
+        assert_eq!(
+            f64::from(budget.history),
+            (usable * MAX_HISTORY_SHARE).floor()
+        );
+    }
+
+    #[test]
+    fn memory_budget_is_a_clamped_share_with_a_floor_for_non_finite_input() {
+        assert_eq!(memory_budget(f64::NAN), MEMORY_BUDGET_MIN);
+        assert_eq!(memory_budget(f64::INFINITY), MEMORY_BUDGET_MIN);
+        assert_eq!(memory_budget(-5.0), MEMORY_BUDGET_MIN);
+        assert_eq!(memory_budget(100_000_000.0), MEMORY_BUDGET_MAX);
+        assert_eq!(memory_budget(20_000.0), 5_000);
+    }
+}

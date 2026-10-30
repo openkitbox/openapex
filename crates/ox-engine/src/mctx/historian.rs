@@ -1954,3 +1954,125 @@ pub(crate) async fn collect_completion(
     }
     Ok(text)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mctx::MctxConfig;
+
+    const TAIL_BUDGET: u32 = 10_000;
+
+    fn band() -> Budget {
+        Budget::derive(&MctxConfig::default(), Some(262_144), None)
+    }
+
+    fn triple() -> f64 {
+        f64::from(TAIL_BUDGET) * TAIL_SIZE_MULTIPLIER
+    }
+
+    #[test]
+    fn usage_at_the_hard_band_forces_regardless_of_the_tail() {
+        let band = band();
+        for tail in [0.0, 1.0, triple() * 100.0] {
+            assert_eq!(
+                trigger(Some(band.hard_pct), tail, TAIL_BUDGET, &band),
+                Trigger::Forced
+            );
+            assert_eq!(
+                trigger(Some(band.hard_pct + 10.0), tail, TAIL_BUDGET, &band),
+                Trigger::Forced
+            );
+        }
+    }
+
+    #[test]
+    fn usage_between_the_bands_is_speculative() {
+        let band = band();
+        for usage in [band.soft_pct, (band.soft_pct + band.hard_pct) / 2.0] {
+            assert_eq!(
+                trigger(Some(usage), 0.0, TAIL_BUDGET, &band),
+                Trigger::Speculative
+            );
+        }
+        assert_eq!(
+            trigger(Some(band.hard_pct - 0.01), 0.0, TAIL_BUDGET, &band),
+            Trigger::Speculative
+        );
+    }
+
+    #[test]
+    fn low_usage_with_a_small_tail_does_not_trigger() {
+        let band = band();
+        assert_eq!(
+            trigger(
+                Some(band.soft_pct - 0.01),
+                triple() - 1.0,
+                TAIL_BUDGET,
+                &band
+            ),
+            Trigger::No
+        );
+        assert_eq!(trigger(Some(0.0), 0.0, TAIL_BUDGET, &band), Trigger::No);
+    }
+
+    #[test]
+    fn unknown_usage_falls_back_to_the_tail_size() {
+        let band = band();
+        assert_eq!(
+            trigger(None, triple() + 1.0, TAIL_BUDGET, &band),
+            Trigger::Speculative
+        );
+        assert_eq!(trigger(None, 0.0, TAIL_BUDGET, &band), Trigger::No);
+    }
+
+    #[test]
+    fn a_tail_of_exactly_three_budgets_is_speculative_and_just_below_is_not() {
+        let band = band();
+        assert_eq!(
+            trigger(None, triple(), TAIL_BUDGET, &band),
+            Trigger::Speculative
+        );
+        assert_eq!(
+            trigger(None, triple() - 1.0, TAIL_BUDGET, &band),
+            Trigger::No
+        );
+    }
+
+    #[test]
+    fn a_large_tail_below_the_soft_band_is_speculative_never_forced() {
+        let band = band();
+        assert_eq!(
+            trigger(
+                Some(band.soft_pct - 1.0),
+                triple() * 100.0,
+                TAIL_BUDGET,
+                &band
+            ),
+            Trigger::Speculative
+        );
+    }
+
+    #[test]
+    fn a_zero_tail_budget_never_tail_triggers() {
+        let band = band();
+        assert_eq!(trigger(None, 1e12, 0, &band), Trigger::No);
+        assert_eq!(trigger(Some(0.0), 1e12, 0, &band), Trigger::No);
+        // Usage still decides.
+        assert_eq!(
+            trigger(Some(band.soft_pct), 0.0, 0, &band),
+            Trigger::Speculative
+        );
+    }
+
+    #[test]
+    fn a_non_finite_tail_estimate_is_no_even_at_forcing_usage() {
+        let band = band();
+        for tail in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(trigger(None, tail, TAIL_BUDGET, &band), Trigger::No);
+            assert_eq!(
+                trigger(Some(band.hard_pct + 10.0), tail, TAIL_BUDGET, &band),
+                Trigger::No
+            );
+        }
+    }
+}

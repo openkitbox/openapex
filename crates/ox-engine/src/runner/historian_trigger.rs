@@ -121,7 +121,7 @@ pub(crate) fn mctx_historian(
 /// the tail through this same function (plan D1), so the two triggers can
 /// never disagree about what a turn cost. Its decoded twin is step.rs's
 /// `assistant_tokens`; the parity test
-/// `token_parity_tests::assistant_tokens_parity_with_raw_prompt_tokens`
+/// `step::tests::assistant_tokens_parity_with_raw_prompt_tokens`
 /// (bottom of step.rs) locks the two to one meaning per row shape.
 pub(crate) fn prompt_tokens(row: &serde_json::Value) -> Option<i64> {
     if row.get("type").and_then(|kind| kind.as_str()) != Some("assistant") {
@@ -603,4 +603,147 @@ struct Published {
     covered: String,
     /// Compartments the run published.
     compartments: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mctx::MctxConfig;
+    use serde_json::json;
+
+    fn budget() -> Budget {
+        Budget::derive(&MctxConfig::default(), Some(262_144), None)
+    }
+
+    /// Tokens (provider units) that put usage just below / at the soft band.
+    fn below_soft(budget: &Budget) -> i64 {
+        let window = 262_144.0;
+        (window * (budget.soft_pct - 1.0) / 100.0) as i64
+    }
+
+    fn above_soft(budget: &Budget) -> i64 {
+        let window = 262_144.0;
+        (window * (budget.soft_pct + 1.0) / 100.0) as i64
+    }
+
+    /// Bytes whose `bytes / 4 * ratio` equals `tokens` for ratio 1.0.
+    fn bytes_for(tokens: u32) -> i64 {
+        i64::from(tokens) * 4
+    }
+
+    #[test]
+    fn an_ambiguous_scan_never_skips() {
+        let budget = budget();
+        assert!(!tail_load_skippable(
+            NewestUsage::Ambiguous,
+            0,
+            &budget,
+            1.0
+        ));
+    }
+
+    #[test]
+    fn usage_at_or_above_the_soft_band_never_skips() {
+        let budget = budget();
+        let usage = NewestUsage::Reported(above_soft(&budget));
+        assert!(!tail_load_skippable(usage, 0, &budget, 1.0));
+    }
+
+    #[test]
+    fn usage_below_the_soft_band_skips_when_the_tail_is_under_the_trigger() {
+        let budget = budget();
+        let usage = NewestUsage::Reported(below_soft(&budget));
+        assert!(tail_load_skippable(
+            usage,
+            bytes_for(budget.trigger) - 4,
+            &budget,
+            1.0
+        ));
+    }
+
+    #[test]
+    fn a_tail_at_the_trigger_still_loads() {
+        let budget = budget();
+        let usage = NewestUsage::Reported(below_soft(&budget));
+        assert!(!tail_load_skippable(
+            usage,
+            bytes_for(budget.trigger),
+            &budget,
+            1.0
+        ));
+    }
+
+    #[test]
+    fn the_calibration_ratio_scales_the_tail_bound() {
+        let budget = budget();
+        let usage = NewestUsage::Reported(below_soft(&budget));
+        let bytes = bytes_for(budget.trigger) - 4;
+        assert!(tail_load_skippable(usage, bytes, &budget, 1.0));
+        assert!(!tail_load_skippable(usage, bytes, &budget, 2.0));
+    }
+
+    #[test]
+    fn no_reported_usage_decides_by_the_tail_alone() {
+        let budget = budget();
+        assert!(tail_load_skippable(
+            NewestUsage::NoneReported,
+            100,
+            &budget,
+            1.0
+        ));
+        assert!(!tail_load_skippable(
+            NewestUsage::NoneReported,
+            bytes_for(budget.trigger),
+            &budget,
+            1.0
+        ));
+    }
+
+    #[test]
+    fn unknown_window_reported_usage_falls_through_to_the_tail_bound() {
+        let budget = Budget::derive(&MctxConfig::default(), None, None);
+        assert!(tail_load_skippable(
+            NewestUsage::Reported(10_000_000),
+            100,
+            &budget,
+            1.0
+        ));
+    }
+
+    #[test]
+    fn prompt_tokens_sums_input_and_cache_read() {
+        let row = json!({"type": "assistant", "tokens": {"input": 800, "cache": {"read": 200}}});
+        assert_eq!(prompt_tokens(&row), Some(1000));
+    }
+
+    #[test]
+    fn prompt_tokens_without_cache_is_the_input() {
+        let row = json!({"type": "assistant", "tokens": {"input": 800}});
+        assert_eq!(prompt_tokens(&row), Some(800));
+    }
+
+    #[test]
+    fn prompt_tokens_treats_zero_as_reported() {
+        let row = json!({"type": "assistant", "tokens": {"input": 0, "cache": {"read": 0}}});
+        assert_eq!(prompt_tokens(&row), Some(0));
+    }
+
+    #[test]
+    fn prompt_tokens_is_none_without_tokens_or_input() {
+        assert_eq!(prompt_tokens(&json!({"type": "assistant"})), None);
+        assert_eq!(
+            prompt_tokens(&json!({"type": "assistant", "tokens": {"cache": {"read": 5}}})),
+            None
+        );
+    }
+
+    #[test]
+    fn prompt_tokens_is_none_for_other_row_types() {
+        let tokens = json!({"input": 800});
+        assert_eq!(
+            prompt_tokens(&json!({"type": "user", "tokens": tokens})),
+            None
+        );
+        assert_eq!(prompt_tokens(&json!({"tokens": tokens})), None);
+    }
 }

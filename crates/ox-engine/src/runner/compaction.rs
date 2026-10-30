@@ -1250,3 +1250,146 @@ async fn settle_quiet_outcome(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The fold threshold in the percent units `fold_decision` compares.
+    fn threshold_pct() -> f64 {
+        FOLD_USAGE_THRESHOLD * 100.0
+    }
+
+    #[test]
+    fn a_running_row_wins_over_every_other_gate() {
+        assert_eq!(
+            fold_decision(false, 0, 10, true, Some(99.0)),
+            FoldDecision::SkipInFlight
+        );
+        assert_eq!(
+            fold_decision(true, 10, 10, true, Some(99.0)),
+            FoldDecision::SkipInFlight
+        );
+    }
+
+    #[test]
+    fn a_floor_covering_the_latest_row_skips_when_mctx_is_on() {
+        assert_eq!(
+            fold_decision(true, 10, 10, false, Some(99.0)),
+            FoldDecision::SkipCovered
+        );
+        assert_eq!(
+            fold_decision(true, 11, 10, false, Some(99.0)),
+            FoldDecision::SkipCovered
+        );
+    }
+
+    #[test]
+    fn a_floor_short_of_the_latest_row_does_not_skip() {
+        assert_eq!(
+            fold_decision(true, 9, 10, false, Some(99.0)),
+            FoldDecision::Fold
+        );
+    }
+
+    #[test]
+    fn a_zero_floor_with_mctx_on_fails_open_to_the_usage_check() {
+        assert_eq!(
+            fold_decision(true, 0, 0, false, Some(99.0)),
+            FoldDecision::Fold
+        );
+        assert_eq!(
+            fold_decision(true, 0, 0, false, Some(1.0)),
+            FoldDecision::SkipUnderThreshold
+        );
+    }
+
+    #[test]
+    fn mctx_off_ignores_floor_coverage() {
+        assert_eq!(
+            fold_decision(false, 10, 10, false, Some(99.0)),
+            FoldDecision::Fold
+        );
+    }
+
+    #[test]
+    fn unknown_usage_is_under_threshold() {
+        assert_eq!(
+            fold_decision(false, 0, 10, false, None),
+            FoldDecision::SkipUnderThreshold
+        );
+    }
+
+    #[test]
+    fn usage_below_the_threshold_skips_and_the_threshold_itself_folds() {
+        let threshold = threshold_pct();
+        assert_eq!(
+            fold_decision(false, 0, 10, false, Some(threshold - 0.01)),
+            FoldDecision::SkipUnderThreshold
+        );
+        assert_eq!(
+            fold_decision(false, 0, 10, false, Some(threshold)),
+            FoldDecision::Fold
+        );
+        assert_eq!(
+            fold_decision(false, 0, 10, false, Some(threshold + 0.01)),
+            FoldDecision::Fold
+        );
+    }
+
+    fn assistant(tokens: Option<(i64, i64)>) -> Message {
+        let mut value = serde_json::json!({
+            "type": "assistant",
+            "id": "msg_a",
+            "time": { "created": 1 },
+            "agent": "build",
+            "model": { "id": "m", "providerID": "p" },
+            "content": [],
+        });
+        if let Some((input, cached)) = tokens {
+            value["tokens"] = serde_json::json!({
+                "input": input,
+                "output": 0,
+                "reasoning": 0,
+                "cache": { "read": cached, "write": 0 },
+            });
+        }
+        serde_json::from_value(value).expect("minimal assistant row decodes")
+    }
+
+    /// Any non-assistant row; `agent-switched` is the smallest valid one.
+    fn other_row() -> Message {
+        serde_json::from_value(serde_json::json!({
+            "type": "agent-switched",
+            "id": "msg_u",
+            "time": { "created": 1 },
+            "agent": "build",
+        }))
+        .expect("minimal non-assistant row decodes")
+    }
+
+    #[test]
+    fn measured_prompt_tokens_is_input_plus_cache_read_of_the_newest_reporting_turn() {
+        let messages = [
+            assistant(Some((100, 0))),
+            assistant(Some((800, 200))),
+            assistant(None),
+            other_row(),
+        ];
+        assert_eq!(measured_prompt_tokens(&messages), Some(1000));
+    }
+
+    #[test]
+    fn measured_prompt_tokens_is_none_without_a_reporting_assistant() {
+        assert_eq!(measured_prompt_tokens(&[]), None);
+        assert_eq!(
+            measured_prompt_tokens(&[other_row(), assistant(None)]),
+            None
+        );
+    }
+
+    #[test]
+    fn measured_prompt_tokens_rejects_a_negative_sum() {
+        assert_eq!(measured_prompt_tokens(&[assistant(Some((-5, 0)))]), None);
+    }
+}
