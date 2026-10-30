@@ -77,8 +77,8 @@ use ox_llm::cardinal::CardinalError;
 use ox_llm::cardinal::chat::BoxChatStream;
 use ox_llm::cardinal::stream::StreamEvent;
 use ox_llm::cardinal::wire::{
-    ChatMessage, ChatRequest, FunctionCall, FunctionType, ImageUrl, ToolCall, Usage, UserContent,
-    UserPart,
+    ChatMessage, ChatRequest, FunctionCall, FunctionType, ImageUrl, ToolCall, ToolChoice, Usage,
+    UserContent, UserPart,
 };
 use ox_schema::event::SessionEventData;
 use ox_schema::id;
@@ -94,6 +94,7 @@ use super::ToolContext;
 use super::compaction;
 use super::drain::DrainCtx;
 use super::instructions;
+use super::loop_guard::fingerprint;
 use super::output_budget::bound_tool_output;
 use super::retry::{self, RetryKind};
 
@@ -110,6 +111,9 @@ const RECALL_LIMIT: usize = 3;
 /// Shortest typed prompt worth searching. A greeting or a `/clear` retrieves
 /// nothing, and every turn that clears this bar pays one indexed query.
 const RECALL_MIN_QUERY_CHARS: usize = 8;
+/// Upstream `MAX_STEPS_PROMPT` (runner/max-steps.ts): the trailing assistant
+/// message of a final step. Never persisted.
+const MAX_STEPS_PROMPT: &str = "The maximum number of steps allowed for this task has been reached. Tools are disabled until next user input. Respond with text only.";
 
 /// Terminal states of one step, consumed by the drain loop.
 #[derive(Debug)]
@@ -122,6 +126,9 @@ pub(crate) enum StepOutcome {
     Completed {
         finish: FinishReason,
         needs_continuation: bool,
+        /// Fingerprints of the tool calls this step settled, in stream
+        /// index order (input for the repeated-call detector).
+        calls: Vec<u64>,
     },
     /// The provider rejected the request as context overflow before any
     /// output; the drain compacts and retries the step once.
@@ -139,6 +146,9 @@ pub(crate) struct StepParams<'a> {
     pub assistant_message_id: String,
     pub agent: &'a str,
     pub model: &'a ModelRef,
+    /// The turn's last step: tools stay in the request (cache prefix) but
+    /// are disabled, and any call the model still makes is rejected.
+    pub final_step: bool,
 }
 
 /// Per-attempt result of consuming the stream.
@@ -527,7 +537,35 @@ async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Result<ChatRe
     // The session's selected reasoning level (model variant) rides every
     // chat turn; no selection leaves the field off the wire.
     request.apply_reasoning_effort(params.model.variant.as_deref());
+    if params.final_step {
+        apply_final_step(&mut request);
+    }
     Ok(request)
+}
+
+/// Final-step request shape (upstream llm.ts): keep `tools` so the provider
+/// cache prefix survives, forbid calling them, and end the history with
+/// [`MAX_STEPS_PROMPT`] as an assistant message. Runs after
+/// `ChatRequest::new` (which pairs tool results), so the appended text-only
+/// message cannot disturb pairing.
+fn apply_final_step(request: &mut ChatRequest) {
+    request.tool_choice = ToolChoice::None;
+    request.messages.push(ChatMessage::Assistant {
+        content: Some(MAX_STEPS_PROMPT.to_owned()),
+        tool_calls: None,
+        reasoning_content: None,
+    });
+}
+
+/// The failure a tool call gets in a final step (upstream `executeTool`:
+/// "Tools are disabled after the maximum agent steps").
+fn tools_disabled_error() -> SessionError {
+    SessionError {
+        kind: "tool.disabled".to_owned(),
+        message: "Tools are disabled after the maximum agent steps".to_owned(),
+        status: None,
+        response: None,
+    }
 }
 
 /// Interrupted settlement: an open assistant row settles with `step.failed`
@@ -956,6 +994,11 @@ async fn consume(
     )
     .await?;
     let needs_continuation = tool_acc.values().any(|acc| acc.called);
+    let calls: Vec<u64> = tool_acc
+        .values()
+        .filter(|acc| acc.called)
+        .map(|acc| fingerprint(&acc.name, &acc.arguments))
+        .collect();
 
     ctx.bus
         .publish(SessionEventData::StepStreamed {
@@ -995,6 +1038,7 @@ async fn consume(
     Ok(Attempt::Done(StepOutcome::Completed {
         finish: mapped_finish,
         needs_continuation,
+        calls,
     }))
 }
 
@@ -1123,6 +1167,23 @@ async fn settle_tool_calls(
                 state: None,
             })
             .await?;
+        if params.final_step {
+            // Final step: tools are disabled. The call still gets a result
+            // so the history stays fully paired.
+            ctx.bus
+                .publish(SessionEventData::ToolFailed {
+                    session_id: ctx.session_id.clone(),
+                    assistant_message_id: params.assistant_message_id.clone(),
+                    id: acc.id.clone(),
+                    error: tools_disabled_error(),
+                    content: None,
+                    metadata: None,
+                    executed: false,
+                    result_state: None,
+                })
+                .await?;
+            continue;
+        }
         match ctx.tools.get(&acc.name) {
             Some(tool) => tasks.push((
                 acc.id.clone(),
@@ -2646,5 +2707,106 @@ mod tests {
                 "parity {tokens:?}"
             );
         }
+    }
+
+    fn request_with_tool() -> ChatRequest {
+        let mut request = ChatRequest::new(
+            "m",
+            vec![ChatMessage::system("sys"), ChatMessage::user("go")],
+        );
+        request.tools = Arc::new(vec![ox_llm::cardinal::wire::ToolDef::function(
+            "read",
+            "read a file",
+            serde_json::json!({"type": "object"}),
+        )]);
+        request
+    }
+
+    #[test]
+    fn final_step_disables_tool_choice_and_appends_prompt() {
+        use ox_llm::cardinal::wire::ToolChoice;
+        let mut request = request_with_tool();
+        let tools_before = serde_json::to_string(request.tools.as_slice()).unwrap();
+        let messages_before = request.messages.clone();
+        assert_eq!(request.tool_choice, ToolChoice::Auto);
+
+        apply_final_step(&mut request);
+
+        assert_eq!(request.tool_choice, ToolChoice::None);
+        assert_eq!(
+            serde_json::to_string(request.tools.as_slice()).unwrap(),
+            tools_before,
+            "tool definitions stay to keep the provider cache prefix"
+        );
+        assert_eq!(request.messages.len(), messages_before.len() + 1);
+        assert_eq!(request.messages[..messages_before.len()], messages_before);
+        assert_eq!(
+            request.messages.last(),
+            Some(&ChatMessage::Assistant {
+                content: Some(MAX_STEPS_PROMPT.to_owned()),
+                tool_calls: None,
+                reasoning_content: None,
+            })
+        );
+        assert_eq!(
+            MAX_STEPS_PROMPT,
+            "The maximum number of steps allowed for this task has been reached. Tools are disabled until next user input. Respond with text only."
+        );
+    }
+
+    #[test]
+    fn final_step_request_serializes_tool_choice_none_and_prompt() {
+        let mut request = request_with_tool();
+        apply_final_step(&mut request);
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("\"tool_choice\":\"none\""), "{json}");
+        assert!(json.contains("\"tools\":["), "{json}");
+        assert!(json.contains(MAX_STEPS_PROMPT), "{json}");
+    }
+
+    #[test]
+    fn final_step_keeps_tool_call_pairing_intact() {
+        let call = ToolCall {
+            id: "c1".to_owned(),
+            kind: FunctionType::Function,
+            function: FunctionCall {
+                name: "read".to_owned(),
+                arguments: "{}".to_owned(),
+            },
+        };
+        let mut request = ChatRequest::new(
+            "m",
+            vec![
+                ChatMessage::user("go"),
+                ChatMessage::assistant_tool_calls(vec![call]),
+                ChatMessage::tool("c1", "ok"),
+            ],
+        );
+        let before = request.messages.clone();
+        assert_eq!(before.len(), 3, "already paired, no placeholder spliced");
+
+        apply_final_step(&mut request);
+
+        assert_eq!(request.messages.len(), 4);
+        assert_eq!(request.messages[..3], before);
+        assert!(matches!(
+            request.messages.last(),
+            Some(ChatMessage::Assistant {
+                tool_calls: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn tools_disabled_error_shape() {
+        let error = tools_disabled_error();
+        assert_eq!(error.kind, "tool.disabled");
+        assert_eq!(
+            error.message,
+            "Tools are disabled after the maximum agent steps"
+        );
+        assert_eq!(error.status, None);
+        assert!(error.response.is_none());
     }
 }

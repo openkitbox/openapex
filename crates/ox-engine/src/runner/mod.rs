@@ -30,6 +30,7 @@ pub mod drain;
 pub(crate) mod generate;
 mod historian_trigger;
 pub(crate) mod instructions;
+mod loop_guard;
 mod output_budget;
 pub(crate) mod provider_error;
 mod retry;

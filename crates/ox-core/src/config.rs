@@ -238,6 +238,30 @@ impl Default for SessionsConfig {
     }
 }
 
+/// Per-turn step cap (`[turn]` section). A step is one model call within a
+/// turn; a turn keeps stepping while the model requests tools. After
+/// `max_steps` steps the next step is a tool-less wrap-up step, so the turn
+/// ends with a text report instead of being cut off. `0` means unlimited.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TurnConfig {
+    /// Consecutive model steps allowed in one turn before the wrap-up step.
+    /// `0` removes the cap.
+    #[serde(default = "default_turn_max_steps")]
+    pub max_steps: u32,
+}
+
+fn default_turn_max_steps() -> u32 {
+    500
+}
+
+impl Default for TurnConfig {
+    fn default() -> Self {
+        Self {
+            max_steps: default_turn_max_steps(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     /// LLM endpoint configuration. Flattened: its keys (`cardinal_url`,
@@ -275,6 +299,9 @@ pub struct Config {
     /// Session retention (`[sessions]` section).
     #[serde(default)]
     pub sessions: SessionsConfig,
+    /// Per-turn step cap (`[turn]` section).
+    #[serde(default)]
+    pub turn: TurnConfig,
 }
 
 fn default_event_heartbeat_ms() -> u64 {
@@ -293,6 +320,7 @@ impl Default for Config {
             subagent: SubagentConfig::default(),
             events: EventsConfig::default(),
             sessions: SessionsConfig::default(),
+            turn: TurnConfig::default(),
         }
     }
 }
@@ -378,8 +406,9 @@ impl Config {
     /// names of the keys whose new value was rejected (empty when nothing differed).
     ///
     /// Names come back in a fixed order: `listen`, `db_path`, `event_heartbeat_ms`,
-    /// `events`, `sessions`, `subagent`, `magic_context`. `llm` and `mcp` are hot-swappable and
-    /// never touched. Clones happen only for keys that differ, at a reload boundary.
+    /// `events`, `sessions`, `turn`, `subagent`, `magic_context`. `llm` and `mcp` are
+    /// hot-swappable and never touched. Clones happen only for keys that differ, at a reload
+    /// boundary.
     pub fn pin_restart_only(&mut self, running: &Config) -> Vec<&'static str> {
         let mut rejected = Vec::new();
         if self.listen != running.listen {
@@ -401,6 +430,10 @@ impl Config {
         if self.sessions.retention_days != running.sessions.retention_days {
             self.sessions = running.sessions.clone();
             rejected.push("sessions");
+        }
+        if self.turn.max_steps != running.turn.max_steps {
+            self.turn.max_steps = running.turn.max_steps;
+            rejected.push("turn");
         }
         if self.subagent.depth != running.subagent.depth {
             self.subagent = running.subagent.clone();
@@ -706,6 +739,29 @@ mod tests {
         assert_eq!(next.sessions.retention_days, 30);
 
         let mut same = parse("[sessions]\nretention_days = 30\n");
+        assert!(same.pin_restart_only(&running).is_empty());
+    }
+
+    #[test]
+    fn turn_max_steps_defaults_to_five_hundred() {
+        assert_eq!(Config::default().turn.max_steps, 500);
+        assert_eq!(parse("").turn.max_steps, 500);
+    }
+
+    #[test]
+    fn turn_max_steps_parses_zero_and_explicit_values() {
+        assert_eq!(parse("[turn]\nmax_steps = 0\n").turn.max_steps, 0);
+        assert_eq!(parse("[turn]\nmax_steps = 7\n").turn.max_steps, 7);
+    }
+
+    #[test]
+    fn turn_max_steps_reload_is_rejected_and_pinned() {
+        let running = parse("[turn]\nmax_steps = 500\n");
+        let mut next = parse("[turn]\nmax_steps = 7\n");
+        assert_eq!(next.pin_restart_only(&running), vec!["turn"]);
+        assert_eq!(next.turn.max_steps, 500);
+
+        let mut same = parse("[turn]\nmax_steps = 500\n");
         assert!(same.pin_restart_only(&running).is_empty());
     }
 }

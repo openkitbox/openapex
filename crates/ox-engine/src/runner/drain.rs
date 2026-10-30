@@ -45,6 +45,7 @@ use ox_schema::support::{FinishReason, SessionError};
 
 use super::ToolRegistry;
 use super::compaction;
+use super::loop_guard::{LoopGuard, Verdict};
 use super::resolve_selection;
 use super::unknown_error;
 
@@ -310,6 +311,11 @@ enum TurnOutcome {
 /// synthetic user prompt, giving up after three consecutive truncations
 /// (upstream `Outcome.OutputLimit`).
 ///
+/// The turn is bounded: after `[turn] max_steps` steps, or when the repeated
+/// tool-call detector asks for a wrap-up, the next step is a tool-less final
+/// step (`StepParams::final_step`) and the turn ends with it, whatever it
+/// finished with.
+///
 /// The turn works on its own copy of the busy period's context (one clone of
 /// Arc/String fields per turn) so it can follow a services reload: the copy
 /// is re-pointed at the newest generation when the turn starts and at the top
@@ -329,22 +335,55 @@ async fn run_turn(busy: &DrainCtx, token: &CancellationToken) -> Result<TurnOutc
         Err(error) => return Ok(TurnOutcome::Failed(unknown_error(error.to_string()))),
     };
     let mut compacted = false;
+    // Per-turn state: loop iterations started, the repeated-call detector,
+    // and whether it asked for the next step to be the final one.
+    let mut steps: u32 = 0;
+    let mut guard = LoopGuard::new();
+    let mut wrap_up = false;
     loop {
         if token.is_cancelled() {
             return Ok(TurnOutcome::Interrupted);
         }
         local.refresh();
         let ctx = &local;
+        let final_step = is_final_step(steps, ctx.config.turn.max_steps, wrap_up);
+        steps += 1;
         let mut params = super::step::StepParams {
             assistant_message_id: id::id("msg"),
             agent: &agent,
             model: &model,
+            final_step,
         };
         match super::step::run(ctx, token, &mut params).await? {
             super::step::StepOutcome::Completed {
                 finish,
                 needs_continuation,
+                calls,
             } => {
+                if final_step {
+                    // The final step is the last of the turn whatever it
+                    // finished with: its tool calls were rejected, and a
+                    // length truncation is not continued. Skip the todo
+                    // reminder too: it enqueues a steer that would open a
+                    // fresh turn with the step count reset, bypassing the cap.
+                    return Ok(TurnOutcome::Ended);
+                }
+                if !calls.is_empty() {
+                    match guard.observe(&calls) {
+                        Verdict::Ok => {}
+                        Verdict::Warn => {
+                            ctx.bus
+                                .publish(SessionEventData::SessionSynthetic {
+                                    session_id: ctx.session_id.clone(),
+                                    text: repeat_reminder_text().to_owned(),
+                                    description: None,
+                                    metadata: None,
+                                })
+                                .await?;
+                        }
+                        Verdict::WrapUp => wrap_up = true,
+                    }
+                }
                 if finish == FinishReason::ToolCalls {
                     // The step settled its tool parts (success/failed rows);
                     // steer items that arrived mid-turn join before the
@@ -426,6 +465,18 @@ async fn run_turn(busy: &DrainCtx, token: &CancellationToken) -> Result<TurnOutc
             super::step::StepOutcome::Failed(error) => return Ok(TurnOutcome::Failed(error)),
         }
     }
+}
+
+/// Whether the step about to start is the turn's final (tool-less) one:
+/// the detector asked for a wrap-up, or `steps_done` has spent the cap
+/// (`max_steps == 0` means no cap).
+fn is_final_step(steps_done: u32, max_steps: u32, wrap_up: bool) -> bool {
+    wrap_up || (max_steps != 0 && steps_done >= max_steps)
+}
+
+/// Reminder injected when the detector first sees a call repeated.
+fn repeat_reminder_text() -> &'static str {
+    "<system-reminder>\nYou have issued the same tool call with identical arguments several times in this turn. Repeating it is unlikely to change the result. Try a different approach, or report what is blocking you.\n</system-reminder>"
 }
 
 /// Upstream `CONTINUE_AFTER_OUTPUT_LIMIT` (llm.ts).
@@ -776,4 +827,36 @@ async fn settle_stale_compactions(bus: &EventBus, db: &Db, session_id: &str) -> 
         .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unlimited_cap_is_never_final_unless_wrapping_up() {
+        assert!(!is_final_step(0, 0, false));
+        assert!(!is_final_step(10_000, 0, false));
+        assert!(is_final_step(0, 0, true));
+    }
+
+    #[test]
+    fn final_step_starts_once_the_cap_is_spent() {
+        assert!(!is_final_step(0, 3, false));
+        assert!(!is_final_step(2, 3, false));
+        assert!(is_final_step(3, 3, false));
+        assert!(is_final_step(4, 3, false));
+    }
+
+    #[test]
+    fn wrap_up_forces_the_final_step_below_the_cap() {
+        assert!(is_final_step(1, 500, true));
+    }
+
+    #[test]
+    fn repeat_reminder_is_a_system_reminder() {
+        let text = repeat_reminder_text();
+        assert!(text.starts_with("<system-reminder>"));
+        assert!(text.trim_end().ends_with("</system-reminder>"));
+    }
 }
