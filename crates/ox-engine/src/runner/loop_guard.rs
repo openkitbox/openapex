@@ -147,6 +147,41 @@ mod tests {
     }
 
     #[test]
+    fn full_window_with_same_fingerprint_at_front_does_not_rewarn() {
+        let mut g = LoopGuard::new();
+        let a = fp(1);
+        assert_eq!(g.observe(&[a, a, a]), Verdict::Warn);
+        // Window is now [a, a, a, d0..d16] (20 entries, `a` at the front).
+        let fillers: Vec<u64> = (100..100 + (WINDOW - 3) as u32).map(fp).collect();
+        assert_eq!(g.observe(&fillers), Verdict::Ok);
+        // Pop front `a` (3 -> 2), push `a` (2 -> 3): `a` is already warned.
+        assert_eq!(g.observe(&[a]), Verdict::Ok);
+        assert_eq!(g.observe(&[a]), Verdict::Ok);
+    }
+
+    #[test]
+    fn short_cycle_does_not_flood_reminders() {
+        // Cycles of 7..=9 distinct calls keep every window count between 2
+        // and 3 and never reach `WRAP_UP_AT`; the warnings must stay bounded
+        // by the number of distinct fingerprints, not by the number of steps.
+        for len in 7..=9u32 {
+            let mut g = LoopGuard::new();
+            let (mut warns, mut wraps) = (0, 0);
+            for i in 0..500 {
+                match g.observe(&[fp(i % len)]) {
+                    Verdict::Warn => warns += 1,
+                    Verdict::WrapUp => wraps += 1,
+                    Verdict::Ok => {}
+                }
+            }
+            assert!(warns <= len as usize, "cycle {len}: {warns} warns");
+            // Known limit: such a cycle never wraps up; the step cap is the
+            // only bound.
+            assert_eq!(wraps, 0, "cycle {len}");
+        }
+    }
+
+    #[test]
     fn identical_calls_across_observations_warn_on_third() {
         let mut g = LoopGuard::new();
         let a = fp(1);
