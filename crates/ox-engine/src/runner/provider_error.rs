@@ -8,6 +8,14 @@
 //! (`400 (no body)` / `413 (no body)`). [`is_payload_too_large`] carries the
 //! payload-phrasing list. Status scoping (4xx client errors, 413) happens in
 //! [`is_overflow_error`], the step's entry point.
+//!
+//! Deviation from upstream `classifyProviderFailure`: upstream still treats
+//! the structured codes `context_length_exceeded`,
+//! `model_context_window_exceeded` and `request_too_large` as overflow on a
+//! 429. Here those codes share one pattern table with the free-text phrases,
+//! so a 429 is never classified as overflow by text or code; splitting the
+//! table for a combination that does not occur in practice would be
+//! over-engineering.
 
 use regex::Regex;
 use std::sync::OnceLock;
@@ -135,9 +143,58 @@ pub(crate) fn is_overflow_error(error: &CardinalError) -> bool {
     match error {
         CardinalError::Http { status, body } => {
             (400..=499).contains(status)
-                && (is_context_overflow(body) || *status == 413 || is_payload_too_large(body))
+                && (*status == 413
+                    || is_payload_too_large(body)
+                    // A 429 is a throttle even when its wording matches an
+                    // overflow phrase (Cerebras: "too many tokens processed").
+                    || (*status != 429 && is_context_overflow(body)))
         }
         CardinalError::Upstream(body) => is_context_overflow(body) || is_payload_too_large(body),
         _ => false,
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn http(status: u16, body: &str) -> CardinalError {
+        CardinalError::Http {
+            status,
+            body: body.to_owned(),
+        }
+    }
+
+    #[test]
+    fn throttle_wording_on_429_is_not_overflow() {
+        // Cerebras reports a token-per-minute throttle with overflow-like text.
+        assert!(!is_overflow_error(&http(429, "too many tokens processed")));
+        assert!(!is_overflow_error(&http(429, "token limit exceeded")));
+        assert!(!is_overflow_error(&http(429, "prompt is too long")));
+    }
+
+    #[test]
+    fn same_wording_on_other_4xx_is_still_overflow() {
+        assert!(is_overflow_error(&http(400, "too many tokens processed")));
+        assert!(is_overflow_error(&http(400, "prompt is too long")));
+        assert!(is_overflow_error(&http(422, "token limit exceeded")));
+    }
+
+    #[test]
+    fn payload_too_large_is_overflow_regardless_of_status_text() {
+        assert!(is_overflow_error(&http(413, "")));
+        assert!(is_overflow_error(&http(413, "anything")));
+    }
+
+    #[test]
+    fn in_band_errors_have_no_status_and_still_match_text() {
+        assert!(is_overflow_error(&CardinalError::Upstream(
+            "too many tokens".to_owned()
+        )));
+    }
+
+    #[test]
+    fn server_errors_are_never_overflow() {
+        assert!(!is_overflow_error(&http(500, "prompt is too long")));
+        assert!(!is_overflow_error(&http(503, "too many tokens")));
     }
 }
