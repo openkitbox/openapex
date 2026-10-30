@@ -5,6 +5,9 @@
 
 pub mod api;
 pub(crate) mod reload;
+mod session_retention;
+#[cfg(test)]
+mod test_support;
 pub(crate) mod worktree;
 
 pub use ox_core::{USER_AGENT, config, event_bus, projector};
@@ -258,6 +261,10 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
     // 0 keeps everything). Deliberately started here rather than in
     // `build_state_with`: tests must not acquire a background writer.
     event_bus::spawn_pruner(state.db.clone(), svc.config.events.retention_days);
+    // Session trees past `[sessions] retention_days` (0 keeps everything) are
+    // deleted by the same path as `DELETE /api/session/{id}`. Started here for
+    // the same reason as the pruner: tests must not acquire a background writer.
+    session_retention::spawn_sweeper(state.clone(), svc.config.sessions.retention_days);
     let router = build_router(state.clone());
     Ok((state, router))
 }

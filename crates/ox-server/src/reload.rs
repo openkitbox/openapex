@@ -8,7 +8,7 @@
 //! `Hub` plus the MCP tools in a rebuilt `ToolRegistry`.
 //!
 //! **Pinned keys** (kept at the running value, with a `warn!` naming each):
-//! `listen`, `db_path`, `event_heartbeat_ms`, `[events]`, `[subagent]`,
+//! `listen`, `db_path`, `event_heartbeat_ms`, `[events]`, `[sessions]`, `[subagent]`,
 //! `[magic_context]` (see `Config::pin_restart_only`).
 //!
 //! Everything is built inside `Live::replace`, so concurrent reloads

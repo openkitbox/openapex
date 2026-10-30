@@ -215,6 +215,29 @@ impl Default for EventsConfig {
     }
 }
 
+/// Session retention (`[sessions]` section). Whole session trees (a root and
+/// its subagent descendants) whose last activity is older than the window are
+/// deleted; upstream never deletes sessions, so `0` restores that behavior.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SessionsConfig {
+    /// Days a session tree may sit idle before it is deleted. `0` keeps
+    /// everything.
+    #[serde(default = "default_session_retention_days")]
+    pub retention_days: u32,
+}
+
+fn default_session_retention_days() -> u32 {
+    30
+}
+
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_session_retention_days(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     /// LLM endpoint configuration. Flattened: its keys (`cardinal_url`,
@@ -249,6 +272,9 @@ pub struct Config {
     /// Replay-log retention (`[events]` section).
     #[serde(default)]
     pub events: EventsConfig,
+    /// Session retention (`[sessions]` section).
+    #[serde(default)]
+    pub sessions: SessionsConfig,
 }
 
 fn default_event_heartbeat_ms() -> u64 {
@@ -266,6 +292,7 @@ impl Default for Config {
             mcp: McpConfig::default(),
             subagent: SubagentConfig::default(),
             events: EventsConfig::default(),
+            sessions: SessionsConfig::default(),
         }
     }
 }
@@ -351,7 +378,7 @@ impl Config {
     /// names of the keys whose new value was rejected (empty when nothing differed).
     ///
     /// Names come back in a fixed order: `listen`, `db_path`, `event_heartbeat_ms`,
-    /// `events`, `subagent`, `magic_context`. `llm` and `mcp` are hot-swappable and
+    /// `events`, `sessions`, `subagent`, `magic_context`. `llm` and `mcp` are hot-swappable and
     /// never touched. Clones happen only for keys that differ, at a reload boundary.
     pub fn pin_restart_only(&mut self, running: &Config) -> Vec<&'static str> {
         let mut rejected = Vec::new();
@@ -370,6 +397,10 @@ impl Config {
         if self.events.retention_days != running.events.retention_days {
             self.events = running.events.clone();
             rejected.push("events");
+        }
+        if self.sessions.retention_days != running.sessions.retention_days {
+            self.sessions = running.sessions.clone();
+            rejected.push("sessions");
         }
         if self.subagent.depth != running.subagent.depth {
             self.subagent = running.subagent.clone();
@@ -645,4 +676,36 @@ pub enum EmbeddingProvider {
     /// split into `open-ai-compatible`.
     #[serde(rename = "openai-compatible")]
     OpenAiCompatible,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(raw: &str) -> Config {
+        toml::from_str(raw).expect("config parses")
+    }
+
+    #[test]
+    fn sessions_retention_defaults_to_thirty_days() {
+        assert_eq!(Config::default().sessions.retention_days, 30);
+        assert_eq!(parse("").sessions.retention_days, 30);
+    }
+
+    #[test]
+    fn sessions_retention_zero_parses_as_disabled() {
+        let config = parse("[sessions]\nretention_days = 0\n");
+        assert_eq!(config.sessions.retention_days, 0);
+    }
+
+    #[test]
+    fn sessions_retention_reload_is_rejected_and_pinned() {
+        let running = parse("[sessions]\nretention_days = 30\n");
+        let mut next = parse("[sessions]\nretention_days = 5\n");
+        assert_eq!(next.pin_restart_only(&running), vec!["sessions"]);
+        assert_eq!(next.sessions.retention_days, 30);
+
+        let mut same = parse("[sessions]\nretention_days = 30\n");
+        assert!(same.pin_restart_only(&running).is_empty());
+    }
 }

@@ -1088,42 +1088,39 @@ pub(crate) async fn remove(req: &mut Request, depot: &mut Depot, res: &mut Respo
         }
     }
 
-    // Upstream removes descendants first (depth-first), then the session, then
-    // purges each aggregate's durable log.
-    let descendants = match collect_descendants(&app.db, &session_id).await {
-        Ok(ids) => ids,
-        Err(error) => {
-            unknown_error(res, &error);
-            return;
-        }
-    };
+    if let Err(error) = delete_session_tree(app, &session_id).await {
+        unknown_error(res, &error);
+        return;
+    }
 
-    let mut order = descendants;
+    no_content(res);
+}
+
+/// Delete `root` and every descendant: descendants first (deepest last-found
+/// first), then the root. Each session goes through a `SessionDeleted` event
+/// (so the projection, the event log and SSE subscribers all agree), then its
+/// durable event log is purged and the runner forgets it. Stops at the first
+/// error; sessions already deleted stay deleted and the root is still present,
+/// so a retry finishes the job. Shared by the HTTP handler and any internal
+/// caller that must delete exactly as the API does.
+pub(crate) async fn delete_session_tree(app: &crate::api::AppState, root: &str) -> Result<()> {
+    let mut order = collect_descendants(&app.db, root).await?;
     order.reverse();
-    order.push(session_id.clone());
+    order.push(root.to_owned());
 
     for target in order {
-        if let Err(error) = app
-            .bus
+        app.bus
             .publish(SessionEventData::SessionDeleted {
                 session_id: target.clone(),
             })
-            .await
-        {
-            unknown_error(res, &error);
-            return;
-        }
-        if let Err(error) = app.bus.remove(&target).await {
-            unknown_error(res, &error);
-            return;
-        }
+            .await?;
+        app.bus.remove(&target).await?;
         // Drop the runner's per-session tables now rather than waiting for the
         // idle sweep's 30-minute TTL (the sweep only runs inside a dispatch, so
         // a deleted session's entry could otherwise outlive it indefinitely).
         app.runner.forget_session(&target);
     }
-
-    no_content(res);
+    Ok(())
 }
 
 /// Every descendant of `root`, breadth-first (parents before children).
@@ -3142,4 +3139,49 @@ fn sanitize_tool_content(content: &mut Value, id: &str) {
     }
     redact_key(map, "uri", "tool-file-uri", id);
     redact_key(map, "name", "tool-file-name", id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{rows_of, seed_session, test_state};
+
+    #[tokio::test]
+    async fn delete_session_tree_removes_the_whole_tree_and_only_it() {
+        let app = test_state().await;
+        seed_session(&app, "ses_root", None).await;
+        seed_session(&app, "ses_child", Some("ses_root")).await;
+        seed_session(&app, "ses_grand", Some("ses_child")).await;
+        seed_session(&app, "ses_other", None).await;
+        seed_session(&app, "ses_other_child", Some("ses_other")).await;
+
+        for id in ["ses_root", "ses_child", "ses_grand"] {
+            assert!(
+                rows_of(&app.db, id).await.iter().all(|(_, n)| *n > 0),
+                "{id} must be fully seeded: {:?}",
+                rows_of(&app.db, id).await
+            );
+        }
+
+        delete_session_tree(&app, "ses_root").await.expect("delete");
+
+        for id in ["ses_root", "ses_child", "ses_grand"] {
+            assert_eq!(
+                rows_of(&app.db, id)
+                    .await
+                    .iter()
+                    .filter(|(_, n)| *n != 0)
+                    .collect::<Vec<_>>(),
+                Vec::<&(&str, i64)>::new(),
+                "{id} left rows behind"
+            );
+        }
+        for id in ["ses_other", "ses_other_child"] {
+            assert!(
+                rows_of(&app.db, id).await.iter().all(|(_, n)| *n > 0),
+                "{id} must be untouched: {:?}",
+                rows_of(&app.db, id).await
+            );
+        }
+    }
 }
