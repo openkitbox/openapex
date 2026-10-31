@@ -2,11 +2,6 @@
 name = "ox-tui"
 version.workspace = true
 edition.workspace = true
-default-run = "opencode-tui"
-
-[[bin]]
-name = "opencode-tui"
-path = "src/main.rs"
 
 [lib]
 name = "ox_tui"
@@ -26,7 +21,7 @@ crossterm = { workspace = true, features = ["bracketed-paste"] }
 # bundled syntaxes; colours come from the theme tokens, not syntect themes.
 syntect = { version = "5.3", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }
 tui-textarea-2 = { version = "0.13", default-features = false, features = ["crossterm"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 futures-util.workspace = true
 serde_json.workspace = true
 textwrap.workspace = true
@@ -37,7 +32,7 @@ base64.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 
 [lints]
 workspace = true

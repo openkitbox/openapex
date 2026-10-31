@@ -16,7 +16,7 @@ ox-llm.workspace = true
 ox-mcp.workspace = true
 ox-schema.workspace = true
 ox-tools.workspace = true
-salvo = { workspace = true, features = ["server", "http1", "http2", "sse", "affix-state", "logging"] }
+salvo = { workspace = true, features = ["server", "http1", "http2", "sse", "affix-state", "logging", "unix"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["full"] }

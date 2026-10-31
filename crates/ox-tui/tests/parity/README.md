@@ -23,11 +23,11 @@ tool result streams a markdown answer.
 ```bash
 python3 fakegw.py &                       # fake model gateway
 OX_DB_PATH=$TMP/ox2.db OX_LISTEN=127.0.0.1:14192 OX_CARDINAL_URL=http://127.0.0.1:14193 \
-  OX_CARDINAL_KEY=x OX_DEFAULT_MODEL=cardinal/fake-1 opencode-rs &
+  OX_CARDINAL_KEY=x OX_DEFAULT_MODEL=cardinal/fake-1 ox serve &
 echo hello > /tmp/parity-cwd/hello.txt
 # create a session, POST {"text":"read hello.txt"} to /api/session/<id>/prompt, then capture both TUIs
 # against that same session: upstream `opencode --server URL -s <id> /tmp/parity-cwd`,
-# ox-tui `--server URL --directory /tmp/parity-cwd --session <id>`.
+# `ox --server URL --directory /tmp/parity-cwd --session <id>`.
 ```
 
 Both TUIs must render the same persisted session: the timing footer (`10ms · tok/s`)

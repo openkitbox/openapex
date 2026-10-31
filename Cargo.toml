@@ -92,7 +92,7 @@ version.workspace = true
 edition.workspace = true
 
 [[bin]]
-name = "opencode-rs"
+name = "ox"
 path = "src/main.rs"
 
 [dependencies]
@@ -108,6 +108,7 @@ ox-mcp.workspace = true
 ox-schema.workspace = true
 ox-server.workspace = true
 ox-tools.workspace = true
+ox-tui.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 tracing-appender.workspace = true

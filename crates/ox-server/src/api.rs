@@ -23,6 +23,7 @@ pub mod compat;
 pub mod event;
 pub mod files;
 pub mod form;
+pub mod lease;
 pub mod session;
 pub mod shell;
 pub mod skill;
@@ -44,6 +45,8 @@ pub struct AppState {
     pub live: Arc<Live>,
     /// The `ox.toml` a reload re-reads.
     pub config_path: PathBuf,
+    /// Client leases; the server may exit only while none is held.
+    pub lifecycle: Arc<crate::lifecycle::Lifecycle>,
 }
 
 impl AppState {
@@ -710,6 +713,9 @@ async fn agent_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .hoop(affix_state::inject(state))
+        // ox-only endpoints live beside `/api`, never under it, so upstream
+        // opencode paths stay distinguishable.
+        .push(Router::with_path("ox").push(Router::with_path("lease").get(lease::lease)))
         .push(
             Router::with_path("api")
                 .push(Router::with_path("info").get(server_info))

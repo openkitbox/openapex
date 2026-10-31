@@ -820,4 +820,18 @@ mod tests {
         let mut same = parse("[turn]\nmax_steps = 500\n");
         assert!(same.pin_restart_only(&running).is_empty());
     }
+
+    #[test]
+    fn run_paths_derive_from_ox_home() {
+        assert_eq!(ox_schema::paths::run_dir(), ox_home().join("run"));
+        assert_eq!(
+            ox_schema::paths::socket_path(),
+            ox_home().join("run/ox.sock")
+        );
+        assert_eq!(ox_schema::paths::lock_path(), ox_home().join("run/ox.lock"));
+        assert_eq!(
+            ox_schema::paths::server_log_path(),
+            ox_home().join("ox.log")
+        );
+    }
 }

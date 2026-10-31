@@ -1,4 +1,7 @@
-use ox_tui::{app, bootstrap, executor, terminal, ui};
+//! The `ox` TUI entry point: argument handling, terminal setup, wiring.
+
+use crate::lifecycle::{self, Transport};
+use crate::{app, bootstrap, executor, terminal, ui};
 
 use tokio::sync::{mpsc, watch};
 
@@ -17,9 +20,8 @@ fn arg(name: &str) -> Option<String> {
     None
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    let server = arg("--server").unwrap_or_else(|| "http://127.0.0.1:14090".into());
+pub async fn run() -> anyhow::Result<()> {
+    let transport = lifecycle::transport_of(arg("--server"));
     let directory = match arg("--directory") {
         Some(directory) => directory,
         None => std::env::current_dir()?.display().to_string(),
@@ -28,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
 
     // The terminal's own colours, read once before the input thread starts: the
     // OSC replies arrive on the same stream as the keystrokes.
-    ox_tui::theme::init(ox_tui::theme::terminal::query());
+    crate::theme::init(crate::theme::terminal::query());
 
     // 事件线程：阻塞 read 放独立线程。
     let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -49,11 +51,19 @@ async fn main() -> anyhow::Result<()> {
 
     let demo = std::env::var("OX_TUI_DEMO").ok();
 
+    // The client every online route uses: `--server` is plain HTTP; otherwise
+    // the unix socket, with the server spawned on demand and a lease held.
+    let online_client = match (&demo, transport) {
+        (Some(_), _) => None,
+        (None, Transport::Explicit(url)) => Some(ox_client::Client::new(url, directory.clone())),
+        (None, Transport::Unix) => Some(connect_unix(&directory).await?),
+    };
+
     let route;
     let online;
     let mut home_chrome = ui::prompt::Chrome::default();
-    let bootstrap: bootstrap::Bootstrap = match demo {
-        Some(_) => {
+    let bootstrap: bootstrap::Bootstrap = match online_client {
+        None => {
             online = false;
             route = app::state::Route::Session;
             bootstrap::Bootstrap {
@@ -61,11 +71,11 @@ async fn main() -> anyhow::Result<()> {
                 session: Some("ses_demo".to_string()),
             }
         }
-        None => match session {
+        Some(client) => match session {
             Some(_) => {
                 online = true;
                 route = app::state::Route::Session;
-                let connected = bootstrap::connect(&server, &directory, session).await?;
+                let connected = bootstrap::connect_with(client, session).await?;
                 // The session footer shows the location stored on the session.
                 home_chrome =
                     bootstrap::chrome(&connected.client, &directory, connected.session.as_deref())
@@ -75,7 +85,7 @@ async fn main() -> anyhow::Result<()> {
             None => {
                 online = true;
                 route = app::state::Route::Home;
-                let client = bootstrap::check_reachable(&server, &directory).await?;
+                let client = bootstrap::check_reachable_with(client).await?;
                 home_chrome = bootstrap::chrome(&client, &directory, None).await;
                 bootstrap::Bootstrap {
                     client,
@@ -157,4 +167,35 @@ async fn main() -> anyhow::Result<()> {
         app.attach_history(ui::history::History::load(path));
     }
     app.run(&mut guard, event_rx).await
+}
+
+/// Connect over the unix socket, starting the server if needed, and keep a
+/// lease on it for the rest of the process. Returns only once a lease was
+/// granted, so the server is not one that is already shutting down.
+async fn connect_unix(directory: &str) -> anyhow::Result<ox_client::Client> {
+    let socket = ox_schema::paths::socket_path();
+    let exe = std::env::current_exe()?;
+    let log = ox_schema::paths::server_log_path();
+    let client = ox_client::Client::over_unix(&socket, directory)?;
+    let reconnect = move || {
+        let socket = socket.clone();
+        let exe = exe.clone();
+        let log = log.clone();
+        async move {
+            lifecycle::ensure_server(
+                &socket,
+                || lifecycle::spawn_server(&exe, &log),
+                lifecycle::SERVER_START_WAIT,
+            )
+            .await
+        }
+    };
+    let first = tokio::time::timeout(
+        lifecycle::SERVER_START_WAIT,
+        lifecycle::acquire_lease(&client, reconnect.clone()),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("ox server did not grant a lease; check the server log"))??;
+    tokio::spawn(lifecycle::run_lease(client.clone(), first, reconnect));
+    Ok(client)
 }

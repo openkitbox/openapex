@@ -22,7 +22,11 @@ impl Chat for NoChat {
 }
 
 pub(crate) async fn test_state() -> AppState {
-    let config = Arc::new(Config::default());
+    test_state_with(Config::default()).await
+}
+
+pub(crate) async fn test_state_with(config: Config) -> AppState {
+    let config = Arc::new(config);
     let db = Db::open_in_memory().await.expect("open db");
     let bus = EventBus::new(db.clone());
     let catalog = ox_llm::model_catalog::ModelCatalog::new(&config.llm);
@@ -43,6 +47,7 @@ pub(crate) async fn test_state() -> AppState {
         live: runner.live(),
         runner,
         config_path: std::path::PathBuf::new(),
+        lifecycle: crate::lifecycle::Lifecycle::new(std::time::Instant::now()),
     }
 }
 

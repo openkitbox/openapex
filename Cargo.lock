@@ -2939,6 +2939,7 @@ dependencies = [
  "ox-schema",
  "ox-server",
  "ox-tools",
+ "ox-tui",
  "reqwest",
  "rustfs-mimalloc",
  "salvo",
@@ -3082,6 +3083,7 @@ dependencies = [
 name = "ox-schema"
 version = "0.1.0"
 dependencies = [
+ "dirs",
  "rand 0.10.3",
  "serde",
  "serde_json",
@@ -4229,6 +4231,7 @@ dependencies = [
  "mime-infer",
  "multimap",
  "multra",
+ "nix 0.31.3",
  "parking_lot",
  "percent-encoding",
  "pin-project",

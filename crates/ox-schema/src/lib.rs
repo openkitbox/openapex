@@ -7,6 +7,7 @@ pub mod event;
 pub mod id;
 pub mod inbox;
 pub mod message;
+pub mod paths;
 pub mod slug;
 pub mod support;
 pub mod wire;

@@ -15,7 +15,11 @@ pub struct Bootstrap {
 /// Fast-fail reachability probe (keeps the old startup behaviour without
 /// creating a session).
 pub async fn check_reachable(server: &str, directory: &str) -> anyhow::Result<Client> {
-    let client = Client::new(server, directory);
+    check_reachable_with(Client::new(server, directory)).await
+}
+
+/// [`check_reachable`] for an already-built client (e.g. over a unix socket).
+pub async fn check_reachable_with(client: Client) -> anyhow::Result<Client> {
     let _location = client.location().await?;
     Ok(client)
 }
@@ -187,7 +191,12 @@ pub async fn connect(
     directory: &str,
     session: Option<String>,
 ) -> anyhow::Result<Bootstrap> {
-    let client = check_reachable(server, directory).await?;
+    connect_with(Client::new(server, directory), session).await
+}
+
+/// [`connect`] for an already-built client.
+pub async fn connect_with(client: Client, session: Option<String>) -> anyhow::Result<Bootstrap> {
+    let client = check_reachable_with(client).await?;
     let session = match session {
         Some(session) => Some(session),
         None => Some(client.create_session().await?),

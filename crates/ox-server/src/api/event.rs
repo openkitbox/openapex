@@ -314,6 +314,11 @@ async fn stream(
         }
     });
 
+    sse_stream(res, rx);
+}
+
+/// 200 with the SSE header set, streaming `rx` as the body.
+pub(super) fn sse_stream(res: &mut Response, rx: mpsc::Receiver<String>) {
     res.status_code(StatusCode::OK);
     let headers = res.headers_mut();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));

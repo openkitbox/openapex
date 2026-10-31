@@ -1,9 +1,10 @@
-//! ox — pure-Rust, opencode v2 compatible chat-protocol server.
+//! ox — pure-Rust, opencode v2 compatible chat-protocol server and TUI.
 //!
-//! This binary is the HTTP entrypoint. The library half (`lib.rs`) exposes
-//! config/db/id/api so integration tests can drive the real router.
-//! The `acp` subcommand runs the Agent Client Protocol translator instead
-//! (`src/acp`); the default path boots the server exactly as before.
+//! One binary, three modes picked by the first argument: no subcommand opens
+//! the TUI (which starts `ox serve --exit-when-idle` on demand), `serve` runs
+//! the HTTP server, and `acp` runs the Agent Client Protocol translator
+//! (`src/acp`). The library half (`lib.rs`) exposes config/db/id/api so
+//! integration tests can drive the real router.
 //!
 //! ox owns the process-wide allocator: turso's default `mimalloc` feature
 //! (which would install its own `#[global_allocator]`) is disabled in
@@ -47,6 +48,7 @@ static LOG_GUARDS: OnceLock<Vec<WorkerGuard>> = OnceLock::new();
 struct LogOutputs {
     stdout: bool,
     log_file: Option<PathBuf>,
+    exit_when_idle: bool,
 }
 
 impl Default for LogOutputs {
@@ -54,8 +56,70 @@ impl Default for LogOutputs {
         Self {
             stdout: true,
             log_file: None,
+            exit_when_idle: false,
         }
     }
+}
+
+/// What the command line asks `ox` to run.
+#[derive(Debug, Eq, PartialEq)]
+enum Command {
+    Tui,
+    Serve(LogOutputs),
+    Acp(Option<String>, LogOutputs),
+}
+
+/// Options the TUI reads itself from `std::env::args` (`--name X` or `--name=X`).
+const TUI_OPTIONS: [&str; 3] = ["--server", "--directory", "--session"];
+
+const USAGE: &str =
+    "usage: ox [--server URL] [--directory DIR] [--session ID] | ox serve [flags] | ox acp [flags]";
+
+fn parse_command<I, S>(args: I) -> Result<Command>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut args = args.into_iter();
+    let Some(first) = args.next() else {
+        return Ok(Command::Tui);
+    };
+    match first.as_ref() {
+        "serve" => Ok(Command::Serve(parse_server_args(args)?)),
+        "acp" => {
+            let (explicit_base, outputs) = parse_acp_args(args)?;
+            Ok(Command::Acp(explicit_base, outputs))
+        }
+        flag if flag.starts_with('-') => {
+            check_tui_args(
+                std::iter::once(first.as_ref().to_owned())
+                    .chain(args.map(|a| a.as_ref().to_owned())),
+            )?;
+            Ok(Command::Tui)
+        }
+        other => anyhow::bail!("unknown subcommand `{other}`; {USAGE}"),
+    }
+}
+
+/// Reject anything the TUI would not understand. The TUI parses its own
+/// options, so this only validates them.
+fn check_tui_args(args: impl IntoIterator<Item = String>) -> Result<()> {
+    let mut args = args.into_iter();
+    while let Some(argument) = args.next() {
+        let name = argument
+            .split_once('=')
+            .map_or(argument.as_str(), |(name, _)| name);
+        if !TUI_OPTIONS.contains(&name) {
+            if argument.starts_with('-') {
+                anyhow::bail!("unknown option `{argument}`; use `ox serve` to start the server");
+            }
+            anyhow::bail!("unknown argument `{argument}`; {USAGE}");
+        }
+        if !argument.contains('=') && args.next().is_none() {
+            anyhow::bail!("{name} needs a value");
+        }
+    }
+    Ok(())
 }
 
 fn parse_server_args<I, S>(args: I) -> Result<LogOutputs>
@@ -77,6 +141,7 @@ where
                 }
                 outputs.log_file = Some(PathBuf::from(path.as_ref()));
             }
+            "--exit-when-idle" => outputs.exit_when_idle = true,
             "--stdout" => set_stdout_flag(&mut outputs, &mut stdout_flag, true)?,
             "--no-stdout" => set_stdout_flag(&mut outputs, &mut stdout_flag, false)?,
             other => anyhow::bail!("unknown argument `{other}`"),
@@ -154,14 +219,21 @@ fn rolling_log_writer(path: &Path) -> Result<(NonBlocking, WorkerGuard)> {
         .with_context(|| format!("failed to open log file `{}`", path.display()))?;
     Ok(tracing_appender::non_blocking(appender))
 }
+fn serve_options(outputs: &LogOutputs) -> ox::ServeOptions {
+    ox::ServeOptions {
+        exit_when_idle: outputs.exit_when_idle,
+        ..ox::ServeOptions::default()
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Subcommand split happens before tracing init: in `acp` mode stdout is
-    // the NDJSON wire, so logs go to stderr; the server mode keeps stdout.
-    let mut args = std::env::args().skip(1);
-    match args.next().as_deref() {
-        Some("acp") => {
-            let (explicit_base, outputs) = parse_acp_args(args)?;
+    // Mode split happens before tracing init: the TUI owns the terminal (no
+    // logs), `acp` uses stdout as the NDJSON wire (logs go to stderr), and
+    // `serve` logs to stdout and/or a file.
+    match parse_command(std::env::args().skip(1))? {
+        Command::Tui => ox_tui::run::run().await,
+        Command::Acp(explicit_base, outputs) => {
             if let Some(base) = &explicit_base {
                 ox::acp::validate_base(base)?;
             }
@@ -169,8 +241,7 @@ async fn main() -> Result<()> {
             let config = ox::config::Config::load()?;
             ox::acp::run(explicit_base, config).await
         }
-        Some(flag) if flag.starts_with('-') => {
-            let outputs = parse_server_args(std::iter::once(flag.to_owned()).chain(args))?;
+        Command::Serve(outputs) => {
             init_tracing(&outputs, false)?;
             let config = ox::config::Config::load()?;
             tracing::info!(
@@ -179,20 +250,7 @@ async fn main() -> Result<()> {
                 cardinal_url = %config.llm.cardinal_url,
                 "starting ox"
             );
-            ox::run(config).await
-        }
-        Some(other) => anyhow::bail!("unknown subcommand `{other}`; usage: opencode-rs [acp]"),
-        None => {
-            let outputs = parse_server_args(args)?;
-            init_tracing(&outputs, false)?;
-            let config = ox::config::Config::load()?;
-            tracing::info!(
-                listen = %config.listen,
-                db = %config.db_path.display(),
-                cardinal_url = %config.llm.cardinal_url,
-                "starting ox"
-            );
-            ox::run(config).await
+            ox::run_with(config, serve_options(&outputs)).await
         }
     }
 }
@@ -235,4 +293,86 @@ fn init_tracing(outputs: &LogOutputs, acp: bool) -> Result<()> {
         .set(guards)
         .map_err(|_| anyhow::anyhow!("tracing guards already initialized"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_when_idle_is_off_unless_asked_for() {
+        assert!(
+            !parse_server_args(Vec::<&str>::new())
+                .unwrap()
+                .exit_when_idle
+        );
+        let outputs = parse_server_args(["--exit-when-idle", "--no-stdout"]).unwrap();
+        assert!(outputs.exit_when_idle);
+        assert!(!outputs.stdout);
+        assert!(serve_options(&outputs).exit_when_idle);
+    }
+
+    fn command(args: &[&str]) -> Result<Command> {
+        parse_command(args.iter().copied())
+    }
+
+    #[test]
+    fn no_subcommand_and_tui_options_open_the_tui() {
+        for args in [
+            &[][..],
+            &["--server", "http://x"],
+            &["--server=http://x"],
+            &["--directory", "/a", "--session", "ses_1"],
+            &["--session=ses_1", "--directory=/a"],
+        ] {
+            assert_eq!(command(args).unwrap(), Command::Tui, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn tui_option_without_a_value_is_an_error() {
+        assert!(command(&["--server"]).is_err());
+        assert!(command(&["--directory", "/a", "--session"]).is_err());
+    }
+
+    #[test]
+    fn serve_parses_server_flags() {
+        assert_eq!(
+            command(&["serve"]).unwrap(),
+            Command::Serve(LogOutputs::default())
+        );
+        assert_eq!(
+            command(&[
+                "serve",
+                "--exit-when-idle",
+                "--no-stdout",
+                "--log-file",
+                "/tmp/x"
+            ])
+            .unwrap(),
+            Command::Serve(LogOutputs {
+                stdout: false,
+                log_file: Some(PathBuf::from("/tmp/x")),
+                exit_when_idle: true,
+            })
+        );
+        assert!(command(&["serve", "--bogus"]).is_err());
+    }
+
+    #[test]
+    fn acp_keeps_its_own_flags() {
+        assert_eq!(
+            command(&["acp", "--server", "http://x"]).unwrap(),
+            Command::Acp(Some("http://x".to_owned()), LogOutputs::default())
+        );
+    }
+
+    #[test]
+    fn old_server_flags_and_unknown_words_are_errors() {
+        let err = command(&["--stdout"]).unwrap_err().to_string();
+        assert!(err.contains("ox serve"), "{err}");
+        let err = command(&["bogus"]).unwrap_err().to_string();
+        assert!(err.contains("unknown subcommand"), "{err}");
+        assert!(command(&["--server", "http://x", "extra"]).is_err());
+    }
 }

@@ -381,6 +381,14 @@ impl Runner {
             .is_some_and(|handle| handle_is_active(&handle))
     }
 
+    /// Whether any session has work scheduled or in flight.
+    pub fn has_active(&self) -> bool {
+        self.inner
+            .sessions
+            .iter()
+            .any(|entry| handle_is_active(entry.value()))
+    }
+
     /// Process-local per-session table sizes (registry entries, keyed-instruction
     /// baselines), for isolated allocator profiling and for tests that need to
     /// see eviction — no HTTP surface exposes what a session costs the process.

@@ -4,6 +4,8 @@
 //! drive it over HTTP against an ephemeral port.
 
 pub mod api;
+pub mod instance;
+pub mod lifecycle;
 pub(crate) mod reload;
 mod session_retention;
 #[cfg(test)]
@@ -20,9 +22,12 @@ pub use ox_mcp as mcp;
 pub use ox_schema::{id, slug};
 pub use ox_tools as tool;
 
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use salvo::conn::JoinedAcceptor;
 use salvo::prelude::*;
 
 use crate::api::AppState;
@@ -161,6 +166,7 @@ pub async fn build_state_on_with_bus(
         live: runner.live(),
         runner,
         config_path: ox_core::config::Config::default_path(),
+        lifecycle: lifecycle::Lifecycle::new(std::time::Instant::now()),
     })
 }
 
@@ -197,13 +203,56 @@ pub fn build_router(state: AppState) -> Router {
     api::build_router(state)
 }
 
-/// Open the DB, build the router and serve on `config.listen`.
+/// How [`run_with`] serves. Paths are explicit so tests never touch the
+/// real home.
+#[derive(Debug, Clone)]
+pub struct ServeOptions {
+    /// Serve on the unix socket only and exit once no client holds a lease
+    /// for `grace`.
+    pub exit_when_idle: bool,
+    pub grace: Duration,
+    pub socket_path: PathBuf,
+    pub lock_path: PathBuf,
+}
+
+impl Default for ServeOptions {
+    fn default() -> Self {
+        Self {
+            exit_when_idle: false,
+            grace: Duration::from_secs(15),
+            socket_path: ox_schema::paths::socket_path(),
+            lock_path: ox_schema::paths::lock_path(),
+        }
+    }
+}
+
+/// Open the DB, build the router and serve on `config.listen` and the unix
+/// socket.
 pub async fn run(config: Config) -> Result<()> {
-    let (state, router) = compose(config).await?;
-    let acceptor = TcpListener::new(state.services().config.listen.clone())
-        .try_bind()
-        .await?;
-    serve_on(acceptor, state, router).await
+    run_with(config, ServeOptions::default()).await
+}
+
+/// [`run`] with explicit options. Takes the single-instance lock first, so a
+/// second server fails before it opens the database; the lock is held until
+/// serving ends. In idle mode only the unix socket is bound.
+pub async fn run_with(config: Config, opts: ServeOptions) -> Result<()> {
+    let _lock = instance::InstanceLock::acquire(&opts.lock_path)?;
+    let uds = instance::bind_unix(&opts.socket_path).await?;
+    let outcome = async {
+        if opts.exit_when_idle {
+            let (state, router) = compose(config).await?;
+            serve_with(uds, state, router, Some(opts.grace)).await
+        } else {
+            let tcp = TcpListener::new(config.listen.clone()).try_bind().await?;
+            let (state, router) = compose(config).await?;
+            serve_with(JoinedAcceptor::new(tcp, uds), state, router, None).await
+        }
+    }
+    .await;
+    // Reached on every path after the bind, and only while holding the lock,
+    // so the file is ours to remove.
+    let _ = std::fs::remove_file(&opts.socket_path);
+    outcome
 }
 
 /// Compose the full server state and router without binding anything —
@@ -307,7 +356,135 @@ pub async fn serve_on(
     state: AppState,
     router: Router,
 ) -> Result<()> {
-    let _ = state; // signature symmetry: state owns the runtime handles, the router holds them
-    Server::new(acceptor).serve(router).await;
+    serve_with(acceptor, state, router, None).await
+}
+
+/// Serve on `acceptor`. With `idle = Some(grace)` the server stops itself
+/// once [`lifecycle::Lifecycle::try_close`] says no lease, no turn and a full
+/// `grace` of quiet. Never composes state or reads the real home.
+pub async fn serve_with(
+    acceptor: impl salvo::conn::Acceptor,
+    state: AppState,
+    router: Router,
+    idle: Option<Duration>,
+) -> Result<()> {
+    let server = Server::new(acceptor);
+    let watcher = idle.map(|grace| {
+        let handle = server.handle();
+        let lifecycle = Arc::clone(&state.lifecycle);
+        let runner = state.runner.clone();
+        lifecycle.touch(Instant::now());
+        let period = (grace / 4).clamp(Duration::from_millis(10), Duration::from_secs(1));
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(period).await;
+                if lifecycle.try_close(Instant::now(), runner.has_active(), grace) {
+                    tracing::info!("no clients left; shutting down");
+                    handle.stop_graceful(Duration::from_secs(2));
+                    return;
+                }
+            }
+        })
+    });
+    server.serve(router).await;
+    if let Some(watcher) = watcher {
+        watcher.abort();
+    }
     Ok(())
+}
+
+#[cfg(test)]
+mod serve_tests {
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+
+    use super::*;
+    use crate::instance::bind_unix;
+    use crate::test_support::test_state;
+
+    const GRACE: Duration = Duration::from_millis(200);
+    const BOUND: Duration = Duration::from_secs(10);
+
+    /// A short path: macOS `sun_path` holds fewer than 104 bytes.
+    fn short_socket() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::Builder::new()
+            .prefix("ox")
+            .tempdir_in("/tmp")
+            .expect("tempdir");
+        let socket = dir.path().join("s");
+        (dir, socket)
+    }
+
+    async fn start(
+        socket: &Path,
+        idle: Option<Duration>,
+    ) -> (AppState, tokio::task::JoinHandle<Result<()>>) {
+        let state = test_state().await;
+        let router = build_router(state.clone());
+        let acceptor = bind_unix(socket).await.expect("bind");
+        let task = tokio::spawn(serve_with(acceptor, state.clone(), router, idle));
+        (state, task)
+    }
+
+    async fn open_lease(socket: &Path) -> UnixStream {
+        let mut stream = UnixStream::connect(socket).await.expect("connect");
+        stream
+            .write_all(b"GET /ox/lease HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write");
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 512];
+        let deadline = Instant::now() + BOUND;
+        while !String::from_utf8_lossy(&seen).contains(": lease") {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let n = tokio::time::timeout(left, stream.read(&mut buf))
+                .await
+                .expect("lease head in time")
+                .expect("read");
+            assert!(n > 0, "eof before the lease frame");
+            seen.extend_from_slice(&buf[..n]);
+        }
+        stream
+    }
+
+    #[tokio::test]
+    async fn idle_server_exits_after_the_grace_without_clients() {
+        let (_dir, socket) = short_socket();
+        let (_state, task) = start(&socket, Some(GRACE)).await;
+        let result = tokio::time::timeout(BOUND, task)
+            .await
+            .expect("server exits on its own")
+            .expect("join");
+        result.expect("serve_with result");
+    }
+
+    #[tokio::test]
+    async fn a_held_lease_keeps_the_server_up_until_it_is_released() {
+        let (_dir, socket) = short_socket();
+        let (state, mut task) = start(&socket, Some(GRACE)).await;
+        let lease = open_lease(&socket).await;
+        assert_eq!(state.lifecycle.lease_count(), 1);
+        // Several grace windows with the lease held: the server must stay.
+        let held = tokio::time::timeout(GRACE * 5, &mut task).await;
+        assert!(held.is_err(), "server exited while a lease was held");
+        drop(lease);
+        tokio::time::timeout(BOUND, task)
+            .await
+            .expect("server exits after the lease is released")
+            .expect("join")
+            .expect("serve_with result");
+    }
+
+    #[tokio::test]
+    async fn without_idle_mode_the_server_keeps_serving() {
+        let (_dir, socket) = short_socket();
+        let (_state, mut task) = start(&socket, None).await;
+        let ran = tokio::time::timeout(GRACE * 5, &mut task).await;
+        assert!(ran.is_err(), "server exited without idle mode");
+        UnixStream::connect(&socket).await.expect("still accepting");
+        task.abort();
+    }
 }
