@@ -101,6 +101,7 @@ fn compaction_summary_renders_tables() {
         text: "Summary\n\n| key | value |\n|---|---|\n| goal | ship |",
         cancelled: false,
         tokens: None,
+        spinner: '⠋',
     };
     let rows: Vec<String> = lines(&view, 40)
         .iter()

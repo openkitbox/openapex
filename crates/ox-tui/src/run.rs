@@ -37,6 +37,15 @@ pub async fn run() -> anyhow::Result<()> {
         None => std::env::current_dir()?.display().to_string(),
     };
     let session = arg("--session");
+    // Tool rows show paths relative to the working directory (upstream
+    // `usePathFormatter`); symlinks resolved like the server's location.
+    crate::ui::tool_text::init_paths(crate::ui::tool_text::Paths {
+        directory: Some(
+            std::fs::canonicalize(&directory)
+                .map_or_else(|_| directory.clone(), |p| p.display().to_string()),
+        ),
+        home: std::env::var_os("HOME").map(|home| home.to_string_lossy().into_owned()),
+    });
 
     // The terminal's own colours, read once before the input thread starts: the
     // OSC replies arrive on the same stream as the keystrokes.

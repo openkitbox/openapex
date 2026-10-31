@@ -1,5 +1,5 @@
 use ox_client::history::parse_messages;
-use ox_client::store::{CompletionSource, Item};
+use ox_client::store::{CompletionSource, Item, Notice};
 
 #[test]
 fn history_maps_user_and_assistant_text_in_order() {
@@ -92,18 +92,26 @@ fn history_reads_per_turn_usage() {
 }
 
 #[test]
-fn history_ignores_non_transcript_variants() {
+fn history_ignores_non_transcript_variants_and_keeps_system_notices() {
     let raw = r#"[
       {"type":"synthetic","id":"msg_s1","time":{"created":1},"text":"ignore me"},
-      {"type":"system","id":"msg_s2","time":{"created":2},"text":"ignore me too"},
+      {"type":"system","id":"msg_s2","time":{"created":2},"text":"<instructions/>"},
       {"type":"user","id":"msg_u1","time":{"created":3},"text":"kept"}
     ]"#;
     let messages: Vec<ox_schema::message::Message> = serde_json::from_str(raw).unwrap();
     let items = parse_messages(&messages);
 
-    assert_eq!(items.len(), 1);
-    let Item::User { text, .. } = &items[0] else {
-        panic!("expected user, got {:?}", items[0]);
+    assert_eq!(items.len(), 2, "{items:?}");
+    assert!(
+        matches!(
+            &items[0],
+            Item::Notice(Notice::System { description: None })
+        ),
+        "a system message is an `Instructions updated` notice: {:?}",
+        items[0]
+    );
+    let Item::User { text, .. } = &items[1] else {
+        panic!("expected user, got {:?}", items[1]);
     };
     assert_eq!(text.as_ref(), "kept");
 }

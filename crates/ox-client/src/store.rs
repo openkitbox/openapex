@@ -7,12 +7,27 @@
 //! 2. Every mutation bumps `version` and lowers `changed_from`; the UI compares
 //!    `(id, version)` in O(1) and only re-wraps the changed tail. Text lives in
 //!    an `Arc` so an unchanged block shares the store's buffer (no deep copy).
+//!
+//! Session-level rows (upstream `routes/session/rows.ts`) are data here, no
+//! display text. Deviations:
+//! - Queued compactions are tracked as inbox ids (`queued_compactions`) from
+//!   enqueue until delivered or cancelled, not as message rows.
+//!   They come from live inbox events only (no REST call lists the inbox),
+//!   so a compaction queued before the TUI opened shows no row until
+//!   delivered.
+//! - [`ShownError`] is not rebuilt on a history reload: after a reload in
+//!   mid-turn, a run failure repeating the step's error gets its own row.
+//! - A live switch with no `previous` on the wire falls back to the store's
+//!   current agent/model; the model fallback is split on the first `/` and
+//!   carries no variant.
+//! - A history `system` message has no description, so it reads as a bare
+//!   `Instructions updated` notice.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ox_schema::event::{EventEnvelope, SessionEventData};
-use ox_schema::support::{FinishReason, TokenUsage};
+use ox_schema::support::{FinishReason, Record, TokenUsage};
 
 use crate::form::{self, FormInfo};
 use crate::todo::{Todo, parse_todos};
@@ -31,6 +46,109 @@ pub enum Item {
     /// A shell / subagent completion notice (`↳ Shell finished · cmd`),
     /// parsed from a `Synthetic` message by [`CompletionItem::from_synthetic`].
     Completion(CompletionItem),
+    /// An agent / model / location change (`*-switched` messages, or the
+    /// `session.agent.selected` / `model.selected` / `moved` events).
+    Switch(Switch),
+    /// A system notice (`system` message, `session.instructions.updated`) or
+    /// a loaded skill (`skill` message).
+    Notice(Notice),
+    /// A run failure the turn's last step or compaction did not already show
+    /// (`idle.error`, `session.execution.failed`; upstream `reduceSessionRows`
+    /// `shownError`).
+    Error(ErrorInfo),
+}
+
+/// A session error as the wire names it: `type` and `message`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorInfo {
+    pub kind: Arc<str>,
+    pub message: Arc<str>,
+}
+
+impl From<&ox_schema::support::SessionError> for ErrorInfo {
+    fn from(error: &ox_schema::support::SessionError) -> Self {
+        Self {
+            kind: Arc::from(error.kind.as_str()),
+            message: Arc::from(error.message.as_str()),
+        }
+    }
+}
+
+/// The error the turn's last step or settled compaction already shows; a
+/// run failure repeating it gets no row of its own. One rule for the live
+/// reducer and history parsing (upstream `rows.ts` `reduceSessionRows`
+/// `shownError`): every assistant step and settled compaction replaces it,
+/// and the turn's end consumes it. User messages do not touch it.
+#[derive(Debug, Default)]
+pub struct ShownError(Option<ErrorInfo>);
+
+impl ShownError {
+    /// An assistant step (its error or none) or a settled compaction (its
+    /// failure, or none when completed) is now the latest thing shown.
+    pub fn show(&mut self, error: Option<ErrorInfo>) {
+        self.0 = error;
+    }
+
+    /// The turn ended with `error`: the row to add, if the error differs in
+    /// type or message from the one already shown. Resets for the next turn.
+    #[must_use]
+    pub fn end_turn(&mut self, error: Option<ErrorInfo>) -> Option<ErrorInfo> {
+        let shown = self.0.take();
+        error.filter(|error| shown.as_ref() != Some(error))
+    }
+}
+
+/// A scheduled retry of a failed step (`retry` on an assistant message).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetryInfo {
+    pub attempt: i64,
+    /// Wall-clock ms the retry fires; the UI derives the countdown from it.
+    pub at: i64,
+    pub message: Arc<str>,
+}
+
+/// A model reference as the wire names it (`providerID`, `id`, `variant`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelChoice {
+    pub provider_id: Arc<str>,
+    pub id: Arc<str>,
+    pub variant: Option<Arc<str>>,
+}
+
+impl From<&ox_schema::support::ModelRef> for ModelChoice {
+    fn from(model: &ox_schema::support::ModelRef) -> Self {
+        Self {
+            provider_id: Arc::from(model.provider_id.as_str()),
+            id: Arc::from(model.id.as_str()),
+            variant: model.variant.as_deref().map(Arc::from),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Switch {
+    Agent {
+        agent: Arc<str>,
+        previous: Option<Arc<str>>,
+    },
+    Model {
+        model: ModelChoice,
+        previous: Option<ModelChoice>,
+    },
+    Location {
+        directory: Arc<str>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Notice {
+    /// `description` is the wire's (`Instructions updated: AGENTS.md`).
+    System {
+        description: Option<Arc<str>>,
+    },
+    Skill {
+        name: Arc<str>,
+    },
 }
 
 /// Who produced a completion notice (`metadata.source`).
@@ -198,6 +316,15 @@ pub struct ToolPart {
     pub todos: Arc<Vec<Todo>>,
     /// The child session of a `subagent` call, once its result is known.
     pub child: Option<ChildRef>,
+    /// The parsed tool input (`tool.called` live, the wire state's `input` in
+    /// history), kept whole so renderers can read any tool-specific field.
+    /// Empty until the call is known, and stays empty when only streamed
+    /// input text arrived.
+    pub input: Arc<Record>,
+    /// The result metadata of a finished call (`tool.success`/`tool.failed`
+    /// live, `completed`/`error` in history), e.g. glob `count` or shell
+    /// `shellID`. `None` while running or when the result carried none.
+    pub metadata: Option<Arc<Record>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -246,20 +373,11 @@ pub struct AssistantItem {
     /// Tokens the last step put in the context window (input + output +
     /// reasoning + cache). The footer's context figure.
     pub context_tokens: i64,
-}
-
-/// Session-level failure line (execution/step failures, scheduled retries).
-/// Ephemeral: they live in the SSE stream, not in history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NoticeKind {
-    Error,
-    Retry,
-}
-
-#[derive(Debug, Clone)]
-pub struct Notice {
-    pub kind: NoticeKind,
-    pub text: String,
+    /// Why the message's last step failed (`step.failed`, wire `error`).
+    pub error: Option<ErrorInfo>,
+    /// The retry scheduled after a failed attempt (`session.retry.scheduled`,
+    /// wire `retry`); cleared when the next attempt starts or the run ends.
+    pub retry: Option<RetryInfo>,
 }
 
 /// A prompt queued while a run is active (server-side inbox, `steer`).
@@ -285,8 +403,9 @@ pub struct DataStore {
     probing: HashSet<String>,
     pub model: Option<String>,
     pub agent: Option<String>,
-    /// Session-level failure/retry notices, newest last.
-    pub notices: Vec<Notice>,
+    /// Inbox ids of compactions enqueued but not yet delivered or cancelled,
+    /// oldest first (upstream `CompactionQueued`).
+    pub queued_compactions: Vec<String>,
     /// Prompts accepted but not yet delivered.
     pub queued: Vec<Queued>,
     /// Completion notices enqueued but not yet delivered, by inbox id. Moved
@@ -302,6 +421,9 @@ pub struct DataStore {
     /// Dispatch timestamp of the step in flight; steps never overlap, so one
     /// slot (not per-item state) is enough to accumulate `active_ms`.
     step_started_ms: Option<i64>,
+    /// See [`ShownError`]; derived from live events only, so a reload in
+    /// mid-turn starts it empty.
+    shown_error: ShownError,
 }
 
 impl DataStore {
@@ -350,6 +472,23 @@ impl DataStore {
             version: 0,
         })));
         self.items.len() - 1
+    }
+
+    /// End the turn: record its failure unless the turn's last step or
+    /// settled compaction already shows it ([`ShownError`]).
+    fn end_turn(&mut self, error: Option<ErrorInfo>) {
+        if let Some(error) = self.shown_error.end_turn(error) {
+            self.items.push(Item::Error(error));
+            let index = self.items.len() - 1;
+            self.touch(index);
+        }
+    }
+
+    /// Push a row-only item (switch, notice) at the end of the transcript.
+    fn push_row(&mut self, item: Item) {
+        self.items.push(item);
+        let index = self.items.len() - 1;
+        self.touch(index);
     }
 
     /// Authoritative replacement after a reconnect/reload.
@@ -487,6 +626,7 @@ impl DataStore {
         self.probing.retain(|id| ChildRef::referenced_in(items, id));
         self.assistant_index.clear();
         self.pending_completions.clear();
+        self.shown_error = ShownError::default();
         for (index, item) in self.items.iter().enumerate() {
             if let Item::Assistant(assistant) = item {
                 self.assistant_index.insert(assistant.id.clone(), index);
@@ -672,6 +812,8 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
                     input_text: Arc::default(),
                     todos: Arc::default(),
                     child: None,
+                    input: Arc::default(),
+                    metadata: None,
                 });
             }
             store.touch(index);
@@ -719,6 +861,7 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
                 part.state = ToolState::Running;
                 part.summary = tool_summary(&part.tool, input);
                 part.todos = todos_of(&part.tool, input);
+                part.input = Arc::new(input.clone());
                 part.version += 1;
             }
             store.touch(index);
@@ -757,6 +900,7 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
                 }
                 part.output = Arc::new(join_text(content));
                 part.child = ChildRef::from_metadata(&part.tool, metadata.as_ref());
+                part.metadata = metadata.clone().map(Arc::new);
                 part.version += 1;
             }
             store.touch(index);
@@ -765,6 +909,7 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
             assistant_message_id,
             id,
             error,
+            metadata,
             ..
         } => {
             let index = store.ensure_assistant(assistant_message_id);
@@ -776,6 +921,7 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
                     part.summary = summary_from_input_text(&part.tool, &part.input_text);
                 }
                 part.output = Arc::new(error.message.clone());
+                part.metadata = metadata.clone().map(Arc::new);
                 part.version += 1;
             }
             store.touch(index);
@@ -787,15 +933,12 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
         | SessionEventData::ExecutionInterrupted { .. } => {
             store.running_since = None;
             finish_last_assistant(store, event.created);
+            store.end_turn(None);
         }
         SessionEventData::ExecutionFailed { error, .. } => {
             store.running_since = None;
             finish_last_assistant(store, event.created);
-            store.notices.push(Notice {
-                kind: NoticeKind::Error,
-                text: error.message.clone(),
-            });
-            store.changed_from = 0; // notices live outside `items`
+            store.end_turn(Some(ErrorInfo::from(error)));
         }
         SessionEventData::StepStarted {
             assistant_message_id,
@@ -805,12 +948,28 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
             ..
         } => {
             store.step_started_ms = Some(*started);
+            // A new attempt supersedes the previous message's pending retry
+            // (the projector closes the stale assistant in place).
+            if !store.assistant_index.contains_key(assistant_message_id)
+                && let Some(index) = last_assistant(store)
+                && let Item::Assistant(item) = &mut store.items[index]
+                && item.retry.take().is_some()
+            {
+                item.version += 1;
+                store.touch(index);
+            }
             let index = store.ensure_assistant(assistant_message_id);
             if let Item::Assistant(item) = &mut store.items[index] {
                 item.agent = Some(agent.clone());
                 item.model = Some(format!("{}/{}", model.provider_id, model.id));
+                // A retried step restarts the message (message_updater
+                // StepStarted on an existing row).
+                item.error = None;
+                item.retry = None;
+                item.finish = None;
                 item.version += 1;
             }
+            store.shown_error.show(None);
             store.touch(index);
         }
         SessionEventData::StepEnded {
@@ -836,19 +995,45 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
             }
             store.touch(index);
         }
-        SessionEventData::SessionRetryScheduled { attempt, error, .. } => {
-            store.notices.push(Notice {
-                kind: NoticeKind::Retry,
-                text: format!("retry {attempt} · {}", error.message),
-            });
-            store.changed_from = 0;
+        SessionEventData::SessionRetryScheduled {
+            assistant_message_id,
+            attempt,
+            at,
+            error,
+            ..
+        } => {
+            let index = store.ensure_assistant(assistant_message_id);
+            if let Item::Assistant(item) = &mut store.items[index] {
+                item.retry = Some(RetryInfo {
+                    attempt: *attempt,
+                    at: *at,
+                    message: Arc::from(error.message.as_str()),
+                });
+                item.version += 1;
+            }
+            store.touch(index);
         }
-        SessionEventData::StepFailed { error, .. } => {
-            store.notices.push(Notice {
-                kind: NoticeKind::Error,
-                text: error.message.clone(),
-            });
-            store.changed_from = 0;
+        SessionEventData::StepFailed {
+            assistant_message_id,
+            error,
+            finish,
+            ..
+        } => {
+            let error = ErrorInfo::from(error);
+            store.shown_error.show(Some(error.clone()));
+            let index = store.ensure_assistant(assistant_message_id);
+            if let Item::Assistant(item) = &mut store.items[index] {
+                item.error = Some(error);
+                item.retry = None;
+                item.finish = Some(match finish {
+                    Some(ox_schema::event::StepFailedFinish::ContentFilter) => {
+                        FinishReason::ContentFilter
+                    }
+                    None => FinishReason::Error,
+                });
+                item.version += 1;
+            }
+            store.touch(index);
         }
         SessionEventData::InboxEnqueued {
             inbox_id,
@@ -875,8 +1060,19 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
                 store.pending_completions.insert(inbox_id.clone(), notice);
             }
         }
+        SessionEventData::InboxEnqueued {
+            inbox_id,
+            item: ox_schema::inbox::Item::Compaction { .. },
+            ..
+        } => {
+            if !store.queued_compactions.contains(inbox_id) {
+                store.queued_compactions.push(inbox_id.clone());
+                store.changed_from = 0;
+            }
+        }
         SessionEventData::InboxDelivered { inbox_id, .. } => {
             store.queued.retain(|queued| queued.inbox_id != *inbox_id);
+            store.queued_compactions.retain(|id| id != inbox_id);
             // Timeline position = delivery time; a repeat finds nothing to move.
             if let Some(notice) = store.pending_completions.remove(inbox_id) {
                 store.items.push(Item::Completion(notice));
@@ -885,14 +1081,58 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
         }
         SessionEventData::InboxCancelled { inbox_id, .. } => {
             store.queued.retain(|queued| queued.inbox_id != *inbox_id);
+            store.queued_compactions.retain(|id| id != inbox_id);
             store.pending_completions.remove(inbox_id);
             store.changed_from = 0;
         }
-        SessionEventData::SessionModelSelected { model, .. } => {
+        SessionEventData::SessionModelSelected {
+            model, previous, ..
+        } => {
+            // `previous` falls back to the session's current model, as the
+            // projector falls back to the session row.
+            let previous = previous.as_ref().map(ModelChoice::from).or_else(|| {
+                let current = store.model.as_deref()?;
+                let (provider_id, id) = current.split_once('/')?;
+                Some(ModelChoice {
+                    provider_id: Arc::from(provider_id),
+                    id: Arc::from(id),
+                    variant: None,
+                })
+            });
+            store.push_row(Item::Switch(Switch::Model {
+                model: ModelChoice::from(model),
+                previous,
+            }));
             store.model = Some(format!("{}/{}", model.provider_id, model.id));
         }
-        SessionEventData::SessionAgentSelected { agent, .. } => {
+        SessionEventData::SessionAgentSelected {
+            agent, previous, ..
+        } => {
+            let previous = previous
+                .as_deref()
+                .or(store.agent.as_deref())
+                .map(Arc::from);
+            store.push_row(Item::Switch(Switch::Agent {
+                agent: Arc::from(agent.as_str()),
+                previous,
+            }));
             store.agent = Some(agent.clone());
+        }
+        SessionEventData::SessionMoved { payload, .. } => {
+            store.push_row(Item::Switch(Switch::Location {
+                directory: Arc::from(payload.location.directory.as_str()),
+            }));
+        }
+        SessionEventData::SessionInstructionsUpdated { delta, text, .. } => {
+            // Upstream message-updater: no text = bookkeeping, no row. The
+            // description is the projector's (message_updater.rs).
+            if text.as_deref().is_some_and(|text| !text.is_empty()) {
+                let keys: Vec<&str> = delta.keys().map(String::as_str).collect();
+                let description = format!("Instructions updated: {}", keys.join(", "));
+                store.push_row(Item::Notice(Notice::System {
+                    description: Some(Arc::from(description)),
+                }));
+            }
         }
         SessionEventData::CompactionStarted { .. } => {
             store.items.push(Item::Compaction(Box::new(CompactionItem {
@@ -923,6 +1163,7 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
                 item.tokens = *tokens;
                 item.version += 1;
             }
+            store.shown_error.show(None);
             store.touch(index);
         }
         SessionEventData::CompactionFailed { error, tokens, .. } => {
@@ -934,6 +1175,7 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
                 item.tokens = *tokens;
                 item.version += 1;
             }
+            store.shown_error.show(Some(ErrorInfo::from(error)));
             store.touch(index);
         }
         SessionEventData::Unknown { r#type, data } => {
@@ -948,8 +1190,6 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
     }
 }
 
-/// On run end the last assistant message becomes immutable: replayed deltas
-/// must not append afterwards.
 /// `MoneyUsd` is the wire's `Finite` (int or float); cost math needs f64.
 pub(crate) fn money_usd(value: &ox_schema::support::Finite) -> f64 {
     match value {
@@ -958,13 +1198,19 @@ pub(crate) fn money_usd(value: &ox_schema::support::Finite) -> f64 {
     }
 }
 
-fn finish_last_assistant(store: &mut DataStore, done_ms: i64) {
-    if let Some(index) = store
+fn last_assistant(store: &DataStore) -> Option<usize> {
+    store
         .items
         .iter()
         .rposition(|item| matches!(item, Item::Assistant(_)))
-    {
+}
+
+/// On run end the last assistant message becomes immutable: replayed deltas
+/// must not append afterwards, and no retry is pending any more.
+fn finish_last_assistant(store: &mut DataStore, done_ms: i64) {
+    if let Some(index) = last_assistant(store) {
         if let Item::Assistant(item) = &mut store.items[index] {
+            item.retry = None;
             item.done = true;
             item.turn_done_ms = Some(done_ms);
             if item.turn_started_ms.is_none() {
@@ -1073,7 +1319,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ChildRef, CompletionItem, CompletionSource, DataStore, Item, NoticeKind, ToolState, reduce,
+        ChildRef, CompletionItem, CompletionSource, DataStore, ErrorInfo, Item, ToolState, reduce,
     };
 
     fn env(kind: &str, data: serde_json::Value) -> EventEnvelope<serde_json::Value> {
@@ -1344,33 +1590,18 @@ mod tests {
     }
 
     #[test]
-    fn execution_failure_retry_and_step_failure_become_notices() {
+    fn step_failure_and_retry_live_on_the_assistant_and_a_new_error_is_an_item() {
         let mut store = DataStore::default();
-        apply(
-            &mut store,
-            "session.execution.failed",
-            json!({"sessionID":"ses_1","error":{"type":"provider","message":"rate limited"}}),
-        );
-        assert_eq!(store.notices.len(), 1);
-        assert_eq!(store.notices[0].kind, NoticeKind::Error);
-        assert_eq!(store.notices[0].text, "rate limited");
-
         apply(
             &mut store,
             "session.retry.scheduled",
             json!({"sessionID":"ses_1","assistantMessageID":"msg_1","attempt":2,"at":123,
                    "error":{"type":"provider","message":"timeout"}}),
         );
-        assert_eq!(store.notices[1].kind, NoticeKind::Retry);
-        assert!(
-            store.notices[1].text.contains("2"),
-            "{:?}",
-            store.notices[1].text
-        );
-        assert!(
-            store.notices[1].text.contains("timeout"),
-            "{:?}",
-            store.notices[1].text
+        let retry = assistant(&store).retry.clone().expect("retry recorded");
+        assert_eq!(
+            (retry.attempt, retry.at, &*retry.message),
+            (2, 123, "timeout")
         );
 
         apply(
@@ -1379,7 +1610,32 @@ mod tests {
             json!({"sessionID":"ses_1","assistantMessageID":"msg_1",
                    "error":{"type":"provider","message":"bad request"}}),
         );
-        assert_eq!(store.notices[2].text, "bad request");
+        let item = assistant(&store);
+        assert!(item.retry.is_none(), "a failed step ends the retry");
+        assert_eq!(
+            item.error.as_ref().map(|e| &*e.message),
+            Some("bad request")
+        );
+        assert_eq!(item.finish, Some(ox_schema::support::FinishReason::Error));
+
+        // The same error again is already on screen; a different one is not.
+        for message in ["bad request", "rate limited"] {
+            apply(
+                &mut store,
+                "session.execution.failed",
+                json!({"sessionID":"ses_1","error":{"type":"provider","message":message}}),
+            );
+        }
+        let errors: Vec<&ErrorInfo> = store
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Error(error) => Some(error),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(&*errors[0].message, "rate limited");
     }
 
     #[test]
@@ -2489,5 +2745,202 @@ mod tests {
         assert!(!store.apply_probe("ses_other", true));
         store.replace_items(Vec::new());
         assert!(!store.apply_probe("ses_c", true), "no longer referenced");
+    }
+
+    /// Drive one glob call through the live events: started, called with
+    /// `input`, then success (with `metadata` unless null) or failure.
+    fn live_glob_call(
+        input: serde_json::Value,
+        metadata: serde_json::Value,
+        outcome: &str,
+    ) -> super::ToolPart {
+        let mut store = DataStore::default();
+        let base = json!({"sessionID":"ses_1","assistantMessageID":"msg_1","id":"part_1"});
+        let with = |extra: serde_json::Value| {
+            let mut data = base.clone();
+            for (key, value) in extra.as_object().expect("extra is an object") {
+                data[key] = value.clone();
+            }
+            data
+        };
+        apply(
+            &mut store,
+            "session.tool.input.started",
+            with(json!({"name":"glob"})),
+        );
+        apply(
+            &mut store,
+            "session.tool.called",
+            with(json!({"input": input, "executed": true})),
+        );
+        if outcome == "success" {
+            apply(
+                &mut store,
+                "session.tool.success",
+                with(json!({"content":[{"type":"text","text":"a.rs"}],
+                            "metadata": metadata, "executed": true})),
+            );
+        } else {
+            apply(
+                &mut store,
+                "session.tool.failed",
+                with(json!({"error":{"type":"x","message":"boom"},
+                            "metadata": metadata, "executed": true})),
+            );
+        }
+        assistant(&store).tools[0].clone()
+    }
+
+    /// The same glob call as recorded in history.
+    fn history_glob_call(state: serde_json::Value) -> super::ToolPart {
+        let messages: Vec<ox_schema::message::Message> = serde_json::from_value(json!([
+            {"type":"assistant","id":"msg_1","time":{"created":1},"agent":"build",
+             "model":{"providerID":"p","id":"m"},
+             "content":[{"type":"tool","id":"part_1","name":"glob","state": state,
+                         "time":{"created":1}}]}
+        ]))
+        .unwrap();
+        let items = crate::history::parse_messages(&messages);
+        match &items[0] {
+            Item::Assistant(assistant) => assistant.tools[0].clone(),
+            other => panic!("expected assistant, got {other:?}"),
+        }
+    }
+
+    /// Error rows only, as `(type, message)`.
+    fn error_rows(items: &[Item]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Error(error) => Some((error.kind.to_string(), error.message.to_string())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_steer_between_step_error_and_run_failure_hides_the_repeat_in_both_paths() {
+        // Live: the step fails, the user steers, the run fails with the same error.
+        let mut store = DataStore::default();
+        apply(
+            &mut store,
+            "session.step.failed",
+            json!({"sessionID":"ses_1","assistantMessageID":"msg_1",
+                   "error":{"type":"provider","message":"bad request"}}),
+        );
+        store.push_user("try again");
+        apply(
+            &mut store,
+            "session.execution.failed",
+            json!({"sessionID":"ses_1","error":{"type":"provider","message":"bad request"}}),
+        );
+
+        let messages: Vec<ox_schema::message::Message> = serde_json::from_value(json!([
+            {"type":"assistant","id":"msg_1","time":{"created":1},"agent":"build",
+             "model":{"providerID":"p","id":"m"},"content":[],
+             "error":{"type":"provider","message":"bad request"}},
+            {"type":"user","id":"msg_u1","time":{"created":2},"text":"try again"},
+            {"type":"idle","id":"msg_i1","time":{"created":3},"outcome":"failed",
+             "error":{"type":"provider","message":"bad request"}}
+        ]))
+        .unwrap();
+        let history = crate::history::parse_messages(&messages);
+
+        assert_eq!(
+            error_rows(&store.items),
+            error_rows(&history),
+            "live and reload must agree"
+        );
+        assert!(
+            error_rows(&history).is_empty(),
+            "the step already shows it: {history:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_compaction_hides_only_an_identical_error() {
+        // Same message, different type: upstream compares both fields.
+        let mut store = DataStore::default();
+        apply(
+            &mut store,
+            "session.compaction.failed",
+            json!({"sessionID":"ses_1","reason":"auto",
+                   "error":{"type":"provider","message":"too long"}}),
+        );
+        apply(
+            &mut store,
+            "session.execution.failed",
+            json!({"sessionID":"ses_1","error":{"type":"unknown","message":"too long"}}),
+        );
+        assert_eq!(
+            error_rows(&store.items),
+            vec![("unknown".to_owned(), "too long".to_owned())]
+        );
+    }
+
+    #[test]
+    fn live_and_history_keep_the_same_input_and_metadata() {
+        let input = json!({"pattern":"**/*.rs"});
+        let metadata = json!({"count": 3, "truncated": false});
+        let live = live_glob_call(input.clone(), metadata.clone(), "success");
+        let history = history_glob_call(json!({
+            "status":"completed","input": input,
+            "content":[{"type":"text","text":"a.rs"}],"metadata": metadata
+        }));
+        assert_eq!(
+            live.input, history.input,
+            "input must not depend on the path"
+        );
+        assert_eq!(live.metadata, history.metadata, "metadata likewise");
+        assert_eq!(live.input.get("pattern"), Some(&json!("**/*.rs")));
+        let count = live.metadata.as_ref().and_then(|m| m.get("count"));
+        assert_eq!(count, Some(&json!(3)), "got {:?}", live.metadata);
+    }
+
+    #[test]
+    fn failed_calls_keep_metadata_in_both_paths() {
+        let input = json!({"pattern":"x"});
+        let metadata = json!({"count": 0});
+        let live = live_glob_call(input.clone(), metadata.clone(), "failed");
+        let history = history_glob_call(json!({
+            "status":"error","input": input,
+            "error":{"type":"x","message":"boom"},"metadata": metadata
+        }));
+        assert!(live.metadata.is_some(), "tool.failed carries metadata");
+        assert_eq!(live.metadata, history.metadata, "same metadata on reload");
+        assert_eq!(live.input, history.input, "same input on reload");
+    }
+
+    #[test]
+    fn metadata_is_none_when_the_result_had_none() {
+        let input = json!({"pattern":"x"});
+        let live = live_glob_call(input.clone(), json!(null), "success");
+        let history = history_glob_call(json!({
+            "status":"completed","input": input,
+            "content":[{"type":"text","text":"a.rs"}]
+        }));
+        assert!(live.metadata.is_none(), "got {:?}", live.metadata);
+        assert!(history.metadata.is_none(), "got {:?}", history.metadata);
+    }
+
+    #[test]
+    fn input_is_empty_without_tool_called() {
+        let mut store = DataStore::default();
+        apply(
+            &mut store,
+            "session.tool.input.started",
+            json!({"sessionID":"ses_1","assistantMessageID":"msg_1","id":"part_1","name":"read"}),
+        );
+        apply(
+            &mut store,
+            "session.tool.input.delta",
+            json!({"sessionID":"ses_1","assistantMessageID":"msg_1","id":"part_1",
+                   "delta":"{\"path\":\"a.txt\"}"}),
+        );
+        let part = &assistant(&store).tools[0];
+        assert!(part.input.is_empty(), "got {:?}", part.input);
+        assert!(part.metadata.is_none(), "got {:?}", part.metadata);
+        let history = history_glob_call(json!({"status":"streaming","input":"{\"pattern\":"}));
+        assert!(history.input.is_empty(), "got {:?}", history.input);
     }
 }

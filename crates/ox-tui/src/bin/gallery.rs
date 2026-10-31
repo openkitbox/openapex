@@ -15,7 +15,10 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, Terminal};
 
 use ox_client::rest::{McpRef, McpStatus};
-use ox_client::store::{CompletionSource, DataStore, Queued, ToolState};
+use ox_client::store::{
+    CompletionSource, DataStore, ErrorInfo, Notice, Queued, RetryInfo, Switch, ToolState,
+};
+use ox_schema::support::Record;
 use ox_tui::app::keymap;
 use ox_tui::theme::{Deck, Palette};
 use ox_tui::ui::dialog;
@@ -25,7 +28,7 @@ use ox_tui::ui::markdown;
 use ox_tui::ui::palette;
 use ox_tui::ui::prompt::{Activity, Chrome, Footer, McpSummary, Prompt, placeholder_line};
 use ox_tui::ui::session_dialog;
-use ox_tui::ui::timeline::{Block, Explored, Transcript, TurnFooter};
+use ox_tui::ui::timeline::{Block, Explored, ExploredCount, Transcript, TurnFooter};
 use ox_tui::ui::toast::{self, Toast, Variant};
 
 /// 一个用例：独立 TestBackend 终端画一帧，然后把 Buffer 打成 ANSI。
@@ -209,12 +212,58 @@ fn cases() -> Vec<Case> {
                 t.render(frame, area);
             }),
         },
+        // 各工具的单行文案（上游 InlineTool：Read/Grep/Glob/WebFetch/Skill/Generic）
+        transcript_case(
+            "tool-inline-texts",
+            14,
+            vec![
+                tool_with(
+                    "read",
+                    ToolState::Success,
+                    serde_json::json!({"path": "src/main.rs", "offset": 10, "limit": 20}),
+                    None,
+                ),
+                tool_with(
+                    "grep",
+                    ToolState::Success,
+                    serde_json::json!({"pattern": "fn main", "path": "crates"}),
+                    Some(serde_json::json!({"matches": 3})),
+                ),
+                tool_with(
+                    "glob",
+                    ToolState::Running,
+                    serde_json::json!({"pattern": "**/*.rs"}),
+                    None,
+                ),
+                tool_with(
+                    "webfetch",
+                    ToolState::Success,
+                    serde_json::json!({"url": "https://example.com/docs"}),
+                    None,
+                ),
+                tool_with(
+                    "skill",
+                    ToolState::Success,
+                    serde_json::json!({"id": "rust-expert"}),
+                    Some(serde_json::json!({"name": "rust-expert"})),
+                ),
+                tool_with(
+                    "lsp_symbols",
+                    ToolState::Success,
+                    serde_json::json!({"query": "Transcript", "limit": 5}),
+                    None,
+                ),
+            ],
+        ),
         // Explored 折叠行：已完成 / 进行中
         transcript_case(
             "explored-done",
             2,
             vec![Block::Explored(Explored {
-                reads: 1,
+                counts: vec![ExploredCount {
+                    noun: "read",
+                    count: 1,
+                }],
                 ..Explored::default()
             })],
         ),
@@ -222,18 +271,60 @@ fn cases() -> Vec<Case> {
             "explored-running",
             2,
             vec![Block::Explored(Explored {
-                reads: 2,
-                searches: 1,
+                counts: vec![
+                    ExploredCount {
+                        noun: "read",
+                        count: 2,
+                    },
+                    ExploredCount {
+                        noun: "search",
+                        count: 1,
+                    },
+                ],
                 running: true,
                 ..Explored::default()
             })],
         ),
-        // 通知行
+        // 会话级行：切换、通知、错误、排队压缩
         transcript_case(
-            "system-notice",
-            2,
-            vec![Block::system("retry 1 · provider overloaded")],
+            "session-rows",
+            10,
+            vec![
+                Block::Switch(Switch::Agent {
+                    agent: Arc::from("build"),
+                    previous: Some(Arc::from("plan")),
+                }),
+                Block::Switch(Switch::Location {
+                    directory: Arc::from("/work/next"),
+                }),
+                Block::Notice(Notice::System { description: None }),
+                Block::Error(ErrorInfo {
+                    kind: Arc::from("provider"),
+                    message: Arc::from("provider overloaded"),
+                }),
+                Block::CompactionQueued,
+            ],
         ),
+        // 重试行挂在助手消息页脚上方（上游 index.tsx:2022-2035）
+        transcript_case("session-retry", 7, {
+            let mut blocks = assistant("Working on it.", "", true);
+            if let Some(Block::Assistant {
+                footer: Some(footer),
+                ..
+            }) = blocks.last_mut()
+            {
+                footer.retry = Some(RetryInfo {
+                    attempt: 2,
+                    // Fires 5 s after the snapshot is drawn.
+                    at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+                        + 5_000,
+                    message: Arc::from("rate limited"),
+                });
+            }
+            blocks
+        }),
         // 完成通知行
         transcript_case(
             "completion-notices",
@@ -419,6 +510,7 @@ fn cases() -> Vec<Case> {
                             Pending,
                         ),
                     ]),
+                    output: Arc::default(),
                 },
             ]
         }),
@@ -428,6 +520,7 @@ fn cases() -> Vec<Case> {
                 version: 0,
                 state,
                 todos: Arc::default(),
+                output: Arc::new("todowrite: invalid status".into()),
             };
             vec![
                 row("t1", ToolState::Running),
@@ -682,6 +775,8 @@ fn assistant(text: &str, reasoning: &str, done: bool) -> Vec<Block> {
             model: Some("provider/model".into()),
             duration_ms: Some(4_200),
             tokens_per_second: Some(70.0),
+            error: None,
+            retry: None,
         }),
     });
     blocks
@@ -696,6 +791,35 @@ fn tool(tool: &str, summary: &str, state: ToolState, output: &str) -> Block {
         summary: summary.into(),
         output: Arc::new(output.to_owned()),
         background: false,
+        input: Arc::default(),
+        metadata: None,
+    }
+}
+
+/// A tool row carrying real input and result metadata, the way `tool_text`
+/// reads them; `input`/`metadata` must be JSON objects.
+fn tool_with(
+    tool: &str,
+    state: ToolState,
+    input: serde_json::Value,
+    metadata: Option<serde_json::Value>,
+) -> Block {
+    let record = |value: serde_json::Value| -> Arc<Record> {
+        let serde_json::Value::Object(map) = value else {
+            panic!("gallery tool input must be a JSON object, got {value}");
+        };
+        Arc::new(map.into_iter().collect())
+    };
+    Block::Tool {
+        id: format!("part_{tool}"),
+        version: 1,
+        tool: tool.into(),
+        state,
+        summary: String::new(),
+        output: Arc::default(),
+        background: false,
+        input: record(input),
+        metadata: metadata.map(record),
     }
 }
 

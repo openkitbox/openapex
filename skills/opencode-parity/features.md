@@ -14,6 +14,10 @@
 | behavior | completion-notice | routes/session/index.tsx:2090 | crates/ox-tui/src/pipeline.rs:58 | partial | `↳ Shell/Subagent finished · ...` 历史与实时两路都做了,子代理行可点击跳转。偏差:标题固定为 Subagent(ox 元数据无 agent 名);hover 只提亮标题 |
 | behavior | family-busy | context/session-tabs.tsx:170 | crates/ox-client/src/store.rs:365 | aligned | 自身回合或任一子会话在跑都算忙;Esc/Ctrl+C 仍只作用于当前会话 |
 | behavior | subagent-background-badge | routes/session/index.tsx:3289 | crates/ox-tui/src/ui/timeline.rs:1626 | aligned | 子会话运行时子代理工具行显示转圈和 Background |
+| behavior | inline-tool-row | routes/session/index.tsx:2789 | crates/ox-tui/src/ui/tool_row.rs:48 | partial | spinner/pending 文案/完成 muted/失败 error 色+点击展开错误已做;失败行无 hover;denied 删除线未移植;通用行未按宽度截断 |
+| behavior | tool-inline-texts | routes/session/index.tsx:3143 | crates/ox-tui/src/ui/tool_text.rs:93 | deviation | Read/Glob/Grep/WebFetch/Skill/Subagent/Question/Generic 文案已移植。偏差:Generic 键序按字母;子代理模型显示原始 provider/model,无 agent 名时为 General;展开体限 TOOL_OUTPUT_MAX_LINES |
+| behavior | explored-group | routes/session/group-view.tsx:115 | crates/ox-tui/src/pipeline.rs:1 | partial | 运行中 spinner `Exploring:`、按首次出现计数、展开子项用专用文案。偏差:无 completePrevious/partitionPending;子项不可点击 |
+| behavior | session-rows | routes/session/index.tsx:2022 | crates/ox-tui/src/ui/timeline.rs:1604 | partial | Error 挂在消息下;Retry 倒计时;agent/model/location 切换行;Instructions updated;Skill;Compaction queued;压缩 spinner。偏差见 store.rs/pipeline.rs 模块文档 |
 | dialog | dialog-agent | component/dialog-agent.tsx:1 |  | todo |  |
 | dialog | dialog-alert | ui/dialog-alert.tsx:1 |  | todo |  |
 | dialog | dialog-config | component/dialog-config.tsx:1 |  | todo |  |

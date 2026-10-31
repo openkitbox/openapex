@@ -1,6 +1,11 @@
 //! The compaction boundary: upstream `CompactionMessage`
 //! (`routes/session/index.tsx:2167`). A rule with the label centred in it,
-//! then the summary as markdown. Pure: item fields and width in, lines out.
+//! then the summary as markdown; and the `CompactionQueued` row (:2226) shown
+//! while a compaction waits in the inbox. Pure: item fields and width in,
+//! lines out.
+//!
+//! Deviation: the `Provider compaction` label (`native.messages`) is not
+//! ported; the wire item carries no `native` field.
 
 use ox_client::store::CompactionStatus;
 use ox_schema::support::TokenUsage;
@@ -17,6 +22,9 @@ pub struct View<'a> {
     pub text: &'a str,
     pub cancelled: bool,
     pub tokens: Option<&'a TokenUsage>,
+    /// The spinner glyph drawn while the compaction runs (the transcript's
+    /// 80ms frame).
+    pub spinner: char,
 }
 
 /// `Locale.number(input) in · Locale.number(output) out`; absent while the
@@ -43,11 +51,9 @@ pub fn lines(view: &View<'_>, width: u16) -> Vec<Line<'static>> {
     let failed = view.status == CompactionStatus::Failed && !view.cancelled;
     let ink: Style = if failed { palette.warn } else { palette.dim };
 
-    // Static `⋯` is upstream's no-animation spinner; the transcript has no
-    // frame clock to drive the animated one.
     let mut parts: Vec<String> = Vec::new();
     match view.status {
-        CompactionStatus::Running => parts.push("\u{22ef}".into()),
+        CompactionStatus::Running => parts.push(view.spinner.into()),
         CompactionStatus::Failed if !view.cancelled => parts.push("\u{2717}".into()),
         _ => {}
     }
@@ -59,17 +65,7 @@ pub fn lines(view: &View<'_>, width: u16) -> Vec<Line<'static>> {
         parts.push(format!("\u{b7} {usage}"));
     }
     let label = format!(" {} ", parts.join(" "));
-
-    // Two equal grow boxes share what the label leaves; yoga rounds the odd
-    // column onto the left rule.
-    let free = (width as usize).saturating_sub(label.width());
-    let left = free.div_ceil(2);
-    let right = free - left;
-    let mut lines = vec![Line::from(vec![
-        Span::styled("\u{2500}".repeat(left), ink),
-        Span::styled(label, ink),
-        Span::styled("\u{2500}".repeat(right), ink),
-    ])];
+    let mut lines = vec![rule(label, ink, ink, width)];
 
     let body = view.text.trim();
     if !body.is_empty() && !view.cancelled {
@@ -79,13 +75,39 @@ pub fn lines(view: &View<'_>, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
+/// Upstream `CompactionQueued`: `── ◇ Compaction queued ──`, the rules in the
+/// border colour and the label muted.
+#[must_use]
+pub fn queued_line(width: u16) -> Line<'static> {
+    let palette = theme::palette();
+    rule(
+        " \u{25c7} Compaction queued ".to_owned(),
+        palette.panel_border,
+        palette.dim,
+        width,
+    )
+}
+
+/// `label` centred in a full-width rule. Two equal grow boxes share what the
+/// label leaves; yoga rounds the odd column onto the left rule.
+fn rule(label: String, border: Style, ink: Style, width: u16) -> Line<'static> {
+    let free = (width as usize).saturating_sub(label.width());
+    let left = free.div_ceil(2);
+    let right = free - left;
+    Line::from(vec![
+        Span::styled("\u{2500}".repeat(left), border),
+        Span::styled(label, ink),
+        Span::styled("\u{2500}".repeat(right), border),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use ox_client::store::CompactionStatus;
     use ox_schema::support::{TokenCache, TokenUsage};
     use ratatui::text::Line;
 
-    use super::{View, lines};
+    use super::{View, lines, queued_line};
 
     fn tokens(input: i64, output: i64, read: i64, write: i64, reasoning: i64) -> TokenUsage {
         TokenUsage {
@@ -110,16 +132,31 @@ mod tests {
             text: body,
             cancelled: false,
             tokens: t,
+            spinner: '⠙',
         }
     }
 
     #[test]
-    fn running_shows_the_pending_glyph_and_no_usage() {
+    fn running_shows_the_spinner_frame_and_no_usage() {
         let t = tokens(100, 50, 0, 0, 0);
         let rows = text(&lines(&view(CompactionStatus::Running, "", Some(&t)), 40));
         assert_eq!(rows.len(), 1);
-        assert!(rows[0].contains(" ⋯ Compaction "), "{}", rows[0]);
+        assert!(rows[0].contains(" ⠙ Compaction "), "{}", rows[0]);
         assert!(!rows[0].contains(" in "), "{}", rows[0]);
+    }
+
+    #[test]
+    fn the_queued_row_is_a_centred_rule_in_the_border_colour() {
+        let palette = super::theme::palette();
+        let line = queued_line(30);
+        let rows = text(std::slice::from_ref(&line));
+        // " ◇ Compaction queued " is 21 wide; 9 free → 5 left, 4 right.
+        assert_eq!(
+            rows[0],
+            format!("{} ◇ Compaction queued {}", "─".repeat(5), "─".repeat(4))
+        );
+        assert_eq!(line.spans[0].style, palette.panel_border);
+        assert_eq!(line.spans[1].style, palette.dim);
     }
 
     #[test]
@@ -174,6 +211,7 @@ mod tests {
             text: "aborted by user",
             cancelled: true,
             tokens: None,
+            spinner: '⠋',
         };
         let out = lines(&v, 50);
         let rows = text(&out);

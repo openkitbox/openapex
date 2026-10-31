@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::time::Instant;
 
 use ratatui::Frame;
@@ -6,16 +7,22 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use ox_client::store::{CompactionStatus, CompletionSource, ToolState};
+use ox_client::store::{
+    CompactionStatus, CompletionSource, ErrorInfo, ModelChoice, Notice, RetryInfo, Switch,
+    ToolState,
+};
 use ox_client::todo::Todo;
-use ox_schema::support::TokenUsage;
+use ox_schema::support::{Record, TokenUsage};
 
 use crate::theme;
 
 use super::selection::{self, Behavior, ClickTracker, Outcome, Pos, Selection};
+use super::tool_row::{self, InlineSpec, RowView};
+use super::tool_text::{self, ToolText};
 
-/// Stats on the line closing a finished turn (upstream `AssistantFooter`,
-/// `routes/session/index.tsx:2000`).
+/// The rows closing a finished (or retrying) turn (upstream `AssistantFooter`,
+/// `routes/session/index.tsx:2000`): the step error, the retry countdown and
+/// the stats line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnFooter {
     /// Agent that produced the turn (`build`); shown title-cased.
@@ -26,11 +33,16 @@ pub struct TurnFooter {
     pub duration_ms: Option<i64>,
     /// Output tokens over provider-active time, across the turn's steps.
     pub tokens_per_second: Option<f64>,
+    /// Why the message's last step failed. `Step interrupted` is not shown as
+    /// an error; it marks the stats line ` · interrupted`.
+    pub error: Option<ErrorInfo>,
+    /// A scheduled retry; its countdown is derived from `at` when drawn.
+    pub retry: Option<RetryInfo>,
 }
 
 /// One tool call folded into an `Explored` group; what the expanded row lists
 /// (upstream `group-view.tsx:129-157`, `children("tool")`). Fields mirror
-/// `Block::Tool`.
+/// `Block::Tool`; `input`/`metadata` are shared with the `ToolPart`.
 #[derive(Debug, Clone)]
 pub struct ExploredCall {
     pub id: String,
@@ -38,16 +50,24 @@ pub struct ExploredCall {
     pub version: u64,
     pub tool: String,
     pub state: ToolState,
-    pub summary: String,
+    pub input: std::sync::Arc<Record>,
+    pub metadata: Option<std::sync::Arc<Record>>,
+}
+
+/// One `2 reads` entry of an Explored header: the singular noun upstream
+/// counts under (`read`, `search`, `fetch`) and how many calls had it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExploredCount {
+    pub noun: &'static str,
+    pub count: u32,
 }
 
 /// Counts behind one `Explored: 1 read` row (upstream `group-view.tsx`) and
 /// the calls they were counted from.
 #[derive(Debug, Clone, Default)]
 pub struct Explored {
-    pub reads: u32,
-    pub searches: u32,
-    pub fetches: u32,
+    /// Per-noun counts in order of first appearance in the group.
+    pub counts: Vec<ExploredCount>,
     /// Some grouped tool has not finished: `Exploring:` instead of `Explored:`.
     pub running: bool,
     /// Id of the group's first call: the key of its expansion state, stable
@@ -60,9 +80,7 @@ pub struct Explored {
 /// `(id, version)`; never summary text.
 impl PartialEq for Explored {
     fn eq(&self, other: &Self) -> bool {
-        self.reads == other.reads
-            && self.searches == other.searches
-            && self.fetches == other.fetches
+        self.counts == other.counts
             && self.running == other.running
             && self.group_id == other.group_id
             && self.calls.len() == other.calls.len()
@@ -105,9 +123,15 @@ pub enum Block {
         text: std::sync::Arc<String>,
         footer: Option<TurnFooter>,
     },
-    System {
-        text: std::sync::Arc<str>,
-    },
+    /// An agent / model / location change (upstream `SessionSwitchMessageV2`).
+    Switch(Switch),
+    /// A system notice or a loaded skill (upstream `SessionNoticeMessageV2`,
+    /// `SessionSkillMessage`).
+    Notice(Notice),
+    /// A run failure no step or compaction already shows: `Error: message`.
+    Error(ErrorInfo),
+    /// A compaction waiting in the inbox (upstream `CompactionQueued`).
+    CompactionQueued,
     /// Consecutive read/search/fetch tool calls, folded into one row.
     Explored(Explored),
     /// One inline tool call row (and its collapsed output).
@@ -123,6 +147,11 @@ pub enum Block {
         /// the part, so a child starting or ending does not bump `version`:
         /// equality compares it too.
         background: bool,
+        /// The parsed call input, shared with the `ToolPart` (per-tool
+        /// texts read their fields from it).
+        input: std::sync::Arc<Record>,
+        /// The result metadata, shared with the `ToolPart`.
+        metadata: Option<std::sync::Arc<Record>>,
     },
     /// A `todowrite` call: the `# Todos` panel once it completed with a
     /// non-empty list, an inline row otherwise (upstream `TodoWrite`).
@@ -132,6 +161,8 @@ pub enum Block {
         version: u64,
         state: ToolState,
         todos: std::sync::Arc<Vec<Todo>>,
+        /// The failure message of a failed call, shared with the `ToolPart`.
+        output: std::sync::Arc<String>,
     },
     /// A context-compaction boundary rule with its summary below.
     Compaction {
@@ -178,11 +209,6 @@ impl Block {
             ms: None,
         }
     }
-    pub fn system(text: &str) -> Self {
-        Block::System {
-            text: std::sync::Arc::from(text),
-        }
-    }
 }
 
 /// O(1) identity comparison: text is shared via `Arc`, store-backed blocks
@@ -220,7 +246,13 @@ impl PartialEq for Block {
                     ..
                 },
             ) => aid == bid && aversion == bversion && afooter == bfooter,
-            (Block::System { text: a }, Block::System { text: b }) => std::sync::Arc::ptr_eq(a, b),
+            // Short `Arc<str>` fields; immutable once built.
+            (Block::Switch(a), Block::Switch(b)) => a == b,
+            (Block::Notice(a), Block::Notice(b)) => a == b,
+            (Block::Error(a), Block::Error(b)) => {
+                std::sync::Arc::ptr_eq(&a.message, &b.message) || a == b
+            }
+            (Block::CompactionQueued, Block::CompactionQueued) => true,
             (Block::Explored(a), Block::Explored(b)) => a == b,
             (
                 Block::Tool {
@@ -286,8 +318,12 @@ struct ViewState {
     /// The pointer is over this Explored title, Reasoning header, User block
     /// or the title row of a Completion notice that links to a child session.
     hovered: bool,
-    /// Reasoning blocks still streaming: the header spinner frame.
+    /// The spinner frame of a block that spins (see `spins`).
     spin: usize,
+    /// Assistant blocks with a scheduled retry: whole seconds until it fires,
+    /// from the transcript's wall clock. Part of the view so a tick rebuilds
+    /// the block only when the displayed second changes.
+    retry_secs: Option<i64>,
 }
 
 struct Entry {
@@ -351,6 +387,9 @@ pub struct Transcript {
     /// Header spinner of a streaming reasoning block.
     spin_frame: usize,
     spin_epoch: std::time::Instant,
+    /// Wall clock (Unix ms) retry countdowns are derived from; refreshed on
+    /// `sync` and `tick`.
+    wall_ms: i64,
     /// Where the last `render` drew the transcript; the click target map.
     last_area: Rect,
 }
@@ -384,6 +423,7 @@ impl Transcript {
             focused_tool: None,
             spin_frame: 0,
             spin_epoch: std::time::Instant::now(),
+            wall_ms: wall_ms_now(),
             last_area: Rect::default(),
         }
     }
@@ -434,7 +474,10 @@ impl Transcript {
     /// A left click at screen cell (`x`, `y`): on a reasoning header it opens
     /// or closes the body (upstream `ReasoningPart` `onMouseUp`); on an
     /// Explored title it lists or hides the group's calls (upstream
-    /// `group-view.tsx:267-284`). Returns whether anything changed.
+    /// `group-view.tsx:267-284`); on a failed tool or todo row it shows or
+    /// hides the error (upstream `InlineTool` `setErrorExpanded`); on a
+    /// generic tool row it lists or hides the input and output (upstream
+    /// `GenericTool` `onClick`). Returns whether anything changed.
     pub fn click(&mut self, x: u16, y: u16) -> bool {
         // Row 0 is the block's blank margin; row 1 is the header.
         let Some((index, 1)) = self.locate(x, y) else {
@@ -449,11 +492,24 @@ impl Transcript {
                 }
                 self.rebuild(index);
             }
+            block @ (Block::Tool { .. } | Block::Todo { .. }) => {
+                if !clickable(block) {
+                    return false;
+                }
+                let Some(id) = entry_tool_id(block).map(str::to_owned) else {
+                    return false;
+                };
+                if !self.tool_expanded.remove(&id) {
+                    self.tool_expanded.insert(id);
+                }
+                self.rebuild(index);
+            }
             Block::User { .. }
             | Block::Assistant { .. }
-            | Block::System { .. }
-            | Block::Tool { .. }
-            | Block::Todo { .. }
+            | Block::Switch(_)
+            | Block::Notice(_)
+            | Block::Error(_)
+            | Block::CompactionQueued
             | Block::Compaction { .. }
             | Block::Completion { .. } => return false,
         }
@@ -485,7 +541,10 @@ impl Transcript {
             Block::User { .. } => Some(index),
             Block::Completion { child_id, .. } => (row == 1 && child_id.is_some()).then_some(index),
             Block::Assistant { .. }
-            | Block::System { .. }
+            | Block::Switch(_)
+            | Block::Notice(_)
+            | Block::Error(_)
+            | Block::CompactionQueued
             | Block::Tool { .. }
             | Block::Todo { .. }
             | Block::Compaction { .. } => None,
@@ -649,33 +708,43 @@ impl Transcript {
             .sum()
     }
 
-    /// Advance the header spinner of streaming reasoning blocks and of
-    /// background subagent rows. `true` when a visible frame changed and a
-    /// repaint is due.
+    /// Advance the spinner of streaming reasoning blocks, running tool and
+    /// todo rows, running Explored groups, and background subagent rows. Only those blocks are
+    /// rebuilt. `true` when a visible frame changed and a repaint is due.
     pub fn tick(&mut self, now: std::time::Instant) -> bool {
+        self.tick_at(now, wall_ms_now())
+    }
+
+    /// `tick` with the wall clock given: also re-renders retry countdowns
+    /// whose displayed second changed (upstream `AssistantRetry` 1s timer).
+    fn tick_at(&mut self, now: std::time::Instant, wall_ms: i64) -> bool {
+        self.wall_ms = wall_ms;
+        // Index loop: no per-tick allocation, and nothing to do when no
+        // entry is retrying.
+        let mut counted = false;
+        for index in 0..self.entries.len() {
+            let entry = &self.entries[index];
+            if entry.view.retry_secs.is_some()
+                && self.view_of(index, &entry.block).retry_secs != entry.view.retry_secs
+            {
+                self.rebuild(index);
+                counted = true;
+            }
+        }
         let streaming: Vec<usize> = self
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| {
-                matches!(
-                    entry.block,
-                    Block::Reasoning { done: false, .. }
-                        | Block::Tool {
-                            background: true,
-                            ..
-                        }
-                )
-            })
+            .filter(|(_, entry)| spins(&entry.block))
             .map(|(index, _)| index)
             .collect();
         if streaming.is_empty() {
-            return false;
+            return counted;
         }
         let elapsed = now.saturating_duration_since(self.spin_epoch).as_millis();
         let frame = (elapsed / SPINNER_INTERVAL_MS) as usize % SPINNER_FRAMES.len();
         if frame == self.spin_frame {
-            return false;
+            return counted;
         }
         self.spin_frame = frame;
         for index in streaming {
@@ -691,7 +760,7 @@ impl Transcript {
         self.entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| entry_tool_output(&entry.block).is_some())
+            .filter(|(_, entry)| tool_expandable(&entry.block))
             .map(|(index, _)| index)
             .collect()
     }
@@ -755,26 +824,28 @@ impl Transcript {
     fn view_of(&self, index: usize, block: &Block) -> ViewState {
         let hovered = self.hovered == Some(index);
         match block {
-            Block::Reasoning { id, done, .. } => ViewState {
+            Block::Reasoning { id, .. } => ViewState {
                 reasoning_expanded: self.expanded.contains(id),
                 hovered,
-                spin: if *done { 0 } else { self.spin_frame },
+                spin: if spins(block) { self.spin_frame } else { 0 },
                 ..Default::default()
             },
-            Block::Tool {
-                id,
-                output,
-                background,
-                ..
-            } => ViewState {
+            Block::Tool { id, .. } => ViewState {
+                tool_expanded: tool_expandable(block) && self.tool_expanded.contains(id),
+                tool_focused: self.focused_tool.as_deref() == Some(id.as_str()),
+                spin: if spins(block) { self.spin_frame } else { 0 },
+                ..Default::default()
+            },
+            Block::Todo { id, output, .. } => ViewState {
                 tool_expanded: !output.is_empty() && self.tool_expanded.contains(id),
                 tool_focused: self.focused_tool.as_deref() == Some(id.as_str()),
-                spin: if *background { self.spin_frame } else { 0 },
+                spin: if spins(block) { self.spin_frame } else { 0 },
                 ..Default::default()
             },
             Block::Explored(explored) => ViewState {
                 explored_expanded: self.explored_expanded.contains(&explored.group_id),
                 hovered,
+                spin: if spins(block) { self.spin_frame } else { 0 },
                 ..Default::default()
             },
             Block::User { .. } => ViewState {
@@ -785,10 +856,20 @@ impl Transcript {
                 hovered,
                 ..Default::default()
             },
-            Block::Assistant { .. }
-            | Block::System { .. }
-            | Block::Todo { .. }
-            | Block::Compaction { .. } => ViewState::default(),
+            Block::Assistant { footer, .. } => ViewState {
+                retry_secs: footer
+                    .as_ref()
+                    .and_then(|footer| footer.retry.as_ref())
+                    .map(|retry| retry_secs(retry.at, self.wall_ms)),
+                ..Default::default()
+            },
+            Block::Compaction { .. } => ViewState {
+                spin: if spins(block) { self.spin_frame } else { 0 },
+                ..Default::default()
+            },
+            Block::Switch(_) | Block::Notice(_) | Block::Error(_) | Block::CompactionQueued => {
+                ViewState::default()
+            }
         }
     }
 
@@ -821,6 +902,7 @@ impl Transcript {
     /// compared. Changed blocks get a new generation; unchanged keep both cache
     /// and generation.
     pub fn sync(&mut self, blocks: &[Block], changed_from: usize) {
+        self.wall_ms = wall_ms_now();
         let start = changed_from.min(self.entries.len()).min(blocks.len());
 
         let end = self.entries.len().min(blocks.len());
@@ -1141,7 +1223,10 @@ fn text_rows(block: &Block) -> (usize, usize) {
         Block::User { .. } => (2, 1),
         Block::Reasoning { .. }
         | Block::Assistant { .. }
-        | Block::System { .. }
+        | Block::Switch(_)
+        | Block::Notice(_)
+        | Block::Error(_)
+        | Block::CompactionQueued
         | Block::Explored(_)
         | Block::Tool { .. }
         | Block::Todo { .. }
@@ -1221,20 +1306,32 @@ fn render_block(block: &Block, width: u16, view: ViewState) -> Vec<Line<'static>
     let body = match block {
         Block::User { text } => user_block(text, view, width),
         Block::Reasoning { text, done, ms, .. } => reasoning_block(text, *done, *ms, view, width),
-        Block::Assistant { text, footer, .. } => assistant_block(text, footer.as_ref(), width),
-        Block::System { text } => indent_wrapped(&format!("⤷ {text}"), width, 3)
-            .into_iter()
-            .map(|line| line.style(palette.dim))
-            .collect(),
-        Block::Explored(explored) => explored_block(explored, view),
+        Block::Assistant { text, footer, .. } => {
+            assistant_block(text, footer.as_ref(), view.retry_secs, width)
+        }
+        Block::Switch(switch) => vec![switch_line(switch, width)],
+        Block::Notice(notice) => notice_lines(notice, width),
+        Block::Error(error) => error_lines(&error.message, width),
+        Block::CompactionQueued => vec![super::compaction::queued_line(width)],
+        Block::Explored(explored) => explored_block(explored, view, width),
         Block::Tool {
             tool,
             state,
             summary,
             output,
+            input,
+            metadata,
             ..
-        } => tool_block(block, tool, *state, summary, output, view, width),
-        Block::Todo { state, todos, .. } => todo_block(*state, todos, width),
+        } => match tool_text::text(tool, input, metadata.as_deref(), *state, tool_text::paths()) {
+            Some(text) => text_tool_block(block, &text, input, output, view, width),
+            None => tool_block(block, tool, *state, summary, output, view, width),
+        },
+        Block::Todo {
+            state,
+            todos,
+            output,
+            ..
+        } => todo_block(*state, todos, output, view, width),
         Block::Compaction {
             status,
             text,
@@ -1247,6 +1344,7 @@ fn render_block(block: &Block, width: u16, view: ViewState) -> Vec<Line<'static>
                 text,
                 cancelled: *cancelled,
                 tokens: tokens.as_ref(),
+                spinner: SPINNER_FRAMES[view.spin % SPINNER_FRAMES.len()],
             },
             width,
         ),
@@ -1273,7 +1371,7 @@ fn render_block(block: &Block, width: u16, view: ViewState) -> Vec<Line<'static>
     lines
 }
 
-/// Columns the notice row is indented, like `Block::System`.
+/// Columns every session-level row is indented (`paddingLeft={3}`).
 const COMPLETION_INDENT: usize = 3;
 
 /// One completion notice row: `   ↳ Shell finished · description`.
@@ -1477,15 +1575,188 @@ fn reasoning_block(
 }
 
 /// The answer text, then the turn footer (own blank row above it).
-fn assistant_block(text: &str, footer: Option<&TurnFooter>, width: u16) -> Vec<Line<'static>> {
+fn assistant_block(
+    text: &str,
+    footer: Option<&TurnFooter>,
+    retry_secs: Option<i64>,
+    width: u16,
+) -> Vec<Line<'static>> {
     let mut lines = super::markdown::render(text.trim(), width, 3);
     if let Some(footer) = footer {
         if !lines.is_empty() {
             lines.push(Line::default());
         }
-        lines.push(footer_line(footer, width));
+        lines.extend(footer_lines(footer, retry_secs, width));
     }
     lines
+}
+
+/// The step error the engine records for a cancelled step (upstream
+/// `AssistantFooter` `interrupted`).
+const STEP_INTERRUPTED: &str = "Step interrupted";
+
+/// Upstream `AssistantFooter` (`routes/session/index.tsx:2022-2058`): the
+/// error (unless interrupted or retrying), the retry countdown
+/// (`AssistantRetry`, :2528), a blank row when either showed, then the stats
+/// line. `retry_secs` is the countdown `Transcript` derived from the wall clock.
+fn footer_lines(footer: &TurnFooter, retry_secs: Option<i64>, width: u16) -> Vec<Line<'static>> {
+    let palette = theme::palette();
+    let interrupted = footer
+        .error
+        .as_ref()
+        .is_some_and(|error| &*error.message == STEP_INTERRUPTED);
+    let mut lines = Vec::new();
+    if let Some(error) = footer.error.as_ref()
+        && !interrupted
+        && footer.retry.is_none()
+    {
+        lines.extend(error_lines(&error.message, width));
+    }
+    if let Some(retry) = &footer.retry {
+        let seconds = retry_secs.unwrap_or(0);
+        let when = if seconds > 0 {
+            format!("Retrying in {seconds}s")
+        } else {
+            "Retry due".to_owned()
+        };
+        let text = format!(
+            "\u{26a0} {when} \u{b7} attempt {} \u{b7} {}",
+            retry.attempt, retry.message
+        );
+        lines.extend(
+            indent_wrapped(&text, width, COMPLETION_INDENT)
+                .into_iter()
+                .map(|line| line.style(palette.warning)),
+        );
+    }
+    if footer.retry.is_some() || (footer.error.is_some() && !interrupted) {
+        lines.push(Line::default());
+    }
+    let mut stats = footer_line(footer, width);
+    if interrupted {
+        stats
+            .spans
+            .push(Span::styled(" \u{b7} interrupted", palette.dim));
+    }
+    lines.push(stats);
+    lines
+}
+
+/// `Error: message` in the error colour, indented three columns (upstream
+/// `AssistantFooter` fallback and the session-level error row).
+fn error_lines(message: &str, width: u16) -> Vec<Line<'static>> {
+    let palette = theme::palette();
+    indent_wrapped(&format!("Error: {message}"), width, COMPLETION_INDENT)
+        .into_iter()
+        .map(|line| line.style(palette.warn))
+        .collect()
+}
+
+/// Upstream `AssistantRetry`: `max(0, ceil((at − now) / 1000))`.
+fn retry_secs(at: i64, now_ms: i64) -> i64 {
+    let left = at.saturating_sub(now_ms);
+    if left <= 0 {
+        0
+    } else {
+        left.saturating_add(999) / 1000
+    }
+}
+
+/// Milliseconds since the Unix epoch; 0 if the clock is before it.
+fn wall_ms_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| {
+            i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+        })
+}
+
+/// Upstream `SessionSwitchMessageV2` (`routes/session/index.tsx:2060-2088`).
+fn switch_line(switch: &Switch, width: u16) -> Line<'static> {
+    let palette = theme::palette();
+    let pad = " ".repeat(COMPLETION_INDENT);
+    let text = match switch {
+        Switch::Location { directory } => {
+            return Line::from(vec![
+                Span::raw(pad),
+                Span::styled("\u{21b3} Moved to ", palette.dim),
+                Span::styled(directory.to_string(), palette.info),
+            ]);
+        }
+        Switch::Agent { agent, previous } => match previous {
+            Some(previous) if previous != agent => format!(
+                "Switched agent from {} to {}",
+                titlecase(previous),
+                titlecase(agent)
+            ),
+            _ => format!("Switched agent to {}", titlecase(agent)),
+        },
+        Switch::Model { model, previous } => switch_label(model, previous.as_ref()),
+    };
+    let line = indent_wrapped(&text, width, COMPLETION_INDENT)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    line.style(palette.dim)
+}
+
+/// Upstream `switchLabel` (`util/model.ts:10`) without the catalogue's
+/// display names: the same provider and id is a variant switch, anything else
+/// names the model by `formatRef` (`provider/id[/variant]`).
+fn switch_label(model: &ModelChoice, previous: Option<&ModelChoice>) -> String {
+    if let Some(previous) = previous
+        && previous.provider_id == model.provider_id
+        && previous.id == model.id
+    {
+        return format!(
+            "Switched variant to {}",
+            model.variant.as_deref().unwrap_or("default")
+        );
+    }
+    match &model.variant {
+        Some(variant) => format!(
+            "Switched model to {}/{}/{variant}",
+            model.provider_id, model.id
+        ),
+        None => format!("Switched model to {}/{}", model.provider_id, model.id),
+    }
+}
+
+/// Upstream `SessionNoticeMessageV2` (`◈ description`, default
+/// `Instructions updated`) and `SessionSkillMessage` (`→ Skill name`): muted
+/// complete inline tool rows.
+fn notice_lines(notice: &Notice, width: u16) -> Vec<Line<'static>> {
+    let (icon, pending, text) = match notice {
+        Notice::System { description } => (
+            "\u{25c8}",
+            "Notice",
+            Cow::Borrowed(description.as_deref().unwrap_or("Instructions updated")),
+        ),
+        Notice::Skill { name } => ("\u{2192}", "Skill", Cow::Owned(format!("Skill {name}"))),
+    };
+    let spec = InlineSpec {
+        icon,
+        pending,
+        complete: Some(&text),
+        error: None,
+    };
+    let view = RowView {
+        state: ToolState::Success,
+        spinner: SPINNER_FRAMES[0],
+        hovered: false,
+        error_expanded: false,
+    };
+    tool_row::lines(&spec, view, width)
+}
+
+/// Upstream `StatusBadge raised` (`routes/session/index.tsx:2860`): the
+/// label padded by one space each side, muted on the raised background.
+fn push_background_badge(header: &mut Line<'static>) {
+    let palette = theme::palette();
+    let mut badge = palette.dim;
+    badge.bg = palette.panel.bg;
+    header.spans.push(Span::raw(" "));
+    header.spans.push(Span::styled(" Background ", badge));
 }
 
 /// Upstream `AssistantFooter` (`routes/session/index.tsx:2000`): the agent in
@@ -1494,7 +1765,12 @@ fn assistant_block(text: &str, footer: Option<&TurnFooter>, width: u16) -> Vec<L
 /// of the terminal's, which only matters at the 28/36 boundaries.
 fn footer_line(footer: &TurnFooter, width: u16) -> Line<'static> {
     let palette = theme::palette();
-    let mut agent_style = palette.agent;
+    // A failed message's agent is muted (`AssistantFooter`).
+    let mut agent_style = if footer.error.is_some() {
+        palette.dim
+    } else {
+        palette.agent
+    };
     agent_style.bg = None;
     let mut spans = vec![Span::raw("   ")];
     if let Some(agent) = &footer.agent {
@@ -1522,43 +1798,53 @@ fn footer_line(footer: &TurnFooter, width: u16) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The title row, then (expanded) one tool header row per grouped call —
-/// plain inline tool rows, without their output (`group-view.tsx:129-157`).
-fn explored_block(explored: &Explored, view: ViewState) -> Vec<Line<'static>> {
-    let mut lines = vec![explored_line(explored, view.hovered)];
+/// The title row, then (expanded) one inline tool row per grouped call, each
+/// with its per-tool text (`group-view.tsx:129-157`, `children("tool")`).
+fn explored_block(explored: &Explored, view: ViewState, width: u16) -> Vec<Line<'static>> {
+    let mut lines = vec![explored_line(explored, view)];
     if view.explored_expanded {
-        lines.extend(
-            explored
-                .calls
-                .iter()
-                .map(|call| tool_header(&call.tool, call.state, &call.summary, false, None)),
-        );
+        for call in &explored.calls {
+            let Some(text) = tool_text::text(
+                &call.tool,
+                &call.input,
+                call.metadata.as_deref(),
+                call.state,
+                tool_text::paths(),
+            ) else {
+                continue;
+            };
+            lines.extend(text_row(&text, call.state, false, None, view, width));
+            lines.extend(loaded_lines(&text));
+        }
     }
     lines
 }
 
-/// Upstream `group-view.tsx`: `→ Explored: 2 reads, 1 search`, or
-/// `✱ Exploring: …` while a grouped call is still running.
-fn explored_line(explored: &Explored, hovered: bool) -> Line<'static> {
+/// Upstream `group-view.tsx:120-151`: `→ Explored: 2 reads, 1 search` once
+/// every call finished, otherwise the spinner and `Exploring: …`.
+fn explored_line(explored: &Explored, view: ViewState) -> Line<'static> {
     let palette = theme::palette();
-    let mut parts = Vec::new();
-    for (count, one, many) in [
-        (explored.reads, "read", "reads"),
-        (explored.searches, "search", "searches"),
-        (explored.fetches, "fetch", "fetches"),
-    ] {
-        if count > 0 {
-            parts.push(format!("{count} {}", if count == 1 { one } else { many }));
-        }
+    let mut parts = Vec::with_capacity(explored.counts.len());
+    for entry in &explored.counts {
+        let ExploredCount { noun, count } = *entry;
+        let suffix = match (count, noun) {
+            (1, _) => "",
+            (_, "search" | "fetch") => "es",
+            _ => "s",
+        };
+        parts.push(format!("{count} {noun}{suffix}"));
     }
     let (icon, label) = if explored.running {
-        ("\u{2731}", "Exploring:")
+        (
+            SPINNER_FRAMES[view.spin % SPINNER_FRAMES.len()],
+            "Exploring:",
+        )
     } else {
-        ("\u{2192}", "Explored:")
+        ('\u{2192}', "Explored:")
     };
     Line::from(Span::styled(
         format!("   {icon} {label} {}", parts.join(", ")),
-        explored_title_style(palette, hovered),
+        explored_title_style(palette, view.hovered),
     ))
 }
 
@@ -1567,36 +1853,37 @@ fn explored_title_style(palette: &theme::Palette, hovered: bool) -> ratatui::sty
     if hovered { palette.text } else { palette.dim }
 }
 
-/// The head line of an inline tool row: paddingLeft 3, a two-column icon, then
-/// `tool summary`; bold when focused. Shared by `tool_block` and the expanded
-/// Explored group.
-fn tool_header(
-    tool: &str,
-    state: ToolState,
-    summary: &str,
-    focused: bool,
-    spinner: Option<char>,
-) -> Line<'static> {
-    let palette = theme::palette();
-    let (icon, style) = match (spinner, state) {
-        (Some(frame), _) => (frame.to_string(), palette.accent),
-        (None, ToolState::Input | ToolState::Running | ToolState::Progress) => {
-            ("~".to_owned(), palette.accent)
-        }
-        (None, ToolState::Success) => ("\u{2699}".to_owned(), palette.dim),
-        (None, ToolState::Failed) => ("\u{2717}".to_owned(), palette.warn),
-    };
-    let mut label = String::from(tool);
-    if !summary.is_empty() {
-        label.push(' ');
-        label.push_str(summary);
-    }
-    let style = if focused {
-        style.add_modifier(Modifier::BOLD)
+/// The head line of a legacy inline tool row (tools without `tool_text`
+/// texts), drawn by `tool_row`: the label
+/// is `tool summary` both while running and once done; `⚙` on success, `✗`
+/// on failure; bold when focused.
+fn tool_header(tool: &str, summary: &str, row: RowView, focused: bool) -> Line<'static> {
+    let label = if summary.is_empty() {
+        Cow::Borrowed(tool)
     } else {
-        style
+        Cow::Owned(format!("{tool} {summary}"))
     };
-    Line::from(Span::styled(format!("   {icon} {label}"), style))
+    let icon = if matches!(row.state, ToolState::Failed) {
+        "\u{2717}"
+    } else {
+        "\u{2699}"
+    };
+    let spec = InlineSpec {
+        icon,
+        pending: &label,
+        complete: Some(&label),
+        error: None,
+    };
+    // The header alone: the output body below stays `tool_block`'s, so the
+    // row is not cut here (the paragraph clips at the edge as before).
+    let mut header = tool_row::lines(&spec, row, u16::MAX)
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    if focused {
+        header = header.patch_style(Modifier::BOLD);
+    }
+    header
 }
 
 /// Upstream `InlineToolRow` (`message-parts.tsx:202`): the header, then output
@@ -1619,15 +1906,24 @@ fn tool_block(
             ..
         }
     );
-    let expandable = entry_tool_output(block).is_some();
+    let expandable = tool_expandable(block);
     let focused = view.tool_focused && expandable;
     // Upstream `Subagent` row (`routes/session/index.tsx:3289`): while the
     // child runs the call itself is already done, so the spinner replaces the
     // icon and a dim `Background` badge follows the label.
-    let spinner = background.then(|| SPINNER_FRAMES[view.spin % SPINNER_FRAMES.len()]);
-    let mut header = tool_header(tool, state, summary, focused, spinner);
+    let row = RowView {
+        state: if background {
+            ToolState::Running
+        } else {
+            state
+        },
+        spinner: SPINNER_FRAMES[view.spin % SPINNER_FRAMES.len()],
+        hovered: false,
+        error_expanded: false,
+    };
+    let mut header = tool_header(tool, summary, row, focused);
     if background {
-        header.spans.push(Span::styled(" Background", palette.dim));
+        push_background_badge(&mut header);
     }
     let mut lines = vec![header];
     let failed = matches!(state, ToolState::Failed);
@@ -1655,42 +1951,251 @@ fn tool_block(
     lines
 }
 
-/// Upstream `TodoWrite`: the panel when the call completed with todos, else
-/// an `InlineTool` row (`Updating todos…` / `Todo update failed` /
-/// `Cleared todos`).
-fn todo_block(state: ToolState, todos: &[Todo], width: u16) -> Vec<Line<'static>> {
-    let palette = theme::palette();
-    let (icon, label, style) = match state {
-        ToolState::Success if !todos.is_empty() => return super::todo::lines(todos, width),
-        ToolState::Input | ToolState::Running | ToolState::Progress => {
-            ("~", "Updating todos\u{2026}", palette.accent)
-        }
-        ToolState::Success => ("\u{2699}", "Cleared todos", palette.dim),
-        ToolState::Failed => ("\u{2717}", "Todo update failed", palette.warn),
+/// An inline tool row with per-tool texts (`tool_text`), drawn by
+/// `tool_row`: Read's `↳ Loaded` rows below it, the error of a failed row
+/// once opened, and a generic row's `key: value` list once expanded
+/// (upstream `GenericTool`, `index.tsx:2741-2767`). Bold when focused.
+///
+/// Deviation: an expanded generic body keeps at most
+/// [`TOOL_OUTPUT_MAX_LINES`] rows, like a shell row, where upstream lists
+/// everything.
+fn text_tool_block(
+    block: &Block,
+    text: &ToolText<'_>,
+    input: &Record,
+    output: &str,
+    view: ViewState,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let Block::Tool {
+        state, background, ..
+    } = block
+    else {
+        return Vec::new();
     };
-    vec![Line::from(Span::styled(
-        format!("   {icon} {label}"),
-        style,
-    ))]
+    let state = *state;
+    let failed = matches!(state, ToolState::Failed);
+    let error = (failed && !output.is_empty()).then_some(output);
+    let mut lines = text_row(text, state, *background, error, view, width);
+    if let Some(header) = lines.first_mut() {
+        if *background {
+            push_background_badge(header);
+        }
+        if view.tool_focused && tool_expandable(block) {
+            *header = std::mem::take(header).patch_style(Modifier::BOLD);
+        }
+    }
+    lines.extend(loaded_lines(text));
+    if text.generic && view.tool_expanded && !failed {
+        let rows = tool_text::generic_details(input, output);
+        lines.extend(detail_lines(&rows, width));
+    }
+    lines
+}
+
+/// One `tool_text` row drawn by `tool_row` (upstream `InlineToolRow`): a
+/// spinner row shows the label next to the spinner; otherwise icon + label
+/// once complete or failed, else the spinner + pending text. A background
+/// subagent spins with its badge.
+fn text_row(
+    text: &ToolText<'_>,
+    state: ToolState,
+    background: bool,
+    error: Option<&str>,
+    view: ViewState,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let failed = matches!(state, ToolState::Failed);
+    let spinning = text.spinner || background;
+    let spec = InlineSpec {
+        icon: text.icon,
+        pending: if spinning { &text.label } else { text.pending },
+        complete: (!spinning && (text.complete || failed)).then_some(text.label.as_str()),
+        error,
+    };
+    let row = RowView {
+        state: if spinning { ToolState::Running } else { state },
+        spinner: SPINNER_FRAMES[view.spin % SPINNER_FRAMES.len()],
+        hovered: false,
+        error_expanded: view.tool_expanded,
+    };
+    tool_row::lines(&spec, row, width)
+}
+
+/// Read's `↳ Loaded <file>` rows under its tool row.
+fn loaded_lines<'a>(text: &'a ToolText<'_>) -> impl Iterator<Item = Line<'static>> + 'a {
+    let palette = theme::palette();
+    text.loaded.iter().map(move |file| {
+        Line::from(Span::styled(
+            format!("      \u{21b3} Loaded {file}"),
+            palette.dim,
+        ))
+    })
+}
+
+/// Upstream `GenericTool`'s expanded body: per row a muted `key: ` and the
+/// value word-wrapped beside it, everything indented past the icon.
+fn detail_lines(rows: &[(&str, String)], width: u16) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthStr;
+
+    const PAD: usize = 5;
+    let palette = theme::palette();
+    let mut out = Vec::new();
+    for (key, value) in rows {
+        let key = format!("{key}: ");
+        let hang = PAD + key.width();
+        let usable = usize::from(width).saturating_sub(hang).max(1);
+        let options = textwrap::Options::new(usable)
+            .word_separator(textwrap::WordSeparator::UnicodeBreakProperties)
+            .word_splitter(textwrap::WordSplitter::NoHyphenation);
+        let mut first = true;
+        for line in value.split('\n') {
+            let parts = textwrap::wrap(line, &options);
+            let parts = if parts.is_empty() {
+                vec![Cow::Borrowed("")]
+            } else {
+                parts
+            };
+            for part in parts {
+                if out.len() >= TOOL_OUTPUT_MAX_LINES {
+                    out.push(Line::from(Span::styled(
+                        format!("{:PAD$}\u{2026}", ""),
+                        palette.dim,
+                    )));
+                    return out;
+                }
+                let lead = if first {
+                    Span::styled(format!("{:PAD$}{key}", ""), palette.dim)
+                } else {
+                    Span::raw(" ".repeat(hang))
+                };
+                first = false;
+                out.push(Line::from(vec![
+                    lead,
+                    Span::styled(part.into_owned(), palette.text),
+                ]));
+            }
+        }
+    }
+    out
+}
+
+/// Upstream `TodoWrite`: the panel when the call completed with todos, else
+/// an `InlineTool` row (`index.tsx:3623-3647`): `⚙`, pending `Updating
+/// todos…`, complete `Todo update failed` on error and `Cleared todos`
+/// otherwise; a click on a failed row lists the error.
+fn todo_block(
+    state: ToolState,
+    todos: &[Todo],
+    output: &str,
+    view: ViewState,
+    width: u16,
+) -> Vec<Line<'static>> {
+    if matches!(state, ToolState::Success) && !todos.is_empty() {
+        return super::todo::lines(todos, width);
+    }
+    let failed = matches!(state, ToolState::Failed);
+    let spec = InlineSpec {
+        icon: "\u{2699}",
+        pending: "Updating todos\u{2026}",
+        complete: Some(if failed {
+            "Todo update failed"
+        } else {
+            "Cleared todos"
+        }),
+        error: (!output.is_empty()).then_some(output),
+    };
+    let row = RowView {
+        state,
+        spinner: SPINNER_FRAMES[view.spin % SPINNER_FRAMES.len()],
+        hovered: false,
+        error_expanded: view.tool_expanded,
+    };
+    let mut lines = tool_row::lines(&spec, row, width);
+    // The `[` / `]` focus reads as bold, like a tool row.
+    if view.tool_focused
+        && failed
+        && let Some(header) = lines.first_mut()
+    {
+        *header = std::mem::take(header).patch_style(Modifier::BOLD);
+    }
+    lines
+}
+
+/// Blocks whose spinner moves with the clock: streaming reasoning, running
+/// tool and todo rows, and background subagent rows.
+fn spins(block: &Block) -> bool {
+    let running = |state: &ToolState| {
+        matches!(
+            state,
+            ToolState::Input | ToolState::Running | ToolState::Progress
+        )
+    };
+    match block {
+        Block::Reasoning { done, .. } => !done,
+        Block::Tool {
+            state, background, ..
+        } => *background || running(state),
+        Block::Todo { state, .. } => running(state),
+        Block::Explored(explored) => explored.running,
+        _ => false,
+    }
+}
+
+/// A failed tool or todo row with a message to show: the click target that
+/// opens the error.
+fn failed_with_error(block: &Block) -> bool {
+    match block {
+        Block::Tool { state, output, .. } | Block::Todo { state, output, .. } => {
+            matches!(state, ToolState::Failed) && !output.is_empty()
+        }
+        _ => false,
+    }
+}
+
+/// A tool or todo row a click opens: a failed row with an error, or a
+/// generic row with something to list. Legacy rows (`shell`, …) are not
+/// clickable unless failed, as before.
+fn clickable(block: &Block) -> bool {
+    match block {
+        Block::Tool { tool, .. } if !failed_with_error(block) => {
+            tool_text::is_generic(tool) && tool_expandable(block)
+        }
+        _ => failed_with_error(block),
+    }
 }
 
 /// The id of a tool block, for focus/expansion bookkeeping.
 fn entry_tool_id(block: &Block) -> Option<&str> {
     match block {
-        Block::Tool { id, .. } => Some(id.as_str()),
+        Block::Tool { id, .. } | Block::Todo { id, .. } => Some(id.as_str()),
         _ => None,
     }
 }
 
-/// The output of a tool row that can actually be shown.
-fn entry_tool_output(block: &Block) -> Option<&str> {
+/// Whether a tool or todo row has something behind its header: a failed
+/// row's error, a generic row's input and output (upstream `GenericTool`
+/// `expandable`), or a finished legacy row's output.
+fn tool_expandable(block: &Block) -> bool {
     match block {
-        Block::Tool { state, output, .. }
-            if !output.is_empty() && matches!(state, ToolState::Success | ToolState::Failed) =>
-        {
-            Some(output.as_str())
+        Block::Tool {
+            tool,
+            state,
+            output,
+            input,
+            ..
+        } => {
+            if failed_with_error(block) {
+                true
+            } else if tool_text::own_row(tool) {
+                !output.is_empty() && matches!(state, ToolState::Success)
+            } else {
+                tool_text::is_generic(tool) && tool_text::generic_expandable(input, output)
+            }
         }
-        _ => None,
+        // A failed todo row opens its error with `o` like a tool's output.
+        Block::Todo { .. } => failed_with_error(block),
+        _ => false,
     }
 }
 
@@ -1816,7 +2321,7 @@ mod tests {
     use ratatui::style::{Color, Modifier};
     use std::sync::Arc;
 
-    use super::{Block, Explored, ExploredCall, Transcript, reasoning_summary};
+    use super::{Block, Explored, ExploredCall, ExploredCount, Transcript, reasoning_summary};
     use ox_client::store::ToolState;
 
     #[test]
@@ -1832,6 +2337,8 @@ mod tests {
                     summary: "git status".into(),
                     output: Arc::default(),
                     background: false,
+                    input: Arc::default(),
+                    metadata: None,
                 },
                 Block::Tool {
                     id: "p2".into(),
@@ -1841,6 +2348,8 @@ mod tests {
                     summary: "a.txt".into(),
                     output: Arc::new("one\ntwo\nthree".into()),
                     background: false,
+                    input: rec(serde_json::json!({"path": "a.txt"})),
+                    metadata: None,
                 },
                 Block::Tool {
                     id: "p3".into(),
@@ -1850,6 +2359,8 @@ mod tests {
                     summary: "main.rs".into(),
                     output: Arc::new("boom".into()),
                     background: false,
+                    input: Arc::default(),
+                    metadata: None,
                 },
             ],
             0,
@@ -1871,8 +2382,8 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         // Upstream inline rows: `icon tool summary`, no `⎿ N lines` stub.
-        assert!(text.contains("~ shell git status"), "{text}");
-        assert!(text.contains("⚙ read a.txt"), "{text}");
+        assert!(text.contains("\u{280b} shell git status"), "{text}");
+        assert!(text.contains("→ Read a.txt"), "{text}");
         assert!(!text.contains("lines"), "{text}");
         assert!(
             !text.contains("one"),
@@ -1897,6 +2408,8 @@ mod tests {
                 summary: String::new(),
                 output: Arc::default(),
                 background: false,
+                input: Arc::default(),
+                metadata: None,
             }],
             0,
         );
@@ -1908,11 +2421,168 @@ mod tests {
         let buffer = terminal.backend().buffer().clone();
         // Row 0 is the block's marginTop.
         let row: String = (0..40).map(|x| buffer[(x, 1)].symbol()).collect();
-        assert!(row.trim_end().ends_with("grep"), "{row:?}");
+        assert!(
+            row.trim_end().ends_with("Searching content\u{2026}"),
+            "upstream Grep pending text: {row:?}"
+        );
         let row1: String = (0..40).map(|x| buffer[(x, 2)].symbol()).collect();
         assert!(
             row1.trim().is_empty(),
             "no summary and no output yet: header only"
+        );
+    }
+
+    fn rec(value: serde_json::Value) -> Arc<ox_schema::support::Record> {
+        match value {
+            serde_json::Value::Object(map) => Arc::new(map.into_iter().collect()),
+            other => panic!("not an object: {other}"),
+        }
+    }
+
+    fn text_row(tool: &str, state: ToolState, input: serde_json::Value, output: &str) -> Block {
+        Block::Tool {
+            id: "t1".into(),
+            version: 0,
+            tool: tool.into(),
+            state,
+            summary: String::new(),
+            output: Arc::new(output.into()),
+            background: false,
+            input: rec(input),
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn a_generic_row_expands_to_its_input_and_output_on_click_and_o() {
+        let palette = super::theme::palette();
+        let block = text_row(
+            "mcp_lookup",
+            ToolState::Success,
+            serde_json::json!({"query": "rust", "opts": {"k": 1}}),
+            "\u{1b}[1mfound\u{1b}[0m it\n",
+        );
+        let mut t = Transcript::new(40, 12);
+        t.sync(std::slice::from_ref(&block), 0);
+        let collapsed = screen(&mut t, 40, 12);
+        let rows: Vec<&str> = collapsed.lines().collect();
+        assert_eq!(rows[1], "   \u{2713} mcp_lookup [query=rust]", "{rows:?}");
+        assert_eq!(
+            rows.get(2).copied().unwrap_or(""),
+            "",
+            "collapsed: {rows:?}"
+        );
+
+        assert!(t.click(6, 1), "a generic row is clickable");
+        let open = screen(&mut t, 40, 12);
+        let rows: Vec<&str> = open.lines().collect();
+        assert_eq!(
+            &rows[2..7],
+            [
+                "     opts: {",
+                "             \"k\": 1",
+                "           }",
+                "     query: rust",
+                "     output: found it"
+            ],
+            "keys in order, JSON pretty, output last and ANSI-free: {rows:?}"
+        );
+        let line = &t.entries[0].lines[5];
+        assert_eq!(line.spans[0].style.fg, palette.dim.fg, "the key is muted");
+        assert_eq!(
+            line.spans[1].style.fg, palette.text.fg,
+            "the value is base text"
+        );
+
+        assert!(t.click(6, 1), "a second click closes it");
+        assert!(!screen(&mut t, 40, 12).contains("query: rust"));
+
+        assert!(t.toggle_tool_output(), "o opens a generic row too");
+        assert!(screen(&mut t, 40, 12).contains("output: found it"));
+    }
+
+    #[test]
+    fn a_generic_value_wraps_under_itself() {
+        let block = text_row(
+            "mcp",
+            ToolState::Success,
+            serde_json::json!({"q": "one two three four"}),
+            "",
+        );
+        let mut t = Transcript::new(16, 8);
+        t.sync(&[block], 0);
+        assert!(t.toggle_tool_output());
+        let open = screen(&mut t, 16, 8);
+        let rows: Vec<&str> = open.lines().collect();
+        assert_eq!(
+            &rows[2..4],
+            ["     q: one two", "        three"],
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn rows_with_their_own_text_do_not_expand_on_click() {
+        let block = text_row(
+            "read",
+            ToolState::Success,
+            serde_json::json!({"path": "a.rs"}),
+            "fn main() {}",
+        );
+        let mut t = Transcript::new(40, 6);
+        t.sync(&[block], 0);
+        screen(&mut t, 40, 6);
+        assert!(!t.click(6, 1), "Read lists nothing on click");
+        assert!(!t.toggle_tool_output(), "nor with o");
+    }
+
+    #[test]
+    fn a_failed_generic_row_opens_its_error_not_the_details() {
+        let block = text_row(
+            "mcp",
+            ToolState::Failed,
+            serde_json::json!({"q": "x"}),
+            "denied",
+        );
+        let mut t = Transcript::new(40, 6);
+        t.sync(&[block], 0);
+        let rows: Vec<String> = screen(&mut t, 40, 6).lines().map(str::to_owned).collect();
+        assert_eq!(rows[1], "   \u{2717} mcp [q=x]", "{rows:?}");
+        assert!(t.click(6, 1));
+        let open = screen(&mut t, 40, 6);
+        let rows: Vec<&str> = open.lines().collect();
+        assert_eq!(rows[2], "     denied", "{rows:?}");
+        assert!(!open.contains("q: x"), "{open}");
+    }
+
+    #[test]
+    fn a_read_row_lists_the_files_it_loaded() {
+        let mut block = text_row(
+            "read",
+            ToolState::Success,
+            serde_json::json!({"path": "img.png"}),
+            "",
+        );
+        if let Block::Tool { metadata, .. } = &mut block {
+            *metadata = Some(rec(serde_json::json!({"loaded": ["img.png", "b.md"]})));
+        }
+        let mut t = Transcript::new(40, 6);
+        t.sync(&[block], 0);
+        let text = screen(&mut t, 40, 6);
+        let rows: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            &rows[1..4],
+            [
+                "   \u{2192} Read img.png",
+                "      \u{21b3} Loaded img.png",
+                "      \u{21b3} Loaded b.md"
+            ],
+            "{rows:?}"
+        );
+        assert_eq!(
+            t.entries[0].lines[2].spans[0].style.fg,
+            super::theme::palette().dim.fg,
+            "muted"
         );
     }
 
@@ -1947,15 +2617,18 @@ mod tests {
             .join("\n")
     }
 
+    /// A legacy row (`shell` keeps its own output expansion).
     fn tool_row(id: &str, version: u64, summary: &str, state: ToolState, output: &str) -> Block {
         Block::Tool {
             id: id.into(),
             version,
-            tool: "read".into(),
+            tool: "shell".into(),
             state,
             summary: summary.into(),
             output: Arc::new(output.into()),
             background: false,
+            input: Arc::default(),
+            metadata: None,
         }
     }
 
@@ -1973,7 +2646,7 @@ mod tests {
             0,
         );
         let collapsed = screen(&mut t, 60, 10);
-        assert!(collapsed.contains("⚙ read a.txt"), "{collapsed}");
+        assert!(collapsed.contains("⚙ shell a.txt"), "{collapsed}");
         assert!(!collapsed.contains("beta"), "{collapsed}");
 
         assert!(t.toggle_tool_output(), "a tool row was expanded");
@@ -2017,7 +2690,7 @@ mod tests {
         assert!(t.toggle_tool_output());
         let expanded = screen(&mut t, 60, 12);
         assert!(expanded.contains("two"), "{expanded}");
-        assert_eq!(bold_rows(&mut t, 60, 12), ["⚙ read second"]);
+        assert_eq!(bold_rows(&mut t, 60, 12), ["⚙ shell second"]);
 
         assert!(t.toggle_tool_output());
         let collapsed = screen(&mut t, 60, 12);
@@ -2038,16 +2711,16 @@ mod tests {
             t.focus_tool(true),
             "focus moves from nothing to the first row"
         );
-        assert_eq!(bold_rows(&mut t, 60, 12), ["⚙ read first"]);
+        assert_eq!(bold_rows(&mut t, 60, 12), ["⚙ shell first"]);
 
         assert!(t.focus_tool(true));
-        assert_eq!(bold_rows(&mut t, 60, 12), ["⚙ read second"]);
+        assert_eq!(bold_rows(&mut t, 60, 12), ["⚙ shell second"]);
 
         assert!(t.focus_tool(true), "wraps to the first row");
-        assert_eq!(bold_rows(&mut t, 60, 12), ["⚙ read first"]);
+        assert_eq!(bold_rows(&mut t, 60, 12), ["⚙ shell first"]);
 
         assert!(t.focus_tool(false), "backwards wraps to the last row");
-        assert_eq!(bold_rows(&mut t, 60, 12), ["⚙ read second"]);
+        assert_eq!(bold_rows(&mut t, 60, 12), ["⚙ shell second"]);
     }
 
     #[test]
@@ -2106,6 +2779,8 @@ mod tests {
             model: Some("p/m".into()),
             duration_ms: Some(duration_ms),
             tokens_per_second,
+            error: None,
+            retry: None,
         }
     }
 
@@ -2135,6 +2810,103 @@ mod tests {
         assert!(!text.contains("tok/s"), "{text}");
     }
 
+    fn error(message: &str) -> ox_client::store::ErrorInfo {
+        ox_client::store::ErrorInfo {
+            kind: Arc::from("provider"),
+            message: Arc::from(message),
+        }
+    }
+
+    #[test]
+    fn footer_error_sits_above_the_stats_line_in_the_error_colour() {
+        let mut footer = turn_footer(1_000, None);
+        footer.error = Some(error("boom"));
+        let lines = super::footer_lines(&footer, None, 60);
+        let rows: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        assert_eq!(rows[0], "   Error: boom", "{rows:?}");
+        assert_eq!(rows[1], "", "blank row between error and stats: {rows:?}");
+        assert!(rows[2].trim_start().starts_with("Build"), "{rows:?}");
+        assert_eq!(lines[0].style.fg, super::theme::palette().warn.fg);
+    }
+
+    #[test]
+    fn an_interrupted_step_shows_no_error_row_but_marks_the_stats() {
+        let mut footer = turn_footer(1_000, None);
+        footer.error = Some(error(super::STEP_INTERRUPTED));
+        let rows: Vec<String> = super::footer_lines(&footer, None, 60)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].ends_with(" · interrupted"), "{rows:?}");
+    }
+
+    #[test]
+    fn a_retry_replaces_the_error_and_counts_down_in_the_warning_colour() {
+        let mut footer = turn_footer(1_000, None);
+        footer.error = Some(error("boom"));
+        footer.retry = Some(ox_client::store::RetryInfo {
+            attempt: 3,
+            at: 10_000,
+            message: Arc::from("busy"),
+        });
+        let lines = super::footer_lines(&footer, Some(4), 60);
+        let rows: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            rows[0], "   ⚠ Retrying in 4s · attempt 3 · busy",
+            "{rows:?}"
+        );
+        assert!(!rows.iter().any(|row| row.contains("Error")), "{rows:?}");
+        assert_eq!(lines[0].style.fg, super::theme::palette().warning.fg);
+        let due: Vec<String> = super::footer_lines(&footer, Some(0), 60)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(due[0], "   ⚠ Retry due · attempt 3 · busy", "{due:?}");
+    }
+
+    #[test]
+    fn retry_seconds_round_up_and_floor_at_zero() {
+        assert_eq!(super::retry_secs(10_000, 9_001), 1);
+        assert_eq!(super::retry_secs(10_000, 9_000), 1);
+        assert_eq!(super::retry_secs(10_000, 8_999), 2);
+        assert_eq!(super::retry_secs(10_000, 10_000), 0);
+        assert_eq!(super::retry_secs(10_000, 12_000), 0);
+    }
+
+    #[test]
+    fn tick_rebuilds_a_retry_row_only_when_its_second_changes() {
+        let mut footer = turn_footer(1_000, None);
+        footer.retry = Some(ox_client::store::RetryInfo {
+            attempt: 1,
+            at: 10_000,
+            message: Arc::from("busy"),
+        });
+        let mut t = Transcript::new(60, 12);
+        let now = std::time::Instant::now();
+        t.tick_at(now, 7_500);
+        t.sync(&[footer_block(footer)], 0);
+        t.tick_at(now, 7_500);
+        assert!(screen(&mut t, 60, 12).contains("Retrying in 3s"));
+        let generation = t.entry_generation(0);
+
+        assert!(!t.tick_at(now, 7_900), "same displayed second: no repaint");
+        assert_eq!(t.entry_generation(0), generation, "not rebuilt");
+
+        assert!(t.tick_at(now, 8_100), "second changed: repaint");
+        assert_ne!(t.entry_generation(0), generation, "rebuilt");
+        assert!(screen(&mut t, 60, 12).contains("Retrying in 2s"));
+    }
+
+    #[test]
+    fn background_badge_uses_the_raised_background() {
+        let mut header = ratatui::text::Line::default();
+        super::push_background_badge(&mut header);
+        let badge = header.spans.last().expect("badge span");
+        assert_eq!(badge.content, " Background ");
+        assert_eq!(badge.style.bg, super::theme::palette().panel.bg);
+    }
+
     #[test]
     fn sync_keeps_tool_row_caches_while_the_text_streams() {
         let tool = Block::Tool {
@@ -2145,6 +2917,8 @@ mod tests {
             summary: "git status".into(),
             output: Arc::default(),
             background: false,
+            input: Arc::default(),
+            metadata: None,
         };
         let mut t = Transcript::new(40, 10);
         t.sync(&[Block::assistant("msg_1", 0, "b"), tool.clone()], 0);
@@ -2296,26 +3070,50 @@ mod tests {
         assert!(!draw(&mut t).contains("Let me look"));
     }
 
-    fn call(id: &str, version: u64, tool: &str, summary: &str, state: ToolState) -> ExploredCall {
+    fn call(
+        id: &str,
+        version: u64,
+        tool: &str,
+        input: serde_json::Value,
+        state: ToolState,
+    ) -> ExploredCall {
         ExploredCall {
             id: id.into(),
             version,
             tool: tool.into(),
             state,
-            summary: summary.into(),
+            input: rec(input),
+            metadata: None,
         }
     }
 
+    /// A group whose counts follow the first appearance of each noun, as
+    /// the pipeline builds them.
     fn group(calls: Vec<ExploredCall>) -> Block {
+        let mut counts: Vec<ExploredCount> = Vec::new();
+        for c in &calls {
+            let noun = if c.tool == "read" { "read" } else { "search" };
+            match counts.iter_mut().find(|e| e.noun == noun) {
+                Some(e) => e.count += 1,
+                None => counts.push(ExploredCount { noun, count: 1 }),
+            }
+        }
         Block::Explored(Explored {
-            reads: calls.len() as u32,
+            counts,
             running: calls
                 .iter()
                 .any(|c| !matches!(c.state, ToolState::Success | ToolState::Failed)),
             group_id: calls[0].id.clone(),
             calls,
-            ..Explored::default()
         })
+    }
+
+    fn read_a() -> serde_json::Value {
+        serde_json::json!({"path": "a.txt"})
+    }
+
+    fn grep_needle() -> serde_json::Value {
+        serde_json::json!({"pattern": "needle"})
     }
 
     #[test]
@@ -2323,13 +3121,16 @@ mod tests {
         let mut t = Transcript::new(50, 12);
         t.sync(
             &[group(vec![
-                call("a", 1, "read", "a.txt", ToolState::Success),
-                call("b", 1, "grep", "needle", ToolState::Failed),
+                call("a", 1, "read", read_a(), ToolState::Success),
+                call("b", 1, "grep", grep_needle(), ToolState::Failed),
             ])],
             0,
         );
         let collapsed = screen(&mut t, 50, 12);
-        assert!(collapsed.contains("→ Explored: 2 reads"), "{collapsed}");
+        assert!(
+            collapsed.contains("→ Explored: 1 read, 1 search"),
+            "{collapsed}"
+        );
         assert!(!collapsed.contains("a.txt"), "{collapsed}");
         let lines_before = t.total_lines();
 
@@ -2338,9 +3139,9 @@ mod tests {
         assert_eq!(t.total_lines(), lines_before + 2, "one row per call");
         let open = screen(&mut t, 50, 12);
         let rows: Vec<&str> = open.lines().collect();
-        assert_eq!(rows[1], "   → Explored: 2 reads", "{rows:?}");
-        assert_eq!(rows[2], "   ⚙ read a.txt", "{rows:?}");
-        assert_eq!(rows[3], "   ✗ grep needle", "{rows:?}");
+        assert_eq!(rows[1], "   → Explored: 1 read, 1 search", "{rows:?}");
+        assert_eq!(rows[2], "   → Read a.txt", "{rows:?}");
+        assert_eq!(rows[3], "   ✱ Grep \"needle\"", "{rows:?}");
 
         assert!(!t.click(6, 2), "call rows are not click targets");
         assert!(t.click(6, 1));
@@ -2349,37 +3150,119 @@ mod tests {
     }
 
     #[test]
+    fn a_running_group_spins_its_header_and_running_children() {
+        let mut t = Transcript::new(50, 12);
+        t.sync(
+            &[group(vec![
+                call("a", 1, "read", read_a(), ToolState::Running),
+                call("b", 1, "grep", grep_needle(), ToolState::Running),
+            ])],
+            0,
+        );
+        screen(&mut t, 50, 12);
+        assert!(t.click(6, 1));
+        let first = screen(&mut t, 50, 12);
+        let rows: Vec<&str> = first.lines().collect();
+        assert_eq!(
+            rows[1], "   \u{280b} Exploring: 1 read, 1 search",
+            "{rows:?}"
+        );
+        assert_eq!(rows[2], "   \u{280b} Read a.txt", "{rows:?}");
+        assert_eq!(rows[3], "   \u{280b} Searching content\u{2026}", "{rows:?}");
+
+        let later = t.spin_epoch + std::time::Duration::from_millis(80);
+        assert!(t.tick(later), "a running group asks for a repaint");
+        let second = screen(&mut t, 50, 12);
+        let rows: Vec<&str> = second.lines().collect();
+        assert_eq!(
+            rows[1], "   \u{2819} Exploring: 1 read, 1 search",
+            "{rows:?}"
+        );
+        assert_eq!(rows[2], "   \u{2819} Read a.txt", "{rows:?}");
+    }
+
+    #[test]
+    fn a_finished_group_does_not_spin() {
+        let mut t = Transcript::new(50, 6);
+        t.sync(
+            &[group(vec![call(
+                "a",
+                1,
+                "read",
+                read_a(),
+                ToolState::Success,
+            )])],
+            0,
+        );
+        let text = screen(&mut t, 50, 6);
+        assert!(text.contains("   → Explored: 1 read"), "{text}");
+        let later = t.spin_epoch + std::time::Duration::from_millis(80);
+        assert!(!t.tick(later), "nothing spins, nothing repaints");
+    }
+
+    #[test]
+    fn header_counts_follow_first_appearance_and_pluralise_like_upstream() {
+        let mut t = Transcript::new(60, 6);
+        t.sync(
+            &[Block::Explored(Explored {
+                counts: vec![
+                    ExploredCount {
+                        noun: "search",
+                        count: 2,
+                    },
+                    ExploredCount {
+                        noun: "read",
+                        count: 3,
+                    },
+                    ExploredCount {
+                        noun: "fetch",
+                        count: 2,
+                    },
+                ],
+                group_id: "a".into(),
+                ..Explored::default()
+            })],
+            0,
+        );
+        let text = screen(&mut t, 60, 6);
+        assert!(
+            text.contains("→ Explored: 2 searches, 3 reads, 2 fetches"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn an_expanded_group_stays_open_when_a_call_changes_state() {
         let mut t = Transcript::new(50, 12);
         t.sync(
             &[group(vec![
-                call("a", 1, "read", "a.txt", ToolState::Success),
-                call("b", 1, "grep", "needle", ToolState::Running),
+                call("a", 1, "read", read_a(), ToolState::Success),
+                call("b", 1, "grep", grep_needle(), ToolState::Running),
             ])],
             0,
         );
         screen(&mut t, 50, 12);
         assert!(t.click(6, 1));
         let running = screen(&mut t, 50, 12);
-        assert!(running.contains("✱ Exploring: 2 reads"), "{running}");
-        assert!(running.contains("~ grep needle"), "{running}");
+        assert!(running.contains("Exploring: 1 read, 1 search"), "{running}");
+        assert!(running.contains("Searching content"), "{running}");
 
         t.sync(
             &[group(vec![
-                call("a", 1, "read", "a.txt", ToolState::Success),
-                call("b", 2, "grep", "needle", ToolState::Success),
+                call("a", 1, "read", read_a(), ToolState::Success),
+                call("b", 2, "grep", grep_needle(), ToolState::Success),
             ])],
             0,
         );
         let done = screen(&mut t, 50, 12);
-        assert!(done.contains("→ Explored: 2 reads"), "{done}");
-        assert!(done.contains("⚙ grep needle"), "{done}");
-        assert!(done.contains("⚙ read a.txt"), "{done}");
+        assert!(done.contains("→ Explored: 1 read, 1 search"), "{done}");
+        assert!(done.contains("✱ Grep \"needle\""), "{done}");
+        assert!(done.contains("→ Read a.txt"), "{done}");
     }
 
     fn one_group_then_a_user() -> [Block; 2] {
         [
-            group(vec![call("a", 1, "read", "a.txt", ToolState::Success)]),
+            group(vec![call("a", 1, "read", read_a(), ToolState::Success)]),
             Block::user("hello"),
         ]
     }
@@ -2424,7 +3307,7 @@ mod tests {
         let mut t = Transcript::new(50, 12);
         t.sync(
             &[
-                group(vec![call("a", 1, "read", "a.txt", ToolState::Success)]),
+                group(vec![call("a", 1, "read", read_a(), ToolState::Success)]),
                 Block::assistant("m", 1, "answer"),
             ],
             0,
@@ -2539,13 +3422,13 @@ mod tests {
                 "a",
                 1,
                 "read",
-                "a.txt",
+                read_a(),
                 ToolState::Running,
             )])],
             0,
         );
         let text = screen(&mut t, 50, 6);
-        assert!(text.contains("✱ Exploring: 1 read"), "{text}");
+        assert!(text.contains("\u{280b} Exploring: 1 read"), "{text}");
         assert!(!text.contains("a.txt"), "{text}");
     }
 
@@ -2558,6 +3441,8 @@ mod tests {
             summary: "explore".into(),
             output: Arc::default(),
             background,
+            input: rec(serde_json::json!({"description": "explore"})),
+            metadata: None,
         }
     }
 
@@ -2566,12 +3451,18 @@ mod tests {
         let mut t = Transcript::new(60, 4);
         t.sync(&[subagent_row(true)], 0);
         let text = screen(&mut t, 60, 4);
-        assert!(text.contains("\u{280b} subagent explore"), "{text}");
+        assert!(
+            text.contains("\u{280b} General Subagent \u{2014} explore"),
+            "{text}"
+        );
         assert!(text.contains("Background"), "{text}");
 
         t.sync(&[subagent_row(false)], 0);
         let text = screen(&mut t, 60, 4);
-        assert!(text.contains("\u{2699} subagent explore"), "{text}");
+        assert!(
+            text.contains("\u{2713} General Subagent \u{2014} explore"),
+            "{text}"
+        );
         assert!(!text.contains("Background"), "{text}");
         assert!(!text.contains('\u{280b}'), "{text}");
     }
@@ -2589,7 +3480,7 @@ mod tests {
         let later = t.spin_epoch + std::time::Duration::from_millis(80);
         assert!(t.tick(later), "a new frame asks for a repaint");
         assert!(!t.tick(later), "the same frame does not");
-        assert!(screen(&mut t, 60, 4).contains("\u{2819} subagent explore"));
+        assert!(screen(&mut t, 60, 4).contains("\u{2819} General Subagent \u{2014} explore"));
 
         t.sync(&[subagent_row(false)], 0);
         let next = later + std::time::Duration::from_millis(80);
@@ -2650,6 +3541,8 @@ mod tests {
                 summary: "ls".into(),
                 output: Arc::new("a".into()),
                 background: false,
+                input: Arc::default(),
+                metadata: None,
             }],
             0,
         );
@@ -2820,6 +3713,7 @@ mod tests {
             version: 0,
             state,
             todos: Arc::clone(todos),
+            output: Arc::default(),
         };
         let mut t = Transcript::new(40, 12);
         t.sync(&[block(ToolState::Success, &todos)], 0);
@@ -2829,9 +3723,9 @@ mod tests {
 
         let empty = Arc::new(Vec::new());
         for (state, label) in [
-            (ToolState::Running, "~ Updating todos…"),
+            (ToolState::Running, "\u{280b} Updating todos…"),
             (ToolState::Success, "⚙ Cleared todos"),
-            (ToolState::Failed, "✗ Todo update failed"),
+            (ToolState::Failed, "⚙ Todo update failed"),
         ] {
             let mut t = Transcript::new(40, 4);
             t.sync(&[block(state, &empty)], 0);
@@ -2839,6 +3733,103 @@ mod tests {
             assert!(text.contains(label), "{label}: {text}");
             assert!(!text.contains("# Todos"), "{text}");
         }
+    }
+
+    fn todo_row(state: ToolState, output: &str) -> Block {
+        Block::Todo {
+            id: "t1".into(),
+            version: 0,
+            state,
+            todos: Arc::default(),
+            output: Arc::new(output.into()),
+        }
+    }
+
+    #[test]
+    fn a_running_todo_row_is_muted_and_spins_with_the_clock() {
+        let palette = super::theme::palette();
+        let mut t = Transcript::new(40, 4);
+        t.sync(&[todo_row(ToolState::Running, "")], 0);
+        let header = &t.entries[0].lines[1];
+        assert_eq!(header.spans[0].style.fg, palette.dim.fg, "{header:?}");
+        let generation = t.entries[0].generation;
+
+        let later = t.spin_epoch + std::time::Duration::from_millis(80);
+        assert!(t.tick(later), "a running row asks for a repaint");
+        assert!(
+            screen(&mut t, 40, 4).contains("\u{2819} Updating todos…"),
+            "the next braille frame"
+        );
+        assert_eq!(t.entries[0].generation, generation + 1, "rebuilt once");
+
+        t.sync(&[todo_row(ToolState::Success, "")], 0);
+        let next = later + std::time::Duration::from_millis(80);
+        assert!(!t.tick(next), "a finished row does not spin");
+    }
+
+    #[test]
+    fn a_running_tool_row_spins_and_only_it_is_rebuilt() {
+        let mut t = Transcript::new(40, 8);
+        t.sync(
+            &[
+                tool_row("p1", 0, "a.txt", ToolState::Success, "x"),
+                tool_row("p2", 0, "b.txt", ToolState::Running, ""),
+            ],
+            0,
+        );
+        let idle = t.entries[0].generation;
+        let running = t.entries[1].generation;
+        let later = t.spin_epoch + std::time::Duration::from_millis(80);
+        assert!(t.tick(later), "a running row asks for a repaint");
+        assert_eq!(t.entries[0].generation, idle, "the finished row is kept");
+        assert_eq!(
+            t.entries[1].generation,
+            running + 1,
+            "the running row is rebuilt"
+        );
+        assert!(
+            screen(&mut t, 40, 8).contains("\u{2819} shell b.txt"),
+            "spinner then the generic label"
+        );
+    }
+
+    #[test]
+    fn clicking_a_failed_todo_row_toggles_its_error() {
+        let palette = super::theme::palette();
+        let mut t = Transcript::new(40, 6);
+        t.sync(
+            &[todo_row(ToolState::Failed, "\u{1b}[31mbad status\u{1b}[0m")],
+            0,
+        );
+        let collapsed = screen(&mut t, 40, 6);
+        assert!(collapsed.contains("⚙ Todo update failed"), "{collapsed}");
+        assert!(!collapsed.contains("bad status"), "{collapsed}");
+        assert_eq!(
+            t.entries[0].lines[1].spans[0].style.fg, palette.warn.fg,
+            "error colour"
+        );
+
+        assert!(!t.click(6, 0), "the margin row is not a target");
+        assert!(t.click(6, 1), "the header toggles");
+        let open = screen(&mut t, 40, 6);
+        let rows: Vec<&str> = open.lines().collect();
+        assert_eq!(rows[2], "     bad status", "ANSI-free, indented: {rows:?}");
+
+        assert!(t.click(6, 1), "a second click closes it");
+        assert!(!screen(&mut t, 40, 6).contains("bad status"));
+    }
+
+    #[test]
+    fn o_opens_a_failed_todo_rows_error_and_a_clean_row_is_not_clickable() {
+        let mut t = Transcript::new(40, 6);
+        t.sync(&[todo_row(ToolState::Failed, "bad status")], 0);
+        assert!(t.toggle_tool_output(), "a failed todo row is expandable");
+        assert!(screen(&mut t, 40, 6).contains("bad status"));
+
+        let mut t = Transcript::new(40, 6);
+        t.sync(&[todo_row(ToolState::Success, "")], 0);
+        screen(&mut t, 40, 6);
+        assert!(!t.click(6, 1), "nothing to open on a clean row");
     }
 
     #[test]

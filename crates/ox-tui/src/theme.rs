@@ -116,6 +116,11 @@ pub struct Palette {
     pub text: Style,
     /// Labels, separators, meta lines (`text.muted`).
     pub dim: Style,
+    /// Receded text such as cancelled todo items (upstream `faint`). The
+    /// default theme defines no `faint`, so upstream falls back to
+    /// `$text.muted` (`theme/src/tui/expand.ts:52`); the colour equals `dim`
+    /// there but stays a separate role so themes that define it can differ.
+    pub faint: Style,
     /// The interactive accent: running dot, search hits (`primary`).
     pub accent: Style,
     /// Failures and interrupts (`error`).
@@ -172,6 +177,7 @@ impl Palette {
             Deck::Ansi16 => Self {
                 text: Style::default(),
                 dim: Style::default().fg(Color::DarkGray),
+                faint: Style::default().fg(Color::DarkGray),
                 accent: Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
@@ -197,6 +203,7 @@ impl Palette {
             Deck::NoColor => Self {
                 text: Style::default(),
                 dim: Style::default().add_modifier(Modifier::DIM),
+                faint: Style::default().add_modifier(Modifier::DIM),
                 accent: Style::default().add_modifier(Modifier::BOLD),
                 warn: Style::default().add_modifier(Modifier::BOLD),
                 success: Style::default(),
@@ -239,6 +246,7 @@ impl Palette {
         Self {
             text: Style::default().fg(rgb(t.text)),
             dim: Style::default().fg(rgb(t.text_muted)),
+            faint: Style::default().fg(rgb(t.text_muted)),
             accent: Style::default()
                 .fg(rgb(t.primary))
                 .add_modifier(Modifier::BOLD),
@@ -287,6 +295,7 @@ impl Palette {
         Some(Self {
             text: Style::default(),
             dim: Style::default().fg(Color::DarkGray),
+            faint: Style::default().fg(Color::DarkGray),
             accent: Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),

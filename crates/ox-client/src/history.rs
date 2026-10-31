@@ -2,6 +2,10 @@
 //! ordered `Vec<Item>`. Pure function, no IO. Only shell / subagent
 //! completion notices are kept from synthetic messages; every other synthetic
 //! message stays skipped. Compaction messages become boundary items.
+//! `*-switched`, `system` and `skill` messages become row items, and an
+//! `idle` error becomes one only when it differs from the error the turn's
+//! last step or settled compaction already shows (upstream `rows.ts`
+//! `reduceSessionRows` `shownError`).
 
 use std::sync::Arc;
 
@@ -9,13 +13,14 @@ use ox_schema::message::{AssistantContent, Compaction, Message, ToolState as Wir
 use ox_schema::support::Content;
 
 use crate::store::{
-    AssistantItem, ChildRef, CompactionItem, CompactionStatus, CompletionItem, Item, ToolPart,
-    ToolState,
+    AssistantItem, ChildRef, CompactionItem, CompactionStatus, CompletionItem, ErrorInfo, Item,
+    ModelChoice, Notice, RetryInfo, ShownError, Switch, ToolPart, ToolState,
 };
 
 /// Turn a chronological message list into the store's ordered sequence.
 pub fn parse_messages(messages: &[Message]) -> Vec<Item> {
     let mut items = Vec::new();
+    let mut shown = ShownError::default();
 
     for message in messages {
         match message {
@@ -38,7 +43,19 @@ pub fn parse_messages(messages: &[Message]) -> Vec<Item> {
                         }
                     }
                 }
-                if text.is_empty() && reasoning.is_empty() && tools.is_empty() {
+                let error = assistant.error.as_ref().map(ErrorInfo::from);
+                shown.show(error.clone());
+                let retry = assistant.retry.as_ref().map(|retry| RetryInfo {
+                    attempt: retry.attempt,
+                    at: retry.at,
+                    message: Arc::from(retry.error.message.as_str()),
+                });
+                if text.is_empty()
+                    && reasoning.is_empty()
+                    && tools.is_empty()
+                    && error.is_none()
+                    && retry.is_none()
+                {
                     continue;
                 }
                 items.push(Item::Assistant(Box::new(AssistantItem {
@@ -82,12 +99,47 @@ pub fn parse_messages(messages: &[Message]) -> Vec<Item> {
                         .as_ref()
                         .map(crate::store::money_usd)
                         .unwrap_or(0.0),
+                    error,
+                    retry,
                     ..Default::default()
                 })));
             }
             Message::Compaction(message) => {
+                match &message.compaction {
+                    Compaction::Running { .. } => {}
+                    Compaction::Failed { error, .. } => shown.show(Some(ErrorInfo::from(error))),
+                    Compaction::Completed(_) => shown.show(None),
+                }
                 items.push(Item::Compaction(Box::new(compaction_item(message))));
             }
+            Message::Idle { error, .. } => {
+                if let Some(error) = shown.end_turn(error.as_ref().map(ErrorInfo::from)) {
+                    items.push(Item::Error(error));
+                }
+            }
+            Message::AgentSwitched {
+                agent, previous, ..
+            } => items.push(Item::Switch(Switch::Agent {
+                agent: Arc::from(agent.as_str()),
+                previous: previous.as_deref().map(Arc::from),
+            })),
+            Message::ModelSwitched {
+                model, previous, ..
+            } => items.push(Item::Switch(Switch::Model {
+                model: ModelChoice::from(model),
+                previous: previous.as_ref().map(ModelChoice::from),
+            })),
+            Message::LocationSwitched { location, .. } => {
+                items.push(Item::Switch(Switch::Location {
+                    directory: Arc::from(location.location.directory.as_str()),
+                }));
+            }
+            Message::System { description, .. } => items.push(Item::Notice(Notice::System {
+                description: description.as_deref().map(Arc::from),
+            })),
+            Message::Skill { name, .. } => items.push(Item::Notice(Notice::Skill {
+                name: Arc::from(name.as_str()),
+            })),
             Message::Synthetic {
                 id,
                 metadata,
@@ -139,15 +191,22 @@ fn compaction_item(message: &ox_schema::message::CompactionMessage) -> Compactio
 /// the resolved states carry the parsed input record.
 fn tool_part(id: &str, name: &str, state: &WireToolState) -> ToolPart {
     let mut child = None;
-    let (state, record, output, input_text): (ToolState, Option<&_>, String, String) = match state {
+    let (state, record, output, input_text, metadata): (
+        ToolState,
+        Option<&_>,
+        String,
+        String,
+        Option<&_>,
+    ) = match state {
         WireToolState::Streaming { input } => {
-            (ToolState::Input, None, String::new(), input.clone())
+            (ToolState::Input, None, String::new(), input.clone(), None)
         }
         WireToolState::Running { input, .. } => (
             ToolState::Running,
             Some(input),
             String::new(),
             String::new(),
+            None,
         ),
         WireToolState::Completed {
             input,
@@ -160,13 +219,20 @@ fn tool_part(id: &str, name: &str, state: &WireToolState) -> ToolPart {
                 Some(input),
                 join_text(content),
                 String::new(),
+                metadata.as_ref(),
             )
         }
-        WireToolState::Error { input, error, .. } => (
+        WireToolState::Error {
+            input,
+            error,
+            metadata,
+            ..
+        } => (
             ToolState::Failed,
             Some(input),
             error.message.clone(),
             String::new(),
+            metadata.as_ref(),
         ),
     };
     let mut part = ToolPart {
@@ -183,6 +249,10 @@ fn tool_part(id: &str, name: &str, state: &WireToolState) -> ToolPart {
             .map(|record| crate::store::todos_of(name, record))
             .unwrap_or_default(),
         child,
+        input: record
+            .map(|record| Arc::new(record.clone()))
+            .unwrap_or_default(),
+        metadata: metadata.map(|metadata| Arc::new(metadata.clone())),
     };
     if part.todos.is_empty() {
         part.todos = crate::store::todos_from_input_text(name, &part.input_text);

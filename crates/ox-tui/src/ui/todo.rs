@@ -57,6 +57,8 @@ pub fn lines(todos: &[Todo], width: u16) -> Vec<Line<'static>> {
     for todo in todos {
         let ink = match todo.status {
             TodoStatus::InProgress => palette.warning,
+            // Upstream `todo-item.tsx`: cancelled items recede to `faint`.
+            TodoStatus::Cancelled => palette.faint,
             _ => palette.dim,
         };
         let content_style = if todo.status == TodoStatus::Cancelled {
@@ -203,5 +205,18 @@ mod tests {
         );
         assert_eq!(out[3].spans[1].style.fg, palette.warning.fg);
         assert_eq!(out[4].spans[1].style.fg, palette.dim.fg);
+    }
+
+    #[test]
+    fn cancelled_items_use_the_faint_colour() {
+        let palette = super::theme::palette();
+        let out = lines(&[todo("a", TodoStatus::Cancelled)], 20);
+        let faint = palette.faint.patch(palette.raised_base);
+        assert_eq!(out[3].spans[1].style.fg, faint.fg, "marker");
+        assert_eq!(out[3].spans[2].style.fg, faint.fg, "content");
+        assert_eq!(
+            out[3].spans[1].style.add_modifier, faint.add_modifier,
+            "marker carries faint's modifiers (DIM on colourless decks)"
+        );
     }
 }

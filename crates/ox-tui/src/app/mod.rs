@@ -1714,6 +1714,8 @@ mod tests {
                 summary: "cargo test".into(),
                 output: std::sync::Arc::new("ok\ndone".into()),
                 background: false,
+                input: std::sync::Arc::default(),
+                metadata: None,
             }],
             0,
         );
@@ -4164,20 +4166,24 @@ mod tests {
 
     #[test]
     fn a_press_and_release_in_place_is_still_a_click() {
-        use crate::ui::timeline::{Block, Explored, ExploredCall, Transcript};
+        use crate::ui::timeline::{Block, Explored, ExploredCall, ExploredCount, Transcript};
         use ox_client::store::ToolState;
         let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
         app.transcript = Transcript::new(40, 10);
         app.transcript.sync(
             &[Block::Explored(Explored {
-                reads: 1,
+                counts: vec![ExploredCount {
+                    noun: "read",
+                    count: 1,
+                }],
                 group_id: "a".into(),
                 calls: vec![ExploredCall {
                     id: "a".into(),
                     version: 1,
                     tool: "read".into(),
                     state: ToolState::Success,
-                    summary: "a.txt".into(),
+                    input: std::sync::Arc::default(),
+                    metadata: None,
                 }],
                 ..Explored::default()
             })],
@@ -4199,20 +4205,24 @@ mod tests {
 
     #[test]
     fn a_double_click_on_a_toggle_row_toggles_once_and_selects_instead() {
-        use crate::ui::timeline::{Block, Explored, ExploredCall, Transcript};
+        use crate::ui::timeline::{Block, Explored, ExploredCall, ExploredCount, Transcript};
         use ox_client::store::ToolState;
         let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
         app.transcript = Transcript::new(40, 10);
         app.transcript.sync(
             &[Block::Explored(Explored {
-                reads: 1,
+                counts: vec![ExploredCount {
+                    noun: "read",
+                    count: 1,
+                }],
                 group_id: "a".into(),
                 calls: vec![ExploredCall {
                     id: "a".into(),
                     version: 1,
                     tool: "read".into(),
                     state: ToolState::Success,
-                    summary: "a.txt".into(),
+                    input: std::sync::Arc::default(),
+                    metadata: None,
                 }],
                 ..Explored::default()
             })],

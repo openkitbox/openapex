@@ -27,3 +27,5 @@ pub mod timeline;
 pub mod timeline_dialog;
 pub mod toast;
 pub mod todo;
+pub mod tool_row;
+pub mod tool_text;
