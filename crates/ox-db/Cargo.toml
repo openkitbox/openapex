@@ -10,7 +10,7 @@ tracing.workspace = true
 # `fts` is required: the mc_*_fts virtual tables are created through it.
 # Default features stay off so the driver never installs its own mimalloc
 # global allocator over the binary's.
-turso = { version = "=0.9.0-pre.1", default-features = false, features = ["fts"] }
+turso = { version = "0.9.0-pre.1", default-features = false, features = ["fts"] }
 
 [dev-dependencies]
 tempfile.workspace = true
