@@ -52,6 +52,7 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
         AppCommand::FindFiles(query) => find_files(&client, &tx, query).await,
         AppCommand::LoadAttachments(text) => load_attachments(&tx, text).await,
         AppCommand::ReadClipboard => read_clipboard(&tx).await,
+        AppCommand::WriteClipboard(text) => write_clipboard(&tx, text).await,
         AppCommand::LoadSessionChrome { session } => session_chrome(&client, &tx, session).await,
         AppCommand::McpList => mcp_list(&client, &tx).await,
         AppCommand::ModelList => model_list(&client, &tx).await,
@@ -155,6 +156,18 @@ async fn read_clipboard(tx: &Events) {
             crate::clipboard::Clip::Empty
         });
     let _ = tx.send(AppEvent::ClipboardPasted(clip));
+}
+
+/// Copy `text` to the host clipboard on a blocking thread. The text is moved
+/// in; a panicked task or a failed write reports `host_ok: false`.
+async fn write_clipboard(tx: &Events, text: String) {
+    let host_ok = tokio::task::spawn_blocking(move || crate::clipboard::write(&text).is_ok())
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(%err, "clipboard write task failed");
+            false
+        });
+    let _ = tx.send(AppEvent::ClipboardWritten { host_ok });
 }
 
 async fn session_chrome(client: &Client, tx: &Events, session: String) {

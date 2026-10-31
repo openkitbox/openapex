@@ -15,6 +15,7 @@ pub mod models;
 pub mod palette;
 pub mod paste;
 pub mod prompt;
+pub(crate) mod selection;
 pub mod session_dialog;
 pub mod spinner;
 pub mod table;

@@ -26,6 +26,7 @@ use crate::ui::layout;
 use crate::ui::palette;
 use crate::ui::paste;
 use crate::ui::prompt::{Chrome, Footer, Prompt, PromptAction, pick_placeholder, placeholder_line};
+use crate::ui::selection::Outcome;
 use crate::ui::session_dialog;
 use crate::ui::timeline::Transcript;
 use crate::ui::timeline_dialog;
@@ -110,6 +111,12 @@ pub struct App {
     /// once, the first time a context figure needs a percentage.
     context_limits: std::collections::HashMap<String, i64>,
     limits_requested: bool,
+    /// OSC 52 sequence of the last copy, written to the terminal before the
+    /// next frame (the executor never touches the terminal).
+    pending_osc52: Option<String>,
+    /// Whether the last copy produced an OSC 52 sequence, so the terminal was
+    /// asked to set its clipboard even if the host write fails.
+    osc52_attempted: bool,
 }
 
 impl App {
@@ -158,6 +165,8 @@ impl App {
             toast: None,
             context_limits: std::collections::HashMap::new(),
             limits_requested: false,
+            pending_osc52: None,
+            osc52_attempted: false,
         }
     }
 
@@ -168,8 +177,12 @@ impl App {
             AppEvent::Paste(text) => self.handle_paste(text),
             AppEvent::Attachments { text, loaded } => self.handle_attachments(text, loaded),
             AppEvent::ClipboardPasted(clip) => self.handle_clipboard(clip),
+            AppEvent::ClipboardWritten { host_ok } => self.handle_clipboard_written(host_ok),
             AppEvent::Resize => self.dirty = true,
-            AppEvent::Click { x, y } => self.handle_click(x, y),
+            AppEvent::MouseDown { x, y } => self.handle_mouse_down(x, y),
+            AppEvent::MouseDrag { x, y } => self.handle_mouse_drag(x, y),
+            AppEvent::MouseUp { x, y } => self.handle_mouse_up(x, y),
+            AppEvent::Hover { x, y } => self.handle_hover(x, y),
             AppEvent::Wheel(direction) => self.handle_wheel(direction),
             AppEvent::Stream(msg) => self.handle_stream(msg),
             AppEvent::History { request_id, items } => self.handle_history(request_id, items),
@@ -427,6 +440,27 @@ impl App {
         ));
     }
 
+    /// The host write finished. Like upstream, a failed host write is only an
+    /// error when the terminal was not asked to copy either.
+    fn handle_clipboard_written(&mut self, host_ok: bool) {
+        let toast = if host_ok || self.osc52_attempted {
+            Toast::new(
+                toast::Variant::Info,
+                None,
+                "Copied to clipboard",
+                Instant::now(),
+            )
+        } else {
+            Toast::new(
+                toast::Variant::Warning,
+                Some("Clipboard".to_owned()),
+                "Could not copy to the clipboard",
+                Instant::now(),
+            )
+        };
+        self.show_toast(toast);
+    }
+
     /// Replace the current toast and schedule a redraw.
     fn show_toast(&mut self, toast: Toast) {
         self.toast = Some(toast);
@@ -605,6 +639,15 @@ impl App {
 
     /// `handle_key` with the clock injected (the leader's 2s window).
     fn handle_key_at(&mut self, key: crossterm::event::KeyEvent, now: Instant) {
+        // A selection takes the key first (upstream `handleSelectionKey`):
+        // esc only clears it; every other key clears it and carries on.
+        if key.kind != crossterm::event::KeyEventKind::Release && self.transcript.clear_selection()
+        {
+            self.dirty = true;
+            if key.code == KeyCode::Esc {
+                return;
+            }
+        }
         // A dialog is modal: it eats every key, and only dismissal leaves it.
         if let Some(dialog) = &mut self.dialog {
             self.keymap.reset();
@@ -979,13 +1022,76 @@ impl App {
         }
     }
 
-    /// A click reaches the transcript only when nothing modal is on top.
-    fn handle_click(&mut self, x: u16, y: u16) {
-        if self.route == Route::Session
+    /// The pointer reaches the transcript only when nothing modal is on top.
+    fn pointer_enabled(&self) -> bool {
+        self.route == Route::Session
             && self.dialog.is_none()
             && !matches!(self.mode, Mode::SearchInput(_))
-            && self.transcript.click(x, y)
-        {
+    }
+
+    /// The gate closed (a modal opened, the route changed): a selection left
+    /// behind would stay highlighted and keep following a drag nobody sees.
+    fn close_pointer_gate(&mut self) {
+        if self.transcript.clear_selection() {
+            self.dirty = true;
+        }
+    }
+
+    fn handle_mouse_down(&mut self, x: u16, y: u16) {
+        self.handle_mouse_down_at(x, y, Instant::now());
+    }
+
+    /// `handle_mouse_down` with the clock injected (the multi-click window).
+    fn handle_mouse_down_at(&mut self, x: u16, y: u16, now: Instant) {
+        if !self.pointer_enabled() {
+            return self.close_pointer_gate();
+        }
+        if self.transcript.press(x, y, now) {
+            self.dirty = true;
+        }
+    }
+
+    fn handle_mouse_drag(&mut self, x: u16, y: u16) {
+        if !self.pointer_enabled() {
+            return self.close_pointer_gate();
+        }
+        if self.transcript.drag(x, y) {
+            self.dirty = true;
+        }
+    }
+
+    /// A release without a drag is the old click; a drag that selected text
+    /// hands it over for the clipboard.
+    fn handle_mouse_up(&mut self, x: u16, y: u16) {
+        if !self.pointer_enabled() {
+            return self.close_pointer_gate();
+        }
+        match self.transcript.release() {
+            Outcome::Click => {
+                if self.transcript.click(x, y) {
+                    self.dirty = true;
+                }
+            }
+            Outcome::Copy(text) => {
+                // Encode by borrowing, then move the text to the writer.
+                self.pending_osc52 = crate::clipboard::osc52(&text);
+                self.osc52_attempted = self.pending_osc52.is_some();
+                let _ = self.commands.send(AppCommand::WriteClipboard(text));
+                self.dirty = true;
+            }
+            Outcome::Nothing => self.dirty = true,
+        }
+    }
+
+    /// The pointer lights up transcript rows under the same gate as a click;
+    /// anywhere else it clears the hover. Repaint only when that changed.
+    fn handle_hover(&mut self, x: u16, y: u16) {
+        let changed = if self.pointer_enabled() {
+            self.transcript.hover(x, y)
+        } else {
+            self.transcript.clear_hover()
+        };
+        if changed {
             self.dirty = true;
         }
     }
@@ -998,6 +1104,11 @@ impl App {
             self.transcript.scroll_up(WHEEL_LINES);
         } else {
             self.transcript.scroll_down(WHEEL_LINES);
+        }
+        // A drag in progress follows the content under the pointer.
+        self.transcript.refocus_selection();
+        if self.pointer_enabled() {
+            self.transcript.rehover();
         }
         self.dirty = true;
     }
@@ -1141,6 +1252,7 @@ impl App {
                         // cursor hopping around while cells are written is
                         // never seen (an IME anchors on it). Terminals that
                         // do not know the sequence ignore it.
+                        flush_osc52(&mut self.pending_osc52, terminal.terminal.backend_mut())?;
                         execute!(terminal.terminal.backend_mut(), BeginSynchronizedUpdate)?;
                         let drawn = match self.route {
                             Route::Home => {
@@ -1216,6 +1328,16 @@ impl App {
             }
         }
     }
+}
+
+/// Send the pending OSC 52 copy sequence, if any, through the writer ratatui
+/// draws with, so it cannot interleave with a frame.
+fn flush_osc52(pending: &mut Option<String>, out: &mut impl std::io::Write) -> std::io::Result<()> {
+    if let Some(sequence) = pending.take() {
+        out.write_all(sequence.as_bytes())?;
+        out.flush()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1300,6 +1422,61 @@ mod tests {
         app.dirty = false;
         app.handle(AppEvent::Resize);
         assert!(app.dirty, "a terminal resize must schedule a redraw");
+    }
+
+    #[test]
+    fn hover_marks_the_transcript_dirty_only_when_the_hovered_row_changes() {
+        use crate::ui::timeline::{Block, Transcript};
+
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        app.transcript = Transcript::new(40, 10);
+        app.transcript.sync(&[Block::user("hello")], 0);
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| app.transcript.render(frame, frame.area()))
+            .unwrap();
+
+        app.dirty = false;
+        app.handle(AppEvent::Hover { x: 5, y: 2 });
+        assert!(app.dirty, "entering the user block repaints");
+        app.dirty = false;
+        app.handle(AppEvent::Hover { x: 9, y: 2 });
+        assert!(!app.dirty, "same block: no repaint per pointer cell");
+        app.handle(AppEvent::Hover { x: 100, y: 2 });
+        assert!(app.dirty, "leaving the transcript clears and repaints");
+    }
+
+    #[test]
+    fn hover_is_cleared_and_ignored_under_a_dialog_or_off_the_session_route() {
+        use crate::ui::timeline::{Block, Transcript};
+
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        app.transcript = Transcript::new(40, 10);
+        app.transcript.sync(&[Block::user("hello")], 0);
+        let backend = ratatui::backend::TestBackend::new(40, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| app.transcript.render(frame, frame.area()))
+            .unwrap();
+        app.handle(AppEvent::Hover { x: 5, y: 2 });
+
+        app.dialog = Some(Dialog::Select(crate::ui::palette::select(
+            crate::ui::palette::Context { in_session: true },
+            crate::app::keymap::hint,
+        )));
+        app.dirty = false;
+        app.handle(AppEvent::Hover { x: 5, y: 2 });
+        assert!(app.dirty, "opening a dialog dropped the existing hover");
+        app.dirty = false;
+        app.handle(AppEvent::Hover { x: 5, y: 2 });
+        assert!(!app.dirty, "a modal swallows hover; nothing left to clear");
+
+        app.dialog = None;
+        app.route = Route::Home;
+        app.dirty = false;
+        app.handle(AppEvent::Hover { x: 5, y: 2 });
+        assert!(!app.dirty, "the home route has no transcript to hover");
     }
 
     #[test]
@@ -2980,5 +3157,290 @@ mod tests {
             selection: selection("stale"),
         });
         assert_eq!(app.prompt.chrome().model.as_deref(), Some("k3"));
+    }
+
+    fn pointer_app(texts: &[&str]) -> (App, mpsc::UnboundedReceiver<AppCommand>) {
+        use crate::ui::timeline::{Block, Transcript};
+        let (mut app, rx) = app(Route::Session, Some("ses_test"));
+        app.transcript = Transcript::new(40, 10);
+        let blocks: Vec<Block> = texts.iter().map(|t| Block::user(t)).collect();
+        app.transcript.sync(&blocks, 0);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|frame| app.transcript.render(frame, frame.area()))
+            .unwrap();
+        (app, rx)
+    }
+
+    fn drag_over(app: &mut App, from: (u16, u16), to: (u16, u16)) {
+        app.handle(AppEvent::MouseDown {
+            x: from.0,
+            y: from.1,
+        });
+        app.handle(AppEvent::MouseDrag { x: to.0, y: to.1 });
+        app.handle(AppEvent::MouseUp { x: to.0, y: to.1 });
+    }
+
+    fn copy_texts(commands: &[AppCommand]) -> Vec<&str> {
+        commands
+            .iter()
+            .filter_map(|c| match c {
+                AppCommand::WriteClipboard(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn toast_of(app: &App) -> &Toast {
+        app.toast.as_ref().expect("a toast")
+    }
+
+    #[test]
+    fn a_copy_sends_one_write_command_and_queues_the_osc_sequence() {
+        let (mut app, mut rx) = pointer_app(&["hello world"]);
+        drag_over(&mut app, (3, 2), (7, 2));
+        let commands = drain(&mut rx);
+        assert_eq!(copy_texts(&commands), ["hello"]);
+        assert_eq!(commands.len(), 1, "{commands:?}");
+        assert_eq!(app.pending_osc52.as_deref(), Some("\x1b]52;c;aGVsbG8=\x07"));
+    }
+
+    #[test]
+    fn the_pending_osc_sequence_is_written_once_and_cleared() {
+        let mut pending = Some("\x1b]52;c;aGk=\x07".to_owned());
+        let mut out: Vec<u8> = Vec::new();
+        super::flush_osc52(&mut pending, &mut out).unwrap();
+        assert_eq!(out, b"\x1b]52;c;aGk=\x07");
+        assert_eq!(pending, None);
+        super::flush_osc52(&mut pending, &mut out).unwrap();
+        assert_eq!(out, b"\x1b]52;c;aGk=\x07", "nothing more to write");
+    }
+
+    #[test]
+    fn a_host_write_shows_the_copied_toast() {
+        let (mut app, _rx) = pointer_app(&["hello world"]);
+        app.dirty = false;
+        app.handle(AppEvent::ClipboardWritten { host_ok: true });
+        assert_eq!(toast_of(&app).variant, toast::Variant::Info);
+        assert_eq!(toast_of(&app).message, "Copied to clipboard");
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn a_failed_host_write_is_fine_when_the_osc_sequence_went_out() {
+        let (mut app, _rx) = pointer_app(&["hello world"]);
+        drag_over(&mut app, (3, 2), (7, 2));
+        app.handle(AppEvent::ClipboardWritten { host_ok: false });
+        assert_eq!(toast_of(&app).variant, toast::Variant::Info);
+        assert_eq!(toast_of(&app).message, "Copied to clipboard");
+    }
+
+    #[test]
+    fn a_failed_host_write_without_an_osc_sequence_warns() {
+        let (mut app, _rx) = pointer_app(&["hello world"]);
+        app.handle(AppEvent::ClipboardWritten { host_ok: false });
+        assert_eq!(toast_of(&app).variant, toast::Variant::Warning);
+    }
+
+    #[test]
+    fn dragging_over_text_hands_over_the_selected_text_and_repaints() {
+        let (mut app, mut rx) = pointer_app(&["hello world"]);
+        app.dirty = false;
+        drag_over(&mut app, (3, 2), (7, 2));
+        assert_eq!(copy_texts(&drain(&mut rx)), ["hello"]);
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn a_press_and_release_in_place_is_still_a_click() {
+        use crate::ui::timeline::{Block, Explored, ExploredCall, Transcript};
+        use ox_client::store::ToolState;
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        app.transcript = Transcript::new(40, 10);
+        app.transcript.sync(
+            &[Block::Explored(Explored {
+                reads: 1,
+                group_id: "a".into(),
+                calls: vec![ExploredCall {
+                    id: "a".into(),
+                    version: 1,
+                    tool: "read".into(),
+                    state: ToolState::Success,
+                    summary: "a.txt".into(),
+                }],
+                ..Explored::default()
+            })],
+            0,
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|frame| app.transcript.render(frame, frame.area()))
+            .unwrap();
+        let rows = app.transcript.total_lines();
+        app.dirty = false;
+        app.handle(AppEvent::MouseDown { x: 6, y: 1 });
+        app.handle(AppEvent::MouseUp { x: 6, y: 1 });
+        assert!(app.dirty, "the click expanded the group");
+        assert!(app.transcript.total_lines() > rows);
+        assert!(copy_texts(&drain(&mut rx)).is_empty());
+    }
+
+    #[test]
+    fn a_double_click_on_a_toggle_row_toggles_once_and_selects_instead() {
+        use crate::ui::timeline::{Block, Explored, ExploredCall, Transcript};
+        use ox_client::store::ToolState;
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        app.transcript = Transcript::new(40, 10);
+        app.transcript.sync(
+            &[Block::Explored(Explored {
+                reads: 1,
+                group_id: "a".into(),
+                calls: vec![ExploredCall {
+                    id: "a".into(),
+                    version: 1,
+                    tool: "read".into(),
+                    state: ToolState::Success,
+                    summary: "a.txt".into(),
+                }],
+                ..Explored::default()
+            })],
+            0,
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|frame| app.transcript.render(frame, frame.area()))
+            .unwrap();
+        let collapsed = app.transcript.total_lines();
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+
+        // First click: an ordinary click, the group opens.
+        app.handle_mouse_down_at(6, 1, t0);
+        app.handle_mouse_up(6, 1);
+        let open = app.transcript.total_lines();
+        assert!(open > collapsed);
+
+        // Second click within the window selects a word and does not toggle
+        // again (upstream click handlers skip when text is selected).
+        app.handle_mouse_down_at(6, 1, t0 + ms(100));
+        app.handle_mouse_up(6, 1);
+        assert_eq!(app.transcript.total_lines(), open, "still open");
+        assert!(app.transcript.has_selection(), "the word is highlighted");
+
+        // Third click selects the line, still no toggle.
+        app.handle_mouse_down_at(6, 1, t0 + ms(200));
+        app.handle_mouse_up(6, 1);
+        assert_eq!(app.transcript.total_lines(), open, "still open");
+
+        // After the window lapses a click is a plain click again.
+        app.handle_mouse_down_at(6, 1, t0 + ms(900));
+        app.handle_mouse_up(6, 1);
+        assert_eq!(app.transcript.total_lines(), collapsed, "closed again");
+        drain(&mut rx);
+    }
+
+    #[test]
+    fn a_double_click_copies_the_word() {
+        let (mut app, mut rx) = pointer_app(&["hello world"]);
+        let t0 = Instant::now();
+        app.handle_mouse_down_at(10, 2, t0);
+        app.handle_mouse_up(10, 2);
+        assert!(
+            copy_texts(&drain(&mut rx)).is_empty(),
+            "one click copies nothing"
+        );
+        app.handle_mouse_down_at(10, 2, t0 + Duration::from_millis(120));
+        app.handle_mouse_up(10, 2);
+        assert_eq!(copy_texts(&drain(&mut rx)), ["world"]);
+        app.handle_mouse_down_at(10, 2, t0 + Duration::from_millis(240));
+        app.handle_mouse_up(10, 2);
+        assert_eq!(copy_texts(&drain(&mut rx)), ["hello world"]);
+    }
+
+    #[test]
+    fn a_modal_swallows_the_pointer() {
+        let (mut app, mut rx) = pointer_app(&["hello world"]);
+        app.route = Route::Home;
+        drag_over(&mut app, (3, 2), (7, 2));
+        assert!(copy_texts(&drain(&mut rx)).is_empty());
+    }
+
+    #[test]
+    fn esc_clears_a_selection_and_is_swallowed_other_keys_clear_and_carry_on() {
+        let (mut app, _rx) = pointer_app(&["hello world"]);
+        drag_over(&mut app, (3, 2), (7, 2));
+        assert!(app.transcript.has_selection());
+        app.dirty = false;
+        key(&mut app, KeyCode::Esc);
+        assert!(!app.transcript.has_selection());
+        assert!(app.dirty);
+
+        drag_over(&mut app, (3, 2), (7, 2));
+        ctrl(&mut app, 'c');
+        assert!(!app.transcript.has_selection());
+        assert!(
+            app.view.should_quit,
+            "ctrl+c clears the selection and then does its normal job"
+        );
+
+        drag_over(&mut app, (3, 2), (7, 2));
+        key(&mut app, KeyCode::Char('x'));
+        assert!(!app.transcript.has_selection());
+        assert_eq!(app.prompt.text(), "x", "the key still reached the prompt");
+    }
+
+    #[test]
+    fn the_wheel_moves_the_focus_of_a_drag_in_progress() {
+        let (mut app, _rx) = pointer_app(&["aaa", "bbb", "ccc", "ddd"]);
+        app.handle(AppEvent::MouseDown { x: 3, y: 2 });
+        app.handle(AppEvent::MouseDrag { x: 5, y: 7 });
+        let before = app.transcript.selection_focus();
+        app.handle(AppEvent::Wheel(-1));
+        assert_ne!(app.transcript.selection_focus(), before);
+    }
+
+    #[test]
+    fn a_modal_opening_mid_drag_drops_the_selection() {
+        let (mut app, mut rx) = pointer_app(&["hello world"]);
+        app.handle(AppEvent::MouseDown { x: 3, y: 2 });
+        app.handle(AppEvent::MouseDrag { x: 7, y: 2 });
+        assert!(app.transcript.has_selection());
+        app.mode = crate::app::Mode::SearchInput(Box::default());
+        app.dirty = false;
+        app.handle(AppEvent::MouseDrag { x: 8, y: 2 });
+        assert!(!app.transcript.has_selection());
+        assert!(app.dirty, "the highlight went away, repaint");
+        app.mode = crate::app::Mode::Browse;
+        app.handle(AppEvent::MouseUp { x: 8, y: 2 });
+        assert!(
+            copy_texts(&drain(&mut rx)).is_empty(),
+            "the gesture is over, nothing is copied"
+        );
+
+        // The same through a dialog, ended by the release.
+        app.handle(AppEvent::MouseDown { x: 3, y: 2 });
+        app.handle(AppEvent::MouseDrag { x: 7, y: 2 });
+        app.dialog = Some(Dialog::Select(crate::ui::palette::select(
+            crate::ui::palette::Context { in_session: true },
+            crate::app::keymap::hint,
+        )));
+        app.handle(AppEvent::MouseUp { x: 7, y: 2 });
+        assert!(!app.transcript.has_selection());
+        assert!(copy_texts(&drain(&mut rx)).is_empty());
+    }
+
+    #[test]
+    fn esc_without_a_selection_is_not_swallowed() {
+        let (mut app, _rx) = pointer_app(&["hello world"]);
+        assert!(!app.transcript.has_selection());
+        app.dialog = Some(Dialog::Select(crate::ui::palette::select(
+            crate::ui::palette::Context { in_session: true },
+            crate::app::keymap::hint,
+        )));
+        key(&mut app, KeyCode::Esc);
+        assert!(app.dialog.is_none(), "esc reached the dialog and closed it");
     }
 }

@@ -1,5 +1,5 @@
 // event.rs — UI intent (keyboard/stream), never network actions.
-use crossterm::event::{Event, KeyEvent, MouseButton, MouseEventKind};
+use crossterm::event::{Event, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ox_client::store::Item;
 use ox_schema::support::FileInput;
 
@@ -11,8 +11,24 @@ pub enum AppEvent {
     /// The terminal changed size. It carries no geometry: the redraw re-reads
     /// `frame.area()` and ratatui re-queries the backend on every `draw`.
     Resize,
-    /// Left click at a screen cell.
-    Click {
+    /// Left button pressed at a screen cell (without ctrl, which the terminal
+    /// layer keeps for itself, `renderer.ts:3994-3998`).
+    MouseDown {
+        x: u16,
+        y: u16,
+    },
+    /// The pointer moved to a screen cell with the left button held.
+    MouseDrag {
+        x: u16,
+        y: u16,
+    },
+    /// Left button released at a screen cell.
+    MouseUp {
+        x: u16,
+        y: u16,
+    },
+    /// The pointer moved to a screen cell with no button held.
+    Hover {
         x: u16,
         y: u16,
     },
@@ -92,6 +108,11 @@ pub enum AppEvent {
     },
     /// Answer to `AppCommand::ReadClipboard`.
     ClipboardPasted(crate::clipboard::Clip),
+    /// Answer to `AppCommand::WriteClipboard`: whether a host command took
+    /// the text.
+    ClipboardWritten {
+        host_ok: bool,
+    },
 }
 
 impl AppEvent {
@@ -104,7 +125,23 @@ impl AppEvent {
             Event::Paste(text) => Some(AppEvent::Paste(text)),
             Event::Resize(_, _) => Some(AppEvent::Resize),
             Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::Up(MouseButton::Left) => Some(AppEvent::Click {
+                MouseEventKind::Down(MouseButton::Left)
+                    if !mouse.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    Some(AppEvent::MouseDown {
+                        x: mouse.column,
+                        y: mouse.row,
+                    })
+                }
+                MouseEventKind::Drag(MouseButton::Left) => Some(AppEvent::MouseDrag {
+                    x: mouse.column,
+                    y: mouse.row,
+                }),
+                MouseEventKind::Up(MouseButton::Left) => Some(AppEvent::MouseUp {
+                    x: mouse.column,
+                    y: mouse.row,
+                }),
+                MouseEventKind::Moved => Some(AppEvent::Hover {
                     x: mouse.column,
                     y: mouse.row,
                 }),
@@ -148,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn left_release_is_a_click_and_the_wheel_scrolls() {
+    fn left_button_press_drag_release_and_the_wheel_translate() {
         use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
         let mouse = |kind| {
             Event::Mouse(MouseEvent {
@@ -159,14 +196,51 @@ mod tests {
             })
         };
         assert!(matches!(
+            AppEvent::from_terminal(mouse(MouseEventKind::Down(MouseButton::Left))),
+            Some(AppEvent::MouseDown { x: 7, y: 5 })
+        ));
+        assert!(matches!(
+            AppEvent::from_terminal(mouse(MouseEventKind::Drag(MouseButton::Left))),
+            Some(AppEvent::MouseDrag { x: 7, y: 5 })
+        ));
+        assert!(matches!(
             AppEvent::from_terminal(mouse(MouseEventKind::Up(MouseButton::Left))),
-            Some(AppEvent::Click { x: 7, y: 5 })
+            Some(AppEvent::MouseUp { x: 7, y: 5 })
         ));
         assert!(matches!(
             AppEvent::from_terminal(mouse(MouseEventKind::ScrollUp)),
             Some(AppEvent::Wheel(-1))
         ));
-        assert!(AppEvent::from_terminal(mouse(MouseEventKind::Down(MouseButton::Left))).is_none());
+    }
+
+    #[test]
+    fn ctrl_left_press_and_other_buttons_are_dropped() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mouse = |kind, modifiers| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 1,
+                row: 1,
+                modifiers,
+            })
+        };
+        assert!(
+            AppEvent::from_terminal(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                KeyModifiers::CONTROL
+            ))
+            .is_none(),
+            "ctrl+left-down never starts a selection"
+        );
+        for button in [MouseButton::Right, MouseButton::Middle] {
+            for kind in [
+                MouseEventKind::Down(button),
+                MouseEventKind::Drag(button),
+                MouseEventKind::Up(button),
+            ] {
+                assert!(AppEvent::from_terminal(mouse(kind, KeyModifiers::NONE)).is_none());
+            }
+        }
     }
 
     #[test]
@@ -179,14 +253,26 @@ mod tests {
             other => panic!("key events must survive: {other:?}"),
         }
         assert!(AppEvent::from_terminal(Event::FocusGained).is_none());
-        assert!(
-            AppEvent::from_terminal(Event::Mouse(crossterm::event::MouseEvent {
-                kind: crossterm::event::MouseEventKind::Moved,
-                column: 0,
-                row: 0,
+    }
+
+    #[test]
+    fn pointer_motion_becomes_a_hover_and_other_mouse_kinds_stay_dropped() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mouse = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 9,
+                row: 4,
                 modifiers: KeyModifiers::NONE,
-            }))
-            .is_none()
+            })
+        };
+        assert!(matches!(
+            AppEvent::from_terminal(mouse(MouseEventKind::Moved)),
+            Some(AppEvent::Hover { x: 9, y: 4 })
+        ));
+        assert!(
+            AppEvent::from_terminal(mouse(MouseEventKind::Drag(MouseButton::Right))).is_none(),
+            "only the left button drags"
         );
     }
 }

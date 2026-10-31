@@ -3,7 +3,7 @@ use std::sync::Arc;
 use ox_client::store::{AssistantItem, DataStore, Item, ToolPart};
 use ox_schema::support::FinishReason;
 
-use crate::ui::timeline::{Block, Explored, TurnFooter};
+use crate::ui::timeline::{Block, Explored, ExploredCall, TurnFooter};
 
 /// Projection of the store's ordered items into display blocks. Ordering is
 /// owned by `DataStore::items`; text is shared via `Arc` so an unchanged block
@@ -78,8 +78,18 @@ fn push_tools(blocks: &mut Vec<Block>, tools: &[ToolPart]) {
     let mut group: Option<Explored> = None;
     for tool in tools {
         if let Some(count) = explored_kind(&tool.tool) {
-            let explored = group.get_or_insert_with(Explored::default);
+            let explored = group.get_or_insert_with(|| Explored {
+                group_id: tool.id.clone(),
+                ..Explored::default()
+            });
             count(explored);
+            explored.calls.push(ExploredCall {
+                id: tool.id.clone(),
+                version: tool.version,
+                tool: tool.tool.clone(),
+                state: tool.state,
+                summary: tool.summary.clone(),
+            });
             explored.running |= !matches!(
                 tool.state,
                 ox_client::store::ToolState::Success | ox_client::store::ToolState::Failed
@@ -204,6 +214,76 @@ mod tests {
         assert!(
             matches!(&blocks[2], Block::Explored(e) if e.reads == 1 && e.searches == 0 && !e.running)
         );
+    }
+
+    fn part(id: &str, tool: &str, state: ToolState, version: u64) -> ToolPart {
+        ToolPart {
+            id: id.into(),
+            tool: tool.into(),
+            state,
+            summary: format!("{tool}-arg"),
+            version,
+            ..Default::default()
+        }
+    }
+
+    fn store_with_tools(tools: Vec<ToolPart>) -> DataStore {
+        let mut store = DataStore::default();
+        store.items = vec![Item::Assistant(Box::new(AssistantItem {
+            id: "m1".into(),
+            tools,
+            ..Default::default()
+        }))];
+        store
+    }
+
+    #[test]
+    fn consecutive_exploring_tools_fold_into_one_group_that_keeps_its_calls() {
+        let store = store_with_tools(vec![
+            part("a", "read", ToolState::Success, 1),
+            part("b", "grep", ToolState::Success, 2),
+            part("c", "webfetch", ToolState::Success, 3),
+            part("d", "shell", ToolState::Success, 4),
+            part("e", "read", ToolState::Success, 5),
+        ]);
+
+        let blocks = blocks_from_store(&store);
+        assert_eq!(blocks.len(), 4, "text, group, shell, second group");
+        let Block::Explored(first) = &blocks[1] else {
+            panic!("{:?}", blocks[1]);
+        };
+        assert_eq!(first.group_id, "a", "id of the first call");
+        assert_eq!((first.reads, first.searches, first.fetches), (1, 1, 1));
+        let calls: Vec<(&str, &str)> = first
+            .calls
+            .iter()
+            .map(|call| (call.id.as_str(), call.tool.as_str()))
+            .collect();
+        assert_eq!(calls, [("a", "read"), ("b", "grep"), ("c", "webfetch")]);
+        assert_eq!(first.calls[1].summary, "grep-arg");
+        let Block::Explored(second) = &blocks[3] else {
+            panic!("{:?}", blocks[3]);
+        };
+        assert_eq!(second.group_id, "e");
+        assert_eq!(second.calls.len(), 1);
+    }
+
+    #[test]
+    fn a_call_status_change_makes_the_group_block_unequal() {
+        let running = blocks_from_store(&store_with_tools(vec![
+            part("a", "read", ToolState::Success, 1),
+            part("b", "grep", ToolState::Running, 1),
+        ]));
+        let done = blocks_from_store(&store_with_tools(vec![
+            part("a", "read", ToolState::Success, 1),
+            part("b", "grep", ToolState::Success, 2),
+        ]));
+        let same = blocks_from_store(&store_with_tools(vec![
+            part("a", "read", ToolState::Success, 1),
+            part("b", "grep", ToolState::Running, 1),
+        ]));
+        assert_ne!(running[1], done[1]);
+        assert_eq!(running[1], same[1]);
     }
 
     #[test]

@@ -1,20 +1,25 @@
-//! Reading the system clipboard. This is the only module that spawns
-//! clipboard-reading subprocesses (`osascript`/`pbpaste` on macOS,
-//! `wl-paste`/`xclip` on Linux). Which commands to try ([`read_plan`]) and what
-//! their output means ([`classify`]) are pure; [`read`] and
-//! [`run_with_timeout`] are the I/O edge, run by the executor under
-//! `spawn_blocking`.
+//! Reading and writing the system clipboard. This is the only module that
+//! spawns clipboard subprocesses (`osascript`/`pbpaste`/`pbcopy` on macOS,
+//! `wl-paste`/`wl-copy`/`xclip` on Linux). Which commands to try
+//! ([`read_plan`], [`write_plan`]), what their output means ([`classify`]) and
+//! the terminal-side copy sequence ([`osc52`]) are pure; [`read`], [`write`]
+//! and [`run_with_timeout`] are the I/O edge, run by the executor under
+//! `spawn_blocking`. Writing never prints to the terminal: the OSC 52 string is
+//! handed back to the caller, which owns the terminal.
 //!
 //! Deviations from upstream `clipboard.ts` (which uses OpenTUI's host
 //! clipboard): other platforms answer [`Clip::Unsupported`] instead of reading
 //! through the terminal, and macOS images come from `osascript`'s
 //! `«data PNGf…»` hex text rather than a temp file, so nothing touches disk.
 
-use std::io::Read;
+use std::borrow::Cow;
+use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use ox_schema::support::FileInput;
 
 /// Largest image or text taken from the clipboard (same budget as pasted files).
@@ -23,6 +28,8 @@ pub const MAX_CLIPBOARD_BYTES: usize = 20 * 1024 * 1024;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// What a command may print: osascript writes the PNG as hex, twice the size.
 const MAX_OUTPUT_BYTES: usize = 2 * MAX_CLIPBOARD_BYTES + 64;
+/// Largest OSC 52 base64 payload sent; some terminals drop bigger ones.
+const MAX_OSC52_PAYLOAD: usize = 75_000;
 const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
 
 /// What the clipboard held.
@@ -147,6 +154,90 @@ fn hex_digit(byte: u8) -> Option<u8> {
     char::from(byte).to_digit(16).map(|d| d as u8)
 }
 
+/// The commands that copy stdin to the clipboard on `os`, first working one
+/// wins. Empty means unsupported.
+pub fn write_plan(os: &str) -> Vec<(&'static str, &'static [&'static str])> {
+    match os {
+        "macos" => vec![("pbcopy", &[])],
+        "linux" => vec![
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard", "-i"]),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// `text` without NUL bytes (neither the host clipboard nor OSC 52 can carry
+/// them); borrowed when there are none.
+fn without_nul(text: &str) -> Cow<'_, str> {
+    if text.contains('\0') {
+        Cow::Owned(text.replace('\0', ""))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+/// The terminal sequence (`ESC ] 52 ; c ; <base64> BEL`) that makes the
+/// terminal set its clipboard, which reaches the local machine over ssh.
+/// `None` for empty text or a payload over [`MAX_OSC52_PAYLOAD`].
+pub fn osc52(text: &str) -> Option<String> {
+    let text = without_nul(text);
+    if text.is_empty() || text.len().div_ceil(3) * 4 > MAX_OSC52_PAYLOAD {
+        return None;
+    }
+    Some(format!(
+        "\x1b]52;c;{}\x07",
+        STANDARD.encode(text.as_bytes())
+    ))
+}
+
+/// Copy `text` to the host clipboard with the first command of
+/// [`write_plan`] that accepts it. Blocks; nothing is printed.
+pub fn write(text: &str) -> std::io::Result<()> {
+    let text = without_nul(text);
+    for (program, args) in write_plan(std::env::consts::OS) {
+        if pipe_into(program, args, text.as_bytes(), COMMAND_TIMEOUT) {
+            return Ok(());
+        }
+    }
+    Err(std::io::Error::other(
+        "no clipboard command accepted the text",
+    ))
+}
+
+/// Run `program`, feed it `input` on stdin, and report whether it exited
+/// successfully within `timeout` (it is killed after that). The input is
+/// written from a helper thread so a child that stops reading cannot stall us.
+fn pipe_into(program: &str, args: &[&str], input: &[u8], timeout: Duration) -> bool {
+    let Ok(mut child) = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    };
+    let deadline = Instant::now() + timeout;
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            // A broken pipe means the child exited early; its status says why.
+            let _ = stdin.write_all(input);
+        });
+        let ok = wait_until(&mut child, deadline) == Some(true);
+        if !ok {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        ok
+    })
+}
+
 /// Read the clipboard with the commands of this platform. Blocks.
 pub fn read() -> Clip {
     let plan = read_plan(std::env::consts::OS);
@@ -217,9 +308,6 @@ fn wait_until(child: &mut Child, deadline: Instant) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
-
-    use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD;
 
     use super::*;
 
@@ -377,5 +465,75 @@ mod tests {
             started.elapsed() < Duration::from_secs(20),
             "the child must be killed, not waited for"
         );
+    }
+
+    #[test]
+    fn write_plans_per_os() {
+        assert_eq!(write_plan("macos"), [("pbcopy", &[] as &[&str])]);
+        assert_eq!(
+            write_plan("linux"),
+            [
+                ("wl-copy", &[] as &[&str]),
+                ("xclip", &["-selection", "clipboard", "-i"][..])
+            ]
+        );
+        for os in ["windows", "freebsd", ""] {
+            assert!(write_plan(os).is_empty(), "{os}");
+        }
+    }
+
+    #[test]
+    fn osc52_wraps_the_base64_text() {
+        assert_eq!(osc52("hi").as_deref(), Some("\x1b]52;c;aGk=\x07"));
+        assert_eq!(osc52("你好").as_deref(), Some("\x1b]52;c;5L2g5aW9\x07"));
+    }
+
+    #[test]
+    fn osc52_skips_empty_and_oversized_text() {
+        assert_eq!(osc52(""), None);
+        assert_eq!(osc52("\0\0"), None, "nothing is left after the NULs");
+        // 56_250 bytes encode to exactly 75_000; one more byte does not fit.
+        assert!(osc52(&"a".repeat(56_250)).is_some());
+        assert_eq!(osc52(&"a".repeat(56_251)), None);
+    }
+
+    #[test]
+    fn osc52_drops_nul_bytes_before_encoding() {
+        assert_eq!(osc52("h\0i").as_deref(), osc52("hi").as_deref());
+    }
+
+    #[test]
+    fn a_command_receives_the_whole_input_on_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out");
+        let script = format!("cat > {}", out.display());
+        let big = "x".repeat(300_000); // more than a pipe buffer holds
+        assert!(pipe_into(
+            "sh",
+            &["-c", &script],
+            big.as_bytes(),
+            Duration::from_secs(10)
+        ));
+        assert_eq!(std::fs::read_to_string(out).unwrap(), big);
+    }
+
+    #[test]
+    fn a_failing_hung_or_missing_writer_reports_false() {
+        let t = Duration::from_millis(200);
+        assert!(!pipe_into(
+            "sh",
+            &["-c", "cat >/dev/null; exit 3"],
+            b"hi",
+            t
+        ));
+        assert!(!pipe_into("ox-no-such-clipboard-tool", &[], b"hi", t));
+        let started = Instant::now();
+        assert!(!pipe_into(
+            "sh",
+            &["-c", "sleep 30"],
+            &vec![b'x'; 300_000],
+            t
+        ));
+        assert!(started.elapsed() < Duration::from_secs(20));
     }
 }

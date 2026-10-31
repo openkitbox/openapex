@@ -8,7 +8,11 @@ use tokio::sync::{mpsc, watch};
 use app::App;
 
 fn arg(name: &str) -> Option<String> {
-    let mut args = std::env::args().skip(1);
+    arg_in(std::env::args().skip(1), name)
+}
+
+fn arg_in(args: impl IntoIterator<Item = String>, name: &str) -> Option<String> {
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if arg == name {
             return args.next();
@@ -18,6 +22,12 @@ fn arg(name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Mouse capture is on unless `--no-mouse` is given: without it the terminal
+/// keeps its native text selection.
+fn mouse_enabled(args: impl IntoIterator<Item = String>) -> bool {
+    !args.into_iter().any(|arg| arg == "--no-mouse")
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -46,7 +56,7 @@ pub async fn run() -> anyhow::Result<()> {
         }
     });
 
-    let mut guard = terminal::TerminalGuard::new()?;
+    let mut guard = terminal::TerminalGuard::new(mouse_enabled(std::env::args().skip(1)))?;
     terminal::install_panic_hook();
 
     let demo = std::env::var("OX_TUI_DEMO").ok();
@@ -198,4 +208,49 @@ async fn connect_unix(directory: &str) -> anyhow::Result<ox_client::Client> {
     .map_err(|_| anyhow::anyhow!("ox server did not grant a lease; check the server log"))??;
     tokio::spawn(lifecycle::run_lease(client.clone(), first, reconnect));
     Ok(client)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn mouse_is_enabled_by_default() {
+        assert!(mouse_enabled(args(&[])));
+        assert!(mouse_enabled(args(&[
+            "--server",
+            "http://x",
+            "--session=s"
+        ])));
+    }
+
+    #[test]
+    fn no_mouse_turns_capture_off_anywhere_in_the_args() {
+        assert!(!mouse_enabled(args(&["--no-mouse"])));
+        assert!(!mouse_enabled(args(&["--session", "s", "--no-mouse"])));
+    }
+
+    #[test]
+    fn a_lookalike_flag_does_not_turn_capture_off() {
+        assert!(mouse_enabled(args(&[
+            "--no-mouse=1",
+            "--mouse",
+            "no-mouse"
+        ])));
+    }
+
+    #[test]
+    fn other_args_still_parse_beside_no_mouse() {
+        let list = args(&["--no-mouse", "--server", "http://a", "--directory=/d"]);
+        assert_eq!(
+            arg_in(list.clone(), "--server").as_deref(),
+            Some("http://a")
+        );
+        assert_eq!(arg_in(list.clone(), "--directory").as_deref(), Some("/d"));
+        assert_eq!(arg_in(list, "--session"), None);
+    }
 }

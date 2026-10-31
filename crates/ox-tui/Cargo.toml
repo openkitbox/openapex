@@ -26,6 +26,8 @@ futures-util.workspace = true
 serde_json.workspace = true
 textwrap.workspace = true
 unicode-width.workspace = true
+# Already in the lock via ratatui; selection columns are measured per grapheme cluster.
+unicode-segmentation = "1.13"
 tracing.workspace = true
 anyhow.workspace = true
 base64.workspace = true

@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
@@ -9,6 +11,8 @@ use ox_client::todo::Todo;
 use ox_schema::support::TokenUsage;
 
 use crate::theme;
+
+use super::selection::{self, Behavior, ClickTracker, Outcome, Pos, Selection};
 
 /// Stats on the line closing a finished turn (upstream `AssistantFooter`,
 /// `routes/session/index.tsx:2000`).
@@ -24,15 +28,52 @@ pub struct TurnFooter {
     pub tokens_per_second: Option<f64>,
 }
 
-/// Counts behind one `Explored: 1 read` row (upstream `group-view.tsx`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// One tool call folded into an `Explored` group; what the expanded row lists
+/// (upstream `group-view.tsx:129-157`, `children("tool")`). Fields mirror
+/// `Block::Tool`.
+#[derive(Debug, Clone)]
+pub struct ExploredCall {
+    pub id: String,
+    /// `ToolPart::version` — equality is `(id, version)`.
+    pub version: u64,
+    pub tool: String,
+    pub state: ToolState,
+    pub summary: String,
+}
+
+/// Counts behind one `Explored: 1 read` row (upstream `group-view.tsx`) and
+/// the calls they were counted from.
+#[derive(Debug, Clone, Default)]
 pub struct Explored {
     pub reads: u32,
     pub searches: u32,
     pub fetches: u32,
     /// Some grouped tool has not finished: `Exploring:` instead of `Explored:`.
     pub running: bool,
+    /// Id of the group's first call: the key of its expansion state, stable
+    /// while later calls join the group (upstream `groupID`).
+    pub group_id: String,
+    pub calls: Vec<ExploredCall>,
 }
+
+/// Identity comparison, like `Block`: counts, `running` and each call's
+/// `(id, version)`; never summary text.
+impl PartialEq for Explored {
+    fn eq(&self, other: &Self) -> bool {
+        self.reads == other.reads
+            && self.searches == other.searches
+            && self.fetches == other.fetches
+            && self.running == other.running
+            && self.group_id == other.group_id
+            && self.calls.len() == other.calls.len()
+            && self
+                .calls
+                .iter()
+                .zip(&other.calls)
+                .all(|(a, b)| a.id == b.id && a.version == b.version)
+    }
+}
+impl Eq for Explored {}
 
 /// Blank rows kept under the last block (`routes/session/index.tsx` scrollbox
 /// content padding).
@@ -223,6 +264,10 @@ struct ViewState {
     tool_expanded: bool,
     /// Tool blocks: the row is the current focus (`[` / `]`).
     tool_focused: bool,
+    /// Explored blocks: the per-call tool rows are listed under the title.
+    explored_expanded: bool,
+    /// The pointer is over this Explored title, Reasoning header or User block.
+    hovered: bool,
     /// Reasoning blocks still streaming: the header spinner frame.
     spin: usize,
 }
@@ -268,6 +313,21 @@ pub struct Transcript {
     /// Tool parts whose output is expanded (`o`). Keyed by part id, so a
     /// streaming `version` bump keeps the row open.
     tool_expanded: std::collections::HashSet<String>,
+    /// Explored groups whose calls are listed, keyed by `Explored::group_id`.
+    explored_expanded: std::collections::HashSet<String>,
+    /// Entry under the pointer, if it is a hover target (see `hover_target`).
+    hovered: Option<usize>,
+    /// Drag selection, in absolute line / display column coordinates so it
+    /// stays on its content while the view scrolls. Text is read from
+    /// `entries` only when it is copied.
+    selection: Option<Selection>,
+    /// Multi-click history. Lives here because the entry under the pointer is
+    /// part of the rule, and `clear_selection` forgets it like upstream's
+    /// `clearSelection`.
+    clicks: ClickTracker,
+    /// Last pointer cell seen by `press`/`drag`, so a wheel scroll can move
+    /// the focus under a stationary pointer.
+    pointer: Option<(u16, u16)>,
     /// The tool row the expansion keys act on (`[` / `]`).
     focused_tool: Option<String>,
     /// Header spinner of a streaming reasoning block.
@@ -298,6 +358,11 @@ impl Transcript {
             search: SearchState::default(),
             expanded: std::collections::HashSet::new(),
             tool_expanded: std::collections::HashSet::new(),
+            explored_expanded: std::collections::HashSet::new(),
+            hovered: None,
+            selection: None,
+            clicks: ClickTracker::default(),
+            pointer: None,
             focused_tool: None,
             spin_frame: 0,
             spin_epoch: std::time::Instant::now(),
@@ -330,29 +395,214 @@ impl Transcript {
         self.rebuild(index);
     }
 
-    /// A left click at screen cell (`x`, `y`): on a reasoning header it opens
-    /// or closes the body (upstream `ReasoningPart` `onMouseUp`). Returns
-    /// whether anything changed.
-    pub fn click(&mut self, x: u16, y: u16) -> bool {
+    /// Map screen cell (`x`, `y`) to `(entry index, row within the block)`.
+    /// `None` outside the last drawn transcript area or below the content.
+    fn locate(&self, x: u16, y: u16) -> Option<(usize, usize)> {
         let area = self.last_area;
         if x < area.x || x >= area.x + area.width || y < area.y || y >= area.y + area.height {
-            return false;
+            return None;
         }
         let mut line = self.scroll + usize::from(y - area.y);
-        for index in 0..self.entries.len() {
-            let count = self.entries[index].lines.len();
-            if line >= count {
-                line -= count;
-                continue;
+        for (index, entry) in self.entries.iter().enumerate() {
+            let count = entry.lines.len();
+            if line < count {
+                return Some((index, line));
             }
-            // Row 0 is the block's blank margin; row 1 is the header.
-            if line == 1 && matches!(self.entries[index].block, Block::Reasoning { .. }) {
-                self.toggle_reasoning_at(index);
-                return true;
+            line -= count;
+        }
+        None
+    }
+
+    /// A left click at screen cell (`x`, `y`): on a reasoning header it opens
+    /// or closes the body (upstream `ReasoningPart` `onMouseUp`); on an
+    /// Explored title it lists or hides the group's calls (upstream
+    /// `group-view.tsx:267-284`). Returns whether anything changed.
+    pub fn click(&mut self, x: u16, y: u16) -> bool {
+        // Row 0 is the block's blank margin; row 1 is the header.
+        let Some((index, 1)) = self.locate(x, y) else {
+            return false;
+        };
+        match &self.entries[index].block {
+            Block::Reasoning { .. } => self.toggle_reasoning_at(index),
+            Block::Explored(explored) => {
+                let id = explored.group_id.clone();
+                if !self.explored_expanded.remove(&id) {
+                    self.explored_expanded.insert(id);
+                }
+                self.rebuild(index);
             }
+            _ => return false,
+        }
+        true
+    }
+
+    /// The entry a pointer at (`x`, `y`) lights up: an Explored or Reasoning
+    /// title row, or anywhere in a User block (upstream `group-view.tsx:146,
+    /// 166-177` and `routes/session/index.tsx:2379-2383`).
+    fn hover_target(&self, x: u16, y: u16) -> Option<usize> {
+        let (index, row) = self.locate(x, y)?;
+        match self.entries[index].block {
+            Block::Explored(_) | Block::Reasoning { .. } => (row == 1).then_some(index),
+            Block::User { .. } => Some(index),
+            _ => None,
+        }
+    }
+
+    /// Point the hover at `target`; only the old and new entries are rebuilt.
+    /// Returns whether it moved, i.e. whether a repaint is due.
+    fn set_hover(&mut self, target: Option<usize>) -> bool {
+        if self.hovered == target {
             return false;
         }
-        false
+        let previous = std::mem::replace(&mut self.hovered, target);
+        for index in [previous, target].into_iter().flatten() {
+            if index < self.entries.len() {
+                self.rebuild(index);
+            }
+        }
+        true
+    }
+
+    /// The pointer moved to screen cell (`x`, `y`). Returns whether the
+    /// hovered entry changed.
+    pub fn hover(&mut self, x: u16, y: u16) -> bool {
+        self.pointer = Some((x, y));
+        let target = self.hover_target(x, y);
+        self.set_hover(target)
+    }
+
+    /// Re-evaluate the hover at the last pointer cell: a wheel scroll moves
+    /// the content under a stationary pointer.
+    pub fn rehover(&mut self) -> bool {
+        match self.pointer {
+            Some((x, y)) => self.hover(x, y),
+            None => false,
+        }
+    }
+
+    /// The pointer left the transcript (or a modal took over).
+    pub fn clear_hover(&mut self) -> bool {
+        self.set_hover(None)
+    }
+
+    /// Whether a non-empty range is selected (and therefore drawn).
+    pub(crate) fn has_selection(&self) -> bool {
+        self.selection.is_some_and(|s| !s.is_empty())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selection_focus(&self) -> Option<Pos> {
+        self.selection.map(|s| s.focus)
+    }
+
+    /// Drop the selection. Returns whether a visible range went away.
+    pub(crate) fn clear_selection(&mut self) -> bool {
+        let visible = self.has_selection();
+        self.selection = None;
+        self.clicks.reset();
+        visible
+    }
+
+    /// Left button down at (`x`, `y`) at time `now`: forget the old selection
+    /// and, when the cell holds content, start a new one there. `clicks`
+    /// counts the press: the second selects a word, the third a line. Returns
+    /// whether a visible selection was dropped (a repaint is due).
+    pub(crate) fn press(&mut self, x: u16, y: u16, now: Instant) -> bool {
+        let dropped = self.has_selection();
+        self.pointer = Some((x, y));
+        let area = self.last_area;
+        let located = self.locate(x, y);
+        self.selection = located.map(|(entry, _)| {
+            let cell = Pos {
+                line: usize::from(y),
+                col: x,
+            };
+            let behavior = Behavior::from_clicks(self.clicks.register(now, cell, entry));
+            let pos = Pos {
+                line: self.scroll + usize::from(y - area.y),
+                col: x - area.x,
+            };
+            Selection::start(pos, behavior, &|line| selectable_text(&self.entries, line))
+        });
+        dropped
+    }
+
+    /// Pointer moved with the button down. Returns whether the focus moved.
+    pub(crate) fn drag(&mut self, x: u16, y: u16) -> bool {
+        self.pointer = Some((x, y));
+        self.refocus_selection()
+    }
+
+    /// Re-aim the focus of a drag in progress at the last pointer cell: the
+    /// content under a stationary pointer changes when the wheel scrolls
+    /// (upstream `requestSelectionUpdate`). Returns whether the focus moved.
+    pub(crate) fn refocus_selection(&mut self) -> bool {
+        let Some((x, y)) = self.pointer else {
+            return false;
+        };
+        let Some(focus) = self.focus_at(x, y) else {
+            return false;
+        };
+        match &mut self.selection {
+            Some(sel) if sel.dragging && sel.focus != focus => {
+                sel.drag(focus, &|line| selectable_text(&self.entries, line));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Left button up: end the drag and say what it meant. A copy keeps its
+    /// highlight; a click or an empty drag drops the selection.
+    pub(crate) fn release(&mut self) -> Outcome {
+        let Some(mut sel) = self.selection.take() else {
+            return Outcome::Nothing;
+        };
+        let outcome = sel.release(|s| selection::extract(text_blocks(&self.entries), s));
+        if matches!(outcome, Outcome::Copy(_)) {
+            self.selection = Some(sel);
+        }
+        outcome
+    }
+
+    /// The selection cell a pointer at (`x`, `y`) maps to, clamped to the
+    /// content: above the area is the first visible line's start, below the
+    /// area or the content is the last line's end (upstream clamps the focus
+    /// to the text head/tail, `text-buffer-view.zig:1104-1150`).
+    fn focus_at(&self, x: u16, y: u16) -> Option<Pos> {
+        let area = self.last_area;
+        let total = self.total_lines();
+        if total == 0 || area.width == 0 || area.height == 0 {
+            return None;
+        }
+        let last = total - 1;
+        if y < area.y {
+            return Some(Pos {
+                line: self.scroll.min(last),
+                col: 0,
+            });
+        }
+        let below = y >= area.y + area.height;
+        let row = if below { area.height - 1 } else { y - area.y };
+        let line = self.scroll + usize::from(row);
+        if below || line > last {
+            return Some(Pos {
+                line: line.min(last),
+                col: u16::MAX,
+            });
+        }
+        Some(Pos {
+            line,
+            col: x.saturating_sub(area.x).min(area.width - 1),
+        })
+    }
+
+    /// Lines before entry `index`.
+    fn first_line_of(&self, index: usize) -> usize {
+        self.entries[..index]
+            .iter()
+            .map(|entry| entry.lines.len())
+            .sum()
     }
 
     /// Advance the header spinner of streaming reasoning blocks. `true` when a
@@ -448,10 +698,12 @@ impl Transcript {
     }
 
     /// The view flags for one block, derived from the transcript's open sets.
-    fn view_of(&self, block: &Block) -> ViewState {
+    fn view_of(&self, index: usize, block: &Block) -> ViewState {
+        let hovered = self.hovered == Some(index);
         match block {
             Block::Reasoning { id, done, .. } => ViewState {
                 reasoning_expanded: self.expanded.contains(id),
+                hovered,
                 spin: if *done { 0 } else { self.spin_frame },
                 ..Default::default()
             },
@@ -460,15 +712,31 @@ impl Transcript {
                 tool_focused: self.focused_tool.as_deref() == Some(id.as_str()),
                 ..Default::default()
             },
+            Block::Explored(explored) => ViewState {
+                explored_expanded: self.explored_expanded.contains(&explored.group_id),
+                hovered,
+                ..Default::default()
+            },
+            Block::User { .. } => ViewState {
+                hovered,
+                ..Default::default()
+            },
             _ => ViewState::default(),
         }
     }
 
     fn rebuild(&mut self, index: usize) {
         let block = self.entries[index].block.clone();
-        let view = self.view_of(&block);
+        let view = self.view_of(index, &block);
         let generation = self.entries[index].generation + 1;
+        let rows = self.entries[index].lines.len();
         self.entries[index] = Entry::new(block, generation, self.width, view);
+        if let Some(sel) = self.selection
+            && self.entries[index].lines.len() != rows
+            && self.first_line_of(index) <= sel.ordered().1.line
+        {
+            self.selection = None;
+        }
     }
 
     /// Scroll the row into view: a row focused while off screen would make the
@@ -491,16 +759,31 @@ impl Transcript {
         let end = self.entries.len().min(blocks.len());
         let views: Vec<ViewState> = blocks[start..end]
             .iter()
-            .map(|block| self.view_of(block))
+            .enumerate()
+            .map(|(offset, block)| self.view_of(start + offset, block))
             .collect();
+        // A selection is anchored to absolute line numbers, so it survives
+        // only while no entry at or above its last line changes its row count.
+        let selected_to = self.selection.map(|sel| sel.ordered().1.line);
+        let mut base = if selected_to.is_some() {
+            self.first_line_of(start)
+        } else {
+            0
+        };
+        let mut stale = false;
         for ((entry, block), view) in self.entries[start..end]
             .iter_mut()
             .zip(&blocks[start..end])
             .zip(views)
         {
+            let rows = entry.lines.len();
             if entry.block != *block || entry.view != view {
                 let generation = entry.generation + 1;
                 *entry = Entry::new(block.clone(), generation, self.width, view);
+            }
+            if let Some(last) = selected_to {
+                stale |= entry.lines.len() != rows && base <= last;
+                base += entry.lines.len();
             }
         }
 
@@ -508,7 +791,8 @@ impl Transcript {
             let appended = self.entries.len();
             let views: Vec<ViewState> = blocks[appended..]
                 .iter()
-                .map(|block| self.view_of(block))
+                .enumerate()
+                .map(|(offset, block)| self.view_of(appended + offset, block))
                 .collect();
             for (block, view) in blocks[appended..].iter().zip(views) {
                 self.entries
@@ -516,7 +800,21 @@ impl Transcript {
             }
         }
 
+        if let Some(last) = selected_to
+            && blocks.len() < self.entries.len()
+        {
+            stale |= self.first_line_of(blocks.len()) <= last;
+        }
+        if stale {
+            self.selection = None;
+        }
         self.entries.truncate(blocks.len());
+        if self
+            .hovered
+            .is_some_and(|index| index >= self.entries.len())
+        {
+            self.hovered = None;
+        }
         if !self.search.query.is_empty() {
             self.recompute_search();
         }
@@ -633,6 +931,9 @@ impl Transcript {
         self.height = height;
         if self.width != width {
             self.width = width;
+            // Re-wrapping renumbers lines, so a selection no longer points at
+            // what it selected.
+            self.selection = None;
             // Re-wrap eagerly: `search.matches` holds absolute wrapped-line
             // numbers, and a width change renumbers every line after the first
             // one that now wraps differently. Costs nothing on the frames that
@@ -693,7 +994,9 @@ impl Transcript {
         let mut base = 0usize;
         let current_match = self.current_line();
 
+        let selection = self.selection.filter(|s| !s.is_empty());
         for entry in &mut self.entries {
+            let (head, tail) = text_rows(&entry.block);
             let lines = entry.lines_for(area.width);
             let count = lines.len();
 
@@ -721,6 +1024,20 @@ impl Transcript {
             // ratatui 0.29's `Into<Text<'a>>` has no impl for `&[Line]`, so this clones
             // only the visible window's lines (≤ viewport height) each frame.
             let mut visible = visible.to_vec();
+            // Selected columns per visible row, found before `visible` moves
+            // into the widget: `(row offset, from, to)`.
+            let mut marks: Vec<(u16, u16, u16)> = Vec::new();
+            if let Some(sel) = &selection {
+                for (offset, line) in visible.iter().enumerate() {
+                    let row = skip + offset;
+                    if row < head || row >= count.saturating_sub(tail) {
+                        continue;
+                    }
+                    if let Some((from, to)) = selection::highlight_range(line, sel, base + row) {
+                        marks.push((offset as u16, from, to));
+                    }
+                }
+            }
             if let Some(matched) = current_match {
                 let first = base + skip;
                 if matched >= first && matched < first + visible.len() {
@@ -729,6 +1046,18 @@ impl Transcript {
                 }
             }
             frame.render_widget(Paragraph::new(visible), rect);
+            for (offset, from, to) in marks {
+                let cells = Rect {
+                    x: area.x + from,
+                    y: y + offset,
+                    width: to - from + 1,
+                    height: 1,
+                }
+                .intersection(rect);
+                frame
+                    .buffer_mut()
+                    .set_style(cells, theme::palette().highlight);
+            }
             y += height;
             base += count;
             if y >= area.y + area.height {
@@ -736,6 +1065,55 @@ impl Transcript {
             }
         }
     }
+}
+
+/// Rows of an entry that are layout and not text: the blank margin above every
+/// block, and the inner padding above and below a user message.
+fn text_rows(block: &Block) -> (usize, usize) {
+    match block {
+        Block::User { .. } => (2, 1),
+        _ => (1, 0),
+    }
+}
+
+/// The text of absolute transcript line `abs`; `None` past the end and on
+/// rows that are layout (margins, user padding).
+fn selectable_text(entries: &[Entry], abs: usize) -> Option<String> {
+    let mut first = 0usize;
+    for entry in entries {
+        let count = entry.lines.len();
+        if abs < first + count {
+            let (head, tail) = text_rows(&entry.block);
+            let row = abs - first;
+            if row < head || row >= count.saturating_sub(tail) {
+                return None;
+            }
+            return Some(
+                entry.lines[row]
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect(),
+            );
+        }
+        first += count;
+    }
+    None
+}
+
+/// The entries as selectable text blocks, in line order.
+fn text_blocks(entries: &[Entry]) -> impl Iterator<Item = selection::Block<'_>> {
+    entries.iter().scan(0usize, |first, entry| {
+        let (skip_head, skip_tail) = text_rows(&entry.block);
+        let block = selection::Block {
+            first: *first,
+            lines: &entry.lines,
+            skip_head,
+            skip_tail,
+        };
+        *first += entry.lines.len();
+        Some(block)
+    })
 }
 
 /// Paint a whole line with the search highlight: the palette decides the style,
@@ -767,14 +1145,14 @@ fn line_text(line: &Line<'_>) -> String {
 fn render_block(block: &Block, width: u16, view: ViewState) -> Vec<Line<'static>> {
     let palette = theme::palette();
     let body = match block {
-        Block::User { text } => user_block(text, width),
+        Block::User { text } => user_block(text, view, width),
         Block::Reasoning { text, done, ms, .. } => reasoning_block(text, *done, *ms, view, width),
         Block::Assistant { text, footer, .. } => assistant_block(text, footer.as_ref(), width),
         Block::System { text } => indent_wrapped(&format!("⤷ {text}"), width, 3)
             .into_iter()
             .map(|line| line.style(palette.dim))
             .collect(),
-        Block::Explored(explored) => vec![explored_line(explored)],
+        Block::Explored(explored) => explored_block(explored, view),
         Block::Tool {
             tool,
             state,
@@ -842,6 +1220,22 @@ fn reasoning_summary(text: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// Header colour: full `warning` when open, or when a finished header is
+/// hovered (upstream `group-view.tsx:166-177`); the 60% `thought` tint
+/// otherwise.
+fn thought_header_style(
+    palette: &theme::Palette,
+    expanded: bool,
+    done: bool,
+    hovered: bool,
+) -> ratatui::style::Style {
+    if expanded || (done && hovered) {
+        palette.warning
+    } else {
+        palette.thought
+    }
+}
+
 /// Upstream `ReasoningPart` / `ReasoningHeader` (`message-parts.tsx`). The
 /// header is `+ Thought` collapsed, `- Thought` open, and a spinner with
 /// `Thinking` while the reasoning streams. An open block shows its text on a
@@ -863,11 +1257,7 @@ fn reasoning_block(
     }
     let expanded = view.reasoning_expanded;
     let (title, body) = reasoning_summary(text);
-    let style = if expanded {
-        palette.warning
-    } else {
-        palette.thought
-    };
+    let style = thought_header_style(palette, expanded, done, view.hovered);
     let header = if done {
         let duration = ms.map(|ms| format_duration(ms as i64));
         let mut header = format!("   {} Thought", if expanded { '-' } else { '+' });
@@ -957,9 +1347,24 @@ fn footer_line(footer: &TurnFooter, width: u16) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The title row, then (expanded) one tool header row per grouped call —
+/// plain inline tool rows, without their output (`group-view.tsx:129-157`).
+fn explored_block(explored: &Explored, view: ViewState) -> Vec<Line<'static>> {
+    let mut lines = vec![explored_line(explored, view.hovered)];
+    if view.explored_expanded {
+        lines.extend(
+            explored
+                .calls
+                .iter()
+                .map(|call| tool_header(&call.tool, call.state, &call.summary, false)),
+        );
+    }
+    lines
+}
+
 /// Upstream `group-view.tsx`: `→ Explored: 2 reads, 1 search`, or
 /// `✱ Exploring: …` while a grouped call is still running.
-fn explored_line(explored: &Explored) -> Line<'static> {
+fn explored_line(explored: &Explored, hovered: bool) -> Line<'static> {
     let palette = theme::palette();
     let mut parts = Vec::new();
     for (count, one, many) in [
@@ -978,26 +1383,20 @@ fn explored_line(explored: &Explored) -> Line<'static> {
     };
     Line::from(Span::styled(
         format!("   {icon} {label} {}", parts.join(", ")),
-        palette.dim,
+        explored_title_style(palette, hovered),
     ))
 }
 
-/// Upstream `InlineToolRow` (`message-parts.tsx:202`): paddingLeft 3, a
-/// two-column icon, then the label. Output hangs below only when expanded
-/// (`o`) or when the call failed; the focused row is bold instead of
-/// advertising its key.
-fn tool_block(
-    block: &Block,
-    tool: &str,
-    state: ToolState,
-    summary: &str,
-    output: &str,
-    view: ViewState,
-    width: u16,
-) -> Vec<Line<'static>> {
+/// Muted at rest, full text colour under the pointer (`group-view.tsx:146`).
+fn explored_title_style(palette: &theme::Palette, hovered: bool) -> ratatui::style::Style {
+    if hovered { palette.text } else { palette.dim }
+}
+
+/// The head line of an inline tool row: paddingLeft 3, a two-column icon, then
+/// `tool summary`; bold when focused. Shared by `tool_block` and the expanded
+/// Explored group.
+fn tool_header(tool: &str, state: ToolState, summary: &str, focused: bool) -> Line<'static> {
     let palette = theme::palette();
-    let expandable = entry_tool_output(block).is_some();
-    let focused = view.tool_focused && expandable;
     let (icon, style) = match state {
         ToolState::Input | ToolState::Running | ToolState::Progress => ("~", palette.accent),
         ToolState::Success => ("\u{2699}", palette.dim),
@@ -1013,10 +1412,25 @@ fn tool_block(
     } else {
         style
     };
-    let mut lines = vec![Line::from(Span::styled(
-        format!("   {icon} {label}"),
-        style,
-    ))];
+    Line::from(Span::styled(format!("   {icon} {label}"), style))
+}
+
+/// Upstream `InlineToolRow` (`message-parts.tsx:202`): the header, then output
+/// hanging below only when expanded (`o`) or when the call failed; the
+/// focused row is bold instead of advertising its key.
+fn tool_block(
+    block: &Block,
+    tool: &str,
+    state: ToolState,
+    summary: &str,
+    output: &str,
+    view: ViewState,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let palette = theme::palette();
+    let expandable = entry_tool_output(block).is_some();
+    let focused = view.tool_focused && expandable;
+    let mut lines = vec![tool_header(tool, state, summary, focused)];
     let failed = matches!(state, ToolState::Failed);
     let body_style = if failed { palette.warn } else { palette.dim };
     if view.tool_expanded && expandable {
@@ -1099,13 +1513,24 @@ fn wrap_output(output: &str, width: u16) -> Vec<String> {
     wrapped
 }
 
+/// The band behind a user message: `raised.base`, one step stronger under the
+/// pointer (`routes/session/index.tsx:2281, 2410`, `decrease(raised.base)`).
+/// `panel` is the `raised.high` surface (`theme.rs`, `from_tokens`).
+fn user_surface(palette: &theme::Palette, hovered: bool) -> ratatui::style::Style {
+    if hovered {
+        palette.panel
+    } else {
+        palette.raised_base
+    }
+}
+
 /// Upstream user message (`routes/session/index.tsx` ~2341): a raised box
 /// with an agent-coloured left rule, one blank row above and below the text,
 /// and the text two columns in from the rule. The rule sits on the raised
 /// surface too, so the whole row is one band.
-fn user_block(text: &str, width: u16) -> Vec<Line<'static>> {
+fn user_block(text: &str, view: ViewState, width: u16) -> Vec<Line<'static>> {
     let palette = theme::palette();
-    let raised = palette.raised_base;
+    let raised = user_surface(palette, view.hovered);
     let rail = palette.agent.patch(raised);
     let body = palette.text.patch(raised);
     let usable = width.saturating_sub(3).max(1) as usize;
@@ -1192,7 +1617,7 @@ mod tests {
     use ratatui::style::{Color, Modifier};
     use std::sync::Arc;
 
-    use super::{Block, Transcript, reasoning_summary};
+    use super::{Block, Explored, ExploredCall, Transcript, reasoning_summary};
     use ox_client::store::ToolState;
 
     #[test]
@@ -1666,6 +2091,259 @@ mod tests {
         assert!(!draw(&mut t).contains("Let me look"));
     }
 
+    fn call(id: &str, version: u64, tool: &str, summary: &str, state: ToolState) -> ExploredCall {
+        ExploredCall {
+            id: id.into(),
+            version,
+            tool: tool.into(),
+            state,
+            summary: summary.into(),
+        }
+    }
+
+    fn group(calls: Vec<ExploredCall>) -> Block {
+        Block::Explored(Explored {
+            reads: calls.len() as u32,
+            running: calls
+                .iter()
+                .any(|c| !matches!(c.state, ToolState::Success | ToolState::Failed)),
+            group_id: calls[0].id.clone(),
+            calls,
+            ..Explored::default()
+        })
+    }
+
+    #[test]
+    fn clicking_an_explored_title_lists_its_calls_and_a_second_click_hides_them() {
+        let mut t = Transcript::new(50, 12);
+        t.sync(
+            &[group(vec![
+                call("a", 1, "read", "a.txt", ToolState::Success),
+                call("b", 1, "grep", "needle", ToolState::Failed),
+            ])],
+            0,
+        );
+        let collapsed = screen(&mut t, 50, 12);
+        assert!(collapsed.contains("→ Explored: 2 reads"), "{collapsed}");
+        assert!(!collapsed.contains("a.txt"), "{collapsed}");
+        let lines_before = t.total_lines();
+
+        assert!(!t.click(6, 0), "the margin row is not a target");
+        assert!(t.click(6, 1));
+        assert_eq!(t.total_lines(), lines_before + 2, "one row per call");
+        let open = screen(&mut t, 50, 12);
+        let rows: Vec<&str> = open.lines().collect();
+        assert_eq!(rows[1], "   → Explored: 2 reads", "{rows:?}");
+        assert_eq!(rows[2], "   ⚙ read a.txt", "{rows:?}");
+        assert_eq!(rows[3], "   ✗ grep needle", "{rows:?}");
+
+        assert!(!t.click(6, 2), "call rows are not click targets");
+        assert!(t.click(6, 1));
+        assert_eq!(t.total_lines(), lines_before);
+        assert!(!screen(&mut t, 50, 12).contains("a.txt"));
+    }
+
+    #[test]
+    fn an_expanded_group_stays_open_when_a_call_changes_state() {
+        let mut t = Transcript::new(50, 12);
+        t.sync(
+            &[group(vec![
+                call("a", 1, "read", "a.txt", ToolState::Success),
+                call("b", 1, "grep", "needle", ToolState::Running),
+            ])],
+            0,
+        );
+        screen(&mut t, 50, 12);
+        assert!(t.click(6, 1));
+        let running = screen(&mut t, 50, 12);
+        assert!(running.contains("✱ Exploring: 2 reads"), "{running}");
+        assert!(running.contains("~ grep needle"), "{running}");
+
+        t.sync(
+            &[group(vec![
+                call("a", 1, "read", "a.txt", ToolState::Success),
+                call("b", 2, "grep", "needle", ToolState::Success),
+            ])],
+            0,
+        );
+        let done = screen(&mut t, 50, 12);
+        assert!(done.contains("→ Explored: 2 reads"), "{done}");
+        assert!(done.contains("⚙ grep needle"), "{done}");
+        assert!(done.contains("⚙ read a.txt"), "{done}");
+    }
+
+    fn one_group_then_a_user() -> [Block; 2] {
+        [
+            group(vec![call("a", 1, "read", "a.txt", ToolState::Success)]),
+            Block::user("hello"),
+        ]
+    }
+
+    /// Cell `(x, y)` of one drawn frame.
+    fn cell_at(
+        t: &mut Transcript,
+        width: u16,
+        height: u16,
+        x: u16,
+        y: u16,
+    ) -> ratatui::buffer::Cell {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| t.render(frame, frame.area()))
+            .unwrap();
+        terminal.backend().buffer()[(x, y)].clone()
+    }
+
+    #[test]
+    fn hover_reports_only_index_changes_and_targets_titles_and_user_blocks() {
+        let mut t = Transcript::new(50, 12);
+        t.sync(&one_group_then_a_user(), 0);
+        screen(&mut t, 50, 12); // rows: 0 margin, 1 Explored title, 2 margin, 3.. user
+        let lines = t.total_lines();
+
+        assert!(!t.hover(6, 0), "a block margin is not a target");
+        assert!(t.hover(6, 1), "entering the Explored title is a change");
+        assert_eq!(t.hovered, Some(0));
+        assert!(!t.hover(9, 1), "same entry again: nothing to redraw");
+        assert!(t.hover(6, 4), "any row of a user block hovers it");
+        assert_eq!(t.hovered, Some(1));
+        assert!(!t.hover(20, 3), "still the same user block");
+        assert!(t.hover(60, 4), "leaving the transcript clears the hover");
+        assert_eq!(t.hovered, None);
+        assert!(!t.hover(60, 4), "already clear");
+        assert_eq!(t.total_lines(), lines, "hover never changes the row count");
+    }
+
+    #[test]
+    fn hover_ignores_call_rows_and_other_blocks_and_clear_hover_reports_a_change() {
+        let mut t = Transcript::new(50, 12);
+        t.sync(
+            &[
+                group(vec![call("a", 1, "read", "a.txt", ToolState::Success)]),
+                Block::assistant("m", 1, "answer"),
+            ],
+            0,
+        );
+        screen(&mut t, 50, 12);
+        assert!(t.click(6, 1)); // expand: call row at y=2
+        screen(&mut t, 50, 12);
+        assert!(!t.hover(6, 2), "call rows are not hover targets");
+        assert!(!t.hover(6, 5), "assistant text is not a hover target");
+        assert!(t.hover(6, 1));
+        assert!(t.clear_hover());
+        assert!(!t.clear_hover(), "nothing left to clear");
+    }
+
+    #[test]
+    fn hover_survives_a_sync_of_the_hovered_entry_and_drops_a_vanished_one() {
+        let mut t = Transcript::new(50, 12);
+        t.sync(&one_group_then_a_user(), 0);
+        screen(&mut t, 50, 12);
+        assert!(t.hover(6, 4));
+        t.sync(&[Block::user("changed"), Block::user("again")], 0);
+        t.sync(&[Block::user("only")], 0);
+        assert_eq!(t.hovered, None, "the hovered entry no longer exists");
+    }
+
+    #[test]
+    fn hover_styles_pick_the_stronger_colour_for_each_block() {
+        use super::{explored_title_style, thought_header_style, user_surface};
+        use crate::theme::{Deck, Palette};
+        let p = Palette::for_deck(Deck::Truecolor);
+        assert_eq!(explored_title_style(&p, false), p.dim);
+        assert_eq!(explored_title_style(&p, true), p.text);
+        // Collapsed and finished: 60% thought -> full warning on hover.
+        assert_eq!(thought_header_style(&p, false, true, false), p.thought);
+        assert_eq!(thought_header_style(&p, false, true, true), p.warning);
+        assert_eq!(thought_header_style(&p, true, true, false), p.warning);
+        // A streaming header keeps its colour: upstream only lights finished ones.
+        assert_eq!(thought_header_style(&p, false, false, true), p.thought);
+        assert_ne!(user_surface(&p, false).bg, user_surface(&p, true).bg);
+        assert_eq!(user_surface(&p, false), p.raised_base);
+        assert_eq!(user_surface(&p, true), p.panel, "raised.high");
+    }
+
+    #[test]
+    fn hovering_recolours_the_explored_title_the_thought_header_and_the_user_band() {
+        use super::{explored_title_style, thought_header_style, user_surface};
+        let p = crate::theme::palette();
+
+        let mut t = Transcript::new(50, 12);
+        t.sync(&one_group_then_a_user(), 0);
+        let plain_title = cell_at(&mut t, 50, 12, 6, 1);
+        assert_eq!(
+            plain_title.fg,
+            explored_title_style(p, false).fg.unwrap_or(Color::Reset)
+        );
+        let rows_before = screen(&mut t, 50, 12);
+        assert!(t.hover(6, 1));
+        let lit_title = cell_at(&mut t, 50, 12, 6, 1);
+        assert_eq!(
+            lit_title.fg,
+            explored_title_style(p, true).fg.unwrap_or(Color::Reset)
+        );
+        assert_eq!(
+            screen(&mut t, 50, 12),
+            rows_before,
+            "same text, only colour moves"
+        );
+        assert!(t.hover(6, 4));
+        assert_eq!(
+            cell_at(&mut t, 50, 12, 6, 1).fg,
+            plain_title.fg,
+            "the title returns to its resting colour"
+        );
+        let lit_user = cell_at(&mut t, 50, 12, 10, 4);
+        assert_eq!(
+            lit_user.bg,
+            user_surface(p, true).bg.unwrap_or(Color::Reset)
+        );
+        assert!(t.hover(60, 4));
+        let rest_user = cell_at(&mut t, 50, 12, 10, 4);
+        assert_eq!(
+            rest_user.bg,
+            user_surface(p, false).bg.unwrap_or(Color::Reset)
+        );
+
+        let mut t = Transcript::new(50, 6);
+        t.sync(&[Block::reasoning("m", 1, "pondering", true)], 0);
+        let rest = cell_at(&mut t, 50, 6, 6, 1);
+        assert_eq!(
+            rest.fg,
+            thought_header_style(p, false, true, false)
+                .fg
+                .unwrap_or(Color::Reset)
+        );
+        let lines = t.total_lines();
+        assert!(t.hover(6, 1));
+        let lit = cell_at(&mut t, 50, 6, 6, 1);
+        assert_eq!(
+            lit.fg,
+            thought_header_style(p, false, true, true)
+                .fg
+                .unwrap_or(Color::Reset)
+        );
+        assert_eq!(t.total_lines(), lines);
+    }
+
+    #[test]
+    fn a_running_group_keeps_the_exploring_title_when_collapsed() {
+        let mut t = Transcript::new(50, 6);
+        t.sync(
+            &[group(vec![call(
+                "a",
+                1,
+                "read",
+                "a.txt",
+                ToolState::Running,
+            )])],
+            0,
+        );
+        let text = screen(&mut t, 50, 6);
+        assert!(text.contains("✱ Exploring: 1 read"), "{text}");
+        assert!(!text.contains("a.txt"), "{text}");
+    }
+
     #[test]
     fn a_streaming_thought_spins_and_a_bold_title_names_it() {
         let mut t = Transcript::new(50, 6);
@@ -1927,5 +2605,321 @@ mod tests {
         let text = screen(&mut t, 40, 8);
         assert!(text.contains("── Compaction ──"), "{text}");
         assert!(text.contains("   Goal: ship"), "{text}");
+    }
+
+    // ---- drag selection (plan task 4) ----
+
+    use crate::ui::selection::Outcome;
+
+    /// A fresh instant a second after the last one, so consecutive presses
+    /// never form a multi-click unless a test says so.
+    fn later() -> std::time::Instant {
+        use std::sync::OnceLock;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Instant;
+        static BASE: OnceLock<Instant> = OnceLock::new();
+        static STEP: AtomicU64 = AtomicU64::new(0);
+        *BASE.get_or_init(Instant::now)
+            + std::time::Duration::from_secs(STEP.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    fn users(texts: &[&str]) -> Vec<Block> {
+        texts.iter().map(|t| Block::user(t)).collect()
+    }
+
+    /// Draw once so `last_area` and the click target map exist.
+    fn drawn(t: &mut Transcript, width: u16, height: u16) {
+        screen(t, width, height);
+    }
+
+    fn is_highlighted(cell: &ratatui::buffer::Cell) -> bool {
+        let hl = crate::theme::palette().highlight;
+        hl.bg.is_none_or(|bg| cell.bg == bg) && cell.modifier.contains(hl.add_modifier)
+    }
+
+    #[test]
+    fn drag_over_a_user_line_copies_the_selected_cells() {
+        // rows: 0 margin, 1 padding, 2 `┃  hello world`, 3 padding
+        let mut t = Transcript::new(40, 10);
+        t.sync(&users(&["hello world"]), 0);
+        drawn(&mut t, 40, 10);
+        t.press(3, 2, later());
+        assert!(t.drag(7, 2));
+        assert_eq!(t.release(), Outcome::Copy("hello".to_owned()));
+        assert!(t.has_selection(), "a finished copy keeps its highlight");
+    }
+
+    fn ms(base: std::time::Instant, ms: u64) -> std::time::Instant {
+        base + std::time::Duration::from_millis(ms)
+    }
+
+    #[test]
+    fn a_double_click_copies_the_word_and_a_triple_click_the_line() {
+        let mut t = Transcript::new(40, 10);
+        t.sync(&users(&["hello world"]), 0);
+        drawn(&mut t, 40, 10);
+        let t0 = later();
+        t.press(10, 2, t0);
+        assert_eq!(t.release(), Outcome::Click);
+        t.press(10, 2, ms(t0, 100));
+        assert!(t.has_selection(), "the word is selected on press");
+        assert_eq!(t.release(), Outcome::Copy("world".to_owned()));
+        assert!(t.has_selection(), "a copy keeps its highlight");
+        t.press(10, 2, ms(t0, 200));
+        assert_eq!(t.release(), Outcome::Copy("hello world".to_owned()));
+    }
+
+    #[test]
+    fn a_double_click_then_a_drag_extends_by_words() {
+        let mut t = Transcript::new(40, 10);
+        t.sync(&users(&["alpha beta gamma"]), 0);
+        drawn(&mut t, 40, 10);
+        let t0 = later();
+        t.press(10, 2, t0);
+        t.release();
+        t.press(10, 2, ms(t0, 100)); // `beta` is cols 9..=12 on screen
+        assert!(t.drag(16, 2));
+        assert_eq!(t.release(), Outcome::Copy("beta gamma".to_owned()));
+    }
+
+    #[test]
+    fn a_slow_or_distant_second_press_is_not_a_double_click() {
+        let mut t = Transcript::new(40, 10);
+        t.sync(&users(&["alpha beta gamma"]), 0);
+        drawn(&mut t, 40, 10);
+        let t0 = later();
+        t.press(10, 2, t0);
+        t.release();
+        t.press(10, 2, ms(t0, 501));
+        assert_eq!(t.release(), Outcome::Click);
+        t.press(10, 2, ms(t0, 600));
+        t.release();
+        t.press(13, 2, ms(t0, 700)); // three cells away
+        assert_eq!(t.release(), Outcome::Click);
+    }
+
+    #[test]
+    fn a_double_click_on_a_cjk_run_selects_it_whole() {
+        let mut t = Transcript::new(40, 10);
+        t.sync(&users(&["日本語abc xyz"]), 0);
+        drawn(&mut t, 40, 10);
+        let t0 = later();
+        t.press(6, 2, t0);
+        t.release();
+        t.press(6, 2, ms(t0, 50));
+        assert_eq!(t.release(), Outcome::Copy("日本語abc".to_owned()));
+    }
+
+    #[test]
+    fn clearing_the_selection_forgets_the_click_history() {
+        let mut t = Transcript::new(40, 10);
+        t.sync(&users(&["hello world"]), 0);
+        drawn(&mut t, 40, 10);
+        let t0 = later();
+        t.press(10, 2, t0);
+        t.release();
+        t.clear_selection();
+        t.press(10, 2, ms(t0, 50));
+        assert_eq!(t.release(), Outcome::Click, "the history was reset");
+    }
+
+    #[test]
+    fn press_and_release_without_moving_is_a_click_and_leaves_no_selection() {
+        let mut t = Transcript::new(40, 10);
+        t.sync(&users(&["hello"]), 0);
+        drawn(&mut t, 40, 10);
+        t.press(3, 2, later());
+        assert_eq!(t.release(), Outcome::Click);
+        assert!(!t.has_selection());
+    }
+
+    #[test]
+    fn a_press_off_the_content_starts_nothing() {
+        let mut t = Transcript::new(40, 10);
+        t.sync(&users(&["hello"]), 0);
+        drawn(&mut t, 40, 10);
+        t.press(3, 9, later()); // below the 4 content rows
+        assert!(!t.drag(7, 2));
+        assert_eq!(t.release(), Outcome::Nothing);
+        t.press(60, 2, later()); // right of the transcript area
+        assert_eq!(t.release(), Outcome::Nothing);
+    }
+
+    #[test]
+    fn dragging_below_the_content_selects_to_the_end_without_blank_lines_between_blocks() {
+        let mut t = Transcript::new(40, 10);
+        t.sync(&users(&["one", "two"]), 0);
+        drawn(&mut t, 40, 10);
+        t.press(3, 2, later());
+        assert!(t.drag(0, 40), "far below the area");
+        assert_eq!(t.release(), Outcome::Copy("one\ntwo".to_owned()));
+    }
+
+    #[test]
+    fn dragging_above_the_area_selects_from_the_first_visible_row() {
+        let mut t = Transcript::new(40, 10);
+        t.sync(&users(&["one"]), 0);
+        let mut terminal = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        let area = ratatui::layout::Rect::new(0, 2, 40, 10);
+        terminal.draw(|frame| t.render(frame, area)).unwrap();
+        t.press(3, 4, later()); // content line 2, the text row
+        assert!(t.drag(0, 0), "above the area");
+        assert_eq!(t.release(), Outcome::Copy("o".to_owned()));
+    }
+
+    #[test]
+    fn a_new_press_clears_the_old_selection() {
+        let mut t = Transcript::new(40, 10);
+        t.sync(&users(&["hello world"]), 0);
+        drawn(&mut t, 40, 10);
+        t.press(3, 2, later());
+        t.drag(7, 2);
+        t.release();
+        assert!(
+            t.press(3, 2, later()),
+            "dropping a selected range asks for a repaint"
+        );
+        assert!(!t.has_selection(), "the new one is empty until it moves");
+    }
+
+    #[test]
+    fn clear_selection_reports_whether_text_was_selected() {
+        let mut t = Transcript::new(40, 10);
+        t.sync(&users(&["hello world"]), 0);
+        drawn(&mut t, 40, 10);
+        assert!(!t.clear_selection());
+        t.press(3, 2, later());
+        assert!(!t.clear_selection(), "a bare press selected nothing");
+        t.press(3, 2, later());
+        t.drag(7, 2);
+        assert!(t.clear_selection());
+        assert!(!t.has_selection());
+    }
+
+    #[test]
+    fn selected_cells_are_highlighted_but_the_gutter_is_not() {
+        let mut t = Transcript::new(40, 10);
+        t.sync(&users(&["hello world"]), 0);
+        drawn(&mut t, 40, 10);
+        t.press(0, 2, later());
+        t.drag(7, 2);
+        t.release();
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|frame| t.render(frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for x in 0..3 {
+            assert!(!is_highlighted(&buffer[(x, 2)]), "gutter column {x}");
+        }
+        for x in 3..=7 {
+            assert!(is_highlighted(&buffer[(x, 2)]), "text column {x}");
+        }
+        assert!(!is_highlighted(&buffer[(8, 2)]), "past the focus");
+        assert!(!is_highlighted(&buffer[(3, 3)]), "other rows");
+    }
+
+    #[test]
+    fn the_selection_stays_on_its_content_when_the_view_scrolls() {
+        let mut t = Transcript::new(40, 8);
+        t.sync(&users(&["aaa", "bbb", "ccc", "ddd"]), 0); // 16 rows, 8 visible
+        drawn(&mut t, 40, 8);
+        // Bottom-pinned: scroll = 16 + 1 - 8 = 9; row 5 shows line 14 (`ddd`'s
+        // text row is line 14).
+        let text_y = (14 - t.scroll) as u16;
+        t.press(3, text_y, later());
+        t.drag(5, text_y);
+        t.release();
+        t.scroll_up(2);
+        let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
+        terminal
+            .draw(|frame| t.render(frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(is_highlighted(&buffer[(3, text_y + 2)]));
+        assert!(!is_highlighted(&buffer[(3, text_y)]));
+    }
+
+    #[test]
+    fn a_width_change_clears_the_selection() {
+        let mut t = Transcript::new(40, 10);
+        t.sync(&users(&["hello world"]), 0);
+        drawn(&mut t, 40, 10);
+        t.press(3, 2, later());
+        t.drag(7, 2);
+        t.release();
+        t.set_viewport(30, 10);
+        assert!(!t.has_selection());
+    }
+
+    #[test]
+    fn rows_changing_at_or_before_the_selection_clear_it_later_rows_do_not() {
+        let mut t = Transcript::new(40, 12);
+        t.sync(&users(&["one", "two"]), 0);
+        drawn(&mut t, 40, 12);
+        t.press(3, 2, later()); // first block
+        t.drag(5, 2);
+        t.release();
+
+        let mut grown = users(&["one", "two"]);
+        grown.push(Block::user("three"));
+        t.sync(&grown, 0);
+        assert!(
+            t.has_selection(),
+            "an appended block is below the selection"
+        );
+
+        let mut taller = users(&["one", "two", "three"]);
+        taller[1] = Block::user(&"word ".repeat(30));
+        t.sync(&taller, 0);
+        assert!(t.has_selection(), "a later block may grow");
+
+        let mut earlier = taller.clone();
+        earlier[0] = Block::user(&"word ".repeat(30));
+        t.sync(&earlier, 0);
+        assert!(!t.has_selection(), "the selected block changed its rows");
+    }
+
+    #[test]
+    fn refocus_moves_the_focus_to_the_last_pointer_cell_after_a_scroll() {
+        let mut t = Transcript::new(40, 8);
+        t.sync(&users(&["aaa", "bbb", "ccc", "ddd"]), 0);
+        drawn(&mut t, 40, 8);
+        t.press(3, 2, later());
+        t.drag(5, 7);
+        t.scroll_up(4);
+        assert!(
+            t.refocus_selection(),
+            "the same cell now holds other content"
+        );
+        assert!(!t.refocus_selection(), "nothing moved");
+    }
+
+    #[test]
+    fn rehover_follows_the_content_under_a_stationary_pointer() {
+        let mut t = Transcript::new(50, 12);
+        t.sync(&one_group_then_a_user(), 0);
+        screen(&mut t, 50, 12);
+        assert!(!t.rehover(), "no pointer seen yet");
+        assert!(t.hover(6, 1));
+        assert!(!t.rehover(), "same content under the pointer");
+        t.sync(&[Block::assistant("m", 1, "answer")], 0);
+        screen(&mut t, 50, 12);
+        assert!(t.rehover(), "assistant text is not a hover target");
+    }
+
+    #[test]
+    fn syncing_fewer_entries_than_the_selection_reaches_clears_it() {
+        let mut t = Transcript::new(40, 12);
+        t.sync(&users(&["one", "two", "three"]), 0);
+        drawn(&mut t, 40, 12);
+        let y = (t.total_lines() - 2 - t.scroll) as u16; // text row of "three"
+        t.press(3, y, later());
+        t.drag(5, y);
+        assert!(t.has_selection());
+        t.sync(&users(&["one"]), 0);
+        assert!(!t.has_selection());
+        drawn(&mut t, 40, 12);
+        assert_eq!(t.release(), Outcome::Nothing);
     }
 }

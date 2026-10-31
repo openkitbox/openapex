@@ -6,8 +6,9 @@
 //! an `Instant` argument, so expiry is testable without sleeping.
 //!
 //! Deviations from upstream, all deliberate:
-//! - No queue and no hover pause (`toast.tsx:121-197`): ox-tui has no mouse
-//!   input, and a newer toast replaces the current one instead of waiting.
+//! - No queue and no hover pause (`toast.tsx:121-197`): a newer toast replaces
+//!   the current one instead of waiting, and hovering the toast does not
+//!   stop its timer.
 //! - No action affordance (`› label`, `toast.tsx:42`): nothing in ox-tui
 //!   attaches an action, so the affordance is always the muted `x`.
 //! - A terminal too narrow for the chrome draws nothing instead of overflowing.

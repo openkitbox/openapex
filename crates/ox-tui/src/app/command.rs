@@ -87,6 +87,9 @@ pub enum AppCommand {
     /// `ctrl+v` (or an empty bracketed paste): read the system clipboard off
     /// the UI thread; the answer is `AppEvent::ClipboardPasted`.
     ReadClipboard,
+    /// A finished drag selection: copy the text to the host clipboard off the
+    /// UI thread; the answer is `AppEvent::ClipboardWritten`.
+    WriteClipboard(String),
 }
 
 /// Why the agent list is being fetched.
