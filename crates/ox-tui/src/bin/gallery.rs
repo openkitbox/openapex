@@ -248,14 +248,68 @@ fn cases() -> Vec<Case> {
                 "139 passed",
             )],
         ),
-        transcript_case(
-            "tool-failed",
-            6,
-            vec![tool(
+        transcript_case("tool-failed", 6, {
+            let mut block = tool_with(
                 "edit",
-                "store.rs",
                 ToolState::Failed,
-                "file modified since read",
+                serde_json::json!({"path": "src/store.rs"}),
+                None,
+            );
+            if let Block::Tool { output, .. } = &mut block {
+                *output = Arc::new("file modified since read".to_owned());
+            }
+            vec![block]
+        }),
+        // edit 完成态：diff 块（>120 列为 split，否则 unified）
+        transcript_case(
+            "edit-diff",
+            17,
+            vec![tool_with(
+                "edit",
+                ToolState::Success,
+                serde_json::json!({"path": "src/store.rs"}),
+                Some(
+                    serde_json::json!({"files": [file_diff("src/store.rs", "modified", EDIT_PATCH)]}),
+                ),
+            )],
+        ),
+        // patch 完成态：每个文件一个块（新增 / 修改 / 删除），块间空一行
+        transcript_case(
+            "patch-files",
+            31,
+            vec![tool_with(
+                "patch",
+                ToolState::Success,
+                serde_json::json!({"patchText": ""}),
+                Some(serde_json::json!({"files": [
+                    file_diff("src/cache.rs", "added", PATCH_ADD),
+                    file_diff("src/store.rs", "modified", EDIT_PATCH),
+                    file_diff("src/legacy.rs", "deleted", PATCH_DELETE),
+                ]})),
+            )],
+        ),
+        // patch 失败：单一目标时标题带路径，错误文字为 muted
+        transcript_case("patch-failed", 7, {
+            let mut block = tool_with(
+                "patch",
+                ToolState::Failed,
+                serde_json::json!({"patchText": "*** Begin Patch\n*** Update File: src/store.rs\n@@\n-a\n+b\n*** End Patch"}),
+                None,
+            );
+            if let Block::Tool { output, .. } = &mut block {
+                *output = Arc::new("hunk 1 did not match src/store.rs".to_owned());
+            }
+            vec![block]
+        }),
+        // write 完成态：带行号的文件内容（语法高亮，按显示宽度折行）
+        transcript_case(
+            "write-file",
+            13,
+            vec![tool_with(
+                "write",
+                ToolState::Success,
+                serde_json::json!({"path": "src/cache.rs", "content": WRITE_CONTENT}),
+                None,
             )],
         ),
         // 工具输出展开：聚焦态提示 + 展开态全文（o / [ ]）
@@ -933,6 +987,39 @@ fn tool_with(
         input: record(input),
         metadata: metadata.map(record),
     }
+}
+
+/// An edit's patch as ox's `render_patch` writes it: two hunks, the second
+/// with a line long enough to wrap.
+const EDIT_PATCH: &str = "--- src/store.rs\n+++ src/store.rs\n\
+@@ -3,4 +3,4 @@\n use std::sync::Arc;\n \n-pub fn load(path: &str) -> Store {\n+pub fn load(path: &Path) -> Result<Store> {\n     let raw = read(path);\n\
+@@ -40,3 +40,4 @@\n     store.flush();\n+    tracing::debug!(entries = store.len(), \"flushed the store to disk after compaction\");\n     Ok(())\n }\n";
+
+const PATCH_ADD: &str =
+    "--- /dev/null\n+++ src/cache.rs\n@@ -0,0 +1,3 @@\n+pub struct Cache {\n+    hits: u64,\n+}\n";
+
+const PATCH_DELETE: &str =
+    "--- src/legacy.rs\n+++ src/legacy.rs\n@@ -1,2 +0,0 @@\n-fn old() {}\n-fn older() {}\n";
+
+const WRITE_CONTENT: &str = "use std::collections::HashMap;\n\n/// Hit counts per key, kept until the next compaction pass rewrites the store on disk.\npub struct Cache {\n    hits: HashMap<String, u64>,\n}\n";
+
+/// One `metadata.files` entry in ox's wire shape (`ox-tools` `FileDiff`).
+fn file_diff(file: &str, status: &str, patch: &str) -> serde_json::Value {
+    let count = |sign: char| {
+        patch
+            .lines()
+            .filter(|line| {
+                line.starts_with(sign) && !line.starts_with("+++") && !line.starts_with("---")
+            })
+            .count()
+    };
+    serde_json::json!({
+        "file": file,
+        "status": status,
+        "patch": patch,
+        "additions": count('+'),
+        "deletions": count('-'),
+    })
 }
 
 // ---- chrome mock ----

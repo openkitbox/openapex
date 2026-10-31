@@ -110,6 +110,99 @@ impl SyntaxStyles {
     }
 }
 
+/// Diff colours, one per upstream `diff.*` token (`theme/src/tui/schema.ts`
+/// `DiffDefinition`). `*_bg` styles carry a background only; the others a
+/// foreground only, so a row composes them with `patch`.
+#[derive(Debug, Clone, Copy)]
+pub struct DiffStyles {
+    /// `diff.text.added`.
+    pub added: Style,
+    /// `diff.text.removed`.
+    pub removed: Style,
+    /// `diff.text.context`.
+    pub context: Style,
+    /// `diff.text.hunkHeader`: the `@@` row between hunks.
+    pub hunk: Style,
+    /// `diff.highlight.added`: the `+` sign.
+    pub sign_added: Style,
+    /// `diff.highlight.removed`: the `-` sign.
+    pub sign_removed: Style,
+    /// `diff.background.added`.
+    pub added_bg: Style,
+    /// `diff.background.removed`.
+    pub removed_bg: Style,
+    /// `diff.background.context`: context rows and their gutter, pad rows.
+    pub context_bg: Style,
+    /// `diff.lineNumber.text`.
+    pub line_number: Style,
+    /// `diff.lineNumber.background.added`.
+    pub line_number_added_bg: Style,
+    /// `diff.lineNumber.background.removed`.
+    pub line_number_removed_bg: Style,
+}
+
+impl DiffStyles {
+    fn from_tokens(d: &tokens::Diff) -> Self {
+        let fg = |color: Rgb| Style::default().fg(rgb(color));
+        let bg = |color: Rgb| Style::default().bg(rgb(color));
+        Self {
+            added: fg(d.added),
+            removed: fg(d.removed),
+            context: fg(d.context),
+            hunk: fg(d.hunk),
+            sign_added: fg(d.highlight_added),
+            sign_removed: fg(d.highlight_removed),
+            added_bg: bg(d.added_bg),
+            removed_bg: bg(d.removed_bg),
+            context_bg: bg(d.context_bg),
+            line_number: fg(d.line_number),
+            line_number_added_bg: bg(d.line_number_added_bg),
+            line_number_removed_bg: bg(d.line_number_removed_bg),
+        }
+    }
+
+    /// Named hues on the text and signs; no backgrounds (the signs carry the
+    /// meaning).
+    fn ansi16() -> Self {
+        let fg = |color: Color| Style::default().fg(color);
+        let none = Style::default();
+        Self {
+            added: fg(Color::Green),
+            removed: fg(Color::Red),
+            context: fg(Color::DarkGray),
+            hunk: fg(Color::DarkGray),
+            sign_added: fg(Color::Green),
+            sign_removed: fg(Color::Red),
+            added_bg: none,
+            removed_bg: none,
+            context_bg: none,
+            line_number: fg(Color::DarkGray),
+            line_number_added_bg: none,
+            line_number_removed_bg: none,
+        }
+    }
+
+    /// `NO_COLOR`: no colour at all; the gutter and hunk rows recede.
+    fn no_color() -> Self {
+        let none = Style::default();
+        let dim = none.add_modifier(Modifier::DIM);
+        Self {
+            added: none,
+            removed: none,
+            context: none,
+            hunk: dim,
+            sign_added: none,
+            sign_removed: none,
+            added_bg: none,
+            removed_bg: none,
+            context_bg: none,
+            line_number: dim,
+            line_number_added_bg: none,
+            line_number_removed_bg: none,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Palette {
     /// Body text (`text.base`; the terminal foreground in the system theme).
@@ -165,6 +258,8 @@ pub struct Palette {
     /// A finished reasoning header: `warning` tinted 60% over the background
     /// (upstream `message-parts.tsx` ReasoningHeader).
     pub thought: Style,
+    /// Diff rows (upstream `diff.*` tokens).
+    pub diff: DiffStyles,
 }
 
 impl Palette {
@@ -199,6 +294,7 @@ impl Palette {
                 link: Style::default().fg(Color::Blue),
                 syntax: SyntaxStyles::ansi16(),
                 thought: Style::default().fg(Color::Yellow),
+                diff: DiffStyles::ansi16(),
             },
             Deck::NoColor => Self {
                 text: Style::default(),
@@ -221,6 +317,7 @@ impl Palette {
                 link: Style::default(),
                 syntax: SyntaxStyles::no_color(),
                 thought: Style::default(),
+                diff: DiffStyles::no_color(),
             },
         }
     }
@@ -266,6 +363,7 @@ impl Palette {
             link: Style::default().fg(rgb(t.markdown.link)),
             syntax: SyntaxStyles::from_tokens(&t.syntax),
             thought: thought(t.background, t.warning),
+            diff: DiffStyles::from_tokens(&t.diff),
         }
     }
 
@@ -317,6 +415,7 @@ impl Palette {
             link: Style::default().fg(Color::Blue),
             syntax: SyntaxStyles::ansi16(),
             thought: Style::default().fg(Color::Yellow),
+            diff: DiffStyles::ansi16(),
         })
     }
 
@@ -522,6 +621,59 @@ mod tests {
         assert_eq!(p.panel.bg, None, "no RGB surface on a 16-colour deck");
         assert_eq!(p.menu.bg, None);
         assert_eq!(p.dim.fg, Some(Color::DarkGray));
+    }
+
+    /// R11: the 16-colour and colourless decks keep the signs' meaning in
+    /// text (and, on 16 colours, named hues) but paint no diff background.
+    #[test]
+    fn diff_styles_degrade_without_truecolor() {
+        let colors = probed(Rgb::new(16, 16, 16));
+        let system16 = Palette::system(&colors, Deck::Ansi16).expect("background was reported");
+        for p in [Palette::for_deck(Deck::Ansi16), system16] {
+            assert_eq!(p.diff.sign_added.fg, Some(Color::Green));
+            assert_eq!(p.diff.sign_removed.fg, Some(Color::Red));
+            for bg in [
+                p.diff.added_bg,
+                p.diff.removed_bg,
+                p.diff.context_bg,
+                p.diff.line_number_added_bg,
+                p.diff.line_number_removed_bg,
+            ] {
+                assert_eq!(bg.bg, None, "no diff background on 16 colours");
+            }
+        }
+        let d = Palette::for_deck(Deck::NoColor).diff;
+        for style in [
+            d.added,
+            d.removed,
+            d.context,
+            d.hunk,
+            d.sign_added,
+            d.sign_removed,
+            d.added_bg,
+            d.removed_bg,
+            d.context_bg,
+            d.line_number,
+            d.line_number_added_bg,
+            d.line_number_removed_bg,
+        ] {
+            assert_eq!(
+                (style.fg, style.bg),
+                (None, None),
+                "colour leaked: {style:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn truecolor_diff_styles_come_from_the_tokens() {
+        let d = Palette::for_deck(Deck::Truecolor).diff;
+        assert_eq!(d.added_bg.bg, Some(Color::Rgb(0x20, 0x30, 0x3b)));
+        assert_eq!(d.removed_bg.bg, Some(Color::Rgb(0x37, 0x22, 0x2c)));
+        assert_eq!(d.context_bg.bg, Some(Color::Rgb(0x14, 0x14, 0x14)));
+        assert_eq!(d.sign_added.fg, Some(Color::Rgb(0xb8, 0xdb, 0x87)));
+        assert_eq!(d.line_number.fg, Some(Color::Rgb(0x8f, 0x8f, 0x8f)));
+        assert_eq!(d.hunk.fg, Some(Color::Rgb(0x82, 0x8b, 0xb8)));
     }
 
     #[test]

@@ -152,6 +152,38 @@ fn syntax_for(info: &str) -> Option<&'static SyntaxReference> {
         .filter(|syntax| syntax.name != "Plain Text")
 }
 
+/// The fence token for a file path, from its extension (upstream
+/// `util/filetype.ts` `filetype`): `ts`/`tsx`/`js`/`jsx` all read as
+/// TypeScript there, which here is the JavaScript grammar. Extensions the
+/// table does not name are passed through for the grammar lookup to try.
+#[must_use]
+pub fn lang_for_path(path: &str) -> Option<&str> {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    if name.eq_ignore_ascii_case("makefile") {
+        return Some("makefile");
+    }
+    // `path.extname`: a leading dot alone (`.bashrc`) is no extension.
+    let (stem, ext) = name.rsplit_once('.')?;
+    if stem.is_empty() || ext.is_empty() {
+        return None;
+    }
+    let lang = match ext.to_ascii_lowercase().as_str() {
+        "ts" | "tsx" | "mts" | "cts" | "mtsx" | "ctsx" | "ets" | "js" | "jsx" | "mjs" | "cjs" => {
+            "ts"
+        }
+        "rs" => "rust",
+        "py" => "python",
+        "sh" | "bash" | "zsh" | "ksh" => "bash",
+        "md" | "markdown" => "markdown",
+        "yml" | "yaml" => "yaml",
+        "htm" | "html" => "html",
+        "rb" | "rake" | "gemspec" | "ru" => "ruby",
+        "patch" | "diff" => "diff",
+        _ => return Some(ext),
+    };
+    Some(lang)
+}
+
 /// `code` as one span list per line. An unknown language, or a line the
 /// engine cannot lex, comes back as plain text in the palette's text colour.
 pub fn highlight(lang: &str, code: &str, palette: &Palette) -> Vec<Vec<Span<'static>>> {
@@ -231,7 +263,7 @@ mod tests {
     use ratatui::style::{Color, Modifier, Style};
     use ratatui::text::Span;
 
-    use super::highlight;
+    use super::{highlight, lang_for_path};
     use crate::theme::{Deck, Palette};
 
     fn find<'a>(line: &'a [Span<'static>], text: &str) -> &'a Span<'static> {
@@ -319,6 +351,26 @@ mod tests {
         assert_eq!(lines[0].len(), 1);
         assert_eq!(lines[0][0].content.as_ref(), "fn main() {}");
         assert_eq!(lines[0][0].style, p.text);
+    }
+
+    #[test]
+    fn paths_map_to_fence_tokens_by_extension() {
+        assert_eq!(lang_for_path("src/main.rs"), Some("rust"));
+        assert_eq!(lang_for_path("a/b.tsx"), Some("ts"));
+        assert_eq!(lang_for_path("x.TS"), Some("ts"));
+        assert_eq!(lang_for_path("tool.py"), Some("python"));
+        assert_eq!(lang_for_path("run.zsh"), Some("bash"));
+        assert_eq!(lang_for_path("dir/Makefile"), Some("makefile"));
+        assert_eq!(
+            lang_for_path("main.go"),
+            Some("go"),
+            "unknown ext passes through"
+        );
+        assert_eq!(lang_for_path(".bashrc"), None, "a dotfile has no extension");
+        assert_eq!(lang_for_path("README"), None);
+        let p = truecolor();
+        let lines = highlight(lang_for_path("a.rs").expect("rust"), "fn a() {}", &p);
+        assert_eq!(find(&lines[0], "fn").style.fg, p.syntax.function.fg);
     }
 
     #[test]

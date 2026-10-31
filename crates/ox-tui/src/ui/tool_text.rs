@@ -16,8 +16,17 @@
 //!   ox's `name` input alias is not consulted.
 //! - Subagent model labels show the raw `provider/model` reference: the TUI
 //!   has no model list to look the display name up in.
-//! - `write`/`edit`/`patch` keep the legacy `tool summary` row until their
-//!   block renderers land, like `shell`, so they map to `None` here.
+//! - `write` before it finishes is upstream's inline `← Write <path>` row
+//!   (`index.tsx:3170-3174`); a failed write lists its error under it. The
+//!   finished file is `write_block`'s.
+//! - `patch` (also `apply_patch`) without blocks to draw (running, or
+//!   finished without `metadata.files`) is an inline `← Patching[ <path>]`
+//!   row, where upstream draws a title-only `BlockTool` with a spinner
+//!   (`index.tsx:3600-3617`); the `←` icon is borrowed from Edit. Finished and failed blocks
+//!   are `patch_block`'s.
+//! - `edit` without a diff to draw (running, failed, no `metadata.files`) is
+//!   this inline row, where upstream draws a title-only `BlockTool`
+//!   (`index.tsx:3485-3496`); the finished diff block is `edit_block`'s.
 
 use std::borrow::Cow;
 use std::path::{Component, Path, PathBuf};
@@ -73,7 +82,7 @@ pub struct ToolText<'a> {
 /// Whether `tool` keeps a row of its own instead of a text row here.
 #[must_use]
 pub fn own_row(tool: &str) -> bool {
-    matches!(tool, "shell" | "todowrite" | "write" | "edit" | "patch")
+    matches!(tool, "shell" | "todowrite")
 }
 
 /// Whether `tool` falls back to upstream `GenericTool` (no own texts, no
@@ -83,12 +92,22 @@ pub fn is_generic(tool: &str) -> bool {
     !own_row(tool)
         && !matches!(
             tool,
-            "read" | "glob" | "grep" | "webfetch" | "skill" | "question" | "subagent"
+            "read"
+                | "glob"
+                | "grep"
+                | "webfetch"
+                | "skill"
+                | "question"
+                | "subagent"
+                | "edit"
+                | "write"
+                | "patch"
+                | "apply_patch"
         )
 }
 
 /// The texts for one call, or `None` for tools that keep their own row
-/// (`shell`, `todowrite`, `write`, `edit`, `patch`).
+/// (`shell`, `todowrite`).
 #[must_use]
 pub fn text<'a>(
     tool: &'a str,
@@ -181,6 +200,46 @@ pub fn text<'a>(
             base("\u{2192}", "Asking questions\u{2026}", label, count > 0)
         }
         "subagent" => subagent(input, state),
+        "edit" => {
+            let path = input_str("path");
+            let label = format!("Edit {}", format_path(path.unwrap_or_default(), paths));
+            // The spinner carries the label only once the path is known.
+            ToolText {
+                spinner: running(state) && truthy_str(path),
+                ..base(
+                    "\u{2190}",
+                    "Preparing edit\u{2026}",
+                    label,
+                    truthy_str(path),
+                )
+            }
+        }
+        "write" => {
+            let path = input_str("path");
+            let label = format!("Write {}", format_path(path.unwrap_or_default(), paths));
+            ToolText {
+                spinner: running(state) && truthy_str(path),
+                ..base(
+                    "\u{2190}",
+                    "Preparing write\u{2026}",
+                    label,
+                    truthy_str(path),
+                )
+            }
+        }
+        "patch" | "apply_patch" => {
+            let label =
+                match super::patch_block::targets(input_str("patchText").unwrap_or_default())
+                    .as_slice()
+                {
+                    [one] => format!("Patching {}", format_path(one, paths)),
+                    _ => String::from("Patching"),
+                };
+            ToolText {
+                spinner: running(state),
+                ..base("\u{2190}", "Patching", label, true)
+            }
+        }
         _ => {
             let summary = generic_summary(tool, input);
             ToolText {
@@ -664,6 +723,61 @@ mod tests {
                 Running,
                 "* mcp_tool [flag=true]",
             ),
+            // Edit without a diff block (`index.tsx:3485-3496`, inline here)
+            (
+                "edit",
+                json!({"path": "/work/repo/src/a.rs"}),
+                None,
+                Success,
+                "\u{2190} Edit src/a.rs",
+            ),
+            (
+                "edit",
+                json!({"path": "src/a.rs"}),
+                None,
+                Running,
+                "* Edit src/a.rs",
+            ),
+            ("edit", json!({}), None, Input, "* Preparing edit\u{2026}"),
+            (
+                "edit",
+                json!({"path": "a.rs"}),
+                None,
+                Failed,
+                "\u{2190} Edit a.rs",
+            ),
+            // Write before it finishes (`index.tsx:3170-3174`)
+            ("write", json!({}), None, Input, "* Preparing write\u{2026}"),
+            (
+                "write",
+                json!({"path": "/work/repo/src/a.rs"}),
+                None,
+                Running,
+                "* Write src/a.rs",
+            ),
+            (
+                "write",
+                json!({"path": "a.rs"}),
+                None,
+                Failed,
+                "\u{2190} Write a.rs",
+            ),
+            // Patch without blocks (`index.tsx:3600-3617`, inline here)
+            ("patch", json!({}), None, Running, "* Patching"),
+            (
+                "patch",
+                json!({"patchText": "*** Update File: /work/repo/src/a.rs\n"}),
+                None,
+                Running,
+                "* Patching src/a.rs",
+            ),
+            (
+                "apply_patch",
+                json!({"patchText": "*** Add File: a\n*** Add File: b\n"}),
+                Some(json!({"files": []})),
+                Success,
+                "\u{2190} Patching",
+            ),
         ];
         for (tool, input, metadata, state, want) in cases {
             let got = head(tool, input.clone(), metadata.clone(), state);
@@ -673,7 +787,7 @@ mod tests {
 
     #[test]
     fn rows_with_their_own_renderer_have_no_text() {
-        for tool in ["shell", "todowrite", "write", "edit", "patch"] {
+        for tool in ["shell", "todowrite"] {
             assert!(
                 text(tool, &Record::new(), None, ToolState::Success, &paths()).is_none(),
                 "{tool} keeps its own row"
@@ -694,7 +808,17 @@ mod tests {
         assert!(generic("capability_search"), "fallback");
         assert!(is_generic("capability_search"), "fallback");
         for tool in [
-            "read", "glob", "grep", "webfetch", "skill", "question", "subagent",
+            "read",
+            "glob",
+            "grep",
+            "webfetch",
+            "skill",
+            "question",
+            "subagent",
+            "edit",
+            "write",
+            "patch",
+            "apply_patch",
         ] {
             assert!(!generic(tool), "{tool} has its own text");
             assert!(!is_generic(tool), "{tool} has its own text");

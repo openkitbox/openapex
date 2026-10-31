@@ -13,9 +13,8 @@
 //!    so `light` means "the terminal background is light".
 //! 2. A light background whose luma rounds to 0 would divide by zero upstream
 //!    (NaN grays); here it takes the same fixed ramp as the near-black case.
-//! 3. Only the grays and the muted text are derived. Upstream also splits a
-//!    markdown/syntax palette and tints diff backgrounds from these same hues;
-//!    ox has no markdown or diff surface yet, so those stay out until they do.
+//! 3. Only the grays and the muted text are derived here; the hues and the
+//!    diff tints built from them live in `tokens::Tokens::system`.
 
 use super::terminal::{Rgb, TerminalColors};
 

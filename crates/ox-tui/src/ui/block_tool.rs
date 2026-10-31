@@ -12,15 +12,16 @@
 //! - The rail is upstream's `background.base`. When the deck does not know
 //!   that colour as RGB (16-colour, colourless) the rail is a blank cell on
 //!   the band instead of a default-coloured bar.
-//! - `path` titles (`FilePath` truncation) and `headerColor`/`errorColor`
-//!   overrides are not ported; callers pass a finished title string. Tool
-//!   permission (warning-coloured title) is not ported either.
+//! - `path` titles (`FilePath` truncation) are not ported; callers pass a
+//!   finished title string. Tool permission (warning-coloured title) is not
+//!   ported either. `headerColor`/`errorColor` are [`BlockSpec::title_fg`] /
+//!   [`BlockSpec::error_fg`].
 //! - Without animations upstream shows `⋯` for the spinner; this always shows
 //!   the frame the caller passes.
 
 use std::borrow::Cow;
 
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
 use crate::theme;
@@ -43,6 +44,10 @@ pub struct BlockSpec<'a> {
     pub error: Option<&'a str>,
     /// The pointer is over a clickable block.
     pub hovered: bool,
+    /// Upstream `headerColor`: the title colour; `None` is `text.muted`.
+    pub title_fg: Option<Color>,
+    /// Upstream `errorColor`: the error colour; `None` is the error token.
+    pub error_fg: Option<Color>,
 }
 
 /// The band behind a block: `raised.base`, `raised.high` under the pointer.
@@ -117,7 +122,8 @@ pub fn lines(spec: &BlockSpec<'_>, body: Vec<Line<'static>>, width: u16) -> Vec<
             }
             None => Cow::Borrowed(title),
         };
-        parts.push(styled_wrap(&head, palette.dim, usable));
+        let style = spec.title_fg.map_or(palette.dim, |fg| palette.dim.fg(fg));
+        parts.push(styled_wrap(&head, style, usable));
     }
     if !body.is_empty() {
         parts.push(body);
@@ -125,7 +131,8 @@ pub fn lines(spec: &BlockSpec<'_>, body: Vec<Line<'static>>, width: u16) -> Vec<
     if let Some(error) = spec.error {
         let clean = paste::normalize(error);
         if !clean.trim().is_empty() {
-            parts.push(styled_wrap(&clean, palette.warn, usable));
+            let style = spec.error_fg.map_or(palette.warn, |fg| palette.warn.fg(fg));
+            parts.push(styled_wrap(&clean, style, usable));
         }
     }
     let mut rows = Vec::new();
@@ -142,10 +149,7 @@ pub fn lines(spec: &BlockSpec<'_>, body: Vec<Line<'static>>, width: u16) -> Vec<
 /// colour is unknown.
 fn rail(palette: &theme::Palette, band: Style) -> Span<'static> {
     match palette.backdrop {
-        Some(base) => Span::styled(
-            RAIL,
-            band.fg(ratatui::style::Color::Rgb(base.r, base.g, base.b)),
-        ),
+        Some(base) => Span::styled(RAIL, band.fg(Color::Rgb(base.r, base.g, base.b))),
         None => Span::styled(" ", band),
     }
 }
@@ -260,6 +264,23 @@ mod tests {
             3,
             "a blank error adds nothing"
         );
+    }
+
+    #[test]
+    fn title_and_error_colours_can_be_overridden() {
+        use ratatui::style::Color;
+        let p = theme::palette();
+        let spec = BlockSpec {
+            title: Some("# Patch failed"),
+            error: Some("boom"),
+            title_fg: Some(Color::Rgb(1, 2, 3)),
+            error_fg: Some(Color::Rgb(4, 5, 6)),
+            ..BlockSpec::default()
+        };
+        let rows = lines(&spec, Vec::new(), 30);
+        assert_eq!(rows[1].spans[2].style.fg, Some(Color::Rgb(1, 2, 3)));
+        assert_eq!(rows[1].spans[2].style.bg, p.raised_base.bg);
+        assert_eq!(rows[3].spans[2].style.fg, Some(Color::Rgb(4, 5, 6)));
     }
 
     #[test]

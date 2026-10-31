@@ -8,6 +8,8 @@
 |---|---|---|---|---|---|
 | behavior | block-tool | routes/session/index.tsx:2883 | crates/ox-tui/src/ui/block_tool.rs:68 | partial | ┃ 轨、上下空行、内容缩进 2 列、整块同色带,与用户消息共用 frame。偏差:hover 用 palette.panel;16 色/无色主题轨为空格;未移植 path 标题截断、headerColor/errorColor、权限色;无动画时不显示 ⋯ |
 | behavior | completion-notice | routes/session/index.tsx:2090 | crates/ox-tui/src/pipeline.rs:58 | partial | `↳ Shell/Subagent finished · ...` 历史与实时两路都做了,子代理行可点击跳转。偏差:标题固定为 Subagent(ox 元数据无 agent 名);hover 只提亮标题 |
+| behavior | diff-block | routes/session/index.tsx:3439 | crates/ox-tui/src/ui/diff.rs:208 | partial | unified/split（按 width-4 选视图）、行号 gutter（pad,号,符号,pad）、hunk 行、12 个 diff 主题色、解析失败回退原文。偏差见 diff.rs:20-41:无语法高亮、无词级高亮、无 diffwrap 切换 |
+| behavior | edit-block | routes/session/index.tsx:3439 | crates/ox-tui/src/ui/edit_block.rs:38 | partial | `← Edit path` BlockTool + diff。偏差:非成功态仍为单行 tool_text;无 diagnostics(服务端无);不可展开点击 |
 | behavior | explored-expand | routes/session/group-view.tsx:152 | crates/ox-tui/src/ui/timeline.rs:432 | aligned | 点击标题行展开/折叠,状态按 group id 保存 |
 | behavior | explored-group | routes/session/group-view.tsx:115 | crates/ox-tui/src/pipeline.rs:1 | partial | 运行中 spinner `Exploring:`、按首次出现计数、展开子项用专用文案。偏差:无 completePrevious/partitionPending;子项不可点击 |
 | behavior | family-busy | context/session-tabs.tsx:170 | crates/ox-client/src/store.rs:365 | aligned | 自身回合或任一子会话在跑都算忙;Esc/Ctrl+C 仍只作用于当前会话 |
@@ -16,12 +18,14 @@
 | behavior | mouse-select-copy | util/selection.ts:34 | crates/ox-tui/src/ui/selection.rs:167 | deviation | 拖选/双击/三击/自动复制/toast 已做。偏差:软换行处复制带 \\n;仅转录区可选;拖出边缘不自动滚动;无右键复制;双击三击按显示行而非源行 |
 | behavior | paste-attachment | component/prompt/local-attachment.ts:1 | crates/ox-tui/src/attachment.rs:37 | deviation | 图片/PDF 路径与 file:// 成为附件,上限 32 个 / 20MB;附件不写入历史,提交失败不恢复文本 |
 | behavior | paste-fold | component/prompt/index.tsx:1447 | crates/ox-tui/src/ui/paste.rs:88 | deviation | 3 行以上或超 150 字符折叠为 [Pasted ~N lines];占位符是普通文本(tui-textarea 无 extmark),无点击展开 |
+| behavior | patch-block | routes/session/index.tsx:3503 | crates/ox-tui/src/ui/patch_block.rs:44 | partial | 每文件一个 diff 块,patch/apply_patch 两名都认,失败态也画块。偏差:无 metadata.applied、无 move 源路径、失败无 metadata(服务端缺口) |
 | behavior | session-rows | routes/session/index.tsx:2022 | crates/ox-tui/src/ui/timeline.rs:1604 | partial | Error 挂在消息下;Retry 倒计时;agent/model/location 切换行;Instructions updated;Skill;Compaction queued;压缩 spinner。偏差见 store.rs/pipeline.rs 模块文档 |
 | behavior | shell-background-output | routes/session/index.tsx:3015 | crates/ox-tui/src/shell_captures.rs:114 | partial | 展开时每秒拉取一页、在飞不重发,退出后 drain 一次,超 1 MiB 保留尾部并显示 [earlier output omitted]。偏差:复用 33ms UI tick 节流;折叠块不轮询;按原始字节计限,绘制时去 ANSI;失败不立即重试;后台调用无输出前不显示结果文本;失败调用只显示错误 |
 | behavior | shell-block | routes/session/index.tsx:2969 | crates/ox-tui/src/ui/shell_block.rs:173 | partial | BlockTool 框、`$ [cd wd && ]cmd`、运行 spinner、Writing command…、折叠 10 行带 (N earlier lines)、点击/o 展开、Background 徽标、失败 error 已做(接线 ui/timeline.rs:1467)。偏差:前台完成调用显示工具结果;Background 仅在 shell 仍存活时显示;无部分输入解析;hover 用 palette.panel;无权限色;[ ] 焦点画 hover 带;spinner 只改缓存行的 spinner span |
 | behavior | shell-message | routes/session/index.tsx:2322 |  | n/a | ox 服务端从不产生 Message::Shell(仅 schema 有),TUI 也没有 ! 输入模式,故不渲染 |
 | behavior | subagent-background-badge | routes/session/index.tsx:3289 | crates/ox-tui/src/ui/timeline.rs:1626 | aligned | 子会话运行时子代理工具行显示转圈和 Background |
 | behavior | tool-inline-texts | routes/session/index.tsx:3143 | crates/ox-tui/src/ui/tool_text.rs:93 | deviation | Read/Glob/Grep/WebFetch/Skill/Subagent/Question/Generic 文案已移植。偏差:Generic 键序按字母;子代理模型显示原始 provider/model,无 agent 名时为 General;展开体限 TOOL_OUTPUT_MAX_LINES |
+| behavior | write-block | routes/session/index.tsx:3143 | crates/ox-tui/src/ui/write_block.rs:40 | partial | `# Wrote path` + 带行号全文。偏差:无语法高亮;无 diagnostics;超宽单字形独占一行 |
 | dialog | dialog-agent | component/dialog-agent.tsx:1 |  | todo |  |
 | dialog | dialog-alert | ui/dialog-alert.tsx:1 |  | todo |  |
 | dialog | dialog-config | component/dialog-config.tsx:1 |  | todo |  |
@@ -446,18 +450,18 @@
 | theme_token | border | theme/assets/opencode.json:92 |  | todo |  |
 | theme_token | borderActive | theme/assets/opencode.json:96 |  | todo |  |
 | theme_token | borderSubtle | theme/assets/opencode.json:100 |  | todo |  |
-| theme_token | diffAdded | theme/assets/opencode.json:104 |  | todo |  |
-| theme_token | diffAddedBg | theme/assets/opencode.json:128 |  | todo |  |
-| theme_token | diffAddedLineNumberBg | theme/assets/opencode.json:144 |  | todo |  |
-| theme_token | diffContext | theme/assets/opencode.json:112 |  | todo |  |
-| theme_token | diffContextBg | theme/assets/opencode.json:136 |  | todo |  |
-| theme_token | diffHighlightAdded | theme/assets/opencode.json:120 |  | todo |  |
-| theme_token | diffHighlightRemoved | theme/assets/opencode.json:124 |  | todo |  |
-| theme_token | diffHunkHeader | theme/assets/opencode.json:116 |  | todo |  |
-| theme_token | diffLineNumber | theme/assets/opencode.json:140 |  | todo |  |
-| theme_token | diffRemoved | theme/assets/opencode.json:108 |  | todo |  |
-| theme_token | diffRemovedBg | theme/assets/opencode.json:132 |  | todo |  |
-| theme_token | diffRemovedLineNumberBg | theme/assets/opencode.json:148 |  | todo |  |
+| theme_token | diffAdded | theme/assets/opencode.json:104 | crates/ox-tui/src/theme.rs:117 | aligned | Palette.diff 对应 diff.* token |
+| theme_token | diffAddedBg | theme/assets/opencode.json:128 | crates/ox-tui/src/theme.rs:117 | aligned | Palette.diff 对应 diff.* token |
+| theme_token | diffAddedLineNumberBg | theme/assets/opencode.json:144 | crates/ox-tui/src/theme.rs:117 | aligned | Palette.diff 对应 diff.* token |
+| theme_token | diffContext | theme/assets/opencode.json:112 | crates/ox-tui/src/theme.rs:117 | aligned | Palette.diff 对应 diff.* token |
+| theme_token | diffContextBg | theme/assets/opencode.json:136 | crates/ox-tui/src/theme.rs:117 | aligned | Palette.diff 对应 diff.* token |
+| theme_token | diffHighlightAdded | theme/assets/opencode.json:120 | crates/ox-tui/src/theme.rs:117 | aligned | Palette.diff 对应 diff.* token |
+| theme_token | diffHighlightRemoved | theme/assets/opencode.json:124 | crates/ox-tui/src/theme.rs:117 | aligned | Palette.diff 对应 diff.* token |
+| theme_token | diffHunkHeader | theme/assets/opencode.json:116 | crates/ox-tui/src/theme.rs:117 | aligned | Palette.diff 对应 diff.* token |
+| theme_token | diffLineNumber | theme/assets/opencode.json:140 | crates/ox-tui/src/theme.rs:117 | aligned | Palette.diff 对应 diff.* token |
+| theme_token | diffRemoved | theme/assets/opencode.json:108 | crates/ox-tui/src/theme.rs:117 | aligned | Palette.diff 对应 diff.* token |
+| theme_token | diffRemovedBg | theme/assets/opencode.json:132 | crates/ox-tui/src/theme.rs:117 | aligned | Palette.diff 对应 diff.* token |
+| theme_token | diffRemovedLineNumberBg | theme/assets/opencode.json:148 | crates/ox-tui/src/theme.rs:117 | aligned | Palette.diff 对应 diff.* token |
 | theme_token | error | theme/assets/opencode.json:56 |  | todo |  |
 | theme_token | info | theme/assets/opencode.json:68 |  | todo |  |
 | theme_token | markdownBlockQuote | theme/assets/opencode.json:172 |  | todo |  |
@@ -564,11 +568,11 @@
 | theme_token_v2 | text.formfield.$selected | theme/assets/v2/opencode.json:36 |  | todo |  |
 | theme_token_v2 | text.formfield.base | theme/assets/v2/opencode.json:31 |  | todo |  |
 | theme_token_v2 | text.muted | theme/assets/v2/opencode.json:13 |  | todo |  |
-| tool_renderer | edit | routes/session/message-parts.tsx:29 |  | todo |  |
+| tool_renderer | edit | routes/session/message-parts.tsx:29 | crates/ox-tui/src/ui/edit_block.rs:38 | partial | 见 behavior edit-block |
 | tool_renderer | execute | routes/session/message-parts.tsx:31 |  | todo |  |
 | tool_renderer | glob | routes/session/message-parts.tsx:23 |  | todo |  |
 | tool_renderer | grep | routes/session/message-parts.tsx:25 |  | todo |  |
-| tool_renderer | patch | routes/session/message-parts.tsx:32 |  | todo |  |
+| tool_renderer | patch | routes/session/message-parts.tsx:32 | crates/ox-tui/src/ui/patch_block.rs:44 | partial | 见 behavior patch-block |
 | tool_renderer | question | routes/session/message-parts.tsx:34 |  | todo |  |
 | tool_renderer | read | routes/session/message-parts.tsx:24 |  | todo |  |
 | tool_renderer | shell | routes/session/message-parts.tsx:22 | crates/ox-tui/src/ui/shell_block.rs:173 | partial | 见 behavior shell-block |
@@ -577,4 +581,4 @@
 | tool_renderer | todowrite | routes/session/message-parts.tsx:33 |  | todo |  |
 | tool_renderer | webfetch | routes/session/message-parts.tsx:26 |  | todo |  |
 | tool_renderer | websearch | routes/session/message-parts.tsx:27 |  | todo |  |
-| tool_renderer | write | routes/session/message-parts.tsx:28 |  | todo |  |
+| tool_renderer | write | routes/session/message-parts.tsx:28 | crates/ox-tui/src/ui/write_block.rs:40 | partial | 见 behavior write-block |

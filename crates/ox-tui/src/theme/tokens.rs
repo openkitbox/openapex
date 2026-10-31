@@ -10,7 +10,7 @@
 //!
 //! Deliberate deviations from upstream:
 //!
-//! 1. Only the tokens ox renders are kept. Action/formfield states, diff and
+//! 1. Only the tokens ox renders are kept. Action/formfield states and
 //!    scrollbar tokens are not resolved; the state-expansion rules in
 //!    `packages/theme/src/tui/expand.ts` are therefore not ported.
 //! 2. `opencode.json` has no `secondary` token. `secondary` is `blue.200`, the
@@ -259,6 +259,35 @@ pub struct Markdown {
     pub code_block: Rgb,
 }
 
+/// The `diff.*` group (`theme/src/tui/schema.ts` `DiffDefinition`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Diff {
+    /// `diff.text.added`.
+    pub added: Rgb,
+    /// `diff.text.removed`.
+    pub removed: Rgb,
+    /// `diff.text.context`.
+    pub context: Rgb,
+    /// `diff.text.hunkHeader`.
+    pub hunk: Rgb,
+    /// `diff.highlight.added`: the `+` sign (`addedSignColor`, `index.tsx:3475`).
+    pub highlight_added: Rgb,
+    /// `diff.highlight.removed`: the `-` sign.
+    pub highlight_removed: Rgb,
+    /// `diff.background.added`.
+    pub added_bg: Rgb,
+    /// `diff.background.removed`.
+    pub removed_bg: Rgb,
+    /// `diff.background.context`, also the context gutter.
+    pub context_bg: Rgb,
+    /// `diff.lineNumber.text`.
+    pub line_number: Rgb,
+    /// `diff.lineNumber.background.added`.
+    pub line_number_added_bg: Rgb,
+    /// `diff.lineNumber.background.removed`.
+    pub line_number_removed_bg: Rgb,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tokens {
     /// `text.base`.
@@ -289,6 +318,7 @@ pub struct Tokens {
     pub agent: Rgb,
     pub syntax: Syntax,
     pub markdown: Markdown,
+    pub diff: Diff,
 }
 
 impl Tokens {
@@ -357,6 +387,41 @@ impl Tokens {
                 image_text: cyan,
                 code_block: text,
             },
+            // `assets/v2/opencode.json` diff blocks: dark :98-120, light
+            // :271-292. Light omits `text.removed` and `background.context`;
+            // v1 (`assets/opencode.json`) gives `#c53b53`, and the context
+            // surface is `neutral.700` in both modes.
+            diff: if dark {
+                Diff {
+                    added: h(0x4fd6be),
+                    removed: h(0xc53b53),
+                    context: h(0x828bb8),
+                    hunk: h(0x828bb8),
+                    highlight_added: h(0xb8db87),
+                    highlight_removed: h(0xe26a75),
+                    added_bg: h(0x20303b),
+                    removed_bg: h(0x37222c),
+                    context_bg: gray[S700],
+                    line_number: h(0x8f8f8f),
+                    line_number_added_bg: h(0x1b2b34),
+                    line_number_removed_bg: h(0x2d1f26),
+                }
+            } else {
+                Diff {
+                    added: h(0x1e725c),
+                    removed: h(0xc53b53),
+                    context: h(0x7086b5),
+                    hunk: h(0x7086b5),
+                    highlight_added: h(0x4db380),
+                    highlight_removed: h(0xf52a65),
+                    added_bg: h(0xd5e5d5),
+                    removed_bg: h(0xf7d8db),
+                    context_bg: gray[S700],
+                    line_number: h(0x595959),
+                    line_number_added_bg: h(0xc5d5c5),
+                    line_number_removed_bg: h(0xe7c8cb),
+                }
+            },
         }
     }
 
@@ -375,6 +440,9 @@ impl Tokens {
             colors.slot(6),
         );
         let rule = system.grays[7];
+        // system.ts:36-41: diff surfaces tinted from the background.
+        let alpha = if system.is_light { 0.14 } else { 0.22 };
+        let context_bg = system.grays[2];
         Self {
             text: fg,
             text_muted: system.muted,
@@ -417,6 +485,21 @@ impl Tokens {
                 image: blue,
                 image_text: cyan,
                 code_block: fg,
+            },
+            // system.ts:62-73.
+            diff: Diff {
+                added: green,
+                removed: red,
+                context: rule,
+                hunk: rule,
+                highlight_added: colors.slot(10),
+                highlight_removed: colors.slot(9),
+                added_bg: Rgb::tint(system.background, green, alpha),
+                removed_bg: Rgb::tint(system.background, red, alpha),
+                context_bg,
+                line_number: system.muted,
+                line_number_added_bg: Rgb::tint(context_bg, green, alpha),
+                line_number_removed_bg: Rgb::tint(context_bg, red, alpha),
             },
         }
     }
@@ -584,6 +667,69 @@ mod tests {
         assert_eq!(t.markdown.code, hex(0xb5bd68));
         assert_eq!(t.markdown.horizontal_rule, hex(0x3f5c84));
         assert_eq!(t.markdown.text, hex(0xa6b2c0));
+    }
+
+    #[test]
+    fn opencode_diff_tokens_match_the_v2_document() {
+        let d = Tokens::opencode(Mode::Dark).diff;
+        assert_eq!(d.added, hex(0x4fd6be));
+        assert_eq!(d.removed, hex(0xc53b53));
+        assert_eq!(d.context, hex(0x828bb8));
+        assert_eq!(d.hunk, hex(0x828bb8));
+        assert_eq!(d.highlight_added, hex(0xb8db87));
+        assert_eq!(d.highlight_removed, hex(0xe26a75));
+        assert_eq!(d.added_bg, hex(0x20303b));
+        assert_eq!(d.removed_bg, hex(0x37222c));
+        assert_eq!(d.context_bg, hex(0x141414));
+        assert_eq!(d.line_number, hex(0x8f8f8f));
+        assert_eq!(d.line_number_added_bg, hex(0x1b2b34));
+        assert_eq!(d.line_number_removed_bg, hex(0x2d1f26));
+        let l = Tokens::opencode(Mode::Light).diff;
+        assert_eq!(l.added, hex(0x1e725c));
+        assert_eq!(l.removed, hex(0xc53b53), "v1 fallback");
+        assert_eq!(l.context, hex(0x7086b5));
+        assert_eq!(l.highlight_added, hex(0x4db380));
+        assert_eq!(l.highlight_removed, hex(0xf52a65));
+        assert_eq!(l.added_bg, hex(0xd5e5d5));
+        assert_eq!(l.removed_bg, hex(0xf7d8db));
+        assert_eq!(l.context_bg, hex(0xfafafa));
+        assert_eq!(l.line_number, hex(0x595959));
+        assert_eq!(l.line_number_added_bg, hex(0xc5d5c5));
+        assert_eq!(l.line_number_removed_bg, hex(0xe7c8cb));
+    }
+
+    /// R10: system.ts:36-41, alpha 0.22 dark / 0.14 light.
+    #[test]
+    fn system_diff_backgrounds_tint_the_background_by_mode() {
+        let colors = gold_terminal();
+        let system = System::derive(&colors).expect("background reported");
+        let d = Tokens::system(&system, &colors).diff;
+        let bg = hex(0x1b2738);
+        assert_eq!(d.added_bg, Rgb::tint(bg, hex(0xb5bd68), 0.22));
+        assert_eq!(d.removed_bg, Rgb::tint(bg, hex(0xcc6666), 0.22));
+        assert_eq!(d.context_bg, system.grays[2]);
+        assert_eq!(
+            d.line_number_added_bg,
+            Rgb::tint(system.grays[2], hex(0xb5bd68), 0.22)
+        );
+        assert_eq!(
+            d.line_number_removed_bg,
+            Rgb::tint(system.grays[2], hex(0xcc6666), 0.22)
+        );
+        assert_eq!(d.line_number, system.muted);
+        assert_eq!(d.added, hex(0xb5bd68));
+        assert_eq!(d.removed, hex(0xcc6666));
+        assert_eq!(d.highlight_added, hex(0xb9ca4a));
+        assert_eq!(d.highlight_removed, hex(0xd54e53));
+        assert_eq!(d.hunk, system.grays[7]);
+
+        let mut light = colors;
+        light.background = Some(hex(0xfdf6e3));
+        let system = System::derive(&light).expect("background reported");
+        assert!(system.is_light, "a cream background is light");
+        let d = Tokens::system(&system, &light).diff;
+        assert_eq!(d.added_bg, Rgb::tint(hex(0xfdf6e3), hex(0xb5bd68), 0.14));
+        assert_eq!(d.removed_bg, Rgb::tint(hex(0xfdf6e3), hex(0xcc6666), 0.14));
     }
 
     #[test]

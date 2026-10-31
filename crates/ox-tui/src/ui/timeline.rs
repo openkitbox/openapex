@@ -17,6 +17,7 @@ use ox_schema::support::{Record, TokenUsage};
 use crate::theme;
 
 use super::block_tool;
+use super::patch_block::PatchCall;
 use super::selection::{self, Behavior, ClickTracker, Outcome, Pos, Selection};
 use super::tool_row::{self, InlineSpec, RowView};
 use super::tool_text::{self, ToolText};
@@ -1503,9 +1504,25 @@ fn render_entry(
             input,
             metadata,
             ..
-        } => match tool_text::text(tool, input, metadata.as_deref(), *state, tool_text::paths()) {
-            Some(text) => text_tool_block(block, &text, input, output, view, width),
-            None => tool_block(block, tool, *state, summary, output, view, width),
+        } => match own_block(
+            tool,
+            &PatchCall {
+                state: *state,
+                input,
+                metadata: metadata.as_deref(),
+                output,
+            },
+            width,
+            palette,
+        ) {
+            Some(lines) => lines,
+            None => {
+                match tool_text::text(tool, input, metadata.as_deref(), *state, tool_text::paths())
+                {
+                    Some(text) => text_tool_block(block, &text, input, output, view, width),
+                    None => tool_block(block, tool, *state, summary, output, view, width),
+                }
+            }
         },
         Block::Todo {
             state,
@@ -1555,6 +1572,38 @@ fn render_entry(
 
 /// Columns every session-level row is indented (`paddingLeft={3}`).
 const COMPLETION_INDENT: usize = 3;
+
+/// A call drawn as its tool's own block (upstream `Edit`, `ApplyPatch`,
+/// `Write`), or
+/// `None` to keep the inline row. Such blocks are not expandable
+/// ([`draws_block`] keeps `tool_expandable` and `clickable` false).
+fn own_block(
+    tool: &str,
+    call: &PatchCall<'_>,
+    width: u16,
+    palette: &theme::Palette,
+) -> Option<Vec<Line<'static>>> {
+    if !draws_block(tool, call.state) {
+        return None;
+    }
+    match tool {
+        "edit" => super::edit_block::render(call.metadata, width, palette),
+        "patch" | "apply_patch" => super::patch_block::render(call, width, palette),
+        "write" => Some(super::write_block::render(call.input, width, palette)),
+        _ => None,
+    }
+}
+
+/// Whether `tool` in `state` is drawn by [`own_block`] (when its data
+/// allows). Those calls, and their inline fallbacks in the same state, have
+/// nothing to open: the block shows everything, the fallback has no body.
+fn draws_block(tool: &str, state: ToolState) -> bool {
+    match tool {
+        "edit" | "write" => matches!(state, ToolState::Success),
+        "patch" | "apply_patch" => matches!(state, ToolState::Success | ToolState::Failed),
+        _ => false,
+    }
+}
 
 /// One completion notice row: `   ↳ Shell finished · description`.
 ///
@@ -2345,6 +2394,7 @@ fn failed_with_error(block: &Block) -> bool {
 /// clickable unless failed, as before.
 fn clickable(block: &Block) -> bool {
     match block {
+        Block::Tool { tool, state, .. } if draws_block(tool, *state) => false,
         Block::Tool { tool, .. } if !failed_with_error(block) => {
             tool_text::is_generic(tool) && tool_expandable(block)
         }
@@ -2383,7 +2433,9 @@ fn tool_expandable(block: &Block) -> bool {
             input,
             ..
         } => {
-            if failed_with_error(block) {
+            if draws_block(tool, *state) {
+                false
+            } else if failed_with_error(block) {
                 true
             } else if tool_text::own_row(tool) {
                 !output.is_empty() && matches!(state, ToolState::Success)
@@ -2523,7 +2575,7 @@ mod tests {
                 Block::Tool {
                     id: "p3".into(),
                     version: 0,
-                    tool: "edit".into(),
+                    tool: "todowrite".into(),
                     state: ToolState::Failed,
                     summary: "main.rs".into(),
                     output: Arc::new("boom".into()),
@@ -2558,7 +2610,7 @@ mod tests {
             !text.contains("one"),
             "success output stays collapsed: {text}"
         );
-        assert!(text.contains("✗ edit main.rs"), "{text}");
+        assert!(text.contains("✗ todowrite main.rs"), "{text}");
         assert!(
             text.contains("boom"),
             "failures keep their bounded output: {text}"
@@ -2753,6 +2805,165 @@ mod tests {
             super::theme::palette().dim.fg,
             "muted"
         );
+    }
+
+    fn edit_call(state: ToolState, files: bool) -> Block {
+        let mut block = text_row(
+            "edit",
+            state,
+            serde_json::json!({"path": "src/a.rs"}),
+            if matches!(state, ToolState::Failed) {
+                "no match"
+            } else {
+                ""
+            },
+        );
+        if files && let Block::Tool { metadata, .. } = &mut block {
+            *metadata = Some(rec(serde_json::json!({"files": [{
+                "file": "src/a.rs", "additions": 1, "deletions": 1, "status": "modified",
+                "patch": "--- src/a.rs\n+++ src/a.rs\n@@ -1,2 +1,2 @@\n keep\n-old\n+new\n"
+            }]})));
+        }
+        block
+    }
+
+    #[test]
+    fn a_finished_edit_draws_its_diff_block_and_does_not_expand() {
+        let mut t = Transcript::new(60, 12);
+        t.sync(&[edit_call(ToolState::Success, true)], 0);
+        let text = screen(&mut t, 60, 12);
+        let rows: Vec<&str> = text.lines().collect();
+        assert!(rows[2].ends_with("\u{2190} Edit src/a.rs"), "{rows:?}");
+        assert!(text.contains("1   keep"), "{text}");
+        assert!(text.contains("2 - old"), "{text}");
+        assert!(text.contains("2 + new"), "{text}");
+        assert!(!t.click(6, 2), "the block is always open");
+        assert!(!t.toggle_tool_output(), "nor toggled with o");
+        assert!(
+            !super::spins(&t.entries[0].block),
+            "a finished block never respins"
+        );
+    }
+
+    fn patch_call(state: ToolState, output: &str) -> Block {
+        let mut block = text_row(
+            "patch",
+            state,
+            serde_json::json!({"patchText": "*** Update File: src/a.rs\n@@\n-old\n+new\n"}),
+            output,
+        );
+        if matches!(state, ToolState::Success)
+            && let Block::Tool { metadata, .. } = &mut block
+        {
+            *metadata = Some(rec(serde_json::json!({"files": [
+                {"file": "src/a.rs", "additions": 1, "deletions": 1, "status": "modified",
+                 "patch": "--- src/a.rs\n+++ src/a.rs\n@@ -1 +1 @@\n-old\n+new\n"},
+                {"file": "src/b.rs", "additions": 0, "deletions": 2, "status": "deleted",
+                 "patch": "--- src/b.rs\n+++ src/b.rs\n@@ -1,2 +0,0 @@\n-x\n-y\n"}
+            ]})));
+        }
+        block
+    }
+
+    #[test]
+    fn a_finished_patch_draws_a_block_per_file_and_does_not_expand() {
+        let mut t = Transcript::new(60, 20);
+        t.sync(&[patch_call(ToolState::Success, "")], 0);
+        let text = screen(&mut t, 60, 20);
+        assert!(text.contains("\u{2190} Patched src/a.rs"), "{text}");
+        assert!(text.contains("1 - old"), "{text}");
+        assert!(text.contains("# Deleted src/b.rs"), "{text}");
+        assert!(text.contains("-2 lines"), "{text}");
+        assert!(!t.click(6, 2), "the blocks are always open");
+        assert!(!t.toggle_tool_output(), "nor toggled with o");
+        assert!(
+            !super::spins(&t.entries[0].block),
+            "a finished block never respins"
+        );
+    }
+
+    #[test]
+    fn a_failed_patch_is_a_block_with_its_error_and_does_not_expand() {
+        let mut t = Transcript::new(60, 10);
+        t.sync(&[patch_call(ToolState::Failed, "hunk did not apply")], 0);
+        let text = screen(&mut t, 60, 10);
+        assert!(text.contains("# Patch failed src/a.rs"), "{text}");
+        assert!(text.contains("hunk did not apply"), "{text}");
+        assert!(!t.click(6, 2), "the error is already shown");
+        assert!(!t.toggle_tool_output(), "nor toggled with o");
+    }
+
+    #[test]
+    fn a_running_patch_keeps_its_inline_spinner_row() {
+        let mut t = Transcript::new(60, 6);
+        t.sync(&[patch_call(ToolState::Running, "")], 0);
+        let rows = screen(&mut t, 60, 6);
+        assert_eq!(
+            rows.lines().nth(1),
+            Some("   \u{280b} Patching src/a.rs"),
+            "{rows}"
+        );
+        assert!(super::spins(&t.entries[0].block), "the row spins");
+    }
+
+    #[test]
+    fn a_finished_write_draws_the_file_and_does_not_expand() {
+        let input = serde_json::json!({"path": "src/a.rs", "content": "fn a() {}\nfn b() {}\n"});
+        let mut t = Transcript::new(60, 10);
+        t.sync(
+            &[text_row(
+                "write",
+                ToolState::Success,
+                input.clone(),
+                "Wrote 2 lines",
+            )],
+            0,
+        );
+        let text = screen(&mut t, 60, 10);
+        assert!(text.contains("# Wrote src/a.rs"), "{text}");
+        assert!(text.contains("  1 fn a() {}"), "{text}");
+        assert!(text.contains("  2 fn b() {}"), "{text}");
+        assert!(!t.click(6, 2), "the block is always open");
+        assert!(!t.toggle_tool_output(), "nor toggled with o");
+        assert!(!super::spins(&t.entries[0].block), "never respins");
+
+        let mut t = Transcript::new(60, 6);
+        t.sync(&[text_row("write", ToolState::Running, input, "")], 0);
+        let rows = screen(&mut t, 60, 6);
+        assert_eq!(
+            rows.lines().nth(1),
+            Some("   \u{280b} Write src/a.rs"),
+            "{rows}"
+        );
+    }
+
+    #[test]
+    fn an_edit_without_a_diff_keeps_its_inline_row() {
+        let mut t = Transcript::new(60, 6);
+        t.sync(&[edit_call(ToolState::Running, false)], 0);
+        let rows = screen(&mut t, 60, 6);
+        assert_eq!(
+            rows.lines().nth(1),
+            Some("   \u{280b} Edit src/a.rs"),
+            "{rows}"
+        );
+
+        let mut t = Transcript::new(60, 6);
+        t.sync(&[edit_call(ToolState::Success, false)], 0);
+        let rows = screen(&mut t, 60, 6);
+        assert_eq!(
+            rows.lines().nth(1),
+            Some("   \u{2190} Edit src/a.rs"),
+            "{rows}"
+        );
+
+        let mut t = Transcript::new(60, 6);
+        t.sync(&[edit_call(ToolState::Failed, true)], 0);
+        screen(&mut t, 60, 6);
+        assert!(t.click(6, 1), "a failed edit opens its error");
+        let open = screen(&mut t, 60, 6);
+        assert_eq!(open.lines().nth(2), Some("     no match"), "{open}");
+        assert!(!open.contains("+ new"), "no diff for a failed call: {open}");
     }
 
     /// Draws the transcript once and returns the screen as text rows. Wide

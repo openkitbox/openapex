@@ -231,6 +231,7 @@ pub fn render(spec: &ShellSpec<'_>, width: u16) -> Rendered {
         spinner: None,
         error,
         hovered: spec.hovered,
+        ..BlockSpec::default()
     };
     Rendered {
         lines: block_tool::lines(&block, body, width),
