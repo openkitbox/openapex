@@ -364,3 +364,256 @@ async fn find_files_queries_fs_find_and_parses_entries() {
             .contains("x-opencode-directory: /proj")
     );
 }
+
+#[tokio::test]
+async fn session_info_reads_the_parent_id() {
+    let mock = MockOx::default();
+    mock.reply(
+        "/api/session/ses_c",
+        r#"{"data":{"id":"ses_c","parentID":"ses_p"}}"#,
+    );
+    mock.reply("/api/session/ses_r", r#"{"data":{"id":"ses_r"}}"#);
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    assert_eq!(
+        client
+            .session_info("ses_c")
+            .await
+            .unwrap()
+            .parent_id
+            .as_deref(),
+        Some("ses_p")
+    );
+    assert_eq!(client.session_info("ses_r").await.unwrap().parent_id, None);
+}
+
+#[tokio::test]
+async fn session_family_is_one_request_to_the_ox_endpoint() {
+    let mock = MockOx::default();
+    mock.reply(
+        "/ox/session/ses_c/family",
+        r#"{"location":{"directory":"/proj"},"data":[
+            {"id":"ses_root","title":"main","agent":"build","parentID":null,"time":{"created":1,"updated":5},"running":false},
+            {"id":"ses_c","title":null,"agent":"explore","parentID":"ses_root","time":{"created":2,"updated":3},"running":true}
+        ]}"#,
+    );
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    let family = client.session_family("ses_c").await.unwrap();
+    assert_eq!(family.len(), 2);
+    assert_eq!(family[0].id, "ses_root");
+    assert_eq!(family[0].title.as_deref(), Some("main"));
+    assert_eq!(family[0].agent.as_deref(), Some("build"));
+    assert_eq!(family[0].parent_id, None);
+    assert!(!family[0].running);
+    assert_eq!(family[0].time.updated, 5);
+    assert_eq!(family[1].title, None);
+    assert_eq!(family[1].agent.as_deref(), Some("explore"));
+    assert_eq!(family[1].parent_id.as_deref(), Some("ses_root"));
+    assert!(family[1].running);
+
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(
+        requests[0].starts_with("GET /ox/session/ses_c/family "),
+        "{}",
+        requests[0]
+    );
+    assert!(
+        requests[0]
+            .to_lowercase()
+            .contains("x-opencode-directory: /proj"),
+        "{}",
+        requests[0]
+    );
+}
+
+#[tokio::test]
+async fn session_family_surfaces_a_failed_status() {
+    let mock = MockOx::default(); // unregistered path answers 404
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    let err = client.session_family("ses_x").await.unwrap_err();
+    assert!(matches!(err, ox_client::Error::Status(status) if status.as_u16() == 404));
+}
+
+#[tokio::test]
+async fn shells_parse_the_wire_shape() {
+    let mock = MockOx::default();
+    mock.reply(
+        "/api/shell",
+        r#"{"location":{"directory":"/proj"},"data":[
+            {"id":"shl_1","status":"running","command":"sleep 99","cwd":"/proj","shell":"zsh","file":"ox-shell://shl_1","pid":42,"metadata":{"sessionID":"ses_1"},"time":{"started":7}},
+            {"id":"shl_2","status":"exited","command":"true","cwd":"/proj","shell":"zsh","file":"ox-shell://shl_2","pid":43,"exit":0,"metadata":{},"time":{"started":8,"completed":9}}
+        ]}"#,
+    );
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    let shells = client.shells().await.unwrap();
+    assert_eq!(shells.len(), 2);
+    assert_eq!(shells[0].status, "running");
+    assert_eq!(shells[0].command, "sleep 99");
+    assert_eq!(shells[0].pid, Some(42));
+    assert_eq!(shells[0].exit, None);
+    assert_eq!(shells[0].signal, None);
+    assert_eq!(shells[0].session_id(), Some("ses_1"));
+    assert_eq!(shells[0].time.started, 7);
+    assert_eq!(shells[0].time.completed, None);
+    assert_eq!(shells[1].exit, Some(0));
+    assert_eq!(shells[1].session_id(), None);
+    assert_eq!(shells[1].time.completed, Some(9));
+    assert!(mock.requests()[0].starts_with("GET /api/shell"));
+}
+
+#[tokio::test]
+async fn shell_output_reads_a_page_from_the_cursor() {
+    let mock = MockOx::default();
+    mock.reply(
+        "/api/shell/shl_1/output",
+        r#"{"location":{"directory":"/proj"},"data":{"output":"hi\n","cursor":3,"size":10,"truncated":true}}"#,
+    );
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    let page = client.shell_output("shl_1", 0).await.unwrap();
+    assert_eq!(page.output, "hi\n");
+    assert_eq!(page.cursor, 3);
+    assert_eq!(page.size, 10);
+    assert!(page.truncated);
+    let request = &mock.requests()[0];
+    assert!(
+        request.starts_with("GET /api/shell/shl_1/output?"),
+        "{request}"
+    );
+    assert!(request.contains("cursor=0"), "{request}");
+}
+
+#[tokio::test]
+async fn kill_shell_sends_a_delete() {
+    let mock = MockOx::default();
+    mock.reply_raw(
+        "/api/shell/shl_1",
+        "HTTP/1.1 204 No Content\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+    );
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    client.kill_shell("shl_1").await.unwrap();
+    assert!(mock.requests()[0].starts_with("DELETE /api/shell/shl_1"));
+
+    let err = client.kill_shell("shl_missing").await.unwrap_err();
+    assert!(matches!(err, ox_client::Error::Status(status) if status.as_u16() == 404));
+}
+
+fn shell_page(output: &str, cursor: u64, size: u64) -> String {
+    format!(
+        r#"{{"location":{{"directory":"/proj"}},"data":{{"output":{},"cursor":{cursor},"size":{size},"truncated":false}}}}"#,
+        serde_json::to_string(output).expect("json string")
+    )
+}
+
+#[tokio::test]
+async fn shell_tail_probes_the_size_then_reads_from_size_minus_max() {
+    let mock = MockOx::default();
+    mock.reply("/api/shell/shl_1/output", &shell_page("tail", 10, 10));
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    let tail = client.shell_tail("shl_1", 4).await.unwrap();
+    assert_eq!(tail.text, "tail");
+    assert!(tail.omitted, "bytes before the start cursor were skipped");
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2, "{requests:?}");
+    assert!(
+        requests[0].contains("cursor=9007199254740991"),
+        "{requests:?}"
+    );
+    assert!(requests[1].contains("cursor=6"), "{requests:?}");
+}
+
+#[tokio::test]
+async fn shell_tail_of_a_small_capture_starts_at_zero_and_omits_nothing() {
+    let mock = MockOx::default();
+    mock.reply("/api/shell/shl_1/output", &shell_page("hi\n", 3, 3));
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    let tail = client.shell_tail("shl_1", 64 * 1024).await.unwrap();
+    assert_eq!(tail.text, "hi\n");
+    assert!(!tail.omitted);
+    assert!(
+        mock.requests()[1].contains("cursor=0"),
+        "{:?}",
+        mock.requests()
+    );
+}
+
+#[tokio::test]
+async fn shell_tail_drops_the_split_character_at_the_start() {
+    let mock = MockOx::default();
+    mock.reply(
+        "/api/shell/shl_1/output",
+        &shell_page("\u{fffd}\u{fffd}ok", 10, 10),
+    );
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    let tail = client.shell_tail("shl_1", 4).await.unwrap();
+    assert_eq!(tail.text, "ok", "a char cut by the cursor is not shown");
+    assert!(tail.omitted);
+}
+
+#[tokio::test]
+async fn shell_tail_keeps_only_the_newest_max_bytes_on_a_char_boundary() {
+    let mock = MockOx::default();
+    mock.reply("/api/shell/shl_1/output", &shell_page("aé世b", 7, 7));
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    // The newest 3 bytes start inside "世" (bytes 3..6): the cut moves
+    // forward to the next char boundary.
+    let tail = client.shell_tail("shl_1", 3).await.unwrap();
+    assert_eq!(tail.text, "b");
+    assert!(tail.omitted);
+}
+
+#[tokio::test]
+async fn shell_tail_stops_when_the_server_makes_no_progress() {
+    let mock = MockOx::default();
+    // The cursor never reaches `size`: the loop must still end.
+    mock.reply("/api/shell/shl_1/output", &shell_page("x", 3, 10));
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    let tail = client.shell_tail("shl_1", 4).await.unwrap();
+    assert_eq!(tail.text, "x");
+    assert!(mock.request_count() <= 3, "{:?}", mock.requests());
+}
+
+#[tokio::test]
+async fn shell_tail_of_a_missing_shell_is_a_status_error() {
+    let mock = MockOx::default();
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    let err = client.shell_tail("shl_gone", 4).await.unwrap_err();
+    assert!(matches!(err, ox_client::Error::Status(status) if status.as_u16() == 404));
+}
+
+#[tokio::test]
+async fn shell_tail_reports_omitted_when_the_server_dropped_the_head() {
+    let mock = MockOx::default();
+    mock.reply(
+        "/api/shell/shl_1/output",
+        r#"{"data":{"output":"late","cursor":4,"size":4,"truncated":true}}"#,
+    );
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    let tail = client.shell_tail("shl_1", 64 * 1024).await.unwrap();
+    assert!(tail.omitted, "a capture that lost its head is partial");
+}

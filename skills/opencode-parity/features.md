@@ -11,6 +11,9 @@
 | behavior | mouse-select-copy | util/selection.ts:34 | crates/ox-tui/src/ui/selection.rs:167 | deviation | 拖选/双击/三击/自动复制/toast 已做。偏差:软换行处复制带 \\n;仅转录区可选;拖出边缘不自动滚动;无右键复制;双击三击按显示行而非源行 |
 | behavior | paste-attachment | component/prompt/local-attachment.ts:1 | crates/ox-tui/src/attachment.rs:37 | deviation | 图片/PDF 路径与 file:// 成为附件,上限 32 个 / 20MB;附件不写入历史,提交失败不恢复文本 |
 | behavior | paste-fold | component/prompt/index.tsx:1447 | crates/ox-tui/src/ui/paste.rs:88 | deviation | 3 行以上或超 150 字符折叠为 [Pasted ~N lines];占位符是普通文本(tui-textarea 无 extmark),无点击展开 |
+| behavior | completion-notice | routes/session/index.tsx:2090 | crates/ox-tui/src/pipeline.rs:58 | partial | `↳ Shell/Subagent finished · ...` 历史与实时两路都做了,子代理行可点击跳转。偏差:标题固定为 Subagent(ox 元数据无 agent 名);hover 只提亮标题 |
+| behavior | family-busy | context/session-tabs.tsx:170 | crates/ox-client/src/store.rs:365 | aligned | 自身回合或任一子会话在跑都算忙;Esc/Ctrl+C 仍只作用于当前会话 |
+| behavior | subagent-background-badge | routes/session/index.tsx:3289 | crates/ox-tui/src/ui/timeline.rs:1626 | aligned | 子会话运行时子代理工具行显示转圈和 Background |
 | dialog | dialog-agent | component/dialog-agent.tsx:1 |  | todo |  |
 | dialog | dialog-alert | ui/dialog-alert.tsx:1 |  | todo |  |
 | dialog | dialog-config | component/dialog-config.tsx:1 |  | todo |  |
@@ -37,7 +40,7 @@
 | dialog | dialog-select | ui/dialog-select.tsx:1 |  | todo |  |
 | dialog | dialog-session-list | component/dialog-session-list.tsx:1 | crates/ox-tui/src/ui/session_dialog.rs:63 | todo | ox 有对应对话框,字段与交互未逐项核对 |
 | dialog | dialog-session-rename | component/dialog-session-rename.tsx:1 | crates/ox-tui/src/ui/session_dialog.rs:97 | todo | ox 有对应对话框,字段与交互未逐项核对 |
-| dialog | dialog-shell-output | component/dialog-shell-output.tsx:1 |  | todo |  |
+| dialog | dialog-shell-output | component/dialog-shell-output.tsx:1 | crates/ox-tui/src/ui/output_dialog.rs:45 | deviation | 显示命令、状态、最近 64 KiB 输出(去 ANSI),↑↓/PageUp/PageDown/Home/End 滚动;不轮询,ctrl+r 刷新 |
 | dialog | dialog-skill | component/dialog-skill.tsx:1 |  | todo |  |
 | dialog | dialog-stash | component/dialog-stash.tsx:1 |  | todo |  |
 | dialog | dialog-status | component/dialog-status.tsx:1 |  | todo |  |
@@ -61,14 +64,14 @@
 | keybind | app.toggle.file_context | config/keybind.ts:54 |  | todo |  |
 | keybind | app.toggle.paste_summary | config/keybind.ts:56 |  | todo |  |
 | keybind | command.palette.show | config/keybind.ts:57 |  | todo |  |
-| keybind | composer.shell.down | config/keybind.ts:254 |  | todo |  |
-| keybind | composer.shell.kill | config/keybind.ts:256 |  | todo |  |
-| keybind | composer.shell.select | config/keybind.ts:255 |  | todo |  |
-| keybind | composer.shell.up | config/keybind.ts:253 |  | todo |  |
-| keybind | composer.subagent.down | config/keybind.ts:250 |  | todo |  |
-| keybind | composer.subagent.interrupt | config/keybind.ts:252 |  | todo |  |
-| keybind | composer.subagent.select | config/keybind.ts:251 |  | todo |  |
-| keybind | composer.subagent.up | config/keybind.ts:249 |  | todo |  |
+| keybind | composer.shell.down | config/keybind.ts:254 | crates/ox-tui/src/ui/shell_dialog.rs:20 | deviation | 偏差:用 Select 对话框而非 composer 面板;入口 ctrl+x b 或 /shells(上游无独立键) |
+| keybind | composer.shell.kill | config/keybind.ts:256 | crates/ox-tui/src/ui/shell_dialog.rs:20 | deviation | 偏差:对话框形态;ctrl+d 杀掉后重新拉取列表,光标回到顶部;无点击和页脚 M shells 提示 |
+| keybind | composer.shell.select | config/keybind.ts:255 | crates/ox-tui/src/ui/shell_dialog.rs:20 | deviation | 偏差:Enter 打开只读输出查看器(output_dialog.rs:45),不轮询,ctrl+r 手动刷新(上游每秒轮询) |
+| keybind | composer.shell.up | config/keybind.ts:253 | crates/ox-tui/src/ui/shell_dialog.rs:20 | deviation | 偏差:用 Select 对话框而非 composer 面板;入口 ctrl+x b 或 /shells(上游无独立键) |
+| keybind | composer.subagent.down | config/keybind.ts:250 | crates/ox-tui/src/ui/subagent_dialog.rs:45 | deviation | 偏差:用 Select 对话框而非底部 composer 面板;↑/↓ 在列表内移动 |
+| keybind | composer.subagent.interrupt | config/keybind.ts:252 | crates/ox-tui/src/ui/subagent_dialog.rs:45 | deviation | 偏差:用 Select 对话框而非底部 composer 面板;ctrl+d 只在运行中列表有效,对话框保持打开;ctrl+a 切换运行中/已结束;入口 ctrl+x ↓ 或 /subagents;无点击命中测试,页脚无 N subagents 提示 |
+| keybind | composer.subagent.select | config/keybind.ts:251 | crates/ox-tui/src/ui/subagent_dialog.rs:45 | deviation | 偏差:用 Select 对话框而非底部 composer 面板;Enter 跳到子会话;列表来自 GET /ox/session/{id}/family(ox 专用端点);只在根会话可开 |
+| keybind | composer.subagent.up | config/keybind.ts:249 | crates/ox-tui/src/ui/subagent_dialog.rs:45 | deviation | 偏差:用 Select 对话框而非底部 composer 面板;↑/↓ 在列表内移动,在第一行 ↑ 不关闭,Esc 关闭 |
 | keybind | composer.terminal.down | config/keybind.ts:258 |  | todo |  |
 | keybind | composer.terminal.select | config/keybind.ts:259 |  | todo |  |
 | keybind | composer.terminal.up | config/keybind.ts:257 |  | todo |  |
@@ -200,9 +203,9 @@
 | keybind | server.pair | config/keybind.ts:61 |  | todo |  |
 | keybind | service.restart | config/keybind.ts:62 |  | todo |  |
 | keybind | session.aside | config/keybind.ts:131 |  | todo |  |
-| keybind | session.background | config/keybind.ts:129 |  | todo |  |
+| keybind | session.background | config/keybind.ts:129 |  | missing | 服务端没有 session.background 路由,需先做服务端 |
 | keybind | session.cd | config/keybind.ts:132 |  | todo |  |
-| keybind | session.child.first | config/keybind.ts:138 |  | todo |  |
+| keybind | session.child.first | config/keybind.ts:138 | crates/ox-tui/src/ui/subagent_dialog.rs:45 | partial | 只做了 Subagents 选择器(ctrl+x ↓),没有 first/next/previous 的会话间直接切换键 |
 | keybind | session.child.next | config/keybind.ts:139 |  | todo |  |
 | keybind | session.child.previous | config/keybind.ts:140 |  | todo |  |
 | keybind | session.compact | config/keybind.ts:130 |  | todo |  |
@@ -298,7 +301,7 @@
 | sdk_call | location.get | app.tsx:229 |  | todo |  |
 | sdk_call | server.info | component/devtools-bar.tsx:57 |  | todo |  |
 | sdk_call | server.pair | component/dialog-pair.tsx:22 |  | todo |  |
-| sdk_call | session.background | component/prompt/index.tsx:544 |  | todo |  |
+| sdk_call | session.background | component/prompt/index.tsx:544 |  | missing | 服务端没有对应路由 |
 | sdk_call | session.command | component/prompt/index.tsx:1325 |  | todo |  |
 | sdk_call | session.environment | component/prompt/index.tsx:1255 |  | todo |  |
 | sdk_call | session.interrupt | component/prompt/index.tsx:524 |  | todo |  |
@@ -311,8 +314,8 @@
 | sdk_call | session.update | routes/session/index.tsx:1051 |  | todo |  |
 | sdk_call | session.view | context/session-tabs.tsx:245 |  | todo |  |
 | sdk_call | shell.get | component/dialog-shell-output.tsx:41 |  | todo |  |
-| sdk_call | shell.output | component/dialog-shell-output.tsx:46 |  | todo |  |
-| sdk_call | shell.remove | routes/session/composer/shell-tab.tsx:104 |  | todo |  |
+| sdk_call | shell.output | component/dialog-shell-output.tsx:46 | crates/ox-client/src/rest.rs:433 | aligned |  |
+| sdk_call | shell.remove | routes/session/composer/shell-tab.tsx:104 | crates/ox-client/src/rest.rs:485 | aligned |  |
 | sdk_call | worktree.create | component/prompt/move.tsx:41 |  | todo |  |
 | sdk_call | worktree.list | component/dialog-open.tsx:122 |  | todo |  |
 | sdk_call | worktree.refresh | component/dialog-open.tsx:133 |  | todo |  |

@@ -22,9 +22,15 @@ pub const RENAME_KEY: char = 'r';
 /// Upstream's `withTimestampedFallback`: a session nobody named is shown as
 /// `New session - <created, ISO-8601 UTC>`.
 fn title_of(session: &SessionSummary) -> String {
-    match &session.title {
-        Some(title) => title.clone(),
-        None => match Timestamp::from_millisecond(session.time.created) {
+    fallback_title(session.title.as_deref(), session.time.created)
+}
+
+/// [`title_of`] for any session shape: its title, else the timestamped fallback.
+#[must_use]
+pub fn fallback_title(title: Option<&str>, created: i64) -> String {
+    match title {
+        Some(title) => title.to_owned(),
+        None => match Timestamp::from_millisecond(created) {
             Ok(created) => format!(
                 "New session - {}",
                 created
@@ -121,6 +127,7 @@ mod tests {
                 ..SessionTime::default()
             },
             location: None,
+            parent_id: None,
         }
     }
 

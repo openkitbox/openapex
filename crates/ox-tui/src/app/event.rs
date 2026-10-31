@@ -92,6 +92,25 @@ pub enum AppEvent {
     Quit,
     /// Answer to `AppCommand::ListSessions`; opens the `/sessions` dialog.
     Sessions(Vec<ox_client::rest::SessionSummary>),
+    /// Answer to `AppCommand::ListFamily`: the family `session` belongs to;
+    /// opens the subagent picker.
+    Family {
+        session: String,
+        members: Vec<ox_client::rest::FamilyMember>,
+    },
+    /// Answer to `AppCommand::ListShells`: every shell the server knows;
+    /// `session` is the one that asked, and the picker filters by it.
+    Shells {
+        session: String,
+        shells: Vec<ox_client::rest::ShellInfo>,
+    },
+    /// Answer to `AppCommand::ShellOutput`: the shell as the server lists it
+    /// now, plus the newest part of its output.
+    ShellOutput {
+        session: String,
+        shell: Box<ox_client::rest::ShellInfo>,
+        tail: ox_client::rest::ShellTail,
+    },
     /// A session was deleted on the server.
     SessionDeleted(String),
     /// A fork finished; the app switches to the new session.

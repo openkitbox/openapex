@@ -21,6 +21,7 @@ use ox_schema::id::now_millis;
 mod attachment;
 pub mod compat;
 pub mod event;
+pub mod family;
 pub mod files;
 pub mod form;
 pub mod lease;
@@ -715,7 +716,11 @@ pub fn build_router(state: AppState) -> Router {
         .hoop(affix_state::inject(state))
         // ox-only endpoints live beside `/api`, never under it, so upstream
         // opencode paths stay distinguishable.
-        .push(Router::with_path("ox").push(Router::with_path("lease").get(lease::lease)))
+        .push(
+            Router::with_path("ox")
+                .push(Router::with_path("lease").get(lease::lease))
+                .push(Router::with_path("session/{id}/family").get(family::family)),
+        )
         .push(
             Router::with_path("api")
                 .push(Router::with_path("info").get(server_info))

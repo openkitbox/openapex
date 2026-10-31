@@ -21,6 +21,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::form::{self, FormOutcome, FormState};
 use super::fuzzy;
+use super::output_dialog::{self, Output};
 use super::paste;
 use crate::theme::{self, Palette};
 
@@ -54,6 +55,8 @@ pub enum Dialog {
     Input(Input),
     /// A pending form (`ui/form.rs`); drawn over the prompt, not centred.
     Form(Box<FormState>),
+    /// A shell's recent output (`ui/output_dialog.rs`).
+    Output(Output),
 }
 
 impl Dialog {
@@ -63,6 +66,7 @@ impl Dialog {
             Self::Select(select) => &select.title,
             Self::Input(input) => &input.title,
             Self::Form(form) => form.title(),
+            Self::Output(_) => "Shell output",
         }
     }
 
@@ -74,6 +78,7 @@ impl Dialog {
             Self::Select(select) => select.tag,
             Self::Input(input) => input.tag,
             Self::Form(_) => None,
+            Self::Output(_) => Some(output_dialog::TAG),
         }
     }
 
@@ -93,6 +98,7 @@ impl Dialog {
                 FormOutcome::Submit(answer) => DialogOutcome::FormSubmitted(answer),
                 FormOutcome::Cancel => DialogOutcome::Cancelled,
             },
+            Self::Output(output) => output.on_key(key),
         }
     }
 }
@@ -103,7 +109,7 @@ impl Dialog {
     /// so it never reaches the composer).
     pub fn on_paste(&mut self, text: &str) -> DialogOutcome {
         match self {
-            Self::Info(_) => DialogOutcome::Idle,
+            Self::Info(_) | Self::Output(_) => DialogOutcome::Idle,
             Self::Select(select) => select.on_paste(text),
             Self::Input(input) => input.on_paste(text),
             Self::Form(form) => match form.on_paste(text) {
@@ -194,6 +200,9 @@ pub fn render(frame: &mut Frame, area: Rect, dialog: &Dialog) {
                 frame.set_cursor_position(cursor);
             }
         }
+        Dialog::Output(output) => {
+            output_dialog::draw(frame.buffer_mut(), area, output, theme::palette());
+        }
     }
 }
 
@@ -261,7 +270,7 @@ const PANEL_WIDTH: u16 = 60;
 const LARGE_PANEL_WIDTH: u16 = 88;
 /// Text column inside the panel: `DIALOG_INSET` 3 + the header's 1-cell inset
 /// (`dialog.tsx:26-28`, `dialog-select.tsx:696`).
-const TEXT_INSET: u16 = 4;
+pub(super) const TEXT_INSET: u16 = 4;
 /// Rows above the list: top padding, header, gap, search input, gap
 /// (`dialog.tsx:83`, `dialog-select.tsx:696-713`, `DialogLayout` gap 1).
 const CHROME_TOP: usize = 5;
@@ -354,6 +363,8 @@ pub struct Select {
     offset: Cell<usize>,
     width: u16,
     tag: Option<&'static str>,
+    /// Replaces "No items available" when there are no items at all.
+    empty_text: Option<String>,
     actions: Vec<Action>,
     /// A row that pressed a confirming action once and awaits the second.
     armed: Option<Armed>,
@@ -367,6 +378,8 @@ pub struct Select {
 struct Action {
     key: char,
     confirm: Option<String>,
+    /// Fires even when no row is selected, with an empty value.
+    rowless: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -387,6 +400,7 @@ impl Select {
             offset: Cell::new(0),
             width: PANEL_WIDTH,
             tag: None,
+            empty_text: None,
             actions: Vec::new(),
             armed: None,
         }
@@ -409,8 +423,35 @@ impl Select {
         self.actions.push(Action {
             key,
             confirm: confirm.map(str::to_owned),
+            rowless: false,
         });
         self
+    }
+
+    /// Register `ctrl+<key>` as an action on the dialog itself: it fires with
+    /// an empty value when the list has no row to act on.
+    pub fn rowless_action(mut self, key: char) -> Self {
+        self.actions.push(Action {
+            key,
+            confirm: None,
+            rowless: true,
+        });
+        self
+    }
+
+    /// What to say when the dialog has no items at all.
+    pub fn empty_text(mut self, text: impl Into<String>) -> Self {
+        self.empty_text = Some(text.into());
+        self
+    }
+
+    /// The text drawn in place of the list when it is empty.
+    pub fn empty_message(&self) -> &str {
+        if !self.items.is_empty() {
+            "No results found"
+        } else {
+            self.empty_text.as_deref().unwrap_or("No items available")
+        }
     }
 
     /// The row whose value is `value`.
@@ -533,7 +574,14 @@ impl Select {
     fn run_action(&mut self, ch: char) -> Option<DialogOutcome> {
         let action = self.actions.iter().find(|action| action.key == ch)?;
         let Some(value) = self.selected_value().map(str::to_owned) else {
-            return Some(DialogOutcome::Idle);
+            return Some(if action.rowless {
+                DialogOutcome::Action {
+                    key: ch,
+                    value: String::new(),
+                }
+            } else {
+                DialogOutcome::Idle
+            });
         };
         let armed = Armed { key: ch, value };
         if action.confirm.is_some() && self.armed.as_ref() != Some(&armed) {
@@ -822,7 +870,7 @@ fn entries(items: &[Item], view: &[usize]) -> Vec<Entry> {
 /// Dim everything in `area` the way black at alpha 150 would. `Reset` colours
 /// are resolved to the terminal's own colours when the palette knows them;
 /// anything that cannot be blended falls back to the DIM modifier.
-fn dim_backdrop(buf: &mut Buffer, area: Rect, pal: &Palette) {
+pub(super) fn dim_backdrop(buf: &mut Buffer, area: Rect, pal: &Palette) {
     let rgb = |color: Option<Color>| match color {
         Some(Color::Rgb(r, g, b)) => Some((r, g, b)),
         _ => None,
@@ -858,7 +906,15 @@ fn shade(color: Color, reset_as: Option<(u8, u8, u8)>) -> Option<Color> {
 
 /// Write `text` at `(x, y)` inside `clip`, at most `max` cells wide; returns
 /// the next free column. Writes outside `clip` are dropped.
-fn put(buf: &mut Buffer, clip: Rect, x: u16, y: u16, max: u16, text: &str, style: Style) -> u16 {
+pub(super) fn put(
+    buf: &mut Buffer,
+    clip: Rect,
+    x: u16,
+    y: u16,
+    max: u16,
+    text: &str,
+    style: Style,
+) -> u16 {
     if y < clip.top() || y >= clip.bottom() || x >= clip.right() {
         return x;
     }
@@ -928,12 +984,15 @@ fn draw_select(buf: &mut Buffer, area: Rect, select: &Select, pal: &Palette) -> 
     let body_y = top + CHROME_TOP as u16;
     let cursor = select.selected.min(view.len().saturating_sub(1));
     if rows.is_empty() {
-        let text = if select.items.is_empty() {
-            "No items available"
-        } else {
-            "No results found"
-        };
-        put(buf, panel, text_x, body_y, span, text, pal.dim);
+        put(
+            buf,
+            panel,
+            text_x,
+            body_y,
+            span,
+            select.empty_message(),
+            pal.dim,
+        );
     } else {
         let selected_row = rows
             .iter()
@@ -1149,7 +1208,7 @@ mod tests {
     fn info(dialog: &Dialog) -> &Info {
         match dialog {
             Dialog::Info(info) => info,
-            Dialog::Select(_) | Dialog::Input(_) | Dialog::Form(_) => {
+            Dialog::Select(_) | Dialog::Input(_) | Dialog::Form(_) | Dialog::Output(_) => {
                 panic!("expected an info dialog")
             }
         }
@@ -1500,6 +1559,39 @@ mod tests {
         let screen = draw(&select, 100, 30).join("\n");
         assert!(screen.contains("No results found"), "{screen}");
         assert!(screen.contains("zzz"), "{screen}");
+    }
+
+    #[test]
+    fn select_shows_its_own_empty_text_only_when_it_has_no_items() {
+        let empty = Select::new("Subagents", Vec::new()).empty_text("No active subagents");
+        assert_eq!(empty.empty_message(), "No active subagents");
+        let screen = draw(&empty, 100, 30).join("\n");
+        assert!(screen.contains("No active subagents"), "{screen}");
+        assert!(!screen.contains("No items available"), "{screen}");
+
+        let mut filled = Select::new("Subagents", vec![Item::new("a", "Alpha")])
+            .empty_text("No active subagents");
+        type_text(&mut filled, "zzz");
+        let screen = draw(&filled, 100, 30).join("\n");
+        assert!(screen.contains("No results found"), "{screen}");
+    }
+
+    #[test]
+    fn a_rowless_action_fires_on_an_empty_list_but_a_row_action_does_not() {
+        let mut select = Select::new("Subagents", Vec::new())
+            .action('r', None)
+            .rowless_action('a');
+        assert_eq!(
+            select.on_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            DialogOutcome::Idle
+        );
+        assert_eq!(
+            select.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            DialogOutcome::Action {
+                key: 'a',
+                value: String::new()
+            }
+        );
     }
 
     #[test]

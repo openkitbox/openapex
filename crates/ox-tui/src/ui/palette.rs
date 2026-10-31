@@ -32,6 +32,8 @@ const ORDER: &[CommandAction] = &[
     CommandAction::Rename,
     CommandAction::Timeline,
     CommandAction::Fork,
+    CommandAction::Subagents,
+    CommandAction::Shells,
     CommandAction::Models,
     CommandAction::Agents,
     CommandAction::Status,
@@ -43,6 +45,8 @@ const SESSION_ONLY: &[CommandAction] = &[
     CommandAction::Rename,
     CommandAction::Timeline,
     CommandAction::Fork,
+    CommandAction::Subagents,
+    CommandAction::Shells,
 ];
 
 /// What the palette needs to know about the app.

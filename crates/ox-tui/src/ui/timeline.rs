@@ -1768,7 +1768,7 @@ fn format_duration(ms: i64) -> String {
     }
 }
 
-fn titlecase(word: &str) -> String {
+pub(crate) fn titlecase(word: &str) -> String {
     let mut chars = word.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),

@@ -514,6 +514,7 @@ fn session_case(
             ..SessionTime::default()
         },
         location: None,
+        parent_id: None,
     };
     let sessions = [
         summary("ses_a", Some("Fix the SSE reconnect"), 5 * 60_000),

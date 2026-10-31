@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{KeyCode, KeyEvent};
 use crossterm::execute;
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+use ox_client::rest::{FamilyMember, ShellInfo, ShellTail};
 use ox_client::sse::StreamMsg;
 use ox_client::store::{DataStore, Item};
 use ox_schema::support::FileInput;
@@ -23,6 +24,7 @@ use crate::ui::composer::{SearchAction, SearchBox, Submission};
 use crate::ui::dialog::{Dialog, DialogOutcome};
 use crate::ui::dock::{self, StatusMode};
 use crate::ui::layout;
+use crate::ui::output_dialog::{self, Output};
 use crate::ui::palette;
 use crate::ui::paste;
 use crate::ui::prompt::{
@@ -30,6 +32,8 @@ use crate::ui::prompt::{
 };
 use crate::ui::selection::Outcome;
 use crate::ui::session_dialog;
+use crate::ui::shell_dialog;
+use crate::ui::subagent_dialog;
 use crate::ui::timeline::Transcript;
 use crate::ui::timeline_dialog;
 use crate::ui::toast::{self, Toast};
@@ -119,6 +123,23 @@ pub struct App {
     /// Whether the last copy produced an OSC 52 sequence, so the terminal was
     /// asked to set its clipboard even if the host write fails.
     osc52_attempted: bool,
+    /// The family behind the open subagent picker, fetched when it opened and
+    /// replaced on every fetch. Only `ctrl+a` reads it, to rebuild the rows.
+    family: Vec<FamilyMember>,
+    /// The picker's filter; it outlives the dialog like upstream's in-memory
+    /// `subagents-filter`.
+    subagents_active_only: bool,
+    /// The shell dialog the user just asked for and has not seen yet. A shell
+    /// answer may open a dialog only for this; otherwise it may refresh a
+    /// dialog that is still open. So a refresh that lands after `esc` is dropped.
+    shell_wanted: Option<ShellWanted>,
+}
+
+/// Which shell dialog an in-flight request will open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellWanted {
+    Picker,
+    Viewer,
 }
 
 impl App {
@@ -169,6 +190,9 @@ impl App {
             limits_requested: false,
             pending_osc52: None,
             osc52_attempted: false,
+            family: Vec::new(),
+            subagents_active_only: true,
+            shell_wanted: None,
         }
     }
 
@@ -264,6 +288,13 @@ impl App {
                     self.dirty = true;
                 }
             }
+            AppEvent::Family { session, members } => self.on_family(&session, members),
+            AppEvent::Shells { session, shells } => self.on_shells(&session, &shells),
+            AppEvent::ShellOutput {
+                session,
+                shell,
+                tail,
+            } => self.on_shell_output(&session, &shell, tail),
             AppEvent::SessionDeleted(id) => self.handle_session_deleted(id),
             AppEvent::SessionForked(id) => {
                 self.show_toast(Toast::new(
@@ -277,6 +308,86 @@ impl App {
             AppEvent::SessionOpFailed { title, error } => {
                 self.show_toast(Toast::error(title, error, Instant::now()))
             }
+        }
+    }
+
+    /// Open the subagent picker for the family just fetched. A late answer
+    /// (the user moved to another session, a form needs answering) is dropped,
+    /// and so is one for a child session: upstream only closes the picker there.
+    fn on_family(&mut self, session: &str, members: Vec<FamilyMember>) {
+        if self.session.as_deref() != Some(session) || self.form_open() {
+            return;
+        }
+        let is_child = members
+            .iter()
+            .any(|member| member.id == session && member.parent_id.is_some());
+        if is_child {
+            return;
+        }
+        self.dialog = Some(subagent_dialog::dialog(
+            &members,
+            session,
+            self.subagents_active_only,
+        ));
+        self.family = members;
+        self.dirty = true;
+    }
+
+    /// Open (or refresh) the shell picker. A late answer for another session
+    /// or one that would cover a form is dropped.
+    fn on_shells(&mut self, session: &str, shells: &[ShellInfo]) {
+        let opens = self.shell_wanted == Some(ShellWanted::Picker) && self.dialog.is_none();
+        let refreshes = self.dialog.as_ref().and_then(Dialog::tag) == Some(shell_dialog::TAG);
+        if self.session.as_deref() != Some(session) || !(opens || refreshes) {
+            return;
+        }
+        if opens {
+            self.shell_wanted = None;
+        }
+        self.dialog = Some(shell_dialog::dialog(shells, session));
+        self.dirty = true;
+    }
+
+    /// Open (or refresh) the output viewer. A refresh of the same shell keeps
+    /// the reader where they were. A late answer for another session or one
+    /// that would cover a form is dropped.
+    fn on_shell_output(&mut self, session: &str, shell: &ShellInfo, tail: ShellTail) {
+        let opens = self.shell_wanted == Some(ShellWanted::Viewer) && self.dialog.is_none();
+        let refreshes =
+            matches!(&self.dialog, Some(Dialog::Output(open)) if open.shell_id() == shell.id);
+        if self.session.as_deref() != Some(session) || !(opens || refreshes) {
+            return;
+        }
+        if opens {
+            self.shell_wanted = None;
+        }
+        let mut output = Output::new(shell, tail);
+        if let Some(Dialog::Output(open)) = &self.dialog
+            && open.shell_id() == output.shell_id()
+        {
+            output.keep_scroll_of(open);
+        }
+        self.dialog = Some(Dialog::Output(output));
+        self.dirty = true;
+    }
+
+    /// Ask the executor for `id`'s recent output.
+    fn request_shell_output(&self, id: String) {
+        if let Some(session) = self.session.clone() {
+            let _ = self.commands.send(AppCommand::ShellOutput { session, id });
+        }
+    }
+
+    /// `ctrl+a` in the picker: flip running/finished and rebuild from the
+    /// members fetched when it opened.
+    fn toggle_subagents(&mut self) {
+        self.subagents_active_only = !self.subagents_active_only;
+        if let Some(session) = self.session.as_deref() {
+            self.dialog = Some(subagent_dialog::dialog(
+                &self.family,
+                session,
+                self.subagents_active_only,
+            ));
         }
     }
 
@@ -326,8 +437,11 @@ impl App {
             DialogOutcome::Selected(value) => {
                 self.dialog = None;
                 self.dirty = true;
-                if tag == Some(session_dialog::LIST_TAG) {
+                if tag == Some(session_dialog::LIST_TAG) || tag == Some(subagent_dialog::TAG) {
                     self.switch_session(value);
+                } else if tag == Some(shell_dialog::TAG) {
+                    self.shell_wanted = Some(ShellWanted::Viewer);
+                    self.request_shell_output(value);
                 } else if tag == Some(timeline_dialog::TAG) {
                     if let Ok(index) = value.parse::<usize>() {
                         self.transcript.jump_to_entry(index);
@@ -343,6 +457,31 @@ impl App {
             }
             DialogOutcome::Action { key, value } => {
                 self.dirty = true;
+                if tag == Some(subagent_dialog::TAG) {
+                    if key == subagent_dialog::TOGGLE_KEY {
+                        self.toggle_subagents();
+                    } else if key == subagent_dialog::INTERRUPT_KEY {
+                        // The child's own session, not the one on screen.
+                        let _ = self.commands.send(AppCommand::Interrupt { session: value });
+                    }
+                    return;
+                }
+                if tag == Some(output_dialog::TAG) {
+                    if key == output_dialog::REFRESH_KEY {
+                        self.request_shell_output(value);
+                    }
+                    return;
+                }
+                if tag == Some(shell_dialog::TAG) {
+                    if key == shell_dialog::KILL_KEY
+                        && let Some(session) = self.session.clone()
+                    {
+                        let _ = self
+                            .commands
+                            .send(AppCommand::KillShell { session, id: value });
+                    }
+                    return;
+                }
                 if tag != Some(session_dialog::LIST_TAG) {
                     return;
                 }
@@ -908,6 +1047,17 @@ impl App {
             }
             CommandAction::Sessions => {
                 let _ = self.commands.send(AppCommand::ListSessions);
+            }
+            CommandAction::Subagents => {
+                if let Some(session) = self.session.clone() {
+                    let _ = self.commands.send(AppCommand::ListFamily { session });
+                }
+            }
+            CommandAction::Shells => {
+                if let Some(session) = self.session.clone() {
+                    self.shell_wanted = Some(ShellWanted::Picker);
+                    let _ = self.commands.send(AppCommand::ListShells { session });
+                }
             }
             CommandAction::Rename => {
                 if let Some(session) = self.session.clone() {
@@ -2402,6 +2552,7 @@ mod tests {
                 ..Default::default()
             },
             location: None,
+            parent_id: None,
         }
     }
 
@@ -2513,6 +2664,442 @@ mod tests {
             }],
         });
         assert_eq!(app.store.items.len(), 1);
+    }
+
+    fn member(id: &str, parent: Option<&str>, running: bool) -> ox_client::rest::FamilyMember {
+        ox_client::rest::FamilyMember {
+            id: id.into(),
+            title: Some(format!("title {id}")),
+            agent: Some("explore".into()),
+            parent_id: parent.map(String::from),
+            time: ox_client::rest::SessionTime::default(),
+            running,
+        }
+    }
+
+    fn family_event(session: &str) -> AppEvent {
+        AppEvent::Family {
+            session: session.into(),
+            members: vec![
+                member("ses_root", None, false),
+                member("ses_a", Some("ses_root"), true),
+                member("ses_b", Some("ses_root"), true),
+                member("ses_done", Some("ses_root"), false),
+            ],
+        }
+    }
+
+    fn subagents_open(app: &App) -> bool {
+        app.dialog.as_ref().and_then(Dialog::tag) == Some(crate::ui::subagent_dialog::TAG)
+    }
+
+    #[test]
+    fn the_subagents_command_asks_for_the_family_and_needs_a_session() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_root"));
+        type_text(&mut app, "/subagents");
+        key(&mut app, KeyCode::Enter);
+        match rx.try_recv() {
+            Ok(AppCommand::ListFamily { session }) => assert_eq!(session, "ses_root"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        let (mut home, mut home_rx) = self::app(Route::Home, None);
+        home.run_command(crate::ui::commands::CommandAction::Subagents);
+        assert!(home_rx.try_recv().is_err(), "no session, nothing to list");
+    }
+
+    #[test]
+    fn leader_down_asks_for_the_family() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_root"));
+        let t = Instant::now();
+        press_at(&mut app, 'x', true, t);
+        app.handle_key_at(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), t);
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [AppCommand::ListFamily { .. }]
+        ));
+    }
+
+    #[test]
+    fn the_family_answer_opens_the_picker_on_running_subagents() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_root"));
+        app.handle(family_event("ses_root"));
+        assert!(subagents_open(&app));
+        let Some(Dialog::Select(select)) = app.dialog.as_ref() else {
+            panic!("select");
+        };
+        assert!(select.item("ses_a").is_some());
+        assert!(select.item("ses_done").is_none());
+    }
+
+    #[test]
+    fn a_family_answer_for_another_session_or_a_form_is_ignored() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_root"));
+        app.handle(family_event("ses_other"));
+        assert!(app.dialog.is_none(), "the user moved on");
+        app.dialog = Some(Dialog::Form(Box::new(crate::ui::form::FormState::new(
+            &serde_json::from_value(serde_json::json!({
+                "id": "frm_1", "sessionID": "ses_root", "title": "T",
+                "fields": [{"type": "string", "key": "name", "title": "Name"}]
+            }))
+            .expect("form json"),
+        ))));
+        app.handle(family_event("ses_root"));
+        assert!(matches!(app.dialog, Some(Dialog::Form(_))));
+    }
+
+    #[test]
+    fn a_child_session_does_not_open_the_picker() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_a"));
+        app.handle(family_event("ses_a"));
+        assert!(app.dialog.is_none());
+    }
+
+    #[test]
+    fn ctrl_a_swaps_between_active_and_inactive_and_remembers_it() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_root"));
+        app.handle(family_event("ses_root"));
+        ctrl_key(&mut app, 'a');
+        let Some(Dialog::Select(select)) = app.dialog.as_ref() else {
+            panic!("the picker stays open");
+        };
+        assert!(select.item("ses_done").is_some());
+        assert!(select.item("ses_a").is_none());
+        // Reopening keeps the last choice.
+        key(&mut app, KeyCode::Esc);
+        app.handle(family_event("ses_root"));
+        let Some(Dialog::Select(select)) = app.dialog.as_ref() else {
+            panic!("reopened");
+        };
+        assert!(select.item("ses_done").is_some());
+    }
+
+    #[test]
+    fn ctrl_a_on_an_empty_picker_still_swaps() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_root"));
+        app.handle(AppEvent::Family {
+            session: "ses_root".into(),
+            members: vec![
+                member("ses_root", None, false),
+                member("ses_done", Some("ses_root"), false),
+            ],
+        });
+        ctrl_key(&mut app, 'a');
+        let Some(Dialog::Select(select)) = app.dialog.as_ref() else {
+            panic!("select");
+        };
+        assert!(select.item("ses_done").is_some());
+    }
+
+    #[test]
+    fn ctrl_d_on_a_running_subagent_interrupts_that_child_not_the_current_session() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_root"));
+        app.handle(family_event("ses_root"));
+        key(&mut app, KeyCode::Down);
+        ctrl_key(&mut app, 'd');
+        match drain(&mut rx).as_slice() {
+            [AppCommand::Interrupt { session }] => assert_eq!(session, "ses_b"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(subagents_open(&app), "the picker stays open");
+    }
+
+    #[test]
+    fn ctrl_d_in_the_finished_list_or_on_an_empty_one_sends_nothing() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_root"));
+        app.handle(family_event("ses_root"));
+        ctrl_key(&mut app, 'a');
+        drain(&mut rx);
+        ctrl_key(&mut app, 'd');
+        assert!(
+            drain(&mut rx).is_empty(),
+            "finished rows cannot be interrupted"
+        );
+        let Some(Dialog::Select(select)) = app.dialog.as_ref() else {
+            panic!("select");
+        };
+        assert!(select.item("ses_done").is_some(), "the row is still there");
+    }
+
+    #[test]
+    fn enter_on_a_subagent_switches_to_it() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_root"));
+        app.handle(family_event("ses_root"));
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.session.as_deref(), Some("ses_b"));
+        assert!(app.dialog.is_none());
+        let sent = drain(&mut rx);
+        assert!(
+            sent.iter()
+                .any(|c| matches!(c, AppCommand::AttachSession { session } if session == "ses_b")),
+            "{sent:?}"
+        );
+    }
+
+    fn shell(id: &str, session: &str, status: &str) -> ox_client::rest::ShellInfo {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "status": status, "command": format!("cmd {id}"),
+            "cwd": "/", "shell": "zsh", "file": "/tmp/o",
+            "metadata": { "sessionID": session },
+            "time": { "started": 1 },
+        }))
+        .expect("shell json")
+    }
+
+    fn shells_event(session: &str) -> AppEvent {
+        AppEvent::Shells {
+            session: session.into(),
+            shells: vec![
+                shell("sh_1", "ses_root", "running"),
+                shell("sh_2", "ses_root", "running"),
+                shell("sh_3", "ses_other", "running"),
+            ],
+        }
+    }
+
+    /// What the user does to see the picker: ask, then the answer lands.
+    fn show_shells(app: &mut App, rx: &mut mpsc::UnboundedReceiver<AppCommand>) {
+        app.run_command(crate::ui::commands::CommandAction::Shells);
+        drain(rx);
+        app.handle(shells_event("ses_root"));
+    }
+
+    /// The viewer was asked for (Enter on a row or `ctrl+r`); the answer lands.
+    fn show_output(app: &mut App, text: &str) {
+        app.shell_wanted = Some(super::ShellWanted::Viewer);
+        app.handle(shell_output_event("ses_root", text));
+    }
+
+    fn shells_open(app: &App) -> bool {
+        app.dialog.as_ref().and_then(Dialog::tag) == Some(crate::ui::shell_dialog::TAG)
+    }
+
+    #[test]
+    fn the_shells_command_asks_for_the_list_and_needs_a_session() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_root"));
+        type_text(&mut app, "/shells");
+        key(&mut app, KeyCode::Enter);
+        match rx.try_recv() {
+            Ok(AppCommand::ListShells { session }) => assert_eq!(session, "ses_root"),
+            other => panic!("unexpected: {other:?}"),
+        }
+        let (mut home, mut home_rx) = self::app(Route::Home, None);
+        home.run_command(crate::ui::commands::CommandAction::Shells);
+        assert!(home_rx.try_recv().is_err(), "no session, nothing to list");
+    }
+
+    #[test]
+    fn leader_b_asks_for_the_shells() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_root"));
+        let t = Instant::now();
+        press_at(&mut app, 'x', true, t);
+        press_at(&mut app, 'b', false, t);
+        assert!(matches!(
+            drain(&mut rx).as_slice(),
+            [AppCommand::ListShells { .. }]
+        ));
+    }
+
+    #[test]
+    fn the_shells_answer_opens_the_picker_with_this_sessions_running_shells() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_root"));
+        show_shells(&mut app, &mut rx);
+        assert!(shells_open(&app));
+        let Some(Dialog::Select(select)) = app.dialog.as_ref() else {
+            panic!("select");
+        };
+        assert!(select.item("sh_1").is_some());
+        assert!(select.item("sh_3").is_none());
+    }
+
+    #[test]
+    fn a_shells_answer_for_another_session_or_a_form_is_ignored() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_root"));
+        app.handle(shells_event("ses_other"));
+        assert!(app.dialog.is_none(), "the user moved on");
+        app.dialog = Some(Dialog::Form(Box::new(crate::ui::form::FormState::new(
+            &serde_json::from_value(serde_json::json!({
+                "id": "frm_1", "sessionID": "ses_root", "title": "T",
+                "fields": [{"type": "string", "key": "name", "title": "Name"}]
+            }))
+            .expect("form json"),
+        ))));
+        app.handle(shells_event("ses_root"));
+        assert!(matches!(app.dialog, Some(Dialog::Form(_))));
+    }
+
+    #[test]
+    fn ctrl_d_kills_the_selected_shell_and_keeps_the_picker_open() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_root"));
+        show_shells(&mut app, &mut rx);
+        key(&mut app, KeyCode::Down);
+        ctrl_key(&mut app, 'd');
+        match drain(&mut rx).as_slice() {
+            [AppCommand::KillShell { session, id }] => {
+                assert_eq!(session, "ses_root");
+                assert_eq!(id, "sh_2");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(shells_open(&app), "the picker stays open");
+    }
+
+    #[test]
+    fn a_refreshed_shells_answer_replaces_the_open_picker() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_root"));
+        show_shells(&mut app, &mut rx);
+        app.handle(AppEvent::Shells {
+            session: "ses_root".into(),
+            shells: vec![shell("sh_1", "ses_root", "running")],
+        });
+        let Some(Dialog::Select(select)) = app.dialog.as_ref() else {
+            panic!("select");
+        };
+        assert!(select.item("sh_1").is_some());
+        assert!(select.item("sh_2").is_none(), "the killed row is gone");
+    }
+
+    fn output_open(app: &App) -> bool {
+        app.dialog.as_ref().and_then(Dialog::tag) == Some(crate::ui::output_dialog::TAG)
+    }
+
+    fn shell_output_event(session: &str, text: &str) -> AppEvent {
+        AppEvent::ShellOutput {
+            session: session.into(),
+            shell: Box::new(shell("sh_1", "ses_root", "running")),
+            tail: ox_client::rest::ShellTail {
+                text: text.into(),
+                omitted: false,
+            },
+        }
+    }
+
+    #[test]
+    fn enter_on_a_shell_asks_for_its_output() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_root"));
+        show_shells(&mut app, &mut rx);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Enter);
+        match drain(&mut rx).as_slice() {
+            [AppCommand::ShellOutput { session, id }] => {
+                assert_eq!(session, "ses_root");
+                assert_eq!(id, "sh_2");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert_eq!(app.session.as_deref(), Some("ses_root"));
+        assert!(!shells_open(&app), "the picker closes on Enter");
+    }
+
+    #[test]
+    fn the_output_answer_opens_the_viewer_and_esc_closes_it() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_root"));
+        show_output(&mut app, "hello\n");
+        assert!(output_open(&app));
+        let Some(Dialog::Output(output)) = app.dialog.as_ref() else {
+            panic!("viewer");
+        };
+        assert_eq!(output.shell_id(), "sh_1");
+        assert_eq!(output.text(), "hello\n");
+        key(&mut app, KeyCode::Esc);
+        assert!(app.dialog.is_none());
+    }
+
+    #[test]
+    fn an_output_answer_for_another_session_or_a_form_is_ignored() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_root"));
+        app.handle(shell_output_event("ses_other", "x"));
+        assert!(app.dialog.is_none(), "the user moved on");
+        app.dialog = Some(Dialog::Form(Box::new(crate::ui::form::FormState::new(
+            &serde_json::from_value(serde_json::json!({
+                "id": "frm_1", "sessionID": "ses_root", "title": "T",
+                "fields": [{"type": "string", "key": "name", "title": "Name"}]
+            }))
+            .expect("form json"),
+        ))));
+        show_output(&mut app, "x");
+        assert!(matches!(app.dialog, Some(Dialog::Form(_))));
+    }
+
+    #[test]
+    fn ctrl_r_in_the_viewer_asks_for_the_same_shell_again() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_root"));
+        show_output(&mut app, "x");
+        ctrl_key(&mut app, 'r');
+        match drain(&mut rx).as_slice() {
+            [AppCommand::ShellOutput { session, id }] => {
+                assert_eq!(session, "ses_root");
+                assert_eq!(id, "sh_1");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(output_open(&app), "the viewer stays while it refreshes");
+    }
+
+    #[test]
+    fn a_refreshed_answer_replaces_the_viewer_and_keeps_its_scroll() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_root"));
+        let long: String = (0..100).map(|n| format!("line {n}\n")).collect();
+        show_output(&mut app, &long);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).expect("terminal");
+        let mut draw = |app: &App| {
+            terminal
+                .draw(|frame| {
+                    if let Some(dialog) = app.dialog.as_ref() {
+                        crate::ui::dialog::render(frame, frame.area(), dialog);
+                    }
+                })
+                .expect("draw");
+        };
+        draw(&app);
+        key(&mut app, KeyCode::Home);
+        show_output(&mut app, &format!("{long}more\n"));
+        let Some(Dialog::Output(output)) = app.dialog.as_ref() else {
+            panic!("viewer");
+        };
+        assert!(output.text().ends_with("more\n"));
+        assert!(!output.following(), "the reader stayed at the top");
+    }
+
+    #[test]
+    fn the_output_answer_after_enter_opens_the_viewer() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_root"));
+        show_shells(&mut app, &mut rx);
+        key(&mut app, KeyCode::Enter);
+        drain(&mut rx);
+        show_output(&mut app, "x");
+        assert!(output_open(&app));
+    }
+
+    #[test]
+    fn a_late_shells_answer_after_esc_does_not_reopen_the_picker() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_root"));
+        show_shells(&mut app, &mut rx);
+        // `ctrl+d` re-fetches the list; the user closes the picker meanwhile.
+        key(&mut app, KeyCode::Esc);
+        app.handle(shells_event("ses_root"));
+        assert!(app.dialog.is_none(), "the user closed it");
+    }
+
+    #[test]
+    fn a_late_output_answer_after_esc_does_not_reopen_the_viewer() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_root"));
+        show_output(&mut app, "x");
+        ctrl_key(&mut app, 'r');
+        key(&mut app, KeyCode::Esc);
+        app.handle(shell_output_event("ses_root", "y"));
+        assert!(app.dialog.is_none(), "the refresh must not reopen it");
+    }
+
+    #[test]
+    fn a_late_shells_answer_does_not_replace_the_viewer() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_root"));
+        show_shells(&mut app, &mut rx);
+        key(&mut app, KeyCode::Enter);
+        show_output(&mut app, "x");
+        app.handle(shells_event("ses_root"));
+        assert!(output_open(&app), "the viewer stays");
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //! Upstream defaults (`packages/tui/src/config/keybind.ts`):
 //! `command.palette.show = ctrl+p`, `leader = ctrl+x` with a 2000ms timeout
 //! (`context/keymap.tsx:143`), `session.new = <leader>n`,
-//! `session.list = <leader>l`, `model.list = <leader>m`, `agent.list = <leader>a`,
+//! `session.list = <leader>l`, `session.child.first = <leader>down`, `model.list = <leader>m`, `agent.list = <leader>a`,
 //! `opencode.status = <leader>s`, `app.exit = ctrl+c,ctrl+d,<leader>q`.
 //! A key that does not continue a pending leader sequence cancels it and is
 //! swallowed (upstream `registerEscapeClearsPendingSequence` plus the
@@ -25,13 +25,15 @@ pub const LEADER_LABEL: &str = "ctrl+x";
 pub const LEADER_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// `<leader><key>` bindings. The palette's key hints derive from this table.
-const LEADER_KEYS: &[(char, CommandAction)] = &[
-    ('n', CommandAction::New),
-    ('l', CommandAction::Sessions),
-    ('m', CommandAction::Models),
-    ('a', CommandAction::Agents),
-    ('s', CommandAction::Status),
-    ('q', CommandAction::Exit),
+const LEADER_KEYS: &[(KeyCode, CommandAction)] = &[
+    (KeyCode::Char('n'), CommandAction::New),
+    (KeyCode::Char('l'), CommandAction::Sessions),
+    (KeyCode::Char('m'), CommandAction::Models),
+    (KeyCode::Char('a'), CommandAction::Agents),
+    (KeyCode::Char('s'), CommandAction::Status),
+    (KeyCode::Char('q'), CommandAction::Exit),
+    (KeyCode::Down, CommandAction::Subagents),
+    (KeyCode::Char('b'), CommandAction::Shells),
 ];
 
 /// What a global binding asks the app to do.
@@ -102,7 +104,11 @@ pub fn hint(action: CommandAction) -> Option<String> {
     LEADER_KEYS
         .iter()
         .find(|(_, bound)| *bound == action)
-        .map(|(ch, _)| format!("{LEADER_LABEL} {ch}"))
+        .map(|(code, _)| match code {
+            KeyCode::Down => format!("{LEADER_LABEL} ↓"),
+            KeyCode::Char(ch) => format!("{LEADER_LABEL} {ch}"),
+            other => format!("{LEADER_LABEL} {other}"),
+        })
 }
 
 /// `ctrl+c`: interrupt a running turn, otherwise quit. Works in every mode.
@@ -125,12 +131,9 @@ fn follow_up(key: &KeyEvent) -> Option<CommandAction> {
     if !key.modifiers.is_empty() {
         return None;
     }
-    let KeyCode::Char(ch) = key.code else {
-        return None;
-    };
     LEADER_KEYS
         .iter()
-        .find(|(bound, _)| *bound == ch)
+        .find(|(bound, _)| *bound == key.code)
         .map(|(_, action)| *action)
 }
 
@@ -211,6 +214,35 @@ mod tests {
             );
             assert!(!map.is_armed(), "the follow-up disarms the leader");
         }
+    }
+
+    #[test]
+    fn leader_b_opens_the_shell_picker() {
+        let mut map = Keymap::default();
+        let t0 = Instant::now();
+        map.feed(&ctrl('x'), t0, true);
+        assert_eq!(
+            map.feed(&plain('b'), at(t0, 100), true),
+            Feed::Action(Action::Run(CommandAction::Shells))
+        );
+    }
+
+    #[test]
+    fn leader_down_arrow_opens_the_subagent_picker() {
+        let mut map = Keymap::default();
+        let t0 = Instant::now();
+        map.feed(&ctrl('x'), t0, true);
+        assert_eq!(
+            map.feed(&key(KeyCode::Down, KeyModifiers::NONE), at(t0, 100), true),
+            Feed::Action(Action::Run(CommandAction::Subagents))
+        );
+        assert!(!map.is_armed());
+        // With a modifier held it is not the binding.
+        map.feed(&ctrl('x'), t0, true);
+        assert_eq!(
+            map.feed(&key(KeyCode::Down, KeyModifiers::ALT), at(t0, 100), true),
+            Feed::Consumed
+        );
     }
 
     #[test]
@@ -326,6 +358,8 @@ mod tests {
         assert_eq!(hint(CommandAction::New).as_deref(), Some("ctrl+x n"));
         assert_eq!(hint(CommandAction::Models).as_deref(), Some("ctrl+x m"));
         assert_eq!(hint(CommandAction::Exit).as_deref(), Some("ctrl+x q"));
+        assert_eq!(hint(CommandAction::Subagents).as_deref(), Some("ctrl+x ↓"));
+        assert_eq!(hint(CommandAction::Shells).as_deref(), Some("ctrl+x b"));
         assert_eq!(hint(CommandAction::Fork), None);
         assert_eq!(hint(CommandAction::Clear), None);
     }

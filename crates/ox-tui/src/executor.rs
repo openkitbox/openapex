@@ -35,6 +35,10 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
         } => prompt(&client, &tx, &session, &text, &files).await,
         AppCommand::Interrupt { session } => interrupt(&client, &tx, &session).await,
         AppCommand::ListSessions => list_sessions(&client, &tx).await,
+        AppCommand::ListFamily { session } => list_family(&client, &tx, session).await,
+        AppCommand::ListShells { session } => list_shells(&client, &tx, session).await,
+        AppCommand::ShellOutput { session, id } => shell_output(&client, &tx, session, &id).await,
+        AppCommand::KillShell { session, id } => kill_shell(&client, &tx, session, &id).await,
         AppCommand::RenameSession { session, title } => {
             rename_session(&client, &tx, &session, &title).await
         }
@@ -91,6 +95,64 @@ async fn list_sessions(client: &Client, tx: &Events) {
         Err(err) => session_failed("Failed to list sessions", err),
     };
     let _ = tx.send(event);
+}
+
+async fn list_family(client: &Client, tx: &Events, session: String) {
+    let event = match client.session_family(&session).await {
+        Ok(members) => AppEvent::Family { session, members },
+        Err(err) => session_failed("Failed to list subagents", err),
+    };
+    let _ = tx.send(event);
+}
+
+async fn list_shells(client: &Client, tx: &Events, session: String) {
+    let event = match client.shells().await {
+        Ok(shells) => AppEvent::Shells { session, shells },
+        Err(err) => session_failed("Failed to list shells", err),
+    };
+    let _ = tx.send(event);
+}
+
+/// Newest output kept for the viewer (upstream `PAGE_BYTES`).
+const SHELL_TAIL_BYTES: usize = 64 * 1024;
+
+/// The shell's current state and its recent output, for the viewer. A shell
+/// the server no longer lists is reported as not found.
+async fn shell_output(client: &Client, tx: &Events, session: String, id: &str) {
+    let event = match read_shell(client, id).await {
+        Ok((shell, tail)) => AppEvent::ShellOutput {
+            session,
+            shell: Box::new(shell),
+            tail,
+        },
+        Err(err) => session_failed("Failed to read shell output", err),
+    };
+    let _ = tx.send(event);
+}
+
+async fn read_shell(
+    client: &Client,
+    id: &str,
+) -> ox_client::Result<(ox_client::rest::ShellInfo, ox_client::rest::ShellTail)> {
+    let shell = client
+        .shells()
+        .await?
+        .into_iter()
+        .find(|shell| shell.id == id)
+        .ok_or(ox_client::Error::Status(
+            ox_client::reqwest::StatusCode::NOT_FOUND,
+        ))?;
+    let tail = client.shell_tail(id, SHELL_TAIL_BYTES).await?;
+    Ok((shell, tail))
+}
+
+/// Kill, then answer with the fresh list so the open picker drops the row.
+async fn kill_shell(client: &Client, tx: &Events, session: String, id: &str) {
+    if let Err(err) = client.kill_shell(id).await {
+        let _ = tx.send(session_failed("Failed to kill shell", err));
+        return;
+    }
+    list_shells(client, tx, session).await;
 }
 
 async fn rename_session(client: &Client, tx: &Events, session: &str, title: &str) {
@@ -335,6 +397,22 @@ mod tests {
             event,
             AppEvent::SessionOpFailed {
                 title: "Failed to interrupt",
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_failed_shell_output_read_becomes_a_toast_event() {
+        let event = first_event(AppCommand::ShellOutput {
+            session: "ses_x".into(),
+            id: "sh_1".into(),
+        })
+        .await;
+        assert!(matches!(
+            event,
+            AppEvent::SessionOpFailed {
+                title: "Failed to read shell output",
                 ..
             }
         ));

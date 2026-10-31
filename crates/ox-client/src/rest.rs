@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::time::Duration;
 
 use ox_schema::support::FileInput;
@@ -137,6 +138,27 @@ pub struct SessionSummary {
     pub time: SessionTime,
     #[serde(default)]
     pub location: Option<SessionLocation>,
+    /// Set on child (subagent) sessions; absent on roots.
+    #[serde(default, rename = "parentID")]
+    pub parent_id: Option<String>,
+}
+
+/// One session of a family tree (`GET /ox/session/{id}/family`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct FamilyMember {
+    pub id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Absent on the root.
+    #[serde(default, rename = "parentID")]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub time: SessionTime,
+    /// The server's runner has work scheduled or in flight for the session.
+    #[serde(default)]
+    pub running: bool,
 }
 
 /// Epoch milliseconds, as stored by the server.
@@ -208,6 +230,8 @@ struct StoredSession {
     model: Option<StoredModel>,
     #[serde(default)]
     title: Option<String>,
+    #[serde(default, rename = "parentID")]
+    parent_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -232,6 +256,8 @@ pub struct SessionInfo {
     pub variant: Option<String>,
     pub title: Option<String>,
     pub time: SessionTime,
+    /// Set on child (subagent) sessions; absent on roots.
+    pub parent_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -244,9 +270,66 @@ struct CreatedSession {
     id: String,
 }
 
+/// One entry of `GET /api/shell`: a background shell session.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShellInfo {
+    pub id: String,
+    /// `running`, `exited`, `timeout` or `killed`.
+    pub status: String,
+    pub command: String,
+    pub cwd: String,
+    pub shell: String,
+    pub file: String,
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub exit: Option<i32>,
+    #[serde(default)]
+    pub signal: Option<String>,
+    #[serde(default)]
+    pub metadata: HashMap<String, Value>,
+    pub time: ShellTime,
+}
+
+impl ShellInfo {
+    /// The session that started this shell, when the server recorded one.
+    pub fn session_id(&self) -> Option<&str> {
+        self.metadata.get("sessionID").and_then(Value::as_str)
+    }
+}
+
+/// Epoch milliseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct ShellTime {
+    pub started: i64,
+    #[serde(default)]
+    pub completed: Option<i64>,
+}
+
+/// `GET /api/shell/{id}/output`: one page of captured output.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ShellOutputPage {
+    pub output: String,
+    /// Where the next read continues.
+    pub cursor: u64,
+    pub size: u64,
+    pub truncated: bool,
+}
+
+/// The newest part of a shell's capture, as text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellTail {
+    pub text: String,
+    /// Output before `text` exists but was not returned.
+    pub omitted: bool,
+}
+
 /// Bound for every REST call. Set per request, not on the shared client:
 /// the SSE stream uses the same client and must live indefinitely.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// `Number.MAX_SAFE_INTEGER`: a cursor no capture reaches, so the answer only
+/// carries the capture's `size` (upstream's probe).
+const MAX_SAFE_CURSOR: u64 = 9_007_199_254_740_991;
 
 impl Client {
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -296,6 +379,7 @@ impl Client {
             variant,
             title: stored.title,
             time: stored.time,
+            parent_id: stored.parent_id,
         })
     }
 
@@ -311,6 +395,102 @@ impl Client {
             return Err(Error::Status(resp.status()));
         }
         Ok(resp.json::<Page<SessionSummary>>().await?.data)
+    }
+
+    /// The whole session tree `current` belongs to, root first and then its
+    /// descendants breadth-first (`GET /ox/session/{id}/family`, an ox-only
+    /// endpoint: upstream's `parentID` filter reaches direct children only).
+    /// The server bounds the tree and reports each session's agent and
+    /// whether it is running.
+    pub async fn session_family(&self, current: &str) -> Result<Vec<FamilyMember>> {
+        let resp = self
+            .request(
+                reqwest::Method::GET,
+                &format!("/ox/session/{current}/family"),
+            )
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Error::Status(resp.status()));
+        }
+        Ok(resp.json::<Envelope<Vec<FamilyMember>>>().await?.data)
+    }
+
+    /// Background shell sessions of the server (`GET /api/shell`).
+    pub async fn shells(&self) -> Result<Vec<ShellInfo>> {
+        let resp = self
+            .request(reqwest::Method::GET, "/api/shell")
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Error::Status(resp.status()));
+        }
+        Ok(resp.json::<Envelope<Vec<ShellInfo>>>().await?.data)
+    }
+
+    /// One page of a shell's captured output from byte `cursor`; the page
+    /// size is the server default.
+    pub async fn shell_output(&self, id: &str, cursor: u64) -> Result<ShellOutputPage> {
+        let resp = self
+            .request(reqwest::Method::GET, &format!("/api/shell/{id}/output"))
+            .query(&[("cursor", cursor)])
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Error::Status(resp.status()));
+        }
+        Ok(resp.json::<Envelope<ShellOutputPage>>().await?.data)
+    }
+
+    /// The newest `max_bytes` of a shell's capture. A probe at an unreachable
+    /// cursor learns the capture's size, then pages are read from
+    /// `size - max_bytes` up to that size; output appended meanwhile is left
+    /// for the next call. A character cut by the start cursor is dropped.
+    pub async fn shell_tail(&self, id: &str, max_bytes: usize) -> Result<ShellTail> {
+        let size = self.shell_output(id, MAX_SAFE_CURSOR).await?.size;
+        let start = size.saturating_sub(max_bytes as u64);
+        let mut cursor = start;
+        let mut text = String::new();
+        let mut omitted = start > 0;
+        loop {
+            let page = self.shell_output(id, cursor).await?;
+            if cursor == start {
+                omitted |= page.truncated;
+            }
+            let progressed = page.cursor > cursor;
+            cursor = page.cursor;
+            text.push_str(&page.output);
+            if !progressed || cursor >= size {
+                break;
+            }
+        }
+        if start > 0 {
+            // The server decodes lossily: a character cut by the cursor shows
+            // up as replacement characters at the very start.
+            let cut = text.len() - text.trim_start_matches('\u{fffd}').len();
+            text.drain(..cut);
+        }
+        if text.len() > max_bytes {
+            let mut from = text.len() - max_bytes;
+            while !text.is_char_boundary(from) {
+                from += 1;
+            }
+            text.drain(..from);
+            omitted = true;
+        }
+        Ok(ShellTail { text, omitted })
+    }
+
+    /// `DELETE /api/shell/{id}` (204): kill the shell session.
+    pub async fn kill_shell(&self, id: &str) -> Result<()> {
+        let resp = self
+            .request(reqwest::Method::DELETE, &format!("/api/shell/{id}"))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Error::Status(resp.status()));
+        }
+        Ok(())
     }
 
     /// `PATCH /api/session/{id}` with `{title}` (204). An empty title makes the

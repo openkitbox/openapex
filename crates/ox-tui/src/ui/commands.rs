@@ -35,6 +35,10 @@ pub enum CommandAction {
     Rename,
     /// Open the message timeline and jump to the chosen message.
     Timeline,
+    /// Fetch the session family and open the subagent picker.
+    Subagents,
+    /// Fetch the background shells and open the shell picker.
+    Shells,
 }
 
 /// One registered command. `aliases` are rendered as their own menu rows,
@@ -117,6 +121,22 @@ pub const COMMANDS: &[Command] = &[
         title: "Switch session",
         group: "Session",
         action: CommandAction::Sessions,
+    },
+    Command {
+        name: "shells",
+        aliases: &[],
+        description: "View background shells",
+        title: "View background shells",
+        group: "Session",
+        action: CommandAction::Shells,
+    },
+    Command {
+        name: "subagents",
+        aliases: &[],
+        description: "Toggle subagent picker",
+        title: "Toggle subagent picker",
+        group: "Session",
+        action: CommandAction::Subagents,
     },
     Command {
         name: "timeline",
@@ -234,8 +254,22 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "agents", "clear", "continue", "exit", "fork", "models", "new", "q", "quit",
-                "rename", "resume", "sessions", "status", "timeline"
+                "agents",
+                "clear",
+                "continue",
+                "exit",
+                "fork",
+                "models",
+                "new",
+                "q",
+                "quit",
+                "rename",
+                "resume",
+                "sessions",
+                "shells",
+                "status",
+                "subagents",
+                "timeline"
             ]
         );
     }
@@ -243,7 +277,7 @@ mod tests {
     #[test]
     fn every_alias_is_its_own_row() {
         let all = rows("");
-        assert_eq!(all.len(), 14);
+        assert_eq!(all.len(), 16);
         let quit = all.iter().find(|row| row.name == "quit").expect("quit row");
         assert_eq!(quit.action, CommandAction::Exit);
         assert_eq!(quit.description, "Exit the app");
@@ -293,11 +327,11 @@ mod tests {
     #[test]
     fn display_is_padded_to_the_catalog_width() {
         let width = padded_width();
-        assert_eq!(width, "/continue".len() + 2);
+        assert_eq!(width, "/subagents".len() + 2);
         for row in rows("") {
             assert_eq!(row.display.chars().count(), width, "{:?}", row.display);
         }
-        assert_eq!(rows("")[0].display, "/agents    ");
+        assert_eq!(rows("")[0].display, "/agents     ");
     }
 
     #[test]

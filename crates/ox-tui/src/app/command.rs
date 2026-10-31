@@ -65,6 +65,25 @@ pub enum AppCommand {
     Quit,
     /// Fetch `GET /api/session` for the `/sessions` dialog.
     ListSessions,
+    /// Fetch the session family of `session`; answered with `AppEvent::Family`.
+    ListFamily {
+        session: String,
+    },
+    /// Fetch the background shells; answered with `AppEvent::Shells`.
+    ListShells {
+        session: String,
+    },
+    /// Kill shell `id`, then re-fetch the list for `session`.
+    KillShell {
+        session: String,
+        id: String,
+    },
+    /// Fetch shell `id` and its recent output; answered with
+    /// `AppEvent::ShellOutput`.
+    ShellOutput {
+        session: String,
+        id: String,
+    },
     /// Follow `session`'s event stream instead of the previous one. The app has
     /// already reset the shared seq to `None`.
     AttachSession {

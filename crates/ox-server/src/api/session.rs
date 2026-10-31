@@ -46,7 +46,7 @@ const DEFAULT_PAGE_LIMIT: i64 = 50;
 // ---------------------------------------------------------------------------
 
 /// 404 `SessionNotFoundError`.
-fn session_not_found(res: &mut Response, session_id: &str) {
+pub(crate) fn session_not_found(res: &mut Response, session_id: &str) {
     res.status_code(StatusCode::NOT_FOUND);
     res.render(Json(json!({
         "_tag": "SessionNotFoundError",
