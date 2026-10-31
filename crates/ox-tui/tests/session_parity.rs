@@ -15,7 +15,7 @@ use ox_tui::pipeline::blocks_from_store;
 use ox_tui::theme::terminal::{Rgb, TerminalColors};
 use ox_tui::ui::dock::{StatusMode, status_line};
 use ox_tui::ui::layout;
-use ox_tui::ui::prompt::{Chrome, Footer, Prompt};
+use ox_tui::ui::prompt::{Activity, Chrome, Footer, Prompt};
 use ox_tui::ui::timeline::Transcript;
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -90,7 +90,12 @@ fn render(width: u16, height: u16) -> Buffer {
             let full = frame.area();
             let prompt_h = prompt.height(full.height).min(full.height - 1);
             let (timeline, prompt_area, dock) = layout::split(full, prompt_h);
-            prompt.render(frame, layout::padded(prompt_area, full.width), full, false);
+            prompt.render(
+                frame,
+                layout::padded(prompt_area, full.width),
+                full,
+                Activity::Idle,
+            );
             transcript.render(frame, layout::padded(timeline, full.width));
             let line = status_line(&store, StatusMode::Normal);
             frame.render_widget(Paragraph::new(line), dock);

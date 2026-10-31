@@ -166,6 +166,19 @@ pub enum PromptAction {
     Esc,
 }
 
+/// What the footer reports as going on. `Turn` is the focused session's own
+/// turn: Esc / ctrl+c interrupt it, so the footer advertises that. `Children`
+/// is only background subagents running: the scanner shows (upstream
+/// `session-tabs.tsx:170` rolls children into "busy") but no interrupt hint,
+/// because nothing here would be interrupted. Display only; the interrupt
+/// keys themselves stay on `DataStore::running_since`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Activity {
+    Idle,
+    Children,
+    Turn,
+}
+
 pub struct Prompt {
     composer: Composer,
     auto: Autocomplete,
@@ -281,15 +294,17 @@ impl Prompt {
 
     /// Advance the footer scanner; `true` when its frame changed and a repaint
     /// is needed. Idle resets it so the next turn starts from frame 0.
-    pub fn tick_spinner(&mut self, now: Instant, running: bool) -> bool {
+    pub fn tick_spinner(&mut self, now: Instant, activity: Activity) -> bool {
         let mut changed = false;
+        // An armed Esc only means something while the own turn can be stopped.
         if let Some(armed) = self.interrupt_armed
-            && (!running || now.saturating_duration_since(armed) >= INTERRUPT_WINDOW)
+            && (activity != Activity::Turn
+                || now.saturating_duration_since(armed) >= INTERRUPT_WINDOW)
         {
             self.interrupt_armed = None;
             changed = true;
         }
-        if !running {
+        if activity == Activity::Idle {
             self.spin_frame = 0;
             return self.spin_started.take().is_some() || changed;
         }
@@ -566,7 +581,8 @@ impl Prompt {
         }
     }
 
-    pub fn render(&mut self, frame: &mut Frame, area: Rect, full: Rect, running: bool) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, full: Rect, activity: Activity) {
+        let running = activity != Activity::Idle;
         let pal = *theme::palette();
         if area.width == 0 || area.height == 0 {
             return;
@@ -666,7 +682,9 @@ impl Prompt {
                 let mut spans = vec![Span::raw(" ")];
                 spans.extend(spinner::spans(self.spin_frame, &pal));
                 spans.push(Span::raw(" "));
-                if self.interrupt_armed.is_some() {
+                if activity == Activity::Children {
+                    // Nothing of ours to interrupt: scanner only.
+                } else if self.interrupt_armed.is_some() {
                     spans.push(Span::styled("esc ", pal.warning));
                     spans.push(Span::styled("again to interrupt", pal.warning));
                 } else {
@@ -983,8 +1001,8 @@ fn row_text(buf: &ratatui::buffer::Buffer, y: u16, from: u16, to: u16) -> String
 #[cfg(test)]
 mod tests {
     use super::{
-        Chrome, Footer, McpSummary, Meta, Prompt, PromptAction, Submission, metadata_line,
-        placeholder_line, row_text,
+        Activity, Chrome, Footer, McpSummary, Meta, Prompt, PromptAction, Submission,
+        metadata_line, placeholder_line, row_text,
     };
     use crate::theme::{Deck, Palette};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -1037,7 +1055,7 @@ mod tests {
                     width,
                     height: h,
                 };
-                prompt.render(frame, prompt_area, frame.area(), false);
+                prompt.render(frame, prompt_area, frame.area(), Activity::Idle);
             })
             .unwrap();
         terminal.backend().clone()
@@ -1519,7 +1537,7 @@ mod tests {
             .draw(|frame| {
                 let h = prompt.height(height).min(height);
                 let area = Rect::new(0, height - h, width, h);
-                prompt.render(frame, area, frame.area(), false);
+                prompt.render(frame, area, frame.area(), Activity::Idle);
             })
             .unwrap();
         let position = terminal.get_cursor_position().unwrap();
@@ -1579,12 +1597,55 @@ mod tests {
                     width: 100,
                     height: h,
                 };
-                prompt.render(frame, prompt_area, frame.area(), true);
+                prompt.render(frame, prompt_area, frame.area(), Activity::Turn);
             })
             .unwrap();
         let buf = terminal.backend().buffer();
         let footer = row_text(buf, 23, 0, 60);
         assert!(footer.contains("esc interrupt"), "{footer:?}");
+    }
+
+    fn footer_with(activity: Activity) -> String {
+        let mut prompt = prompt();
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                let h = prompt.height(24);
+                let area = Rect::new(0, 24 - h, 100, h);
+                prompt.render(frame, area, frame.area(), activity);
+            })
+            .unwrap();
+        row_text(terminal.backend().buffer(), 23, 0, 60)
+    }
+
+    #[test]
+    fn children_only_footer_shows_the_scanner_without_the_interrupt_hint() {
+        let footer = footer_with(Activity::Children);
+        let cells = footer.chars().filter(|c| matches!(c, '■' | '⬝')).count();
+        assert_eq!(cells, 8, "{footer:?}");
+        assert!(!footer.contains("esc"), "{footer:?}");
+        assert!(!footer.contains("interrupt"), "{footer:?}");
+    }
+
+    #[test]
+    fn own_turn_footer_keeps_the_interrupt_hint() {
+        let footer = footer_with(Activity::Turn);
+        assert!(footer.contains("esc interrupt"), "{footer:?}");
+    }
+
+    #[test]
+    fn children_only_ticks_animate_the_scanner_but_never_keep_an_armed_esc() {
+        use std::time::Duration;
+        let mut prompt = prompt();
+        let t0 = Instant::now();
+        prompt.press_interrupt(t0);
+        assert!(prompt.tick_spinner(t0, Activity::Children), "disarms");
+        assert!(
+            !prompt.press_interrupt(t0 + Duration::from_millis(10)),
+            "the arm was dropped, so this press only arms"
+        );
+        assert!(prompt.tick_spinner(t0 + Duration::from_millis(40), Activity::Children));
+        assert_eq!(prompt.spin_frame, 1);
     }
 
     #[test]
@@ -1594,7 +1655,7 @@ mod tests {
         let t0 = Instant::now();
         assert!(!prompt.press_interrupt(t0), "first press only arms");
         assert!(
-            prompt.tick_spinner(t0 + Duration::from_secs(5), true),
+            prompt.tick_spinner(t0 + Duration::from_secs(5), Activity::Turn),
             "window closes"
         );
         assert!(
@@ -1618,7 +1679,7 @@ mod tests {
                     width: 100,
                     height: h,
                 };
-                prompt.render(frame, area, frame.area(), true);
+                prompt.render(frame, area, frame.area(), Activity::Turn);
             })
             .unwrap();
         let footer = row_text(terminal.backend().buffer(), 23, 0, 60);
@@ -1630,13 +1691,19 @@ mod tests {
         use std::time::Duration;
         let mut prompt = prompt();
         let t0 = Instant::now();
-        assert!(prompt.tick_spinner(t0, true), "first running tick repaints");
-        assert!(!prompt.tick_spinner(t0, true), "same frame: no repaint");
-        assert!(prompt.tick_spinner(t0 + Duration::from_millis(40), true));
+        assert!(
+            prompt.tick_spinner(t0, Activity::Turn),
+            "first running tick repaints"
+        );
+        assert!(
+            !prompt.tick_spinner(t0, Activity::Turn),
+            "same frame: no repaint"
+        );
+        assert!(prompt.tick_spinner(t0 + Duration::from_millis(40), Activity::Turn));
         assert_eq!(prompt.spin_frame, 1);
-        assert!(prompt.tick_spinner(t0 + Duration::from_millis(80), false));
+        assert!(prompt.tick_spinner(t0 + Duration::from_millis(80), Activity::Idle));
         assert_eq!(prompt.spin_frame, 0);
-        assert!(!prompt.tick_spinner(t0 + Duration::from_millis(120), false));
+        assert!(!prompt.tick_spinner(t0 + Duration::from_millis(120), Activity::Idle));
     }
 
     #[test]
@@ -1648,7 +1715,7 @@ mod tests {
             .draw(|frame| {
                 let h = prompt.height(24);
                 let area = Rect::new(0, 24 - h, 100, h);
-                prompt.render(frame, area, frame.area(), true);
+                prompt.render(frame, area, frame.area(), Activity::Turn);
             })
             .unwrap();
         let footer = row_text(terminal.backend().buffer(), 23, 0, 60);
@@ -1681,7 +1748,7 @@ mod tests {
                     width: 96,
                     height: 6,
                 };
-                prompt.render(frame, area, frame.area(), false);
+                prompt.render(frame, area, frame.area(), Activity::Idle);
             })
             .unwrap();
         let buffer = terminal.backend().buffer().clone();

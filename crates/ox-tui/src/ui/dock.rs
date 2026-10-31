@@ -44,8 +44,9 @@ pub fn status_line(store: &DataStore, mode: StatusMode<'_>) -> Line<'static> {
         StatusMode::Normal => {
             // Upstream's session view has no status line and no elapsed timer
             // (the running state is the prompt footer's `esc interrupt`), so
-            // this row is blank unless prompts are queued behind a turn.
-            if store.running_since.is_none() || store.queued.is_empty() {
+            // this row is blank unless prompts are queued behind a turn or
+            // behind the child sessions it delegated to (display: `busy`).
+            if !store.busy() || store.queued.is_empty() {
                 return Line::default();
             }
             Line::from(Span::styled(
@@ -118,6 +119,33 @@ mod tests {
         ];
         let line = text(&status_line(&store, StatusMode::Normal));
         assert_eq!(line, "2 queued", "{line}");
+    }
+
+    #[test]
+    fn queued_prompts_show_while_only_a_child_runs() {
+        use ox_client::store::{AssistantItem, ChildRef, Item, ToolPart};
+        let mut store = DataStore::default();
+        store.session = Some("ses_1".into());
+        store.items = vec![Item::Assistant(Box::new(AssistantItem {
+            id: "m1".into(),
+            tools: vec![ToolPart {
+                id: "p1".into(),
+                tool: "subagent".into(),
+                child: Some(ChildRef {
+                    session_id: "ses_c".into(),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }))];
+        store.queued = vec![ox_client::store::Queued {
+            inbox_id: "inb_1".into(),
+            text: std::sync::Arc::from("first"),
+        }];
+        assert_eq!(text(&status_line(&store, StatusMode::Normal)), "");
+        assert!(store.set_child_running("ses_c", true));
+        assert_eq!(store.running_since, None);
+        assert_eq!(text(&status_line(&store, StatusMode::Normal)), "1 queued");
     }
 
     #[test]

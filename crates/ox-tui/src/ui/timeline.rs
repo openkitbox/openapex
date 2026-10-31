@@ -119,6 +119,10 @@ pub enum Block {
         state: ToolState,
         summary: String,
         output: std::sync::Arc<String>,
+        /// A subagent call whose child session is still running. Not part of
+        /// the part, so a child starting or ending does not bump `version`:
+        /// equality compares it too.
+        background: bool,
     },
     /// A `todowrite` call: the `# Todos` panel once it completed with a
     /// non-empty list, an inline row otherwise (upstream `TodoWrite`).
@@ -222,14 +226,16 @@ impl PartialEq for Block {
                 Block::Tool {
                     id: aid,
                     version: aversion,
+                    background: abackground,
                     ..
                 },
                 Block::Tool {
                     id: bid,
                     version: bversion,
+                    background: bbackground,
                     ..
                 },
-            ) => aid == bid && aversion == bversion,
+            ) => aid == bid && aversion == bversion && abackground == bbackground,
             (
                 Block::Todo {
                     id: aid,
@@ -643,14 +649,24 @@ impl Transcript {
             .sum()
     }
 
-    /// Advance the header spinner of streaming reasoning blocks. `true` when a
-    /// visible frame changed and a repaint is due.
+    /// Advance the header spinner of streaming reasoning blocks and of
+    /// background subagent rows. `true` when a visible frame changed and a
+    /// repaint is due.
     pub fn tick(&mut self, now: std::time::Instant) -> bool {
         let streaming: Vec<usize> = self
             .entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| matches!(entry.block, Block::Reasoning { done: false, .. }))
+            .filter(|(_, entry)| {
+                matches!(
+                    entry.block,
+                    Block::Reasoning { done: false, .. }
+                        | Block::Tool {
+                            background: true,
+                            ..
+                        }
+                )
+            })
             .map(|(index, _)| index)
             .collect();
         if streaming.is_empty() {
@@ -745,9 +761,15 @@ impl Transcript {
                 spin: if *done { 0 } else { self.spin_frame },
                 ..Default::default()
             },
-            Block::Tool { id, output, .. } => ViewState {
+            Block::Tool {
+                id,
+                output,
+                background,
+                ..
+            } => ViewState {
                 tool_expanded: !output.is_empty() && self.tool_expanded.contains(id),
                 tool_focused: self.focused_tool.as_deref() == Some(id.as_str()),
+                spin: if *background { self.spin_frame } else { 0 },
                 ..Default::default()
             },
             Block::Explored(explored) => ViewState {
@@ -1509,7 +1531,7 @@ fn explored_block(explored: &Explored, view: ViewState) -> Vec<Line<'static>> {
             explored
                 .calls
                 .iter()
-                .map(|call| tool_header(&call.tool, call.state, &call.summary, false)),
+                .map(|call| tool_header(&call.tool, call.state, &call.summary, false, None)),
         );
     }
     lines
@@ -1548,12 +1570,21 @@ fn explored_title_style(palette: &theme::Palette, hovered: bool) -> ratatui::sty
 /// The head line of an inline tool row: paddingLeft 3, a two-column icon, then
 /// `tool summary`; bold when focused. Shared by `tool_block` and the expanded
 /// Explored group.
-fn tool_header(tool: &str, state: ToolState, summary: &str, focused: bool) -> Line<'static> {
+fn tool_header(
+    tool: &str,
+    state: ToolState,
+    summary: &str,
+    focused: bool,
+    spinner: Option<char>,
+) -> Line<'static> {
     let palette = theme::palette();
-    let (icon, style) = match state {
-        ToolState::Input | ToolState::Running | ToolState::Progress => ("~", palette.accent),
-        ToolState::Success => ("\u{2699}", palette.dim),
-        ToolState::Failed => ("\u{2717}", palette.warn),
+    let (icon, style) = match (spinner, state) {
+        (Some(frame), _) => (frame.to_string(), palette.accent),
+        (None, ToolState::Input | ToolState::Running | ToolState::Progress) => {
+            ("~".to_owned(), palette.accent)
+        }
+        (None, ToolState::Success) => ("\u{2699}".to_owned(), palette.dim),
+        (None, ToolState::Failed) => ("\u{2717}".to_owned(), palette.warn),
     };
     let mut label = String::from(tool);
     if !summary.is_empty() {
@@ -1581,9 +1612,24 @@ fn tool_block(
     width: u16,
 ) -> Vec<Line<'static>> {
     let palette = theme::palette();
+    let background = matches!(
+        block,
+        Block::Tool {
+            background: true,
+            ..
+        }
+    );
     let expandable = entry_tool_output(block).is_some();
     let focused = view.tool_focused && expandable;
-    let mut lines = vec![tool_header(tool, state, summary, focused)];
+    // Upstream `Subagent` row (`routes/session/index.tsx:3289`): while the
+    // child runs the call itself is already done, so the spinner replaces the
+    // icon and a dim `Background` badge follows the label.
+    let spinner = background.then(|| SPINNER_FRAMES[view.spin % SPINNER_FRAMES.len()]);
+    let mut header = tool_header(tool, state, summary, focused, spinner);
+    if background {
+        header.spans.push(Span::styled(" Background", palette.dim));
+    }
+    let mut lines = vec![header];
     let failed = matches!(state, ToolState::Failed);
     let body_style = if failed { palette.warn } else { palette.dim };
     if view.tool_expanded && expandable {
@@ -1785,6 +1831,7 @@ mod tests {
                     state: ToolState::Running,
                     summary: "git status".into(),
                     output: Arc::default(),
+                    background: false,
                 },
                 Block::Tool {
                     id: "p2".into(),
@@ -1793,6 +1840,7 @@ mod tests {
                     state: ToolState::Success,
                     summary: "a.txt".into(),
                     output: Arc::new("one\ntwo\nthree".into()),
+                    background: false,
                 },
                 Block::Tool {
                     id: "p3".into(),
@@ -1801,6 +1849,7 @@ mod tests {
                     state: ToolState::Failed,
                     summary: "main.rs".into(),
                     output: Arc::new("boom".into()),
+                    background: false,
                 },
             ],
             0,
@@ -1847,6 +1896,7 @@ mod tests {
                 state: ToolState::Input,
                 summary: String::new(),
                 output: Arc::default(),
+                background: false,
             }],
             0,
         );
@@ -1905,6 +1955,7 @@ mod tests {
             state,
             summary: summary.into(),
             output: Arc::new(output.into()),
+            background: false,
         }
     }
 
@@ -2093,6 +2144,7 @@ mod tests {
             state: ToolState::Running,
             summary: "git status".into(),
             output: Arc::default(),
+            background: false,
         };
         let mut t = Transcript::new(40, 10);
         t.sync(&[Block::assistant("msg_1", 0, "b"), tool.clone()], 0);
@@ -2497,6 +2549,53 @@ mod tests {
         assert!(!text.contains("a.txt"), "{text}");
     }
 
+    fn subagent_row(background: bool) -> Block {
+        Block::Tool {
+            id: "p1".into(),
+            version: 0,
+            tool: "subagent".into(),
+            state: ToolState::Success,
+            summary: "explore".into(),
+            output: Arc::default(),
+            background,
+        }
+    }
+
+    #[test]
+    fn a_background_subagent_row_shows_a_spinner_and_the_badge() {
+        let mut t = Transcript::new(60, 4);
+        t.sync(&[subagent_row(true)], 0);
+        let text = screen(&mut t, 60, 4);
+        assert!(text.contains("\u{280b} subagent explore"), "{text}");
+        assert!(text.contains("Background"), "{text}");
+
+        t.sync(&[subagent_row(false)], 0);
+        let text = screen(&mut t, 60, 4);
+        assert!(text.contains("\u{2699} subagent explore"), "{text}");
+        assert!(!text.contains("Background"), "{text}");
+        assert!(!text.contains('\u{280b}'), "{text}");
+    }
+
+    #[test]
+    fn flipping_background_makes_tool_blocks_unequal() {
+        assert_ne!(subagent_row(true), subagent_row(false));
+        assert_eq!(subagent_row(true), subagent_row(true));
+    }
+
+    #[test]
+    fn a_background_row_spins_with_the_clock_and_idle_rows_do_not_repaint() {
+        let mut t = Transcript::new(60, 4);
+        t.sync(&[subagent_row(true)], 0);
+        let later = t.spin_epoch + std::time::Duration::from_millis(80);
+        assert!(t.tick(later), "a new frame asks for a repaint");
+        assert!(!t.tick(later), "the same frame does not");
+        assert!(screen(&mut t, 60, 4).contains("\u{2819} subagent explore"));
+
+        t.sync(&[subagent_row(false)], 0);
+        let next = later + std::time::Duration::from_millis(80);
+        assert!(!t.tick(next), "nothing spins, nothing repaints");
+    }
+
     #[test]
     fn a_streaming_thought_spins_and_a_bold_title_names_it() {
         let mut t = Transcript::new(50, 6);
@@ -2550,6 +2649,7 @@ mod tests {
                 state: ToolState::Success,
                 summary: "ls".into(),
                 output: Arc::new("a".into()),
+                background: false,
             }],
             0,
         );

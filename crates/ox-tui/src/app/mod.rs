@@ -25,7 +25,9 @@ use crate::ui::dock::{self, StatusMode};
 use crate::ui::layout;
 use crate::ui::palette;
 use crate::ui::paste;
-use crate::ui::prompt::{Chrome, Footer, Prompt, PromptAction, pick_placeholder, placeholder_line};
+use crate::ui::prompt::{
+    Activity, Chrome, Footer, Prompt, PromptAction, pick_placeholder, placeholder_line,
+};
 use crate::ui::selection::Outcome;
 use crate::ui::session_dialog;
 use crate::ui::timeline::Transcript;
@@ -186,6 +188,11 @@ impl App {
             AppEvent::Wheel(direction) => self.handle_wheel(direction),
             AppEvent::Stream(msg) => self.handle_stream(msg),
             AppEvent::History { request_id, items } => self.handle_history(request_id, items),
+            AppEvent::ChildRunning { child, running } => {
+                if self.store.apply_probe(&child, running) {
+                    self.child_state_changed();
+                }
+            }
             AppEvent::SessionReady {
                 session,
                 prompt,
@@ -485,6 +492,21 @@ impl App {
         self.pending_reload = None;
         self.store.replace_items(items);
         self.refresh();
+        // Starts missed while the history was loading, or while the stream
+        // was down, are not replayed: ask the server about every child.
+        let children = self.store.referenced_children();
+        self.probe_children(children);
+    }
+
+    /// Ask the server whether each of `children` is running. The store is told
+    /// first so an execution event that arrives while the request is in
+    /// flight wins over its (older) answer; see `DataStore::apply_probe`.
+    fn probe_children(&mut self, children: Vec<String>) {
+        if children.is_empty() {
+            return;
+        }
+        self.store.mark_probing(&children);
+        let _ = self.commands.send(AppCommand::ProbeChildren { children });
     }
 
     fn request_reload(&mut self) {
@@ -999,6 +1021,32 @@ impl App {
         }
     }
 
+    /// A child's running state may have flipped. It lives beside the parts, not
+    /// in them, so no part version moved and `changed_from` is untouched:
+    /// lower it so the next `refresh` re-derives the subagent rows' `background`
+    /// flag (a compare of `(id, version, background)` per block, no re-wrap
+    /// unless a flag actually differs).
+    fn child_state_changed(&mut self) {
+        self.store.changed_from = 0;
+        self.store_dirty = true;
+        self.dirty = true;
+    }
+
+    /// What the footer shows as going on. Display only: the own turn
+    /// (`running_since`) wins, otherwise running child sessions still light
+    /// the scanner. `press_esc` and `interrupt_or_quit` below deliberately
+    /// stay on `running_since`: child events never touch it, so Esc / ctrl+c
+    /// keep acting on the own turn alone.
+    fn activity(&self) -> Activity {
+        if self.store.running_since.is_some() {
+            Activity::Turn
+        } else if self.store.busy() {
+            Activity::Children
+        } else {
+            Activity::Idle
+        }
+    }
+
     /// Esc while a turn runs: the second press inside the window interrupts.
     fn press_esc(&mut self, now: Instant) {
         if self.store.running_since.is_none() {
@@ -1132,9 +1180,25 @@ impl App {
                 // store filters them by `form.sessionID` itself.
                 let is_form = envelope.kind.starts_with("form.");
                 if !is_form && typed.data.session_id() != self.session.as_deref() {
-                    return; // 全局流里过滤出本会话
+                    // 其它会话不进 reducer；子会话的执行起止由 store 自己筛选。
+                    if self.store.observe_foreign(&typed) {
+                        self.child_state_changed();
+                    }
+                    return;
                 }
                 ox_client::store::reduce(&mut self.store, &typed);
+                // A tool result that names a child session may have missed
+                // that child's `execution.started`: probe it once.
+                if let ox_schema::event::SessionEventData::ToolSuccess {
+                    assistant_message_id,
+                    id,
+                    ..
+                } = &typed.data
+                    && let Some(child) = self.store.tool_child(assistant_message_id, id)
+                {
+                    let child = child.session_id.clone();
+                    self.probe_children(vec![child]);
+                }
                 // 服务端换了会话的 model / agent：metadata 行跟着刷新。
                 if let Some(session) = self.session.clone()
                     && matches!(
@@ -1241,8 +1305,7 @@ impl App {
                                 self.handle_stream(StreamMsg::Event(Box::new(envelope)));
                             }
                     // 运行中的扫描条按时间走帧，空闲时不再重绘。
-                    let running = self.store.running_since.is_some();
-                    if self.prompt.tick_spinner(Instant::now(), running) {
+                    if self.prompt.tick_spinner(Instant::now(), self.activity()) {
                         self.dirty = true;
                     }
                     if self.route == Route::Session && self.transcript.tick(Instant::now()) {
@@ -1295,12 +1358,12 @@ impl App {
                                         _ => {
                                             let prompt_area =
                                                 layout::padded(prompt_area, full.width);
-                                            let running = self.store.running_since.is_some();
+                                            let activity = self.activity();
                                             self.prompt.render(
                                                 frame,
                                                 prompt_area,
                                                 full,
-                                                running,
+                                                activity,
                                             );
                                         }
                                     }
@@ -1500,6 +1563,7 @@ mod tests {
                 state: ToolState::Success,
                 summary: "cargo test".into(),
                 output: std::sync::Arc::new("ok\ndone".into()),
+                background: false,
             }],
             0,
         );
@@ -2335,6 +2399,7 @@ mod tests {
             time: ox_client::rest::SessionTime {
                 created: 1_793_448_000_000,
                 updated: 1_793_448_000_000,
+                ..Default::default()
             },
             location: None,
         }
@@ -2698,6 +2763,259 @@ mod tests {
         let toast = app.toast.as_ref().expect("toast");
         assert_eq!(toast.title.as_deref(), Some("Failed to delete session"));
         assert_eq!(toast.message, "boom");
+    }
+
+    // ---- child sessions (subagents) ---------------------------------------
+
+    /// A wire session event, as the global stream delivers it.
+    fn session_frame(kind: &str, data: serde_json::Value) -> AppEvent {
+        let envelope = serde_json::from_value(serde_json::json!({
+            "id": "evt_1", "created": 1, "type": kind, "data": data
+        }))
+        .unwrap();
+        AppEvent::Stream(ox_client::sse::StreamMsg::Event(Box::new(envelope)))
+    }
+
+    /// The focused session ran a `subagent` call that named `child`.
+    fn subagent_result(app: &mut App, child: &str) {
+        app.handle(session_frame(
+            "session.tool.input.started",
+            serde_json::json!({"sessionID":"ses_test","assistantMessageID":"msg_1",
+                               "id":"part_1","name":"subagent"}),
+        ));
+        app.handle(session_frame(
+            "session.tool.success",
+            serde_json::json!({"sessionID":"ses_test","assistantMessageID":"msg_1",
+                               "id":"part_1","content":[],"executed":true,
+                               "metadata":{"sessionID":child,"status":"running"}}),
+        ));
+    }
+
+    /// A focused session whose only activity is a running child.
+    fn only_a_child_running() -> (App, mpsc::UnboundedReceiver<AppCommand>) {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        subagent_result(&mut app, "ses_child");
+        app.handle(session_frame(
+            "session.execution.started",
+            serde_json::json!({"sessionID":"ses_child"}),
+        ));
+        assert!(app.store.busy());
+        assert_eq!(app.store.running_since, None);
+        drain(&mut rx); // the probe request
+        (app, rx)
+    }
+
+    #[test]
+    fn esc_with_only_a_child_running_never_interrupts() {
+        let (mut app, mut rx) = only_a_child_running();
+        key(&mut app, KeyCode::Esc);
+        key(&mut app, KeyCode::Esc);
+        assert!(drain(&mut rx).is_empty(), "Esc stays bound to the own turn");
+    }
+
+    #[test]
+    fn ctrl_c_with_only_a_child_running_still_quits() {
+        let (mut app, mut rx) = only_a_child_running();
+        ctrl(&mut app, 'c');
+        assert!(app.view.should_quit);
+        assert!(drain(&mut rx).is_empty(), "no interrupt is sent");
+    }
+
+    #[test]
+    fn a_child_starting_and_ending_flips_the_subagent_row_badge() {
+        use crate::ui::timeline::Transcript;
+
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        app.transcript = Transcript::new(60, 10);
+        subagent_result(&mut app, "ses_child");
+        app.refresh();
+        assert_eq!(app.transcript.set_query("Background"), 0, "child idle");
+
+        app.handle(session_frame(
+            "session.execution.started",
+            serde_json::json!({"sessionID":"ses_child"}),
+        ));
+        app.refresh();
+        assert_eq!(app.transcript.set_query("Background"), 1, "child running");
+
+        app.handle(session_frame(
+            "session.execution.succeeded",
+            serde_json::json!({"sessionID":"ses_child"}),
+        ));
+        app.refresh();
+        assert_eq!(app.transcript.set_query("Background"), 0, "child done");
+    }
+
+    #[test]
+    fn a_probe_answer_flips_the_subagent_row_badge() {
+        use crate::ui::timeline::Transcript;
+
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        app.transcript = Transcript::new(60, 10);
+        subagent_result(&mut app, "ses_child");
+        app.refresh();
+        app.handle(AppEvent::ChildRunning {
+            child: "ses_child".into(),
+            running: true,
+        });
+        app.refresh();
+        assert_eq!(app.transcript.set_query("Background"), 1);
+    }
+
+    fn probes(rx: &mut mpsc::UnboundedReceiver<AppCommand>) -> Vec<Vec<String>> {
+        drain(rx)
+            .into_iter()
+            .filter_map(|command| match command {
+                AppCommand::ProbeChildren { children, .. } => Some(children),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn foreign_execution_events_feed_the_running_children_not_the_reducer() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        subagent_result(&mut app, "ses_child");
+        assert!(!app.store.busy());
+        let items = app.store.items.len();
+
+        app.handle(session_frame(
+            "session.execution.started",
+            serde_json::json!({"sessionID":"ses_child"}),
+        ));
+        assert!(app.store.is_child_running("ses_child"));
+        assert!(app.store.busy());
+        assert_eq!(app.store.running_since, None, "never the parent's turn");
+
+        // Other foreign traffic still cannot reach the reducer.
+        app.handle(session_frame(
+            "session.text.delta",
+            serde_json::json!({"sessionID":"ses_child","assistantMessageID":"msg_c",
+                               "ordinal":0,"delta":"hi"}),
+        ));
+        assert_eq!(app.store.items.len(), items);
+
+        app.handle(session_frame(
+            "session.execution.succeeded",
+            serde_json::json!({"sessionID":"ses_child"}),
+        ));
+        assert!(!app.store.busy());
+    }
+
+    #[test]
+    fn a_foreign_session_the_tools_never_named_stays_ignored() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        subagent_result(&mut app, "ses_child");
+        app.store_dirty = false;
+        app.store.changed_from = usize::MAX;
+        app.handle(session_frame(
+            "session.execution.started",
+            serde_json::json!({"sessionID":"ses_stranger"}),
+        ));
+        assert!(!app.store.busy());
+        // An event that changed nothing must not force a full resync.
+        assert!(!app.store_dirty);
+        assert_eq!(app.store.changed_from, usize::MAX);
+    }
+
+    #[test]
+    fn a_tool_result_naming_a_child_probes_it_once() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        subagent_result(&mut app, "ses_child");
+        assert_eq!(probes(&mut rx), vec![vec!["ses_child".to_owned()]]);
+    }
+
+    #[test]
+    fn a_tool_result_without_a_child_probes_nothing() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        app.handle(session_frame(
+            "session.tool.input.started",
+            serde_json::json!({"sessionID":"ses_test","assistantMessageID":"msg_1",
+                               "id":"part_1","name":"shell"}),
+        ));
+        app.handle(session_frame(
+            "session.tool.success",
+            serde_json::json!({"sessionID":"ses_test","assistantMessageID":"msg_1",
+                               "id":"part_1","content":[],"executed":true}),
+        ));
+        assert!(probes(&mut rx).is_empty());
+    }
+
+    fn history_with_child(child: &str) -> Vec<Item> {
+        let mut scratch = App::new(
+            Route::Session,
+            Some("ses_test".into()),
+            crate::ui::prompt::Chrome::default(),
+            mpsc::unbounded_channel().0,
+            watch::channel(None).0,
+        );
+        subagent_result(&mut scratch, child);
+        std::mem::take(&mut scratch.store.items)
+    }
+
+    #[test]
+    fn loaded_history_probes_every_referenced_child() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        app.request_reload();
+        let Ok(AppCommand::ReloadHistory { request_id, .. }) = rx.try_recv() else {
+            panic!("a reload command");
+        };
+        app.handle(AppEvent::History {
+            request_id,
+            items: history_with_child("ses_child"),
+        });
+        assert_eq!(probes(&mut rx), vec![vec!["ses_child".to_owned()]]);
+    }
+
+    #[test]
+    fn loaded_history_without_children_probes_nothing() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        app.request_reload();
+        let Ok(AppCommand::ReloadHistory { request_id, .. }) = rx.try_recv() else {
+            panic!("a reload command");
+        };
+        app.handle(AppEvent::History {
+            request_id,
+            items: Vec::new(),
+        });
+        assert!(probes(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn a_probe_answer_marks_the_child_running() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        subagent_result(&mut app, "ses_child");
+        app.handle(AppEvent::ChildRunning {
+            child: "ses_child".into(),
+            running: true,
+        });
+        assert!(app.store.busy());
+    }
+
+    #[test]
+    fn an_event_after_the_probe_went_out_beats_its_answer() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        subagent_result(&mut app, "ses_child"); // sends the probe
+        app.handle(session_frame(
+            "session.execution.succeeded",
+            serde_json::json!({"sessionID":"ses_child"}),
+        ));
+        // The probe was answered "running" before the child finished.
+        app.handle(AppEvent::ChildRunning {
+            child: "ses_child".into(),
+            running: true,
+        });
+        assert!(!app.store.busy(), "the newer event wins");
+    }
+
+    #[test]
+    fn a_probe_answer_for_a_child_of_another_session_is_dropped() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        app.handle(AppEvent::ChildRunning {
+            child: "ses_child".into(),
+            running: true,
+        });
+        assert!(!app.store.busy());
     }
 
     // ---- forms -----------------------------------------------------------

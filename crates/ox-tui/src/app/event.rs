@@ -41,6 +41,13 @@ pub enum AppEvent {
         request_id: u64,
         items: Vec<Item>,
     },
+    /// Answer to `AppCommand::ProbeChildren` for one child session. Applies
+    /// only if no execution event for the child arrived since the probe went
+    /// out. A failed probe sends nothing.
+    ChildRunning {
+        child: String,
+        running: bool,
+    },
     /// A lazily created session is ready; `prompt` is the text that triggered
     /// the creation (the app shows it optimistically and sends it).
     SessionReady {

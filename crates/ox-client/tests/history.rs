@@ -176,3 +176,36 @@ fn history_keeps_shell_completion_between_turns_and_skips_other_synthetic() {
     assert_eq!(&*done.description, "cargo test");
     assert!(matches!(items[2], Item::Assistant(_)));
 }
+
+#[test]
+fn history_subagent_tool_keeps_its_child_session() {
+    let raw = r#"[
+      {"type":"assistant","id":"msg_a1","time":{"created":1},"agent":"build",
+       "model":{"providerID":"p","id":"m"},
+       "content":[
+         {"type":"tool","id":"call_1","name":"subagent",
+          "state":{"status":"completed","input":{"prompt":"go","description":"d"},
+                   "content":[{"type":"text","text":"working"}],
+                   "metadata":{"sessionID":"ses_c","status":"running","description":"d"}},
+          "time":{"created":1}},
+         {"type":"tool","id":"call_2","name":"shell",
+          "state":{"status":"completed","input":{"command":"ls"},
+                   "content":[{"type":"text","text":"x"}],
+                   "metadata":{"sessionID":"ses_not_a_child"}},
+          "time":{"created":1}}
+       ]}
+    ]"#;
+    let messages: Vec<ox_schema::message::Message> = serde_json::from_str(raw).unwrap();
+    let items = parse_messages(&messages);
+    let Item::Assistant(assistant) = &items[0] else {
+        panic!("expected assistant, got {:?}", items[0]);
+    };
+    assert_eq!(
+        assistant.tools[0].child.as_ref().unwrap().session_id,
+        "ses_c"
+    );
+    assert!(
+        assistant.tools[1].child.is_none(),
+        "only subagent calls name a child"
+    );
+}

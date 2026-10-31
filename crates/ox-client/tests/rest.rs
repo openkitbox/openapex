@@ -56,6 +56,47 @@ async fn session_info_reads_agent_and_model() {
 }
 
 #[tokio::test]
+async fn session_info_reads_the_busy_and_idle_times() {
+    let mock = MockOx::default();
+    mock.reply(
+        "/api/session/ses_c",
+        r#"{"data":{"id":"ses_c","time":{"created":1,"updated":9,"busy":5}}}"#,
+    );
+    mock.reply(
+        "/api/session/ses_d",
+        r#"{"data":{"id":"ses_d","time":{"created":1,"updated":9,"busy":5,"idle":6}}}"#,
+    );
+    mock.reply("/api/session/ses_e", r#"{"data":{"id":"ses_e"}}"#);
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    assert!(
+        client
+            .session_info("ses_c")
+            .await
+            .unwrap()
+            .time
+            .is_running()
+    );
+    assert!(
+        !client
+            .session_info("ses_d")
+            .await
+            .unwrap()
+            .time
+            .is_running()
+    );
+    assert!(
+        !client
+            .session_info("ses_e")
+            .await
+            .unwrap()
+            .time
+            .is_running()
+    );
+}
+
+#[tokio::test]
 async fn create_session_posts_directory() {
     let mock = MockOx::default();
     mock.reply("/api/session", r#"{"data":{"id":"ses_1"}}"#);

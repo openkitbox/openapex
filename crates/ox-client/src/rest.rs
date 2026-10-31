@@ -146,6 +146,26 @@ pub struct SessionTime {
     pub created: i64,
     #[serde(default)]
     pub updated: i64,
+    /// Start of the latest turn; absent until the session first runs.
+    #[serde(default)]
+    pub busy: Option<i64>,
+    /// End of the latest turn; absent until one finishes.
+    #[serde(default)]
+    pub idle: Option<i64>,
+}
+
+impl SessionTime {
+    /// A turn is in flight: it started (`busy`) and has not ended since
+    /// (`idle` absent or older). The server stamps `busy` on
+    /// `execution.started` and `idle` (strictly after `busy`) on every end
+    /// (`projector.rs`). A crashed server can leave a stale `true` behind.
+    pub fn is_running(&self) -> bool {
+        match (self.busy, self.idle) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some(busy), Some(idle)) => idle < busy,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -179,6 +199,8 @@ struct SessionEnvelope {
 #[derive(Deserialize)]
 struct StoredSession {
     #[serde(default)]
+    time: SessionTime,
+    #[serde(default)]
     location: Option<StoredLocation>,
     #[serde(default)]
     agent: Option<String>,
@@ -209,6 +231,7 @@ pub struct SessionInfo {
     /// Raw variant; `default` is the server's "none" and is left to the caller.
     pub variant: Option<String>,
     pub title: Option<String>,
+    pub time: SessionTime,
 }
 
 #[derive(Deserialize)]
@@ -272,6 +295,7 @@ impl Client {
             provider_id,
             variant,
             title: stored.title,
+            time: stored.time,
         })
     }
 
@@ -683,5 +707,49 @@ mod tests {
                 McpStatus::Disabled,
             ]
         );
+    }
+
+    #[test]
+    fn is_running_table() {
+        // (busy, idle, running)
+        let cases = [
+            (None, None, false),
+            (None, Some(5), false),
+            (Some(10), None, true),
+            (Some(10), Some(5), true),
+            (Some(10), Some(10), false),
+            (Some(10), Some(11), false),
+        ];
+        for (busy, idle, running) in cases {
+            let time = SessionTime {
+                busy,
+                idle,
+                ..SessionTime::default()
+            };
+            assert_eq!(time.is_running(), running, "busy={busy:?} idle={idle:?}");
+        }
+    }
+
+    #[test]
+    fn a_real_shaped_session_time_deserializes_busy_and_idle() {
+        // The shape `session.rs` emits: busy/idle only once set.
+        let running: SessionTime = serde_json::from_value(json!({
+            "created": 1_793_448_000_000_i64, "updated": 1_793_448_005_000_i64,
+            "busy": 1_793_448_001_000_i64, "viewed": 1_793_448_002_000_i64
+        }))
+        .unwrap();
+        assert_eq!(running.busy, Some(1_793_448_001_000));
+        assert_eq!(running.idle, None);
+        assert!(running.is_running());
+
+        let finished: SessionTime = serde_json::from_value(json!({
+            "created": 1, "updated": 9, "busy": 5, "idle": 6
+        }))
+        .unwrap();
+        assert!(!finished.is_running());
+
+        let fresh: SessionTime =
+            serde_json::from_value(json!({"created": 1, "updated": 1})).unwrap();
+        assert_eq!((fresh.busy, fresh.idle), (None, None));
     }
 }

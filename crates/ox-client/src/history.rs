@@ -9,7 +9,8 @@ use ox_schema::message::{AssistantContent, Compaction, Message, ToolState as Wir
 use ox_schema::support::Content;
 
 use crate::store::{
-    AssistantItem, CompactionItem, CompactionStatus, CompletionItem, Item, ToolPart, ToolState,
+    AssistantItem, ChildRef, CompactionItem, CompactionStatus, CompletionItem, Item, ToolPart,
+    ToolState,
 };
 
 /// Turn a chronological message list into the store's ordered sequence.
@@ -137,6 +138,7 @@ fn compaction_item(message: &ox_schema::message::CompactionMessage) -> Compactio
 /// carries the raw input text (the summary derives from it as a fallback);
 /// the resolved states carry the parsed input record.
 fn tool_part(id: &str, name: &str, state: &WireToolState) -> ToolPart {
+    let mut child = None;
     let (state, record, output, input_text): (ToolState, Option<&_>, String, String) = match state {
         WireToolState::Streaming { input } => {
             (ToolState::Input, None, String::new(), input.clone())
@@ -147,12 +149,19 @@ fn tool_part(id: &str, name: &str, state: &WireToolState) -> ToolPart {
             String::new(),
             String::new(),
         ),
-        WireToolState::Completed { input, content, .. } => (
-            ToolState::Success,
-            Some(input),
-            join_text(content),
-            String::new(),
-        ),
+        WireToolState::Completed {
+            input,
+            content,
+            metadata,
+        } => {
+            child = ChildRef::from_metadata(name, metadata.as_ref());
+            (
+                ToolState::Success,
+                Some(input),
+                join_text(content),
+                String::new(),
+            )
+        }
         WireToolState::Error { input, error, .. } => (
             ToolState::Failed,
             Some(input),
@@ -173,6 +182,7 @@ fn tool_part(id: &str, name: &str, state: &WireToolState) -> ToolPart {
         todos: record
             .map(|record| crate::store::todos_of(name, record))
             .unwrap_or_default(),
+        child,
     };
     if part.todos.is_empty() {
         part.todos = crate::store::todos_from_input_text(name, &part.input_text);

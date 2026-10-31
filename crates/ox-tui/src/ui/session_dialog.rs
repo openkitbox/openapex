@@ -115,7 +115,11 @@ mod tests {
         SessionSummary {
             id: id.into(),
             title: title.map(String::from),
-            time: SessionTime { created, updated },
+            time: SessionTime {
+                created,
+                updated,
+                ..SessionTime::default()
+            },
             location: None,
         }
     }

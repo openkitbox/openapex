@@ -45,7 +45,7 @@ pub fn blocks_from_store(store: &DataStore) -> Vec<Block> {
                 });
                 // Tool rows follow the message text: the wire gives tool
                 // parts no ordinal, so the interleaving is not recoverable.
-                push_tools(&mut blocks, &assistant.tools);
+                push_tools(&mut blocks, &assistant.tools, store);
             }
             Item::Compaction(compaction) => blocks.push(Block::Compaction {
                 id: compaction.id.clone(),
@@ -81,7 +81,7 @@ fn explored_kind(tool: &str) -> Option<fn(&mut Explored)> {
     }
 }
 
-fn push_tools(blocks: &mut Vec<Block>, tools: &[ToolPart]) {
+fn push_tools(blocks: &mut Vec<Block>, tools: &[ToolPart], store: &DataStore) {
     let mut group: Option<Explored> = None;
     for tool in tools {
         if let Some(count) = explored_kind(&tool.tool) {
@@ -122,6 +122,10 @@ fn push_tools(blocks: &mut Vec<Block>, tools: &[ToolPart]) {
             state: tool.state,
             summary: tool.summary.clone(),
             output: Arc::clone(&tool.output),
+            background: tool
+                .child
+                .as_ref()
+                .is_some_and(|child| store.is_child_running(&child.session_id)),
         });
     }
     if let Some(explored) = group {
@@ -184,6 +188,52 @@ mod tests {
 
     use super::blocks_from_store;
     use crate::ui::timeline::Block;
+
+    fn store_with_subagent(child: Option<&str>) -> DataStore {
+        let mut store = DataStore::default();
+        store.session = Some("ses_parent".into());
+        store.items = vec![Item::Assistant(Box::new(AssistantItem {
+            id: "m1".into(),
+            tools: vec![ToolPart {
+                id: "p1".into(),
+                tool: "subagent".into(),
+                state: ToolState::Success,
+                child: child.map(|id| ox_client::store::ChildRef {
+                    session_id: id.into(),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }))];
+        store
+    }
+
+    fn background_of(store: &DataStore) -> bool {
+        blocks_from_store(store)
+            .iter()
+            .find_map(|block| match block {
+                Block::Tool { background, .. } => Some(*background),
+                _ => None,
+            })
+            .expect("a tool block")
+    }
+
+    #[test]
+    fn background_is_true_only_while_the_child_runs() {
+        let mut store = store_with_subagent(Some("ses_c"));
+        assert!(!background_of(&store), "child known but idle");
+        assert!(store.set_child_running("ses_c", true));
+        assert!(background_of(&store), "child running");
+        assert!(store.set_child_running("ses_c", false));
+        assert!(!background_of(&store), "child finished");
+    }
+
+    #[test]
+    fn a_tool_without_a_child_is_never_background() {
+        let mut store = store_with_subagent(None);
+        assert!(!store.set_child_running("ses_c", true), "nothing names it");
+        assert!(!background_of(&store));
+    }
 
     #[test]
     fn projects_tool_parts_after_the_assistant_text() {

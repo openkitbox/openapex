@@ -22,6 +22,11 @@ pub enum AppCommand {
         session: String,
         request_id: u64,
     },
+    /// Read each child (subagent) session's `time.busy/idle`, one request
+    /// after another; every answer is an `AppEvent::ChildRunning`.
+    ProbeChildren {
+        children: Vec<String>,
+    },
     /// Fetch the session's stored agent/model for the prompt's metadata row;
     /// answered with `AppEvent::SessionChrome`.
     LoadSessionChrome {

@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::theme::{self, terminal::Rgb};
-use crate::ui::prompt::{McpSummary, Prompt};
+use crate::ui::prompt::{Activity, McpSummary, Prompt};
 
 /// Upstream `logo.left` / `logo.right` (`logo.ts:1-4`), verbatim. The mask
 /// alphabet (`component/logo.tsx:12-49`): `_` a blank on the shadow colour, `^`
@@ -259,7 +259,7 @@ pub fn render(frame: &mut ratatui::Frame, area: Rect, prompt: &mut Prompt) {
             height: prompt_h.min(prompt_area.height),
             ..prompt_area
         };
-        prompt.render(frame, prompt_area, frame.area(), false);
+        prompt.render(frame, prompt_area, frame.area(), Activity::Idle);
     }
 
     if footer_h > 0 {

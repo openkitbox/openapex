@@ -23,7 +23,7 @@ use ox_tui::ui::dock::{StatusMode, status_line};
 use ox_tui::ui::home;
 use ox_tui::ui::markdown;
 use ox_tui::ui::palette;
-use ox_tui::ui::prompt::{Chrome, Footer, McpSummary, Prompt, placeholder_line};
+use ox_tui::ui::prompt::{Activity, Chrome, Footer, McpSummary, Prompt, placeholder_line};
 use ox_tui::ui::session_dialog;
 use ox_tui::ui::timeline::{Block, Explored, Transcript, TurnFooter};
 use ox_tui::ui::toast::{self, Toast, Variant};
@@ -145,6 +145,13 @@ fn cases() -> Vec<Case> {
                 "",
             )],
         ),
+        transcript_case("tool-subagent-background", 2, {
+            let mut block = tool("subagent", "explore the repo", ToolState::Success, "");
+            if let Block::Tool { background, .. } = &mut block {
+                *background = true;
+            }
+            vec![block]
+        }),
         transcript_case(
             "tool-success",
             3,
@@ -504,6 +511,7 @@ fn session_case(
         time: SessionTime {
             created: NOW - age_ms,
             updated: NOW - age_ms,
+            ..SessionTime::default()
         },
         location: None,
     };
@@ -686,6 +694,7 @@ fn tool(tool: &str, summary: &str, state: ToolState, output: &str) -> Block {
         state,
         summary: summary.into(),
         output: Arc::new(output.to_owned()),
+        background: false,
     }
 }
 
@@ -807,7 +816,12 @@ fn prompt_case(
                 height: h,
                 ..area
             };
-            prompt.render(frame, panel_area, area, running);
+            let activity = if running {
+                Activity::Turn
+            } else {
+                Activity::Idle
+            };
+            prompt.render(frame, panel_area, area, activity);
         }),
     }
 }
@@ -842,7 +856,7 @@ fn prompt_files_case() -> Case {
                 height: h,
                 ..area
             };
-            prompt.render(frame, panel_area, area, false);
+            prompt.render(frame, panel_area, area, Activity::Idle);
         }),
     }
 }

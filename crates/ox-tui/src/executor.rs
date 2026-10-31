@@ -53,6 +53,7 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
         AppCommand::LoadAttachments(text) => load_attachments(&tx, text).await,
         AppCommand::ReadClipboard => read_clipboard(&tx).await,
         AppCommand::WriteClipboard(text) => write_clipboard(&tx, text).await,
+        AppCommand::ProbeChildren { children } => probe_children(&client, &tx, children).await,
         AppCommand::LoadSessionChrome { session } => session_chrome(&client, &tx, session).await,
         AppCommand::McpList => mcp_list(&client, &tx).await,
         AppCommand::ModelList => model_list(&client, &tx).await,
@@ -179,6 +180,21 @@ async fn session_chrome(client: &Client, tx: &Events, session: String) {
             let _ = tx.send(AppEvent::SessionChrome { session, selection });
         }
         Err(err) => tracing::warn!(%err, "session chrome lookup failed"),
+    }
+}
+
+/// Probe the children one after another (a handful at most, so one task and
+/// no fan-out). A failed lookup is skipped: the event stream still drives
+/// that child.
+async fn probe_children(client: &Client, tx: &Events, children: Vec<String>) {
+    for child in children {
+        match client.session_info(&child).await {
+            Ok(info) => {
+                let running = info.time.is_running();
+                let _ = tx.send(AppEvent::ChildRunning { child, running });
+            }
+            Err(err) => tracing::warn!(%err, child, "child session probe failed"),
+        }
     }
 }
 
@@ -338,6 +354,20 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_server_yields_no_probe_answers() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run(
+            offline(),
+            tx,
+            AppCommand::ProbeChildren {
+                children: vec!["ses_a".into(), "ses_b".into()],
+            },
+        )
+        .await;
+        assert!(rx.try_recv().is_err(), "a failed probe says nothing");
     }
 
     #[tokio::test]

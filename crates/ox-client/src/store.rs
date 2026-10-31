@@ -8,7 +8,7 @@
 //!    `(id, version)` in O(1) and only re-wraps the changed tail. Text lives in
 //!    an `Arc` so an unchanged block shares the store's buffer (no deep copy).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ox_schema::event::{EventEnvelope, SessionEventData};
@@ -133,6 +133,47 @@ pub enum ToolState {
     Failed,
 }
 
+/// The child (subagent) session a `subagent` tool call started or resumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildRef {
+    pub session_id: String,
+}
+
+impl ChildRef {
+    /// The tool name the server registers the subagent tool under
+    /// (`ox-tools/src/subagent.rs`, `Tool::name`).
+    pub const SUBAGENT_TOOL: &'static str = "subagent";
+
+    /// The single parse point shared by history and the live path. The
+    /// subagent tool puts `{sessionID, status, description}` in its result
+    /// metadata, both for a background launch and a foreground completion.
+    /// Other tools' metadata is never read.
+    pub fn from_metadata(
+        tool: &str,
+        metadata: Option<&ox_schema::support::Record>,
+    ) -> Option<Self> {
+        if tool != Self::SUBAGENT_TOOL {
+            return None;
+        }
+        let session_id = metadata?.get("sessionID")?.as_str()?;
+        Some(Self {
+            session_id: session_id.to_owned(),
+        })
+    }
+
+    /// Whether some tool part in `items` names `session_id` as its child.
+    fn referenced_in(items: &[Item], session_id: &str) -> bool {
+        items.iter().any(|item| match item {
+            Item::Assistant(assistant) => assistant.tools.iter().any(|part| {
+                part.child
+                    .as_ref()
+                    .is_some_and(|c| c.session_id == session_id)
+            }),
+            _ => false,
+        })
+    }
+}
+
 /// One tool call inside an assistant message. Events are keyed by the tool
 /// part `id`, so out-of-order arrival is tolerated and finished parts ignore
 /// late events.
@@ -155,6 +196,8 @@ pub struct ToolPart {
     /// The list a `todowrite` call carries, parsed from its input. Empty for
     /// every other tool.
     pub todos: Arc<Vec<Todo>>,
+    /// The child session of a `subagent` call, once its result is known.
+    pub child: Option<ChildRef>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -232,6 +275,14 @@ pub struct DataStore {
     pub items: Vec<Item>,
     assistant_index: HashMap<String, usize>,
     pub running_since: Option<i64>,
+    /// Known child sessions (see [`ChildRef`]) whose turn is in flight.
+    /// Derived from `session.execution.*` events alone; see
+    /// [`DataStore::observe_foreign`].
+    running_children: HashSet<String>,
+    /// Children whose REST probe is in flight. An execution event for a child
+    /// removes it from here, so the (older) probe result is then discarded:
+    /// the event stream is newer than the answer to a request sent before it.
+    probing: HashSet<String>,
     pub model: Option<String>,
     pub agent: Option<String>,
     /// Session-level failure/retry notices, newest last.
@@ -307,8 +358,133 @@ impl DataStore {
         self.pending_forms.first()
     }
 
+    /// Something is running for this session: its own turn, or a child
+    /// session it delegated to. Display only; interrupts keep using
+    /// `running_since`, which child events never touch.
+    pub fn busy(&self) -> bool {
+        self.running_since.is_some() || !self.running_children.is_empty()
+    }
+
+    /// Whether `session_id` is a known child whose turn is in flight.
+    pub fn is_child_running(&self, session_id: &str) -> bool {
+        self.running_children.contains(session_id)
+    }
+
+    /// Feed an event that belongs to a session OTHER than the focused one.
+    /// The caller (the TUI event loop) must route every such event here
+    /// instead of dropping it, and must NOT pass it to [`reduce`]. Only
+    /// `session.execution.*` of a child already named by a tool part of the
+    /// current items has an effect; everything else is ignored, so other
+    /// clients' sessions on the same server cannot make this one look busy.
+    ///
+    /// Limitation: a child's `execution.started` that arrives before the
+    /// parent's tool result names the child is ignored (the id is not known
+    /// yet), and so is a `succeeded` seen in that window. The REST rebuild
+    /// after history load is responsible for that window.
+    ///
+    /// Returns whether the event named a known child (so the caller needs to
+    /// repaint); `false` for every event that changed nothing.
+    pub fn observe_foreign(&mut self, event: &EventEnvelope<SessionEventData>) -> bool {
+        let (session_id, running) = match &event.data {
+            SessionEventData::ExecutionStarted { session_id } => (session_id, true),
+            SessionEventData::ExecutionSucceeded { session_id }
+            | SessionEventData::ExecutionFailed { session_id, .. }
+            | SessionEventData::ExecutionInterrupted { session_id, .. } => (session_id, false),
+            _ => return false,
+        };
+        // Fail closed: the focused session is `reduce`'s business.
+        if !self.is_foreign_child(session_id) {
+            return false;
+        }
+        self.probing.remove(session_id);
+        self.set_running(session_id, running);
+        true
+    }
+
+    fn set_running(&mut self, session_id: &str, running: bool) {
+        if running {
+            self.running_children.insert(session_id.to_owned());
+        } else {
+            self.running_children.remove(session_id);
+        }
+    }
+
+    /// Whether `session_id` is a child the current items name and not the
+    /// focused session itself (`reduce`'s business).
+    fn is_foreign_child(&self, session_id: &str) -> bool {
+        self.session.as_deref() != Some(session_id)
+            && ChildRef::referenced_in(&self.items, session_id)
+    }
+
+    /// Set a child's running state from a source other than the event stream
+    /// (the REST probe). Same fail-closed rule as [`observe_foreign`]: only a
+    /// child some tool part names is touched. Returns whether it acted.
+    pub fn set_child_running(&mut self, session_id: &str, running: bool) -> bool {
+        if !self.is_foreign_child(session_id) {
+            return false;
+        }
+        self.set_running(session_id, running);
+        true
+    }
+
+    /// Every child session the items name, once each, in first-seen order.
+    pub fn referenced_children(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut children = Vec::new();
+        for item in &self.items {
+            let Item::Assistant(assistant) = item else {
+                continue;
+            };
+            for child in assistant
+                .tools
+                .iter()
+                .filter_map(|part| part.child.as_ref())
+            {
+                if seen.insert(child.session_id.as_str()) {
+                    children.push(child.session_id.clone());
+                }
+            }
+        }
+        children
+    }
+
+    /// The child of tool part `part_id` inside assistant message `message_id`.
+    pub fn tool_child(&self, message_id: &str, part_id: &str) -> Option<&ChildRef> {
+        let index = *self.assistant_index.get(message_id)?;
+        let Item::Assistant(assistant) = self.items.get(index)? else {
+            return None;
+        };
+        assistant
+            .tools
+            .iter()
+            .find(|part| part.id == part_id)?
+            .child
+            .as_ref()
+    }
+
+    /// Note that a REST probe for each referenced child in `ids` is about to
+    /// be sent. Must be called before the request goes out.
+    pub fn mark_probing(&mut self, ids: &[String]) {
+        for id in ids {
+            if self.is_foreign_child(id) {
+                self.probing.insert(id.clone());
+            }
+        }
+    }
+
+    /// Apply a probe answer unless an execution event for the child arrived
+    /// after [`mark_probing`] (or the child is no longer referenced). Each
+    /// `mark_probing` is consumed by one answer. Returns whether it applied.
+    pub fn apply_probe(&mut self, session_id: &str, running: bool) -> bool {
+        self.probing.remove(session_id) && self.set_child_running(session_id, running)
+    }
+
     pub fn replace_items(&mut self, items: Vec<Item>) {
         self.items = items;
+        let items = &self.items;
+        self.running_children
+            .retain(|id| ChildRef::referenced_in(items, id));
+        self.probing.retain(|id| ChildRef::referenced_in(items, id));
         self.assistant_index.clear();
         self.pending_completions.clear();
         for (index, item) in self.items.iter().enumerate() {
@@ -495,6 +671,7 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
                     version: 0,
                     input_text: Arc::default(),
                     todos: Arc::default(),
+                    child: None,
                 });
             }
             store.touch(index);
@@ -564,6 +741,7 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
             assistant_message_id,
             id,
             content,
+            metadata,
             ..
         } => {
             let index = store.ensure_assistant(assistant_message_id);
@@ -578,6 +756,7 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
                     part.todos = todos_from_input_text(&part.tool, &part.input_text);
                 }
                 part.output = Arc::new(join_text(content));
+                part.child = ChildRef::from_metadata(&part.tool, metadata.as_ref());
                 part.version += 1;
             }
             store.touch(index);
@@ -893,7 +1072,9 @@ mod tests {
     use ox_schema::event::EventEnvelope;
     use serde_json::json;
 
-    use super::{CompletionItem, CompletionSource, DataStore, Item, NoticeKind, ToolState, reduce};
+    use super::{
+        ChildRef, CompletionItem, CompletionSource, DataStore, Item, NoticeKind, ToolState, reduce,
+    };
 
     fn env(kind: &str, data: serde_json::Value) -> EventEnvelope<serde_json::Value> {
         serde_json::from_value(json!({
@@ -1973,5 +2154,340 @@ mod tests {
         let metadata = meta(json!({"source": "shell", "state": "completed", "childID": "ses_x"}));
         let item = CompletionItem::from_synthetic("i", Some(&metadata), None).unwrap();
         assert_eq!(item.child_id, None);
+    }
+
+    // -- Child (subagent) sessions -------------------------------------------
+
+    fn record(value: serde_json::Value) -> ox_schema::support::Record {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn child_ref_from_metadata_table() {
+        let with_id = record(json!({"sessionID":"ses_c","status":"running"}));
+        let no_id = record(json!({"status":"running"}));
+        let numeric = record(json!({"sessionID": 7}));
+        let cases: [(&str, Option<&ox_schema::support::Record>, Option<&str>); 6] = [
+            ("subagent", Some(&with_id), Some("ses_c")),
+            ("shell", Some(&with_id), None),
+            ("subagent", None, None),
+            ("subagent", Some(&no_id), None),
+            ("subagent", Some(&numeric), None),
+            ("", Some(&with_id), None),
+        ];
+        for (tool, metadata, expected) in cases {
+            let got = ChildRef::from_metadata(tool, metadata);
+            assert_eq!(
+                got.as_ref().map(|c| c.session_id.as_str()),
+                expected,
+                "tool={tool:?} metadata={metadata:?}"
+            );
+        }
+    }
+
+    fn subagent_call(store: &mut DataStore, metadata: serde_json::Value) {
+        apply(
+            store,
+            "session.tool.input.started",
+            json!({"sessionID":"ses_1","assistantMessageID":"msg_1","id":"part_1","name":"subagent"}),
+        );
+        apply(
+            store,
+            "session.tool.success",
+            json!({"sessionID":"ses_1","assistantMessageID":"msg_1","id":"part_1",
+                   "content":[{"type":"text","text":"working"}],
+                   "metadata": metadata, "executed":true}),
+        );
+    }
+
+    #[test]
+    fn live_tool_success_records_the_child_and_bumps_the_version() {
+        let mut store = DataStore::default();
+        apply(
+            &mut store,
+            "session.tool.input.started",
+            json!({"sessionID":"ses_1","assistantMessageID":"msg_1","id":"part_1","name":"subagent"}),
+        );
+        let before = assistant(&store).tools[0].version;
+        apply(
+            &mut store,
+            "session.tool.success",
+            json!({"sessionID":"ses_1","assistantMessageID":"msg_1","id":"part_1",
+                   "content":[{"type":"text","text":"working"}],
+                   "metadata":{"sessionID":"ses_c","status":"running","description":"d"},
+                   "executed":true}),
+        );
+        let part = &assistant(&store).tools[0];
+        assert_eq!(part.child.as_ref().unwrap().session_id, "ses_c");
+        assert!(part.version > before, "the UI line cache keys on version");
+    }
+
+    #[test]
+    fn live_tool_success_without_metadata_has_no_child() {
+        let mut store = DataStore::default();
+        subagent_call(&mut store, json!(null));
+        assert!(assistant(&store).tools[0].child.is_none());
+    }
+
+    fn child_event(store: &mut DataStore, kind: &str, data: serde_json::Value) {
+        store.observe_foreign(&env(kind, data).parse_typed());
+    }
+
+    fn store_with_child() -> DataStore {
+        let mut store = DataStore {
+            session: Some("ses_1".to_owned()),
+            ..DataStore::default()
+        };
+        subagent_call(
+            &mut store,
+            json!({"sessionID":"ses_c","status":"running","description":"d"}),
+        );
+        store
+    }
+
+    #[test]
+    fn child_execution_events_toggle_running_children_and_busy() {
+        let interrupted = json!({"sessionID":"ses_c","reason":"user"});
+        let failed = json!({"sessionID":"ses_c","error":{"type":"x","message":"boom"}});
+        let ended = [
+            ("session.execution.succeeded", json!({"sessionID":"ses_c"})),
+            ("session.execution.failed", failed),
+            ("session.execution.interrupted", interrupted),
+        ];
+        for (kind, data) in ended {
+            let mut store = store_with_child();
+            assert!(!store.busy());
+            child_event(
+                &mut store,
+                "session.execution.started",
+                json!({"sessionID":"ses_c"}),
+            );
+            assert!(store.is_child_running("ses_c"), "{kind}");
+            assert!(store.busy(), "{kind}");
+            child_event(&mut store, kind, data);
+            assert!(!store.is_child_running("ses_c"), "{kind}");
+            assert!(!store.busy(), "{kind}");
+        }
+    }
+
+    #[test]
+    fn unknown_foreign_session_is_ignored() {
+        let mut store = store_with_child();
+        child_event(
+            &mut store,
+            "session.execution.started",
+            json!({"sessionID":"ses_other"}),
+        );
+        assert!(!store.busy());
+        assert!(!store.is_child_running("ses_other"));
+    }
+
+    #[test]
+    fn non_execution_foreign_events_are_ignored() {
+        let mut store = store_with_child();
+        child_event(
+            &mut store,
+            "session.text.delta",
+            json!({"sessionID":"ses_c","assistantMessageID":"m","ordinal":0,"delta":"x"}),
+        );
+        assert!(!store.busy());
+        assert_eq!(store.items.len(), 1, "foreign events never reach items");
+    }
+
+    #[test]
+    fn child_events_never_touch_running_since() {
+        let mut store = store_with_child();
+        child_event(
+            &mut store,
+            "session.execution.started",
+            json!({"sessionID":"ses_c"}),
+        );
+        assert_eq!(store.running_since, None);
+        apply(
+            &mut store,
+            "session.execution.started",
+            json!({"sessionID":"ses_1"}),
+        );
+        assert_eq!(store.running_since, Some(1000));
+        child_event(
+            &mut store,
+            "session.execution.succeeded",
+            json!({"sessionID":"ses_c"}),
+        );
+        assert_eq!(store.running_since, Some(1000), "parent turn unaffected");
+        apply(
+            &mut store,
+            "session.execution.succeeded",
+            json!({"sessionID":"ses_1"}),
+        );
+        assert_eq!(store.running_since, None);
+    }
+
+    #[test]
+    fn parent_turn_end_does_not_clear_running_children() {
+        let mut store = store_with_child();
+        child_event(
+            &mut store,
+            "session.execution.started",
+            json!({"sessionID":"ses_c"}),
+        );
+        apply(
+            &mut store,
+            "session.execution.started",
+            json!({"sessionID":"ses_1"}),
+        );
+        apply(
+            &mut store,
+            "session.execution.succeeded",
+            json!({"sessionID":"ses_1"}),
+        );
+        assert_eq!(store.running_since, None);
+        assert!(store.busy(), "the child is still running");
+    }
+
+    #[test]
+    fn replace_items_keeps_referenced_children_and_drops_the_rest() {
+        let mut store = store_with_child();
+        child_event(
+            &mut store,
+            "session.execution.started",
+            json!({"sessionID":"ses_c"}),
+        );
+        let kept = store.items.clone();
+        store.replace_items(kept);
+        assert!(store.is_child_running("ses_c"), "still referenced");
+        store.replace_items(Vec::new());
+        assert!(!store.is_child_running("ses_c"), "no longer referenced");
+        assert!(!store.busy());
+    }
+
+    // -- Probe feed: referenced children and REST-derived state --------------
+
+    #[test]
+    fn referenced_children_lists_each_child_once_in_order() {
+        let mut store = store_with_child();
+        // A second call resumes the same child; a third names another one.
+        for (message, part, child) in [("msg_2", "part_2", "ses_c"), ("msg_3", "part_3", "ses_d")] {
+            apply(
+                &mut store,
+                "session.tool.input.started",
+                json!({"sessionID":"ses_1","assistantMessageID":message,"id":part,"name":"subagent"}),
+            );
+            apply(
+                &mut store,
+                "session.tool.success",
+                json!({"sessionID":"ses_1","assistantMessageID":message,"id":part,
+                       "content":[],"metadata":{"sessionID":child},"executed":true}),
+            );
+        }
+        assert_eq!(store.referenced_children(), ["ses_c", "ses_d"]);
+        assert!(DataStore::default().referenced_children().is_empty());
+    }
+
+    #[test]
+    fn tool_child_finds_the_child_of_one_part() {
+        let store = store_with_child();
+        let child = store.tool_child("msg_1", "part_1").unwrap();
+        assert_eq!(child.session_id, "ses_c");
+        assert!(store.tool_child("msg_1", "nope").is_none());
+        assert!(store.tool_child("nope", "part_1").is_none());
+    }
+
+    #[test]
+    fn set_child_running_table() {
+        // (child, running, expected is_child_running afterwards)
+        let cases = [
+            ("ses_c", true, true),
+            ("ses_c", false, false),
+            ("ses_other", true, false), // not referenced: fail closed
+            ("ses_1", true, false),     // the focused session is reduce's
+        ];
+        for (child, running, expected) in cases {
+            let mut store = store_with_child();
+            let acted = store.set_child_running(child, running);
+            assert_eq!(acted, child == "ses_c", "{child} {running}");
+            assert_eq!(store.is_child_running(child), expected, "{child} {running}");
+            assert_eq!(store.busy(), expected, "{child} {running}");
+        }
+    }
+
+    #[test]
+    fn set_child_running_false_clears_a_running_child() {
+        let mut store = store_with_child();
+        assert!(store.set_child_running("ses_c", true));
+        assert!(store.busy());
+        store.set_child_running("ses_c", false);
+        assert!(!store.busy());
+    }
+
+    fn started(store: &mut DataStore) {
+        child_event(
+            store,
+            "session.execution.started",
+            json!({"sessionID":"ses_c"}),
+        );
+    }
+
+    fn ended(store: &mut DataStore) {
+        child_event(
+            store,
+            "session.execution.succeeded",
+            json!({"sessionID":"ses_c"}),
+        );
+    }
+
+    #[test]
+    fn a_probe_result_applies_when_no_event_arrived_since_it_started() {
+        for running in [true, false] {
+            let mut store = store_with_child();
+            store.mark_probing(&["ses_c".to_owned()]);
+            assert!(store.apply_probe("ses_c", running));
+            assert_eq!(store.is_child_running("ses_c"), running);
+        }
+    }
+
+    #[test]
+    fn an_event_after_the_probe_started_wins_over_its_result() {
+        // The event says finished, the (older) probe says running.
+        let mut store = store_with_child();
+        store.mark_probing(&["ses_c".to_owned()]);
+        ended(&mut store);
+        assert!(!store.apply_probe("ses_c", true));
+        assert!(!store.is_child_running("ses_c"));
+
+        // The event says started, the (older) probe says idle.
+        let mut store = store_with_child();
+        store.mark_probing(&["ses_c".to_owned()]);
+        started(&mut store);
+        assert!(!store.apply_probe("ses_c", false));
+        assert!(store.is_child_running("ses_c"));
+    }
+
+    #[test]
+    fn an_event_before_the_probe_started_loses_to_its_result() {
+        let mut store = store_with_child();
+        started(&mut store);
+        store.mark_probing(&["ses_c".to_owned()]);
+        assert!(store.apply_probe("ses_c", false));
+        assert!(!store.is_child_running("ses_c"));
+    }
+
+    #[test]
+    fn a_probe_result_is_used_once_and_only_if_it_was_started() {
+        let mut store = store_with_child();
+        assert!(!store.apply_probe("ses_c", true), "never started");
+        store.mark_probing(&["ses_c".to_owned()]);
+        assert!(store.apply_probe("ses_c", true));
+        assert!(!store.apply_probe("ses_c", false), "already consumed");
+        assert!(store.is_child_running("ses_c"));
+    }
+
+    #[test]
+    fn mark_probing_ignores_unreferenced_ids_and_replace_items_forgets_them() {
+        let mut store = store_with_child();
+        store.mark_probing(&["ses_other".to_owned(), "ses_c".to_owned()]);
+        assert!(!store.apply_probe("ses_other", true));
+        store.replace_items(Vec::new());
+        assert!(!store.apply_probe("ses_c", true), "no longer referenced");
     }
 }
