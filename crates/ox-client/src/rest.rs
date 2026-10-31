@@ -324,6 +324,27 @@ pub struct ShellTail {
     pub omitted: bool,
 }
 
+/// How far [`Client::shell_read`] reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellReadMode {
+    /// One page: a poll of a shell that is still writing.
+    Page,
+    /// Up to the capture's size, jumping to the newest `max_bytes` when more
+    /// is pending: the final read of a shell that exited.
+    Drain,
+}
+
+/// Output read from a cursor by [`Client::shell_read`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellRead {
+    pub text: String,
+    /// Where the next read continues.
+    pub end: u64,
+    /// Bytes between the requested cursor and `text` were never returned
+    /// (the server dropped them, or the drain jumped over them).
+    pub skipped: bool,
+}
+
 /// Bound for every REST call. Set per request, not on the shared client:
 /// the SSE stream uses the same client and must live indefinitely.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
@@ -434,6 +455,74 @@ impl Client {
         let resp = self
             .request(reqwest::Method::GET, &format!("/api/shell/{id}/output"))
             .query(&[("cursor", cursor)])
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Error::Status(resp.status()));
+        }
+        Ok(resp.json::<Envelope<ShellOutputPage>>().await?.data)
+    }
+
+    /// Read a shell's output from byte `cursor`, `max_bytes` per page
+    /// (upstream `ShellDisplay.loadBackgroundOutput`). `Drain` keeps paging
+    /// until the size seen in the first answer; when more than `max_bytes` is
+    /// still pending it jumps to `size - max_bytes`, drops what it read before
+    /// the jump and reports the skip. A page that does not move the cursor
+    /// ends the read.
+    pub async fn shell_read(
+        &self,
+        id: &str,
+        cursor: u64,
+        mode: ShellReadMode,
+        max_bytes: usize,
+    ) -> Result<ShellRead> {
+        let mut read = ShellRead {
+            text: String::new(),
+            end: cursor,
+            skipped: false,
+        };
+        // The size the first page reports: output written while draining is
+        // left for the next read, so a shell that writes as fast as it is
+        // read cannot keep the drain going.
+        let mut first_size = None;
+        loop {
+            let page = self.shell_output_page(id, read.end, max_bytes).await?;
+            let target = *first_size.get_or_insert(page.size);
+            read.skipped |= page.truncated;
+            read.text.push_str(&page.output);
+            if page.cursor <= read.end {
+                break;
+            }
+            read.end = page.cursor;
+            if mode == ShellReadMode::Page || read.end >= target {
+                break;
+            }
+            let tail = target.saturating_sub(max_bytes as u64);
+            if tail > read.end {
+                read.end = tail;
+                read.skipped = true;
+                read.text.clear();
+            }
+        }
+        if read.skipped {
+            // The server decodes lossily: a character cut by the cursor shows
+            // up as replacement characters at the very start.
+            let cut = read.text.len() - read.text.trim_start_matches('\u{fffd}').len();
+            read.text.drain(..cut);
+        }
+        Ok(read)
+    }
+
+    /// `GET /api/shell/{id}/output?cursor&limit`.
+    async fn shell_output_page(
+        &self,
+        id: &str,
+        cursor: u64,
+        limit: usize,
+    ) -> Result<ShellOutputPage> {
+        let resp = self
+            .request(reqwest::Method::GET, &format!("/api/shell/{id}/output"))
+            .query(&[("cursor", cursor), ("limit", limit as u64)])
             .send()
             .await?;
         if !resp.status().is_success() {

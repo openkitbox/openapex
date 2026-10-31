@@ -168,7 +168,7 @@ fn status_text(shell: &ShellInfo) -> String {
 /// Printable text: ANSI sequences gone, line ends as `\n`, tabs expanded and
 /// the other control characters dropped (`stripAnsi` + `\r\n?` → `\n`).
 #[must_use]
-fn clean(raw: &str) -> String {
+pub(crate) fn clean(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for ch in paste::normalize(raw).chars() {
         match ch {

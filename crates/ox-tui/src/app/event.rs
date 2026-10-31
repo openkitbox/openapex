@@ -104,12 +104,25 @@ pub enum AppEvent {
         session: String,
         shells: Vec<ox_client::rest::ShellInfo>,
     },
+    /// Answer to `AppCommand::SyncShells`: the ids of the server's running
+    /// shells. Replaces `DataStore`'s running set; a failed list sends nothing.
+    RunningShells {
+        generation: u64,
+        ids: Vec<String>,
+    },
     /// Answer to `AppCommand::ShellOutput`: the shell as the server lists it
     /// now, plus the newest part of its output.
     ShellOutput {
         session: String,
         shell: Box<ox_client::rest::ShellInfo>,
         tail: ox_client::rest::ShellTail,
+    },
+    /// Answer to `AppCommand::ShellPoll`: what was read from `start`, or
+    /// `None` when the request failed (so the next poll may go out).
+    ShellPolled {
+        id: String,
+        start: u64,
+        read: Option<ox_client::rest::ShellRead>,
     },
     /// A session was deleted on the server.
     SessionDeleted(String),

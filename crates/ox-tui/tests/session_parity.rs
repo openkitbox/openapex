@@ -12,6 +12,7 @@ use ox_client::history::parse_messages;
 use ox_client::store::DataStore;
 use ox_schema::message::Message;
 use ox_tui::pipeline::blocks_from_store;
+use ox_tui::shell_captures::ShellCaptures;
 use ox_tui::theme::terminal::{Rgb, TerminalColors};
 use ox_tui::ui::dock::{StatusMode, status_line};
 use ox_tui::ui::layout;
@@ -82,7 +83,7 @@ fn render(width: u16, height: u16) -> Buffer {
     prompt.set_ctx(store.context_tokens().map(ox_tui::ui::dock::format_tokens));
 
     let mut transcript = Transcript::new(width, height);
-    transcript.sync(&blocks_from_store(&store), 0);
+    transcript.sync(&blocks_from_store(&store, &ShellCaptures::default()), 0);
 
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal

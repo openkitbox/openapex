@@ -11,13 +11,14 @@ use crossterm::execute;
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use ox_client::rest::{FamilyMember, ShellInfo, ShellTail};
 use ox_client::sse::StreamMsg;
-use ox_client::store::{DataStore, Item};
+use ox_client::store::{DataStore, Item, ShellRef};
 use ox_schema::support::FileInput;
 use tokio::sync::{mpsc, watch};
 
 use crate::attachment::Loaded;
 use crate::clipboard::Clip;
 use crate::pipeline;
+use crate::shell_captures::ShellCaptures;
 use crate::terminal::TerminalGuard;
 use crate::ui::commands::CommandAction;
 use crate::ui::composer::{SearchAction, SearchBox, Submission};
@@ -133,6 +134,12 @@ pub struct App {
     /// answer may open a dialog only for this; otherwise it may refresh a
     /// dialog that is still open. So a refresh that lands after `esc` is dropped.
     shell_wanted: Option<ShellWanted>,
+    /// Output fetched for expanded shell blocks of the open session.
+    shell_captures: ShellCaptures,
+    /// Number of the last `SyncShells` sent. Kept here, not in the store, so
+    /// it keeps counting across session switches and an answer to a request
+    /// made for an earlier store never matches the current one.
+    shell_syncs: u64,
 }
 
 /// Which shell dialog an in-flight request will open.
@@ -193,6 +200,8 @@ impl App {
             family: Vec::new(),
             subagents_active_only: true,
             shell_wanted: None,
+            shell_captures: ShellCaptures::default(),
+            shell_syncs: 0,
         }
     }
 
@@ -290,11 +299,21 @@ impl App {
             }
             AppEvent::Family { session, members } => self.on_family(&session, members),
             AppEvent::Shells { session, shells } => self.on_shells(&session, &shells),
+            AppEvent::RunningShells { generation, ids } => {
+                if self.store.set_running_shells(generation, ids) {
+                    self.child_state_changed();
+                }
+            }
             AppEvent::ShellOutput {
                 session,
                 shell,
                 tail,
             } => self.on_shell_output(&session, &shell, tail),
+            AppEvent::ShellPolled { id, start, read } => {
+                if self.shell_captures.merge(&id, start, read) {
+                    self.child_state_changed();
+                }
+            }
             AppEvent::SessionDeleted(id) => self.handle_session_deleted(id),
             AppEvent::SessionForked(id) => {
                 self.show_toast(Toast::new(
@@ -535,6 +554,7 @@ impl App {
         self.store = store;
         self.session = Some(id.clone());
         self.transcript = Transcript::new(80, 20);
+        self.shell_captures = ShellCaptures::default();
         // `next_reload_id` keeps counting, so an answer for the old session
         // can never match the new request.
         self.pending_reload = None;
@@ -552,6 +572,7 @@ impl App {
         let _ = self
             .commands
             .send(AppCommand::LoadSessionChrome { session: id });
+        self.request_running_shells();
         self.refresh();
     }
 
@@ -568,6 +589,7 @@ impl App {
             text: prompt,
             files,
         });
+        self.request_running_shells();
         self.refresh();
     }
 
@@ -1089,6 +1111,7 @@ impl App {
                 self.session = None;
                 self.store = DataStore::default();
                 self.transcript = Transcript::new(80, 20);
+                self.shell_captures = ShellCaptures::default();
                 self.pending_reload = None;
                 self.pending_home_prompt = None;
                 self.show_help = false;
@@ -1105,6 +1128,50 @@ impl App {
     fn request_forms(&self) {
         if let Some(session) = self.session.clone() {
             let _ = self.commands.send(AppCommand::ListForms { session });
+        }
+    }
+
+    /// Ask for the output each expanded shell block needs at `now`
+    /// (`ShellCaptures::poll` decides; called once per UI tick).
+    fn poll_shells(&mut self, now: Instant) {
+        for item in &self.store.items {
+            let Item::Assistant(assistant) = item else {
+                continue;
+            };
+            for tool in &assistant.tools {
+                if tool.tool != ShellRef::SHELL_TOOL || !self.transcript.is_tool_expanded(&tool.id)
+                {
+                    continue;
+                }
+                let Some(shell) = tool.shell_view() else {
+                    continue;
+                };
+                // A call whose block shows its tool result needs no capture.
+                if !crate::shell_captures::shows_capture(tool.state, shell.background) {
+                    continue;
+                }
+                let running = self.store.is_shell_running(shell.id);
+                if let Some(poll) = self.shell_captures.poll(shell.id, running, now) {
+                    let _ = self.commands.send(AppCommand::ShellPoll {
+                        id: poll.id,
+                        cursor: poll.cursor,
+                        mode: poll.mode,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Rebuild the running-shell set from `GET /api/shell` (session open and
+    /// reconnect: `shell.*` frames are ephemeral, so missed ones are gone).
+    /// Its answer takes its own path, never the picker's `shell_wanted` one.
+    fn request_running_shells(&mut self) {
+        if self.session.is_some() {
+            self.shell_syncs += 1;
+            self.store.begin_shell_sync(self.shell_syncs);
+            let _ = self.commands.send(AppCommand::SyncShells {
+                generation: self.shell_syncs,
+            });
         }
     }
 
@@ -1323,8 +1390,18 @@ impl App {
                 self.request_reload();
                 // form.* frames missed while down: reconcile with REST.
                 self.request_forms();
+                // shell.* frames missed while down: rebuild the running set.
+                self.request_running_shells();
             }
             StreamMsg::Event(envelope) => {
+                // `shell.*` frames carry no session id: they would fail the
+                // foreign-session filter below, so they are handled first.
+                if envelope.kind.starts_with("shell.") {
+                    if self.store.apply_shell_frame(&envelope.kind, &envelope.data) {
+                        self.child_state_changed();
+                    }
+                    return;
+                }
                 let typed = envelope.parse_typed();
                 // `form.*` frames parse as `Unknown` (no session id); the
                 // store filters them by `form.sessionID` itself.
@@ -1378,7 +1455,7 @@ impl App {
     pub fn refresh(&mut self) {
         self.store_dirty = false;
         let changed_from = self.store.claim_changed_from();
-        let blocks = pipeline::blocks_from_store(&self.store);
+        let blocks = pipeline::blocks_from_store(&self.store, &self.shell_captures);
         self.transcript.sync(&blocks, changed_from);
         self.refresh_context();
         let cost = self.store.total_cost();
@@ -1444,6 +1521,7 @@ impl App {
 
         if self.route == Route::Session {
             self.request_reload();
+            self.request_running_shells();
         }
 
         loop {
@@ -1460,6 +1538,9 @@ impl App {
                     }
                     if self.route == Route::Session && self.transcript.tick(Instant::now()) {
                         self.dirty = true;
+                    }
+                    if self.route == Route::Session {
+                        self.poll_shells(Instant::now());
                     }
                     self.expire_toast(Instant::now());
                     if self.dirty {
@@ -3568,6 +3649,281 @@ mod tests {
             items: Vec::new(),
         });
         assert!(probes(&mut rx).is_empty());
+    }
+
+    // ---- running shells ---------------------------------------------------
+
+    /// `shell.created` exactly as `ox-tools/src/shell/events.rs:frame`
+    /// publishes it: no session id at the top level.
+    fn shell_created_frame(id: &str) -> AppEvent {
+        session_frame(
+            "shell.created",
+            serde_json::json!({"info": {
+                "id": id, "status": "running", "command": "sleep 9", "cwd": "/",
+                "shell": "zsh", "file": "/tmp/o", "pid": 7,
+                "metadata": {"sessionID": "ses_test"}, "time": {"started": 1}
+            }}),
+        )
+    }
+
+    fn shell_syncs(rx: &mut mpsc::UnboundedReceiver<AppCommand>) -> usize {
+        drain(rx)
+            .iter()
+            .filter(|command| matches!(command, AppCommand::SyncShells { .. }))
+            .count()
+    }
+
+    #[test]
+    fn shell_frames_update_the_running_set_and_repaint_only_on_change() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        app.dirty = false;
+        app.handle(shell_created_frame("sh_1"));
+        assert!(app.store.is_shell_running("sh_1"));
+        assert!(app.dirty, "a new running shell repaints");
+
+        app.dirty = false;
+        app.handle(session_frame(
+            "shell.exited",
+            serde_json::json!({"id": "sh_9", "status": "exited", "exit": 0}),
+        ));
+        assert!(!app.dirty, "an unknown shell changes nothing");
+
+        app.handle(session_frame(
+            "shell.exited",
+            serde_json::json!({"id": "sh_1", "status": "exited", "exit": 0}),
+        ));
+        assert!(!app.store.is_shell_running("sh_1"));
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn the_rebuild_answer_replaces_the_set_and_never_opens_a_dialog() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        app.handle(shell_created_frame("sh_old"));
+        // Even with a picker request outstanding, the rebuild is not its answer.
+        app.shell_wanted = Some(super::ShellWanted::Picker);
+        app.request_running_shells();
+        app.handle(AppEvent::RunningShells {
+            generation: app.shell_syncs,
+            ids: vec!["sh_new".into()],
+        });
+        assert!(app.dialog.is_none(), "the rebuild never opens the picker");
+        assert_eq!(app.shell_wanted, Some(super::ShellWanted::Picker));
+        assert!(app.store.is_shell_running("sh_new"));
+        assert!(!app.store.is_shell_running("sh_old"));
+    }
+
+    #[test]
+    fn a_rebuild_answer_from_before_a_session_switch_is_dropped() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        app.request_running_shells();
+        let stale = app.shell_syncs;
+        app.switch_session("ses_other".into());
+        app.handle(AppEvent::RunningShells {
+            generation: stale,
+            ids: vec!["sh_old".into()],
+        });
+        assert!(
+            !app.store.is_shell_running("sh_old"),
+            "only the request made for this store applies"
+        );
+    }
+
+    #[test]
+    fn opening_a_session_and_reconnecting_rebuild_the_running_shells() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        app.handle(AppEvent::Stream(ox_client::sse::StreamMsg::Reconnected));
+        assert_eq!(shell_syncs(&mut rx), 1, "a reconnect re-lists the shells");
+
+        app.switch_session("ses_other".into());
+        assert_eq!(
+            shell_syncs(&mut rx),
+            1,
+            "opening a session lists the shells"
+        );
+
+        let (mut home, mut home_rx) = self::app(Route::Home, None);
+        home.handle(AppEvent::SessionReady {
+            session: "ses_new".into(),
+            prompt: "hi".into(),
+            files: Vec::new(),
+        });
+        assert_eq!(
+            shell_syncs(&mut home_rx),
+            1,
+            "a new session lists the shells"
+        );
+    }
+
+    // ---- shell block output -----------------------------------------------
+
+    /// The focused session ran `npm run dev`, which returned while shell
+    /// `sh_1` kept running; the block is drawn.
+    fn background_shell_call(app: &mut App) {
+        app.handle(session_frame(
+            "session.tool.input.started",
+            serde_json::json!({"sessionID":"ses_test","assistantMessageID":"msg_1",
+                               "id":"part_sh","name":"shell"}),
+        ));
+        app.handle(session_frame(
+            "session.tool.success",
+            serde_json::json!({"sessionID":"ses_test","assistantMessageID":"msg_1",
+                               "id":"part_sh","content":[],"executed":true,
+                               "metadata":{"shellID":"sh_1","status":"running"}}),
+        ));
+        app.handle(shell_created_frame("sh_1"));
+        app.refresh();
+    }
+
+    use ox_client::rest::ShellReadMode;
+
+    fn shell_polls(rx: &mut mpsc::UnboundedReceiver<AppCommand>) -> Vec<(u64, ShellReadMode)> {
+        drain(rx)
+            .into_iter()
+            .filter_map(|command| match command {
+                AppCommand::ShellPoll { id, cursor, mode } if id == "sh_1" => Some((cursor, mode)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn polled(text: &str, start: u64, end: u64) -> AppEvent {
+        AppEvent::ShellPolled {
+            id: "sh_1".into(),
+            start,
+            read: Some(ox_client::rest::ShellRead {
+                text: text.into(),
+                end,
+                skipped: false,
+            }),
+        }
+    }
+
+    fn shell_block_output(app: &App) -> String {
+        let blocks = crate::pipeline::blocks_from_store(&app.store, &app.shell_captures);
+        blocks
+            .iter()
+            .find_map(|block| match block {
+                crate::ui::timeline::Block::Shell { output, .. } => {
+                    Some(output.as_str().to_owned())
+                }
+                _ => None,
+            })
+            .expect("the call projects to a shell block")
+    }
+
+    #[test]
+    fn a_collapsed_shell_block_is_never_polled() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        background_shell_call(&mut app);
+        drain(&mut rx);
+        app.poll_shells(Instant::now());
+        assert!(shell_polls(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn an_expanded_completed_foreground_shell_is_never_polled() {
+        // Its block shows the tool result (`shows_capture`), so a fetch
+        // would only fill a capture nothing draws.
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        app.handle(session_frame(
+            "session.tool.input.started",
+            serde_json::json!({"sessionID":"ses_test","assistantMessageID":"msg_1",
+                               "id":"part_sh","name":"shell"}),
+        ));
+        app.handle(session_frame(
+            "session.tool.success",
+            serde_json::json!({"sessionID":"ses_test","assistantMessageID":"msg_1",
+                               "id":"part_sh","content":[{"type":"text","text":"done"}],
+                               "executed":true,
+                               "metadata":{"shellID":"sh_1","status":"completed"}}),
+        ));
+        app.refresh();
+        assert!(
+            app.transcript.toggle_tool_output(),
+            "o opens the shell block"
+        );
+        drain(&mut rx);
+        app.poll_shells(Instant::now());
+        assert!(shell_polls(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn an_expanded_running_shell_streams_until_it_exits_then_drains_once() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        background_shell_call(&mut app);
+        assert!(
+            app.transcript.toggle_tool_output(),
+            "o opens the shell block"
+        );
+        drain(&mut rx);
+        let t0 = Instant::now();
+        app.poll_shells(t0);
+        assert_eq!(shell_polls(&mut rx), [(0, ShellReadMode::Page)]);
+        app.poll_shells(t0 + Duration::from_millis(500));
+        assert!(shell_polls(&mut rx).is_empty(), "in flight");
+
+        app.dirty = false;
+        app.handle(polled("ready\n", 0, 6));
+        assert!(
+            app.dirty && app.store_dirty && app.store.changed_from == 0,
+            "new bytes re-project every block, not only the changed tail"
+        );
+        assert_eq!(shell_block_output(&app), "ready\n");
+        app.handle(polled("late\n", 0, 11));
+        assert_eq!(
+            shell_block_output(&app),
+            "ready\n",
+            "a late answer is dropped"
+        );
+
+        app.poll_shells(t0 + Duration::from_millis(900));
+        assert!(
+            shell_polls(&mut rx).is_empty(),
+            "throttled to once a second"
+        );
+        app.poll_shells(t0 + Duration::from_secs(1));
+        assert_eq!(shell_polls(&mut rx), [(6, ShellReadMode::Page)]);
+        app.handle(polled("", 6, 6));
+
+        app.handle(session_frame(
+            "shell.exited",
+            serde_json::json!({"id": "sh_1", "status": "exited", "exit": 0}),
+        ));
+        app.poll_shells(t0 + Duration::from_millis(1100));
+        assert_eq!(shell_polls(&mut rx), [(6, ShellReadMode::Drain)]);
+        app.handle(polled("bye\n", 6, 10));
+        app.poll_shells(t0 + Duration::from_secs(9));
+        assert!(shell_polls(&mut rx).is_empty(), "drained once");
+        assert_eq!(shell_block_output(&app), "ready\nbye\n");
+        assert!(app.dialog.is_none(), "poll answers never open a dialog");
+    }
+
+    #[test]
+    fn collapsing_a_shell_block_stops_its_polls() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        background_shell_call(&mut app);
+        assert!(app.transcript.toggle_tool_output());
+        let t0 = Instant::now();
+        app.poll_shells(t0);
+        app.handle(polled("a", 0, 1));
+        assert!(app.transcript.toggle_tool_output(), "o closes it");
+        drain(&mut rx);
+        app.poll_shells(t0 + Duration::from_secs(5));
+        assert!(shell_polls(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn switching_sessions_forgets_the_captures() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        background_shell_call(&mut app);
+        assert!(app.transcript.toggle_tool_output());
+        app.poll_shells(Instant::now());
+        app.handle(polled("a", 0, 1));
+        app.switch_session("ses_other".into());
+        app.dirty = false;
+        app.handle(polled("b", 1, 2));
+        assert!(!app.dirty, "an answer for the old session merges nowhere");
     }
 
     #[test]

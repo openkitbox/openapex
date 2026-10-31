@@ -37,7 +37,11 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
         AppCommand::ListSessions => list_sessions(&client, &tx).await,
         AppCommand::ListFamily { session } => list_family(&client, &tx, session).await,
         AppCommand::ListShells { session } => list_shells(&client, &tx, session).await,
+        AppCommand::SyncShells { generation } => sync_shells(&client, generation, &tx).await,
         AppCommand::ShellOutput { session, id } => shell_output(&client, &tx, session, &id).await,
+        AppCommand::ShellPoll { id, cursor, mode } => {
+            shell_poll(&client, &tx, id, cursor, mode).await
+        }
         AppCommand::KillShell { session, id } => kill_shell(&client, &tx, session, &id).await,
         AppCommand::RenameSession { session, title } => {
             rename_session(&client, &tx, &session, &title).await
@@ -111,6 +115,50 @@ async fn list_shells(client: &Client, tx: &Events, session: String) {
         Err(err) => session_failed("Failed to list shells", err),
     };
     let _ = tx.send(event);
+}
+
+/// The same `GET /api/shell` the picker uses, reduced to the running ids.
+/// A failure is logged only: the `shell.*` frames still drive the set.
+async fn sync_shells(client: &Client, generation: u64, tx: &Events) {
+    match client.shells().await {
+        Ok(shells) => {
+            let running: Vec<String> = shells
+                .into_iter()
+                .filter(|shell| shell.status == "running")
+                .map(|shell| shell.id)
+                .collect();
+            let _ = tx.send(AppEvent::RunningShells {
+                generation,
+                ids: running,
+            });
+        }
+        Err(err) => tracing::warn!(%err, "shell sync failed"),
+    }
+}
+
+/// Read a shell block's output. A failure is logged, not toasted (it repeats
+/// every second while the server is away), and still answered so the block's
+/// in-flight request is released.
+async fn shell_poll(
+    client: &Client,
+    tx: &Events,
+    id: String,
+    cursor: u64,
+    mode: ox_client::rest::ShellReadMode,
+) {
+    let limit = crate::shell_captures::DISPLAY_LIMIT;
+    let read = match client.shell_read(&id, cursor, mode, limit).await {
+        Ok(read) => Some(read),
+        Err(err) => {
+            tracing::warn!(%err, shell = id, "shell output poll failed");
+            None
+        }
+    };
+    let _ = tx.send(AppEvent::ShellPolled {
+        id,
+        start: cursor,
+        read,
+    });
 }
 
 /// Newest output kept for the viewer (upstream `PAGE_BYTES`).
@@ -446,6 +494,30 @@ mod tests {
         )
         .await;
         assert!(rx.try_recv().is_err(), "a failed probe says nothing");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_server_yields_no_shell_sync() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run(offline(), tx, AppCommand::SyncShells { generation: 1 }).await;
+        assert!(rx.try_recv().is_err(), "a failed sync says nothing");
+    }
+
+    #[tokio::test]
+    async fn a_failed_shell_poll_releases_the_request_without_a_toast() {
+        let event = first_event(AppCommand::ShellPoll {
+            id: "sh_1".into(),
+            cursor: 4,
+            mode: ox_client::rest::ShellReadMode::Page,
+        })
+        .await;
+        assert!(
+            matches!(
+                &event,
+                AppEvent::ShellPolled { id, start: 4, read: None } if id == "sh_1"
+            ),
+            "{event:?}"
+        );
     }
 
     #[tokio::test]

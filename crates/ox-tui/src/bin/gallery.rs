@@ -132,6 +132,89 @@ fn cases() -> Vec<Case> {
             4,
             assistant("", "正在权衡两种布局方案", false),
         ),
+        // shell 块（上游 BlockTool + Shell）
+        transcript_case(
+            "shell-writing",
+            5,
+            vec![shell(
+                ToolState::Input,
+                serde_json::json!({}),
+                "",
+                Live::default(),
+            )],
+        ),
+        transcript_case(
+            "shell-running",
+            7,
+            vec![shell(
+                ToolState::Running,
+                serde_json::json!({"command": "cargo test -p ox-tui"}),
+                "Compiling ox-tui v0.1.0",
+                Live::default(),
+            )],
+        ),
+        transcript_case(
+            "shell-done-workdir",
+            8,
+            vec![shell(
+                ToolState::Success,
+                serde_json::json!({"command": "ls", "workdir": "/var/log"}),
+                "\u{1b}[34msystem.log\u{1b}[0m\ninstall.log",
+                Live::default(),
+            )],
+        ),
+        transcript_case(
+            "shell-collapsed-long",
+            13,
+            vec![shell(
+                ToolState::Success,
+                serde_json::json!({"command": "seq 30"}),
+                &long_output(),
+                Live::default(),
+            )],
+        ),
+        Case {
+            name: "shell-expanded",
+            height: 36,
+            draw: Box::new(|frame, area| {
+                let mut t = Transcript::new(area.width, area.height);
+                t.sync(
+                    &[shell(
+                        ToolState::Success,
+                        serde_json::json!({"command": "seq 30"}),
+                        &long_output(),
+                        Live::default(),
+                    )],
+                    0,
+                );
+                t.toggle_tool_output();
+                t.render(frame, area);
+            }),
+        },
+        transcript_case(
+            "shell-failed",
+            7,
+            vec![shell(
+                ToolState::Failed,
+                serde_json::json!({"command": "cargo build"}),
+                "error[E0599]: no variant named `Shell`",
+                Live::default(),
+            )],
+        ),
+        transcript_case(
+            "shell-background",
+            7,
+            vec![shell(
+                ToolState::Success,
+                serde_json::json!({"command": "npm run dev"}),
+                "VITE ready in 312 ms",
+                Live {
+                    shell: true,
+                    background: true,
+                    running: true,
+                },
+            )],
+        ),
         // 工具行四态
         transcript_case(
             "tool-input",
@@ -780,6 +863,35 @@ fn assistant(text: &str, reasoning: &str, done: bool) -> Vec<Block> {
         }),
     });
     blocks
+}
+
+/// The store-derived flags of a shell block.
+#[derive(Default)]
+struct Live {
+    shell: bool,
+    background: bool,
+    running: bool,
+}
+
+fn shell(state: ToolState, input: serde_json::Value, output: &str, live: Live) -> Block {
+    let serde_json::Value::Object(map) = input else {
+        panic!("gallery shell input must be a JSON object, got {input}");
+    };
+    Block::Shell {
+        id: "part_sh".into(),
+        version: 1,
+        state,
+        input: Arc::new(map.into_iter().collect()),
+        output: Arc::new(output.to_owned()),
+        omitted: false,
+        shell: live.shell,
+        background: live.background,
+        shell_running: live.running,
+    }
+}
+
+fn long_output() -> String {
+    (1..=30).map(|n| format!("line {n}\n")).collect()
 }
 
 fn tool(tool: &str, summary: &str, state: ToolState, output: &str) -> Block {

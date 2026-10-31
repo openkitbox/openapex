@@ -1,6 +1,7 @@
 mod support;
 
 use ox_client::Client;
+use ox_client::rest::ShellReadMode;
 use support::MockOx;
 
 #[tokio::test]
@@ -616,4 +617,144 @@ async fn shell_tail_reports_omitted_when_the_server_dropped_the_head() {
 
     let tail = client.shell_tail("shl_1", 64 * 1024).await.unwrap();
     assert!(tail.omitted, "a capture that lost its head is partial");
+}
+
+fn shell_page_truncated(output: &str, cursor: u64, size: u64) -> String {
+    format!(
+        r#"{{"data":{{"output":{},"cursor":{cursor},"size":{size},"truncated":true}}}}"#,
+        serde_json::to_string(output).expect("json string")
+    )
+}
+
+#[tokio::test]
+async fn shell_read_page_mode_reads_one_limited_page_from_the_cursor() {
+    let mock = MockOx::default();
+    mock.reply("/api/shell/shl_1/output", &shell_page("more", 7, 20));
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    let read = client
+        .shell_read("shl_1", 3, ShellReadMode::Page, 1024)
+        .await
+        .unwrap();
+    assert_eq!(read.text, "more");
+    assert_eq!(read.end, 7);
+    assert!(!read.skipped);
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 1, "a poll reads one page: {requests:?}");
+    assert!(requests[0].contains("cursor=3"), "{requests:?}");
+    assert!(requests[0].contains("limit=1024"), "{requests:?}");
+}
+
+#[tokio::test]
+async fn shell_read_drain_pages_up_to_the_size() {
+    let mock = MockOx::default();
+    mock.reply("/api/shell/shl_1/output?cursor=0&", &shell_page("ab", 2, 4));
+    mock.reply("/api/shell/shl_1/output?cursor=2&", &shell_page("cd", 4, 4));
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    let read = client
+        .shell_read("shl_1", 0, ShellReadMode::Drain, 4)
+        .await
+        .unwrap();
+    assert_eq!(read.text, "abcd");
+    assert_eq!(read.end, 4);
+    assert!(!read.skipped);
+    assert_eq!(mock.request_count(), 2, "{:?}", mock.requests());
+}
+
+#[tokio::test]
+async fn shell_read_drain_stops_at_the_size_seen_first_while_the_shell_keeps_writing() {
+    let mock = MockOx::default();
+    // Every page reports two more bytes than it returns: a shell writing as
+    // fast as it is read. The drain targets the first size (4) and stops.
+    for cursor in (0..100u64).step_by(2) {
+        mock.reply(
+            format!("/api/shell/shl_1/output?cursor={cursor}&"),
+            &shell_page("xx", cursor + 2, cursor + 4),
+        );
+    }
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    let read = client
+        .shell_read("shl_1", 0, ShellReadMode::Drain, 2)
+        .await
+        .unwrap();
+    assert_eq!(read.end, 4, "drained to the first size seen");
+    assert_eq!(read.text, "xxxx");
+    assert_eq!(mock.request_count(), 2, "{:?}", mock.requests());
+}
+
+#[tokio::test]
+async fn shell_read_drain_jumps_to_the_newest_max_bytes() {
+    let mock = MockOx::default();
+    // 10 bytes exist and the cap is 4: after the first page the read jumps
+    // to `size - 4` and keeps only what it read from there.
+    mock.reply(
+        "/api/shell/shl_1/output?cursor=0&",
+        &shell_page("0123", 4, 10),
+    );
+    mock.reply(
+        "/api/shell/shl_1/output?cursor=6&",
+        &shell_page("6789", 10, 10),
+    );
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    let read = client
+        .shell_read("shl_1", 0, ShellReadMode::Drain, 4)
+        .await
+        .unwrap();
+    assert_eq!(read.text, "6789");
+    assert_eq!(read.end, 10);
+    assert!(read.skipped, "bytes 4..6 were never read");
+}
+
+#[tokio::test]
+async fn shell_read_reports_a_skip_when_the_server_dropped_the_cursor() {
+    let mock = MockOx::default();
+    mock.reply(
+        "/api/shell/shl_1/output",
+        &shell_page_truncated("late", 12, 12),
+    );
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    let read = client
+        .shell_read("shl_1", 2, ShellReadMode::Page, 1024)
+        .await
+        .unwrap();
+    assert_eq!(read.text, "late");
+    assert!(read.skipped, "the server no longer holds bytes from 2");
+}
+
+#[tokio::test]
+async fn shell_read_stops_when_the_cursor_does_not_move() {
+    let mock = MockOx::default();
+    mock.reply("/api/shell/shl_1/output", &shell_page("", 5, 9));
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    let read = client
+        .shell_read("shl_1", 5, ShellReadMode::Drain, 1024)
+        .await
+        .unwrap();
+    assert_eq!(read.text, "");
+    assert_eq!(read.end, 5);
+    assert_eq!(mock.request_count(), 1, "{:?}", mock.requests());
+}
+
+#[tokio::test]
+async fn shell_read_of_a_missing_shell_is_a_status_error() {
+    let mock = MockOx::default();
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    let err = client
+        .shell_read("shl_gone", 0, ShellReadMode::Page, 4)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ox_client::Error::Status(status) if status.as_u16() == 404));
 }

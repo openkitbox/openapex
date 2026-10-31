@@ -43,9 +43,10 @@
 
 use std::sync::Arc;
 
-use ox_client::store::{AssistantItem, DataStore, Item, ToolPart};
+use ox_client::store::{AssistantItem, DataStore, Item, ShellRef, ToolPart};
 use ox_schema::support::FinishReason;
 
+use crate::shell_captures::ShellCaptures;
 use crate::ui::timeline::{Block, Explored, ExploredCall, ExploredCount, TurnFooter};
 
 /// Projection of the store's ordered items into display blocks. Ordering is
@@ -53,8 +54,10 @@ use crate::ui::timeline::{Block, Explored, ExploredCall, ExploredCount, TurnFoot
 /// costs a pointer clone. One assistant item becomes up to four kinds of
 /// block: its reasoning header, its answer text (with the turn footer once the
 /// turn has finished), and its tool calls, where consecutive read/search/fetch
-/// calls fold into one `Explored` row (upstream `group-view.tsx`).
-pub fn blocks_from_store(store: &DataStore) -> Vec<Block> {
+/// calls fold into one `Explored` row (upstream `group-view.tsx`). A shell
+/// call shows its tool result or its shell's fetched output in `captures`.
+#[must_use]
+pub fn blocks_from_store(store: &DataStore, captures: &ShellCaptures) -> Vec<Block> {
     let mut blocks = Vec::new();
     // First item of the turn currently being projected (the user prompt).
     let mut turn_start = 0;
@@ -88,7 +91,7 @@ pub fn blocks_from_store(store: &DataStore) -> Vec<Block> {
                 });
                 // Tool rows follow the message text: the wire gives tool
                 // parts no ordinal, so the interleaving is not recoverable.
-                push_tools(&mut blocks, &assistant.tools, store);
+                push_tools(&mut blocks, &assistant.tools, store, captures);
             }
             Item::Compaction(compaction) => blocks.push(Block::Compaction {
                 id: compaction.id.clone(),
@@ -130,7 +133,12 @@ fn explored_noun(tool: &str) -> Option<&'static str> {
     }
 }
 
-fn push_tools(blocks: &mut Vec<Block>, tools: &[ToolPart], store: &DataStore) {
+fn push_tools(
+    blocks: &mut Vec<Block>,
+    tools: &[ToolPart],
+    store: &DataStore,
+    captures: &ShellCaptures,
+) {
     let mut group: Option<Explored> = None;
     for tool in tools {
         if let Some(noun) = explored_noun(&tool.tool) {
@@ -158,6 +166,24 @@ fn push_tools(blocks: &mut Vec<Block>, tools: &[ToolPart], store: &DataStore) {
         }
         if let Some(explored) = group.take() {
             blocks.push(Block::Explored(explored));
+        }
+        if tool.tool == ShellRef::SHELL_TOOL {
+            let bound = tool.shell();
+            let shown = captures.shown(tool, bound.as_ref());
+            blocks.push(Block::Shell {
+                id: tool.id.clone(),
+                version: tool.version,
+                state: tool.state,
+                input: Arc::clone(&tool.input),
+                output: shown.text,
+                omitted: shown.omitted,
+                shell: bound.is_some(),
+                background: bound.as_ref().is_some_and(|shell| shell.background),
+                shell_running: bound
+                    .as_ref()
+                    .is_some_and(|shell| store.is_shell_running(&shell.id)),
+            });
+            continue;
         }
         if tool.tool == "todowrite" {
             blocks.push(Block::Todo {
@@ -248,8 +274,13 @@ mod tests {
 
     use ox_client::store::{AssistantItem, DataStore, Item, ToolPart, ToolState};
 
-    use super::blocks_from_store;
+    use crate::shell_captures::ShellCaptures;
     use crate::ui::timeline::{Block, ExploredCount};
+
+    /// The projection with nothing fetched for any shell.
+    fn blocks_from_store(store: &DataStore) -> Vec<Block> {
+        super::blocks_from_store(store, &ShellCaptures::default())
+    }
 
     fn store_with_subagent(child: Option<&str>) -> DataStore {
         let mut store = DataStore::default();
@@ -328,10 +359,105 @@ mod tests {
         let blocks = blocks_from_store(&store);
         assert_eq!(blocks.len(), 3, "text, the shell row, one Explored row");
         assert!(
-            matches!(&blocks[1], Block::Tool { id, version, .. } if id == "p1" && *version == 3)
+            matches!(&blocks[1], Block::Shell { id, version, .. } if id == "p1" && *version == 3)
         );
         assert!(
             matches!(&blocks[2], Block::Explored(e) if e.counts == [ExploredCount { noun: "read", count: 1 }] && !e.running)
+        );
+    }
+
+    fn shell_part(metadata: serde_json::Value) -> ToolPart {
+        let serde_json::Value::Object(map) = metadata else {
+            panic!("metadata must be an object, got {metadata}");
+        };
+        ToolPart {
+            id: "sh".into(),
+            tool: "shell".into(),
+            state: ToolState::Success,
+            output: Arc::new("ok".into()),
+            input: Arc::new(
+                [("command".to_owned(), serde_json::json!("npm run dev"))]
+                    .into_iter()
+                    .collect(),
+            ),
+            metadata: Some(Arc::new(map.into_iter().collect())),
+            version: 2,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_shell_call_projects_to_a_shell_block_sharing_its_input_and_output() {
+        let tool = shell_part(serde_json::json!({"shellID": "sh_1", "status": "running"}));
+        let mut store = store_with_tools(vec![tool]);
+        let project = |store: &DataStore| match blocks_from_store(store).swap_remove(1) {
+            Block::Shell {
+                shell,
+                background,
+                shell_running,
+                input,
+                output,
+                ..
+            } => (shell, background, shell_running, input, output),
+            other => panic!("expected a shell block, got {other:?}"),
+        };
+        let (shell, background, running, input, output) = project(&store);
+        assert!(
+            shell && background && !running,
+            "bound, returned early, not live"
+        );
+        let Item::Assistant(assistant) = &store.items[0] else {
+            panic!("assistant item");
+        };
+        assert!(
+            Arc::ptr_eq(&input, &assistant.tools[0].input),
+            "input shared"
+        );
+        assert!(
+            output.is_empty(),
+            "a background call shows nothing before its shell's output is fetched"
+        );
+        store.begin_shell_sync(1);
+        store.set_running_shells(1, vec!["sh_1".to_owned()]);
+        assert!(project(&store).2, "the store's live set marks it running");
+    }
+
+    #[test]
+    fn a_background_shell_block_shows_its_fetched_output() {
+        let tool = shell_part(serde_json::json!({"shellID": "sh_1", "status": "running"}));
+        let store = store_with_tools(vec![tool]);
+        let mut captures = ShellCaptures::default();
+        let now = std::time::Instant::now();
+        let poll = captures.poll("sh_1", true, now).expect("first poll");
+        assert!(captures.merge(
+            "sh_1",
+            poll.cursor,
+            Some(ox_client::rest::ShellRead {
+                text: "listening".into(),
+                end: 9,
+                skipped: true,
+            })
+        ));
+        let project = |captures: &ShellCaptures| super::blocks_from_store(&store, captures);
+        let first = project(&captures);
+        match &first[1] {
+            Block::Shell {
+                output, omitted, ..
+            } => {
+                assert_eq!(output.as_str(), "listening");
+                assert!(*omitted, "the skipped head is flagged");
+            }
+            other => panic!("expected a shell block, got {other:?}"),
+        }
+        assert_eq!(
+            first[1],
+            project(&captures)[1],
+            "unchanged capture, equal block"
+        );
+        assert_ne!(
+            first[1],
+            blocks_from_store(&store)[1],
+            "a different source rebuilds the block"
         );
     }
 
@@ -546,7 +672,7 @@ mod tests {
             &blocks[1],
             Block::Todo { id, version: 4, todos, .. } if id == "t1" && todos.len() == 1
         ));
-        assert!(matches!(&blocks[2], Block::Tool { tool, .. } if tool == "shell"));
+        assert!(matches!(&blocks[2], Block::Shell { .. }));
         assert!(matches!(
             &blocks[3],
             Block::Compaction { id, version: 2, status: CompactionStatus::Completed, .. }

@@ -6,18 +6,22 @@
 
 | kind | id | 上游 | ox | 状态 | 备注 |
 |---|---|---|---|---|---|
+| behavior | block-tool | routes/session/index.tsx:2883 | crates/ox-tui/src/ui/block_tool.rs:68 | partial | ┃ 轨、上下空行、内容缩进 2 列、整块同色带,与用户消息共用 frame。偏差:hover 用 palette.panel;16 色/无色主题轨为空格;未移植 path 标题截断、headerColor/errorColor、权限色;无动画时不显示 ⋯ |
+| behavior | completion-notice | routes/session/index.tsx:2090 | crates/ox-tui/src/pipeline.rs:58 | partial | `↳ Shell/Subagent finished · ...` 历史与实时两路都做了,子代理行可点击跳转。偏差:标题固定为 Subagent(ox 元数据无 agent 名);hover 只提亮标题 |
 | behavior | explored-expand | routes/session/group-view.tsx:152 | crates/ox-tui/src/ui/timeline.rs:432 | aligned | 点击标题行展开/折叠,状态按 group id 保存 |
+| behavior | explored-group | routes/session/group-view.tsx:115 | crates/ox-tui/src/pipeline.rs:1 | partial | 运行中 spinner `Exploring:`、按首次出现计数、展开子项用专用文案。偏差:无 completePrevious/partitionPending;子项不可点击 |
+| behavior | family-busy | context/session-tabs.tsx:170 | crates/ox-client/src/store.rs:365 | aligned | 自身回合或任一子会话在跑都算忙;Esc/Ctrl+C 仍只作用于当前会话 |
 | behavior | hover-highlight | routes/session/group-view.tsx:150 | crates/ox-tui/src/ui/timeline.rs:475 | partial | Explored/Thought/用户消息已做;Ansi16 与无色主题下用户块悬停背景不可见;Tokens、Instructions 行未核对 |
+| behavior | inline-tool-row | routes/session/index.tsx:2789 | crates/ox-tui/src/ui/tool_row.rs:48 | partial | spinner/pending 文案/完成 muted/失败 error 色+点击展开错误已做;失败行无 hover;denied 删除线未移植;通用行未按宽度截断 |
 | behavior | mouse-select-copy | util/selection.ts:34 | crates/ox-tui/src/ui/selection.rs:167 | deviation | 拖选/双击/三击/自动复制/toast 已做。偏差:软换行处复制带 \\n;仅转录区可选;拖出边缘不自动滚动;无右键复制;双击三击按显示行而非源行 |
 | behavior | paste-attachment | component/prompt/local-attachment.ts:1 | crates/ox-tui/src/attachment.rs:37 | deviation | 图片/PDF 路径与 file:// 成为附件,上限 32 个 / 20MB;附件不写入历史,提交失败不恢复文本 |
 | behavior | paste-fold | component/prompt/index.tsx:1447 | crates/ox-tui/src/ui/paste.rs:88 | deviation | 3 行以上或超 150 字符折叠为 [Pasted ~N lines];占位符是普通文本(tui-textarea 无 extmark),无点击展开 |
-| behavior | completion-notice | routes/session/index.tsx:2090 | crates/ox-tui/src/pipeline.rs:58 | partial | `↳ Shell/Subagent finished · ...` 历史与实时两路都做了,子代理行可点击跳转。偏差:标题固定为 Subagent(ox 元数据无 agent 名);hover 只提亮标题 |
-| behavior | family-busy | context/session-tabs.tsx:170 | crates/ox-client/src/store.rs:365 | aligned | 自身回合或任一子会话在跑都算忙;Esc/Ctrl+C 仍只作用于当前会话 |
-| behavior | subagent-background-badge | routes/session/index.tsx:3289 | crates/ox-tui/src/ui/timeline.rs:1626 | aligned | 子会话运行时子代理工具行显示转圈和 Background |
-| behavior | inline-tool-row | routes/session/index.tsx:2789 | crates/ox-tui/src/ui/tool_row.rs:48 | partial | spinner/pending 文案/完成 muted/失败 error 色+点击展开错误已做;失败行无 hover;denied 删除线未移植;通用行未按宽度截断 |
-| behavior | tool-inline-texts | routes/session/index.tsx:3143 | crates/ox-tui/src/ui/tool_text.rs:93 | deviation | Read/Glob/Grep/WebFetch/Skill/Subagent/Question/Generic 文案已移植。偏差:Generic 键序按字母;子代理模型显示原始 provider/model,无 agent 名时为 General;展开体限 TOOL_OUTPUT_MAX_LINES |
-| behavior | explored-group | routes/session/group-view.tsx:115 | crates/ox-tui/src/pipeline.rs:1 | partial | 运行中 spinner `Exploring:`、按首次出现计数、展开子项用专用文案。偏差:无 completePrevious/partitionPending;子项不可点击 |
 | behavior | session-rows | routes/session/index.tsx:2022 | crates/ox-tui/src/ui/timeline.rs:1604 | partial | Error 挂在消息下;Retry 倒计时;agent/model/location 切换行;Instructions updated;Skill;Compaction queued;压缩 spinner。偏差见 store.rs/pipeline.rs 模块文档 |
+| behavior | shell-background-output | routes/session/index.tsx:3015 | crates/ox-tui/src/shell_captures.rs:114 | partial | 展开时每秒拉取一页、在飞不重发,退出后 drain 一次,超 1 MiB 保留尾部并显示 [earlier output omitted]。偏差:复用 33ms UI tick 节流;折叠块不轮询;按原始字节计限,绘制时去 ANSI;失败不立即重试;后台调用无输出前不显示结果文本;失败调用只显示错误 |
+| behavior | shell-block | routes/session/index.tsx:2969 | crates/ox-tui/src/ui/shell_block.rs:173 | partial | BlockTool 框、`$ [cd wd && ]cmd`、运行 spinner、Writing command…、折叠 10 行带 (N earlier lines)、点击/o 展开、Background 徽标、失败 error 已做(接线 ui/timeline.rs:1467)。偏差:前台完成调用显示工具结果;Background 仅在 shell 仍存活时显示;无部分输入解析;hover 用 palette.panel;无权限色;[ ] 焦点画 hover 带;spinner 只改缓存行的 spinner span |
+| behavior | shell-message | routes/session/index.tsx:2322 |  | n/a | ox 服务端从不产生 Message::Shell(仅 schema 有),TUI 也没有 ! 输入模式,故不渲染 |
+| behavior | subagent-background-badge | routes/session/index.tsx:3289 | crates/ox-tui/src/ui/timeline.rs:1626 | aligned | 子会话运行时子代理工具行显示转圈和 Background |
+| behavior | tool-inline-texts | routes/session/index.tsx:3143 | crates/ox-tui/src/ui/tool_text.rs:93 | deviation | Read/Glob/Grep/WebFetch/Skill/Subagent/Question/Generic 文案已移植。偏差:Generic 键序按字母;子代理模型显示原始 provider/model,无 agent 名时为 General;展开体限 TOOL_OUTPUT_MAX_LINES |
 | dialog | dialog-agent | component/dialog-agent.tsx:1 |  | todo |  |
 | dialog | dialog-alert | ui/dialog-alert.tsx:1 |  | todo |  |
 | dialog | dialog-config | component/dialog-config.tsx:1 |  | todo |  |
@@ -567,7 +571,7 @@
 | tool_renderer | patch | routes/session/message-parts.tsx:32 |  | todo |  |
 | tool_renderer | question | routes/session/message-parts.tsx:34 |  | todo |  |
 | tool_renderer | read | routes/session/message-parts.tsx:24 |  | todo |  |
-| tool_renderer | shell | routes/session/message-parts.tsx:22 |  | todo |  |
+| tool_renderer | shell | routes/session/message-parts.tsx:22 | crates/ox-tui/src/ui/shell_block.rs:173 | partial | 见 behavior shell-block |
 | tool_renderer | skill | routes/session/message-parts.tsx:35 |  | todo |  |
 | tool_renderer | subagent | routes/session/message-parts.tsx:30 |  | todo |  |
 | tool_renderer | todowrite | routes/session/message-parts.tsx:33 |  | todo |  |

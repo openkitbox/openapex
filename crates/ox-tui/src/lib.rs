@@ -6,6 +6,7 @@ pub mod executor;
 pub mod lifecycle;
 pub mod pipeline;
 pub mod run;
+pub mod shell_captures;
 pub mod terminal;
 pub mod theme;
 pub mod ui;

@@ -16,6 +16,7 @@ use ox_schema::support::{Record, TokenUsage};
 
 use crate::theme;
 
+use super::block_tool;
 use super::selection::{self, Behavior, ClickTracker, Outcome, Pos, Selection};
 use super::tool_row::{self, InlineSpec, RowView};
 use super::tool_text::{self, ToolText};
@@ -153,6 +154,31 @@ pub enum Block {
         /// The result metadata, shared with the `ToolPart`.
         metadata: Option<std::sync::Arc<Record>>,
     },
+    /// A `shell` call, drawn as a block (`super::shell_block`, upstream
+    /// `Shell`). `input`/`output` are shared with the `ToolPart`.
+    Shell {
+        id: String,
+        /// `ToolPart::version` — equality is `(id, version)` plus the two
+        /// store-derived flags below.
+        version: u64,
+        state: ToolState,
+        /// The parsed call input (`command`, `workdir`).
+        input: std::sync::Arc<Record>,
+        /// The text shown: the tool result (output or failure message), or
+        /// the bound shell's fetched output (`crate::shell_captures`).
+        /// Equality compares the pointer: a new capture is a new `Arc`.
+        output: std::sync::Arc<String>,
+        /// `output` lacks the shell's earliest bytes.
+        omitted: bool,
+        /// The result names a `shellID` (upstream `Boolean(shellID)`).
+        shell: bool,
+        /// The call returned while its shell kept running
+        /// (`metadata.status == "running"`).
+        background: bool,
+        /// The bound shell is alive (`DataStore::is_shell_running`). Not part
+        /// of the part, so equality compares it.
+        shell_running: bool,
+    },
     /// A `todowrite` call: the `# Todos` panel once it completed with a
     /// non-empty list, an inline row otherwise (upstream `TodoWrite`).
     Todo {
@@ -269,6 +295,33 @@ impl PartialEq for Block {
                 },
             ) => aid == bid && aversion == bversion && abackground == bbackground,
             (
+                Block::Shell {
+                    id: aid,
+                    version: aversion,
+                    output: aoutput,
+                    omitted: aomitted,
+                    background: abackground,
+                    shell_running: arunning,
+                    ..
+                },
+                Block::Shell {
+                    id: bid,
+                    version: bversion,
+                    output: boutput,
+                    omitted: bomitted,
+                    background: bbackground,
+                    shell_running: brunning,
+                    ..
+                },
+            ) => {
+                aid == bid
+                    && aversion == bversion
+                    && std::sync::Arc::ptr_eq(aoutput, boutput)
+                    && aomitted == bomitted
+                    && abackground == bbackground
+                    && arunning == brunning
+            }
+            (
                 Block::Todo {
                     id: aid,
                     version: aversion,
@@ -332,26 +385,65 @@ struct Entry {
     lines: Vec<Line<'static>>,
     width: u16,
     view: ViewState,
+    /// A click or `o` toggles the block (see `entry_expandable`). Computed
+    /// with `lines`, because a shell block's answer depends on the width its
+    /// collapse ran at; pointer moves read it instead of re-rendering.
+    expandable: bool,
+    /// The row of `lines` holding a shell block's spinner lead (see
+    /// `shell_block::Rendered::spinner_row`), rendered with `lines`.
+    spinner_row: Option<usize>,
 }
 
 impl Entry {
     fn new(block: Block, generation: u64, width: u16, view: ViewState) -> Self {
-        let lines = render_block(&block, width, view);
+        let (lines, expandable, spinner_row) = render_entry(&block, width, view);
         Self {
             block,
             generation,
             lines,
             width,
             view,
+            expandable,
+            spinner_row,
         }
     }
 
     fn lines_for(&mut self, width: u16) -> &[Line<'static>] {
         if self.width != width {
-            self.lines = render_block(&self.block, width, self.view);
+            (self.lines, self.expandable, self.spinner_row) =
+                render_entry(&self.block, width, self.view);
             self.width = width;
         }
         &self.lines
+    }
+
+    /// Move a shell block to spinner frame `view.spin` by rewriting its one
+    /// spinner span, when that is the only change: the expanded output of a
+    /// running shell (up to the capture cap) is not cleaned and re-wrapped
+    /// 12 times a second. The rows stay exactly what `render_entry` would
+    /// draw, since the glyph is the only thing the frame index selects.
+    fn respin(&mut self, view: ViewState) -> bool {
+        let Some(row) = self.spinner_row else {
+            return false;
+        };
+        let unchanged = ViewState {
+            spin: view.spin,
+            ..self.view
+        };
+        if unchanged != view {
+            return false;
+        }
+        let Some(span) = self
+            .lines
+            .get_mut(row)
+            .and_then(|line| line.spans.get_mut(super::shell_block::SPINNER_SPAN))
+        else {
+            return false;
+        };
+        let glyph = SPINNER_FRAMES[view.spin % SPINNER_FRAMES.len()];
+        span.content = super::shell_block::spinner_lead(glyph).into();
+        self.view = view;
+        true
     }
 }
 
@@ -479,10 +571,18 @@ impl Transcript {
     /// generic tool row it lists or hides the input and output (upstream
     /// `GenericTool` `onClick`). Returns whether anything changed.
     pub fn click(&mut self, x: u16, y: u16) -> bool {
-        // Row 0 is the block's blank margin; row 1 is the header.
-        let Some((index, 1)) = self.locate(x, y) else {
+        let Some((index, row)) = self.locate(x, y) else {
             return false;
         };
+        // Row 0 is the block's blank margin. A shell block is one click
+        // target (upstream `BlockTool` `onMouseUp`); everything else answers
+        // on its header row only.
+        if let Block::Shell { .. } = &self.entries[index].block {
+            return row > 0 && self.toggle_shell(index);
+        }
+        if row != 1 {
+            return false;
+        }
         match &self.entries[index].block {
             Block::Reasoning { .. } => self.toggle_reasoning_at(index),
             Block::Explored(explored) => {
@@ -511,8 +611,25 @@ impl Transcript {
             | Block::Error(_)
             | Block::CompactionQueued
             | Block::Compaction { .. }
-            | Block::Completion { .. } => return false,
+            | Block::Completion { .. }
+            | Block::Shell { .. } => return false,
         }
+        true
+    }
+
+    /// Open or close an expandable shell block's full command and output.
+    fn toggle_shell(&mut self, index: usize) -> bool {
+        let entry = &self.entries[index];
+        let Block::Shell { id, .. } = &entry.block else {
+            return false;
+        };
+        if !entry.expandable {
+            return false;
+        }
+        if !self.tool_expanded.remove(id) {
+            self.tool_expanded.insert(id.clone());
+        }
+        self.rebuild(index);
         true
     }
 
@@ -540,6 +657,7 @@ impl Transcript {
             Block::Explored(_) | Block::Reasoning { .. } => (row == 1).then_some(index),
             Block::User { .. } => Some(index),
             Block::Completion { child_id, .. } => (row == 1 && child_id.is_some()).then_some(index),
+            Block::Shell { .. } => (row > 0 && self.entries[index].expandable).then_some(index),
             Block::Assistant { .. }
             | Block::Switch(_)
             | Block::Notice(_)
@@ -760,7 +878,7 @@ impl Transcript {
         self.entries
             .iter()
             .enumerate()
-            .filter(|(_, entry)| tool_expandable(&entry.block))
+            .filter(|(_, entry)| entry_expandable(entry))
             .map(|(index, _)| index)
             .collect()
     }
@@ -791,6 +909,12 @@ impl Transcript {
         self.rebuild(index);
         self.reveal(index);
         true
+    }
+
+    /// Whether tool part `id`'s output is expanded.
+    #[must_use]
+    pub fn is_tool_expanded(&self, id: &str) -> bool {
+        self.tool_expanded.contains(id)
     }
 
     /// Expand/collapse the focused tool row's output. With nothing focused it
@@ -836,6 +960,13 @@ impl Transcript {
                 spin: if spins(block) { self.spin_frame } else { 0 },
                 ..Default::default()
             },
+            Block::Shell { id, .. } => ViewState {
+                tool_expanded: self.tool_expanded.contains(id),
+                tool_focused: self.focused_tool.as_deref() == Some(id.as_str()),
+                hovered,
+                spin: if spins(block) { self.spin_frame } else { 0 },
+                ..Default::default()
+            },
             Block::Todo { id, output, .. } => ViewState {
                 tool_expanded: !output.is_empty() && self.tool_expanded.contains(id),
                 tool_focused: self.focused_tool.as_deref() == Some(id.as_str()),
@@ -874,9 +1005,13 @@ impl Transcript {
     }
 
     fn rebuild(&mut self, index: usize) {
-        let block = self.entries[index].block.clone();
-        let view = self.view_of(index, &block);
+        let view = self.view_of(index, &self.entries[index].block);
         let generation = self.entries[index].generation + 1;
+        if self.entries[index].respin(view) {
+            self.entries[index].generation = generation;
+            return;
+        }
+        let block = self.entries[index].block.clone();
         let rows = self.entries[index].lines.len();
         self.entries[index] = Entry::new(block, generation, self.width, view);
         if let Some(sel) = self.selection
@@ -1220,7 +1355,8 @@ impl Transcript {
 /// block, and the inner padding above and below a user message.
 fn text_rows(block: &Block) -> (usize, usize) {
     match block {
-        Block::User { .. } => (2, 1),
+        // Margin and top padding above, bottom padding below.
+        Block::User { .. } | Block::Shell { .. } => (2, 1),
         Block::Reasoning { .. }
         | Block::Assistant { .. }
         | Block::Switch(_)
@@ -1301,9 +1437,54 @@ fn line_text(line: &Line<'_>) -> String {
 /// Every block is one upstream row: `marginTop={1}` puts a blank line above it
 /// (`routes/session/index.tsx:1670`). A block with nothing to show draws
 /// nothing, not a stray blank line.
-fn render_block(block: &Block, width: u16, view: ViewState) -> Vec<Line<'static>> {
+/// A block's rows, and whether a click or `o` toggles it: a shell block
+/// learns that from the same collapse its rows came from.
+/// A shell block also reports the row of its spinner lead.
+fn render_entry(
+    block: &Block,
+    width: u16,
+    view: ViewState,
+) -> (Vec<Line<'static>>, bool, Option<usize>) {
     let palette = theme::palette();
+    let mut expandable = tool_expandable(block);
+    let mut spinner_row = None;
     let body = match block {
+        Block::Shell {
+            state,
+            input,
+            output,
+            omitted,
+            shell,
+            background,
+            shell_running,
+            ..
+        } => {
+            let workdir = input
+                .get("workdir")
+                .and_then(serde_json::Value::as_str)
+                .map(|dir| tool_text::format_path(dir, tool_text::paths()))
+                .unwrap_or_default();
+            let spec = super::shell_block::ShellSpec {
+                command: input
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+                workdir: &workdir,
+                state: *state,
+                output,
+                omitted: *omitted,
+                has_shell: *shell,
+                background: *background,
+                shell_running: *shell_running,
+                expanded: view.tool_expanded,
+                hovered: view.hovered || view.tool_focused,
+                spinner: SPINNER_FRAMES[view.spin % SPINNER_FRAMES.len()],
+            };
+            let rendered = super::shell_block::render(&spec, width);
+            expandable = rendered.expandable;
+            spinner_row = rendered.spinner_row;
+            rendered.lines
+        }
         Block::User { text } => user_block(text, view, width),
         Block::Reasoning { text, done, ms, .. } => reasoning_block(text, *done, *ms, view, width),
         Block::Assistant { text, footer, .. } => {
@@ -1363,12 +1544,13 @@ fn render_block(block: &Block, width: u16, view: ViewState) -> Vec<Line<'static>
         )],
     };
     if body.is_empty() {
-        return body;
+        return (body, expandable, None);
     }
     let mut lines = Vec::with_capacity(body.len() + 1);
     lines.push(Line::default());
     lines.extend(body);
-    lines
+    // The margin row above shifts the block's own rows down by one.
+    (lines, expandable, spinner_row.map(|row| row + 1))
 }
 
 /// Columns every session-level row is indented (`paddingLeft={3}`).
@@ -2137,6 +2319,11 @@ fn spins(block: &Block) -> bool {
             state, background, ..
         } => *background || running(state),
         Block::Todo { state, .. } => running(state),
+        Block::Shell {
+            state,
+            shell_running,
+            ..
+        } => *shell_running || running(state),
         Block::Explored(explored) => explored.running,
         _ => false,
     }
@@ -2168,8 +2355,19 @@ fn clickable(block: &Block) -> bool {
 /// The id of a tool block, for focus/expansion bookkeeping.
 fn entry_tool_id(block: &Block) -> Option<&str> {
     match block {
-        Block::Tool { id, .. } | Block::Todo { id, .. } => Some(id.as_str()),
+        Block::Tool { id, .. } | Block::Todo { id, .. } | Block::Shell { id, .. } => {
+            Some(id.as_str())
+        }
         _ => None,
+    }
+}
+
+/// Whether a click or `o` toggles the entry: cached at render for a shell
+/// block, derived from the block for tool and todo rows.
+fn entry_expandable(entry: &Entry) -> bool {
+    match entry.block {
+        Block::Shell { .. } => entry.expandable,
+        _ => tool_expandable(&entry.block),
     }
 }
 
@@ -2217,47 +2415,18 @@ fn wrap_output(output: &str, width: u16) -> Vec<String> {
     wrapped
 }
 
-/// The band behind a user message: `raised.base`, one step stronger under the
-/// pointer (`routes/session/index.tsx:2281, 2410`, `decrease(raised.base)`).
-/// `panel` is the `raised.high` surface (`theme.rs`, `from_tokens`).
-fn user_surface(palette: &theme::Palette, hovered: bool) -> ratatui::style::Style {
-    if hovered {
-        palette.panel
-    } else {
-        palette.raised_base
-    }
-}
-
-/// Upstream user message (`routes/session/index.tsx` ~2341): a raised box
-/// with an agent-coloured left rule, one blank row above and below the text,
-/// and the text two columns in from the rule. The rule sits on the raised
-/// surface too, so the whole row is one band.
+/// Upstream user message (`routes/session/index.tsx` ~2370): the block-tool
+/// frame with an agent-coloured rail, on `raised.base` (`raised.high` under
+/// the pointer, `block_tool::surface`).
 fn user_block(text: &str, view: ViewState, width: u16) -> Vec<Line<'static>> {
     let palette = theme::palette();
-    let raised = user_surface(palette, view.hovered);
-    let rail = palette.agent.patch(raised);
-    let body = palette.text.patch(raised);
-    let usable = width.saturating_sub(3).max(1) as usize;
-    let options = textwrap::Options::new(usable)
-        .word_separator(textwrap::WordSeparator::UnicodeBreakProperties)
-        .word_splitter(textwrap::WordSplitter::NoHyphenation);
-    let fill = width.saturating_sub(1) as usize;
-    let row = |content: &str| -> Line<'static> {
-        let used = unicode_width::UnicodeWidthStr::width(content);
-        Line::from(vec![
-            Span::styled("\u{2503}", rail),
-            Span::styled(
-                format!("{content}{}", " ".repeat(fill.saturating_sub(used))),
-                body,
-            ),
-        ])
-    };
-    let mut lines = vec![row("")];
-    for line in textwrap::wrap(text, options) {
-        lines.push(row(&format!("  {line}")));
-    }
-    lines.push(row(""));
-    lines
+    let band = block_tool::surface(palette, view.hovered);
+    let rail = Span::styled(block_tool::RAIL, palette.agent.patch(band));
+    let rows: Vec<Line<'static>> = block_tool::wrap(text, block_tool::content_width(width))
+        .into_iter()
+        .map(|row| Line::from(Span::styled(row, palette.text)))
+        .collect();
+    block_tool::frame(rows, &rail, band, width)
 }
 
 /// Mirrors upstream `Locale.duration`.
@@ -3333,10 +3502,92 @@ mod tests {
         assert_eq!(t.hovered, None, "the hovered entry no longer exists");
     }
 
+    // ---- user block regression lock (T2.1): the cells must not move when
+    // the block draws through `block_tool` ----
+
+    /// Paint `lines` the way the transcript does: a plain `Paragraph`.
+    fn paint(lines: Vec<ratatui::text::Line<'static>>, width: u16) -> ratatui::buffer::Buffer {
+        use ratatui::widgets::{Paragraph, Widget};
+        let height = u16::try_from(lines.len()).expect("a test block is short");
+        let area = ratatui::layout::Rect::new(0, 0, width, height);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        Paragraph::new(lines).render(area, &mut buf);
+        buf
+    }
+
+    /// The user block as it rendered before `block_tool` existed, spelled out
+    /// row by row: the agent rail and the text, both on the band.
+    fn user_rows_locked(rows: &[&str], hovered: bool) -> Vec<ratatui::text::Line<'static>> {
+        use ratatui::text::{Line, Span};
+        let p = crate::theme::palette();
+        let band = if hovered { p.panel } else { p.raised_base };
+        rows.iter()
+            .map(|row| {
+                Line::from(vec![
+                    Span::styled("\u{2503}", p.agent.patch(band)),
+                    Span::styled((*row).to_owned(), p.text.patch(band)),
+                ])
+            })
+            .collect()
+    }
+
+    fn user_cells(text: &str, hovered: bool, width: u16) -> ratatui::buffer::Buffer {
+        let view = super::ViewState {
+            hovered,
+            ..super::ViewState::default()
+        };
+        paint(super::user_block(text, view, width), width)
+    }
+
+    #[test]
+    fn user_block_cells_are_locked_for_latin_text_at_two_widths() {
+        let wide = user_cells("hello world foo", false, 20);
+        let rows = [
+            "                   ",
+            "  hello world foo  ",
+            "                   ",
+        ];
+        assert_eq!(wide, paint(user_rows_locked(&rows, false), 20));
+
+        let narrow = user_cells("hello world foo", false, 10);
+        let rows = [
+            "         ",
+            "  hello  ",
+            "  world  ",
+            "  foo    ",
+            "         ",
+        ];
+        assert_eq!(narrow, paint(user_rows_locked(&rows, false), 10));
+    }
+
+    #[test]
+    fn user_block_cells_are_locked_for_wrapped_cjk_and_explicit_newlines() {
+        let cjk = user_cells("你好世界和平万岁", false, 12);
+        let rows = ["           ", "  你好世界 ", "  和平万岁 ", "           "];
+        assert_eq!(cjk, paint(user_rows_locked(&rows, false), 12));
+
+        let lines = user_cells("one\ntwo", false, 8);
+        let rows = ["       ", "  one  ", "  two  ", "       "];
+        assert_eq!(lines, paint(user_rows_locked(&rows, false), 8));
+    }
+
+    #[test]
+    fn user_block_cells_are_locked_when_hovered_and_when_too_narrow() {
+        let lit = user_cells("你好 hi", true, 12);
+        let rows = ["           ", "  你好 hi  ", "           "];
+        assert_eq!(lit, paint(user_rows_locked(&rows, true), 12));
+
+        // Narrower than the inset: one column of text per row, clipped.
+        let tight = user_cells("ab", false, 3);
+        let rows = ["  ", "  a", "  b", "  "];
+        assert_eq!(tight, paint(user_rows_locked(&rows, false), 3));
+    }
+
     #[test]
     fn hover_styles_pick_the_stronger_colour_for_each_block() {
-        use super::{explored_title_style, thought_header_style, user_surface};
+        use super::{explored_title_style, thought_header_style};
         use crate::theme::{Deck, Palette};
+        use crate::ui::block_tool::surface as user_surface;
         let p = Palette::for_deck(Deck::Truecolor);
         assert_eq!(explored_title_style(&p, false), p.dim);
         assert_eq!(explored_title_style(&p, true), p.text);
@@ -3353,7 +3604,8 @@ mod tests {
 
     #[test]
     fn hovering_recolours_the_explored_title_the_thought_header_and_the_user_band() {
-        use super::{explored_title_style, thought_header_style, user_surface};
+        use super::{explored_title_style, thought_header_style};
+        use crate::ui::block_tool::surface as user_surface;
         let p = crate::theme::palette();
 
         let mut t = Transcript::new(50, 12);
@@ -3649,7 +3901,8 @@ mod tests {
             "a narrower viewport must re-wrap the cached block into more lines"
         );
         let expected: Vec<usize> =
-            super::render_block(&Block::user(text), 12, super::ViewState::default())
+            super::render_entry(&Block::user(text), 12, super::ViewState::default())
+                .0
                 .iter()
                 .enumerate()
                 .filter(|(_, line)| super::line_text(line).to_lowercase().contains("alpha"))
@@ -4439,6 +4692,151 @@ mod tests {
             let rows: Vec<String> = screen(&mut t, 40, 4).lines().map(str::to_owned).collect();
             assert_eq!(rows[0], "", "margin row");
             assert_eq!(rows[1], "   ↳ Shell finished · cargo test");
+        }
+    }
+
+    mod shell {
+        use super::*;
+
+        fn shell(state: ToolState, command: &str, output: &str, bound: bool) -> Block {
+            let input: ox_schema::support::Record = [(
+                "command".to_owned(),
+                serde_json::Value::String(command.to_owned()),
+            )]
+            .into_iter()
+            .collect();
+            Block::Shell {
+                id: "part_sh".into(),
+                version: 1,
+                state,
+                input: Arc::new(input),
+                output: Arc::new(output.to_owned()),
+                omitted: false,
+                shell: bound,
+                background: false,
+                shell_running: false,
+            }
+        }
+
+        fn long_output() -> String {
+            (1..=30).map(|n| format!("line {n}\n")).collect()
+        }
+
+        fn texts(t: &Transcript) -> Vec<String> {
+            t.entries[0]
+                .lines
+                .iter()
+                .map(|line| line.spans.iter().map(|s| s.content.as_ref()).collect())
+                .collect()
+        }
+
+        #[test]
+        fn a_shell_call_draws_as_a_block_below_its_margin() {
+            let mut t = Transcript::new(40, 12);
+            t.sync(&[shell(ToolState::Success, "cargo test", "ok", true)], 0);
+            let rows = texts(&t);
+            assert_eq!(rows[0], "", "margin row");
+            assert_eq!(rows[2].trim_end(), "┃  $ cargo test", "rail, pad, command");
+            assert_eq!(rows[4].trim_end(), "┃  ok", "{rows:?}");
+            assert_eq!(rows.len(), 1 + 1 + 3 + 1, "margin, pad, cmd/gap/out, pad");
+        }
+
+        #[test]
+        fn a_click_on_any_row_of_an_expandable_shell_toggles_it() {
+            let output = long_output();
+            let mut t = Transcript::new(60, 60);
+            t.sync(&[shell(ToolState::Success, "seq 30", &output, false)], 0);
+            screen(&mut t, 60, 60);
+            let collapsed = t.entries[0].lines.len();
+            assert!(!t.click(6, 0), "the margin row is not a target");
+            assert!(t.click(6, 4), "a body row toggles");
+            let open = t.entries[0].lines.len();
+            assert!(open > collapsed, "expanded {open} > collapsed {collapsed}");
+            assert!(t.click(6, 1), "the top padding row toggles back");
+            assert_eq!(t.entries[0].lines.len(), collapsed);
+        }
+
+        #[test]
+        fn o_toggles_a_shell_and_the_pointer_lights_any_row() {
+            let mut t = Transcript::new(40, 12);
+            t.sync(&[shell(ToolState::Success, "ls", "a", true)], 0);
+            screen(&mut t, 40, 12);
+            assert!(t.hover(6, 3), "a bound shell lights under the pointer");
+            assert_eq!(t.hovered, Some(0));
+            assert!(t.toggle_tool_output(), "o opens the shell");
+            assert!(t.tool_expanded.contains("part_sh"));
+            assert!(t.toggle_tool_output(), "o closes it");
+            assert!(!t.tool_expanded.contains("part_sh"));
+        }
+
+        #[test]
+        fn a_short_shell_without_a_shell_id_is_not_expandable() {
+            let mut t = Transcript::new(40, 12);
+            t.sync(&[shell(ToolState::Success, "echo hi", "hi", false)], 0);
+            screen(&mut t, 40, 12);
+            assert!(!t.click(6, 2), "nothing to expand");
+            assert!(!t.hover(6, 2), "no hover band without a click");
+            assert!(!t.toggle_tool_output(), "o has no target");
+        }
+
+        #[test]
+        fn a_spinner_tick_redraws_only_the_spinner_of_an_expanded_running_shell() {
+            use crate::ui::shell_block::render_count;
+            let output = long_output();
+            let mut block = shell(ToolState::Running, "seq 30", &output, true);
+            let mut t = Transcript::new(60, 60);
+            t.tool_expanded.insert("part_sh".into());
+            t.sync(std::slice::from_ref(&block), 0);
+            let before = texts(&t);
+            let renders = render_count();
+
+            let later = t.spin_epoch + std::time::Duration::from_millis(80);
+            assert!(t.tick(later), "a running shell spins");
+            assert_eq!(render_count(), renders, "the output rows are not redrawn");
+            let after = texts(&t);
+            assert_ne!(before[2], after[2], "the spinner moved");
+            assert_eq!(before[3..], after[3..], "every other row is kept");
+            let mut fresh = Transcript::new(60, 60);
+            fresh.tool_expanded.insert("part_sh".into());
+            fresh.spin_frame = t.spin_frame;
+            fresh.sync(std::slice::from_ref(&block), 0);
+            assert_eq!(
+                t.entries[0].lines, fresh.entries[0].lines,
+                "the patched block equals a fresh render"
+            );
+
+            let renders = render_count();
+            if let Block::Shell { output, .. } = &mut block {
+                *output = Arc::new(format!("{output}more\n"));
+            }
+            t.sync(std::slice::from_ref(&block), 0);
+            assert_eq!(render_count(), renders + 1, "new output is drawn");
+            assert!(texts(&t).iter().any(|row| row.contains("more")));
+        }
+
+        #[test]
+        fn a_live_shell_spins_and_equality_tracks_liveness() {
+            let mut live = shell(ToolState::Success, "npm run dev", "", true);
+            if let Block::Shell {
+                background,
+                shell_running,
+                ..
+            } = &mut live
+            {
+                *background = true;
+                *shell_running = true;
+            }
+            assert!(super::super::spins(&live), "a live shell spins");
+            let done = shell(ToolState::Success, "npm run dev", "", true);
+            assert!(!super::super::spins(&done));
+            assert_ne!(live, done, "the shell exiting must rebuild the block");
+            let mut t = Transcript::new(40, 12);
+            t.sync(std::slice::from_ref(&live), 0);
+            assert!(
+                texts(&t).iter().any(|row| row.contains(" Background ")),
+                "{:?}",
+                texts(&t)
+            );
         }
     }
 }

@@ -73,10 +73,23 @@ pub enum AppCommand {
     ListShells {
         session: String,
     },
+    /// Fetch the background shells to rebuild the running set; answered with
+    /// `AppEvent::RunningShells`, which never opens a dialog. `generation`
+    /// numbers the request; the answer carries it back.
+    SyncShells {
+        generation: u64,
+    },
     /// Kill shell `id`, then re-fetch the list for `session`.
     KillShell {
         session: String,
         id: String,
+    },
+    /// Read shell `id`'s output from `cursor` for its expanded block;
+    /// answered with `AppEvent::ShellPolled`, which never opens a dialog.
+    ShellPoll {
+        id: String,
+        cursor: u64,
+        mode: ox_client::rest::ShellReadMode,
     },
     /// Fetch shell `id` and its recent output; answered with
     /// `AppEvent::ShellOutput`.

@@ -1,4 +1,5 @@
 pub mod autocomplete;
+pub mod block_tool;
 pub mod commands;
 pub mod compaction;
 pub mod composer;
@@ -19,6 +20,8 @@ pub mod paste;
 pub mod prompt;
 pub(crate) mod selection;
 pub mod session_dialog;
+pub mod shell_block;
+pub mod shell_collapse;
 pub mod shell_dialog;
 pub mod spinner;
 pub mod subagent_dialog;

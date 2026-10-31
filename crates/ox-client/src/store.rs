@@ -292,6 +292,79 @@ impl ChildRef {
     }
 }
 
+/// The background shell a `shell` tool call is bound to, read from its result
+/// metadata (`ox-tools/src/shell/mod.rs`: `{status, shellID, ..}`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellRef {
+    pub id: String,
+    /// `metadata.status == "running"`: the call returned while the shell kept
+    /// running (upstream `background`).
+    pub background: bool,
+}
+
+/// One outstanding `GET /api/shell` rebuild: the shell frames seen since it
+/// was issued are newer than its answer, so they are replayed over it (the
+/// `probing` rule for children, per shell id).
+#[derive(Debug, Default)]
+struct ShellSync {
+    generation: u64,
+    /// Last running state each frame since the request left the shell in.
+    /// Bounded by the shells that changed while one request was in flight.
+    seen: HashMap<String, bool>,
+}
+
+impl ShellRef {
+    /// The tool name the server registers the shell tool under
+    /// (`ox-tools/src/shell/mod.rs`, `Tool::name`).
+    pub const SHELL_TOOL: &'static str = "shell";
+
+    /// Owned [`ShellView::from_metadata`].
+    pub fn from_metadata(
+        tool: &str,
+        metadata: Option<&ox_schema::support::Record>,
+    ) -> Option<Self> {
+        ShellView::from_metadata(tool, metadata).map(ShellView::into_owned)
+    }
+}
+
+/// [`ShellRef`] borrowed from the call's metadata, for per-frame readers
+/// that only look the id up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShellView<'a> {
+    pub id: &'a str,
+    pub background: bool,
+}
+
+impl<'a> ShellView<'a> {
+    /// The single parse point shared by history and the live path. `None`
+    /// unless `tool` is the shell tool and the metadata names a string
+    /// `shellID`. Other tools' metadata is never read.
+    #[must_use]
+    pub fn from_metadata(
+        tool: &str,
+        metadata: Option<&'a ox_schema::support::Record>,
+    ) -> Option<Self> {
+        if tool != ShellRef::SHELL_TOOL {
+            return None;
+        }
+        let metadata = metadata?;
+        let id = metadata.get("shellID")?.as_str()?;
+        let status = metadata.get("status").and_then(serde_json::Value::as_str);
+        Some(Self {
+            id,
+            background: status == Some("running"),
+        })
+    }
+
+    #[must_use]
+    pub fn into_owned(self) -> ShellRef {
+        ShellRef {
+            id: self.id.to_owned(),
+            background: self.background,
+        }
+    }
+}
+
 /// One tool call inside an assistant message. Events are keyed by the tool
 /// part `id`, so out-of-order arrival is tolerated and finished parts ignore
 /// late events.
@@ -325,6 +398,32 @@ pub struct ToolPart {
     /// live, `completed`/`error` in history), e.g. glob `count` or shell
     /// `shellID`. `None` while running or when the result carried none.
     pub metadata: Option<Arc<Record>>,
+}
+
+impl ToolPart {
+    /// The shell this call is bound to; derived from [`Self::metadata`] so it
+    /// cannot drift from it.
+    #[must_use]
+    pub fn shell(&self) -> Option<ShellRef> {
+        self.shell_view().map(ShellView::into_owned)
+    }
+
+    /// [`Self::shell`] borrowed: no allocation.
+    #[must_use]
+    pub fn shell_view(&self) -> Option<ShellView<'_>> {
+        ShellView::from_metadata(&self.tool, self.metadata.as_deref())
+    }
+
+    /// The `workdir` a shell call ran in, from its parsed input. `None` for
+    /// other tools, when absent or not a string, and while only streamed input
+    /// text exists (see [`Self::input`]).
+    #[must_use]
+    pub fn shell_workdir(&self) -> Option<&str> {
+        if self.tool != ShellRef::SHELL_TOOL {
+            return None;
+        }
+        self.input.get("workdir")?.as_str()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -401,6 +500,13 @@ pub struct DataStore {
     /// removes it from here, so the (older) probe result is then discarded:
     /// the event stream is newer than the answer to a request sent before it.
     probing: HashSet<String>,
+    /// Ids of the server's running shells (upstream `data.shell`), from the
+    /// `shell.*` frames and the `GET /api/shell` rebuild. Ids only: the cap
+    /// is the number of live shells on the server.
+    running_shells: HashSet<String>,
+    /// The `GET /api/shell` request in flight, if any; see
+    /// [`DataStore::begin_shell_sync`].
+    shell_sync: Option<ShellSync>,
     pub model: Option<String>,
     pub agent: Option<String>,
     /// Inbox ids of compactions enqueued but not yet delivered or cancelled,
@@ -507,6 +613,92 @@ impl DataStore {
     /// Whether `session_id` is a known child whose turn is in flight.
     pub fn is_child_running(&self, session_id: &str) -> bool {
         self.running_children.contains(session_id)
+    }
+
+    /// Whether shell `id` is running (upstream: present in `data.shell`).
+    #[must_use]
+    pub fn is_shell_running(&self, id: &str) -> bool {
+        self.running_shells.contains(id)
+    }
+
+    /// Feed one `shell.*` frame (`ox-tools/src/shell/events.rs:frame`):
+    /// `created` with status `running` adds `info.id`; `exited` / `deleted`
+    /// remove `id`. Shell frames carry no session id, so the caller routes
+    /// them here before any session filter. Returns whether the set changed.
+    /// While a rebuild is outstanding the frame is also recorded, so its
+    /// older answer cannot undo it.
+    pub fn apply_shell_frame(&mut self, kind: &str, data: &serde_json::Value) -> bool {
+        fn id_of(value: &serde_json::Value) -> Option<&str> {
+            value.get("id").and_then(serde_json::Value::as_str)
+        }
+        let (id, running) = match kind {
+            "shell.created" => {
+                let Some(info) = data.get("info") else {
+                    return false;
+                };
+                let Some(id) = id_of(info) else {
+                    return false;
+                };
+                let running =
+                    info.get("status").and_then(serde_json::Value::as_str) == Some("running");
+                (id, running)
+            }
+            "shell.exited" | "shell.deleted" => {
+                let Some(id) = id_of(data) else {
+                    return false;
+                };
+                (id, false)
+            }
+            _ => return false,
+        };
+        if let Some(sync) = &mut self.shell_sync {
+            match sync.seen.get_mut(id) {
+                Some(state) => *state = running,
+                None => {
+                    sync.seen.insert(id.to_owned(), running);
+                }
+            }
+        }
+        if running {
+            !self.running_shells.contains(id) && self.running_shells.insert(id.to_owned())
+        } else {
+            self.running_shells.remove(id)
+        }
+    }
+
+    /// A `GET /api/shell` rebuild numbered `generation` is about to be sent.
+    /// It supersedes any earlier one still in flight.
+    pub fn begin_shell_sync(&mut self, generation: u64) {
+        self.shell_sync = Some(ShellSync {
+            generation,
+            seen: HashMap::new(),
+        });
+    }
+
+    /// Answer to rebuild `generation` (the ids whose status is `running`):
+    /// replaces the set, then replays the frames seen since the request was
+    /// issued, which are newer. An answer to any other request (superseded,
+    /// or already applied) is dropped. Returns whether the set changed.
+    pub fn set_running_shells(&mut self, generation: u64, ids: Vec<String>) -> bool {
+        let Some(sync) = self
+            .shell_sync
+            .take_if(|sync| sync.generation == generation)
+        else {
+            return false;
+        };
+        let mut next: HashSet<String> = ids.into_iter().collect();
+        for (id, running) in sync.seen {
+            if running {
+                next.insert(id);
+            } else {
+                next.remove(&id);
+            }
+        }
+        if next == self.running_shells {
+            return false;
+        }
+        self.running_shells = next;
+        true
     }
 
     /// Feed an event that belongs to a session OTHER than the focused one.
@@ -1319,7 +1511,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ChildRef, CompletionItem, CompletionSource, DataStore, ErrorInfo, Item, ToolState, reduce,
+        ChildRef, CompletionItem, CompletionSource, DataStore, ErrorInfo, Item, ShellRef,
+        ToolState, reduce,
     };
 
     fn env(kind: &str, data: serde_json::Value) -> EventEnvelope<serde_json::Value> {
@@ -2489,6 +2682,109 @@ mod tests {
         store.observe_foreign(&env(kind, data).parse_typed());
     }
 
+    // ---- running shells ----------------------------------------------------
+
+    /// `shell.created` as `ox-tools/src/shell/events.rs:frame` publishes it.
+    fn shell_created(id: &str, status: &str) -> serde_json::Value {
+        json!({"info": {
+            "id": id, "status": status, "command": "sleep 9", "cwd": "/",
+            "shell": "zsh", "file": "/tmp/o", "pid": 7,
+            "metadata": {"sessionID": "ses_1"}, "time": {"started": 1}
+        }})
+    }
+
+    #[test]
+    fn a_created_shell_runs_until_it_exits() {
+        let mut store = DataStore::default();
+        assert!(store.apply_shell_frame("shell.created", &shell_created("sh_1", "running")));
+        assert!(store.is_shell_running("sh_1"));
+        assert!(!store.apply_shell_frame("shell.created", &shell_created("sh_1", "running")));
+        let exited = json!({"id": "sh_1", "status": "exited", "exit": 0});
+        assert!(store.apply_shell_frame("shell.exited", &exited));
+        assert!(!store.is_shell_running("sh_1"));
+    }
+
+    #[test]
+    fn a_created_shell_runs_until_it_is_deleted() {
+        let mut store = DataStore::default();
+        store.apply_shell_frame("shell.created", &shell_created("sh_1", "running"));
+        assert!(store.apply_shell_frame("shell.deleted", &json!({"id": "sh_1"})));
+        assert!(!store.is_shell_running("sh_1"));
+    }
+
+    #[test]
+    fn shell_frames_that_change_nothing_report_false() {
+        let mut store = DataStore::default();
+        store.apply_shell_frame("shell.created", &shell_created("sh_1", "running"));
+        let unknown = json!({"id": "sh_9", "status": "killed"});
+        assert!(!store.apply_shell_frame("shell.exited", &unknown));
+        assert!(!store.apply_shell_frame("shell.deleted", &json!({"id": "sh_9"})));
+        assert!(!store.apply_shell_frame("shell.created", &shell_created("sh_2", "exited")));
+        assert!(!store.apply_shell_frame("shell.output", &json!({"id": "sh_1"})));
+        assert!(!store.apply_shell_frame("shell.exited", &json!({"status": "exited"})));
+        assert!(store.is_shell_running("sh_1"), "sh_1 untouched");
+        assert!(
+            !store.is_shell_running("sh_2"),
+            "created settled is not running"
+        );
+    }
+
+    #[test]
+    fn a_rebuild_replaces_the_running_shells() {
+        let mut store = DataStore::default();
+        store.apply_shell_frame("shell.created", &shell_created("sh_old", "running"));
+        store.begin_shell_sync(1);
+        assert!(store.set_running_shells(1, vec!["sh_a".to_owned(), "sh_b".to_owned()]));
+        assert!(
+            !store.is_shell_running("sh_old"),
+            "the server no longer lists it"
+        );
+        assert!(store.is_shell_running("sh_a") && store.is_shell_running("sh_b"));
+        assert!(
+            !store.set_running_shells(1, vec!["sh_b".to_owned(), "sh_a".to_owned()]),
+            "the same set is no change"
+        );
+    }
+
+    #[test]
+    fn an_exit_seen_after_the_request_wins_over_its_stale_answer() {
+        let mut store = DataStore::default();
+        store.apply_shell_frame("shell.created", &shell_created("sh_1", "running"));
+        store.begin_shell_sync(1);
+        let exited = json!({"id": "sh_1", "status": "exited", "exit": 0});
+        assert!(store.apply_shell_frame("shell.exited", &exited));
+        assert!(!store.set_running_shells(1, vec!["sh_1".to_owned()]));
+        assert!(
+            !store.is_shell_running("sh_1"),
+            "the answer predates the exit"
+        );
+    }
+
+    #[test]
+    fn a_shell_created_after_the_request_survives_an_answer_without_it() {
+        let mut store = DataStore::default();
+        store.begin_shell_sync(1);
+        store.apply_shell_frame("shell.created", &shell_created("sh_2", "running"));
+        store.apply_shell_frame("shell.created", &shell_created("sh_3", "running"));
+        store.apply_shell_frame("shell.deleted", &json!({"id": "sh_3"}));
+        store.set_running_shells(1, vec!["sh_1".to_owned()]);
+        assert!(store.is_shell_running("sh_1"), "the snapshot applies");
+        assert!(store.is_shell_running("sh_2"), "created after the request");
+        assert!(!store.is_shell_running("sh_3"), "created, then deleted");
+    }
+
+    #[test]
+    fn only_the_answer_to_the_latest_request_applies() {
+        let mut store = DataStore::default();
+        store.begin_shell_sync(1);
+        store.begin_shell_sync(2);
+        assert!(!store.set_running_shells(1, vec!["sh_old".to_owned()]));
+        assert!(!store.is_shell_running("sh_old"), "superseded answer");
+        assert!(!store.set_running_shells(7, vec!["sh_x".to_owned()]));
+        assert!(!store.is_shell_running("sh_x"), "never requested");
+        assert!(store.set_running_shells(2, vec!["sh_new".to_owned()]));
+    }
+
     fn store_with_child() -> DataStore {
         let mut store = DataStore {
             session: Some("ses_1".to_owned()),
@@ -2747,9 +3043,10 @@ mod tests {
         assert!(!store.apply_probe("ses_c", true), "no longer referenced");
     }
 
-    /// Drive one glob call through the live events: started, called with
+    /// Drive one `name` call through the live events: started, called with
     /// `input`, then success (with `metadata` unless null) or failure.
-    fn live_glob_call(
+    fn live_tool_call(
+        name: &str,
         input: serde_json::Value,
         metadata: serde_json::Value,
         outcome: &str,
@@ -2766,7 +3063,7 @@ mod tests {
         apply(
             &mut store,
             "session.tool.input.started",
-            with(json!({"name":"glob"})),
+            with(json!({"name": name})),
         );
         apply(
             &mut store,
@@ -2791,12 +3088,12 @@ mod tests {
         assistant(&store).tools[0].clone()
     }
 
-    /// The same glob call as recorded in history.
-    fn history_glob_call(state: serde_json::Value) -> super::ToolPart {
+    /// The same `name` call as recorded in history.
+    fn history_tool_call(name: &str, state: serde_json::Value) -> super::ToolPart {
         let messages: Vec<ox_schema::message::Message> = serde_json::from_value(json!([
             {"type":"assistant","id":"msg_1","time":{"created":1},"agent":"build",
              "model":{"providerID":"p","id":"m"},
-             "content":[{"type":"tool","id":"part_1","name":"glob","state": state,
+             "content":[{"type":"tool","id":"part_1","name": name,"state": state,
                          "time":{"created":1}}]}
         ]))
         .unwrap();
@@ -2882,11 +3179,14 @@ mod tests {
     fn live_and_history_keep_the_same_input_and_metadata() {
         let input = json!({"pattern":"**/*.rs"});
         let metadata = json!({"count": 3, "truncated": false});
-        let live = live_glob_call(input.clone(), metadata.clone(), "success");
-        let history = history_glob_call(json!({
-            "status":"completed","input": input,
-            "content":[{"type":"text","text":"a.rs"}],"metadata": metadata
-        }));
+        let live = live_tool_call("glob", input.clone(), metadata.clone(), "success");
+        let history = history_tool_call(
+            "glob",
+            json!({
+                "status":"completed","input": input,
+                "content":[{"type":"text","text":"a.rs"}],"metadata": metadata
+            }),
+        );
         assert_eq!(
             live.input, history.input,
             "input must not depend on the path"
@@ -2901,11 +3201,14 @@ mod tests {
     fn failed_calls_keep_metadata_in_both_paths() {
         let input = json!({"pattern":"x"});
         let metadata = json!({"count": 0});
-        let live = live_glob_call(input.clone(), metadata.clone(), "failed");
-        let history = history_glob_call(json!({
-            "status":"error","input": input,
-            "error":{"type":"x","message":"boom"},"metadata": metadata
-        }));
+        let live = live_tool_call("glob", input.clone(), metadata.clone(), "failed");
+        let history = history_tool_call(
+            "glob",
+            json!({
+                "status":"error","input": input,
+                "error":{"type":"x","message":"boom"},"metadata": metadata
+            }),
+        );
         assert!(live.metadata.is_some(), "tool.failed carries metadata");
         assert_eq!(live.metadata, history.metadata, "same metadata on reload");
         assert_eq!(live.input, history.input, "same input on reload");
@@ -2914,11 +3217,14 @@ mod tests {
     #[test]
     fn metadata_is_none_when_the_result_had_none() {
         let input = json!({"pattern":"x"});
-        let live = live_glob_call(input.clone(), json!(null), "success");
-        let history = history_glob_call(json!({
-            "status":"completed","input": input,
-            "content":[{"type":"text","text":"a.rs"}]
-        }));
+        let live = live_tool_call("glob", input.clone(), json!(null), "success");
+        let history = history_tool_call(
+            "glob",
+            json!({
+                "status":"completed","input": input,
+                "content":[{"type":"text","text":"a.rs"}]
+            }),
+        );
         assert!(live.metadata.is_none(), "got {:?}", live.metadata);
         assert!(history.metadata.is_none(), "got {:?}", history.metadata);
     }
@@ -2940,7 +3246,118 @@ mod tests {
         let part = &assistant(&store).tools[0];
         assert!(part.input.is_empty(), "got {:?}", part.input);
         assert!(part.metadata.is_none(), "got {:?}", part.metadata);
-        let history = history_glob_call(json!({"status":"streaming","input":"{\"pattern\":"}));
+        let history = history_tool_call(
+            "glob",
+            json!({"status":"streaming","input":"{\"pattern\":"}),
+        );
         assert!(history.input.is_empty(), "got {:?}", history.input);
+    }
+
+    // -- Shell calls ---------------------------------------------------------
+
+    #[test]
+    fn shell_ref_from_metadata_table() {
+        let running = record(json!({"status":"running","shellID":"sh_1","output":""}));
+        let completed = record(json!({"status":"completed","shellID":"sh_2","exit":0}));
+        let no_id = record(json!({"status":"running"}));
+        let numeric_id = record(json!({"status":"running","shellID": 7}));
+        let numeric_status = record(json!({"status": 1,"shellID":"sh_3"}));
+        type Case<'a> = (
+            &'a str,
+            Option<&'a ox_schema::support::Record>,
+            Option<(&'a str, bool)>,
+        );
+        let cases: [Case; 7] = [
+            ("shell", Some(&running), Some(("sh_1", true))),
+            ("shell", Some(&completed), Some(("sh_2", false))),
+            ("shell", Some(&no_id), None),
+            ("shell", Some(&numeric_id), None),
+            ("shell", Some(&numeric_status), Some(("sh_3", false))),
+            ("shell", None, None),
+            ("subagent", Some(&running), None),
+        ];
+        for (tool, metadata, expected) in cases {
+            let got = ShellRef::from_metadata(tool, metadata);
+            assert_eq!(
+                got.as_ref().map(|s| (s.id.as_str(), s.background)),
+                expected,
+                "tool={tool:?} metadata={metadata:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_workdir_table() {
+        let cases: [(&str, serde_json::Value, Option<&str>); 6] = [
+            (
+                "shell",
+                json!({"command":"ls","workdir":"crates"}),
+                Some("crates"),
+            ),
+            ("shell", json!({"command":"ls","workdir":"."}), Some(".")),
+            ("shell", json!({"command":"ls"}), None),
+            ("shell", json!({"command":"ls","workdir": 3}), None),
+            ("read", json!({"path":"a","workdir":"crates"}), None),
+            ("glob", json!({"pattern":"*","workdir":"crates"}), None),
+        ];
+        for (tool, input, expected) in cases {
+            let part = live_tool_call(tool, input.clone(), json!(null), "success");
+            assert_eq!(
+                part.shell_workdir(),
+                expected,
+                "tool={tool:?} input={input}"
+            );
+        }
+    }
+
+    #[test]
+    fn live_and_history_derive_the_same_shell() {
+        let input = json!({"command":"cargo build","workdir":"crates/ox-client"});
+        let metadata = json!({"status":"running","shellID":"sh_9","output":"Compiling"});
+        let live = live_tool_call("shell", input.clone(), metadata.clone(), "success");
+        let history = history_tool_call(
+            "shell",
+            json!({
+                "status":"completed","input": input,
+                "content":[{"type":"text","text":"Compiling"}],"metadata": metadata
+            }),
+        );
+        let expected = ShellRef {
+            id: "sh_9".to_owned(),
+            background: true,
+        };
+        assert_eq!(live.shell(), Some(expected.clone()), "live");
+        assert_eq!(history.shell(), Some(expected), "history");
+        assert_eq!(live.shell_workdir(), Some("crates/ox-client"));
+        assert_eq!(history.shell_workdir(), live.shell_workdir());
+    }
+
+    #[test]
+    fn the_shell_view_borrows_its_id_from_the_metadata() {
+        let metadata = json!({"status":"running","shellID":"sh_9"});
+        let live = live_tool_call("shell", json!({"command":"ls"}), metadata, "success");
+        let view = live.shell_view().expect("a bound call");
+        let stored = live
+            .metadata
+            .as_deref()
+            .and_then(|record| record.get("shellID"))
+            .and_then(serde_json::Value::as_str)
+            .expect("the live metadata names the shell");
+        assert!(
+            std::ptr::eq(view.id, stored),
+            "the view points into the metadata, not at a copy"
+        );
+        assert!(view.background);
+        assert_eq!(Some(view.into_owned()), live.shell(), "one parse point");
+    }
+
+    #[test]
+    fn a_streaming_shell_call_has_no_shell_or_workdir_yet() {
+        let history = history_tool_call(
+            "shell",
+            json!({"status":"streaming","input":"{\"command\":\"ls\",\"workdir\":\"src\""}),
+        );
+        assert_eq!(history.shell(), None, "no metadata before the result");
+        assert_eq!(history.shell_workdir(), None, "input is unparsed text");
     }
 }

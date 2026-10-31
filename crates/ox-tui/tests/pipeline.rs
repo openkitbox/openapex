@@ -1,5 +1,6 @@
 use ox_schema::event::EventEnvelope;
 use ox_tui::pipeline::blocks_from_store;
+use ox_tui::shell_captures::ShellCaptures;
 use ox_tui::ui::timeline::Transcript;
 
 fn load_demo() -> Vec<EventEnvelope<serde_json::Value>> {
@@ -20,7 +21,7 @@ fn demo_events_produce_expected_transcript() {
         ox_client::store::reduce(&mut store, &envelope.parse_typed());
     }
 
-    let blocks = blocks_from_store(&store);
+    let blocks = blocks_from_store(&store, &ShellCaptures::default());
     assert_eq!(blocks.len(), 1);
     let transcript_text = format!("{blocks:?}");
     assert!(transcript_text.contains("先看现有布局，然后把 dock 固定住。"));
@@ -49,6 +50,7 @@ mod completion_notices {
     use ox_schema::message::{Message, TimeCreated};
     use ox_schema::support::Record;
     use ox_tui::pipeline::blocks_from_store;
+    use ox_tui::shell_captures::ShellCaptures;
     use ox_tui::ui::timeline::Transcript;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -165,7 +167,7 @@ mod completion_notices {
 
     pub(super) fn rows_sized(store: &DataStore, width: u16, height: u16) -> Vec<String> {
         let mut transcript = Transcript::new(width, height);
-        transcript.sync(&blocks_from_store(store), 0);
+        transcript.sync(&blocks_from_store(store, &ShellCaptures::default()), 0);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| transcript.render(frame, frame.area()))
