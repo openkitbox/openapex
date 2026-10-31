@@ -869,9 +869,12 @@ fn home_case() -> Case {
 fn markdown_case() -> Case {
     Case {
         name: "markdown-samples",
-        height: 12,
+        height: 24,
         draw: Box::new(|frame, area| {
-            let text = "# Title\n- first\n- second\n> quoted\n---\nplain\n```rust\nlet a = 1;\n```";
+            let text = "# Title\n- first\n- second\n> quoted\n---\nplain\n```rust\nlet a = 1;\n```\n\n\
+                | name | 说明 | notes |\n|:--|:-:|--:|\n\
+                | foo | `bar` | short |\n\
+                | 中文列 | **bold** | a deliberately long cell whose text must wrap onto several rows once the table runs out of horizontal room, 这一格故意写得很长以便观察换行 |";
             let lines = markdown::render(text, area.width, 3);
             Paragraph::new(lines).render(area, frame.buffer_mut());
         }),

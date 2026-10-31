@@ -17,6 +17,7 @@ pub mod paste;
 pub mod prompt;
 pub mod session_dialog;
 pub mod spinner;
+pub mod table;
 pub mod timeline;
 pub mod timeline_dialog;
 pub mod toast;
