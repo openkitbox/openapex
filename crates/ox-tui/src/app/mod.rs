@@ -1068,7 +1068,12 @@ impl App {
         }
         match self.transcript.release() {
             Outcome::Click => {
-                if self.transcript.click(x, y) {
+                // A subagent notice opens its child session; the owned id
+                // ends the transcript borrow before `switch_session`.
+                if let Some(child) = self.transcript.child_at(x, y).map(str::to_owned) {
+                    self.switch_session(child);
+                    self.dirty = true;
+                } else if self.transcript.click(x, y) {
                     self.dirty = true;
                 }
             }
@@ -3358,6 +3363,81 @@ mod tests {
         app.handle_mouse_down_at(10, 2, t0 + Duration::from_millis(240));
         app.handle_mouse_up(10, 2);
         assert_eq!(copy_texts(&drain(&mut rx)), ["hello world"]);
+    }
+
+    /// A session app whose transcript holds one completion notice, drawn so
+    /// the title row is screen row 1.
+    fn notice_app(
+        source: ox_client::store::CompletionSource,
+        child: Option<&str>,
+    ) -> (App, mpsc::UnboundedReceiver<AppCommand>) {
+        use crate::ui::timeline::{Block, Transcript};
+        let (mut app, rx) = app(Route::Session, Some("ses_parent"));
+        app.transcript = Transcript::new(40, 10);
+        app.transcript.sync(
+            &[Block::Completion {
+                id: "n1".into(),
+                source,
+                state: Some("completed".into()),
+                description: "review".into(),
+                child_id: child.map(Into::into),
+            }],
+            0,
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+        terminal
+            .draw(|frame| app.transcript.render(frame, frame.area()))
+            .unwrap();
+        (app, rx)
+    }
+
+    #[test]
+    fn clicking_a_subagent_notice_opens_the_child_session() {
+        use ox_client::store::CompletionSource::Subagent;
+        let (mut app, mut rx) = notice_app(Subagent, Some("ses_child"));
+        app.dirty = false;
+        app.handle(AppEvent::MouseDown { x: 6, y: 1 });
+        app.handle(AppEvent::MouseUp { x: 6, y: 1 });
+        assert_eq!(app.session.as_deref(), Some("ses_child"));
+        assert!(app.dirty);
+        assert!(
+            drain(&mut rx).iter().any(
+                |c| matches!(c, AppCommand::AttachSession { session } if session == "ses_child")
+            )
+        );
+    }
+
+    #[test]
+    fn clicking_a_shell_notice_or_a_childless_subagent_stays_put() {
+        use ox_client::store::CompletionSource::{Shell, Subagent};
+        for (source, child) in [(Shell, None), (Subagent, None)] {
+            let (mut app, _rx) = notice_app(source, child);
+            app.handle(AppEvent::MouseDown { x: 6, y: 1 });
+            app.handle(AppEvent::MouseUp { x: 6, y: 1 });
+            assert_eq!(app.session.as_deref(), Some("ses_parent"));
+        }
+    }
+
+    #[test]
+    fn clicking_the_margin_above_a_subagent_notice_stays_put() {
+        use ox_client::store::CompletionSource::Subagent;
+        let (mut app, _rx) = notice_app(Subagent, Some("ses_child"));
+        app.handle(AppEvent::MouseDown { x: 6, y: 0 });
+        app.handle(AppEvent::MouseUp { x: 6, y: 0 });
+        assert_eq!(app.session.as_deref(), Some("ses_parent"));
+    }
+
+    #[test]
+    fn dragging_across_a_subagent_notice_selects_instead_of_opening_it() {
+        use ox_client::store::CompletionSource::Subagent;
+        let (mut app, mut rx) = notice_app(Subagent, Some("ses_child"));
+        drag_over(&mut app, (4, 1), (20, 1));
+        assert_eq!(app.session.as_deref(), Some("ses_parent"));
+        assert!(
+            !copy_texts(&drain(&mut rx)).is_empty(),
+            "the drag copied text, it was not a click"
+        );
     }
 
     #[test]

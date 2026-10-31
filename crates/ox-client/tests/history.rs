@@ -1,5 +1,5 @@
 use ox_client::history::parse_messages;
-use ox_client::store::Item;
+use ox_client::store::{CompletionSource, Item};
 
 #[test]
 fn history_maps_user_and_assistant_text_in_order() {
@@ -149,4 +149,30 @@ fn history_keeps_todowrite_input_and_compaction_boundaries() {
     };
     assert_eq!(failed.status, ox_client::store::CompactionStatus::Failed);
     assert!(failed.cancelled);
+}
+
+#[test]
+fn history_keeps_shell_completion_between_turns_and_skips_other_synthetic() {
+    let raw = r#"[
+      {"type":"user","id":"msg_u1","time":{"created":1},"text":"run it"},
+      {"type":"synthetic","id":"inb_1","time":{"created":2},"text":"done",
+       "description":"cargo   test","metadata":{"source":"shell","shellID":"sh_1","state":"error"}},
+      {"type":"synthetic","id":"syn_2","time":{"created":3},"text":"remember todos"},
+      {"type":"assistant","id":"msg_a1","time":{"created":4},"agent":"build",
+       "model":{"providerID":"p","id":"m"},
+       "content":[{"type":"text","text":"ok"}]}
+    ]"#;
+    let messages: Vec<ox_schema::message::Message> = serde_json::from_str(raw).unwrap();
+    let items = parse_messages(&messages);
+
+    assert_eq!(items.len(), 3, "source-less synthetic is skipped");
+    assert!(matches!(items[0], Item::User { .. }));
+    let Item::Completion(done) = &items[1] else {
+        panic!("expected completion, got {:?}", items[1]);
+    };
+    assert_eq!(done.id, "inb_1");
+    assert_eq!(done.source, CompletionSource::Shell);
+    assert_eq!(done.state.as_deref(), Some("error"));
+    assert_eq!(&*done.description, "cargo test");
+    assert!(matches!(items[2], Item::Assistant(_)));
 }

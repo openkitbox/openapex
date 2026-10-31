@@ -6,7 +6,7 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use ox_client::store::{CompactionStatus, ToolState};
+use ox_client::store::{CompactionStatus, CompletionSource, ToolState};
 use ox_client::todo::Todo;
 use ox_schema::support::TokenUsage;
 
@@ -139,6 +139,16 @@ pub enum Block {
         cancelled: bool,
         tokens: Option<TokenUsage>,
     },
+    /// A shell / subagent completion notice (`↳ Shell finished · cmd`).
+    /// Mirrors `ox_client::store::CompletionItem`; equality is by `id` alone
+    /// because the item is immutable once built.
+    Completion {
+        id: String,
+        source: CompletionSource,
+        state: Option<std::sync::Arc<str>>,
+        description: std::sync::Arc<str>,
+        child_id: Option<std::sync::Arc<str>>,
+    },
 }
 
 impl Block {
@@ -244,6 +254,7 @@ impl PartialEq for Block {
                     ..
                 },
             ) => aid == bid && aversion == bversion,
+            (Block::Completion { id: a, .. }, Block::Completion { id: b, .. }) => a == b,
             _ => false,
         }
     }
@@ -266,7 +277,8 @@ struct ViewState {
     tool_focused: bool,
     /// Explored blocks: the per-call tool rows are listed under the title.
     explored_expanded: bool,
-    /// The pointer is over this Explored title, Reasoning header or User block.
+    /// The pointer is over this Explored title, Reasoning header, User block
+    /// or the title row of a Completion notice that links to a child session.
     hovered: bool,
     /// Reasoning blocks still streaming: the header spinner frame.
     spin: usize,
@@ -431,20 +443,46 @@ impl Transcript {
                 }
                 self.rebuild(index);
             }
-            _ => return false,
+            Block::User { .. }
+            | Block::Assistant { .. }
+            | Block::System { .. }
+            | Block::Tool { .. }
+            | Block::Todo { .. }
+            | Block::Compaction { .. }
+            | Block::Completion { .. } => return false,
         }
         true
     }
 
+    /// The child session a click at screen cell (`x`, `y`) opens: the title
+    /// row of a Completion notice that carries a `child_id` (upstream
+    /// `routes/session/index.tsx:2090-2151`). `None` anywhere else.
+    pub fn child_at(&self, x: u16, y: u16) -> Option<&str> {
+        // Row 0 is the block's blank margin; row 1 is the title.
+        let (index, 1) = self.locate(x, y)? else {
+            return None;
+        };
+        match &self.entries[index].block {
+            Block::Completion { child_id, .. } => child_id.as_deref(),
+            _ => None,
+        }
+    }
+
     /// The entry a pointer at (`x`, `y`) lights up: an Explored or Reasoning
-    /// title row, or anywhere in a User block (upstream `group-view.tsx:146,
-    /// 166-177` and `routes/session/index.tsx:2379-2383`).
+    /// title row, a Completion title row that links to a child session, or
+    /// anywhere in a User block (upstream `group-view.tsx:146, 166-177` and
+    /// `routes/session/index.tsx:2127-2128, 2379-2383`).
     fn hover_target(&self, x: u16, y: u16) -> Option<usize> {
         let (index, row) = self.locate(x, y)?;
-        match self.entries[index].block {
+        match &self.entries[index].block {
             Block::Explored(_) | Block::Reasoning { .. } => (row == 1).then_some(index),
             Block::User { .. } => Some(index),
-            _ => None,
+            Block::Completion { child_id, .. } => (row == 1 && child_id.is_some()).then_some(index),
+            Block::Assistant { .. }
+            | Block::System { .. }
+            | Block::Tool { .. }
+            | Block::Todo { .. }
+            | Block::Compaction { .. } => None,
         }
     }
 
@@ -721,7 +759,14 @@ impl Transcript {
                 hovered,
                 ..Default::default()
             },
-            _ => ViewState::default(),
+            Block::Completion { .. } => ViewState {
+                hovered,
+                ..Default::default()
+            },
+            Block::Assistant { .. }
+            | Block::System { .. }
+            | Block::Todo { .. }
+            | Block::Compaction { .. } => ViewState::default(),
         }
     }
 
@@ -1072,7 +1117,14 @@ impl Transcript {
 fn text_rows(block: &Block) -> (usize, usize) {
     match block {
         Block::User { .. } => (2, 1),
-        _ => (1, 0),
+        Block::Reasoning { .. }
+        | Block::Assistant { .. }
+        | Block::System { .. }
+        | Block::Explored(_)
+        | Block::Tool { .. }
+        | Block::Todo { .. }
+        | Block::Compaction { .. }
+        | Block::Completion { .. } => (1, 0),
     }
 }
 
@@ -1176,6 +1228,19 @@ fn render_block(block: &Block, width: u16, view: ViewState) -> Vec<Line<'static>
             },
             width,
         ),
+        Block::Completion {
+            source,
+            state,
+            description,
+            ..
+        } => vec![completion_line(
+            *source,
+            state.as_deref(),
+            description,
+            usize::from(width),
+            view.hovered,
+            palette,
+        )],
     };
     if body.is_empty() {
         return body;
@@ -1184,6 +1249,94 @@ fn render_block(block: &Block, width: u16, view: ViewState) -> Vec<Line<'static>
     lines.push(Line::default());
     lines.extend(body);
     lines
+}
+
+/// Columns the notice row is indented, like `Block::System`.
+const COMPLETION_INDENT: usize = 3;
+
+/// One completion notice row: `   ↳ Shell finished · description`.
+///
+/// The icon is `↳` for `completed` and `!` for every other state. Only the
+/// title carries a status colour (`error` → error, `cancelled` → warning,
+/// anything else → info, or the base text colour while `hovered`; error and
+/// cancelled win over the hover, as upstream); the ` · description` suffix is always muted. The
+/// suffix is cut by display width to fit `width` and ends with `…`; when even
+/// ` · …` does not fit it is dropped, so the row never exceeds `width` unless
+/// the title alone does.
+fn completion_line(
+    source: CompletionSource,
+    state: Option<&str>,
+    description: &str,
+    width: usize,
+    hovered: bool,
+    palette: &theme::Palette,
+) -> Line<'static> {
+    use std::borrow::Cow;
+
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+    let icon = if state == Some("completed") {
+        '↳'
+    } else {
+        '!'
+    };
+    let actor = match source {
+        CompletionSource::Shell => "Shell",
+        CompletionSource::Subagent => "Subagent",
+    };
+    let word = match state {
+        Some("completed") | None => "finished",
+        Some("error") => "failed",
+        Some(other) => other,
+    };
+    let title_style = match state {
+        Some("error") => palette.warn,
+        Some("cancelled") => palette.warning,
+        _ if hovered => palette.text,
+        _ => palette.info,
+    };
+    let title = format!("{:COMPLETION_INDENT$}{icon} {actor} {word}", "");
+    let budget = width.saturating_sub(title.width());
+
+    const SEPARATOR: &str = " · ";
+    // Control characters (`\n`, `\t`, …) are dropped by the terminal draw and
+    // would corrupt copied text, so each one renders as a single space.
+    let description: Cow<'_, str> = if description.chars().any(char::is_control) {
+        Cow::Owned(
+            description
+                .chars()
+                .map(|ch| if ch.is_control() { ' ' } else { ch })
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(description)
+    };
+    let cell_width = |ch: char| ch.width().unwrap_or(0);
+    let description_cells: usize = description.chars().map(cell_width).sum();
+    let separator_cells = SEPARATOR.chars().map(cell_width).sum::<usize>();
+    let suffix = if separator_cells + description_cells <= budget {
+        Some(format!("{SEPARATOR}{description}"))
+    } else if budget > separator_cells {
+        // Leave one cell for the ellipsis.
+        let mut room = budget - separator_cells - 1;
+        let mut cut = String::from(SEPARATOR);
+        for ch in description.chars() {
+            let cells = cell_width(ch);
+            if cells > room {
+                break;
+            }
+            room -= cells;
+            cut.push(ch);
+        }
+        cut.push('…');
+        Some(cut)
+    } else {
+        None
+    };
+
+    let mut spans = vec![Span::styled(title, title_style)];
+    spans.extend(suffix.map(|suffix| Span::styled(suffix, palette.dim)));
+    Line::from(spans)
 }
 
 /// Upstream `braille` spinner (`component/spinner-frames.ts`), 80ms a frame.
@@ -2921,5 +3074,280 @@ mod tests {
         assert!(!t.has_selection());
         drawn(&mut t, 40, 12);
         assert_eq!(t.release(), Outcome::Nothing);
+    }
+
+    mod completion {
+        use std::sync::Arc;
+
+        use ox_client::store::CompletionSource::{self, Shell, Subagent};
+        use ratatui::text::Line;
+        use unicode_width::UnicodeWidthStr;
+
+        use super::super::{Block, Transcript, completion_line};
+        use super::screen;
+        use crate::theme::{Deck, Palette};
+
+        fn palette() -> Palette {
+            Palette::for_deck(Deck::Truecolor)
+        }
+
+        fn text(line: &Line<'_>) -> String {
+            line.spans.iter().map(|s| s.content.as_ref()).collect()
+        }
+
+        fn line(
+            source: CompletionSource,
+            state: Option<&str>,
+            desc: &str,
+            width: usize,
+        ) -> Line<'static> {
+            completion_line(source, state, desc, width, false, &palette())
+        }
+
+        #[test]
+        fn the_line_text_follows_the_state_table() {
+            let cases = [
+                (Shell, Some("completed"), "cmd", "   ↳ Shell finished · cmd"),
+                (Shell, Some("error"), "cmd", "   ! Shell failed · cmd"),
+                (
+                    Subagent,
+                    Some("cancelled"),
+                    "d",
+                    "   ! Subagent cancelled · d",
+                ),
+                (Shell, Some("weird"), "d", "   ! Shell weird · d"),
+                (Shell, None, "d", "   ! Shell finished · d"),
+                (
+                    Subagent,
+                    Some("completed"),
+                    "d",
+                    "   ↳ Subagent finished · d",
+                ),
+            ];
+            for (source, state, desc, want) in cases {
+                assert_eq!(text(&line(source, state, desc, 120)), want, "{state:?}");
+            }
+        }
+
+        #[test]
+        fn an_empty_description_still_draws_the_separator() {
+            assert_eq!(
+                text(&line(Shell, Some("completed"), "", 40)),
+                "   ↳ Shell finished · "
+            );
+        }
+
+        #[test]
+        fn long_descriptions_truncate_to_the_width_with_an_ellipsis() {
+            let long = "x".repeat(200);
+            for width in [40usize, 120] {
+                let rendered = text(&line(Shell, Some("completed"), &long, width));
+                assert!(rendered.width() <= width, "{width}: {}", rendered.width());
+                assert!(rendered.ends_with('…'), "{rendered}");
+                assert_eq!(rendered.width(), width, "fills the budget exactly");
+            }
+        }
+
+        #[test]
+        fn cjk_descriptions_truncate_on_display_width() {
+            let cjk = "你好世界你好世界你好世界";
+            for width in 30..=40usize {
+                let rendered = text(&line(Shell, Some("completed"), cjk, width));
+                assert!(rendered.width() <= width, "{width}: {rendered}");
+                assert!(rendered.ends_with('…'), "{rendered}");
+            }
+        }
+
+        #[test]
+        fn control_characters_in_the_description_render_as_single_spaces() {
+            let rendered = text(&line(Subagent, Some("completed"), "a\nb\tc", 120));
+            assert_eq!(rendered, "   ↳ Subagent finished · a b c");
+            assert!(!rendered.chars().any(char::is_control), "{rendered:?}");
+        }
+
+        #[test]
+        fn truncation_with_control_characters_stays_within_the_width() {
+            use unicode_width::UnicodeWidthChar;
+
+            let desc = "ab\ncd\tef\r\ngh ijkl mnop";
+            for width in 24..=44usize {
+                let rendered = text(&line(Subagent, Some("completed"), desc, width));
+                let cells: usize = rendered.chars().map(|c| c.width().unwrap_or(0)).sum();
+                assert!(cells <= width, "{width}: {cells} {rendered:?}");
+                assert!(!rendered.chars().any(char::is_control), "{rendered:?}");
+            }
+            let cut = text(&line(Subagent, Some("completed"), desc, 34));
+            assert_eq!(cut, "   ↳ Subagent finished · ab cd ef…");
+        }
+
+        #[test]
+        fn a_tiny_budget_drops_the_suffix_instead_of_overflowing() {
+            for width in 0..24usize {
+                let rendered = text(&line(Shell, Some("completed"), "command", width));
+                let title = "   ↳ Shell finished";
+                assert!(
+                    rendered.width() <= width.max(title.width()),
+                    "{width}: {rendered}"
+                );
+                if width < title.width() + 4 {
+                    assert_eq!(rendered, title, "{width}");
+                }
+            }
+        }
+
+        #[test]
+        fn the_title_colour_follows_the_state_and_the_suffix_is_muted() {
+            let p = palette();
+            let fg = |state: Option<&str>| {
+                let l = completion_line(Shell, state, "cmd", 80, false, &p);
+                let title = l
+                    .spans
+                    .iter()
+                    .find(|s| s.content.contains("Shell"))
+                    .unwrap();
+                let suffix = l.spans.iter().find(|s| s.content.contains("cmd")).unwrap();
+                (title.style, suffix.style)
+            };
+            let (done, done_suffix) = fg(Some("completed"));
+            let (error, _) = fg(Some("error"));
+            let (cancelled, _) = fg(Some("cancelled"));
+            assert_eq!(done.fg, p.info.fg);
+            assert_eq!(error.fg, p.warn.fg);
+            assert_eq!(cancelled.fg, p.warning.fg);
+            assert_ne!(done.fg, error.fg);
+            assert_ne!(done.fg, cancelled.fg);
+            assert_ne!(error.fg, cancelled.fg);
+            assert_eq!(done_suffix.fg, p.dim.fg);
+            assert_ne!(done_suffix.fg, done.fg);
+        }
+
+        #[test]
+        fn hover_recolours_the_title_only_for_neutral_states() {
+            let p = palette();
+            let title_fg = |state: Option<&str>, hovered: bool| {
+                let l = completion_line(Subagent, state, "cmd", 80, hovered, &p);
+                (l.spans[0].style.fg, l.spans[1].style.fg)
+            };
+            for state in [Some("completed"), Some("weird"), None] {
+                let (idle, idle_suffix) = title_fg(state, false);
+                let (hot, hot_suffix) = title_fg(state, true);
+                assert_eq!(idle, p.info.fg, "{state:?}");
+                assert_eq!(
+                    hot, p.text.fg,
+                    "{state:?} hovered uses the base text colour"
+                );
+                assert_ne!(idle, hot, "{state:?}");
+                assert_eq!(idle_suffix, hot_suffix, "the suffix stays muted");
+                assert_eq!(hot_suffix, p.dim.fg);
+            }
+            // error and cancelled keep their own colour under the pointer.
+            assert_eq!(title_fg(Some("error"), true).0, p.warn.fg);
+            assert_eq!(title_fg(Some("cancelled"), true).0, p.warning.fg);
+        }
+
+        fn subagent(id: &str, state: &str, child: Option<&str>) -> Block {
+            Block::Completion {
+                id: id.into(),
+                source: Subagent,
+                state: Some(Arc::from(state)),
+                description: Arc::from("review"),
+                child_id: child.map(Arc::from),
+            }
+        }
+
+        /// One block per case, each drawn alone in a 40x6 transcript.
+        fn lone(block: Block) -> Transcript {
+            let mut t = Transcript::new(40, 6);
+            t.sync(&[block], 0);
+            screen(&mut t, 40, 6);
+            t
+        }
+
+        #[test]
+        fn child_at_names_the_child_on_the_title_row_of_a_subagent_notice() {
+            let t = lone(subagent("a", "completed", Some("ses_child")));
+            assert_eq!(t.child_at(5, 1), Some("ses_child"));
+            assert_eq!(t.child_at(39, 1), Some("ses_child"), "anywhere on the row");
+            assert_eq!(t.child_at(5, 0), None, "row 0 is the margin");
+            assert_eq!(t.child_at(5, 2), None, "below the block");
+            assert_eq!(t.child_at(40, 1), None, "outside the drawn area");
+        }
+
+        #[test]
+        fn child_at_ignores_rows_without_a_child() {
+            assert_eq!(
+                lone(notice("a", "completed", "cargo test")).child_at(5, 1),
+                None,
+                "a shell notice"
+            );
+            assert_eq!(
+                lone(subagent("a", "completed", None)).child_at(5, 1),
+                None,
+                "a subagent notice without a child id"
+            );
+            assert_eq!(lone(Block::user("hi")).child_at(5, 1), None);
+        }
+
+        fn title_fg(t: &mut Transcript) -> Option<ratatui::style::Color> {
+            use ratatui::{Terminal, backend::TestBackend};
+            let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
+            terminal.draw(|f| t.render(f, f.area())).unwrap();
+            // Column 5 is inside `Subagent` on the title row.
+            terminal.backend().buffer()[(5, 1)].style().fg
+        }
+
+        #[test]
+        fn hovering_a_subagent_title_lights_it_up_unless_it_failed_or_was_cancelled() {
+            let base = crate::theme::palette();
+            let mut t = lone(subagent("a", "completed", Some("ses_child")));
+            assert_eq!(title_fg(&mut t), base.info.fg);
+            assert!(t.hover(5, 1), "entering the row is a change");
+            assert_eq!(t.hovered, Some(0));
+            assert_eq!(title_fg(&mut t), base.text.fg);
+            assert!(!t.hover(9, 1), "same row again: nothing to redraw");
+            assert!(t.hover(5, 0), "the margin is not a target");
+            assert_eq!(title_fg(&mut t), base.info.fg);
+
+            let mut t = lone(subagent("a", "error", Some("ses_child")));
+            t.hover(5, 1);
+            assert_eq!(title_fg(&mut t), base.warn.fg);
+            let mut t = lone(subagent("a", "cancelled", Some("ses_child")));
+            t.hover(5, 1);
+            assert_eq!(title_fg(&mut t), base.warning.fg);
+        }
+
+        #[test]
+        fn rows_without_a_child_never_hover() {
+            let mut t = lone(notice("a", "completed", "cargo test"));
+            assert!(!t.hover(5, 1), "a shell row");
+            let mut t = lone(subagent("a", "completed", None));
+            assert!(!t.hover(5, 1), "no child id");
+            assert_eq!(t.hovered, None);
+        }
+
+        fn notice(id: &str, state: &str, desc: &str) -> Block {
+            Block::Completion {
+                id: id.into(),
+                source: Shell,
+                state: Some(Arc::from(state)),
+                description: Arc::from(desc),
+                child_id: None,
+            }
+        }
+
+        #[test]
+        fn equality_is_by_id_only() {
+            assert_eq!(notice("a", "completed", "x"), notice("a", "error", "y"));
+            assert_ne!(notice("a", "completed", "x"), notice("b", "completed", "x"));
+        }
+
+        #[test]
+        fn a_transcript_draws_the_notice_one_blank_row_below_the_top() {
+            let mut t = Transcript::new(40, 4);
+            t.sync(&[notice("a", "completed", "cargo test")], 0);
+            let rows: Vec<String> = screen(&mut t, 40, 4).lines().map(str::to_owned).collect();
+            assert_eq!(rows[0], "", "margin row");
+            assert_eq!(rows[1], "   ↳ Shell finished · cargo test");
+        }
     }
 }

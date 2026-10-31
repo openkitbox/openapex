@@ -1,13 +1,16 @@
 //! History parsing: a chronological `Vec<Message>` becomes the store's single
-//! ordered `Vec<Item>`. Pure function, no IO. Synthetic messages are out of
-//! scope and are skipped; compaction messages become boundary items.
+//! ordered `Vec<Item>`. Pure function, no IO. Only shell / subagent
+//! completion notices are kept from synthetic messages; every other synthetic
+//! message stays skipped. Compaction messages become boundary items.
 
 use std::sync::Arc;
 
 use ox_schema::message::{AssistantContent, Compaction, Message, ToolState as WireToolState};
 use ox_schema::support::Content;
 
-use crate::store::{AssistantItem, CompactionItem, CompactionStatus, Item, ToolPart, ToolState};
+use crate::store::{
+    AssistantItem, CompactionItem, CompactionStatus, CompletionItem, Item, ToolPart, ToolState,
+};
 
 /// Turn a chronological message list into the store's ordered sequence.
 pub fn parse_messages(messages: &[Message]) -> Vec<Item> {
@@ -83,6 +86,18 @@ pub fn parse_messages(messages: &[Message]) -> Vec<Item> {
             }
             Message::Compaction(message) => {
                 items.push(Item::Compaction(Box::new(compaction_item(message))));
+            }
+            Message::Synthetic {
+                id,
+                metadata,
+                description,
+                ..
+            } => {
+                if let Some(item) =
+                    CompletionItem::from_synthetic(id, metadata.as_ref(), description.as_deref())
+                {
+                    items.push(Item::Completion(item));
+                }
             }
             _ => {}
         }

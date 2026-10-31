@@ -15,7 +15,7 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, Terminal};
 
 use ox_client::rest::{McpRef, McpStatus};
-use ox_client::store::{DataStore, Queued, ToolState};
+use ox_client::store::{CompletionSource, DataStore, Queued, ToolState};
 use ox_tui::app::keymap;
 use ox_tui::theme::{Deck, Palette};
 use ox_tui::ui::dialog;
@@ -226,6 +226,26 @@ fn cases() -> Vec<Case> {
             "system-notice",
             2,
             vec![Block::system("retry 1 · provider overloaded")],
+        ),
+        // 完成通知行
+        transcript_case(
+            "completion-notices",
+            8,
+            vec![
+                completion("n1", CompletionSource::Shell, "completed", "cargo test"),
+                completion(
+                    "n2",
+                    CompletionSource::Shell,
+                    "error",
+                    "cargo build --release",
+                ),
+                completion(
+                    "n3",
+                    CompletionSource::Subagent,
+                    "cancelled",
+                    "explore the repo",
+                ),
+            ],
         ),
         // prompt footer
         prompt_case(
@@ -999,5 +1019,15 @@ fn form_case(name: &'static str, height: u16, kind: FormKind) -> Case {
                 &Palette::for_deck(Deck::Truecolor),
             );
         }),
+    }
+}
+
+fn completion(id: &str, source: CompletionSource, state: &str, description: &str) -> Block {
+    Block::Completion {
+        id: id.into(),
+        source,
+        state: Some(Arc::from(state)),
+        description: Arc::from(description),
+        child_id: None,
     }
 }

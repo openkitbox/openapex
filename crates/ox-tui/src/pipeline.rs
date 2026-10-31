@@ -55,6 +55,13 @@ pub fn blocks_from_store(store: &DataStore) -> Vec<Block> {
                 cancelled: compaction.cancelled,
                 tokens: compaction.tokens,
             }),
+            Item::Completion(notice) => blocks.push(Block::Completion {
+                id: notice.id.clone(),
+                source: notice.source,
+                state: notice.state.clone(),
+                description: Arc::clone(&notice.description),
+                child_id: notice.child_id.clone(),
+            }),
         }
     }
     // Session-level failure/retry notices trail the transcript.
@@ -384,5 +391,40 @@ mod tests {
             Block::Compaction { id, version: 2, status: CompactionStatus::Completed, .. }
                 if id == "c1"
         ));
+    }
+
+    #[test]
+    fn completion_items_project_in_place_as_completion_blocks() {
+        use ox_client::store::{CompletionItem, CompletionSource};
+
+        let mut store = DataStore::default();
+        store.items = vec![
+            Item::User {
+                text: Arc::from("a"),
+                created: None,
+            },
+            Item::Completion(CompletionItem {
+                id: "n1".into(),
+                source: CompletionSource::Subagent,
+                state: Some(Arc::from("completed")),
+                description: Arc::from("explore"),
+                child_id: Some(Arc::from("ses_child")),
+            }),
+            Item::Assistant(Box::new(AssistantItem {
+                id: "m1".into(),
+                done: true,
+                ..Default::default()
+            })),
+        ];
+
+        let blocks = blocks_from_store(&store);
+        assert_eq!(blocks.len(), 3);
+        assert!(matches!(blocks[0], Block::User { .. }));
+        assert!(matches!(
+            &blocks[1],
+            Block::Completion { id, source: CompletionSource::Subagent, state: Some(state), description, child_id: Some(child) }
+                if id == "n1" && &**state == "completed" && &**description == "explore" && &**child == "ses_child"
+        ));
+        assert!(matches!(blocks[2], Block::Assistant { .. }));
     }
 }

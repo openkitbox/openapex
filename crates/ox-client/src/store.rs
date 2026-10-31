@@ -28,6 +28,71 @@ pub enum Item {
     /// A context-compaction boundary (`session.compaction.*` live, or a
     /// `compaction` message from history).
     Compaction(Box<CompactionItem>),
+    /// A shell / subagent completion notice (`↳ Shell finished · cmd`),
+    /// parsed from a `Synthetic` message by [`CompletionItem::from_synthetic`].
+    Completion(CompletionItem),
+}
+
+/// Who produced a completion notice (`metadata.source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionSource {
+    Shell,
+    Subagent,
+}
+
+/// One completion notice. Immutable once built, so it carries no version.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionItem {
+    /// Inbox / message id.
+    pub id: String,
+    pub source: CompletionSource,
+    /// The wire `state` word verbatim (`completed`/`error`/`cancelled`, or
+    /// anything else); `None` when absent. Never normalised here.
+    pub state: Option<Arc<str>>,
+    /// Shell: whitespace runs collapsed to one space and trimmed. Subagent:
+    /// verbatim. Empty means no description.
+    pub description: Arc<str>,
+    /// `metadata.childID`, subagent notices only.
+    pub child_id: Option<Arc<str>>,
+}
+
+impl CompletionItem {
+    /// The single parse point shared by history and the live path. `None`
+    /// unless `metadata.source` is `"shell"` or `"subagent"`.
+    pub fn from_synthetic(
+        id: &str,
+        metadata: Option<&ox_schema::support::Record>,
+        description: Option<&str>,
+    ) -> Option<Self> {
+        let metadata = metadata?;
+        let text = |key: &str| metadata.get(key).and_then(serde_json::Value::as_str);
+        let source = match text("source")? {
+            "shell" => CompletionSource::Shell,
+            "subagent" => CompletionSource::Subagent,
+            _ => return None,
+        };
+        let description = description.unwrap_or("");
+        let (description, child_id): (Arc<str>, Option<Arc<str>>) = match source {
+            CompletionSource::Shell => {
+                let mut collapsed = String::with_capacity(description.len());
+                for word in description.split_whitespace() {
+                    if !collapsed.is_empty() {
+                        collapsed.push(' ');
+                    }
+                    collapsed.push_str(word);
+                }
+                (Arc::from(collapsed), None)
+            }
+            CompletionSource::Subagent => (Arc::from(description), text("childID").map(Arc::from)),
+        };
+        Some(Self {
+            id: id.to_owned(),
+            source,
+            state: text("state").map(Arc::from),
+            description,
+            child_id,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +238,9 @@ pub struct DataStore {
     pub notices: Vec<Notice>,
     /// Prompts accepted but not yet delivered.
     pub queued: Vec<Queued>,
+    /// Completion notices enqueued but not yet delivered, by inbox id. Moved
+    /// into `items` on delivery; dropped on cancel and on history reload.
+    pending_completions: HashMap<String, CompletionItem>,
     /// Forms awaiting an answer (`form.created` not yet replied/cancelled),
     /// oldest first. The `question` tool is the only producer today.
     pub pending_forms: Vec<FormInfo>,
@@ -242,6 +310,7 @@ impl DataStore {
     pub fn replace_items(&mut self, items: Vec<Item>) {
         self.items = items;
         self.assistant_index.clear();
+        self.pending_completions.clear();
         for (index, item) in self.items.iter().enumerate() {
             if let Item::Assistant(assistant) = item {
                 self.assistant_index.insert(assistant.id.clone(), index);
@@ -613,9 +682,31 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
             });
             store.changed_from = 0;
         }
-        SessionEventData::InboxDelivered { inbox_id, .. }
-        | SessionEventData::InboxCancelled { inbox_id, .. } => {
+        SessionEventData::InboxEnqueued {
+            inbox_id,
+            item: ox_schema::inbox::Item::Synthetic { payload, .. },
+            ..
+        } => {
+            // No chip: a completion notice only appears once delivered.
+            if let Some(notice) = CompletionItem::from_synthetic(
+                inbox_id,
+                payload.metadata.as_ref(),
+                payload.description.as_deref(),
+            ) {
+                store.pending_completions.insert(inbox_id.clone(), notice);
+            }
+        }
+        SessionEventData::InboxDelivered { inbox_id, .. } => {
             store.queued.retain(|queued| queued.inbox_id != *inbox_id);
+            // Timeline position = delivery time; a repeat finds nothing to move.
+            if let Some(notice) = store.pending_completions.remove(inbox_id) {
+                store.items.push(Item::Completion(notice));
+            }
+            store.changed_from = 0;
+        }
+        SessionEventData::InboxCancelled { inbox_id, .. } => {
+            store.queued.retain(|queued| queued.inbox_id != *inbox_id);
+            store.pending_completions.remove(inbox_id);
             store.changed_from = 0;
         }
         SessionEventData::SessionModelSelected { model, .. } => {
@@ -802,7 +893,7 @@ mod tests {
     use ox_schema::event::EventEnvelope;
     use serde_json::json;
 
-    use super::{DataStore, Item, NoticeKind, ToolState, reduce};
+    use super::{CompletionItem, CompletionSource, DataStore, Item, NoticeKind, ToolState, reduce};
 
     fn env(kind: &str, data: serde_json::Value) -> EventEnvelope<serde_json::Value> {
         serde_json::from_value(json!({
@@ -1137,6 +1228,117 @@ mod tests {
             json!({"sessionID":"ses_1","inboxID":"inb_1"}),
         );
         assert!(store.queued.is_empty());
+    }
+
+    fn enqueue_synthetic(store: &mut DataStore, inbox_id: &str, metadata: serde_json::Value) {
+        apply(
+            store,
+            "session.inbox.enqueued",
+            json!({"sessionID":"ses_1","inboxID":inbox_id,
+                   "item":{"type":"synthetic","delivery":"steer",
+                           "payload":{"text":"body","description":"ls  -la","metadata":metadata}}}),
+        );
+    }
+
+    fn deliver(store: &mut DataStore, inbox_id: &str) {
+        apply(
+            store,
+            "session.inbox.delivered",
+            json!({"sessionID":"ses_1","inboxID":inbox_id}),
+        );
+    }
+
+    fn completions(store: &DataStore) -> Vec<&CompletionItem> {
+        store
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Completion(c) => Some(c),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn shell_meta() -> serde_json::Value {
+        json!({"source":"shell","shellID":"sh_1","state":"completed"})
+    }
+
+    #[test]
+    fn synthetic_shell_notice_lands_on_delivery_after_existing_items() {
+        let mut store = DataStore::default();
+        apply(
+            &mut store,
+            "session.step.started",
+            json!({"sessionID":"ses_1","assistantMessageID":"msg_1","agent":"build",
+                   "model":{"id":"m","providerID":"p"},"started":1}),
+        );
+        let before = store.items.len();
+
+        enqueue_synthetic(&mut store, "inb_9", shell_meta());
+        assert_eq!(store.items.len(), before, "enqueue adds no item");
+        assert!(store.queued.is_empty(), "synthetic creates no chip");
+
+        store.claim_changed_from();
+        deliver(&mut store, "inb_9");
+        assert_eq!(store.items.len(), before + 1);
+        let Some(Item::Completion(c)) = store.items.last() else {
+            panic!("trailing completion expected: {:?}", store.items.last());
+        };
+        assert_eq!(c.id, "inb_9");
+        assert_eq!(c.source, CompletionSource::Shell);
+        assert_eq!(&*c.description, "ls -la");
+        assert!(
+            store.changed_from <= before,
+            "subscribers must redraw the tail"
+        );
+    }
+
+    #[test]
+    fn cancelled_synthetic_never_becomes_a_notice() {
+        let mut store = DataStore::default();
+        enqueue_synthetic(&mut store, "inb_9", shell_meta());
+        apply(
+            &mut store,
+            "session.inbox.cancelled",
+            json!({"sessionID":"ses_1","inboxID":"inb_9"}),
+        );
+        deliver(&mut store, "inb_9");
+        assert!(completions(&store).is_empty());
+    }
+
+    #[test]
+    fn duplicate_delivery_yields_one_notice() {
+        let mut store = DataStore::default();
+        enqueue_synthetic(&mut store, "inb_9", shell_meta());
+        deliver(&mut store, "inb_9");
+        deliver(&mut store, "inb_9");
+        assert_eq!(completions(&store).len(), 1);
+    }
+
+    #[test]
+    fn non_completion_synthetics_never_surface() {
+        let mut store = DataStore::default();
+        enqueue_synthetic(&mut store, "inb_1", json!({"source":"goal"}));
+        enqueue_synthetic(&mut store, "inb_2", json!({}));
+        apply(
+            &mut store,
+            "session.inbox.enqueued",
+            json!({"sessionID":"ses_1","inboxID":"inb_3",
+                   "item":{"type":"synthetic","payload":{"text":"sys"},"delivery":"steer"}}),
+        );
+        for id in ["inb_1", "inb_2", "inb_3"] {
+            deliver(&mut store, id);
+        }
+        assert!(store.items.is_empty(), "{:?}", store.items);
+    }
+
+    #[test]
+    fn replace_items_drops_pending_completions() {
+        let mut store = DataStore::default();
+        enqueue_synthetic(&mut store, "inb_9", shell_meta());
+        store.replace_items(Vec::new());
+        deliver(&mut store, "inb_9");
+        assert!(completions(&store).is_empty());
     }
 
     #[test]
@@ -1695,5 +1897,81 @@ mod tests {
         let items = compaction(&store);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].status, super::CompactionStatus::Completed);
+    }
+
+    fn meta(value: serde_json::Value) -> ox_schema::support::Record {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn from_synthetic_parses_shell_states_verbatim() {
+        for state in ["completed", "error", "cancelled", "weird"] {
+            let metadata = meta(json!({"source": "shell", "shellID": "sh_1", "state": state}));
+            let item = CompletionItem::from_synthetic("inb_1", Some(&metadata), Some("ls"))
+                .expect("shell notice parses");
+            assert_eq!(item.id, "inb_1");
+            assert_eq!(item.source, CompletionSource::Shell);
+            assert_eq!(item.state.as_deref(), Some(state));
+            assert_eq!(&*item.description, "ls");
+            assert_eq!(item.child_id, None);
+        }
+    }
+
+    #[test]
+    fn from_synthetic_subagent_keeps_child_id_and_description_verbatim() {
+        let metadata =
+            meta(json!({"source": "subagent", "childID": "ses_c", "state": "completed"}));
+        let item = CompletionItem::from_synthetic("inb_2", Some(&metadata), Some("  a\n\tb   c "))
+            .expect("subagent notice parses");
+        assert_eq!(item.source, CompletionSource::Subagent);
+        assert_eq!(item.child_id.as_deref(), Some("ses_c"));
+        assert_eq!(&*item.description, "  a\n\tb   c ");
+    }
+
+    #[test]
+    fn from_synthetic_shell_description_collapses_whitespace() {
+        let metadata = meta(json!({"source": "shell", "state": "completed"}));
+        let item = CompletionItem::from_synthetic(
+            "inb_3",
+            Some(&metadata),
+            Some("  echo   hi\n\tthere \n"),
+        )
+        .unwrap();
+        assert_eq!(&*item.description, "echo hi there");
+    }
+
+    #[test]
+    fn from_synthetic_absent_description_is_empty() {
+        let metadata = meta(json!({"source": "shell", "state": "completed"}));
+        let item = CompletionItem::from_synthetic("inb_4", Some(&metadata), None).unwrap();
+        assert_eq!(&*item.description, "");
+    }
+
+    #[test]
+    fn from_synthetic_missing_or_non_string_state_is_none() {
+        let missing = meta(json!({"source": "shell"}));
+        let item = CompletionItem::from_synthetic("i", Some(&missing), None).unwrap();
+        assert_eq!(item.state, None);
+        let numeric = meta(json!({"source": "shell", "state": 3}));
+        let item = CompletionItem::from_synthetic("i", Some(&numeric), None).unwrap();
+        assert_eq!(item.state, None);
+    }
+
+    #[test]
+    fn from_synthetic_rejects_other_sources() {
+        assert!(CompletionItem::from_synthetic("i", None, Some("x")).is_none());
+        let no_source = meta(json!({"state": "completed"}));
+        assert!(CompletionItem::from_synthetic("i", Some(&no_source), None).is_none());
+        let goal = meta(json!({"source": "goal", "state": "completed"}));
+        assert!(CompletionItem::from_synthetic("i", Some(&goal), None).is_none());
+        let non_string = meta(json!({"source": 7}));
+        assert!(CompletionItem::from_synthetic("i", Some(&non_string), None).is_none());
+    }
+
+    #[test]
+    fn from_synthetic_shell_ignores_child_id() {
+        let metadata = meta(json!({"source": "shell", "state": "completed", "childID": "ses_x"}));
+        let item = CompletionItem::from_synthetic("i", Some(&metadata), None).unwrap();
+        assert_eq!(item.child_id, None);
     }
 }
