@@ -132,6 +132,11 @@ tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 [workspace.lints.clippy]
 result_large_err = "allow"
+wildcard_imports = "warn"
+unwrap_used = "warn"
+len_without_is_empty = "warn"
+must_use_candidate = "warn"
+undocumented_unsafe_blocks = "warn"
 
 [lints]
 workspace = true
