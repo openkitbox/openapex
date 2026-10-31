@@ -1,31 +1,34 @@
-//! The `shell` tool: run one command in an embedded brush session (pi-shell),
-//! with combined stdout/stderr capture, timeout kill, and cancellation kill.
+//! The `shell` tool: run one command through the system shell
+//! (`$SHELL` unless fish/nu, else `/bin/zsh` on macOS, `/bin/bash`,
+//! `/bin/sh`) as its own process group, with combined stdout/stderr capture,
+//! timeout kill, and cancellation kill.
 //!
 //! The surface mirrors upstream `packages/core/src/tool/plugin/shell.ts`:
 //! both streams interleave into one buffer, the tail is truncated by the
 //! tool-output limits (last 2 000 lines / 50 KiB), and a command that is
 //! still running when its yield window closes becomes an owned session,
 //! addressed by `session_id` from `interact` (observe) and `stop`. The table
-//! lives in [`sessions`], shared with the `/api/shell` endpoints.
+//! lives in [`sessions`], shared with the `/api/shell` endpoints; the OS
+//! layer (shell choice, spawn, signals) lives in [`process`].
 //!
-//! The engine underneath is pi-shell (pinned oh-my-pi rev): the model writes
-//! `bash`, not the host login shell. Output compression is RTK's job, done
-//! BEFORE execution: [`RtkRewriter`] rewrites the command itself
-//! (`git status` → `rtk git status`), so the capture, the paged output and
-//! the model-facing text are all the same bytes — there is no second,
-//! minimized copy. RTK buffers a wrapped command's output until it exits, so
-//! commands that return an owned session at once (`background=true` or
-//! `yield_time_ms=0`) are never rewritten; a rewritten foreground command
-//! that outlives its yield window says so in its "still running" notice.
-//! Commands run with stdin at `/dev/null` — pi-shell has no writer for a
-//! running command, so the old `chars` parameter is gone and interactive
-//! commands fail fast on EOF instead of hanging.
+//! The model writes the dialect of the selected shell; the tool description
+//! names it ([`sessions::ShellSessions::shell_name`]). Background children
+//! (`cmd &`) are real processes that outlive the call and are torn down by
+//! `stop`. Output compression is RTK's job, done BEFORE execution:
+//! [`RtkRewriter`] rewrites the command itself (`git status` →
+//! `rtk git status`), so the capture, the paged output and the model-facing
+//! text are all the same bytes — there is no second, minimized copy. RTK
+//! buffers a wrapped command's output until it exits, so commands that return
+//! an owned session at once (`background=true` or `yield_time_ms=0`) are never
+//! rewritten; a rewritten foreground command that outlives its yield window
+//! says so in its "still running" notice. Commands run with stdin at
+//! `/dev/null`, so interactive commands fail fast on EOF instead of hanging.
 
 pub mod completion;
 pub mod events;
 pub mod sessions;
 
-mod engine;
+mod process;
 
 use crate::contract::{Tool, ToolContext, ToolOutput};
 use crate::rtk::RtkRewriter;
@@ -62,9 +65,6 @@ pub(crate) const MAX_BYTES: usize = 50 * 1024;
 
 /// Upstream `BACKGROUND_INSTRUCTION` (tool/plugin/shell.ts).
 const BACKGROUND_INSTRUCTION: &str = "You will be notified automatically when the command finishes. The notification will include the command's output. Unless the user explicitly asks otherwise, DO NOT poll for completion, even if you need the final result to continue. Repeatedly sleeping and reading or searching the output file is polling, not useful work. You may read the current output if it lets you do useful work now, but do not repeatedly check it while waiting for the command to finish. Keep working on anything that does not depend on the result. If you have nothing else to do, end your response; you will be resumed automatically when the command finishes.";
-
-/// The dialect the model should write: brush implements `bash`.
-const SHELL_NAME: &str = "bash";
 
 pub struct ShellTool {
     /// Live sessions started by `run`, shared with the `/api/shell` handlers.
@@ -121,7 +121,11 @@ impl Tool for ShellTool {
 
     fn definition(&self) -> ToolDef {
         let mut lines = vec!["Execute a shell command and return its output.".to_owned()];
-        lines.push(format!("Commands run on {} using {SHELL_NAME}.", os_name()));
+        lines.push(format!(
+            "Commands run on {} using {}.",
+            os_name(),
+            self.sessions.shell_name()
+        ));
         lines.push("Quote file paths containing spaces or special characters.".to_owned());
         lines.push("Prefer dedicated tools over shell commands when possible.".to_owned());
         lines.push(

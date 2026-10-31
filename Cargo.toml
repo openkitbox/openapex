@@ -29,7 +29,6 @@ bytes = "1.12"
 crossterm = "0.28"
 dashmap = "6.2.1"
 dirs = "7.0.0"
-flume = "0.12"
 futures-core = "0.3"
 futures-util = "0.3"
 git2 = { version = "0.21", default-features = false }
@@ -54,9 +53,6 @@ ox-schema = { path = "crates/ox-schema" }
 ox-server = { path = "crates/ox-server" }
 ox-tools = { path = "crates/ox-tools" }
 ox-tui = { path = "crates/ox-tui" }
-# Shell engine: omp's pi-shell (brush-based). The pinned rev is the only
-# supported update path; bump it deliberately and re-run the shell corpus A/B.
-pi-shell = { git = "https://github.com/openkitbox/oh-my-pi", branch = "ox" }
 rand = "0.10"
 ratatui = "0.29"
 regex = "1"
@@ -79,10 +75,6 @@ tui-textarea = { version = "0.7", default-features = false }
 unicode-width = "0.2"
 url = "2"
 
-# pi-builtins and the vendored brush-core pull brush-core/brush-parser from
-# crates.io; omp redirects those to its vendored forks at the workspace root.
-# Patches are only honored from the top-level workspace, so ox must repeat them
-# or the graph would mix the crates.io brush with the fork.
 [patch.crates-io]
 # Every turso crate must come from the fork at one rev: the crates.io
 # turso_sdk_kit calls DatabaseOpts methods that the fork's newer core removed.
@@ -95,8 +87,6 @@ turso_sdk_kit = { git = "https://github.com/openkitbox/turso", branch = "ox" }
 turso_sdk_kit_macros = { git = "https://github.com/openkitbox/turso", branch = "ox" }
 turso_sync_engine = { git = "https://github.com/openkitbox/turso", branch = "ox" }
 turso_sync_sdk_kit = { git = "https://github.com/openkitbox/turso", branch = "ox" }
-brush-core = { git = "https://github.com/openkitbox/oh-my-pi", branch = "ox" }
-brush-parser = { git = "https://github.com/openkitbox/oh-my-pi", branch = "ox" }
 
 [package]
 name = "ox"
@@ -143,16 +133,6 @@ tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 [workspace.lints.clippy]
 result_large_err = "allow"
-
-# The shell engine (pi-builtins' grep-pcre2) and libgit2-sys' bundled PCRE2
-# (both hardwired in their build scripts, neither exposes a feature to drop
-# it) export the same `__pcre2_*` C symbols into one binary. ox uses each
-# through disjoint paths (shell `grep -P` vs. libgit2 repo discovery only),
-# so the duplicated tables are harmless; rustc relays ld's complaint about
-# them as linker-messages warnings, which are pure build noise here. Errors
-# from the linker still fail the build — only the relayed warnings are muted.
-[workspace.lints.rust]
-linker_messages = "allow"
 
 [lints]
 workspace = true

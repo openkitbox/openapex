@@ -13,9 +13,8 @@
 //!
 //! Recorded here because this module owns the wire shape of the notification:
 //!
-//! - `signal` is omitted from the metadata: pi-shell reports neither the
-//!   signal nor the stop reason as a signal, so [`Completion::signal`] is
-//!   never set by the engine (a stop shows as the `cancelled` state).
+//! - `signal` is omitted from the metadata: [`Completion::signal`] feeds the
+//!   notice text only, and a stop shows as the `cancelled` state.
 //! - An empty capture renders as `(no output)`; upstream renders an empty body.
 //! - A truncated capture ends with a `[output truncated; full output is paged
 //!   through GET /api/shell/{id}/output]` footer pointing at the paging
@@ -26,7 +25,7 @@
 //! - The `running` tool result lacks `truncated: false` in its metadata.
 //! - A nonzero exit is `completed` with an `Exited with code N` notice, as
 //!   upstream `notifyWhenDone` does; only a run with neither exit code nor
-//!   signal (an engine failure) is `error`, with the fixed text `Command
+//!   signal (a wait failure) is `error`, with the fixed text `Command
 //!   failed` instead of upstream's `info.error`.
 //! - `jobID` is not emitted: ox has one id per shell, the `shellID`.
 
@@ -44,12 +43,12 @@ use serde_json::json;
 use super::sessions::{Completion, Status};
 
 /// A completion sink that also learns which session the shell belongs to.
-/// The tool binds the session id per background call, so the shell engine
+/// The tool binds the session id per background call, so the shell session table
 /// stays unaware of sessions.
 pub type SessionSink = Arc<dyn Fn(&str, Completion) + Send + Sync + 'static>;
 
 /// Wakes a session for a newly enqueued inbox item. Implemented by the
-/// runner; a trait here keeps the shell engine from depending on it.
+/// runner; a trait here keeps the shell session table from depending on it.
 pub trait ShellWaker: Send + Sync {
     fn dispatch<'a>(
         &'a self,
@@ -203,7 +202,7 @@ pub fn payload(completion: &Completion) -> SyntheticPayload {
 /// `(state, notice)` for a settled run, mirroring upstream `notifyWhenDone`:
 /// the state is the job's, not the process's, so a command that ran and exited
 /// nonzero is still `completed` and says so in the notice. Only a run with no
-/// exit code at all (an engine failure) is `error`.
+/// exit code at all (a wait failure) is `error`.
 fn classify(completion: &Completion) -> (&'static str, Option<String>) {
     match completion.status {
         Status::Killed => ("cancelled", Some("Cancelled".to_owned())),

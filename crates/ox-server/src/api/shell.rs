@@ -122,9 +122,10 @@ pub(crate) async fn remove(req: &mut Request, depot: &mut Depot, res: &mut Respo
     };
     let table = sessions();
     // Always `stop`, even for a settled session: `settled()` flips before the
-    // exited notice goes out, and `stop` on a settled session only releases
-    // the interpreter and waits for the announcement, so `deleted` below can
-    // never overtake `exited`. No table lock is held across the await.
+    // exited notice goes out, and `stop` on a settled session only kills any
+    // leftover background process group and waits for the announcement, so
+    // `deleted` below can never overtake `exited`. No table lock is held
+    // across the await.
     if let Some(session) = table.get(&id) {
         session.stop(true).await;
     }
