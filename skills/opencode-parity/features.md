@@ -19,10 +19,14 @@
 | behavior | paste-attachment | component/prompt/local-attachment.ts:1 | crates/ox-tui/src/attachment.rs:37 | deviation | 图片/PDF 路径与 file:// 成为附件,上限 32 个 / 20MB;附件不写入历史,提交失败不恢复文本 |
 | behavior | paste-fold | component/prompt/index.tsx:1447 | crates/ox-tui/src/ui/paste.rs:88 | deviation | 3 行以上或超 150 字符折叠为 [Pasted ~N lines];占位符是普通文本(tui-textarea 无 extmark),无点击展开 |
 | behavior | patch-block | routes/session/index.tsx:3503 | crates/ox-tui/src/ui/patch_block.rs:44 | partial | 每文件一个 diff 块,patch/apply_patch 两名都认,失败态也画块。偏差:无 metadata.applied、无 move 源路径、失败无 metadata(服务端缺口) |
+| behavior | queued-dock | routes/session/index.tsx:225 | crates/ox-tui/src/ui/dock.rs:98 | partial | 输入框上方逐条列出排队提示词,<leader>q 有排队时开对话框、无则退出(keymap.tsx:231)。偏差见 dock.rs/queued_dialog.rs 模块文档 |
+| behavior | question-block | routes/session/index.tsx:3651 | crates/ox-tui/src/ui/question_block.rs:1 | partial | `# Questions` BlockTool + 问答列表;服务端在 metadata.answers 回传答案(ox-tools/src/question.rs)。偏差见 question_block.rs 模块文档 |
+| behavior | reasoning-markdown | routes/session/message-parts.tsx:59 | crates/ox-tui/src/ui/markdown.rs:57 | partial | 展开的思考正文按 muted markdown 渲染,`   ┃ ` 前缀、宽度 width-5(markdown::Tone::Muted) |
 | behavior | session-rows | routes/session/index.tsx:2022 | crates/ox-tui/src/ui/timeline.rs:1604 | partial | Error 挂在消息下;Retry 倒计时;agent/model/location 切换行;Instructions updated;Skill;Compaction queued;压缩 spinner。偏差见 store.rs/pipeline.rs 模块文档 |
 | behavior | shell-background-output | routes/session/index.tsx:3015 | crates/ox-tui/src/shell_captures.rs:114 | partial | 展开时每秒拉取一页、在飞不重发,退出后 drain 一次,超 1 MiB 保留尾部并显示 [earlier output omitted]。偏差:复用 33ms UI tick 节流;折叠块不轮询;按原始字节计限,绘制时去 ANSI;失败不立即重试;后台调用无输出前不显示结果文本;失败调用只显示错误 |
 | behavior | shell-block | routes/session/index.tsx:2969 | crates/ox-tui/src/ui/shell_block.rs:173 | partial | BlockTool 框、`$ [cd wd && ]cmd`、运行 spinner、Writing command…、折叠 10 行带 (N earlier lines)、点击/o 展开、Background 徽标、失败 error 已做(接线 ui/timeline.rs:1467)。偏差:前台完成调用显示工具结果;Background 仅在 shell 仍存活时显示;无部分输入解析;hover 用 palette.panel;无权限色;[ ] 焦点画 hover 带;spinner 只改缓存行的 spinner span |
 | behavior | shell-message | routes/session/index.tsx:2322 |  | n/a | ox 服务端从不产生 Message::Shell(仅 schema 有),TUI 也没有 ! 输入模式,故不渲染 |
+| behavior | sidebar-todo | routes/session/sidebar.tsx:1 | crates/ox-tui/src/ui/sidebar.rs:68 | partial | 42 列侧栏,宽>120 停靠右侧、否则浮层(Esc 先关),子会话不显示;Todo 节 ▼/▶ 折叠、(N remaining)、取最后一次成功 todowrite。偏差见 sidebar.rs 模块文档:无 revert 边界、不持久化、无滚动、只有 Todo 节、浮层无暗化背景 |
 | behavior | subagent-background-badge | routes/session/index.tsx:3289 | crates/ox-tui/src/ui/timeline.rs:1626 | aligned | 子会话运行时子代理工具行显示转圈和 Background |
 | behavior | tool-inline-texts | routes/session/index.tsx:3143 | crates/ox-tui/src/ui/tool_text.rs:93 | deviation | Read/Glob/Grep/WebFetch/Skill/Subagent/Question/Generic 文案已移植。偏差:Generic 键序按字母;子代理模型显示原始 provider/model,无 agent 名时为 General;展开体限 TOOL_OUTPUT_MAX_LINES |
 | behavior | write-block | routes/session/index.tsx:3143 | crates/ox-tui/src/ui/write_block.rs:40 | partial | `# Wrote path` + 带行号全文。偏差:无语法高亮;无 diagnostics;超宽单字形独占一行 |
@@ -40,7 +44,7 @@
 | dialog | dialog-go-upsell | component/dialog-go-upsell.tsx:1 |  | n/a | 上游商业推广弹窗(待用户确认) |
 | dialog | dialog-help | ui/dialog-help.tsx:1 |  | todo |  |
 | dialog | dialog-highlights | component/dialog-highlights.tsx:1 |  | todo |  |
-| dialog | dialog-image-preview | component/dialog-image-preview.tsx:1 |  | todo |  |
+| dialog | dialog-image-preview | component/dialog-image-preview.tsx:1 |  | deviation | 图片预览整体跳过(计划偏差 V8):上游默认关闭,需引入 ratatui-image 依赖链、终端协议探测和 attachment 数据通路;用户需要时另立计划 |
 | dialog | dialog-integration | component/dialog-integration.tsx:1 |  | todo |  |
 | dialog | dialog-mcp | component/dialog-mcp.tsx:1 |  | todo |  |
 | dialog | dialog-message | routes/session/dialog-message.tsx:1 |  | todo |  |
@@ -245,7 +249,7 @@
 | keybind | session.page.up | config/keybind.ts:181 |  | todo |  |
 | keybind | session.parent | config/keybind.ts:141 |  | todo |  |
 | keybind | session.pin.toggle | config/keybind.ts:142 |  | todo |  |
-| keybind | session.queued_prompts | config/keybind.ts:133 |  | todo |  |
+| keybind | session.queued_prompts | config/keybind.ts:133 | crates/ox-tui/src/app/keymap.rs:38 | aligned | <leader>q;无排队时退出,同上游 keymap.tsx:231 |
 | keybind | session.quick_switch.1 | config/keybind.ts:143 |  | todo |  |
 | keybind | session.quick_switch.2 | config/keybind.ts:144 |  | todo |  |
 | keybind | session.quick_switch.3 | config/keybind.ts:145 |  | todo |  |
@@ -258,7 +262,7 @@
 | keybind | session.redo | config/keybind.ts:196 |  | todo |  |
 | keybind | session.rename | config/keybind.ts:123 |  | todo |  |
 | keybind | session.share | config/keybind.ts:126 |  | todo |  |
-| keybind | session.sidebar.toggle | config/keybind.ts:96 |  | todo |  |
+| keybind | session.sidebar.toggle | config/keybind.ts:96 | crates/ox-tui/src/app/keymap.rs:40 | aligned | <leader>b;原 <leader>b 打开 Shells,改为侧栏,/shells 保留 |
 | keybind | session.tab.close | config/keybind.ts:119 |  | todo |  |
 | keybind | session.tab.history.back | config/keybind.ts:115 |  | todo |  |
 | keybind | session.tab.history.forward | config/keybind.ts:116 |  | todo |  |
@@ -573,7 +577,7 @@
 | tool_renderer | glob | routes/session/message-parts.tsx:23 |  | todo |  |
 | tool_renderer | grep | routes/session/message-parts.tsx:25 |  | todo |  |
 | tool_renderer | patch | routes/session/message-parts.tsx:32 | crates/ox-tui/src/ui/patch_block.rs:44 | partial | 见 behavior patch-block |
-| tool_renderer | question | routes/session/message-parts.tsx:34 |  | todo |  |
+| tool_renderer | question | routes/session/message-parts.tsx:34 | crates/ox-tui/src/ui/question_block.rs:1 | partial | 见 behavior question-block |
 | tool_renderer | read | routes/session/message-parts.tsx:24 |  | todo |  |
 | tool_renderer | shell | routes/session/message-parts.tsx:22 | crates/ox-tui/src/ui/shell_block.rs:173 | partial | 见 behavior shell-block |
 | tool_renderer | skill | routes/session/message-parts.tsx:35 |  | todo |  |

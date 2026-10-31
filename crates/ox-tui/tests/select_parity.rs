@@ -191,7 +191,13 @@ fn gold_panel_lines(gold: &str) -> Vec<String> {
 
 /// The real palette builder against the gold's rows it shares.
 fn real_palette_shares_its_rows_with_the_gold(gold_json: &str) {
-    let select = palette::select(Context { in_session: true }, keymap::hint);
+    let select = palette::select(
+        Context {
+            in_session: true,
+            has_queue: false,
+        },
+        keymap::hint,
+    );
     let ox = panel_lines(&render_select(select, 100, 30));
     let gold = gold_panel_lines(gold_json);
     for shared in [

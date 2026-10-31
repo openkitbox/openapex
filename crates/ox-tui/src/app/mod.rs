@@ -13,6 +13,7 @@ use ox_client::rest::{FamilyMember, ShellInfo, ShellTail};
 use ox_client::sse::StreamMsg;
 use ox_client::store::{DataStore, Item, ShellRef};
 use ox_schema::support::FileInput;
+use ratatui::layout::Rect;
 use tokio::sync::{mpsc, watch};
 
 use crate::attachment::Loaded;
@@ -23,7 +24,7 @@ use crate::terminal::TerminalGuard;
 use crate::ui::commands::CommandAction;
 use crate::ui::composer::{SearchAction, SearchBox, Submission};
 use crate::ui::dialog::{Dialog, DialogOutcome};
-use crate::ui::dock::{self, StatusMode};
+use crate::ui::dock::{self, DockHover, StatusMode};
 use crate::ui::layout;
 use crate::ui::output_dialog::{self, Output};
 use crate::ui::palette;
@@ -31,14 +32,16 @@ use crate::ui::paste;
 use crate::ui::prompt::{
     Activity, Chrome, Footer, Prompt, PromptAction, pick_placeholder, placeholder_line,
 };
+use crate::ui::queued_dialog;
 use crate::ui::selection::Outcome;
 use crate::ui::session_dialog;
 use crate::ui::shell_dialog;
+use crate::ui::sidebar::{self, TodoOpen};
 use crate::ui::subagent_dialog;
 use crate::ui::timeline::Transcript;
 use crate::ui::timeline_dialog;
 use crate::ui::toast::{self, Toast};
-use command::AppCommand;
+use command::{AppCommand, CancelReason};
 use event::AppEvent;
 use keymap::{Action, Feed, Keymap};
 use state::{Route, ViewState};
@@ -140,6 +143,49 @@ pub struct App {
     /// it keeps counting across session switches and an answer to a request
     /// made for an earlier store never matches the current one.
     shell_syncs: u64,
+    /// Where the queued-prompt dock was last drawn (empty when hidden), for
+    /// the pointer.
+    queued_dock_area: Rect,
+    /// Whether the pointer is over the queued-prompt dock.
+    dock_hover: DockHover,
+    /// Whether the session sidebar shows (upstream `session.sidebar` config
+    /// plus the in-memory `sidebarOpen`). Not persisted.
+    sidebar_pref: SidebarPref,
+    /// The sidebar Todo section's open state (upstream plugin storage).
+    todo_open: TodoOpen,
+    /// Where the sidebar was last drawn (empty when hidden), for the pointer.
+    sidebar_area: Rect,
+    /// Screen row of the clickable Todo header, when the sidebar drew one.
+    sidebar_header: Option<u16>,
+    /// The open session has a parent: upstream never shows its sidebar.
+    session_child: bool,
+    /// Width of the last session frame; decides docked vs overlay sidebar.
+    screen_width: u16,
+}
+
+/// Upstream `session.sidebar` (`auto` | `hide`) folded with `sidebarOpen`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SidebarPref {
+    /// Shown when the screen is wide.
+    #[default]
+    Auto,
+    /// Shown at any width (an overlay when narrow).
+    Open,
+    Hidden,
+}
+
+/// Upstream `wide`: past this width the sidebar docks beside the session.
+const WIDE_SCREEN: u16 = 120;
+
+/// Upstream `sidebarVisible` for a root session, minus the panels and
+/// terminals ox does not have.
+#[must_use]
+fn sidebar_visible(pref: SidebarPref, width: u16) -> bool {
+    match pref {
+        SidebarPref::Open => true,
+        SidebarPref::Auto => width > WIDE_SCREEN,
+        SidebarPref::Hidden => false,
+    }
 }
 
 /// Which shell dialog an in-flight request will open.
@@ -202,6 +248,14 @@ impl App {
             shell_wanted: None,
             shell_captures: ShellCaptures::default(),
             shell_syncs: 0,
+            queued_dock_area: Rect::default(),
+            dock_hover: DockHover::Off,
+            sidebar_pref: SidebarPref::default(),
+            todo_open: TodoOpen::default(),
+            sidebar_area: Rect::default(),
+            sidebar_header: None,
+            session_child: false,
+            screen_width: 0,
         }
     }
 
@@ -273,6 +327,7 @@ impl App {
                 // 切走之后迟到的答案不能覆盖新会话的显示。
                 if self.session.as_deref() == Some(session.as_str()) {
                     self.session_title = selection.title.clone();
+                    self.session_child = selection.child;
                     self.prompt.set_selection(
                         selection.agent,
                         selection.model,
@@ -427,6 +482,7 @@ impl App {
         }
         self.settled_forms.clear();
         self.session_title = None;
+        self.session_child = false;
         self.seq_tx.send_replace(None);
         self.request_forms();
     }
@@ -458,6 +514,13 @@ impl App {
                 self.dirty = true;
                 if tag == Some(session_dialog::LIST_TAG) || tag == Some(subagent_dialog::TAG) {
                     self.switch_session(value);
+                } else if tag == Some(queued_dialog::TAG) {
+                    if let Some(session) = self.session.clone() {
+                        let _ = self.commands.send(AppCommand::SteerQueued {
+                            session,
+                            inbox: value,
+                        });
+                    }
                 } else if tag == Some(shell_dialog::TAG) {
                     self.shell_wanted = Some(ShellWanted::Viewer);
                     self.request_shell_output(value);
@@ -489,6 +552,10 @@ impl App {
                     if key == output_dialog::REFRESH_KEY {
                         self.request_shell_output(value);
                     }
+                    return;
+                }
+                if tag == Some(queued_dialog::TAG) {
+                    self.on_queued_action(key, value);
                     return;
                 }
                 if tag == Some(shell_dialog::TAG) {
@@ -530,6 +597,66 @@ impl App {
                 }
             }
         }
+    }
+
+    /// `ctrl+d` / `ctrl+u` on a queued prompt. Delete closes the dialog only
+    /// after the last row (upstream `last`); undo moves the text into the
+    /// draft and closes it. The store drops the row only when the server's
+    /// `session.inbox.cancelled` lands, so the dialog is rebuilt without it
+    /// here at once.
+    fn on_queued_action(&mut self, key: char, inbox: String) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        let reason = match key {
+            queued_dialog::DELETE_KEY => CancelReason::Delete,
+            queued_dialog::UNDO_KEY => CancelReason::Undo,
+            _ => return,
+        };
+        if reason == CancelReason::Undo {
+            let Some(queued) = self.store.queued.iter().find(|q| q.inbox_id == inbox) else {
+                return;
+            };
+            let draft = self.prompt.text();
+            let text = if draft.is_empty() {
+                queued.text.to_string()
+            } else {
+                format!("{draft}\n\n{}", queued.text)
+            };
+            self.prompt.restore(&text);
+            self.dialog = None;
+        } else {
+            let rest = self.store.queued.iter().filter(|q| q.inbox_id != inbox);
+            let rest: Vec<&ox_client::store::Queued> = rest.collect();
+            self.dialog = if rest.is_empty() {
+                None
+            } else {
+                Some(queued_dialog::dialog(rest))
+            };
+        }
+        let _ = self.commands.send(AppCommand::CancelQueued {
+            session,
+            inbox,
+            reason,
+        });
+    }
+
+    /// Whether the sidebar shows on the last drawn screen.
+    fn sidebar_shown(&self) -> bool {
+        self.route == Route::Session
+            && !self.session_child
+            && sidebar_visible(self.sidebar_pref, self.screen_width)
+    }
+
+    /// The sidebar shows over the transcript because the screen is narrow.
+    fn sidebar_overlaid(&self) -> bool {
+        self.sidebar_shown() && self.screen_width <= WIDE_SCREEN
+    }
+
+    /// The queued-prompt dock shows above the prompt while prompts wait and
+    /// no form holds the prompt (upstream `index.tsx:1581`).
+    fn queued_dock_shown(&self) -> bool {
+        !self.store.queued.is_empty() && self.store.pending_forms.is_empty()
     }
 
     fn handle_session_deleted(&mut self, id: String) {
@@ -846,6 +973,18 @@ impl App {
             return;
         }
 
+        // The narrow overlay sidebar closes on esc / ctrl+c before anything
+        // else sees them (upstream `index.tsx:256-260`, layer priority 10).
+        if self.sidebar_overlaid()
+            && key.kind != crossterm::event::KeyEventKind::Release
+            && (key.code == KeyCode::Esc || keymap::is_cancel(&key))
+        {
+            self.keymap.reset();
+            self.sidebar_pref = SidebarPref::Hidden;
+            self.dirty = true;
+            return;
+        }
+
         // The search prompt owns the keyboard while it is open.
         if let Mode::SearchInput(boxed) = &mut self.mode {
             self.keymap.reset();
@@ -883,6 +1022,18 @@ impl App {
                 return;
             }
             Feed::Action(action) => {
+                // Upstream binds `<leader>q` to both `session.queued_prompts`
+                // and `app.exit`; with nothing queued the queue command is
+                // disabled and declines the key (`keymap.tsx:231-232`), so
+                // the exit binding runs. Only the key falls through: the
+                // slash menu, the palette and a dock click never exit.
+                if action == Action::Run(CommandAction::QueuedPrompts)
+                    && !self.queued_dialog_available()
+                {
+                    self.view.should_quit = true;
+                    self.dirty = true;
+                    return;
+                }
                 self.run_global(action);
                 self.dirty = true;
                 return;
@@ -970,6 +1121,7 @@ impl App {
             Action::OpenPalette => {
                 let context = palette::Context {
                     in_session: self.route == Route::Session,
+                    has_queue: !self.store.queued.is_empty(),
                 };
                 self.dialog = Some(Dialog::Select(palette::select(context, keymap::hint)));
                 self.dialog_purpose = None;
@@ -1053,6 +1205,11 @@ impl App {
         }
     }
 
+    /// Whether the queued-prompts command is enabled right now.
+    fn queued_dialog_available(&self) -> bool {
+        self.route == Route::Session && !self.store.queued.is_empty()
+    }
+
     fn run_command(&mut self, action: CommandAction) {
         match action {
             CommandAction::Exit => self.view.should_quit = true,
@@ -1075,11 +1232,28 @@ impl App {
                     let _ = self.commands.send(AppCommand::ListFamily { session });
                 }
             }
+            CommandAction::QueuedPrompts => {
+                // Disabled with nothing queued, as upstream (`index.tsx:1400`).
+                if self.queued_dialog_available() {
+                    self.dialog = Some(queued_dialog::dialog(&self.store.queued));
+                    self.dialog_purpose = None;
+                    self.dirty = true;
+                }
+            }
             CommandAction::Shells => {
                 if let Some(session) = self.session.clone() {
                     self.shell_wanted = Some(ShellWanted::Picker);
                     let _ = self.commands.send(AppCommand::ListShells { session });
                 }
+            }
+            CommandAction::ToggleSidebar => {
+                // Upstream `toggleSidebar`: hide what shows, open what does not.
+                self.sidebar_pref = if self.sidebar_shown() {
+                    SidebarPref::Hidden
+                } else {
+                    SidebarPref::Open
+                };
+                self.dirty = true;
             }
             CommandAction::Rename => {
                 if let Some(session) = self.session.clone() {
@@ -1331,6 +1505,19 @@ impl App {
         if !self.pointer_enabled() {
             return self.close_pointer_gate();
         }
+        if contains(self.queued_dock_area, x, y) {
+            self.transcript.release();
+            self.run_command(CommandAction::QueuedPrompts);
+            return;
+        }
+        if contains(self.sidebar_area, x, y) {
+            self.transcript.release();
+            if self.sidebar_header == Some(y) {
+                self.todo_open = self.todo_open.toggled();
+            }
+            self.dirty = true;
+            return;
+        }
         match self.transcript.release() {
             Outcome::Click => {
                 // A subagent notice opens its child session; the owned id
@@ -1356,12 +1543,20 @@ impl App {
     /// The pointer lights up transcript rows under the same gate as a click;
     /// anywhere else it clears the hover. Repaint only when that changed.
     fn handle_hover(&mut self, x: u16, y: u16) {
-        let changed = if self.pointer_enabled() {
+        let enabled = self.pointer_enabled();
+        let changed = if enabled {
             self.transcript.hover(x, y)
         } else {
             self.transcript.clear_hover()
         };
-        if changed {
+        let hover = if enabled && contains(self.queued_dock_area, x, y) {
+            DockHover::On
+        } else {
+            DockHover::Off
+        };
+        let dock_changed = hover != self.dock_hover;
+        self.dock_hover = hover;
+        if changed || dock_changed {
             self.dirty = true;
         }
     }
@@ -1502,6 +1697,80 @@ impl App {
         }
     }
 
+    /// One frame of the session route: transcript, docks, prompt, then the
+    /// sidebar, dialog and toast on top.
+    fn draw_session(&mut self, frame: &mut ratatui::Frame) {
+        let screen = frame.area();
+        self.screen_width = screen.width;
+        let sidebar = self.sidebar_shown().then(|| Rect {
+            x: screen.right().saturating_sub(sidebar::SIDEBAR_WIDTH),
+            width: screen.width.min(sidebar::SIDEBAR_WIDTH),
+            ..screen
+        });
+        // Wide: the session column gives the sidebar its width.
+        let full = match sidebar {
+            Some(panel) if !self.sidebar_overlaid() => Rect {
+                width: screen.width.saturating_sub(panel.width),
+                ..screen
+            },
+            _ => screen,
+        };
+        let searching = matches!(self.mode, Mode::SearchInput(_));
+        let prompt_h = self
+            .prompt
+            .height(full.height)
+            .min(full.height.saturating_sub(1));
+        let queued_h = if self.queued_dock_shown() {
+            dock::queued_dock_height(&self.store.queued)
+        } else {
+            0
+        };
+        let (timeline_area, queued_area, prompt_area, dock_area) =
+            layout::split_with_queue(full, if searching { 1 } else { prompt_h }, queued_h);
+        let queued_area = layout::padded(queued_area, full.width);
+        let queued_area = Rect {
+            height: queued_area.height.min(dock::QUEUED_DOCK_ROWS),
+            ..queued_area
+        };
+        self.queued_dock_area = if queued_h == 0 {
+            Rect::default()
+        } else {
+            queued_area
+        };
+        if queued_h > 0 {
+            let lines = dock::queued_dock(&self.store.queued, queued_area.width, self.dock_hover);
+            frame.render_widget(ratatui::widgets::Paragraph::new(lines), queued_area);
+        }
+        match &mut self.mode {
+            Mode::SearchInput(boxed) => boxed.render(frame, prompt_area, self.dialog.is_none()),
+            _ => {
+                let prompt_area = layout::padded(prompt_area, full.width);
+                let activity = self.activity();
+                self.prompt.render(frame, prompt_area, full, activity);
+            }
+        }
+        self.transcript
+            .render(frame, layout::padded(timeline_area, full.width));
+        let line = dock::status_line(&self.store, self.status_mode());
+        frame.render_widget(ratatui::widgets::Paragraph::new(line), dock_area);
+        self.sidebar_area = sidebar.unwrap_or_default();
+        self.sidebar_header = sidebar.and_then(|panel| {
+            sidebar::render(
+                self.session_title.as_deref().unwrap_or("New session"),
+                self.store.session_todos(),
+                self.todo_open,
+                panel,
+                frame.buffer_mut(),
+            )
+        });
+        if let Some(dialog) = &self.dialog {
+            crate::ui::dialog::render(frame, screen, dialog);
+        }
+        if let Some(toast) = &self.toast {
+            toast::render(frame.buffer_mut(), screen, toast, crate::theme::palette());
+        }
+    }
+
     pub async fn run(
         &mut self,
         terminal: &mut TerminalGuard,
@@ -1571,47 +1840,7 @@ impl App {
                                 }).map(|_| ())
                             }
                             Route::Session => {
-                                terminal.terminal.draw(|frame| {
-                                    let full = frame.area();
-                                    let searching = matches!(self.mode, Mode::SearchInput(_));
-                                    let prompt_h = self
-                                        .prompt
-                                        .height(full.height)
-                                        .min(full.height.saturating_sub(1));
-                                    let (timeline_area, prompt_area, dock_area) = layout::split(
-                                        full,
-                                        if searching { 1 } else { prompt_h },
-                                    );
-                                    match &mut self.mode {
-                                        Mode::SearchInput(boxed) => {
-                                            boxed.render(frame, prompt_area, self.dialog.is_none())
-                                        }
-                                        _ => {
-                                            let prompt_area =
-                                                layout::padded(prompt_area, full.width);
-                                            let activity = self.activity();
-                                            self.prompt.render(
-                                                frame,
-                                                prompt_area,
-                                                full,
-                                                activity,
-                                            );
-                                        }
-                                    }
-                                    self.transcript
-                                        .render(frame, layout::padded(timeline_area, full.width));
-                                    let line = dock::status_line(&self.store, self.status_mode());
-                                    frame.render_widget(
-                                        ratatui::widgets::Paragraph::new(line),
-                                        dock_area,
-                                    );
-                                    if let Some(dialog) = &self.dialog {
-                                        crate::ui::dialog::render(frame, full, dialog);
-                                    }
-                                    if let Some(toast) = &self.toast {
-                                        toast::render(frame.buffer_mut(), full, toast, crate::theme::palette());
-                                    }
-                                }).map(|_| ())
+                                terminal.terminal.draw(|frame| self.draw_session(frame)).map(|_| ())
                             }
                         };
                         execute!(terminal.terminal.backend_mut(), EndSynchronizedUpdate)?;
@@ -1629,6 +1858,11 @@ impl App {
     }
 }
 
+/// Whether the cell `(x, y)` lies in `area`.
+fn contains(area: Rect, x: u16, y: u16) -> bool {
+    area.contains(ratatui::layout::Position { x, y })
+}
+
 /// Send the pending OSC 52 copy sequence, if any, through the writer ratatui
 /// draws with, so it cannot interleave with a frame.
 fn flush_osc52(pending: &mut Option<String>, out: &mut impl std::io::Write) -> std::io::Result<()> {
@@ -1641,17 +1875,20 @@ fn flush_osc52(pending: &mut Option<String>, out: &mut impl std::io::Write) -> s
 
 #[cfg(test)]
 mod tests {
-    use super::{App, PendingHome};
+    use super::{App, PendingHome, SidebarPref};
     use crate::app::command::AppCommand;
     use crate::app::event::AppEvent;
     use crate::app::state::Route;
     use crate::attachment::Loaded;
+    use crate::ui::commands::CommandAction;
     use crate::ui::composer::Submission;
     use crate::ui::dialog::Dialog;
+    use crate::ui::sidebar::{self, TodoOpen};
     use crate::ui::toast::{self, Toast};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ox_client::store::Item;
     use ox_schema::support::FileInput;
+    use ratatui::layout::Rect;
     use std::time::{Duration, Instant};
     use tokio::sync::{mpsc, watch};
 
@@ -1761,7 +1998,10 @@ mod tests {
         app.handle(AppEvent::Hover { x: 5, y: 2 });
 
         app.dialog = Some(Dialog::Select(crate::ui::palette::select(
-            crate::ui::palette::Context { in_session: true },
+            crate::ui::palette::Context {
+                in_session: true,
+                has_queue: false,
+            },
             crate::app::keymap::hint,
         )));
         app.dirty = false;
@@ -2972,15 +3212,196 @@ mod tests {
     }
 
     #[test]
-    fn leader_b_asks_for_the_shells() {
+    fn leader_b_toggles_the_sidebar_and_no_longer_lists_shells() {
         let (mut app, mut rx) = app(Route::Session, Some("ses_root"));
+        app.screen_width = 80;
         let t = Instant::now();
         press_at(&mut app, 'x', true, t);
         press_at(&mut app, 'b', false, t);
-        assert!(matches!(
-            drain(&mut rx).as_slice(),
-            [AppCommand::ListShells { .. }]
-        ));
+        assert_eq!(
+            app.sidebar_pref,
+            SidebarPref::Open,
+            "narrow and hidden: opens"
+        );
+        assert!(
+            !drain(&mut rx)
+                .iter()
+                .any(|command| matches!(command, AppCommand::ListShells { .. })),
+            "leader b is the sidebar now"
+        );
+        press_at(&mut app, 'x', true, t);
+        press_at(&mut app, 'b', false, t);
+        assert_eq!(app.sidebar_pref, SidebarPref::Hidden, "shown: hides");
+    }
+
+    // ---- sidebar ------------------------------------------------------------
+
+    /// Four todos from one completed `todowrite`, as the store holds them.
+    fn with_todos(app: &mut App) {
+        let todos: Vec<ox_client::todo::Todo> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|content| ox_client::todo::Todo {
+                content: (*content).to_owned(),
+                status: ox_client::todo::TodoStatus::Pending,
+            })
+            .collect();
+        app.store
+            .items
+            .push(Item::Assistant(Box::new(ox_client::store::AssistantItem {
+                tools: vec![ox_client::store::ToolPart {
+                    tool: "todowrite".into(),
+                    state: ox_client::store::ToolState::Success,
+                    todos: std::sync::Arc::new(todos),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })));
+    }
+
+    fn draw_at(app: &mut App, width: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30))
+            .expect("terminal");
+        terminal
+            .draw(|frame| app.draw_session(frame))
+            .expect("draw");
+        terminal.backend().buffer().clone()
+    }
+
+    fn screen_row(buf: &ratatui::buffer::Buffer, y: u16, from: u16) -> String {
+        let text: String = (from..buf.area.width)
+            .map(|x| buf[(x, y)].symbol())
+            .collect();
+        text.trim_end().to_owned()
+    }
+
+    #[test]
+    fn a_wide_screen_docks_the_sidebar_by_default() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_root"));
+        app.session_title = Some("Fix the bug".into());
+        with_todos(&mut app);
+        let buf = draw_at(&mut app, 140);
+        let x = 140 - sidebar::SIDEBAR_WIDTH;
+        assert_eq!(
+            app.sidebar_area,
+            Rect::new(x, 0, sidebar::SIDEBAR_WIDTH, 30),
+            "auto and wide: docked on the right"
+        );
+        assert_eq!(screen_row(&buf, 1, x), "  Fix the bug");
+        assert_eq!(screen_row(&buf, 3, x), "  \u{25bc} Todo");
+        assert_eq!(
+            app.sidebar_header,
+            Some(3),
+            "the todo header row is clickable"
+        );
+    }
+
+    #[test]
+    fn a_narrow_screen_hides_the_sidebar_until_asked() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_root"));
+        let _ = draw_at(&mut app, 100);
+        assert_eq!(app.sidebar_area, Rect::default(), "auto and narrow: hidden");
+        app.run_command(CommandAction::ToggleSidebar);
+        let _ = draw_at(&mut app, 100);
+        assert_eq!(
+            app.sidebar_area.x,
+            100 - sidebar::SIDEBAR_WIDTH,
+            "overlay on the right"
+        );
+    }
+
+    #[test]
+    fn toggling_a_shown_sidebar_hides_it_even_when_wide() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_root"));
+        let _ = draw_at(&mut app, 140);
+        app.run_command(CommandAction::ToggleSidebar);
+        assert_eq!(
+            app.sidebar_pref,
+            SidebarPref::Hidden,
+            "shown: the toggle hides"
+        );
+        let _ = draw_at(&mut app, 140);
+        assert_eq!(
+            app.sidebar_area,
+            Rect::default(),
+            "hidden wins over a wide screen"
+        );
+    }
+
+    #[test]
+    fn esc_closes_the_narrow_overlay_first() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_root"));
+        app.screen_width = 100;
+        app.run_command(CommandAction::ToggleSidebar);
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(
+            app.sidebar_pref,
+            SidebarPref::Hidden,
+            "esc closes the overlay"
+        );
+
+        app.run_command(CommandAction::ToggleSidebar);
+        ctrl(&mut app, 'c');
+        assert_eq!(
+            app.sidebar_pref,
+            SidebarPref::Hidden,
+            "ctrl+c closes it too"
+        );
+        assert!(!app.view.should_quit, "and does not reach the quit path");
+    }
+
+    #[test]
+    fn esc_leaves_a_docked_sidebar_alone() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_root"));
+        app.screen_width = 140;
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(
+            app.sidebar_pref,
+            SidebarPref::Auto,
+            "esc only closes an overlay"
+        );
+    }
+
+    #[test]
+    fn a_child_session_never_shows_the_sidebar() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_child"));
+        app.handle(AppEvent::SessionChrome {
+            session: "ses_child".into(),
+            selection: crate::bootstrap::Selection {
+                child: true,
+                ..Default::default()
+            },
+        });
+        app.sidebar_pref = SidebarPref::Open;
+        let _ = draw_at(&mut app, 140);
+        assert_eq!(
+            app.sidebar_area,
+            Rect::default(),
+            "child sessions override an open preference"
+        );
+    }
+
+    #[test]
+    fn clicking_the_todo_header_folds_the_list() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_root"));
+        with_todos(&mut app);
+        let _ = draw_at(&mut app, 140);
+        let x = 140 - sidebar::SIDEBAR_WIDTH + 3;
+        app.handle_mouse_down(x, 3);
+        app.handle_mouse_up(x, 3);
+        assert_eq!(
+            app.todo_open,
+            TodoOpen::Closed,
+            "a header click folds the list"
+        );
+        let buf = draw_at(&mut app, 140);
+        assert_eq!(
+            screen_row(&buf, 3, 140 - sidebar::SIDEBAR_WIDTH),
+            "  \u{25b6} Todo (4 remaining)",
+            "folded: the header counts what is left"
+        );
+        app.handle_mouse_down(x, 5);
+        app.handle_mouse_up(x, 5);
+        assert_eq!(app.todo_open, TodoOpen::Closed, "only the header toggles");
     }
 
     #[test]
@@ -3433,6 +3854,189 @@ mod tests {
         let toast = app.toast.as_ref().expect("toast");
         assert_eq!(toast.title.as_deref(), Some("Failed to delete session"));
         assert_eq!(toast.message, "boom");
+    }
+
+    // ---- queued prompts ----------------------------------------------------
+
+    fn with_queue(app: &mut App) {
+        app.store.queued = ["first", "second"]
+            .iter()
+            .enumerate()
+            .map(|(index, text)| ox_client::store::Queued {
+                inbox_id: format!("inb_{index}"),
+                text: std::sync::Arc::from(*text),
+            })
+            .collect();
+    }
+
+    fn queued_open(app: &App) -> bool {
+        app.dialog.as_ref().and_then(Dialog::tag) == Some(crate::ui::queued_dialog::TAG)
+    }
+
+    fn open_queued(app: &mut App) {
+        let t = Instant::now();
+        press_at(app, 'x', true, t);
+        press_at(app, 'q', false, t);
+    }
+
+    #[test]
+    fn leader_q_opens_the_queued_prompts_with_their_position() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_root"));
+        with_queue(&mut app);
+        open_queued(&mut app);
+        assert!(queued_open(&app), "{:?}", app.dialog);
+        assert!(!app.view.should_quit, "leader q no longer exits");
+        let Some(Dialog::Select(select)) = app.dialog.as_ref() else {
+            panic!("select");
+        };
+        let footers: Vec<Option<&str>> = ["inb_0", "inb_1"]
+            .iter()
+            .map(|id| select.item(id).and_then(|item| item.footer.as_deref()))
+            .collect();
+        assert_eq!(
+            footers,
+            [Some("1 of 2"), Some("2 of 2")],
+            "each row shows its queue position"
+        );
+    }
+
+    #[test]
+    fn an_empty_queue_falls_through_to_exit() {
+        // Upstream binds `<leader>q` to both `session.queued_prompts` and
+        // `app.exit`; the disabled queue command declines the key
+        // (`context/keymap.tsx:231-232`) and the exit binding takes it.
+        let (mut app, _rx) = app(Route::Session, Some("ses_root"));
+        open_queued(&mut app);
+        assert!(app.dialog.is_none(), "{:?}", app.dialog);
+        assert!(app.view.should_quit, "leader q with no queue exits");
+    }
+
+    #[test]
+    fn the_queued_slash_command_with_no_queue_stays_open() {
+        // Upstream only disables the command (`enabled: queuedPrompts().length
+        // > 0`, `index.tsx:1400`); the exit fallthrough belongs to the key.
+        let (mut app, _rx) = app(Route::Session, Some("ses_root"));
+        type_text(&mut app, "/queued");
+        key(&mut app, KeyCode::Enter);
+        assert!(!app.view.should_quit, "/queued must never exit the app");
+        assert!(
+            app.dialog.is_none(),
+            "nothing queued, no dialog: {:?}",
+            app.dialog
+        );
+    }
+
+    #[test]
+    fn a_dock_click_after_the_queue_emptied_does_nothing() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_root"));
+        // The dock was drawn with a queue that has since been cancelled.
+        app.queued_dock_area = ratatui::layout::Rect::new(2, 10, 40, 3);
+        app.handle_mouse_down(5, 11);
+        app.handle_mouse_up(5, 11);
+        assert!(!app.view.should_quit, "a stale dock click must not exit");
+        assert!(
+            app.dialog.is_none(),
+            "nothing queued, no dialog: {:?}",
+            app.dialog
+        );
+    }
+
+    #[test]
+    fn enter_steers_the_selected_queued_prompt() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_root"));
+        with_queue(&mut app);
+        open_queued(&mut app);
+        drain(&mut rx);
+        key(&mut app, KeyCode::Down);
+        key(&mut app, KeyCode::Enter);
+        match drain(&mut rx).as_slice() {
+            [AppCommand::SteerQueued { session, inbox }] => {
+                assert_eq!(session, "ses_root");
+                assert_eq!(inbox, "inb_1");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(app.dialog.is_none(), "steering closes the dialog");
+    }
+
+    #[test]
+    fn ctrl_d_deletes_and_closes_only_after_the_last_prompt() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_root"));
+        with_queue(&mut app);
+        open_queued(&mut app);
+        drain(&mut rx);
+        ctrl_key(&mut app, 'd');
+        match drain(&mut rx).as_slice() {
+            [AppCommand::CancelQueued { session, inbox, .. }] => {
+                assert_eq!(session, "ses_root");
+                assert_eq!(inbox, "inb_0");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(queued_open(&app), "one prompt is left");
+        app.store.queued.remove(0);
+        ctrl_key(&mut app, 'd');
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [AppCommand::CancelQueued { inbox, .. }] if inbox == "inb_1"
+            ),
+            "the remaining prompt is cancelled: {commands:?}"
+        );
+        assert!(app.dialog.is_none(), "the last one closes the dialog");
+    }
+
+    #[test]
+    fn ctrl_u_takes_the_prompt_back_into_the_draft() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_root"));
+        with_queue(&mut app);
+        type_text(&mut app, "draft");
+        open_queued(&mut app);
+        drain(&mut rx);
+        ctrl_key(&mut app, 'u');
+        match drain(&mut rx).as_slice() {
+            [AppCommand::CancelQueued { session, inbox, .. }] => {
+                assert_eq!(session, "ses_root");
+                assert_eq!(inbox, "inb_0");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        assert!(app.dialog.is_none(), "undo closes the dialog");
+        assert_eq!(app.prompt.text(), "draft\n\nfirst");
+    }
+
+    #[test]
+    fn the_palette_offers_queued_prompts_only_with_a_queue() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_root"));
+        let listed = |app: &mut App| {
+            ctrl(app, 'p');
+            let found = matches!(
+                app.dialog.as_ref(),
+                Some(Dialog::Select(select)) if select.item("queued").is_some()
+            );
+            app.dialog = None;
+            found
+        };
+        assert!(!listed(&mut app), "an empty queue hides the entry");
+        with_queue(&mut app);
+        assert!(listed(&mut app), "a queue lists the entry");
+    }
+
+    #[test]
+    fn clicking_the_queued_dock_opens_the_dialog() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_root"));
+        with_queue(&mut app);
+        app.queued_dock_area = ratatui::layout::Rect::new(2, 10, 40, 3);
+        app.handle_hover(5, 11);
+        assert_eq!(
+            app.dock_hover,
+            crate::ui::dock::DockHover::On,
+            "the pointer is over the dock"
+        );
+        app.handle_mouse_down(5, 11);
+        app.handle_mouse_up(5, 11);
+        assert!(queued_open(&app), "{:?}", app.dialog);
     }
 
     // ---- child sessions (subagents) ---------------------------------------
@@ -4340,15 +4944,12 @@ mod tests {
     }
 
     #[test]
-    fn leader_n_goes_home_and_leader_q_quits() {
+    fn leader_n_goes_home() {
         let (mut app, _rx) = app(Route::Session, Some("ses_test"));
         let t = Instant::now();
         press_at(&mut app, 'x', true, t);
         press_at(&mut app, 'n', false, t);
         assert_eq!(app.route, Route::Home);
-        press_at(&mut app, 'x', true, t);
-        press_at(&mut app, 'q', false, t);
-        assert!(app.view.should_quit);
     }
 
     #[test]
@@ -4412,6 +5013,7 @@ mod tests {
             provider: Some("Cardinal".into()),
             variant: Some("high".into()),
             title: None,
+            child: false,
         };
         app.handle(AppEvent::SessionChrome {
             session: "ses_b".into(),
@@ -4775,7 +5377,10 @@ mod tests {
         app.handle(AppEvent::MouseDown { x: 3, y: 2 });
         app.handle(AppEvent::MouseDrag { x: 7, y: 2 });
         app.dialog = Some(Dialog::Select(crate::ui::palette::select(
-            crate::ui::palette::Context { in_session: true },
+            crate::ui::palette::Context {
+                in_session: true,
+                has_queue: false,
+            },
             crate::app::keymap::hint,
         )));
         app.handle(AppEvent::MouseUp { x: 7, y: 2 });
@@ -4788,7 +5393,10 @@ mod tests {
         let (mut app, _rx) = pointer_app(&["hello world"]);
         assert!(!app.transcript.has_selection());
         app.dialog = Some(Dialog::Select(crate::ui::palette::select(
-            crate::ui::palette::Context { in_session: true },
+            crate::ui::palette::Context {
+                in_session: true,
+                has_queue: false,
+            },
             crate::app::keymap::hint,
         )));
         key(&mut app, KeyCode::Esc);

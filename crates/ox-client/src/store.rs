@@ -603,6 +603,32 @@ impl DataStore {
         self.pending_forms.first()
     }
 
+    /// The session's current todo list (upstream `util/todo.ts`
+    /// `sessionTodos`): the list of the last `todowrite` call that
+    /// succeeded, across every assistant message. Running and failed calls
+    /// do not count. Empty when there is none. Borrowed, never copied.
+    ///
+    /// Deviation: upstream stops at the session's revert boundary; the TUI
+    /// tracks no revert state, so every message is considered.
+    #[must_use]
+    pub fn session_todos(&self) -> &[Todo] {
+        let assistants = self.items.iter().rev().filter_map(|item| match item {
+            Item::Assistant(assistant) => Some(assistant),
+            _ => None,
+        });
+        for assistant in assistants {
+            let last = assistant
+                .tools
+                .iter()
+                .rev()
+                .find(|part| part.tool == "todowrite" && part.state == ToolState::Success);
+            if let Some(part) = last {
+                return &part.todos;
+            }
+        }
+        &[]
+    }
+
     /// Something is running for this session: its own turn, or a child
     /// session it delegated to. Display only; interrupts keep using
     /// `running_since`, which child events never touch.
@@ -1227,9 +1253,16 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
             }
             store.touch(index);
         }
+        // Only queue-delivery prompts wait for the turn to end; steering ones
+        // land at the next step boundary and get no dock entry (upstream
+        // `queuedPrompts`, `routes/session/index.tsx:221-229`).
         SessionEventData::InboxEnqueued {
             inbox_id,
-            item: ox_schema::inbox::Item::User { payload, .. },
+            item:
+                ox_schema::inbox::Item::User {
+                    payload,
+                    delivery: ox_schema::inbox::Delivery::Queue,
+                },
             ..
         } => {
             store.queued.push(Queued {
@@ -1269,6 +1302,16 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
             if let Some(notice) = store.pending_completions.remove(inbox_id) {
                 store.items.push(Item::Completion(notice));
             }
+            store.changed_from = 0;
+        }
+        // Steered: it is no longer waiting for the turn. A change back to
+        // `queue` carries no text, so it does not bring an entry back.
+        SessionEventData::InboxDeliveryChanged {
+            inbox_id,
+            delivery: ox_schema::inbox::Delivery::Steer,
+            ..
+        } => {
+            store.queued.retain(|queued| queued.inbox_id != *inbox_id);
             store.changed_from = 0;
         }
         SessionEventData::InboxCancelled { inbox_id, .. } => {
@@ -1507,6 +1550,8 @@ fn bound_summary(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use ox_schema::event::EventEnvelope;
     use serde_json::json;
 
@@ -1838,10 +1883,19 @@ mod tests {
             &mut store,
             "session.inbox.enqueued",
             json!({"sessionID":"ses_1","inboxID":"inb_1",
-                   "item":{"type":"user","payload":{"text":"hi again"},"delivery":"steer"}}),
+                   "item":{"type":"user","payload":{"text":"hi again"},"delivery":"queue"}}),
         );
         assert_eq!(store.queued.len(), 1);
         assert_eq!(&*store.queued[0].text, "hi again");
+
+        // A steering prompt is delivered at the next step boundary: no chip.
+        apply(
+            &mut store,
+            "session.inbox.enqueued",
+            json!({"sessionID":"ses_1","inboxID":"inb_3",
+                   "item":{"type":"user","payload":{"text":"steer"},"delivery":"steer"}}),
+        );
+        assert_eq!(store.queued.len(), 1, "steer items are not queued");
 
         // A non-user item must not create a chip.
         apply(
@@ -1858,6 +1912,38 @@ mod tests {
             json!({"sessionID":"ses_1","inboxID":"inb_1"}),
         );
         assert!(store.queued.is_empty());
+    }
+
+    #[test]
+    fn steering_a_queued_prompt_drops_it_from_the_queue() {
+        let mut store = DataStore::default();
+        for id in ["inb_1", "inb_2"] {
+            apply(
+                &mut store,
+                "session.inbox.enqueued",
+                json!({"sessionID":"ses_1","inboxID":id,
+                       "item":{"type":"user","payload":{"text":id},"delivery":"queue"}}),
+            );
+        }
+        apply(
+            &mut store,
+            "session.inbox.delivery.changed",
+            json!({"sessionID":"ses_1","inboxID":"inb_1","delivery":"steer"}),
+        );
+        let ids: Vec<&str> = store.queued.iter().map(|q| q.inbox_id.as_str()).collect();
+        assert_eq!(ids, ["inb_2"], "a steered prompt leaves the queue");
+
+        // Back to queue: the server does not resend the text, so it stays gone.
+        apply(
+            &mut store,
+            "session.inbox.delivery.changed",
+            json!({"sessionID":"ses_1","inboxID":"inb_2","delivery":"queue"}),
+        );
+        assert_eq!(
+            store.queued.len(),
+            1,
+            "re-queueing without text does not resurrect the row"
+        );
     }
 
     fn enqueue_synthetic(store: &mut DataStore, inbox_id: &str, metadata: serde_json::Value) {
@@ -2412,6 +2498,82 @@ mod tests {
         assert_eq!(part.todos.len(), 2);
         assert_eq!(part.todos[0].content, "write tests");
         assert_eq!(part.todos[1].status, crate::todo::TodoStatus::InProgress);
+    }
+
+    fn tool_part(tool: &str, state: ToolState, contents: &[&str]) -> super::ToolPart {
+        let todos: Vec<crate::todo::Todo> = contents
+            .iter()
+            .map(|c| crate::todo::Todo {
+                content: (*c).to_owned(),
+                status: crate::todo::TodoStatus::Pending,
+            })
+            .collect();
+        super::ToolPart {
+            tool: tool.to_owned(),
+            state,
+            todos: Arc::new(todos),
+            ..Default::default()
+        }
+    }
+
+    fn store_with(messages: Vec<Vec<super::ToolPart>>) -> DataStore {
+        let mut store = DataStore::default();
+        for tools in messages {
+            store
+                .items
+                .push(Item::Assistant(Box::new(super::AssistantItem {
+                    tools,
+                    ..Default::default()
+                })));
+        }
+        store
+    }
+
+    fn contents(todos: &[crate::todo::Todo]) -> Vec<&str> {
+        todos.iter().map(|t| t.content.as_str()).collect()
+    }
+
+    #[test]
+    fn session_todos_is_the_last_completed_todowrite() {
+        let store = store_with(vec![
+            vec![tool_part("todowrite", ToolState::Success, &["old"])],
+            vec![
+                tool_part("todowrite", ToolState::Success, &["new"]),
+                tool_part("read", ToolState::Success, &[]),
+            ],
+        ]);
+        assert_eq!(
+            contents(store.session_todos()),
+            ["new"],
+            "the latest todowrite wins"
+        );
+    }
+
+    #[test]
+    fn session_todos_ignores_unfinished_todowrite_and_other_tools() {
+        let store = store_with(vec![
+            vec![tool_part("todowrite", ToolState::Success, &["kept"])],
+            vec![
+                tool_part("todowrite", ToolState::Running, &["running"]),
+                tool_part("todowrite", ToolState::Failed, &["failed"]),
+                tool_part("other", ToolState::Success, &["other"]),
+            ],
+        ]);
+        assert_eq!(
+            contents(store.session_todos()),
+            ["kept"],
+            "only successful todowrite calls count"
+        );
+    }
+
+    #[test]
+    fn session_todos_is_empty_without_a_todowrite() {
+        let store = store_with(vec![vec![tool_part("read", ToolState::Success, &[])]]);
+        assert!(
+            store.session_todos().is_empty(),
+            "no todowrite, no todos: {:?}",
+            store.session_todos()
+        );
     }
 
     #[test]

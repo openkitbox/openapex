@@ -22,7 +22,7 @@ use ox_schema::support::Record;
 use ox_tui::app::keymap;
 use ox_tui::theme::{Deck, Palette};
 use ox_tui::ui::dialog;
-use ox_tui::ui::dock::{StatusMode, status_line};
+use ox_tui::ui::dock::{DockHover, StatusMode, queued_dock, status_line};
 use ox_tui::ui::home;
 use ox_tui::ui::markdown;
 use ox_tui::ui::palette;
@@ -116,11 +116,15 @@ fn cases() -> Vec<Case> {
         // reasoning 展开态：需要 toggle，单独一个 Case
         Case {
             name: "reasoning-expanded",
-            height: 8,
+            height: 14,
             draw: Box::new(|frame, area| {
                 let mut t = Transcript::new(area.width, area.height);
                 t.sync(
-                    &assistant("答案。", "正在权衡两种布局方案，比较各自开销", true),
+                    &assistant(
+                        "答案。",
+                        "**比较布局**\n\n正在权衡两种布局方案，比较各自**开销**\n\n- 方案 A 用 `grid`\n- 方案 B\n\n```rust\nfn main() {}\n```",
+                        true,
+                    ),
                     0,
                 );
                 t.toggle_last_reasoning();
@@ -310,6 +314,21 @@ fn cases() -> Vec<Case> {
                 ToolState::Success,
                 serde_json::json!({"path": "src/cache.rs", "content": WRITE_CONTENT}),
                 None,
+            )],
+        ),
+        // question 已答：# Questions 块，问题 muted、答案 base，未答显示 (no answer)
+        transcript_case(
+            "question-answers",
+            12,
+            vec![tool_with(
+                "question",
+                ToolState::Success,
+                serde_json::json!({"questions": [
+                    {"question": "Which storage backend should the cache use?"},
+                    {"question": "Which platforms must the build support?"},
+                    {"question": "Anything else to keep in mind?"},
+                ]}),
+                Some(serde_json::json!({"answers": [["SQLite"], ["linux", "macos"], []]})),
             )],
         ),
         // 工具输出展开：聚焦态提示 + 展开态全文（o / [ ]）
@@ -549,21 +568,8 @@ fn cases() -> Vec<Case> {
         prompt_files_case(),
         // dock
         dock_case("dock-idle", DataStore::default(), StatusMode::Normal),
-        {
-            let mut running = DataStore::default();
-            running.running_since = Some(0);
-            running.queued = vec![
-                Queued {
-                    inbox_id: "in_1".into(),
-                    text: Arc::from("q1"),
-                },
-                Queued {
-                    inbox_id: "in_2".into(),
-                    text: Arc::from("q2"),
-                },
-            ];
-            dock_case("dock-running-queued", running, StatusMode::Normal)
-        },
+        queued_dock_case("dock-queued", DockHover::Off),
+        queued_dock_case("dock-queued-hover", DockHover::On),
         dock_case(
             "dock-search",
             DataStore::default(),
@@ -651,6 +657,43 @@ fn cases() -> Vec<Case> {
                 },
             ]
         }),
+        // Session sidebar: open on the left, folded on the right.
+        Case {
+            name: "sidebar",
+            height: 12,
+            draw: Box::new(|frame, area| {
+                use ox_client::todo::{Todo, TodoStatus::*};
+                use ox_tui::ui::sidebar::{self, SIDEBAR_WIDTH, TodoOpen};
+                let todo = |content: &str, status| Todo {
+                    content: content.into(),
+                    status,
+                };
+                let todos = [
+                    todo("Write the failing tests", Completed),
+                    todo("Implement the store projection", InProgress),
+                    todo("Drop the abandoned spike", Cancelled),
+                    todo(
+                        "Wire the sidebar into the session frame and check that a long todo wraps",
+                        Pending,
+                    ),
+                ];
+                let title = "Align the sidebar with upstream";
+                let width = area.width.min(SIDEBAR_WIDTH);
+                let open = Rect { width, ..area };
+                let _ = sidebar::render(title, &todos, TodoOpen::Open, open, frame.buffer_mut());
+                let x = area.x + SIDEBAR_WIDTH + 2;
+                if x + SIDEBAR_WIDTH <= area.right() {
+                    let closed = Rect { x, width, ..area };
+                    let _ = sidebar::render(
+                        title,
+                        &todos,
+                        TodoOpen::Closed,
+                        closed,
+                        frame.buffer_mut(),
+                    );
+                }
+            }),
+        },
         transcript_case("todo-inline-states", 8, {
             let row = |id: &str, state| Block::Todo {
                 id: id.into(),
@@ -703,7 +746,13 @@ fn cases() -> Vec<Case> {
         select_case(
             "command-palette",
             30,
-            palette::select(palette::Context { in_session: true }, keymap::hint),
+            palette::select(
+                palette::Context {
+                    in_session: true,
+                    has_queue: false,
+                },
+                keymap::hint,
+            ),
         ),
         session_case("sessions-list", 30, |_| {}),
         session_case("sessions-delete-armed", 30, |dialog| {
@@ -1194,6 +1243,28 @@ fn dock_case(name: &'static str, store: DataStore, mode: StatusMode<'static>) ->
         height: 1,
         draw: Box::new(move |frame, area| {
             Paragraph::new(line.clone()).render(area, frame.buffer_mut());
+        }),
+    }
+}
+
+/// The queued-prompt dock over two prompts, the first one multi-line.
+fn queued_dock_case(name: &'static str, hover: DockHover) -> Case {
+    let queued = vec![
+        Queued {
+            inbox_id: "in_1".into(),
+            text: Arc::from("run the tests again\nthen fix what breaks"),
+        },
+        Queued {
+            inbox_id: "in_2".into(),
+            text: Arc::from("q2"),
+        },
+    ];
+    Case {
+        name,
+        height: 3,
+        draw: Box::new(move |frame, area| {
+            let lines = queued_dock(&queued, area.width, hover);
+            Paragraph::new(lines).render(area, frame.buffer_mut());
         }),
     }
 }

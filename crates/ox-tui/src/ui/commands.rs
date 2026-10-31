@@ -39,6 +39,10 @@ pub enum CommandAction {
     Subagents,
     /// Fetch the background shells and open the shell picker.
     Shells,
+    /// Open the queued-prompts dialog (upstream `session.queued_prompts`).
+    QueuedPrompts,
+    /// Show or hide the session sidebar (upstream `session.sidebar.toggle`).
+    ToggleSidebar,
 }
 
 /// One registered command. `aliases` are rendered as their own menu rows,
@@ -107,6 +111,14 @@ pub const COMMANDS: &[Command] = &[
         action: CommandAction::New,
     },
     Command {
+        name: "queued",
+        aliases: &[],
+        description: "View queued prompts",
+        title: "View queued prompts",
+        group: "Prompt",
+        action: CommandAction::QueuedPrompts,
+    },
+    Command {
         name: "rename",
         aliases: &[],
         description: "Rename session",
@@ -145,6 +157,14 @@ pub const COMMANDS: &[Command] = &[
         title: "Jump to message",
         group: "Session",
         action: CommandAction::Timeline,
+    },
+    Command {
+        name: "sidebar",
+        aliases: &[],
+        description: "Toggle sidebar",
+        title: "Toggle sidebar",
+        group: "Session",
+        action: CommandAction::ToggleSidebar,
     },
     Command {
         name: "status",
@@ -262,11 +282,13 @@ mod tests {
                 "models",
                 "new",
                 "q",
+                "queued",
                 "quit",
                 "rename",
                 "resume",
                 "sessions",
                 "shells",
+                "sidebar",
                 "status",
                 "subagents",
                 "timeline"
@@ -277,7 +299,7 @@ mod tests {
     #[test]
     fn every_alias_is_its_own_row() {
         let all = rows("");
-        assert_eq!(all.len(), 16);
+        assert_eq!(all.len(), 18, "one row per name and alias");
         let quit = all.iter().find(|row| row.name == "quit").expect("quit row");
         assert_eq!(quit.action, CommandAction::Exit);
         assert_eq!(quit.description, "Exit the app");
@@ -287,7 +309,7 @@ mod tests {
     fn prefix_and_substring_and_subsequence_are_ranked() {
         let matched = rows("q");
         let names: Vec<&str> = matched.iter().map(|row| row.name).collect();
-        assert_eq!(names, vec!["q", "quit"]);
+        assert_eq!(names, vec!["q", "queued", "quit"]);
 
         let matched = rows("ui");
         let names: Vec<&str> = matched.iter().map(|row| row.name).collect();

@@ -8,8 +8,12 @@
 //!
 //! Deviations from upstream, all because ox lacks the feature behind the row:
 //! - no `Connect an integration`, `Open settings` or `Queue prompt` rows;
+//! - `View queued prompts` is left out instead of shown disabled while the
+//!   queue is empty (the Select has no disabled rows);
 //! - `Switch session` is always suggested (upstream: only when sessions exist;
 //!   ox has no cached session list at hand);
+//! - `Toggle sidebar` has one fixed title (upstream switches between
+//!   `Show sidebar` and `Hide sidebar`);
 //! - filtering keeps the category headers (upstream flattens the list and
 //!   shows `group · keys` as the footer).
 
@@ -33,7 +37,9 @@ const ORDER: &[CommandAction] = &[
     CommandAction::Timeline,
     CommandAction::Fork,
     CommandAction::Subagents,
+    CommandAction::QueuedPrompts,
     CommandAction::Shells,
+    CommandAction::ToggleSidebar,
     CommandAction::Models,
     CommandAction::Agents,
     CommandAction::Status,
@@ -46,7 +52,9 @@ const SESSION_ONLY: &[CommandAction] = &[
     CommandAction::Timeline,
     CommandAction::Fork,
     CommandAction::Subagents,
+    CommandAction::QueuedPrompts,
     CommandAction::Shells,
+    CommandAction::ToggleSidebar,
 ];
 
 /// What the palette needs to know about the app.
@@ -55,6 +63,8 @@ pub struct Context {
     /// A session is open (`New session` is only suggested then, and `Fork`
     /// only makes sense then).
     pub in_session: bool,
+    /// Prompts wait in the queue (`View queued prompts` is enabled only then).
+    pub has_queue: bool,
 }
 
 /// Upstream `suggested` per command.
@@ -86,6 +96,7 @@ pub fn select(context: Context, hint_of: HintOf) -> Select {
     let commands: Vec<&Command> = ORDER
         .iter()
         .filter(|action| context.in_session || !SESSION_ONLY.contains(action))
+        .filter(|action| context.has_queue || **action != CommandAction::QueuedPrompts)
         .filter_map(|action| command_of(*action))
         .collect();
     let copies = commands
@@ -140,7 +151,13 @@ mod tests {
 
     #[test]
     fn the_palette_lists_every_command_with_its_key_hint() {
-        let select = select(Context { in_session: true }, keymap::hint);
+        let select = select(
+            Context {
+                in_session: true,
+                has_queue: true,
+            },
+            keymap::hint,
+        );
         for command in COMMANDS {
             let item = select
                 .item(command.name)
@@ -165,13 +182,25 @@ mod tests {
 
     #[test]
     fn suggested_rows_lead_and_follow_the_session_state() {
-        let mut in_session = select(Context { in_session: true }, keymap::hint);
+        let mut in_session = select(
+            Context {
+                in_session: true,
+                has_queue: false,
+            },
+            keymap::hint,
+        );
         assert_eq!(in_session.selected_value(), Some("suggested:sessions"));
         for expected in ["suggested:new", "suggested:models"] {
             press(&mut in_session, KeyCode::Down);
             assert_eq!(in_session.selected_value(), Some(expected));
         }
-        let mut home = select(Context { in_session: false }, keymap::hint);
+        let mut home = select(
+            Context {
+                in_session: false,
+                has_queue: false,
+            },
+            keymap::hint,
+        );
         press(&mut home, KeyCode::Down);
         assert_eq!(home.selected_value(), Some("suggested:models"));
         assert!(home.item("fork").is_none(), "nothing to fork on Home");
@@ -179,7 +208,13 @@ mod tests {
 
     #[test]
     fn typing_drops_the_suggested_copies() {
-        let mut select = select(Context { in_session: true }, keymap::hint);
+        let mut select = select(
+            Context {
+                in_session: true,
+                has_queue: false,
+            },
+            keymap::hint,
+        );
         type_text(&mut select, "switch");
         let mut seen = Vec::new();
         for _ in 0..4 {
@@ -193,7 +228,13 @@ mod tests {
 
     #[test]
     fn enter_hands_back_a_value_that_maps_to_its_action() {
-        let mut select = select(Context { in_session: true }, keymap::hint);
+        let mut select = select(
+            Context {
+                in_session: true,
+                has_queue: false,
+            },
+            keymap::hint,
+        );
         let DialogOutcome::Selected(value) = press(&mut select, KeyCode::Enter) else {
             panic!("enter selects");
         };
@@ -205,7 +246,13 @@ mod tests {
 
     #[test]
     fn the_dialog_carries_the_palette_tag() {
-        let dialog = Dialog::Select(select(Context { in_session: true }, keymap::hint));
+        let dialog = Dialog::Select(select(
+            Context {
+                in_session: true,
+                has_queue: false,
+            },
+            keymap::hint,
+        ));
         assert_eq!(dialog.tag(), Some(TAG));
     }
 }

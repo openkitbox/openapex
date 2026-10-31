@@ -10,7 +10,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::theme;
 
 /// Upstream `todoMarker`.
-fn marker(status: TodoStatus) -> &'static str {
+pub(crate) fn marker(status: TodoStatus) -> &'static str {
     match status {
         TodoStatus::Completed => "[\u{2713}]",
         TodoStatus::InProgress => "[\u{2022}]",

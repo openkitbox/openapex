@@ -510,6 +510,64 @@ async fn kill_shell_sends_a_delete() {
     assert!(matches!(err, ox_client::Error::Status(status) if status.as_u16() == 404));
 }
 
+#[tokio::test]
+async fn steer_queued_patches_the_inbox_delivery() {
+    let mock = MockOx::default();
+    mock.reply_raw(
+        "/api/session/ses_1/inbox/inb_1",
+        "HTTP/1.1 204 No Content\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+    );
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    client.steer_queued("ses_1", "inb_1").await.unwrap();
+    let request = &mock.requests()[0];
+    assert!(
+        request.starts_with("PATCH /api/session/ses_1/inbox/inb_1 "),
+        "steering patches the inbox item: {request}"
+    );
+    assert!(
+        request.contains(r#"{"delivery":"steer"}"#),
+        "the body switches delivery to steer: {request}"
+    );
+
+    let err = client
+        .steer_queued("ses_1", "inb_missing")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ox_client::Error::Status(status) if status.as_u16() == 404),
+        "an unknown inbox item surfaces the 404: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn cancel_queued_deletes_the_inbox_item() {
+    let mock = MockOx::default();
+    mock.reply_raw(
+        "/api/session/ses_1/inbox/inb_1",
+        "HTTP/1.1 204 No Content\r\nconnection: close\r\ncontent-length: 0\r\n\r\n",
+    );
+    let base = mock.start().await;
+    let client = Client::new(base, "/proj");
+
+    client.cancel_queued("ses_1", "inb_1").await.unwrap();
+    let request = &mock.requests()[0];
+    assert!(
+        request.starts_with("DELETE /api/session/ses_1/inbox/inb_1 "),
+        "cancelling deletes the inbox item: {request}"
+    );
+
+    let err = client
+        .cancel_queued("ses_1", "inb_missing")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ox_client::Error::Status(status) if status.as_u16() == 404),
+        "an unknown inbox item surfaces the 404: {err:?}"
+    );
+}
+
 fn shell_page(output: &str, cursor: u64, size: u64) -> String {
     format!(
         r#"{{"location":{{"directory":"/proj"}},"data":{{"output":{},"cursor":{cursor},"size":{size},"truncated":false}}}}"#,

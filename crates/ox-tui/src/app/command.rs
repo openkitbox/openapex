@@ -84,6 +84,17 @@ pub enum AppCommand {
         session: String,
         id: String,
     },
+    /// Deliver queued prompt `inbox` of `session` at the next step boundary.
+    SteerQueued {
+        session: String,
+        inbox: String,
+    },
+    /// Drop queued prompt `inbox` of `session`; `reason` names the toast.
+    CancelQueued {
+        session: String,
+        inbox: String,
+        reason: CancelReason,
+    },
     /// Read shell `id`'s output from `cursor` for its expanded block;
     /// answered with `AppEvent::ShellPolled`, which never opens a dialog.
     ShellPoll {
@@ -162,4 +173,12 @@ impl Switch {
             Switch::Agent { .. } => "Failed to switch agent",
         }
     }
+}
+
+/// Why a queued prompt is cancelled: only the failure toast differs
+/// (upstream `Failed to delete|undo pending prompt`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReason {
+    Delete,
+    Undo,
 }

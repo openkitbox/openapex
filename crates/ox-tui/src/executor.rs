@@ -11,7 +11,7 @@ use ox_client::Client;
 use ox_schema::support::FileInput;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::app::command::{AgentIntent, AppCommand, Switch};
+use crate::app::command::{AgentIntent, AppCommand, CancelReason, Switch};
 use crate::app::event::AppEvent;
 
 type Events = UnboundedSender<AppEvent>;
@@ -43,6 +43,24 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
             shell_poll(&client, &tx, id, cursor, mode).await
         }
         AppCommand::KillShell { session, id } => kill_shell(&client, &tx, session, &id).await,
+        AppCommand::SteerQueued { session, inbox } => {
+            if let Err(err) = client.steer_queued(&session, &inbox).await {
+                let _ = tx.send(session_failed("Failed to steer pending prompt", err));
+            }
+        }
+        AppCommand::CancelQueued {
+            session,
+            inbox,
+            reason,
+        } => {
+            if let Err(err) = client.cancel_queued(&session, &inbox).await {
+                let title = match reason {
+                    CancelReason::Delete => "Failed to delete pending prompt",
+                    CancelReason::Undo => "Failed to undo pending prompt",
+                };
+                let _ = tx.send(session_failed(title, err));
+            }
+        }
         AppCommand::RenameSession { session, title } => {
             rename_session(&client, &tx, &session, &title).await
         }

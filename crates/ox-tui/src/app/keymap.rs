@@ -8,7 +8,11 @@
 //! `command.palette.show = ctrl+p`, `leader = ctrl+x` with a 2000ms timeout
 //! (`context/keymap.tsx:143`), `session.new = <leader>n`,
 //! `session.list = <leader>l`, `session.child.first = <leader>down`, `model.list = <leader>m`, `agent.list = <leader>a`,
-//! `opencode.status = <leader>s`, `app.exit = ctrl+c,ctrl+d,<leader>q`.
+//! `opencode.status = <leader>s`, `session.sidebar.toggle = <leader>b`,
+//! `session.queued_prompts = <leader>q`
+//! (upstream's `app.exit` also lists `<leader>q`: the queue command takes
+//! the key while prompts are queued, otherwise it declines and the app
+//! exits; `App::run_command` makes that choice).
 //! A key that does not continue a pending leader sequence cancels it and is
 //! swallowed (upstream `registerEscapeClearsPendingSequence` plus the
 //! timed-leader's `clearPendingSequence`).
@@ -31,9 +35,9 @@ const LEADER_KEYS: &[(KeyCode, CommandAction)] = &[
     (KeyCode::Char('m'), CommandAction::Models),
     (KeyCode::Char('a'), CommandAction::Agents),
     (KeyCode::Char('s'), CommandAction::Status),
-    (KeyCode::Char('q'), CommandAction::Exit),
+    (KeyCode::Char('q'), CommandAction::QueuedPrompts),
     (KeyCode::Down, CommandAction::Subagents),
-    (KeyCode::Char('b'), CommandAction::Shells),
+    (KeyCode::Char('b'), CommandAction::ToggleSidebar),
 ];
 
 /// What a global binding asks the app to do.
@@ -200,7 +204,7 @@ mod tests {
             ('m', CommandAction::Models),
             ('a', CommandAction::Agents),
             ('s', CommandAction::Status),
-            ('q', CommandAction::Exit),
+            ('q', CommandAction::QueuedPrompts),
         ];
         for (ch, action) in cases {
             let mut map = Keymap::default();
@@ -217,13 +221,13 @@ mod tests {
     }
 
     #[test]
-    fn leader_b_opens_the_shell_picker() {
+    fn leader_b_toggles_the_sidebar() {
         let mut map = Keymap::default();
         let t0 = Instant::now();
         map.feed(&ctrl('x'), t0, true);
         assert_eq!(
             map.feed(&plain('b'), at(t0, 100), true),
-            Feed::Action(Action::Run(CommandAction::Shells))
+            Feed::Action(Action::Run(CommandAction::ToggleSidebar))
         );
     }
 
@@ -357,9 +361,27 @@ mod tests {
         assert_eq!(hint(CommandAction::Sessions).as_deref(), Some("ctrl+x l"));
         assert_eq!(hint(CommandAction::New).as_deref(), Some("ctrl+x n"));
         assert_eq!(hint(CommandAction::Models).as_deref(), Some("ctrl+x m"));
-        assert_eq!(hint(CommandAction::Exit).as_deref(), Some("ctrl+x q"));
+        assert_eq!(
+            hint(CommandAction::QueuedPrompts).as_deref(),
+            Some("ctrl+x q"),
+            "leader q opens the queue"
+        );
+        assert_eq!(
+            hint(CommandAction::Exit),
+            None,
+            "leader q now belongs to the queue"
+        );
         assert_eq!(hint(CommandAction::Subagents).as_deref(), Some("ctrl+x ↓"));
-        assert_eq!(hint(CommandAction::Shells).as_deref(), Some("ctrl+x b"));
+        assert_eq!(
+            hint(CommandAction::ToggleSidebar).as_deref(),
+            Some("ctrl+x b"),
+            "leader b toggles the sidebar"
+        );
+        assert_eq!(
+            hint(CommandAction::Shells),
+            None,
+            "leader b moved to the sidebar"
+        );
         assert_eq!(hint(CommandAction::Fork), None);
         assert_eq!(hint(CommandAction::Clear), None);
     }

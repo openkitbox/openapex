@@ -38,11 +38,33 @@ enum Kind {
     Table,
 }
 
+/// The colour family a markdown body is drawn in.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tone {
+    /// Assistant text: base text, success-coloured code, highlighted fences.
+    Normal,
+    /// Reasoning text: every element keeps its modifiers (bold, underline)
+    /// but takes the muted foreground, like upstream `generateThinkingSyntax`
+    /// (`routes/session/thinking-syntax.ts`).
+    Muted,
+}
+
 pub fn render(text: &str, width: u16, indent: usize) -> Vec<Line<'static>> {
+    render_toned(text, width, indent, Tone::Normal)
+}
+
+/// [`render`] in the given [`Tone`].
+#[must_use]
+pub fn render_toned(text: &str, width: u16, indent: usize, tone: Tone) -> Vec<Line<'static>> {
     let indent = " ".repeat(indent);
     let palette = theme::palette();
-    let base = palette.text;
-    let code = palette.success;
+    let muted = match tone {
+        Tone::Normal => None,
+        Tone::Muted => Some(palette.dim),
+    };
+    let base = muted.unwrap_or(palette.text);
+    let code = muted.unwrap_or(palette.success);
+    let link = muted.unwrap_or(palette.link);
     let heading = base.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
@@ -59,7 +81,7 @@ pub fn render(text: &str, width: u16, indent: usize) -> Vec<Line<'static>> {
         let trimmed = raw.trim_start();
         if let Some(rest) = trimmed.strip_prefix("```") {
             match fence.take() {
-                Some(open) => emit_code(&mut lines, &indent, open, code_width, palette),
+                Some(open) => emit_code(&mut lines, &indent, open, code_width, muted),
                 None => {
                     separate(&mut lines, &mut previous, &mut gap, Kind::Code);
                     fence = Some(Fence {
@@ -104,7 +126,7 @@ pub fn render(text: &str, width: u16, indent: usize) -> Vec<Line<'static>> {
         } else if let Some(content) = trimmed.strip_prefix("- ").or(trimmed.strip_prefix("* ")) {
             separate(&mut lines, &mut previous, &mut gap, Kind::List);
             lines.extend(wrap_first_with_prefix(
-                &[Span::raw(indent.clone()), Span::styled("- ", palette.link)],
+                &[Span::raw(indent.clone()), Span::styled("- ", link)],
                 &format!("{indent}  "),
                 content,
                 width,
@@ -141,7 +163,7 @@ pub fn render(text: &str, width: u16, indent: usize) -> Vec<Line<'static>> {
     }
     // A fence still open at the end is a streaming reply: show what arrived.
     if let Some(open) = fence {
-        emit_code(&mut lines, &indent, open, code_width, palette);
+        emit_code(&mut lines, &indent, open, code_width, muted);
     }
     lines
 }
@@ -331,16 +353,22 @@ struct Fence<'a> {
 }
 
 /// Highlight the whole block (lexer state spans lines), then clip each line to
-/// the viewport: code is never re-wrapped.
+/// the viewport: code is never re-wrapped. A `muted` style replaces every
+/// token's foreground and keeps its modifiers.
 fn emit_code(
     lines: &mut Vec<Line<'static>>,
     indent: &str,
     fence: Fence<'_>,
     width: usize,
-    palette: &theme::Palette,
+    muted: Option<Style>,
 ) {
     let code = fence.code.join("\n");
-    for spans in highlight(fence.lang, &code, palette) {
+    for mut spans in highlight(fence.lang, &code, theme::palette()) {
+        if let Some(muted) = muted {
+            for span in &mut spans {
+                span.style.fg = muted.fg;
+            }
+        }
         let mut line = vec![Span::raw(indent.to_owned())];
         line.extend(clip(spans, width));
         lines.push(Line::from(line));

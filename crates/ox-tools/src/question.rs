@@ -281,6 +281,7 @@ async fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
             // retention window): a duplicate reply must find it and conflict
             // with `FormAlreadySettledError`, not 404.
             ok_text(to_model_content(&questions, &answer))
+                .with_metadata(answers_metadata(questions.len(), &answer))
         }
         Outcome::Cancelled(message) => {
             match message {
@@ -314,6 +315,32 @@ fn to_model_content(questions: &[Question], answer: &Answer) -> String {
     )
 }
 
+/// The client-facing `{answers}` metadata: one string list per question, in
+/// question order (key `q{index}`), as upstream's TUI reads it
+/// (`parseQuestionAnswers`). Blank answers and missing keys are `[]`.
+#[must_use]
+fn answers_metadata(questions: usize, answer: &Answer) -> Value {
+    let answers: Vec<Vec<String>> = (0..questions)
+        .map(|index| match answer.get(&format!("q{index}")) {
+            Some(FormValue::Multiple(values)) => values
+                .iter()
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .collect(),
+            Some(value) => {
+                let text = value.display();
+                if text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![text]
+                }
+            }
+            None => Vec::new(),
+        })
+        .collect();
+    json!({ "answers": answers })
+}
+
 /// Upstream's sentinel when no interactive client is attached.
 pub const NOT_AVAILABLE_SENTINEL: &str =
     "(question is only available in the interactive shell; ask the user freeform instead)";
@@ -325,5 +352,37 @@ pub fn single_option_answer(field: &Field, value: &str) -> FormValue {
     match field {
         Field::Multiselect { .. } => FormValue::Multiple(vec![value.to_owned()]),
         _ => FormValue::String(value.to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn answers_metadata_lists_each_question_in_order() {
+        let mut answer = Answer::new();
+        answer.insert("q0".to_owned(), FormValue::String("Rust".to_owned()));
+        answer.insert(
+            "q1".to_owned(),
+            FormValue::Multiple(vec!["a".to_owned(), String::new(), "b".to_owned()]),
+        );
+        answer.insert("q2".to_owned(), FormValue::String(String::new()));
+        assert_eq!(
+            answers_metadata(4, &answer),
+            json!({"answers": [["Rust"], ["a", "b"], [], []]}),
+            "single, multiple (blanks dropped), empty and missing answers"
+        );
+    }
+
+    #[test]
+    fn answers_metadata_with_no_questions_is_an_empty_list() {
+        assert_eq!(
+            answers_metadata(0, &Answer::new()),
+            json!({"answers": []}),
+            "the array is present even with nothing to answer"
+        );
     }
 }

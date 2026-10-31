@@ -1,7 +1,27 @@
-use ox_client::store::DataStore;
+//! The rows around the prompt: the queued-prompt dock above it and the
+//! status line below it.
+//!
+//! The queued-prompt dock is upstream `QueuedPromptDock`
+//! (`routes/session/index.tsx:2468-2499`). Deviations:
+//! - Hover uses `palette.panel` (`raised.high`) rather than computing
+//!   `decrease(raised.base)`, as every block does (`block_tool::surface`).
+//! - The queued-prompts dialog has no shell-mode undo (ox has no shell
+//!   composer mode to restore) and no "Search queued prompts" placeholder:
+//!   the Select's typed filter searches the prompt text.
+//! - `<leader>q` opens the dialog while prompts are queued and exits
+//!   otherwise, as upstream's two bindings on the key resolve.
+//! - The dialog is also a `/queued` slash command: ox's palette and slash
+//!   menu share one registry (`ui::commands`).
+//! - The dock is drawn in the session's two-column side padding, like the
+//!   prompt, and the dialog closes on enter at once rather than after the
+//!   steer succeeds (a failure still toasts).
+
+use ox_client::store::{DataStore, Queued};
 use ratatui::text::{Line, Span};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme;
+use crate::ui::block_tool;
 
 /// What the single status line is showing this frame. One row, never scrolls,
 /// only ever current values (the timeline owns history).
@@ -17,9 +37,10 @@ pub enum StatusMode<'a> {
 
 const HELP: &str = "↑↓ j/k 滚动 · g/G 顶部/底部 · / 搜索 · n/N 下一个/上一个 · r 推理展开 · o 工具输出 · [ ] 切换工具行 · ⏎ 发送 · ⇧⏎ 换行 · ctrl-c 中断/退出";
 
-/// The row under the prompt footer: search/help text, or the queued-prompt
-/// count while a turn runs. Read straight from the store.
-pub fn status_line(store: &DataStore, mode: StatusMode<'_>) -> Line<'static> {
+/// The row under the prompt footer: search/help text, else blank (the
+/// queued-prompt count lives in the dock above the prompt).
+#[must_use]
+pub fn status_line(_store: &DataStore, mode: StatusMode<'_>) -> Line<'static> {
     let p = theme::palette();
     match mode {
         StatusMode::Help => Line::from(Span::styled(HELP, p.dim)),
@@ -41,20 +62,85 @@ pub fn status_line(store: &DataStore, mode: StatusMode<'_>) -> Line<'static> {
             }
             Line::from(spans)
         }
-        StatusMode::Normal => {
-            // Upstream's session view has no status line and no elapsed timer
-            // (the running state is the prompt footer's `esc interrupt`), so
-            // this row is blank unless prompts are queued behind a turn or
-            // behind the child sessions it delegated to (display: `busy`).
-            if !store.busy() || store.queued.is_empty() {
-                return Line::default();
-            }
-            Line::from(Span::styled(
-                format!("{} queued", store.queued.len()),
-                p.accent,
-            ))
+        // Upstream's session view has no status line and no elapsed timer
+        // (the running state is the prompt footer's `esc interrupt`; the
+        // queue is `queued_dock`).
+        StatusMode::Normal => Line::default(),
+    }
+}
+
+/// Whether the pointer is over the queued-prompt dock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DockHover {
+    #[default]
+    Off,
+    On,
+}
+
+/// Rows the queued-prompt dock draws: padding, the line, padding.
+pub const QUEUED_DOCK_ROWS: u16 = 3;
+
+/// Rows the dock takes above the prompt: nothing for an empty queue, else
+/// its rows and the bottom margin (`marginBottom={1}`).
+#[must_use]
+pub fn queued_dock_height(queued: &[Queued]) -> u16 {
+    if queued.is_empty() {
+        0
+    } else {
+        QUEUED_DOCK_ROWS + 1
+    }
+}
+
+/// Upstream `QueuedPromptDock` (`routes/session/index.tsx:2468-2499`): a
+/// left-railed band with `<N> queued · <next prompt>` on one truncated line.
+/// Empty for an empty queue.
+#[must_use]
+pub fn queued_dock(queued: &[Queued], width: u16, hover: DockHover) -> Vec<Line<'static>> {
+    let Some(first) = queued.first() else {
+        return Vec::new();
+    };
+    let p = theme::palette();
+    let band = block_tool::surface(p, hover == DockHover::On);
+    // paddingRight={1} on top of the rail and the left padding.
+    let room = block_tool::content_width(width).saturating_sub(1);
+    let count = format!("{} queued", queued.len());
+    let next = format!(" · {}", first.text.replace('\n', " "));
+    let mut spans = Vec::with_capacity(2);
+    let mut used = 0;
+    for (piece, style) in [(count, p.text), (next, p.dim)] {
+        let (clipped, width) = clip(&piece, room.saturating_sub(used));
+        used += width;
+        if !clipped.is_empty() {
+            spans.push(Span::styled(clipped, style));
         }
     }
+    let rail = Span::styled(block_tool::RAIL, p.menu_border.patch(band));
+    block_tool::frame(vec![Line::from(spans)], &rail, band, width)
+}
+
+/// `text` cut to `room` display columns, ending in `…` when it overflows
+/// (`truncate`, `wrapMode="none"`). Returns the text and its width.
+fn clip(text: &str, room: usize) -> (String, usize) {
+    if room == 0 {
+        return (String::new(), 0);
+    }
+    let full = UnicodeWidthStr::width(text);
+    if full <= room {
+        return (text.to_owned(), full);
+    }
+    let budget = room - 1;
+    let mut out = String::with_capacity(text.len().min(room * 4));
+    let mut used = 0;
+    for ch in text.chars() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        used += w;
+        out.push(ch);
+    }
+    out.push('…');
+    (out, used + 1)
 }
 
 /// Upstream `Locale.number`: `1.2M`, `12.4K`, or the plain count. The prompt
@@ -84,9 +170,16 @@ pub fn format_context(tokens: i64, limit: Option<i64>) -> String {
 
 #[cfg(test)]
 mod tests {
-    use ox_client::store::DataStore;
+    use std::sync::Arc;
 
-    use super::{StatusMode, format_context, status_line};
+    use ox_client::store::{DataStore, Queued};
+    use unicode_width::UnicodeWidthStr;
+
+    use super::{
+        DockHover, QUEUED_DOCK_ROWS, StatusMode, format_context, queued_dock, queued_dock_height,
+        status_line,
+    };
+    use crate::theme;
 
     #[test]
     fn context_usage_shows_the_percent_only_when_the_window_is_known() {
@@ -103,49 +196,98 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn queued_prompts_are_the_only_thing_the_status_line_shows_while_running() {
-        let mut store = DataStore::default();
-        store.running_since = Some(0);
-        store.queued = vec![
-            ox_client::store::Queued {
-                inbox_id: "inb_1".into(),
-                text: std::sync::Arc::from("first"),
-            },
-            ox_client::store::Queued {
-                inbox_id: "inb_2".into(),
-                text: std::sync::Arc::from("second"),
-            },
-        ];
-        let line = text(&status_line(&store, StatusMode::Normal));
-        assert_eq!(line, "2 queued", "{line}");
+    fn queued(texts: &[&str]) -> Vec<Queued> {
+        texts
+            .iter()
+            .enumerate()
+            .map(|(index, text)| Queued {
+                inbox_id: format!("inb_{index}"),
+                text: Arc::from(*text),
+            })
+            .collect()
     }
 
     #[test]
-    fn queued_prompts_show_while_only_a_child_runs() {
-        use ox_client::store::{AssistantItem, ChildRef, Item, ToolPart};
+    fn the_status_line_leaves_queued_prompts_to_the_dock() {
         let mut store = DataStore::default();
-        store.session = Some("ses_1".into());
-        store.items = vec![Item::Assistant(Box::new(AssistantItem {
-            id: "m1".into(),
-            tools: vec![ToolPart {
-                id: "p1".into(),
-                tool: "subagent".into(),
-                child: Some(ChildRef {
-                    session_id: "ses_c".into(),
-                }),
-                ..Default::default()
-            }],
-            ..Default::default()
-        }))];
-        store.queued = vec![ox_client::store::Queued {
-            inbox_id: "inb_1".into(),
-            text: std::sync::Arc::from("first"),
-        }];
-        assert_eq!(text(&status_line(&store, StatusMode::Normal)), "");
-        assert!(store.set_child_running("ses_c", true));
-        assert_eq!(store.running_since, None);
-        assert_eq!(text(&status_line(&store, StatusMode::Normal)), "1 queued");
+        store.running_since = Some(0);
+        store.queued = queued(&["first", "second"]);
+        let line = text(&status_line(&store, StatusMode::Normal));
+        assert_eq!(line, "", "the queue dock owns the count: {line:?}");
+    }
+
+    #[test]
+    fn the_queued_dock_shows_the_count_and_the_next_prompt_on_one_line() {
+        let prompts = queued(&["first\nprompt", "second"]);
+        let lines = queued_dock(&prompts, 40, DockHover::Off);
+        assert_eq!(lines.len(), usize::from(QUEUED_DOCK_ROWS), "{lines:?}");
+        let rows: Vec<String> = lines.iter().map(text).collect();
+        assert_eq!(rows[0], format!("┃{}", " ".repeat(39)), "padding top");
+        assert_eq!(rows[2], format!("┃{}", " ".repeat(39)), "padding bottom");
+        assert_eq!(
+            rows[1].trim_end(),
+            "┃  2 queued · first prompt",
+            "newlines become spaces"
+        );
+        for row in &rows {
+            assert_eq!(UnicodeWidthStr::width(row.as_str()), 40, "{row:?}");
+        }
+        let palette = theme::palette();
+        let count = lines[1]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("queued"))
+            .expect("count span");
+        assert_eq!(count.style.fg, palette.text.fg, "count in text.base");
+        let next = lines[1]
+            .spans
+            .iter()
+            .find(|span| span.content.contains("first"))
+            .expect("next span");
+        assert_eq!(next.style.fg, palette.dim.fg, "next prompt in text.muted");
+        assert_eq!(count.style.bg, palette.raised_base.bg, "raised band");
+    }
+
+    #[test]
+    fn the_queued_dock_truncates_and_never_wraps() {
+        let prompts = queued(&["一二三四五六七八九十 and a long tail"]);
+        // rail 1 + pad 2 + pad right 1: 16 columns of text.
+        let lines = queued_dock(&prompts, 20, DockHover::Off);
+        assert_eq!(lines.len(), 3, "long text truncates instead of wrapping");
+        let row = text(&lines[1]);
+        assert_eq!(UnicodeWidthStr::width(row.as_str()), 20, "{row:?}");
+        assert!(row.starts_with("┃  1 queued · 一"), "{row:?}");
+        assert!(!row.contains("tail"), "{row:?}");
+    }
+
+    #[test]
+    fn hovering_the_queued_dock_changes_its_band() {
+        let prompts = queued(&["first"]);
+        let calm = queued_dock(&prompts, 30, DockHover::Off);
+        let lit = queued_dock(&prompts, 30, DockHover::On);
+        let band = |lines: &[ratatui::text::Line<'_>]| lines[1].spans.last().map(|s| s.style.bg);
+        assert_eq!(
+            band(&calm),
+            Some(theme::palette().raised_base.bg),
+            "idle: raised band"
+        );
+        assert_eq!(
+            band(&lit),
+            Some(theme::palette().panel.bg),
+            "hovered: panel band"
+        );
+    }
+
+    #[test]
+    fn no_queue_means_no_dock() {
+        let lines = queued_dock(&[], 40, DockHover::Off);
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(queued_dock_height(&[]), 0, "no dock takes no rows");
+        assert_eq!(
+            queued_dock_height(&queued(&["a"])),
+            QUEUED_DOCK_ROWS + 1,
+            "three rows and the bottom margin"
+        );
     }
 
     #[test]

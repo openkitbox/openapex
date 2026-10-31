@@ -1590,6 +1590,7 @@ fn own_block(
         "edit" => super::edit_block::render(call.metadata, width, palette),
         "patch" | "apply_patch" => super::patch_block::render(call, width, palette),
         "write" => Some(super::write_block::render(call.input, width, palette)),
+        "question" => super::question_block::render(call.input, call.metadata, width, palette),
         _ => None,
     }
 }
@@ -1599,7 +1600,7 @@ fn own_block(
 /// nothing to open: the block shows everything, the fallback has no body.
 fn draws_block(tool: &str, state: ToolState) -> bool {
     match tool {
-        "edit" | "write" => matches!(state, ToolState::Success),
+        "edit" | "write" | "question" => matches!(state, ToolState::Success),
         "patch" | "apply_patch" => matches!(state, ToolState::Success | ToolState::Failed),
         _ => false,
     }
@@ -1747,7 +1748,8 @@ fn thought_header_style(
 ///
 /// Observed in upstream 2.2.3 (`gold`): the open header is the plain warning
 /// colour and the collapsed one is warning tinted 60% over the background.
-/// Deviation: the body is plain wrapped text, not rendered markdown.
+/// The body is markdown in the muted tone (upstream `ReasoningPart` with
+/// `generateThinkingSyntax`, `message-parts.tsx:43`).
 fn reasoning_block(
     text: &str,
     done: bool,
@@ -1788,18 +1790,19 @@ fn reasoning_block(
             .bg
             .map_or(palette.dim, |bg| ratatui::style::Style::default().fg(bg));
         lines.push(Line::default());
-        lines.extend(indent_wrapped(body, width, 5).into_iter().map(|line| {
-            let text = line
-                .spans
-                .into_iter()
-                .map(|span| span.content)
-                .collect::<String>();
-            let text = text.get(5..).unwrap_or_default().to_owned();
-            Line::from(vec![
-                Span::raw("   "),
-                Span::styled("\u{2503}", rail),
-                Span::styled(format!(" {text}"), palette.dim),
-            ])
+        let rendered = super::markdown::render_toned(
+            body,
+            width.saturating_sub(5),
+            0,
+            super::markdown::Tone::Muted,
+        );
+        lines.extend(rendered.into_iter().map(|line| {
+            let mut spans = Vec::with_capacity(line.spans.len() + 3);
+            spans.push(Span::raw("   "));
+            spans.push(Span::styled("\u{2503}", rail));
+            spans.push(Span::raw(" "));
+            spans.extend(line.spans);
+            Line::from(spans)
         }));
     }
     lines
@@ -2542,8 +2545,13 @@ mod tests {
     use ratatui::style::{Color, Modifier};
     use std::sync::Arc;
 
-    use super::{Block, Explored, ExploredCall, ExploredCount, Transcript, reasoning_summary};
+    use super::{
+        Block, Explored, ExploredCall, ExploredCount, Transcript, ViewState, reasoning_block,
+        reasoning_summary,
+    };
+    use crate::theme;
     use ox_client::store::ToolState;
+    use ratatui::text::Span;
 
     #[test]
     fn tool_rows_show_name_summary_and_output() {
@@ -2935,6 +2943,34 @@ mod tests {
             Some("   \u{280b} Write src/a.rs"),
             "{rows}"
         );
+    }
+
+    #[test]
+    fn an_answered_question_draws_the_questions_block() {
+        let input = serde_json::json!({"questions": [{"question": "Which language?"}]});
+        let mut block = text_row("question", ToolState::Success, input.clone(), "answered");
+        if let Block::Tool { metadata, .. } = &mut block {
+            *metadata = Some(rec(serde_json::json!({"answers": [["Rust"]]})));
+        }
+        let mut t = Transcript::new(60, 10);
+        t.sync(&[block], 0);
+        let text = screen(&mut t, 60, 10);
+        assert!(text.contains("# Questions"), "{text}");
+        assert!(text.contains("Which language?"), "{text}");
+        assert!(text.contains("Rust"), "{text}");
+        assert!(!t.click(6, 2), "the block is always open");
+
+        let mut t = Transcript::new(60, 6);
+        t.sync(
+            &[text_row("question", ToolState::Success, input, "answered")],
+            0,
+        );
+        let text = screen(&mut t, 60, 6);
+        assert!(
+            text.contains("Asked 1 question"),
+            "no answers keeps the row: {text}"
+        );
+        assert!(!text.contains("# Questions"), "{text}");
     }
 
     #[test]
@@ -3355,6 +3391,37 @@ mod tests {
         assert!(t.toggle_last_reasoning());
         let recollapsed_text = text_of(&mut t);
         assert!(!recollapsed_text.contains("hidden"), "{recollapsed_text}");
+    }
+
+    #[test]
+    fn an_open_thought_renders_markdown_in_the_muted_colour() {
+        let palette = theme::palette();
+        let text = "**Plan**\n\n# Step\n\nuse `grep` and **care**\n\n```rust\nfn main() {}\n```";
+        let view = ViewState {
+            reasoning_expanded: true,
+            ..Default::default()
+        };
+        let lines = reasoning_block(text, true, Some(1_000), view, 60);
+        let body: Vec<&Span<'static>> = lines[2..]
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| !span.content.trim().is_empty() && span.content != "\u{2503}")
+            .collect();
+        let joined: String = body.iter().map(|span| span.content.as_ref()).collect();
+        assert!(!joined.contains("**"), "markers concealed: {joined}");
+        assert!(!joined.contains('#'), "heading marker concealed: {joined}");
+        assert!(!joined.contains("```"), "fence concealed: {joined}");
+        for span in &body {
+            assert_eq!(
+                span.style.fg, palette.dim.fg,
+                "every body span is muted, got {span:?}"
+            );
+        }
+        let bold = body
+            .iter()
+            .find(|span| span.content.contains("care"))
+            .expect("bold span present");
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD), "{bold:?}");
     }
 
     #[test]

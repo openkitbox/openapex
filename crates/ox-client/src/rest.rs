@@ -692,6 +692,40 @@ impl Client {
         Ok(())
     }
 
+    /// `PATCH /api/session/{session}/inbox/{inbox}` with `{"delivery":"steer"}`
+    /// (204): deliver a queued prompt at the next step boundary instead of
+    /// after the turn.
+    pub async fn steer_queued(&self, session: &str, inbox: &str) -> Result<()> {
+        let resp = self
+            .request(
+                reqwest::Method::PATCH,
+                &format!("/api/session/{session}/inbox/{inbox}"),
+            )
+            .json(&serde_json::json!({ "delivery": "steer" }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Error::Status(resp.status()));
+        }
+        Ok(())
+    }
+
+    /// `DELETE /api/session/{session}/inbox/{inbox}` (204): drop a queued
+    /// prompt before it is delivered.
+    pub async fn cancel_queued(&self, session: &str, inbox: &str) -> Result<()> {
+        let resp = self
+            .request(
+                reqwest::Method::DELETE,
+                &format!("/api/session/{session}/inbox/{inbox}"),
+            )
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Error::Status(resp.status()));
+        }
+        Ok(())
+    }
+
     /// Visible primary agents, in server order (the first is the default).
     pub async fn agents(&self) -> Result<Vec<AgentRef>> {
         let resp = self
