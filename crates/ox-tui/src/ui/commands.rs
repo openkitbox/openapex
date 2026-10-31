@@ -5,6 +5,8 @@
 //! (matching); ox keeps both here so the menu, the tests and any future command
 //! palette share one source.
 //!
+//! The command palette (`ui/palette.rs`) lists the same registry.
+//!
 //! Only commands ox can actually execute are registered. Adding one is a single
 //! entry in [`COMMANDS`]; the alias expansion, padding and matching are generic.
 
@@ -17,6 +19,22 @@ pub enum CommandAction {
     Clear,
     /// Quit the app.
     Exit,
+    /// Ask the server for the MCP server list and open the status dialog
+    /// (upstream `dialog-status.tsx`).
+    Status,
+    /// Fetch the model catalogue and open the model picker.
+    Models,
+    /// Fetch the agents and open the agent picker.
+    Agents,
+    /// Ask the server for the session list and open the switcher
+    /// (upstream `dialog-session-list.tsx`).
+    Sessions,
+    /// Fork the current session into a new one and switch to it.
+    Fork,
+    /// Open the rename prompt for the current session.
+    Rename,
+    /// Open the message timeline and jump to the chosen message.
+    Timeline,
 }
 
 /// One registered command. `aliases` are rendered as their own menu rows,
@@ -26,6 +44,10 @@ pub struct Command {
     pub name: &'static str,
     pub aliases: &'static [&'static str],
     pub description: &'static str,
+    /// Row title in the command palette (upstream `title`).
+    pub title: &'static str,
+    /// Palette group header (upstream `group`).
+    pub group: &'static str,
     pub action: CommandAction,
 }
 
@@ -33,24 +55,88 @@ pub struct Command {
 /// display anyway, this is for humans reading the file.
 pub const COMMANDS: &[Command] = &[
     Command {
+        name: "agents",
+        aliases: &[],
+        description: "Switch agent",
+        title: "Switch agent",
+        group: "Agent",
+        action: CommandAction::Agents,
+    },
+    Command {
         name: "clear",
         aliases: &[],
         description: "Clear session",
+        title: "Clear session",
+        group: "Session",
         action: CommandAction::Clear,
     },
     Command {
         name: "exit",
         aliases: &["quit", "q"],
         description: "Exit the app",
+        title: "Exit the app",
+        group: "System",
         action: CommandAction::Exit,
+    },
+    Command {
+        name: "models",
+        aliases: &[],
+        description: "Switch model",
+        title: "Switch model",
+        group: "Agent",
+        action: CommandAction::Models,
+    },
+    Command {
+        name: "fork",
+        aliases: &[],
+        description: "Fork session",
+        title: "Fork session",
+        group: "Session",
+        action: CommandAction::Fork,
     },
     Command {
         name: "new",
         aliases: &[],
         description: "New session",
+        title: "New session",
+        group: "Session",
         action: CommandAction::New,
     },
+    Command {
+        name: "rename",
+        aliases: &[],
+        description: "Rename session",
+        title: "Rename session",
+        group: "Session",
+        action: CommandAction::Rename,
+    },
+    Command {
+        name: "sessions",
+        aliases: &["resume", "continue"],
+        description: "Switch session",
+        title: "Switch session",
+        group: "Session",
+        action: CommandAction::Sessions,
+    },
+    Command {
+        name: "timeline",
+        aliases: &[],
+        description: "Jump to message",
+        title: "Jump to message",
+        group: "Session",
+        action: CommandAction::Timeline,
+    },
+    Command {
+        name: "status",
+        aliases: &[],
+        description: "Show MCP server status",
+        title: "View status",
+        group: "System",
+        action: CommandAction::Status,
+    },
 ];
+
+use super::fuzzy;
 
 /// A single menu row: one command name or alias, already padded for the
 /// two-column look upstream produces with `padEnd(max + 2)`.
@@ -95,7 +181,15 @@ pub fn rows(query: &str) -> Vec<Row> {
                 .map(move |name| (name, command))
         })
         .filter_map(|(name, command)| {
-            let score = score(&query, name, command.description)?;
+            // Description matches are the weakest signal (upstream only matches
+            // the description field for slash commands for exactly this reason).
+            let score = fuzzy::score(&query, name).or_else(|| {
+                command
+                    .description
+                    .to_ascii_lowercase()
+                    .contains(&query)
+                    .then_some(1)
+            })?;
             Some(Row {
                 display: format!("/{name}").pad_to(width),
                 name,
@@ -113,36 +207,6 @@ pub fn rows(query: &str) -> Vec<Row> {
     out
 }
 
-/// Score one name against the query; `None` means it does not match at all.
-fn score(query: &str, name: &str, description: &str) -> Option<u32> {
-    if query.is_empty() {
-        return Some(0);
-    }
-    let name = name.to_ascii_lowercase();
-    if name.starts_with(query) {
-        return Some(3);
-    }
-    if name.contains(query) {
-        return Some(2);
-    }
-    if is_subsequence(query, &name) {
-        return Some(1);
-    }
-    // Description matches are the weakest signal (upstream only matches the
-    // description field for slash commands for exactly this reason).
-    if description.to_ascii_lowercase().contains(query) {
-        return Some(1);
-    }
-    None
-}
-
-fn is_subsequence(needle: &str, haystack: &str) -> bool {
-    let mut chars = haystack.chars();
-    needle
-        .chars()
-        .all(|wanted| chars.any(|candidate| candidate == wanted))
-}
-
 trait PadTo {
     fn pad_to(self, width: usize) -> String;
 }
@@ -156,5 +220,93 @@ impl PadTo for String {
         let mut out = self;
         out.extend(std::iter::repeat_n(' ', width - len));
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{COMMANDS, CommandAction, padded_width, rows};
+
+    #[test]
+    fn empty_query_lists_every_row_alphabetically() {
+        let all = rows("");
+        let names: Vec<&str> = all.iter().map(|row| row.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "agents", "clear", "continue", "exit", "fork", "models", "new", "q", "quit",
+                "rename", "resume", "sessions", "status", "timeline"
+            ]
+        );
+    }
+
+    #[test]
+    fn every_alias_is_its_own_row() {
+        let all = rows("");
+        assert_eq!(all.len(), 14);
+        let quit = all.iter().find(|row| row.name == "quit").expect("quit row");
+        assert_eq!(quit.action, CommandAction::Exit);
+        assert_eq!(quit.description, "Exit the app");
+    }
+
+    #[test]
+    fn prefix_and_substring_and_subsequence_are_ranked() {
+        let matched = rows("q");
+        let names: Vec<&str> = matched.iter().map(|row| row.name).collect();
+        assert_eq!(names, vec!["q", "quit"]);
+
+        let matched = rows("ui");
+        let names: Vec<&str> = matched.iter().map(|row| row.name).collect();
+        assert_eq!(names, vec!["quit"]);
+    }
+
+    #[test]
+    fn descriptions_match_but_rank_below_names() {
+        let matched = rows("app");
+        assert_eq!(
+            matched.len(),
+            3,
+            "all three exit rows share the description"
+        );
+        assert!(matched.iter().all(|row| row.action == CommandAction::Exit));
+    }
+
+    #[test]
+    fn sessions_answers_to_resume_and_continue() {
+        for name in ["sessions", "resume", "continue"] {
+            let row = rows(name).into_iter().find(|row| row.name == name);
+            assert_eq!(row.map(|row| row.action), Some(CommandAction::Sessions));
+        }
+        assert_eq!(rows("fork")[0].action, CommandAction::Fork);
+    }
+
+    #[test]
+    fn query_matches_case_insensitively() {
+        assert_eq!(rows("NEW")[0].name, "new");
+    }
+
+    #[test]
+    fn unmatched_query_is_empty() {
+        assert!(rows("zzz").is_empty());
+    }
+
+    #[test]
+    fn display_is_padded_to_the_catalog_width() {
+        let width = padded_width();
+        assert_eq!(width, "/continue".len() + 2);
+        for row in rows("") {
+            assert_eq!(row.display.chars().count(), width, "{:?}", row.display);
+        }
+        assert_eq!(rows("")[0].display, "/agents    ");
+    }
+
+    #[test]
+    fn registry_has_unique_names_and_aliases() {
+        let mut seen = std::collections::HashSet::new();
+        for command in COMMANDS {
+            for name in std::iter::once(command.name).chain(command.aliases.iter().copied()) {
+                assert!(seen.insert(name), "duplicate command name: {name}");
+            }
+        }
     }
 }

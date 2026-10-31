@@ -1,0 +1,109 @@
+[
+ {
+  "type": "idle",
+  "id": "msg_18ca2edb4004yrfVI5KCIpZ8WC_55",
+  "time": {
+   "created": 1793360850356
+  },
+  "outcome": "succeeded"
+ },
+ {
+  "type": "assistant",
+  "id": "msg_18ca2edb0005uBudcM2rUwuzx8",
+  "time": {
+   "created": 1793360850352,
+   "streamed": 1793360850356,
+   "completed": 1793360850356
+  },
+  "agent": "build",
+  "model": {
+   "id": "fake-1",
+   "providerID": "cardinal"
+  },
+  "content": [
+   {
+    "type": "text",
+    "text": "# Result\n\nThe file says **hello**.\n\n- one\n- two\n\n```rust\nfn main() {}\n```\n"
+   }
+  ],
+  "finish": "stop",
+  "rawFinish": "stop",
+  "cost": 0,
+  "tokens": {
+   "input": 10,
+   "output": 5,
+   "reasoning": 0,
+   "cache": {
+    "read": 0,
+    "write": 0
+   }
+  }
+ },
+ {
+  "type": "assistant",
+  "id": "msg_18ca2edaa0027xinvPibSDJeA7",
+  "time": {
+   "created": 1793360850346,
+   "streamed": 1793360850352,
+   "completed": 1793360850352
+  },
+  "agent": "build",
+  "model": {
+   "id": "fake-1",
+   "providerID": "cardinal"
+  },
+  "content": [
+   {
+    "type": "reasoning",
+    "text": "Let me look at the file first.",
+    "time": {
+     "created": 1793360850351,
+     "completed": 1793360850351
+    }
+   },
+   {
+    "type": "tool",
+    "id": "call_1",
+    "name": "read",
+    "executed": false,
+    "state": {
+     "status": "completed",
+     "input": {
+      "path": "/tmp/parity-cwd/hello.txt"
+     },
+     "content": [
+      {
+       "type": "text",
+       "text": "Read file /tmp/parity-cwd/hello.txt, lines 1-1\n1: hello"
+      }
+     ]
+    },
+    "time": {
+     "created": 1793360850351,
+     "ran": 1793360850351,
+     "completed": 1793360850352
+    }
+   }
+  ],
+  "finish": "tool-calls",
+  "rawFinish": "tool_calls",
+  "cost": 0,
+  "tokens": {
+   "input": 10,
+   "output": 5,
+   "reasoning": 0,
+   "cache": {
+    "read": 0,
+    "write": 0
+   }
+  }
+ },
+ {
+  "type": "user",
+  "id": "msg_18ca2eda8001QThQrbiDm9Q8ye",
+  "time": {
+   "created": 1793360850346
+  },
+  "text": "read hello.txt"
+ }
+]

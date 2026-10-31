@@ -15,18 +15,11 @@ pub enum StatusMode<'a> {
     Help,
 }
 
-const HELP: &str = "↑↓ j/k 滚动 · g/G 顶部/底部 · / 搜索 · n/N 下一个/上一个 · ⏎ 发送 · ⇧⏎ 换行 · ctrl-c 中断/退出";
+const HELP: &str = "↑↓ j/k 滚动 · g/G 顶部/底部 · / 搜索 · n/N 下一个/上一个 · r 推理展开 · o 工具输出 · [ ] 切换工具行 · ⏎ 发送 · ⇧⏎ 换行 · ctrl-c 中断/退出";
 
-/// fx-style ribbon: one plain line, dim separators, one accent for the running
-/// dot. Segments are read directly from the store (single source of truth).
-/// Truncation drops whole segments from the left — model first, ctx next,
-/// session last — and the running state is never dropped.
-pub fn status_line(
-    store: &DataStore,
-    now_ms: i64,
-    width: u16,
-    mode: StatusMode<'_>,
-) -> Line<'static> {
+/// The row under the prompt footer: search/help text, or the queued-prompt
+/// count while a turn runs. Read straight from the store.
+pub fn status_line(store: &DataStore, mode: StatusMode<'_>) -> Line<'static> {
     let p = theme::palette();
     match mode {
         StatusMode::Help => Line::from(Span::styled(HELP, p.dim)),
@@ -49,103 +42,120 @@ pub fn status_line(
             Line::from(spans)
         }
         StatusMode::Normal => {
-            let mut segments: Vec<Vec<Span<'static>>> = Vec::new();
-            if let Some(model) = &store.model {
-                segments.push(vec![Span::styled(model.clone(), p.text)]);
+            // Upstream's session view has no status line and no elapsed timer
+            // (the running state is the prompt footer's `esc interrupt`), so
+            // this row is blank unless prompts are queued behind a turn.
+            if store.running_since.is_none() || store.queued.is_empty() {
+                return Line::default();
             }
-            if let Some(ctx) = store.ctx {
-                segments.push(vec![
-                    Span::styled("ctx ", p.dim),
-                    Span::styled(format_k(ctx.input + ctx.cache_read), p.text),
-                ]);
-            }
-            if let Some(session) = store.session.as_deref() {
-                segments.push(vec![Span::styled(short_session(session), p.dim)]);
-            }
-            segments.push(vec![
-                Span::styled(
-                    if store.running_since.is_some() {
-                        "●"
-                    } else {
-                        "○"
-                    },
-                    if store.running_since.is_some() {
-                        p.accent
-                    } else {
-                        p.dim
-                    },
-                ),
-                Span::styled(
-                    format!(
-                        " {}",
-                        match store.running_since {
-                            Some(started) => format_elapsed(started, now_ms),
-                            None => "idle".to_string(),
-                        }
-                    ),
-                    if store.running_since.is_some() {
-                        p.accent
-                    } else {
-                        p.dim
-                    },
-                ),
-            ]);
-
-            let mut line = join_segments(&segments);
-            while display_width(&line) > width as usize && segments.len() > 1 {
-                segments.remove(0);
-                line = join_segments(&segments);
-            }
-            line
+            Line::from(Span::styled(
+                format!("{} queued", store.queued.len()),
+                p.accent,
+            ))
         }
     }
 }
 
-fn join_segments(segments: &[Vec<Span<'static>>]) -> Line<'static> {
-    let dim = theme::palette().dim;
-    let mut spans = Vec::new();
-    for (index, segment) in segments.iter().enumerate() {
-        if index > 0 {
-            spans.push(Span::styled(" › ", dim));
-        }
-        spans.extend(segment.iter().cloned());
-    }
-    Line::from(spans)
-}
-
-fn line_width(line: &Line<'_>) -> usize {
-    use unicode_width::UnicodeWidthStr;
-    line.spans
-        .iter()
-        .map(|span| span.content.as_ref().width())
-        .sum()
-}
-
-fn display_width(line: &Line<'_>) -> usize {
-    line_width(line)
-}
-
-fn short_session(session: &str) -> String {
-    let tail: String = session
-        .chars()
-        .rev()
-        .take(8)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    tail
-}
-
-fn format_k(tokens: i64) -> String {
-    if tokens >= 1_000 {
-        format!("{:.1}k", tokens as f64 / 1_000.0)
+/// Upstream `Locale.number`: `1.2M`, `12.4K`, or the plain count. The prompt
+/// footer shows context usage with this.
+pub fn format_tokens(tokens: i64) -> String {
+    if tokens >= 999_950 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}K", tokens as f64 / 1_000.0)
     } else {
         tokens.to_string()
     }
 }
 
-fn format_elapsed(started_ms: i64, now_ms: i64) -> String {
-    let seconds = ((now_ms - started_ms).max(0) / 1000) as u64;
-    format!("{:02}:{:02}", seconds / 60, seconds % 60)
+/// Upstream `formatContextUsage`: `12.4K (8%)`, or the bare count when the
+/// model's window is unknown. `tokens / limit` rounds half up like `Math.round`.
+pub fn format_context(tokens: i64, limit: Option<i64>) -> String {
+    let value = format_tokens(tokens);
+    match limit.filter(|limit| *limit > 0) {
+        Some(limit) => format!(
+            "{value} ({}%)",
+            (tokens as f64 / limit as f64 * 100.0).round() as i64
+        ),
+        None => value,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ox_client::store::DataStore;
+
+    use super::{StatusMode, format_context, status_line};
+
+    #[test]
+    fn context_usage_shows_the_percent_only_when_the_window_is_known() {
+        assert_eq!(format_context(16_300, Some(200_000)), "16.3K (8%)");
+        assert_eq!(format_context(1_000, Some(8_000)), "1.0K (13%)");
+        assert_eq!(format_context(16_300, Some(0)), "16.3K");
+        assert_eq!(format_context(16_300, None), "16.3K");
+    }
+
+    fn text(line: &ratatui::text::Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn queued_prompts_are_the_only_thing_the_status_line_shows_while_running() {
+        let mut store = DataStore::default();
+        store.running_since = Some(0);
+        store.queued = vec![
+            ox_client::store::Queued {
+                inbox_id: "inb_1".into(),
+                text: std::sync::Arc::from("first"),
+            },
+            ox_client::store::Queued {
+                inbox_id: "inb_2".into(),
+                text: std::sync::Arc::from("second"),
+            },
+        ];
+        let line = text(&status_line(&store, StatusMode::Normal));
+        assert_eq!(line, "2 queued", "{line}");
+    }
+
+    #[test]
+    fn the_status_line_is_blank_when_idle_and_when_running() {
+        // model/ctx/session were dropped: they duplicate the footer and crowd
+        // the dock. The line is running-state only.
+        let mut store = DataStore::default();
+        store.model = Some("p/m".into());
+        store.session = Some("ses_ea243cfbbffeW3GW0oAChU5mLB".into());
+        let idle = text(&status_line(&store, StatusMode::Normal));
+        assert_eq!(idle, "", "idle is a blank row: {idle:?}");
+
+        // Upstream draws no elapsed timer: the running state lives in the
+        // prompt footer, so a running turn leaves this row blank too.
+        store.running_since = Some(0);
+        let running = text(&status_line(&store, StatusMode::Normal));
+        assert_eq!(running, "", "{running}");
+    }
+
+    #[test]
+    fn search_mode_shows_query_and_position() {
+        let store = DataStore::default();
+        let line = status_line(
+            &store,
+            StatusMode::Search {
+                query: "cache",
+                matches: 12,
+                current: Some(2),
+            },
+        );
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "/cache 3/12");
+    }
+
+    #[test]
+    fn help_mode_replaces_the_line() {
+        let store = DataStore::default();
+        let text = text(&status_line(&store, StatusMode::Help));
+        assert!(text.contains("搜索"));
+    }
 }

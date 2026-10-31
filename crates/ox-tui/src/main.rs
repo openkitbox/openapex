@@ -1,4 +1,4 @@
-use ox_tui::{app, bootstrap, terminal, ui};
+use ox_tui::{app, bootstrap, executor, terminal, ui};
 
 use tokio::sync::{mpsc, watch};
 
@@ -20,8 +20,10 @@ fn arg(name: &str) -> Option<String> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let server = arg("--server").unwrap_or_else(|| "http://127.0.0.1:14090".into());
-    let directory = arg("--directory")
-        .unwrap_or_else(|| std::env::current_dir().unwrap().display().to_string());
+    let directory = match arg("--directory") {
+        Some(directory) => directory,
+        None => std::env::current_dir()?.display().to_string(),
+    };
     let session = arg("--session");
 
     // The terminal's own colours, read once before the input thread starts: the
@@ -63,13 +65,18 @@ async fn main() -> anyhow::Result<()> {
             Some(_) => {
                 online = true;
                 route = app::state::Route::Session;
-                bootstrap::connect(&server, &directory, session).await?
+                let connected = bootstrap::connect(&server, &directory, session).await?;
+                // The session footer shows the location stored on the session.
+                home_chrome =
+                    bootstrap::chrome(&connected.client, &directory, connected.session.as_deref())
+                        .await;
+                connected
             }
             None => {
                 online = true;
                 route = app::state::Route::Home;
                 let client = bootstrap::check_reachable(&server, &directory).await?;
-                home_chrome = bootstrap::chrome(&client, &directory).await;
+                home_chrome = bootstrap::chrome(&client, &directory, None).await;
                 bootstrap::Bootstrap {
                     client,
                     session: None,
@@ -85,37 +92,25 @@ async fn main() -> anyhow::Result<()> {
         let (stream_tx, mut stream_rx) = mpsc::unbounded_channel();
 
         // 会话已知（--session）就现在挂 SSE；Home 模式推迟到会话创建后。
-        let lazy_stream = if bootstrap.session.is_some() {
-            ox_client::sse::spawn_events(
-                bootstrap.client.clone(),
-                bootstrap.session.clone().unwrap_or_default(),
-                seq_rx,
-                stream_tx,
-            );
-            None
-        } else {
-            Some((stream_tx, seq_rx))
-        };
+        // Attachment 由命令任务持有：切换会话时它中止旧流再挂新流。
+        let mut stream =
+            ox_client::sse::Attachment::new(bootstrap.client.clone(), seq_rx, stream_tx);
+        if let Some(session) = &bootstrap.session {
+            stream.attach(session);
+        }
 
-        // 命令执行任务：把 AppCommand 变成网络动作，再把结果送回 UI 事件循环。
+        // 命令执行：只有碰 SSE attachment 的命令留在串行循环里，其余各自
+        // 一个任务（executor::run），慢请求不会拖住 interrupt / 表单应答。
         {
             let client = bootstrap.client.clone();
             let tx = event_tx.clone();
-            let mut lazy_stream = lazy_stream;
             tokio::spawn(async move {
                 while let Some(command) = command_rx.recv().await {
                     match command {
                         app::command::AppCommand::CreateSessionAndPrompt(text) => {
                             match client.create_session().await {
                                 Ok(session) => {
-                                    if let Some((stream_tx, seq_rx)) = lazy_stream.take() {
-                                        ox_client::sse::spawn_events(
-                                            client.clone(),
-                                            session.clone(),
-                                            seq_rx,
-                                            stream_tx,
-                                        );
-                                    }
+                                    stream.attach(&session);
                                     let _ = tx.send(app::event::AppEvent::SessionReady {
                                         session,
                                         prompt: text,
@@ -127,29 +122,13 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
-                        app::command::AppCommand::Prompt { session, text } => {
-                            if let Err(err) = client.prompt(&session, &text).await {
-                                tracing::warn!(%err, "prompt failed");
-                            }
+                        app::command::AppCommand::AttachSession { session } => {
+                            stream.attach(&session);
                         }
-                        app::command::AppCommand::Interrupt { session } => {
-                            let _ = client.interrupt(&session).await;
-                        }
+                        app::command::AppCommand::DetachSession => stream.detach(),
                         app::command::AppCommand::Quit => break,
-                        app::command::AppCommand::ReloadHistory {
-                            session,
-                            request_id,
-                        } => {
-                            match client.messages(&session, None).await {
-                                Ok(page) => {
-                                    let mut messages = page.data;
-                                    messages.reverse(); // desc → chronological
-                                    let items = ox_client::history::parse_messages(&messages);
-                                    let _ = tx
-                                        .send(app::event::AppEvent::History { request_id, items });
-                                }
-                                Err(err) => tracing::warn!(%err, "history reload failed"),
-                            }
+                        other => {
+                            tokio::spawn(executor::run(client.clone(), tx.clone(), other));
                         }
                     }
                 }
@@ -173,5 +152,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut app = App::new(route, bootstrap.session, home_chrome, command_tx, seq_tx);
+    if let Some(path) = ui::history::default_path() {
+        app.attach_history(ui::history::History::load(path));
+    }
     app.run(&mut guard, event_rx).await
 }

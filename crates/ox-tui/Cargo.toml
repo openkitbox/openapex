@@ -2,9 +2,10 @@
 name = "ox-tui"
 version.workspace = true
 edition.workspace = true
+default-run = "opencode-tui"
 
 [[bin]]
-name = "ox-tui"
+name = "opencode-tui"
 path = "src/main.rs"
 
 [lib]
@@ -14,10 +15,17 @@ path = "src/lib.rs"
 [dependencies]
 ox-client.workspace = true
 ox-schema.workspace = true
+jiff.workspace = true
 libc.workspace = true
-ratatui = { workspace = true, features = ["crossterm"] }
+# ratatui 只有 TUI 用，不进 workspace 依赖。
+ratatui = { version = "0.30", features = ["crossterm"] }
 crossterm = { workspace = true, features = ["bracketed-paste"] }
-tui-textarea = { workspace = true, features = ["crossterm"] }
+# 上游 tui-textarea 0.7 锁死 ratatui 0.29；tui-textarea-2 与 ratatui 0.30 配套，
+# lib 名仍是 `tui_textarea`，源码导入不用改。
+# Fenced-code highlighting: pure-Rust regex engine (no onig C build) and only the
+# bundled syntaxes; colours come from the theme tokens, not syntect themes.
+syntect = { version = "5.3", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }
+tui-textarea-2 = { version = "0.13", default-features = false, features = ["crossterm"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 futures-util.workspace = true
 serde_json.workspace = true
@@ -27,6 +35,7 @@ tracing.workspace = true
 anyhow.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [lints]

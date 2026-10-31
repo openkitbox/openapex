@@ -1,7 +1,9 @@
 use std::io::{self, Stdout};
 
 use crossterm::cursor::Show;
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -16,7 +18,12 @@ pub struct TerminalGuard {
 impl TerminalGuard {
     pub fn new() -> io::Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        )?;
         let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         Ok(Self { terminal })
     }
@@ -28,6 +35,7 @@ impl Drop for TerminalGuard {
         let _ = execute!(
             io::stdout(),
             LeaveAlternateScreen,
+            DisableMouseCapture,
             DisableBracketedPaste,
             Show
         );
@@ -43,6 +51,7 @@ pub fn install_panic_hook() {
         let _ = execute!(
             io::stdout(),
             LeaveAlternateScreen,
+            DisableMouseCapture,
             DisableBracketedPaste,
             Show
         );

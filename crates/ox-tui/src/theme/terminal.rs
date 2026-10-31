@@ -30,6 +30,19 @@ impl Rgb {
         Self { r, g, b }
     }
 
+    /// `base` moved `alpha` of the way to `overlay`, rounded per channel
+    /// (upstream `tint`, `theme/color.ts:43`).
+    pub fn tint(base: Self, overlay: Self, alpha: f64) -> Self {
+        let mix = |from: u8, to: u8| {
+            (f64::from(from) + (f64::from(to) - f64::from(from)) * alpha).round() as u8
+        };
+        Self::new(
+            mix(base.r, overlay.r),
+            mix(base.g, overlay.g),
+            mix(base.b, overlay.b),
+        )
+    }
+
     /// Rec.601 luma on the 0-255 scale (upstream `system.ts:106`).
     pub fn luminance(self) -> f64 {
         0.299 * f64::from(self.r) + 0.587 * f64::from(self.g) + 0.114 * f64::from(self.b)
