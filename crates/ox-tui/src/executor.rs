@@ -8,6 +8,7 @@
 //! are no-ops here.
 
 use ox_client::Client;
+use ox_schema::support::FileInput;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::command::{AgentIntent, AppCommand, Switch};
@@ -27,7 +28,11 @@ pub fn session_failed(title: &'static str, err: ox_client::Error) -> AppEvent {
 /// Execute one command and report its outcome on `tx`.
 pub async fn run(client: Client, tx: Events, command: AppCommand) {
     match command {
-        AppCommand::Prompt { session, text } => prompt(&client, &tx, &session, &text).await,
+        AppCommand::Prompt {
+            session,
+            text,
+            files,
+        } => prompt(&client, &tx, &session, &text, &files).await,
         AppCommand::Interrupt { session } => interrupt(&client, &tx, &session).await,
         AppCommand::ListSessions => list_sessions(&client, &tx).await,
         AppCommand::RenameSession { session, title } => {
@@ -45,6 +50,8 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
         }
         AppCommand::ListForms { session } => list_forms(&client, &tx, &session).await,
         AppCommand::FindFiles(query) => find_files(&client, &tx, query).await,
+        AppCommand::LoadAttachments(text) => load_attachments(&tx, text).await,
+        AppCommand::ReadClipboard => read_clipboard(&tx).await,
         AppCommand::LoadSessionChrome { session } => session_chrome(&client, &tx, session).await,
         AppCommand::McpList => mcp_list(&client, &tx).await,
         AppCommand::ModelList => model_list(&client, &tx).await,
@@ -63,8 +70,8 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
     }
 }
 
-async fn prompt(client: &Client, tx: &Events, session: &str, text: &str) {
-    if let Err(err) = client.prompt(session, text).await {
+async fn prompt(client: &Client, tx: &Events, session: &str, text: &str, files: &[FileInput]) {
+    if let Err(err) = client.prompt(session, text, files).await {
         tracing::warn!(%err, "prompt failed");
         let _ = tx.send(AppEvent::PromptFailed(err.to_string()));
     }
@@ -122,6 +129,32 @@ async fn find_files(client: &Client, tx: &Events, query: String) {
         }
         Err(err) => tracing::warn!(%err, "file lookup failed"),
     }
+}
+
+/// Read the files a paste names on a blocking thread (up to 20 MiB of disk
+/// I/O). Only the parsed paths move into the task, so the text stays here and
+/// goes back with the answer even if the task panics.
+async fn load_attachments(tx: &Events, text: String) {
+    let paths = crate::ui::paste::pasted_attachment_paths(&text);
+    let loaded = tokio::task::spawn_blocking(move || crate::attachment::load(&paths))
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(%err, "attachment load task failed");
+            None
+        });
+    let _ = tx.send(AppEvent::Attachments { text, loaded });
+}
+
+/// Read the system clipboard on a blocking thread (it runs subprocesses, each
+/// bounded by a timeout). A panicked task reads as an empty clipboard.
+async fn read_clipboard(tx: &Events) {
+    let clip = tokio::task::spawn_blocking(crate::clipboard::read)
+        .await
+        .unwrap_or_else(|err| {
+            tracing::warn!(%err, "clipboard read task failed");
+            crate::clipboard::Clip::Empty
+        });
+    let _ = tx.send(AppEvent::ClipboardPasted(clip));
 }
 
 async fn session_chrome(client: &Client, tx: &Events, session: String) {

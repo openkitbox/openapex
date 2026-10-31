@@ -15,10 +15,11 @@ use ratatui::widgets::{Block, Paragraph, Widget};
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
+use crate::attachment::Loaded;
 use crate::theme;
 use crate::ui::autocomplete::{self, Autocomplete, FileRow, Trigger};
 use crate::ui::commands::{self, CommandAction, Row};
-use crate::ui::composer::Composer;
+use crate::ui::composer::{Composer, Submission};
 use crate::ui::history::History;
 use crate::ui::spinner;
 
@@ -151,12 +152,12 @@ fn session_hint(pal: &theme::Palette) -> Vec<Span<'static>> {
 }
 
 /// What a key meant to the app.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum PromptAction {
     /// The widget handled it (typed text, menu navigation, cleared draft).
     Ignored,
     /// The user submitted a non-empty prompt.
-    Submit(String),
+    Submit(Submission),
     /// A slash command was chosen; the token was removed from the draft.
     Run(CommandAction),
     /// ctrl+c with an empty draft: the app decides interrupt vs quit.
@@ -187,6 +188,9 @@ pub struct Prompt {
     spin_frame: usize,
     /// First Esc of the two-press interrupt; the hint reads `again to interrupt`.
     interrupt_armed: Option<Instant>,
+    /// A modal owns the terminal cursor: the panel still draws, but leaves the
+    /// cursor to the modal (or hidden, for one without a text field).
+    cursor_yielded: bool,
 }
 
 impl Prompt {
@@ -205,7 +209,14 @@ impl Prompt {
             spin_started: None,
             spin_frame: 0,
             interrupt_armed: None,
+            cursor_yielded: false,
         }
+    }
+
+    /// Set before each draw: `true` while a dialog is open, so the prompt does
+    /// not claim the terminal cursor (the IME would anchor under the dialog).
+    pub fn yield_cursor(&mut self, yielded: bool) {
+        self.cursor_yielded = yielded;
     }
 
     /// Swap in the persisted history (the app wires it once at start-up).
@@ -268,11 +279,6 @@ impl Prompt {
         self.auto.visible()
     }
 
-    /// Advance the cursor blink; `true` when a repaint is needed.
-    pub fn tick(&mut self, now: Instant) -> bool {
-        self.composer.tick(now)
-    }
-
     /// Advance the footer scanner; `true` when its frame changed and a repaint
     /// is needed. Idle resets it so the next turn starts from frame 0.
     pub fn tick_spinner(&mut self, now: Instant, running: bool) -> bool {
@@ -302,11 +308,6 @@ impl Prompt {
         }
         self.interrupt_armed = Some(now);
         false
-    }
-
-    /// Restart the visible cursor phase (keystroke or focus coming back).
-    pub fn touch(&mut self, now: Instant) {
-        self.composer.touch(now);
     }
 
     /// Show a newly selected agent in the metadata row.
@@ -359,9 +360,6 @@ impl Prompt {
 
     pub fn handle_key(&mut self, key: KeyEvent) -> PromptAction {
         if self.auto.visible() {
-            // Menu navigation never reaches the composer, but it is still the
-            // user at the keyboard: keep the cursor in its visible phase.
-            self.composer.touch(Instant::now());
             return self.handle_menu_key(key);
         }
         if key.code == KeyCode::Esc {
@@ -377,12 +375,27 @@ impl Prompt {
         if key.modifiers.is_empty() && self.walk_history(key.code) {
             return PromptAction::Ignored;
         }
-        let Some(text) = self.composer.handle_key(key) else {
+        let Some(submission) = self.composer.handle_key(key) else {
             self.sync_menu();
             return PromptAction::Ignored;
         };
-        self.submitted(&text);
-        PromptAction::Submit(text)
+        self.submitted(&submission.text);
+        PromptAction::Submit(submission)
+    }
+
+    /// Bracketed paste into the composer. The menu follows the new text the
+    /// same way it follows typed keys.
+    pub fn handle_paste(&mut self, text: String) {
+        self.composer.insert_paste(text);
+        self.sync_menu();
+    }
+
+    /// Pasted files that were read: each becomes a label in the composer.
+    pub fn attach(&mut self, loaded: Vec<Loaded>) {
+        for item in loaded {
+            self.composer.attach(item);
+        }
+        self.sync_menu();
     }
 
     /// Record a submitted prompt and close the menu.
@@ -459,9 +472,9 @@ impl Prompt {
                 PromptAction::Ignored
             }
             _ => {
-                if let Some(text) = self.composer.handle_key(key) {
-                    self.submitted(&text);
-                    return PromptAction::Submit(text);
+                if let Some(submission) = self.composer.handle_key(key) {
+                    self.submitted(&submission.text);
+                    return PromptAction::Submit(submission);
                 }
                 self.sync_menu();
                 PromptAction::Ignored
@@ -601,7 +614,7 @@ impl Prompt {
             height: composer_h.min(panel.height.saturating_sub(1)),
         };
         if text_area.height > 0 {
-            self.composer.render(frame, text_area);
+            self.composer.render(frame, text_area, !self.cursor_yielded);
         }
 
         // Metadata row, one blank row under the textarea.
@@ -970,15 +983,14 @@ fn row_text(buf: &ratatui::buffer::Buffer, y: u16, from: u16, to: u16) -> String
 #[cfg(test)]
 mod tests {
     use super::{
-        Chrome, Footer, McpSummary, Meta, Prompt, PromptAction, metadata_line, placeholder_line,
-        row_text,
+        Chrome, Footer, McpSummary, Meta, Prompt, PromptAction, Submission, metadata_line,
+        placeholder_line, row_text,
     };
     use crate::theme::{Deck, Palette};
-    use crate::ui::composer::CURSOR_BLINK;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
-    use ratatui::layout::Rect;
+    use ratatui::layout::{Position, Rect};
     use ratatui::style::{Color, Modifier};
     use std::time::Instant;
 
@@ -1148,6 +1160,37 @@ mod tests {
     }
 
     #[test]
+    fn paste_lands_in_the_composer_and_opens_the_slash_menu() {
+        let mut prompt = prompt();
+        prompt.handle_paste("/new".to_owned());
+        assert_eq!(prompt.text(), "/new");
+        assert!(
+            prompt.autocomplete_visible(),
+            "paste syncs the menu like keys"
+        );
+        prompt.handle_paste(" tail\nmore".to_owned());
+        assert!(
+            !prompt.autocomplete_visible(),
+            "a later paste closes it again"
+        );
+        assert_eq!(prompt.text(), "/new tail\nmore");
+    }
+
+    #[test]
+    fn a_folded_paste_is_submitted_and_recorded_in_full() {
+        let mut prompt = prompt();
+        let long = "l1\nl2\nl3\nl4";
+        prompt.handle_paste(long.to_owned());
+        assert_eq!(prompt.text(), "[Pasted ~4 lines]");
+        let action = key(&mut prompt, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            matches!(action, PromptAction::Submit(ref s) if s.text == long && s.files.is_empty())
+        );
+        up(&mut prompt);
+        assert_eq!(prompt.text(), long, "history holds the expanded text");
+    }
+
+    #[test]
     fn slash_opens_the_menu_and_enter_runs_the_command() {
         let mut prompt = prompt();
         type_text(&mut prompt, "/new");
@@ -1240,7 +1283,7 @@ mod tests {
         type_text(&mut prompt, "hi there");
         assert_eq!(
             key(&mut prompt, KeyCode::Enter, KeyModifiers::NONE),
-            PromptAction::Submit("hi there".into())
+            PromptAction::Submit(Submission::text("hi there"))
         );
     }
 
@@ -1464,34 +1507,61 @@ mod tests {
         assert_eq!(buf[(1, top)].bg, pal().panel.bg.expect("panel bg"));
     }
 
+    /// Where the backend's cursor sits before a draw: not (0, 0), the
+    /// backend's default, so a cursor that is never placed shows as such.
+    const PARKED: Position = Position::new(99, 0);
+
+    fn cursor_of(prompt: &mut Prompt, width: u16, height: u16) -> (Position, TestBackend) {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.set_cursor_position(PARKED).unwrap();
+        terminal
+            .draw(|frame| {
+                let h = prompt.height(height).min(height);
+                let area = Rect::new(0, height - h, width, h);
+                prompt.render(frame, area, frame.area(), false);
+            })
+            .unwrap();
+        let position = terminal.get_cursor_position().unwrap();
+        (position, terminal.backend().clone())
+    }
+
     #[test]
-    fn the_cursor_blinks_and_a_keystroke_wakes_it() {
+    fn the_terminal_cursor_follows_the_caret_and_nothing_is_painted_reversed() {
+        let mut prompt = prompt();
+        type_text(&mut prompt, "你好a");
+        let (cursor, backend) = cursor_of(&mut prompt, 100, 24);
+        let top = 24 - prompt.height(24);
+        // rail (1) + pad (2), then two wide glyphs and one narrow one.
+        assert_eq!(cursor, Position::new(3 + 2 + 2 + 1, top + 1));
+        let buf = backend.buffer();
+        assert!(
+            !(0..24).any(|y| (0..100).any(|x| buf[(x, y)].modifier.contains(Modifier::REVERSED))),
+            "the caret is the terminal's, not a reversed cell"
+        );
+    }
+
+    #[test]
+    fn a_yielded_cursor_is_not_placed_by_the_prompt() {
         let mut prompt = prompt();
         type_text(&mut prompt, "hi");
-        let start = Instant::now();
-        prompt.touch(start);
+        let (placed, _) = cursor_of(&mut prompt, 100, 24);
+        prompt.yield_cursor(true);
+        let (yielded, _) = cursor_of(&mut prompt, 100, 24);
+        assert_ne!(placed, PARKED, "an active prompt moves the cursor");
+        assert_eq!(yielded, PARKED, "a yielded prompt leaves it alone");
+        prompt.yield_cursor(false);
+        assert_eq!(cursor_of(&mut prompt, 100, 24).0, placed);
+    }
 
-        // Force the off phase: the drawn frame has no block cursor.
-        assert!(prompt.tick(start + CURSOR_BLINK));
-        let off = draw(&mut prompt, 100, 24);
-        let total = prompt.height(24);
-        let text_row = 24 - total + 1;
-        assert!(
-            !(0..100).any(|x| off.buffer()[(x, text_row)]
-                .modifier
-                .contains(Modifier::REVERSED)),
-            "off phase must not paint a cursor"
-        );
-
-        // Any key restores the visible phase.
-        key(&mut prompt, KeyCode::Char('x'), KeyModifiers::NONE);
-        let on = draw(&mut prompt, 100, 24);
-        assert!(
-            (0..100).any(|x| on.buffer()[(x, text_row)]
-                .modifier
-                .contains(Modifier::REVERSED)),
-            "on phase must paint the block cursor"
-        );
+    #[test]
+    fn the_cursor_stays_in_the_prompt_while_the_menu_is_open() {
+        let mut prompt = prompt();
+        type_text(&mut prompt, "/ne");
+        assert!(prompt.autocomplete_visible());
+        let (cursor, _) = cursor_of(&mut prompt, 100, 24);
+        let top = 24 - prompt.height(24);
+        assert_eq!(cursor, Position::new(3 + 3, top + 1));
     }
 
     #[test]
@@ -1626,7 +1696,7 @@ mod tests {
         type_text(prompt, text);
         assert_eq!(
             key(prompt, KeyCode::Enter, KeyModifiers::NONE),
-            PromptAction::Submit(text.into())
+            PromptAction::Submit(Submission::text(text))
         );
     }
 

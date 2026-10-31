@@ -38,6 +38,7 @@ use ratatui::widgets::{Clear, Widget};
 use unicode_width::UnicodeWidthStr;
 
 use super::layout;
+use super::paste;
 use crate::theme::Palette;
 
 /// What a key did to the form.
@@ -211,6 +212,25 @@ impl FormState {
             None if handled => FormOutcome::Changed,
             None => FormOutcome::Idle,
         }
+    }
+
+    /// Bracketed paste into the field being typed in (a text field, or the
+    /// "own answer" row once editing). Newlines fold to spaces; anywhere else
+    /// the paste is ignored.
+    pub fn on_paste(&mut self, text: &str) -> FormOutcome {
+        let text = paste::single_line(text);
+        if text.is_empty() || self.confirm() || !(self.editing || self.textual_now()) {
+            return FormOutcome::Idle;
+        }
+        let fields = Arc::clone(&self.fields);
+        let Some(field) = fields.get(self.tab) else {
+            return FormOutcome::Idle;
+        };
+        self.input.push_str(&text);
+        if !textual(field) {
+            self.update_custom(field);
+        }
+        FormOutcome::Changed
     }
 
     /// Tab / arrow / vim keys that move between tabs.
@@ -1662,6 +1682,44 @@ mod tests {
         assert!(
             form.answers.is_empty(),
             "an emptied optional multiselect is unanswered"
+        );
+    }
+
+    #[test]
+    fn paste_extends_a_text_field_on_one_line() {
+        let mut form = FormState::new(&info(json!([
+            {"type": "string", "key": "name", "title": "Name"}
+        ])));
+        type_text(&mut form, "A");
+        assert_eq!(form.on_paste("da\r\nLove"), FormOutcome::Changed);
+        assert_eq!(form.input, "Ada Love");
+        assert_eq!(press(&mut form, KeyCode::Tab), FormOutcome::Changed);
+        assert!(form.confirm());
+        assert_eq!(
+            press(&mut form, KeyCode::Enter),
+            FormOutcome::Submit(answer(&[("name", FormValue::String("Ada Love".into()))]))
+        );
+    }
+
+    #[test]
+    fn paste_is_ignored_when_no_text_is_being_edited() {
+        let mut form = stack(false);
+        assert_eq!(form.on_paste("rust"), FormOutcome::Idle);
+        assert!(form.input.is_empty());
+    }
+
+    #[test]
+    fn paste_extends_an_own_answer_being_edited() {
+        let mut form = stack(true);
+        press(&mut form, KeyCode::Down);
+        press(&mut form, KeyCode::Down); // the "own answer" row
+        type_text(&mut form, "Z"); // starts editing it
+        assert_eq!(form.on_paste("ig"), FormOutcome::Changed);
+        assert_eq!(form.input, "Zig");
+        assert_eq!(
+            form.answers.get("stack"),
+            Some(&FormValue::String("Zig".into())),
+            "the answer follows the paste live"
         );
     }
 

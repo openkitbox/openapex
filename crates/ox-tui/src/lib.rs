@@ -1,5 +1,7 @@
 pub mod app;
+pub mod attachment;
 pub mod bootstrap;
+pub mod clipboard;
 pub mod executor;
 pub mod pipeline;
 pub mod terminal;

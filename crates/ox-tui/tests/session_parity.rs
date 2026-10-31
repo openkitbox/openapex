@@ -22,7 +22,6 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
 use ratatui::widgets::Paragraph;
-use std::time::{Duration, Instant};
 
 fn hex(value: u32) -> Rgb {
     Rgb::new((value >> 16) as u8, (value >> 8) as u8, value as u8)
@@ -80,7 +79,6 @@ fn render(width: u16, height: u16) -> Buffer {
         ..Chrome::default()
     };
     let mut prompt = Prompt::new("", chrome, Footer::Session);
-    prompt.tick(Instant::now() + Duration::from_millis(600));
     prompt.set_ctx(store.context_tokens().map(ox_tui::ui::dock::format_tokens));
 
     let mut transcript = Transcript::new(width, height);

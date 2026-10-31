@@ -115,6 +115,12 @@ pub fn is_search(key: &KeyEvent) -> bool {
     has_ctrl(key, 'f')
 }
 
+/// `ctrl+v`: paste from the system clipboard (upstream `prompt.paste`,
+/// `config/keybind.ts`: `ctrl+v`). Only the prompt acts on it.
+pub fn is_paste(key: &KeyEvent) -> bool {
+    key.kind != KeyEventKind::Release && is_ctrl(key, 'v')
+}
+
 fn follow_up(key: &KeyEvent) -> Option<CommandAction> {
     if !key.modifiers.is_empty() {
         return None;
@@ -293,6 +299,25 @@ mod tests {
         release.kind = KeyEventKind::Release;
         assert_eq!(map.feed(&release, Instant::now(), true), Feed::Pass);
         assert!(!map.is_armed());
+    }
+
+    #[test]
+    fn ctrl_v_is_the_clipboard_paste_key_and_not_a_global_binding() {
+        assert!(is_paste(&ctrl('v')));
+        assert!(!is_paste(&plain('v')));
+        assert!(!is_paste(&ctrl('p')));
+        assert!(!is_paste(&key(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        )));
+        let mut release = ctrl('v');
+        release.kind = KeyEventKind::Release;
+        assert!(!is_paste(&release), "a release is not a second paste");
+        assert_eq!(
+            Keymap::default().feed(&ctrl('v'), Instant::now(), true),
+            Feed::Pass,
+            "the prompt owns it, so it is not a global binding"
+        );
     }
 
     #[test]

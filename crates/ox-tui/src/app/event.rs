@@ -1,10 +1,13 @@
 // event.rs — UI intent (keyboard/stream), never network actions.
 use crossterm::event::{Event, KeyEvent, MouseButton, MouseEventKind};
 use ox_client::store::Item;
+use ox_schema::support::FileInput;
 
 #[derive(Debug)]
 pub enum AppEvent {
     Key(KeyEvent),
+    /// Bracketed paste: the whole pasted text, moved from the terminal event.
+    Paste(String),
     /// The terminal changed size. It carries no geometry: the redraw re-reads
     /// `frame.area()` and ratatui re-queries the backend on every `draw`.
     Resize,
@@ -27,6 +30,7 @@ pub enum AppEvent {
     SessionReady {
         session: String,
         prompt: String,
+        files: Vec<FileInput>,
     },
     /// Lazy session creation failed; the draft must be restored.
     SessionFailed(String),
@@ -79,14 +83,25 @@ pub enum AppEvent {
         query: String,
         entries: Vec<ox_client::rest::FileEntry>,
     },
+    /// Answer to `AppCommand::LoadAttachments`. `loaded` is `None` when any
+    /// file could not be used; `text` is the original paste, to be inserted
+    /// as typed in that case.
+    Attachments {
+        text: String,
+        loaded: Option<Vec<crate::attachment::Loaded>>,
+    },
+    /// Answer to `AppCommand::ReadClipboard`.
+    ClipboardPasted(crate::clipboard::Clip),
 }
 
 impl AppEvent {
-    /// Which terminal events the UI acts on. Everything else (mouse, focus,
-    /// paste) is dropped here, in one place, instead of in the reader thread.
+    /// Which terminal events the UI acts on. Everything else (focus, other
+    /// mouse kinds) is dropped here, in one place, instead of in the reader
+    /// thread. Paste is accepted here only; the app routes it like a key.
     pub fn from_terminal(event: Event) -> Option<Self> {
         match event {
             Event::Key(key) => Some(AppEvent::Key(key)),
+            Event::Paste(text) => Some(AppEvent::Paste(text)),
             Event::Resize(_, _) => Some(AppEvent::Resize),
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::Up(MouseButton::Left) => Some(AppEvent::Click {
@@ -122,6 +137,14 @@ mod tests {
             ),
             "a SIGWINCH-driven resize must not be filtered out"
         );
+    }
+
+    #[test]
+    fn bracketed_paste_reaches_the_app_with_its_text() {
+        match AppEvent::from_terminal(Event::Paste("你好\r\nworld".to_owned())) {
+            Some(AppEvent::Paste(text)) => assert_eq!(text, "你好\r\nworld"),
+            other => panic!("paste must survive untouched: {other:?}"),
+        }
     }
 
     #[test]

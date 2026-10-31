@@ -15,7 +15,6 @@ use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
-use std::time::{Duration, Instant};
 
 fn hex(value: u32) -> Rgb {
     Rgb::new((value >> 16) as u8, (value >> 8) as u8, value as u8)
@@ -64,8 +63,6 @@ fn chrome() -> Chrome {
 
 fn render(width: u16, height: u16, placeholder: usize) -> Buffer {
     let mut prompt = Prompt::new(&placeholder_line(placeholder), chrome(), Footer::Home);
-    // The cursor is a blinking block: capture it in its hidden phase.
-    prompt.tick(Instant::now() + Duration::from_millis(600));
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal
         .draw(|frame| home::render(frame, frame.area(), &mut prompt))

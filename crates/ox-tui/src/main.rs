@@ -107,13 +107,14 @@ async fn main() -> anyhow::Result<()> {
             tokio::spawn(async move {
                 while let Some(command) = command_rx.recv().await {
                     match command {
-                        app::command::AppCommand::CreateSessionAndPrompt(text) => {
+                        app::command::AppCommand::CreateSessionAndPrompt(submission) => {
                             match client.create_session().await {
                                 Ok(session) => {
                                     stream.attach(&session);
                                     let _ = tx.send(app::event::AppEvent::SessionReady {
                                         session,
-                                        prompt: text,
+                                        prompt: submission.text,
+                                        files: submission.files,
                                     });
                                 }
                                 Err(err) => {

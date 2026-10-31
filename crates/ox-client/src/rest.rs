@@ -1,10 +1,20 @@
 use std::time::Duration;
 
-use serde::Deserialize;
+use ox_schema::support::FileInput;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::form::{Answer, FormInfo};
 use crate::{Client, Error, Result};
+
+/// `POST …/prompt` body, borrowing the caller's text and attachments (a
+/// base64 image can be tens of MB, so nothing here is cloned).
+#[derive(Serialize)]
+struct PromptBody<'a> {
+    text: &'a str,
+    #[serde(skip_serializing_if = "<[FileInput]>::is_empty")]
+    files: &'a [FileInput],
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProjectRef {
@@ -358,13 +368,15 @@ impl Client {
         Ok(resp.json().await?)
     }
 
-    pub async fn prompt(&self, session: &str, text: &str) -> Result<Value> {
+    /// `files` are serialized by reference; with none the body is exactly the
+    /// text-only `{"text":..}` the server always accepted.
+    pub async fn prompt(&self, session: &str, text: &str, files: &[FileInput]) -> Result<Value> {
         let resp = self
             .request(
                 reqwest::Method::POST,
                 &format!("/api/session/{session}/prompt"),
             )
-            .json(&serde_json::json!({ "text": text }))
+            .json(&PromptBody { text, files })
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -554,6 +566,43 @@ impl Client {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn file(uri: &str) -> FileInput {
+        FileInput {
+            uri: uri.into(),
+            source: None,
+            name: Some("a.png".into()),
+            description: None,
+            mention: None,
+        }
+    }
+
+    #[test]
+    fn a_prompt_without_files_serializes_to_the_text_only_body() {
+        let body = serde_json::to_string(&PromptBody {
+            text: "hi",
+            files: &[],
+        })
+        .unwrap();
+        assert_eq!(body, r#"{"text":"hi"}"#);
+    }
+
+    #[test]
+    fn a_prompt_with_files_carries_them_in_a_files_array() {
+        let files = [file("data:image/png;base64,AAAA")];
+        let body = serde_json::to_value(PromptBody {
+            text: "hi",
+            files: &files,
+        })
+        .unwrap();
+        assert_eq!(
+            body,
+            json!({
+                "text": "hi",
+                "files": [{"uri": "data:image/png;base64,AAAA", "name": "a.png"}],
+            })
+        );
+    }
 
     #[test]
     fn rest_requests_time_out_but_the_event_stream_does_not() {

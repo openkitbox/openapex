@@ -79,7 +79,7 @@ async fn prompt_posts_text_and_interrupt_uses_session_path() {
     let base = mock.start().await;
     let client = Client::new(base, "/proj");
 
-    let _ = client.prompt("ses_1", "hi").await.unwrap();
+    let _ = client.prompt("ses_1", "hi", &[]).await.unwrap();
     client.interrupt("ses_1").await.unwrap();
 
     let requests = mock.requests();

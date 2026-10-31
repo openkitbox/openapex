@@ -13,6 +13,7 @@ pub mod layout;
 pub mod markdown;
 pub mod models;
 pub mod palette;
+pub mod paste;
 pub mod prompt;
 pub mod session_dialog;
 pub mod spinner;

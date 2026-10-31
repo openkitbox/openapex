@@ -21,6 +21,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::form::{self, FormOutcome, FormState};
 use super::fuzzy;
+use super::paste;
 use crate::theme::{self, Palette};
 
 /// What a key did to the open dialog. The app only needs to know whether to
@@ -91,6 +92,23 @@ impl Dialog {
                 FormOutcome::Changed => DialogOutcome::Changed,
                 FormOutcome::Submit(answer) => DialogOutcome::FormSubmitted(answer),
                 FormOutcome::Cancel => DialogOutcome::Cancelled,
+            },
+        }
+    }
+}
+
+impl Dialog {
+    /// Bracketed paste into the dialog's text field, if it has one. Newlines
+    /// fold to spaces; dialogs without a text field ignore it (they are modal,
+    /// so it never reaches the composer).
+    pub fn on_paste(&mut self, text: &str) -> DialogOutcome {
+        match self {
+            Self::Info(_) => DialogOutcome::Idle,
+            Self::Select(select) => select.on_paste(text),
+            Self::Input(input) => input.on_paste(text),
+            Self::Form(form) => match form.on_paste(text) {
+                FormOutcome::Changed => DialogOutcome::Changed,
+                _ => DialogOutcome::Idle,
             },
         }
     }
@@ -539,6 +557,16 @@ impl Select {
             .as_deref()
     }
 
+    /// Paste into the filter field.
+    pub fn on_paste(&mut self, text: &str) -> DialogOutcome {
+        let text = paste::single_line(text);
+        if text.is_empty() {
+            return DialogOutcome::Idle;
+        }
+        self.filter.push_str(&text);
+        self.refilter()
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) -> DialogOutcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -619,6 +647,15 @@ impl Input {
 
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    pub fn on_paste(&mut self, text: &str) -> DialogOutcome {
+        let text = paste::single_line(text);
+        if text.is_empty() {
+            return DialogOutcome::Idle;
+        }
+        self.text.push_str(&text);
+        DialogOutcome::Changed
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> DialogOutcome {
@@ -1071,6 +1108,36 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
+
+    #[test]
+    fn paste_appends_to_an_input_dialog_on_one_line() {
+        let mut dialog = crate::ui::session_dialog::rename("ses_1", "ab");
+        assert_eq!(dialog.on_paste("cd\r\nef"), DialogOutcome::Changed);
+        let Dialog::Input(input) = &dialog else {
+            panic!("rename is an input dialog");
+        };
+        assert_eq!(input.text(), "abcd ef");
+        assert_eq!(dialog.on_paste(""), DialogOutcome::Idle);
+    }
+
+    #[test]
+    fn paste_extends_a_select_filter_and_refilters() {
+        let mut dialog = Dialog::Select(Select::new(
+            "Pick",
+            vec![Item::new("a", "alpha"), Item::new("b", "beta")],
+        ));
+        assert_eq!(dialog.on_paste("be\nta"), DialogOutcome::Changed);
+        let Dialog::Select(select) = &dialog else {
+            panic!("still a select");
+        };
+        assert_eq!(select.filter, "be ta");
+    }
+
+    #[test]
+    fn paste_is_ignored_by_dialogs_without_a_text_field() {
+        let mut dialog = status(&[server("a", McpStatus::Connected)]);
+        assert_eq!(dialog.on_paste("x"), DialogOutcome::Idle);
+    }
 
     fn server(name: &str, status: McpStatus) -> McpRef {
         McpRef {

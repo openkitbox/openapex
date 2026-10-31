@@ -1,12 +1,17 @@
 // command.rs — App -> server (executed by tokio tasks via ox-client).
+use ox_schema::support::FileInput;
+
+use crate::ui::composer::Submission;
+
 #[derive(Debug, Clone)]
 pub enum AppCommand {
     /// First prompt from Home: create a session, then the app receives
     /// `AppEvent::SessionReady` and follows up with `Prompt`.
-    CreateSessionAndPrompt(String),
+    CreateSessionAndPrompt(Submission),
     Prompt {
         session: String,
         text: String,
+        files: Vec<FileInput>,
     },
     Interrupt {
         session: String,
@@ -75,6 +80,13 @@ pub enum AppCommand {
     },
     /// `GET /api/fs/find` for the `@` file menu; the answer is `AppEvent::Files`.
     FindFiles(String),
+    /// A paste that looks like image/PDF paths: read the files off the UI
+    /// thread. The text is echoed in `AppEvent::Attachments` so a failed read
+    /// can still be pasted as text.
+    LoadAttachments(String),
+    /// `ctrl+v` (or an empty bracketed paste): read the system clipboard off
+    /// the UI thread; the answer is `AppEvent::ClipboardPasted`.
+    ReadClipboard,
 }
 
 /// Why the agent list is being fetched.

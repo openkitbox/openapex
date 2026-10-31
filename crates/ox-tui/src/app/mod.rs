@@ -7,18 +7,24 @@ mod switching;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::execute;
+use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use ox_client::sse::StreamMsg;
 use ox_client::store::{DataStore, Item};
+use ox_schema::support::FileInput;
 use tokio::sync::{mpsc, watch};
 
+use crate::attachment::Loaded;
+use crate::clipboard::Clip;
 use crate::pipeline;
 use crate::terminal::TerminalGuard;
 use crate::ui::commands::CommandAction;
-use crate::ui::composer::{SearchAction, SearchBox};
+use crate::ui::composer::{SearchAction, SearchBox, Submission};
 use crate::ui::dialog::{Dialog, DialogOutcome};
 use crate::ui::dock::{self, StatusMode};
 use crate::ui::layout;
 use crate::ui::palette;
+use crate::ui::paste;
 use crate::ui::prompt::{Chrome, Footer, Prompt, PromptAction, pick_placeholder, placeholder_line};
 use crate::ui::session_dialog;
 use crate::ui::timeline::Transcript;
@@ -58,6 +64,15 @@ pub enum Mode {
     Browse,
 }
 
+/// The home submission awaiting its session. Only the text is kept for a
+/// restore; the attachments travel with the command alone (keeping them here
+/// would duplicate up to ~27 MB each), so a failure just counts what is lost.
+#[derive(Debug, PartialEq)]
+struct PendingHome {
+    text: String,
+    dropped_files: usize,
+}
+
 pub struct App {
     pub route: Route,
     pub session: Option<String>,
@@ -70,7 +85,7 @@ pub struct App {
     next_reload_id: u64,
     pending_reload: Option<u64>,
     /// Home 提交后等待会话创建：失败时把这段文本放回 composer。
-    pending_home_prompt: Option<String>,
+    pending_home_prompt: Option<PendingHome>,
     /// Title of the open session, for the `/rename` prefill.
     session_title: Option<String>,
     dirty: bool,
@@ -150,14 +165,19 @@ impl App {
         match event {
             AppEvent::Quit => self.view.should_quit = true,
             AppEvent::Key(key) => self.handle_key(key),
+            AppEvent::Paste(text) => self.handle_paste(text),
+            AppEvent::Attachments { text, loaded } => self.handle_attachments(text, loaded),
+            AppEvent::ClipboardPasted(clip) => self.handle_clipboard(clip),
             AppEvent::Resize => self.dirty = true,
             AppEvent::Click { x, y } => self.handle_click(x, y),
             AppEvent::Wheel(direction) => self.handle_wheel(direction),
             AppEvent::Stream(msg) => self.handle_stream(msg),
             AppEvent::History { request_id, items } => self.handle_history(request_id, items),
-            AppEvent::SessionReady { session, prompt } => {
-                self.handle_session_ready(session, prompt)
-            }
+            AppEvent::SessionReady {
+                session,
+                prompt,
+                files,
+            } => self.handle_session_ready(session, prompt, files),
             AppEvent::SessionFailed(err) => self.handle_session_failed(err),
             AppEvent::PromptFailed(err) => {
                 self.show_toast(Toast::error("Failed to send prompt", err, Instant::now()))
@@ -376,7 +396,7 @@ impl App {
         self.refresh();
     }
 
-    fn handle_session_ready(&mut self, session: String, prompt: String) {
+    fn handle_session_ready(&mut self, session: String, prompt: String, files: Vec<FileInput>) {
         self.pending_home_prompt = None;
         self.session = Some(session.clone());
         self.store.session = Some(session.clone());
@@ -387,17 +407,22 @@ impl App {
         let _ = self.commands.send(AppCommand::Prompt {
             session,
             text: prompt,
+            files,
         });
         self.refresh();
     }
 
     fn handle_session_failed(&mut self, err: String) {
-        if let Some(draft) = self.pending_home_prompt.take() {
-            self.prompt.restore(&draft);
+        let mut message = err;
+        if let Some(pending) = self.pending_home_prompt.take() {
+            self.prompt.restore(&pending.text);
+            if pending.dropped_files > 0 {
+                message = format!("{message} (attachments were dropped)");
+            }
         }
         self.show_toast(Toast::error(
             "Creating a session failed",
-            err,
+            message,
             Instant::now(),
         ));
     }
@@ -441,14 +466,141 @@ impl App {
         });
     }
 
-    /// The prompt takes keys again on the way out of search/browse: it must not
-    /// inherit a cursor that was blinking off while it was hidden.
-    fn focus_prompt(&mut self) {
-        self.prompt.touch(std::time::Instant::now());
-    }
-
     fn handle_key(&mut self, key: crossterm::event::KeyEvent) {
         self.handle_key_at(key, Instant::now());
+    }
+
+    /// Bracketed paste goes where a key would: an open dialog first (text
+    /// only), then the search prompt (one line), then the main prompt.
+    fn handle_paste(&mut self, text: String) {
+        self.keymap.reset();
+        if let Some(dialog) = &mut self.dialog {
+            let tag = dialog.tag();
+            let outcome = dialog.on_paste(&text);
+            self.apply_dialog_outcome(tag, outcome);
+            return;
+        }
+        if let Mode::SearchInput(boxed) = &mut self.mode {
+            boxed.insert_paste(&text);
+            self.transcript.set_query(&boxed.text());
+            self.dirty = true;
+            return;
+        }
+        // An empty paste is how some terminals (Windows Terminal) report an
+        // image-only clipboard; the clipboard itself has to be read.
+        if text.is_empty() {
+            self.request_clipboard();
+            return;
+        }
+        self.focus_prompt();
+        // Image/PDF paths become attachments; reading them is the executor's
+        // job, and its answer comes back as `AppEvent::Attachments`.
+        if paste::pasted_attachment_paths(&text).is_empty() {
+            self.paste_into_prompt(text);
+        } else if let Err(mpsc::error::SendError(AppCommand::LoadAttachments(text))) =
+            self.commands.send(AppCommand::LoadAttachments(text))
+        {
+            // No executor (offline): the command hands the text back.
+            self.paste_into_prompt(text);
+        }
+    }
+
+    /// Leave browse mode for typing: like any other key, a paste or a
+    /// clipboard read puts the user back in the prompt.
+    fn focus_prompt(&mut self) {
+        if matches!(self.mode, Mode::Browse) {
+            self.transcript.clear_search();
+            self.show_help = false;
+            self.mode = Mode::Compose;
+        }
+    }
+
+    /// Ask the executor to read the system clipboard; the answer arrives as
+    /// `AppEvent::ClipboardPasted`.
+    fn request_clipboard(&mut self) {
+        self.focus_prompt();
+        let _ = self.commands.send(AppCommand::ReadClipboard);
+        self.dirty = true;
+    }
+
+    /// The clipboard's content: an image becomes an attachment, text takes the
+    /// same road as a bracketed paste, and nothing usable is explained in a
+    /// toast. If a modal opened while the read ran, the answer is dropped
+    /// rather than landing behind it.
+    fn handle_clipboard(&mut self, clip: Clip) {
+        if self.another_input_active() {
+            self.drop_late_answer("Clipboard content dropped: another input is active");
+            return;
+        }
+        match clip {
+            Clip::Image(input) => {
+                self.focus_prompt();
+                self.prompt.attach(vec![Loaded::File {
+                    name: "clipboard".to_owned(),
+                    input,
+                }]);
+                self.flush_file_request();
+                self.dirty = true;
+            }
+            Clip::Text(text) => self.handle_paste(text),
+            Clip::Empty => self.show_toast(Toast::new(
+                toast::Variant::Warning,
+                Some("Clipboard".to_owned()),
+                "The clipboard has no image or text",
+                Instant::now(),
+            )),
+            Clip::Unsupported => self.show_toast(Toast::new(
+                toast::Variant::Warning,
+                Some("Clipboard".to_owned()),
+                "Pasting from the clipboard is not supported on this platform",
+                Instant::now(),
+            )),
+        }
+    }
+
+    /// The executor's answer to a paste of file paths: the files as labels,
+    /// or, when any could not be read, the pasted text as it was.
+    fn handle_attachments(&mut self, text: String, loaded: Option<Vec<Loaded>>) {
+        if self.another_input_active() {
+            self.drop_late_answer("Attachments dropped: another input is active");
+            return;
+        }
+        match loaded {
+            Some(loaded) => {
+                self.prompt.attach(loaded);
+                self.flush_file_request();
+                self.dirty = true;
+            }
+            None => self.paste_into_prompt(text),
+        }
+    }
+
+    fn paste_into_prompt(&mut self, text: String) {
+        self.prompt.handle_paste(text);
+        self.flush_file_request();
+        self.dirty = true;
+    }
+
+    /// A dialog or the search box owns the keyboard, so a slow answer (the
+    /// clipboard, loaded files) must not land in the prompt behind it.
+    fn another_input_active(&self) -> bool {
+        self.dialog.is_some() || matches!(self.mode, Mode::SearchInput(_))
+    }
+
+    fn drop_late_answer(&mut self, message: &str) {
+        self.show_toast(Toast::new(
+            toast::Variant::Info,
+            None,
+            message,
+            Instant::now(),
+        ));
+    }
+
+    /// Send the prompt's pending `@` file lookup, if text just changed it.
+    fn flush_file_request(&mut self) {
+        if let Some(query) = self.prompt.take_file_request() {
+            let _ = self.commands.send(AppCommand::FindFiles(query));
+        }
     }
 
     /// `handle_key` with the clock injected (the leader's 2s window).
@@ -474,7 +626,6 @@ impl App {
             if keymap::is_cancel(&key) {
                 self.transcript.clear_search();
                 self.mode = Mode::Compose;
-                self.focus_prompt();
                 self.dirty = true;
                 return;
             }
@@ -482,7 +633,6 @@ impl App {
                 SearchAction::Cancel => {
                     self.transcript.clear_search();
                     self.mode = Mode::Compose;
-                    self.focus_prompt();
                 }
                 SearchAction::Confirm => self.mode = Mode::Browse,
                 SearchAction::Edited => {
@@ -513,6 +663,13 @@ impl App {
             }
         }
 
+        // `ctrl+v` reads the system clipboard (upstream `prompt.paste`). The
+        // modal and search boxes above never get here, so only the prompt acts.
+        if keymap::is_paste(&key) {
+            self.request_clipboard();
+            return;
+        }
+
         // Browse mode: single-letter navigation is safe here because the
         // prompt is not receiving keys.
         if matches!(self.mode, Mode::Browse) {
@@ -526,7 +683,6 @@ impl App {
                     self.transcript.clear_search();
                     self.show_help = false;
                     self.mode = Mode::Compose;
-                    self.focus_prompt();
                 }
                 KeyCode::Char('n') => {
                     self.transcript.next_match(true);
@@ -636,30 +792,38 @@ impl App {
             PromptAction::Ignored => {}
             PromptAction::CtrlC => self.interrupt_or_quit(),
             PromptAction::Esc => self.press_esc(Instant::now()),
-            PromptAction::Submit(text) => self.submit(text),
+            PromptAction::Submit(submission) => self.submit(submission),
             PromptAction::Run(action) => self.run_command(action),
         }
-        if let Some(query) = self.prompt.take_file_request() {
-            let _ = self.commands.send(AppCommand::FindFiles(query));
-        }
+        self.flush_file_request();
         self.dirty = true;
     }
 
-    fn submit(&mut self, text: String) {
+    fn submit(&mut self, submission: Submission) {
         if self.route == Route::Home {
             if self.pending_home_prompt.is_some() {
                 // A creation is already in flight; keep whatever is typed.
                 return;
             }
-            self.pending_home_prompt = Some(text.clone());
-            let _ = self.commands.send(AppCommand::CreateSessionAndPrompt(text));
+            self.pending_home_prompt = Some(PendingHome {
+                text: submission.text.clone(),
+                dropped_files: submission.files.len(),
+            });
+            let _ = self
+                .commands
+                .send(AppCommand::CreateSessionAndPrompt(submission));
             return;
         }
+        let Submission { text, files } = submission;
         // 本地乐观显示：随后一帧就有用户消息；服务端确认后由历史重拉覆盖。
         self.store.push_user(&text);
         self.refresh();
         if let Some(session) = self.session.clone() {
-            let _ = self.commands.send(AppCommand::Prompt { session, text });
+            let _ = self.commands.send(AppCommand::Prompt {
+                session,
+                text,
+                files,
+            });
         }
     }
 
@@ -960,13 +1124,6 @@ impl App {
                             && let Ok(envelope) = serde_json::from_value::<ox_schema::event::EventEnvelope<serde_json::Value>>(raw) {
                                 self.handle_stream(StreamMsg::Event(Box::new(envelope)));
                             }
-                    // An idle app only repaints when `dirty`, so the blinking
-                    // cursor has to ask for its own frames.
-                    if !matches!(self.mode, Mode::SearchInput(_))
-                        && self.prompt.tick(Instant::now())
-                    {
-                        self.dirty = true;
-                    }
                     // 运行中的扫描条按时间走帧，空闲时不再重绘。
                     let running = self.store.running_since.is_some();
                     if self.prompt.tick_spinner(Instant::now(), running) {
@@ -979,7 +1136,13 @@ impl App {
                     if self.dirty {
                         self.flush_store();
                         self.dirty = false;
-                        match self.route {
+                        self.prompt.yield_cursor(self.dialog.is_some());
+                        // The terminal applies the whole frame at once, so the
+                        // cursor hopping around while cells are written is
+                        // never seen (an IME anchors on it). Terminals that
+                        // do not know the sequence ignore it.
+                        execute!(terminal.terminal.backend_mut(), BeginSynchronizedUpdate)?;
+                        let drawn = match self.route {
                             Route::Home => {
                                 terminal.terminal.draw(|frame| {
                                     crate::ui::home::render(
@@ -994,7 +1157,7 @@ impl App {
                                         let area = frame.area();
                                         toast::render(frame.buffer_mut(), area, toast, crate::theme::palette());
                                     }
-                                })?;
+                                }).map(|_| ())
                             }
                             Route::Session => {
                                 terminal.terminal.draw(|frame| {
@@ -1010,7 +1173,7 @@ impl App {
                                     );
                                     match &mut self.mode {
                                         Mode::SearchInput(boxed) => {
-                                            boxed.render(frame, prompt_area)
+                                            boxed.render(frame, prompt_area, self.dialog.is_none())
                                         }
                                         _ => {
                                             let prompt_area =
@@ -1037,9 +1200,11 @@ impl App {
                                     if let Some(toast) = &self.toast {
                                         toast::render(frame.buffer_mut(), full, toast, crate::theme::palette());
                                     }
-                                })?;
+                                }).map(|_| ())
                             }
-                        }
+                        };
+                        execute!(terminal.terminal.backend_mut(), EndSynchronizedUpdate)?;
+                        drawn?;
                     }
                 }
                 Some(event) = events.recv() => {
@@ -1055,14 +1220,17 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::App;
+    use super::{App, PendingHome};
     use crate::app::command::AppCommand;
     use crate::app::event::AppEvent;
     use crate::app::state::Route;
+    use crate::attachment::Loaded;
+    use crate::ui::composer::Submission;
     use crate::ui::dialog::Dialog;
     use crate::ui::toast::{self, Toast};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ox_client::store::Item;
+    use ox_schema::support::FileInput;
     use std::time::{Duration, Instant};
     use tokio::sync::{mpsc, watch};
 
@@ -1225,6 +1393,355 @@ mod tests {
         assert!(app.dialog.is_none(), "esc dismisses the dialog");
     }
 
+    fn paste(app: &mut App, text: &str) {
+        app.handle(AppEvent::Paste(text.to_owned()));
+    }
+
+    #[test]
+    fn paste_in_compose_mode_reaches_the_prompt() {
+        let (mut app, _rx) = app(Route::Home, None);
+        app.dirty = false;
+        paste(&mut app, "第一行\r\n第二行");
+        assert_eq!(app.prompt.text(), "第一行\n第二行");
+        assert!(app.dirty, "the pasted text must repaint");
+    }
+
+    #[test]
+    fn pasting_image_paths_asks_the_executor_to_load_them() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        paste(&mut app, "'/tmp/my shot.png'");
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(commands.as_slice(), [AppCommand::LoadAttachments(t)] if t == "'/tmp/my shot.png'"),
+            "{commands:?}"
+        );
+        assert!(app.prompt.is_empty(), "nothing is typed until the answer");
+    }
+
+    #[test]
+    fn pasting_ordinary_text_never_loads_files() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        paste(&mut app, "see /tmp/notes.txt and a.png");
+        let commands = drain(&mut rx);
+        assert!(commands.is_empty(), "{commands:?}");
+        assert_eq!(app.prompt.text(), "see /tmp/notes.txt and a.png");
+    }
+
+    #[test]
+    fn dialogs_and_search_never_load_files() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        ctrl(&mut app, 'f');
+        paste(&mut app, "/tmp/a.png");
+        assert!(drain(&mut rx).is_empty());
+        assert!(app.prompt.is_empty());
+    }
+
+    #[test]
+    fn a_failed_load_pastes_the_text_as_typed() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        app.dirty = false;
+        app.handle(AppEvent::Attachments {
+            text: "/tmp/gone.png".into(),
+            loaded: None,
+        });
+        assert_eq!(app.prompt.text(), "/tmp/gone.png");
+        assert!(app.dirty);
+    }
+
+    #[test]
+    fn a_failed_load_flushes_the_file_menu_request_at_once() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        app.handle(AppEvent::Attachments {
+            text: "see @sr".into(),
+            loaded: None,
+        });
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(commands.as_slice(), [AppCommand::FindFiles(q)] if q == "sr"),
+            "{commands:?}"
+        );
+    }
+
+    fn one_png() -> Vec<Loaded> {
+        vec![Loaded::File {
+            name: "shot.png".into(),
+            input: FileInput {
+                uri: "data:image/png;base64,AAAA".into(),
+                source: None,
+                name: Some("shot.png".into()),
+                description: None,
+                mention: None,
+            },
+        }]
+    }
+
+    #[test]
+    fn attachments_arriving_behind_a_modal_are_dropped_with_a_toast() {
+        let (mut dialog, _rx) = app(Route::Session, Some("ses_test"));
+        dialog.dialog = Some(crate::ui::session_dialog::rename("ses_test", "old"));
+        dialog.handle(AppEvent::Attachments {
+            text: "/tmp/shot.png".into(),
+            loaded: Some(one_png()),
+        });
+        assert!(dialog.prompt.is_empty(), "nothing lands behind the dialog");
+        let toast = dialog.toast.as_ref().expect("the drop is explained");
+        assert!(toast.message.contains("dropped"), "{toast:?}");
+
+        let (mut search, _rx) = app(Route::Session, Some("ses_test"));
+        ctrl(&mut search, 'f');
+        search.handle(AppEvent::Attachments {
+            text: "/tmp/gone.png".into(),
+            loaded: None,
+        });
+        assert!(search.prompt.is_empty());
+        let toast = search.toast.as_ref().expect("the drop is explained");
+        assert!(toast.message.contains("dropped"), "{toast:?}");
+    }
+
+    #[test]
+    fn a_clipboard_answer_behind_a_modal_is_dropped_with_a_toast() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        app.dialog = Some(crate::ui::session_dialog::rename("ses_test", "old"));
+        app.handle(AppEvent::ClipboardPasted(crate::clipboard::Clip::Text(
+            "late".into(),
+        )));
+        assert!(app.prompt.is_empty());
+        let toast = app.toast.as_ref().expect("the drop is explained");
+        assert!(toast.message.contains("dropped"), "{toast:?}");
+    }
+
+    #[test]
+    fn loaded_files_show_labels_and_ride_along_with_the_prompt() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        app.handle(AppEvent::Attachments {
+            text: "/tmp/shot.png".into(),
+            loaded: Some(vec![Loaded::File {
+                name: "shot.png".into(),
+                input: FileInput {
+                    uri: "data:image/png;base64,AAAA".into(),
+                    source: None,
+                    name: Some("shot.png".into()),
+                    description: None,
+                    mention: None,
+                },
+            }]),
+        });
+        assert_eq!(app.prompt.text(), "[Image 1] ");
+        type_text(&mut app, "what is this");
+        key(&mut app, KeyCode::Enter);
+        let commands = drain(&mut rx);
+        let Some(AppCommand::Prompt { text, files, .. }) = commands
+            .iter()
+            .find(|c| matches!(c, AppCommand::Prompt { .. }))
+        else {
+            panic!("a prompt command expected: {commands:?}");
+        };
+        assert_eq!(text, "[Image 1] what is this");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].uri, "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn without_an_executor_a_path_paste_falls_back_to_text() {
+        let (mut app, rx) = app(Route::Session, Some("ses_test"));
+        drop(rx);
+        paste(&mut app, "/tmp/a.png");
+        assert_eq!(app.prompt.text(), "/tmp/a.png");
+    }
+
+    fn clipboard_png() -> crate::clipboard::Clip {
+        crate::clipboard::Clip::Image(FileInput {
+            uri: "data:image/png;base64,AAAA".into(),
+            source: None,
+            name: Some("clipboard".into()),
+            description: None,
+            mention: None,
+        })
+    }
+
+    fn read_clipboard_requests(commands: &[AppCommand]) -> usize {
+        commands
+            .iter()
+            .filter(|c| matches!(c, AppCommand::ReadClipboard))
+            .count()
+    }
+
+    #[test]
+    fn ctrl_v_in_the_prompt_asks_the_executor_for_the_clipboard() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        ctrl(&mut app, 'v');
+        let commands = drain(&mut rx);
+        assert_eq!(read_clipboard_requests(&commands), 1, "{commands:?}");
+        assert!(app.prompt.is_empty(), "nothing is typed until the answer");
+    }
+
+    #[test]
+    fn ctrl_v_from_browse_mode_goes_back_to_the_prompt_and_asks() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        ctrl(&mut app, 'f');
+        key(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, super::Mode::Browse));
+        ctrl(&mut app, 'v');
+        assert!(matches!(app.mode, super::Mode::Compose));
+        assert_eq!(read_clipboard_requests(&drain(&mut rx)), 1);
+    }
+
+    #[test]
+    fn ctrl_v_in_a_dialog_or_the_search_box_never_reads_the_clipboard() {
+        let (mut searching, mut rx) = app(Route::Session, Some("ses_test"));
+        ctrl(&mut searching, 'f');
+        ctrl(&mut searching, 'v');
+        assert_eq!(read_clipboard_requests(&drain(&mut rx)), 0, "search box");
+
+        let (mut modal, mut rx) = app(Route::Session, Some("ses_test"));
+        modal.dialog = Some(crate::ui::session_dialog::rename("ses_test", "old"));
+        ctrl(&mut modal, 'v');
+        assert_eq!(read_clipboard_requests(&drain(&mut rx)), 0, "dialog");
+    }
+
+    #[test]
+    fn an_empty_bracketed_paste_reads_the_clipboard_in_the_prompt_only() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        paste(&mut app, "");
+        assert_eq!(read_clipboard_requests(&drain(&mut rx)), 1);
+
+        ctrl(&mut app, 'f');
+        paste(&mut app, "");
+        assert_eq!(read_clipboard_requests(&drain(&mut rx)), 0, "search box");
+        assert!(app.prompt.is_empty());
+    }
+
+    #[test]
+    fn a_clipboard_image_becomes_a_labelled_attachment_that_rides_the_prompt() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        app.dirty = false;
+        app.handle(AppEvent::ClipboardPasted(clipboard_png()));
+        assert_eq!(app.prompt.text(), "[Image 1] ");
+        assert!(app.dirty);
+        type_text(&mut app, "what is this");
+        key(&mut app, KeyCode::Enter);
+        let commands = drain(&mut rx);
+        let Some(AppCommand::Prompt { text, files, .. }) = commands
+            .iter()
+            .find(|c| matches!(c, AppCommand::Prompt { .. }))
+        else {
+            panic!("a prompt command expected: {commands:?}");
+        };
+        assert_eq!(text, "[Image 1] what is this");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].uri, "data:image/png;base64,AAAA");
+        assert_eq!(files[0].name.as_deref(), Some("clipboard"));
+    }
+
+    #[test]
+    fn clipboard_text_goes_through_the_paste_entry() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        app.handle(AppEvent::ClipboardPasted(crate::clipboard::Clip::Text(
+            "第一行\r\n第二行".into(),
+        )));
+        assert_eq!(app.prompt.text(), "第一行\n第二行");
+
+        // Image paths on the clipboard attach like a pasted path.
+        app.handle(AppEvent::ClipboardPasted(crate::clipboard::Clip::Text(
+            "'/tmp/my shot.png'".into(),
+        )));
+        let commands = drain(&mut rx);
+        assert!(
+            matches!(commands.as_slice(), [AppCommand::LoadAttachments(t)] if t == "'/tmp/my shot.png'"),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_unsupported_clipboard_shows_a_toast_and_changes_nothing() {
+        use crate::clipboard::Clip;
+        for (clip, needle) in [
+            (Clip::Empty, "no image or text"),
+            (Clip::Unsupported, "not supported"),
+        ] {
+            let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+            app.dirty = false;
+            app.handle(AppEvent::ClipboardPasted(clip));
+            let toast = app
+                .toast
+                .as_ref()
+                .expect("the user is told why nothing happened");
+            assert!(toast.message.contains(needle), "{toast:?}");
+            assert!(app.prompt.is_empty());
+            assert!(app.dirty);
+        }
+    }
+
+    #[test]
+    fn paste_in_search_input_mode_filters_the_transcript_on_one_line() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        ctrl(&mut app, 'f');
+        paste(&mut app, "needle\nhay");
+        let super::Mode::SearchInput(search) = &app.mode else {
+            panic!("search stays open");
+        };
+        assert_eq!(search.text(), "needle hay");
+        assert!(app.prompt.is_empty(), "the draft is untouched");
+    }
+
+    #[test]
+    fn paste_in_browse_mode_goes_back_to_the_prompt() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        ctrl(&mut app, 'f');
+        key(&mut app, KeyCode::Enter);
+        assert!(matches!(app.mode, super::Mode::Browse));
+        paste(&mut app, "typed");
+        assert!(matches!(app.mode, super::Mode::Compose));
+        assert_eq!(app.prompt.text(), "typed");
+    }
+
+    #[test]
+    fn paste_into_a_dialog_input_stays_in_the_dialog() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        app.dialog = Some(crate::ui::session_dialog::rename("ses_test", "old"));
+        paste(&mut app, " new\ntitle");
+        assert!(app.prompt.is_empty(), "a modal must not leak paste");
+        key(&mut app, KeyCode::Enter);
+        assert!(app.dialog.is_none());
+        let mut commands = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            commands.push(command);
+        }
+        assert!(
+            commands.iter().any(|c| matches!(c,
+                AppCommand::RenameSession { title, .. } if title == "old new title")),
+            "{commands:?}"
+        );
+    }
+
+    #[test]
+    fn paste_into_a_dialog_without_a_text_field_is_swallowed() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        app.handle(AppEvent::McpServers(Vec::new()));
+        app.dirty = false;
+        paste(&mut app, "hello");
+        assert!(app.prompt.is_empty());
+        assert!(app.dialog.is_some());
+        assert!(!app.dirty, "nothing changed, so nothing repaints");
+    }
+
+    #[test]
+    fn paste_into_a_form_text_field_is_one_line() {
+        let (mut app, _rx) = app(Route::Session, Some("ses_test"));
+        app.dialog = Some(Dialog::Form(Box::new(crate::ui::form::FormState::new(
+            &serde_json::from_value(serde_json::json!({
+                "id": "frm_1", "sessionID": "ses_test", "title": "T",
+                "fields": [{"type": "string", "key": "name", "title": "Name"}]
+            }))
+            .unwrap(),
+        ))));
+        paste(&mut app, "a\nb");
+        key(&mut app, KeyCode::Tab);
+        key(&mut app, KeyCode::Enter);
+        assert!(app.dialog.is_none(), "the form submits");
+        assert!(app.prompt.is_empty());
+    }
+
     #[test]
     fn an_open_dialog_swallows_message_keys() {
         let (mut app, _rx) = app(Route::Session, Some("ses_test"));
@@ -1252,7 +1769,9 @@ mod tests {
         type_text(&mut app, "hi");
         key(&mut app, KeyCode::Enter);
         match rx.try_recv().expect("a command must be sent") {
-            AppCommand::CreateSessionAndPrompt(text) => assert_eq!(text, "hi"),
+            AppCommand::CreateSessionAndPrompt(submission) => {
+                assert_eq!(submission, Submission::text("hi"))
+            }
             other => panic!("unexpected command: {other:?}"),
         }
         assert_eq!(app.route, Route::Home);
@@ -1260,7 +1779,13 @@ mod tests {
             app.prompt.is_empty(),
             "the draft moves to the pending prompt"
         );
-        assert_eq!(app.pending_home_prompt.as_deref(), Some("hi"));
+        assert_eq!(
+            app.pending_home_prompt,
+            Some(PendingHome {
+                text: "hi".into(),
+                dropped_files: 0
+            })
+        );
     }
 
     #[test]
@@ -1272,19 +1797,105 @@ mod tests {
         app.handle(AppEvent::SessionReady {
             session: "ses_new".into(),
             prompt: "hi".into(),
+            files: Vec::new(),
         });
         assert_eq!(app.route, Route::Session);
         assert_eq!(app.session.as_deref(), Some("ses_new"));
         assert_eq!(app.store.session.as_deref(), Some("ses_new"));
         match rx.try_recv().expect("prompt must follow") {
-            AppCommand::Prompt { session, text } => {
+            AppCommand::Prompt {
+                session,
+                text,
+                files,
+            } => {
                 assert_eq!(session, "ses_new");
                 assert_eq!(text, "hi");
+                assert!(files.is_empty());
             }
             other => panic!("unexpected command: {other:?}"),
         }
         // 乐观显示：store 里已有用户消息
         assert!(format!("{:?}", app.store.items).contains("hi"));
+    }
+
+    fn fake_file() -> FileInput {
+        FileInput {
+            uri: "data:image/png;base64,AAAA".into(),
+            source: None,
+            name: Some("shot.png".into()),
+            description: None,
+            mention: None,
+        }
+    }
+
+    /// Drive the home chain by hand: `submit` -> command -> `SessionReady`
+    /// (what `main` emits) -> `Prompt`. Returns the files the final command
+    /// carries.
+    fn home_chain(files: Vec<FileInput>) -> Vec<FileInput> {
+        let (mut app, mut rx) = app(Route::Home, None);
+        app.submit(Submission {
+            text: "look".into(),
+            files: files.clone(),
+        });
+        let AppCommand::CreateSessionAndPrompt(submission) =
+            rx.try_recv().expect("creation command")
+        else {
+            panic!("expected CreateSessionAndPrompt");
+        };
+        assert_eq!(submission.files, files);
+        app.handle(AppEvent::SessionReady {
+            session: "ses_new".into(),
+            prompt: submission.text,
+            files: submission.files,
+        });
+        match rx.try_recv().expect("prompt must follow") {
+            AppCommand::Prompt {
+                session,
+                text,
+                files,
+            } => {
+                assert_eq!((session.as_str(), text.as_str()), ("ses_new", "look"));
+                files
+            }
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn home_submit_carries_the_same_files_through_session_creation() {
+        assert_eq!(home_chain(vec![fake_file()]), vec![fake_file()]);
+        assert!(home_chain(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn session_submit_sends_the_files_with_the_prompt() {
+        let (mut app, mut rx) = app(Route::Session, Some("ses_test"));
+        app.submit(Submission {
+            text: "see".into(),
+            files: vec![fake_file()],
+        });
+        match rx.try_recv().expect("prompt command") {
+            AppCommand::Prompt { files, .. } => assert_eq!(files, vec![fake_file()]),
+            other => panic!("unexpected command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_failure_with_files_restores_the_text_and_says_attachments_were_dropped() {
+        let (mut app, _rx) = app(Route::Home, None);
+        app.submit(Submission {
+            text: "keep me".into(),
+            files: vec![fake_file()],
+        });
+        app.handle(AppEvent::SessionFailed("server down".into()));
+        assert_eq!(app.prompt.text(), "keep me");
+        let toast = app.toast.as_ref().expect("the failure must surface");
+        assert!(toast.message.contains("server down"), "{}", toast.message);
+        assert!(
+            toast.message.contains("attachments were dropped"),
+            "{}",
+            toast.message
+        );
     }
 
     #[test]
@@ -1375,7 +1986,10 @@ mod tests {
         key(&mut app, KeyCode::Char('x')); // typing continues
         key(&mut app, KeyCode::Enter); // suppressed
         assert!(rx.try_recv().is_err(), "no second creation command");
-        assert_eq!(app.pending_home_prompt.as_deref(), Some("first"));
+        assert_eq!(
+            app.pending_home_prompt.as_ref().map(|p| p.text.as_str()),
+            Some("first")
+        );
         assert_eq!(app.prompt.text(), "x");
     }
 

@@ -33,6 +33,7 @@ textwrap.workspace = true
 unicode-width.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
