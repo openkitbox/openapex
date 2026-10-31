@@ -8,6 +8,7 @@ pub(crate) mod reload;
 mod session_retention;
 #[cfg(test)]
 mod test_support;
+mod tmp_retention;
 pub(crate) mod worktree;
 
 pub use ox_core::{USER_AGENT, config, event_bus, projector};
@@ -265,6 +266,13 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
     // deleted by the same path as `DELETE /api/session/{id}`. Started here for
     // the same reason as the pruner: tests must not acquire a background writer.
     session_retention::spawn_sweeper(state.clone(), svc.config.sessions.retention_days);
+    // `<ox_home>/tmp` (the dir `build_state_with` creates) is swept on
+    // `[tmp] retention_days` (0 keeps everything); started here for the same
+    // reason: tests must not acquire a background deleter.
+    tmp_retention::spawn_sweeper(
+        ox_core::config::ox_home().join("tmp"),
+        svc.config.tmp.retention_days,
+    );
     let router = build_router(state.clone());
     Ok((state, router))
 }

@@ -238,6 +238,30 @@ impl Default for SessionsConfig {
     }
 }
 
+/// Scratch-directory retention (`[tmp]` section). A top-level entry of
+/// `~/.ox/tmp` is deleted only when the newest file inside it is older than
+/// the window.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TmpConfig {
+    /// Days a top-level `~/.ox/tmp` entry may sit untouched (by its newest
+    /// file) before it is deleted. `0` disables cleanup. The server clamps
+    /// the upper bound.
+    #[serde(default = "default_tmp_retention_days")]
+    pub retention_days: u32,
+}
+
+fn default_tmp_retention_days() -> u32 {
+    7
+}
+
+impl Default for TmpConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: default_tmp_retention_days(),
+        }
+    }
+}
+
 /// Per-turn step cap (`[turn]` section). A step is one model call within a
 /// turn; a turn keeps stepping while the model requests tools. After
 /// `max_steps` steps the next step is a tool-less wrap-up step, so the turn
@@ -299,6 +323,9 @@ pub struct Config {
     /// Session retention (`[sessions]` section).
     #[serde(default)]
     pub sessions: SessionsConfig,
+    /// Scratch-directory retention (`[tmp]` section).
+    #[serde(default)]
+    pub tmp: TmpConfig,
     /// Per-turn step cap (`[turn]` section).
     #[serde(default)]
     pub turn: TurnConfig,
@@ -320,6 +347,7 @@ impl Default for Config {
             subagent: SubagentConfig::default(),
             events: EventsConfig::default(),
             sessions: SessionsConfig::default(),
+            tmp: TmpConfig::default(),
             turn: TurnConfig::default(),
         }
     }
@@ -406,7 +434,7 @@ impl Config {
     /// names of the keys whose new value was rejected (empty when nothing differed).
     ///
     /// Names come back in a fixed order: `listen`, `db_path`, `event_heartbeat_ms`,
-    /// `events`, `sessions`, `turn`, `subagent`, `magic_context`. `llm` and `mcp` are
+    /// `events`, `sessions`, `tmp`, `turn`, `subagent`, `magic_context`. `llm` and `mcp` are
     /// hot-swappable and never touched. Clones happen only for keys that differ, at a reload
     /// boundary.
     pub fn pin_restart_only(&mut self, running: &Config) -> Vec<&'static str> {
@@ -430,6 +458,10 @@ impl Config {
         if self.sessions.retention_days != running.sessions.retention_days {
             self.sessions = running.sessions.clone();
             rejected.push("sessions");
+        }
+        if self.tmp.retention_days != running.tmp.retention_days {
+            self.tmp.retention_days = running.tmp.retention_days;
+            rejected.push("tmp");
         }
         if self.turn.max_steps != running.turn.max_steps {
             self.turn.max_steps = running.turn.max_steps;
@@ -739,6 +771,30 @@ mod tests {
         assert_eq!(next.sessions.retention_days, 30);
 
         let mut same = parse("[sessions]\nretention_days = 30\n");
+        assert!(same.pin_restart_only(&running).is_empty());
+    }
+
+    #[test]
+    fn tmp_retention_defaults_to_seven_days() {
+        assert_eq!(Config::default().tmp.retention_days, 7);
+        assert_eq!(parse("").tmp.retention_days, 7);
+        assert_eq!(parse("[tmp]\n").tmp.retention_days, 7);
+    }
+
+    #[test]
+    fn tmp_retention_zero_parses_as_disabled() {
+        let config = parse("[tmp]\nretention_days = 0\n");
+        assert_eq!(config.tmp.retention_days, 0);
+    }
+
+    #[test]
+    fn tmp_retention_reload_is_rejected_and_pinned() {
+        let running = parse("[tmp]\nretention_days = 7\n");
+        let mut next = parse("[tmp]\nretention_days = 3\n");
+        assert_eq!(next.pin_restart_only(&running), vec!["tmp"]);
+        assert_eq!(next.tmp.retention_days, 7);
+
+        let mut same = parse("[tmp]\nretention_days = 7\n");
         assert!(same.pin_restart_only(&running).is_empty());
     }
 
