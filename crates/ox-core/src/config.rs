@@ -178,17 +178,46 @@ pub struct SubagentConfig {
     /// child→grandchild is not. `0` forbids subagents entirely.
     #[serde(default = "default_subagent_depth")]
     pub depth: usize,
+    /// Maximum number of subagent child sessions running at once, across the
+    /// whole server. A call beyond the limit is not rejected: it waits in a
+    /// FIFO queue and starts when a slot frees. Must be at least `1`.
+    ///
+    /// Deadlock risk when `depth > 1`: a child holds its slot until it
+    /// settles, so a child that spawns a grandchild and waits for it needs a
+    /// second slot. If every slot is held by children waiting on descendants,
+    /// nothing can start. Keep `max_active` larger than the number of nesting
+    /// levels that can be in flight together. The default `depth = 1` forbids
+    /// grandchildren, so it cannot trigger this.
+    #[serde(default = "default_subagent_max_active")]
+    pub max_active: usize,
 }
 
 fn default_subagent_depth() -> usize {
     1
 }
 
+fn default_subagent_max_active() -> usize {
+    5
+}
+
 impl Default for SubagentConfig {
     fn default() -> Self {
         Self {
             depth: default_subagent_depth(),
+            max_active: default_subagent_max_active(),
         }
+    }
+}
+
+impl SubagentConfig {
+    /// Reject `max_active = 0`: with no slots every subagent call would queue
+    /// forever, so the shape is wrong before anything runs (fail closed).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.max_active >= 1,
+            "[subagent] max_active must be at least 1 (0 would queue every subagent forever)"
+        );
+        Ok(())
     }
 }
 
@@ -427,6 +456,7 @@ impl Config {
         config.magic_context = config.magic_context.validated();
         config.mcp.validate()?;
         config.llm.validate()?;
+        config.subagent.validate()?;
         Ok(config)
     }
 
@@ -467,7 +497,9 @@ impl Config {
             self.turn.max_steps = running.turn.max_steps;
             rejected.push("turn");
         }
-        if self.subagent.depth != running.subagent.depth {
+        if self.subagent.depth != running.subagent.depth
+            || self.subagent.max_active != running.subagent.max_active
+        {
             self.subagent = running.subagent.clone();
             rejected.push("subagent");
         }
@@ -749,6 +781,43 @@ mod tests {
 
     fn parse(raw: &str) -> Config {
         toml::from_str(raw).expect("config parses")
+    }
+
+    #[test]
+    fn subagent_max_active_defaults_to_five() {
+        assert_eq!(Config::default().subagent.max_active, 5);
+        assert_eq!(parse("").subagent.max_active, 5);
+        assert_eq!(parse("[subagent]\ndepth = 2\n").subagent.max_active, 5);
+    }
+
+    #[test]
+    fn subagent_max_active_zero_is_rejected_at_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ox.toml");
+        std::fs::write(&path, "[subagent]\nmax_active = 0\n").expect("write config");
+        let error = Config::load_from(path).expect_err("max_active = 0 must fail to load");
+        assert!(
+            error.to_string().contains("max_active"),
+            "error names the key: {error}"
+        );
+
+        let ok = dir.path().join("ok.toml");
+        std::fs::write(&ok, "[subagent]\nmax_active = 2\n").expect("write config");
+        assert_eq!(
+            Config::load_from(ok)
+                .expect("valid config")
+                .subagent
+                .max_active,
+            2
+        );
+    }
+
+    #[test]
+    fn subagent_max_active_reload_is_rejected_and_pinned() {
+        let running = parse("[subagent]\nmax_active = 5\n");
+        let mut next = parse("[subagent]\nmax_active = 2\n");
+        assert_eq!(next.pin_restart_only(&running), vec!["subagent"]);
+        assert_eq!(next.subagent.max_active, 5);
     }
 
     #[test]

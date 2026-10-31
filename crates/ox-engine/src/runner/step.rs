@@ -433,7 +433,7 @@ async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Result<ChatRe
         // The baseline log's tool count is the registry size; the names
         // iterate in the same order the definitions do.
         let count = guidance.len();
-        let profile = if ctx.is_subagent {
+        let profile = if ctx.kind.is_subagent() {
             prompt::WorkflowProfile::Subagent
         } else {
             prompt::WorkflowProfile::Parent

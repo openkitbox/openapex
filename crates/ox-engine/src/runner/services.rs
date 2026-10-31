@@ -10,7 +10,8 @@
 //!
 //! Invariants: `generation` increases by exactly one per successful
 //! [`Live::replace`]; a failed build leaves the current snapshot untouched;
-//! `child_tools` is derived from `tools` once, at construction.
+//! `child_tools` and `read_only_tools` are derived from `tools` once, at
+//! construction.
 
 use std::future::Future;
 use std::sync::{Arc, RwLock};
@@ -19,6 +20,8 @@ use anyhow::Result;
 use ox_core::config::Config;
 use ox_llm::model_catalog::ModelCatalog;
 use ox_mcp::Hub;
+use ox_tools::contract::READ_ONLY_AGENT;
+use ox_tools::contract::READ_ONLY_TOOLS;
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::{Chat, SUBAGENT_EXCLUDED_TOOLS, ToolRegistry};
@@ -43,12 +46,49 @@ pub struct Services {
     pub tools: Arc<ToolRegistry>,
     /// Toolset for subagent children: `tools` minus [`SUBAGENT_EXCLUDED_TOOLS`].
     pub child_tools: Arc<ToolRegistry>,
+    /// Toolset for read-only children: only [`READ_ONLY_TOOLS`].
+    pub read_only_tools: Arc<ToolRegistry>,
+}
+
+/// Which toolset and prompt profile a session runs with. Resolved from the
+/// session row at the start of each busy period: the parent link is fixed,
+/// but the agent can be switched between periods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKind {
+    /// A root session the user drives.
+    Main,
+    /// A child spawned by `subagent`.
+    Subagent,
+    /// A child spawned by `subagent` with `read_only: true`.
+    ReadOnlySubagent,
+}
+
+impl SessionKind {
+    /// Classify a session row. Only a child gets the read-only tier: a root
+    /// session whose agent happens to be named `explore` stays [`Main`].
+    ///
+    /// [`Main`]: SessionKind::Main
+    #[must_use]
+    pub fn of(parent_id: Option<&str>, agent: Option<&str>) -> Self {
+        match (parent_id, agent) {
+            (None, _) => Self::Main,
+            (Some(_), Some(agent)) if agent == READ_ONLY_AGENT => Self::ReadOnlySubagent,
+            (Some(_), _) => Self::Subagent,
+        }
+    }
+
+    /// Whether the session was spawned by another session.
+    #[must_use]
+    pub fn is_subagent(self) -> bool {
+        !matches!(self, Self::Main)
+    }
 }
 
 impl Services {
-    /// Move `set` into a generation and derive `child_tools` once.
+    /// Move `set` into a generation and derive the child registries once.
     pub fn new(generation: u64, set: ServiceSet) -> Arc<Self> {
         let child_tools = Arc::new(set.tools.without(SUBAGENT_EXCLUDED_TOOLS));
+        let read_only_tools = Arc::new(set.tools.only(READ_ONLY_TOOLS));
         Arc::new(Self {
             generation,
             config: set.config,
@@ -57,18 +97,22 @@ impl Services {
             mcp: set.mcp,
             tools: set.tools,
             child_tools,
+            read_only_tools,
         })
     }
 
     /// The registry a session's turns advertise and dispatch against: the
-    /// shared one, or `child_tools` for a subagent. A form opened by a child
-    /// has no UI behind it and ox has no foreground tool timeout, so
-    /// `question` there would hang the parent's `subagent` call.
-    pub fn tools_for(&self, is_subagent: bool) -> Arc<ToolRegistry> {
-        Arc::clone(if is_subagent {
-            &self.child_tools
-        } else {
-            &self.tools
+    /// shared one, `child_tools` for a subagent, or `read_only_tools` for a
+    /// read-only child. A form opened by a child has no UI behind it and ox
+    /// has no foreground tool timeout, so `question` there would hang the
+    /// parent's `subagent` call. A read-only child calling a tool outside its
+    /// registry gets the registry's unknown-tool error.
+    #[must_use]
+    pub fn tools_for(&self, kind: SessionKind) -> Arc<ToolRegistry> {
+        Arc::clone(match kind {
+            SessionKind::Main => &self.tools,
+            SessionKind::Subagent => &self.child_tools,
+            SessionKind::ReadOnlySubagent => &self.read_only_tools,
         })
     }
 }
@@ -117,5 +161,62 @@ impl Live {
         let next = Services::new(old.generation + 1, set);
         *self.current.write().unwrap_or_else(|p| p.into_inner()) = Arc::clone(&next);
         Ok(next)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_root_session_is_main_whatever_its_agent() {
+        assert_eq!(SessionKind::of(None, None), SessionKind::Main);
+        assert_eq!(
+            SessionKind::of(None, Some(READ_ONLY_AGENT)),
+            SessionKind::Main
+        );
+    }
+
+    #[test]
+    fn a_child_is_read_only_only_with_the_explore_agent() {
+        assert_eq!(
+            SessionKind::of(Some("ses_parent"), Some(READ_ONLY_AGENT)),
+            SessionKind::ReadOnlySubagent
+        );
+        assert_eq!(
+            SessionKind::of(Some("ses_parent"), None),
+            SessionKind::Subagent
+        );
+        assert_eq!(
+            SessionKind::of(Some("ses_parent"), Some("build")),
+            SessionKind::Subagent
+        );
+    }
+
+    #[test]
+    fn both_child_kinds_count_as_subagents() {
+        assert!(!SessionKind::Main.is_subagent());
+        assert!(SessionKind::Subagent.is_subagent());
+        assert!(SessionKind::ReadOnlySubagent.is_subagent());
+    }
+
+    #[test]
+    fn the_read_only_registry_cannot_resolve_writers() {
+        let read_only = ToolRegistry::with_builtins().only(READ_ONLY_TOOLS);
+        for writer in [
+            "shell",
+            "write",
+            "edit",
+            "patch",
+            "todowrite",
+            "subagent",
+            "question",
+        ] {
+            assert!(
+                read_only.get(writer).is_none(),
+                "{writer} must fail as an unknown tool in a read-only child"
+            );
+        }
+        assert!(read_only.get("read").is_some(), "read stays available");
     }
 }

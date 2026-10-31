@@ -9,12 +9,19 @@
 //! idle and then reads its transcript back through the projector.
 
 use serde_json::{Value, json};
+use std::borrow::Cow;
 
-use crate::contract::{Tool, ToolContext, ToolOutput};
+use crate::contract::{READ_ONLY_AGENT, Tool, ToolContext, ToolOutput};
 use ox_schema::event::SessionEventData;
 use ox_schema::support::{LocationRef, ModelRef, SessionMetadata};
 use ox_schema::wire::ToolDef;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 use super::{fail, object_param, ok_text, param};
 
@@ -85,14 +92,26 @@ pub struct SubagentHandle {
     db: ox_db::Db,
     bus: ox_core::event_bus::EventBus,
     spawner: std::sync::Arc<std::sync::OnceLock<std::sync::Arc<dyn SubagentSpawner>>>,
+    /// One permit per concurrently running child, shared by every clone. A
+    /// child holds its permit from dispatch until it settles; tokio's
+    /// semaphore wakes waiters in FIFO order.
+    slots: Arc<Semaphore>,
 }
 
 impl SubagentHandle {
-    pub fn new(db: ox_db::Db, bus: ox_core::event_bus::EventBus) -> Self {
+    /// `max_active` is the config's `[subagent] max_active`, validated `>= 1`
+    /// at load; `0` would queue every call forever, so it is refused here too.
+    #[must_use]
+    pub fn new(db: ox_db::Db, bus: ox_core::event_bus::EventBus, max_active: usize) -> Self {
+        assert!(
+            max_active >= 1,
+            "subagent max_active must be at least 1, got {max_active}"
+        );
         Self {
             db,
             bus,
             spawner: std::sync::Arc::new(std::sync::OnceLock::new()),
+            slots: Arc::new(Semaphore::new(max_active)),
         }
     }
 
@@ -140,6 +159,7 @@ impl Tool for SubagentTool {
             "subagent",
             "Spawn a child session, delegate a prompt to it, and wait for its final reply. The child has its own context window and transcript; only its final message returns to this conversation. The output includes a sessionID you can pass back later to continue that specific conversation with the subagent. New child sessions start with fresh context, so include all relevant context and instructions when you don't pass a sessionID.\n\n\
              Foreground (default) runs the subagent to completion and returns its result. Background mode (background=true) launches it asynchronously and returns immediately; ox notifies you in this conversation when it finishes. Use background only for independent work that can run while you continue elsewhere.\n\n\
+             Several subagent calls in one turn run in parallel, up to a server-wide limit of active subagents; calls beyond it wait in order for a free slot rather than failing. Passing the sessionID of a subagent that is still running redirects it with the new prompt and returns its final reply. Set read_only=true for exploration or review that must not change anything; the child then cannot run shell or edit files.\n\n\
              When to use: an isolated research or exploration burst whose intermediate steps would flood this context (read a broad area, then summarize), or an independent subtask that needs the full toolkit but not this conversation's history.\n\
              When NOT to use: a question a single read or grep answers (do it directly), work that needs the parent's context, or several rounds of back-and-forth — the child gets one prompt and answers once.",
             object_param(
@@ -170,6 +190,13 @@ impl Tool for SubagentTool {
                         param(
                             "boolean",
                             "Run the subagent in the background and return immediately. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress.",
+                        ),
+                    ),
+                    (
+                        "read_only",
+                        param(
+                            "boolean",
+                            "Start the subagent with a read-only toolset (read, glob, grep, webfetch, skill and context tools; no shell, write, edit, patch or nested subagent). Use it for exploration and research that must not change anything. Only for a new subagent: a continued sessionID keeps the toolset it started with.",
                         ),
                     ),
                 ],
@@ -228,6 +255,28 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
             );
         }
     };
+    let read_only = match input.get("read_only") {
+        Some(Value::Bool(flag)) => *flag,
+        None | Some(Value::Null) => false,
+        Some(other) => {
+            return super::invalid_arguments(
+                "subagent",
+                &[("read_only", format!("Expected a boolean, got {other}"))],
+                input,
+            );
+        }
+    };
+    if read_only && resume_id.is_some() {
+        return super::invalid_arguments(
+            "subagent",
+            &[(
+                "read_only",
+                "Cannot be combined with `sessionID`: a continued subagent keeps the toolset it started with"
+                    .to_owned(),
+            )],
+            input,
+        );
+    }
     let resumed = resume_id.is_some();
     let background = matches!(input.get("background"), Some(Value::Bool(true)));
 
@@ -244,11 +293,17 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         ));
     }
 
-    // The child session: a provided `sessionID` continues that conversation
+    let Some(spawner) = tool.handle.spawner().cloned() else {
+        return runner_missing();
+    };
+
+    // The target child: a provided `sessionID` continues that conversation
     // (validated to exist AND be a child of the current session before it is
     // touched); otherwise a new child is created through the same event as
-    // `POST /api/session {parentID}`, inheriting the parent's directory.
-    let child_id = if let Some(id) = resume_id {
+    // `POST /api/session {parentID}`, inheriting the parent's directory. A
+    // new child's row is only created after its slot is held, so a call
+    // cancelled in the queue leaves no session behind.
+    let target = if let Some(id) = resume_id {
         match load_child_parent(&tool.handle.db, &id).await {
             Ok(None) => return fail(format!("Subagent session not found: {id}")),
             Ok(Some(parent)) if parent.as_deref() != Some(ctx.session_id.as_str()) => {
@@ -256,49 +311,53 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
                     "Session {id} is not a child of the current session"
                 ));
             }
-            Ok(Some(_)) => id,
+            Ok(Some(_)) => Target::Resume(id),
             Err(error) => return fail(format!("Unable to load subagent session: {error}")),
         }
     } else {
-        let (child_id, project_id, directory, workspace_id, subpath, model) =
-            match load_parent(&tool.handle.db, &ctx.session_id).await {
-                Ok(Some(parent)) => (
-                    ox_schema::id::id("ses"),
-                    parent.0,
-                    parent.1,
-                    parent.2,
-                    parent.3,
-                    parent.4,
-                ),
-                Ok(None) => {
-                    return fail(format!("Unknown parent session: {}", ctx.session_id));
-                }
-                Err(error) => return fail(format!("Unable to load parent session: {error}")),
-            };
-
-        // Delegation facts ride the title and the parent link; `metadata`
-        // stays empty (upstream keeps it host-owned).
-        let created = SessionEventData::SessionCreated {
-            session_id: child_id.clone(),
-            project_id,
-            location: LocationRef {
-                directory,
-                workspace_id,
-            },
-            subpath,
-            parent_id: Some(ctx.session_id.clone()),
-            slug: ox_schema::slug::create(),
-            title: Some(description.clone()),
-            agent: None,
-            model,
-            metadata: Some(SessionMetadata::default()),
-            permissions: None,
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-        };
-        if let Err(error) = tool.handle.bus.publish(created).await {
-            return fail(format!("Unable to create child session: {error}"));
+        match load_parent(&tool.handle.db, &ctx.session_id).await {
+            Ok(Some(parent)) => Target::New(parent),
+            Ok(None) => return fail(format!("Unknown parent session: {}", ctx.session_id)),
+            Err(error) => return fail(format!("Unable to load parent session: {error}")),
         }
-        child_id
+    };
+    let active = match &target {
+        Target::Resume(id) => spawner.is_active(id),
+        Target::New(_) => false,
+    };
+    let wants_slot = needs_slot(resumed, active);
+
+    // Foreground waits for its slot (cancellable); background never blocks
+    // the turn, so a full house is handled after the child row exists.
+    let mut permit: Option<OwnedSemaphorePermit> = None;
+    let mut queued_for: Option<Duration> = None;
+    let mut queued_in_background = false;
+    if wants_slot {
+        if background {
+            match tool.handle.slots.clone().try_acquire_owned() {
+                Ok(held) => permit = Some(held),
+                Err(_) => queued_in_background = true,
+            }
+        } else {
+            match acquire_slot(&tool.handle.slots, &ctx.cancellation).await {
+                Ok(acquired) => {
+                    permit = Some(acquired.permit);
+                    queued_for = acquired.queued;
+                }
+                Err(SlotCancelled) => return fail(CANCELLED_SENTINEL),
+            }
+        }
+    }
+
+    let child_id = match target {
+        Target::Resume(id) => id,
+        Target::New(parent) => {
+            let agent = read_only.then_some(READ_ONLY_AGENT);
+            match create_child(&tool.handle, &ctx.session_id, &description, parent, agent).await {
+                Ok(id) => id,
+                Err(message) => return fail(message),
+            }
+        }
     };
 
     // Enqueue the prompt, then wake the child through the same dispatch path
@@ -331,25 +390,42 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
     if let Err(error) = tool.handle.bus.publish(enqueued).await {
         return fail(format!("Unable to enqueue child prompt: {error}"));
     }
-    let Some(spawner) = tool.handle.spawner().cloned() else {
-        return runner_missing();
-    };
-    if let Err(error) = spawner.dispatch(&child_id, &message_id).await {
+    // A queued background child is dispatched by its watcher once a slot
+    // frees; everything else starts now.
+    if !queued_in_background && let Err(error) = spawner.dispatch(&child_id, &message_id).await {
         return fail(format!("Unable to start child session: {error}"));
     }
 
     if background {
         // The watcher outlives this turn by design: the child keeps working
         // and the parent is woken when it settles.
+        let (start, status, lead) = if queued_in_background {
+            (
+                WatcherStart::Queued {
+                    inbox_id: message_id,
+                },
+                "queued",
+                format!(
+                    "All subagent slots are busy, so the subagent is queued (sessionID: {child_id}) \
+                     and starts when a slot frees. "
+                ),
+            )
+        } else {
+            (
+                WatcherStart::Running(permit),
+                "running",
+                format!("The subagent is working in the background (sessionID: {child_id}). "),
+            )
+        };
         spawn_completion_watcher(
             tool.handle.clone(),
             ctx.session_id.clone(),
             child_id.clone(),
             description.clone(),
+            start,
         );
         return ok_text(format!(
-            "The subagent is working in the background (sessionID: {child_id}). \
-             You will be notified automatically when it finishes.\n\
+            "{lead}You will be notified automatically when it finishes.\n\
              DO NOT sleep, poll for progress, ask the subagent for status, or duplicate \
              this subagent's work; avoid working with the same files or topics it is using.\n\
              Work on non-overlapping tasks, or briefly tell the user what you launched and \
@@ -357,10 +433,14 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         ))
         .with_metadata(json!({
             "sessionID": child_id,
-            "status": "running",
+            "status": status,
             "description": description,
         }));
     }
+
+    // Held until this function returns on any path, so the slot frees on
+    // success, failure, and cancellation alike.
+    let _permit = permit;
 
     // Wait for the child to settle (or the parent's turn to be interrupted —
     // the child is cancelled with it, so nothing keeps running). Upstream has
@@ -396,14 +476,18 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
                 &child_id,
                 &ox_core::config::ox_home().join(SUBAGENT_OUTPUT_DIR),
             );
-            ok_text(format!(
-                "<subagent sessionID=\"{child_id}\" state=\"completed\">\n{fold}\n</subagent>"
-            ))
-            .with_metadata(json!({
+            let mut metadata = json!({
                 "sessionID": child_id,
                 "status": "completed",
                 "description": description,
-            }))
+            });
+            if let (Some(queued), Some(map)) = (queued_for, metadata.as_object_mut()) {
+                map.insert(
+                    "queuedMs".to_owned(),
+                    json!(u64::try_from(queued.as_millis()).unwrap_or(u64::MAX)),
+                );
+            }
+            ok_text(envelope(&child_id, "completed", None, &fold)).with_metadata(metadata)
         }
         ChildOutcome::Failed(error) => {
             // Keep the sessionID visible: the model can resume the child.
@@ -411,6 +495,103 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         }
         ChildOutcome::Interrupted => fail(format!("Subagent cancelled (sessionID: {child_id})")),
     }
+}
+
+/// What a call runs against once validated.
+enum Target {
+    /// An existing child of the calling session.
+    Resume(String),
+    /// A child still to be created under the calling session, from the
+    /// parent's inherited row data.
+    New(ParentTuple),
+}
+
+/// Whether a call must hold a concurrency slot. A resumed child that is
+/// already active holds one through the call that started it; every other
+/// case (new child, resume of an idle child) adds a running child.
+fn needs_slot(resumed: bool, active: bool) -> bool {
+    !(resumed && active)
+}
+
+/// The queue wait was cancelled before a slot was granted.
+#[derive(Debug, PartialEq, Eq)]
+struct SlotCancelled;
+
+/// A granted slot. Dropping `permit` frees it.
+struct Acquired {
+    permit: OwnedSemaphorePermit,
+    /// How long the call waited; `None` when a slot was free immediately.
+    queued: Option<Duration>,
+}
+
+/// Take a slot, queueing FIFO behind earlier callers. Cancellation wins over
+/// an available slot (a cancelled turn must not start a child) and ends a
+/// queued wait without leaking a permit.
+async fn acquire_slot(
+    slots: &Arc<Semaphore>,
+    cancellation: &CancellationToken,
+) -> Result<Acquired, SlotCancelled> {
+    if cancellation.is_cancelled() {
+        return Err(SlotCancelled);
+    }
+    if let Ok(permit) = slots.clone().try_acquire_owned() {
+        return Ok(Acquired {
+            permit,
+            queued: None,
+        });
+    }
+    let started = Instant::now();
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(SlotCancelled),
+        acquired = slots.clone().acquire_owned() => match acquired {
+            Ok(permit) => Ok(Acquired {
+                permit,
+                queued: Some(started.elapsed()),
+            }),
+            // The semaphore is never closed; fail closed if that changes.
+            Err(_closed) => Err(SlotCancelled),
+        },
+    }
+}
+
+/// Create the child session row under `parent_session_id` through the same
+/// event as `POST /api/session {parentID}`. Delegation facts ride the title
+/// and the parent link; `metadata` stays empty (upstream keeps it
+/// host-owned). `agent` is `Some` only for a read-only child; the engine picks
+/// the child's toolset from it.
+async fn create_child(
+    handle: &SubagentHandle,
+    parent_session_id: &str,
+    description: &str,
+    parent: ParentTuple,
+    agent: Option<&str>,
+) -> Result<String, String> {
+    let (project_id, directory, workspace_id, subpath, model) = parent;
+    let child_id = ox_schema::id::id("ses");
+    let created = SessionEventData::SessionCreated {
+        session_id: child_id.clone(),
+        project_id,
+        location: LocationRef {
+            directory,
+            workspace_id,
+        },
+        subpath,
+        parent_id: Some(parent_session_id.to_owned()),
+        slug: ox_schema::slug::create(),
+        title: Some(description.to_owned()),
+        agent: agent.map(str::to_owned),
+        model,
+        metadata: Some(SessionMetadata::default()),
+        permissions: None,
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+    };
+    handle
+        .bus
+        .publish(created)
+        .await
+        .map_err(|error| format!("Unable to create child session: {error}"))?;
+    Ok(child_id)
 }
 
 /// `(project_id, directory, workspace_id, subpath, model)` of a session row.
@@ -422,38 +603,82 @@ type ParentTuple = (
     Option<ModelRef>,
 );
 
+/// How a background watcher begins.
+///
+/// Background calls never block the parent's turn. When every slot is busy
+/// the tool still creates the child and enqueues its prompt at once, then
+/// defers the dispatch to this watcher, which waits FIFO for a slot. This
+/// keeps the sessionID available to the model immediately and keeps
+/// "children started by `subagent` that are active ≤ `max_active`", because
+/// a queued child is not dispatched (and so not active) until it holds a
+/// permit.
+enum WatcherStart {
+    /// Already dispatched. Carries the slot it holds, if any (`None` for a
+    /// resume of a child that was already active).
+    Running(Option<OwnedSemaphorePermit>),
+    /// Waiting for a slot; dispatch `inbox_id` once one is granted.
+    Queued { inbox_id: String },
+}
+
 /// Watch a background child and, when it settles, hand its result to the
 /// parent as a synthetic message — which also wakes the parent for a new turn
 /// (or steers it if it is already busy; `Runner::dispatch` coalesces).
 ///
 /// Detached on purpose: the parent's turn is over, the child keeps working.
 /// Nothing here is persisted, so a server restart loses the notification
-/// (crash recovery is out of scope).
+/// (crash recovery is out of scope). The slot is held by this task and
+/// freed when it ends, on every return path.
 fn spawn_completion_watcher(
     handle: std::sync::Arc<SubagentHandle>,
     parent_id: String,
     child_id: String,
     description: String,
+    start: WatcherStart,
 ) {
     tokio::spawn(async move {
         let Some(spawner) = handle.spawner().cloned() else {
             tracing::warn!(child = %child_id, "subagent runner not attached; dropping completion");
             return;
         };
-        // Poll only the process-local active set — the DB is not touched
-        // until the child has settled.
-        while spawner.is_active(&child_id) {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        let Ok(history) = spawner.load_history(&child_id).await else {
-            tracing::warn!(child = %child_id, "subagent finished but its transcript is unreadable; dropping notification");
-            return;
+        // A queued child that cannot start still owes the parent a notice:
+        // it was told it would be notified.
+        let mut start_error: Option<String> = None;
+        let _permit = match start {
+            WatcherStart::Running(permit) => permit,
+            WatcherStart::Queued { inbox_id } => {
+                let Ok(permit) = handle.slots.clone().acquire_owned().await else {
+                    tracing::warn!(child = %child_id, "subagent slots closed; queued child never started");
+                    return;
+                };
+                if let Err(error) = spawner.dispatch(&child_id, &inbox_id).await {
+                    tracing::warn!(child = %child_id, error = %error, "unable to start queued subagent");
+                    start_error = Some(format!("Subagent failed to start: {error}"));
+                }
+                Some(permit)
+            }
         };
-        let outcome = child_outcome(&history);
-        let state = match outcome {
-            ChildOutcome::Completed => "completed",
-            ChildOutcome::Failed(_) => "error",
-            ChildOutcome::Interrupted => "cancelled",
+        let (state, text) = if let Some(text) = start_error {
+            ("error", text)
+        } else {
+            // Poll only the process-local active set — the DB is not touched
+            // until the child has settled.
+            while spawner.is_active(&child_id) {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            let Ok(history) = spawner.load_history(&child_id).await else {
+                tracing::warn!(child = %child_id, "subagent finished but its transcript is unreadable; dropping notification");
+                return;
+            };
+            match child_outcome(&history) {
+                ChildOutcome::Completed => (
+                    "completed",
+                    final_text(&history).unwrap_or_else(|| {
+                        "Subagent completed without a text response.".to_owned()
+                    }),
+                ),
+                ChildOutcome::Failed(error) => ("error", format!("Subagent failed: {error}")),
+                ChildOutcome::Interrupted => ("cancelled", "Subagent cancelled".to_owned()),
+            }
         };
         // The parent may have been deleted while the child ran; the check
         // must precede the publish (a dead parent cannot receive).
@@ -468,15 +693,7 @@ fn spawn_completion_watcher(
                 return;
             }
         }
-        let text = match outcome {
-            ChildOutcome::Completed => final_text(&history)
-                .unwrap_or_else(|| "Subagent completed without a text response.".to_owned()),
-            ChildOutcome::Failed(error) => format!("Subagent failed: {error}"),
-            ChildOutcome::Interrupted => "Subagent cancelled".to_owned(),
-        };
-        let wrapper = format!(
-            "<subagent sessionID=\"{child_id}\" state=\"{state}\" description=\"{description}\">\n{text}\n</subagent>"
-        );
+        let wrapper = envelope(&child_id, state, Some(&description), &text);
         let inbox_id = ox_schema::id::id("msg");
         let item = ox_schema::inbox::Item::Synthetic {
             payload: ox_schema::inbox::SyntheticPayload {
@@ -701,4 +918,868 @@ fn transcript_fold(
         ),
     };
     format!("Subagent report:\n\n{head}\n{marker}")
+}
+
+/// Wrap child output in the `<subagent>` envelope the parent model reads.
+/// The body and description are child-controlled, so both are escaped: a
+/// body containing `</subagent>` must not close the envelope early.
+fn envelope(child_id: &str, state: &str, description: Option<&str>, body: &str) -> String {
+    let body = escape_text(body);
+    match description {
+        Some(description) => {
+            let description = escape_attr(description);
+            format!(
+                "<subagent sessionID=\"{child_id}\" state=\"{state}\" description=\"{description}\">\n{body}\n</subagent>"
+            )
+        }
+        None => {
+            format!("<subagent sessionID=\"{child_id}\" state=\"{state}\">\n{body}\n</subagent>")
+        }
+    }
+}
+
+/// Escape `&`, `<`, `>` for element text; borrows when nothing needs escaping.
+fn escape_text(raw: &str) -> Cow<'_, str> {
+    escape(raw, |c| matches!(c, '&' | '<' | '>'))
+}
+
+/// Escape element-text characters plus `"` for a double-quoted attribute.
+fn escape_attr(raw: &str) -> Cow<'_, str> {
+    escape(raw, |c| matches!(c, '&' | '<' | '>' | '"'))
+}
+
+fn escape(raw: &str, needs_escape: fn(char) -> bool) -> Cow<'_, str> {
+    let Some(first) = raw.find(needs_escape) else {
+        return Cow::Borrowed(raw);
+    };
+    let mut out = String::with_capacity(raw.len() + 16);
+    out.push_str(&raw[..first]);
+    for c in raw[first..].chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' if needs_escape('"') => out.push_str("&quot;"),
+            other => out.push(other),
+        }
+    }
+    Cow::Owned(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- concurrency slots -------------------------------------------
+
+    use crate::contract::ToolRegistry;
+    use ox_schema::message::{IdleOutcome, Message, TimeCreated};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
+    use tokio::sync::Notify;
+
+    const PARENT: &str = "ses_parent";
+    const BOUND: Duration = Duration::from_secs(10);
+
+    #[derive(Default)]
+    struct MockState {
+        active: HashSet<String>,
+        dispatched: Vec<String>,
+        interrupted: Vec<String>,
+        outcomes: HashMap<String, IdleOutcome>,
+        peak: usize,
+        /// When set, dispatching any child (not the parent) fails.
+        fail_child_dispatch: bool,
+    }
+
+    /// Scripted spawner: `dispatch` marks a session active, the test decides
+    /// when it settles via [`MockSpawner::finish`]. `changed` wakes
+    /// [`MockSpawner::wait_for`] on every state change.
+    #[derive(Default)]
+    struct MockSpawner {
+        state: Mutex<MockState>,
+        changed: Notify,
+    }
+
+    impl MockSpawner {
+        fn with<R>(&self, f: impl FnOnce(&mut MockState) -> R) -> R {
+            f(&mut self.state.lock().expect("mock state lock"))
+        }
+
+        fn finish(&self, session_id: &str, outcome: IdleOutcome) {
+            self.with(|state| {
+                state.active.remove(session_id);
+                state.outcomes.insert(session_id.to_owned(), outcome);
+            });
+            self.changed.notify_waiters();
+        }
+
+        /// Poll `cond` on every state change, bounded so a bug fails the test
+        /// instead of hanging it.
+        async fn wait_for(&self, what: &str, cond: impl Fn(&MockState) -> bool) {
+            let wait = async {
+                loop {
+                    let notified = self.changed.notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if self.with(|state| cond(state)) {
+                        return;
+                    }
+                    notified.await;
+                }
+            };
+            tokio::time::timeout(BOUND, wait)
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for: {what}"));
+        }
+
+        fn dispatched(&self) -> Vec<String> {
+            self.with(|state| state.dispatched.clone())
+        }
+    }
+
+    impl SubagentSpawner for MockSpawner {
+        fn dispatch<'a>(
+            &'a self,
+            session_id: &'a str,
+            _inbox_id: &'a str,
+        ) -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+            Box::pin(async move {
+                if self.with(|state| state.fail_child_dispatch && session_id != PARENT) {
+                    anyhow::bail!("scripted dispatch failure");
+                }
+                self.with(|state| {
+                    state.active.insert(session_id.to_owned());
+                    state.dispatched.push(session_id.to_owned());
+                    state.peak = state.peak.max(state.active.len());
+                });
+                self.changed.notify_waiters();
+                Ok(())
+            })
+        }
+
+        fn is_active(&self, session_id: &str) -> bool {
+            self.with(|state| state.active.contains(session_id))
+        }
+
+        fn interrupt(&self, session_id: &str) -> bool {
+            let was_active = self.with(|state| {
+                state.interrupted.push(session_id.to_owned());
+                state
+                    .outcomes
+                    .insert(session_id.to_owned(), IdleOutcome::Interrupted);
+                state.active.remove(session_id)
+            });
+            self.changed.notify_waiters();
+            was_active
+        }
+
+        fn load_history<'a>(&'a self, session_id: &'a str) -> LoadHistory<'a> {
+            Box::pin(async move {
+                let outcome = self.with(|state| {
+                    state
+                        .outcomes
+                        .get(session_id)
+                        .copied()
+                        .unwrap_or(IdleOutcome::Succeeded)
+                });
+                let error =
+                    (outcome == IdleOutcome::Failed).then(|| ox_schema::support::SessionError {
+                        kind: "unknown".to_owned(),
+                        message: "boom".to_owned(),
+                        status: None,
+                        response: None,
+                    });
+                Ok(vec![Message::Idle {
+                    id: "msg_idle".to_owned(),
+                    metadata: None,
+                    time: TimeCreated { created: 0 },
+                    outcome,
+                    error,
+                }])
+            })
+        }
+    }
+
+    struct Rig {
+        tool: Arc<SubagentTool>,
+        spawner: Arc<MockSpawner>,
+        db: ox_db::Db,
+    }
+
+    async fn rig(max_active: usize) -> Rig {
+        let db = ox_db::Db::open_in_memory().await.expect("db");
+        let bus = ox_core::event_bus::EventBus::new(db.clone());
+        bus.publish(SessionEventData::SessionCreated {
+            session_id: PARENT.to_owned(),
+            project_id: "prj".to_owned(),
+            location: LocationRef {
+                directory: "/tmp".to_owned(),
+                workspace_id: None,
+            },
+            subpath: None,
+            parent_id: None,
+            slug: ox_schema::slug::create(),
+            title: None,
+            agent: None,
+            model: None,
+            metadata: Some(SessionMetadata::default()),
+            permissions: None,
+            version: "test".to_owned(),
+        })
+        .await
+        .expect("create parent session");
+        let handle = Arc::new(SubagentHandle::new(db.clone(), bus, max_active));
+        let spawner = Arc::new(MockSpawner::default());
+        handle.attach(spawner.clone());
+        Rig {
+            tool: Arc::new(SubagentTool::new(handle, 1)),
+            spawner,
+            db,
+        }
+    }
+
+    impl Rig {
+        fn call(
+            &self,
+            cancellation: CancellationToken,
+            input: Value,
+        ) -> tokio::task::JoinHandle<ToolOutput> {
+            let tool = self.tool.clone();
+            let ctx = ToolContext {
+                session_id: PARENT.to_owned(),
+                directory: std::path::PathBuf::from("/tmp"),
+                call_id: "call".to_owned(),
+                cancellation,
+                registry: Arc::new(ToolRegistry::new()),
+            };
+            tokio::spawn(async move { tool.execute(ctx, input).await })
+        }
+
+        fn permits(&self) -> usize {
+            self.tool.handle.slots.available_permits()
+        }
+
+        async fn child_rows(&self) -> i64 {
+            let conn = self.db.acquire().await.expect("conn");
+            let mut stmt = conn
+                .prepare("SELECT COUNT(*) FROM session_v2 WHERE parent_id = ?1")
+                .await
+                .expect("prepare");
+            let row = ox_db::optional(&mut stmt, (PARENT,))
+                .await
+                .expect("query")
+                .expect("count row");
+            row.get::<i64>(0).expect("count")
+        }
+
+        /// The `agent` column of every child of the parent, oldest first.
+        async fn child_agents(&self) -> Vec<Option<String>> {
+            let conn = self.db.acquire().await.expect("conn");
+            let mut stmt = conn
+                .prepare("SELECT agent FROM session_v2 WHERE parent_id = ?1 ORDER BY rowid")
+                .await
+                .expect("prepare");
+            let mut rows = stmt.query((PARENT,)).await.expect("query");
+            let mut agents = Vec::new();
+            while let Some(row) = rows.next().await.expect("row") {
+                agents.push(row.get::<Option<String>>(0).expect("agent"));
+            }
+            agents
+        }
+
+        /// Payload text of every inbox item queued for the parent.
+        async fn parent_inbox_texts(&self) -> Vec<String> {
+            let conn = self.db.acquire().await.expect("conn");
+            let mut stmt = conn
+                .prepare("SELECT payload FROM session_inbox WHERE session_id = ?1")
+                .await
+                .expect("prepare");
+            let mut rows = stmt.query((PARENT,)).await.expect("query");
+            let mut texts = Vec::new();
+            while let Some(row) = rows.next().await.expect("row") {
+                texts.push(row.get::<String>(0).expect("payload"));
+            }
+            texts
+        }
+
+        /// Wait (bounded) until every permit is back in the pool.
+        async fn wait_permits(&self, expected: usize) {
+            let wait = async {
+                while self.permits() != expected {
+                    tokio::task::yield_now().await;
+                }
+            };
+            tokio::time::timeout(BOUND, wait).await.unwrap_or_else(|_| {
+                panic!("permits stuck at {}, wanted {expected}", self.permits())
+            });
+        }
+    }
+
+    fn input(description: &str) -> Value {
+        json!({ "prompt": "do it", "description": description })
+    }
+
+    async fn joined(task: tokio::task::JoinHandle<ToolOutput>) -> ToolOutput {
+        tokio::time::timeout(BOUND, task)
+            .await
+            .expect("tool call did not finish in time")
+            .expect("tool task panicked")
+    }
+
+    #[test]
+    fn needs_slot_only_skips_resume_of_an_active_child() {
+        assert!(needs_slot(false, false), "new child needs a slot");
+        assert!(
+            needs_slot(true, false),
+            "resume of an idle child needs a slot"
+        );
+        assert!(
+            !needs_slot(true, true),
+            "resume of an active child already holds one"
+        );
+        assert!(
+            needs_slot(false, true),
+            "a new child is never already active"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_slot_grants_in_fifo_order() {
+        let slots = Arc::new(Semaphore::new(1));
+        let cancel = CancellationToken::new();
+        let held = slots.clone().acquire_owned().await.expect("hold the slot");
+
+        let first = {
+            let (slots, cancel) = (slots.clone(), cancel.clone());
+            tokio::spawn(async move { acquire_slot(&slots, &cancel).await })
+        };
+        // One yield runs the task to its first suspension: the waiter is
+        // registered before the next one is spawned.
+        tokio::task::yield_now().await;
+        let second = {
+            let (slots, cancel) = (slots.clone(), cancel.clone());
+            tokio::spawn(async move { acquire_slot(&slots, &cancel).await })
+        };
+        tokio::task::yield_now().await;
+
+        drop(held);
+        let first = tokio::time::timeout(BOUND, first)
+            .await
+            .expect("first waiter must be served first")
+            .expect("task")
+            .expect("slot");
+        assert!(first.queued.is_some(), "a waiter reports its queue time");
+        assert!(
+            !second.is_finished(),
+            "second waits for the slot first took"
+        );
+        drop(first);
+        let second = joined_slot(second).await;
+        drop(second);
+        assert_eq!(slots.available_permits(), 1, "all permits returned");
+    }
+
+    async fn joined_slot(
+        task: tokio::task::JoinHandle<Result<Acquired, SlotCancelled>>,
+    ) -> Acquired {
+        tokio::time::timeout(BOUND, task)
+            .await
+            .expect("waiter must be served")
+            .expect("task")
+            .expect("slot")
+    }
+
+    #[tokio::test]
+    async fn acquire_slot_cancelled_while_queued_leaks_no_permit() {
+        let slots = Arc::new(Semaphore::new(1));
+        let held = slots.clone().acquire_owned().await.expect("hold the slot");
+        let cancel = CancellationToken::new();
+        let waiter = {
+            let (slots, cancel) = (slots.clone(), cancel.clone());
+            tokio::spawn(async move { acquire_slot(&slots, &cancel).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "waiter must be queued behind the held slot"
+        );
+
+        cancel.cancel();
+        let result = tokio::time::timeout(BOUND, waiter)
+            .await
+            .expect("cancel ends the wait")
+            .expect("task");
+        assert_eq!(
+            result.err(),
+            Some(SlotCancelled),
+            "queued wait is cancelled"
+        );
+
+        drop(held);
+        assert_eq!(
+            slots.available_permits(),
+            1,
+            "cancelled waiter took no permit"
+        );
+    }
+
+    #[tokio::test]
+    async fn acquire_slot_refuses_when_already_cancelled_even_if_free() {
+        let slots = Arc::new(Semaphore::new(1));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert_eq!(
+            acquire_slot(&slots, &cancel).await.err(),
+            Some(SlotCancelled),
+            "a cancelled turn must not start a child"
+        );
+        assert_eq!(slots.available_permits(), 1, "no permit taken");
+    }
+
+    #[tokio::test]
+    async fn four_contenders_never_exceed_two_active_children() {
+        let rig = rig(2).await;
+        let calls: Vec<_> = (0..4)
+            .map(|n| rig.call(CancellationToken::new(), input(&format!("c{n}"))))
+            .collect();
+
+        rig.spawner
+            .wait_for("two children dispatched", |s| s.dispatched.len() == 2)
+            .await;
+        assert_eq!(rig.permits(), 0, "both slots held while two children run");
+        assert_eq!(
+            rig.child_rows().await,
+            2,
+            "queued calls create no child yet"
+        );
+
+        let first = rig.spawner.dispatched()[0].clone();
+        rig.spawner.finish(&first, IdleOutcome::Succeeded);
+        rig.spawner
+            .wait_for("third child dispatched", |s| s.dispatched.len() == 3)
+            .await;
+
+        let second = rig.spawner.dispatched()[1].clone();
+        rig.spawner.finish(&second, IdleOutcome::Succeeded);
+        rig.spawner
+            .wait_for("fourth child dispatched", |s| s.dispatched.len() == 4)
+            .await;
+
+        for id in rig.spawner.dispatched().into_iter().skip(2) {
+            rig.spawner.finish(&id, IdleOutcome::Succeeded);
+        }
+        let mut queued = 0;
+        for call in calls {
+            let output = joined(call).await;
+            assert!(output.error.is_none(), "call succeeds: {:?}", output.error);
+            let metadata = output.metadata.expect("metadata");
+            if metadata.get("queuedMs").is_some() {
+                queued += 1;
+            }
+        }
+        assert_eq!(queued, 2, "exactly the two waiting calls report queuedMs");
+        assert_eq!(
+            rig.spawner.with(|s| s.peak),
+            2,
+            "active children never exceeded max_active"
+        );
+        rig.wait_permits(2).await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_queued_call_creates_no_child_and_leaks_no_permit() {
+        let rig = rig(1).await;
+        let running = rig.call(CancellationToken::new(), input("holder"));
+        rig.spawner
+            .wait_for("holder dispatched", |s| s.dispatched.len() == 1)
+            .await;
+
+        let cancel = CancellationToken::new();
+        let queued = rig.call(cancel.clone(), input("queued"));
+        cancel.cancel();
+        let output = joined(queued).await;
+        assert_eq!(
+            output.error.as_deref(),
+            Some(CANCELLED_SENTINEL),
+            "cancelled while queued reports the cancel failure"
+        );
+        assert_eq!(rig.child_rows().await, 1, "only the holder's child exists");
+        assert_eq!(
+            rig.spawner.dispatched().len(),
+            1,
+            "queued call never dispatched"
+        );
+
+        let holder = rig.spawner.dispatched()[0].clone();
+        rig.spawner.finish(&holder, IdleOutcome::Succeeded);
+        assert!(joined(running).await.error.is_none(), "holder completes");
+        rig.wait_permits(1).await;
+    }
+
+    #[tokio::test]
+    async fn slot_is_released_after_failure_and_after_interrupt() {
+        let rig = rig(1).await;
+
+        let failing = rig.call(CancellationToken::new(), input("fails"));
+        rig.spawner
+            .wait_for("first dispatched", |s| s.dispatched.len() == 1)
+            .await;
+        let id = rig.spawner.dispatched()[0].clone();
+        rig.spawner.finish(&id, IdleOutcome::Failed);
+        let output = joined(failing).await;
+        assert!(
+            output
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("Subagent failed")),
+            "failure surfaces: {:?}",
+            output.error
+        );
+        rig.wait_permits(1).await;
+
+        let cancel = CancellationToken::new();
+        let interrupted = rig.call(cancel.clone(), input("interrupted"));
+        rig.spawner
+            .wait_for("second dispatched", |s| s.dispatched.len() == 2)
+            .await;
+        cancel.cancel();
+        let output = joined(interrupted).await;
+        assert_eq!(
+            output.error.as_deref(),
+            Some(CANCELLED_SENTINEL),
+            "interrupt reported"
+        );
+        assert_eq!(
+            rig.spawner.with(|s| s.interrupted.len()),
+            1,
+            "child interrupted"
+        );
+        rig.wait_permits(1).await;
+
+        let next = rig.call(CancellationToken::new(), input("next"));
+        rig.spawner
+            .wait_for("third dispatched after both releases", |s| {
+                s.dispatched.len() == 3
+            })
+            .await;
+        let id = rig.spawner.dispatched()[2].clone();
+        rig.spawner.finish(&id, IdleOutcome::Succeeded);
+        assert!(joined(next).await.error.is_none(), "third call succeeds");
+        rig.wait_permits(1).await;
+    }
+
+    #[tokio::test]
+    async fn resuming_an_active_child_takes_no_slot() {
+        let rig = rig(1).await;
+        let first = rig.call(CancellationToken::new(), input("first"));
+        rig.spawner
+            .wait_for("child dispatched", |s| s.dispatched.len() == 1)
+            .await;
+        let child = rig.spawner.dispatched()[0].clone();
+        assert_eq!(
+            rig.permits(),
+            0,
+            "the only slot is held by the running child"
+        );
+
+        let resumed = rig.call(
+            CancellationToken::new(),
+            json!({ "prompt": "more", "description": "again", "sessionID": child }),
+        );
+        rig.spawner
+            .wait_for("resume dispatched without waiting for a slot", |s| {
+                s.dispatched.len() == 2
+            })
+            .await;
+        assert_eq!(
+            rig.spawner.dispatched()[1],
+            child,
+            "same child redispatched"
+        );
+        assert_eq!(rig.child_rows().await, 1, "resume creates no new child");
+
+        rig.spawner.finish(&child, IdleOutcome::Succeeded);
+        assert!(joined(first).await.error.is_none(), "first call completes");
+        assert!(joined(resumed).await.error.is_none(), "resume completes");
+        rig.wait_permits(1).await;
+    }
+
+    #[tokio::test]
+    async fn background_call_when_full_is_queued_then_dispatched_on_release() {
+        let rig = rig(1).await;
+        let holder = rig.call(CancellationToken::new(), input("holder"));
+        rig.spawner
+            .wait_for("holder dispatched", |s| s.dispatched.len() == 1)
+            .await;
+        let holder_child = rig.spawner.dispatched()[0].clone();
+
+        let output = joined(rig.call(
+            CancellationToken::new(),
+            json!({ "prompt": "bg", "description": "bg", "background": true }),
+        ))
+        .await;
+        assert!(output.error.is_none(), "background returns immediately");
+        let text = output.content.as_str().expect("text content");
+        assert!(
+            text.contains("queued"),
+            "return text says it is queued: {text}"
+        );
+        let metadata = output.metadata.expect("metadata");
+        assert_eq!(metadata["status"], "queued", "status reflects the queue");
+        assert_eq!(
+            rig.spawner.dispatched().len(),
+            1,
+            "queued child is not dispatched"
+        );
+        assert_eq!(
+            rig.child_rows().await,
+            2,
+            "queued child exists for its sessionID"
+        );
+
+        rig.spawner.finish(&holder_child, IdleOutcome::Succeeded);
+        assert!(joined(holder).await.error.is_none(), "holder completes");
+        rig.spawner
+            .wait_for("queued child dispatched after release", |s| {
+                s.dispatched.len() == 2
+            })
+            .await;
+        let queued_child = rig.spawner.dispatched()[1].clone();
+        assert_ne!(queued_child, holder_child, "a different child started");
+
+        rig.spawner.finish(&queued_child, IdleOutcome::Succeeded);
+        rig.spawner
+            .wait_for("parent woken by completion", |s| {
+                s.dispatched.iter().any(|id| id == PARENT)
+            })
+            .await;
+        rig.wait_permits(1).await;
+    }
+
+    #[tokio::test]
+    async fn a_queued_child_that_fails_to_start_still_notifies_the_parent() {
+        let rig = rig(1).await;
+        let holder = rig.call(CancellationToken::new(), input("holder"));
+        rig.spawner
+            .wait_for("holder dispatched", |s| s.dispatched.len() == 1)
+            .await;
+        let holder_child = rig.spawner.dispatched()[0].clone();
+        let output = joined(rig.call(
+            CancellationToken::new(),
+            json!({ "prompt": "bg", "description": "bg", "background": true }),
+        ))
+        .await;
+        assert_eq!(
+            output.metadata.expect("metadata")["status"],
+            "queued",
+            "the call queues behind the holder"
+        );
+
+        rig.spawner.with(|state| state.fail_child_dispatch = true);
+        rig.spawner.finish(&holder_child, IdleOutcome::Succeeded);
+        assert!(joined(holder).await.error.is_none(), "holder completes");
+        rig.spawner
+            .wait_for("parent told the queued child failed", |s| {
+                s.dispatched.iter().any(|id| id == PARENT)
+            })
+            .await;
+        let notice = rig.parent_inbox_texts().await;
+        assert!(
+            notice
+                .iter()
+                .any(|text| text.contains(r#""state":"error""#) && text.contains("failed to start")),
+            "parent gets an error envelope, got {notice:?}"
+        );
+        rig.wait_permits(1).await;
+    }
+
+    #[tokio::test]
+    async fn background_call_with_a_free_slot_holds_it_until_the_child_settles() {
+        let rig = rig(1).await;
+        let output = joined(rig.call(
+            CancellationToken::new(),
+            json!({ "prompt": "bg", "description": "bg", "background": true }),
+        ))
+        .await;
+        assert_eq!(
+            output.metadata.expect("metadata")["status"],
+            "running",
+            "free slot starts the child at once"
+        );
+        assert_eq!(
+            rig.permits(),
+            0,
+            "the watcher holds the slot while the child runs"
+        );
+        let child = rig.spawner.dispatched()[0].clone();
+        rig.spawner.finish(&child, IdleOutcome::Succeeded);
+        rig.wait_permits(1).await;
+    }
+
+    #[test]
+    fn envelope_escapes_closing_tag_in_body() {
+        let out = envelope(
+            "ses_1",
+            "completed",
+            None,
+            "a </subagent><subagent state=\"x\"> & b",
+        );
+        assert_eq!(
+            out.matches("<subagent").count(),
+            1,
+            "one real opening tag: {out}"
+        );
+        assert_eq!(
+            out.matches("</subagent>").count(),
+            1,
+            "one real closing tag: {out}"
+        );
+        assert!(
+            out.ends_with("\n</subagent>"),
+            "closing tag stays last: {out}"
+        );
+        assert!(
+            out.contains("a &lt;/subagent&gt;&lt;subagent state=\"x\"&gt; &amp; b"),
+            "body escaped as text: {out}"
+        );
+    }
+
+    #[test]
+    fn envelope_escapes_description_attribute() {
+        let out = envelope("ses_1", "error", Some("say \"hi\" > <b> & c"), "body");
+        assert!(
+            out.starts_with(
+                "<subagent sessionID=\"ses_1\" state=\"error\" description=\"say &quot;hi&quot; &gt; &lt;b&gt; &amp; c\">\n"
+            ),
+            "description escaped as attribute: {out}"
+        );
+    }
+
+    #[test]
+    fn envelope_plain_input_matches_legacy_format() {
+        let (child_id, state, description, text) =
+            ("ses_9", "cancelled", "plain desc", "plain body");
+        assert_eq!(
+            envelope(child_id, "completed", None, text),
+            format!("<subagent sessionID=\"{child_id}\" state=\"completed\">\n{text}\n</subagent>"),
+            "sync envelope bytes unchanged"
+        );
+        assert_eq!(
+            envelope(child_id, state, Some(description), text),
+            format!(
+                "<subagent sessionID=\"{child_id}\" state=\"{state}\" description=\"{description}\">\n{text}\n</subagent>"
+            ),
+            "background envelope bytes unchanged"
+        );
+    }
+
+    #[test]
+    fn escapes_borrow_plain_input() {
+        assert!(
+            matches!(escape_text("plain \"quoted\" text"), Cow::Borrowed(_)),
+            "text escape must not allocate without <, >, &"
+        );
+        assert!(
+            matches!(escape_attr("plain text"), Cow::Borrowed(_)),
+            "attr escape must not allocate without special chars"
+        );
+        assert_eq!(
+            escape_text("a<b>&\""),
+            "a&lt;b&gt;&amp;\"",
+            "text keeps quotes"
+        );
+        assert_eq!(
+            escape_attr("a<b>&\""),
+            "a&lt;b&gt;&amp;&quot;",
+            "attr escapes quotes"
+        );
+    }
+
+    // ---- read_only ---------------------------------------------------
+
+    #[tokio::test]
+    async fn read_only_creates_an_explore_child_and_default_leaves_agent_unset() {
+        let rig = rig(2).await;
+        let plain = rig.call(CancellationToken::new(), input("plain"));
+        let mut restricted_input = input("restricted");
+        restricted_input["read_only"] = json!(true);
+        let restricted = rig.call(CancellationToken::new(), restricted_input);
+        rig.spawner
+            .wait_for("both dispatched", |s| s.dispatched.len() == 2)
+            .await;
+        for id in rig.spawner.dispatched() {
+            rig.spawner.finish(&id, IdleOutcome::Succeeded);
+        }
+        assert!(joined(plain).await.error.is_none(), "plain call succeeds");
+        assert!(
+            joined(restricted).await.error.is_none(),
+            "read_only call succeeds"
+        );
+        let mut agents = rig.child_agents().await;
+        agents.sort();
+        assert_eq!(
+            agents,
+            [None, Some(READ_ONLY_AGENT.to_owned())],
+            "only the read_only child carries the explore agent"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_only_false_is_the_default() {
+        let rig = rig(1).await;
+        let mut explicit = input("explicit false");
+        explicit["read_only"] = json!(false);
+        let call = rig.call(CancellationToken::new(), explicit);
+        rig.spawner
+            .wait_for("dispatched", |s| s.dispatched.len() == 1)
+            .await;
+        let id = rig.spawner.dispatched()[0].clone();
+        rig.spawner.finish(&id, IdleOutcome::Succeeded);
+        assert!(joined(call).await.error.is_none(), "call succeeds");
+        assert_eq!(rig.child_agents().await, [None], "agent stays unset");
+    }
+
+    #[tokio::test]
+    async fn read_only_that_is_not_a_boolean_is_rejected_without_a_child() {
+        let rig = rig(1).await;
+        let mut bad = input("bad");
+        bad["read_only"] = json!("yes");
+        let output = joined(rig.call(CancellationToken::new(), bad)).await;
+        let error = output.error.expect("rejected");
+        assert!(error.contains("read_only"), "names the field: {error}");
+        assert_eq!(rig.child_rows().await, 0, "no child created");
+        assert!(rig.spawner.dispatched().is_empty(), "nothing dispatched");
+    }
+
+    #[tokio::test]
+    async fn read_only_with_session_id_is_rejected_without_touching_the_child() {
+        let rig = rig(1).await;
+        let mut bad = input("bad");
+        bad["read_only"] = json!(true);
+        bad["sessionID"] = json!("ses_other");
+        let output = joined(rig.call(CancellationToken::new(), bad)).await;
+        let error = output.error.expect("rejected");
+        assert!(
+            error.contains("read_only") && error.contains("sessionID"),
+            "names both fields: {error}"
+        );
+        assert!(rig.spawner.dispatched().is_empty(), "nothing dispatched");
+    }
+
+    #[tokio::test]
+    async fn the_schema_lists_read_only_as_an_optional_boolean() {
+        let rig = rig(1).await;
+        let schema = serde_json::to_value(rig.tool.definition().function.parameters)
+            .expect("schema serializes");
+        assert_eq!(
+            schema["properties"]["read_only"]["type"], "boolean",
+            "read_only is advertised as a boolean: {schema}"
+        );
+        let required = schema["required"].as_array().expect("required list");
+        assert!(
+            !required.iter().any(|name| name == "read_only"),
+            "read_only is optional: {required:?}"
+        );
+    }
 }

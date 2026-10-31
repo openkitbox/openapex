@@ -105,6 +105,36 @@ pub trait Tool: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>>;
 }
 
+/// The `agent` a read-only subagent session is created with. The `subagent`
+/// tool writes it; the engine reads it back to pick [`READ_ONLY_TOOLS`]. Named
+/// after upstream opencode's read-only `explore` agent.
+pub const READ_ONLY_AGENT: &str = "explore";
+
+/// The toolset of a read-only subagent (`subagent` with `read_only: true`).
+///
+/// Rule: a built-in tool belongs here only if it cannot change the workspace
+/// or start other work. Reading files and the web, loading skills, searching
+/// the tool catalog, and the `ctx_*` context tools (their writes stay in ox's
+/// own database; `ctx_memory` is project-wide, the rest per session) qualify. Excluded: `shell`,
+/// `write`, `edit`, `patch` (workspace writes), `todowrite` (parent-facing
+/// plan state), `subagent` (a read-only child must not spawn a full one),
+/// `question` (no UI watches a child), and every MCP tool, whose side effects
+/// cannot be judged statically. Enforced by registry membership, so a call to
+/// an excluded tool fails as an unknown tool.
+pub const READ_ONLY_TOOLS: &[&str] = &[
+    "capability_search",
+    "ctx_expand",
+    "ctx_memory",
+    "ctx_note",
+    "ctx_reduce",
+    "ctx_search",
+    "glob",
+    "grep",
+    "read",
+    "skill",
+    "webfetch",
+];
+
 /// Name-keyed tool registry. Definitions iterate in name order so the wire
 /// `tools` array is stable across steps (keeps the provider's cached prefix).
 #[derive(Default)]
@@ -170,6 +200,25 @@ impl ToolRegistry {
         }
     }
 
+    /// A copy of this registry holding only the named tools (names that are
+    /// not registered are skipped), sharing their `Arc`s. The counterpart of
+    /// [`ToolRegistry::without`] for allow-lists; built once per services
+    /// generation, never on a hot path.
+    pub fn only(&self, names: &[&str]) -> Self {
+        let tools = self
+            .tools
+            .iter()
+            .filter(|(name, _)| names.contains(&name.as_str()))
+            .map(|(name, tool)| (name.clone(), Arc::clone(tool)))
+            .collect();
+        Self {
+            tools,
+            definitions_cache: std::sync::OnceLock::new(),
+            subagent_handle: self.subagent_handle.clone(),
+            shell_completion: self.shell_completion.clone(),
+        }
+    }
+
     /// Bulk-register pre-built tools. Names must be unique; a duplicate is a
     /// programming error caught by debug builds (built-ins have fixed names).
     pub fn register_all(&mut self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) {
@@ -220,5 +269,67 @@ impl ToolRegistry {
             .into_iter()
             .map(|def| (def.function.name, def.function.description))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WRITERS: &[&str] = &[
+        "shell",
+        "write",
+        "edit",
+        "patch",
+        "subagent",
+        "todowrite",
+        "question",
+    ];
+
+    fn names(registry: &ToolRegistry) -> Vec<&str> {
+        registry.guidances().map(|(name, _)| name).collect()
+    }
+
+    #[test]
+    fn only_keeps_exactly_the_named_builtins_and_shares_their_arcs() {
+        let full = ToolRegistry::with_builtins();
+        let narrowed = full.only(READ_ONLY_TOOLS);
+        assert_eq!(
+            names(&narrowed),
+            [
+                "capability_search",
+                "glob",
+                "grep",
+                "read",
+                "skill",
+                "webfetch"
+            ],
+            "builtins in the allow-list survive; ctx_* are registered elsewhere"
+        );
+        for name in names(&narrowed) {
+            let kept = narrowed.get(name).expect("kept tool");
+            let original = full.get(name).expect("original tool");
+            assert!(Arc::ptr_eq(&kept, &original), "{name} shares its Arc");
+        }
+    }
+
+    #[test]
+    fn the_read_only_list_names_no_workspace_writer() {
+        for writer in WRITERS {
+            assert!(
+                !READ_ONLY_TOOLS.contains(writer),
+                "`{writer}` must not be in the read-only list"
+            );
+        }
+        let narrowed = ToolRegistry::with_builtins().only(READ_ONLY_TOOLS);
+        for writer in WRITERS {
+            assert!(narrowed.get(writer).is_none(), "`{writer}` is absent");
+        }
+    }
+
+    #[test]
+    fn only_skips_names_that_are_not_registered() {
+        let narrowed = ToolRegistry::with_builtins().only(&["read", "no_such_tool"]);
+        assert_eq!(names(&narrowed), ["read"]);
     }
 }

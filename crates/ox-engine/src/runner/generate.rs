@@ -37,7 +37,7 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
         super::resolve_selection(&inner.db, session_id, &svc.config, &svc.model_catalog).await?;
     let ctx = DrainCtx {
         session_id: session_id.to_owned(),
-        is_subagent: false,
+        kind: super::services::SessionKind::Main,
         directory: inner.directory.clone(),
         home: inner.home.clone(),
         config: Arc::clone(&svc.config),

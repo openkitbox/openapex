@@ -23,7 +23,7 @@
 //! real tools; the registry ships empty until task 7 fills it.
 
 pub use ox_llm::cardinal::chat::Chat;
-pub use services::{Live, ServiceSet, Services};
+pub use services::{Live, ServiceSet, Services, SessionKind};
 
 pub mod compaction;
 pub mod drain;
@@ -554,10 +554,6 @@ impl ActorTask {
         let Some(mut rx) = self.rx.take() else {
             return;
         };
-        // Resolve the prompt profile once per actor task: a session's parent
-        // link never changes. Each generation precomputes the child registry
-        // (no `question`; see [`Services::child_tools`]).
-        let is_subagent = self.session_is_subagent().await;
         loop {
             // Absorb the backlog; the first Enqueue opens a busy period.
             let mut token: Option<CancellationToken> = None;
@@ -618,17 +614,23 @@ impl ActorTask {
             // Re-pointed at the newest generation before each drain and
             // before the background fold; `run_turn` also does so at each
             // step boundary.
+            // Resolved per busy period, not per actor: the session's agent
+            // can be switched (`SessionAgentSelected`), which moves a child
+            // in or out of the read-only tier from its next busy period.
+            // Each generation precomputes the registries (see
+            // [`Services::tools_for`]).
+            let kind = self.session_kind().await;
             let svc = self.inner.live.current();
             let mut ctx = drain::DrainCtx {
                 session_id: self.session_id.clone(),
-                is_subagent,
+                kind,
                 directory: self.session_directory().await,
                 home: self.inner.home.clone(),
                 config: Arc::clone(&svc.config),
                 db: self.inner.db.clone(),
                 bus: self.inner.bus.clone(),
                 chat: Arc::clone(&svc.chat),
-                tools: svc.tools_for(is_subagent),
+                tools: svc.tools_for(kind),
                 model_catalog: Arc::clone(&svc.model_catalog),
                 mcp: Arc::clone(&svc.mcp),
                 live: Arc::clone(&self.inner.live),
@@ -738,38 +740,44 @@ impl ActorTask {
         self.inner.forget(&self.session_id);
     }
 
-    /// Whether this session is a subagent (its `parent_id` is set). A missing
-    /// row or a failed lookup answers `true`: fail closed, an unanswered form
-    /// is worse than a missing tool for one turn.
-    async fn session_is_subagent(&self) -> bool {
-        let looked_up: anyhow::Result<Option<Option<String>>> = async {
+    /// The session's kind, from its `parent_id` and `agent` (see
+    /// [`SessionKind::of`]). A missing row or a failed lookup answers
+    /// [`SessionKind::ReadOnlySubagent`], the narrowest toolset: the row
+    /// might be a read-only child, and a missing tool for one busy period is
+    /// cheaper than a writer the parent asked to withhold.
+    async fn session_kind(&self) -> SessionKind {
+        type Row = (Option<String>, Option<String>);
+        let looked_up: anyhow::Result<Option<Row>> = async {
             let conn = self.inner.db.acquire().await?;
             let mut stmt = conn
-                .prepare("SELECT parent_id FROM session_v2 WHERE id = ?1")
+                .prepare("SELECT parent_id, agent FROM session_v2 WHERE id = ?1")
                 .await?;
             let row = ox_db::optional(&mut stmt, [self.session_id.as_str()]).await?;
             match row {
-                Some(row) => Ok(Some(row.get::<Option<String>>(0)?)),
+                Some(row) => Ok(Some((
+                    row.get::<Option<String>>(0)?,
+                    row.get::<Option<String>>(1)?,
+                ))),
                 None => Ok(None),
             }
         }
         .await;
         match looked_up {
-            Ok(Some(parent_id)) => parent_id.is_some(),
+            Ok(Some((parent_id, agent))) => SessionKind::of(parent_id.as_deref(), agent.as_deref()),
             Ok(None) => {
                 tracing::warn!(
                     session = %self.session_id,
-                    "session row missing; running without the question tool"
+                    "session row missing; running with the read-only toolset"
                 );
-                true
+                SessionKind::ReadOnlySubagent
             }
             Err(error) => {
                 tracing::warn!(
                     session = %self.session_id,
                     error = %error,
-                    "session parent lookup failed; running without the question tool"
+                    "session kind lookup failed; running with the read-only toolset"
                 );
-                true
+                SessionKind::ReadOnlySubagent
             }
         }
     }

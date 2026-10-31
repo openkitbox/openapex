@@ -87,7 +87,8 @@ impl ToolRegistry {
 /// The `subagent` tool, registered at app-wiring time (it drives child
 /// sessions through the runner, which does not exist at `with_builtins`).
 impl ToolRegistry {
-    /// Register `subagent` over a fresh handle. The runner attaches itself to
+    /// Register `subagent` over a fresh handle whose slot pool admits
+    /// `max_active` concurrent children server-wide. The runner attaches itself to
     /// the handle in `Runner::new`, completing the cycle tool → runner → tool
     /// without either side owning the other's construction.
     pub fn register_subagent(
@@ -95,8 +96,9 @@ impl ToolRegistry {
         db: ox_db::Db,
         bus: ox_core::event_bus::EventBus,
         depth_limit: usize,
+        max_active: usize,
     ) {
-        let handle = std::sync::Arc::new(subagent::SubagentHandle::new(db, bus));
+        let handle = std::sync::Arc::new(subagent::SubagentHandle::new(db, bus, max_active));
         // The runner looks the handle up here when it is built and attaches
         // itself; until then the tool reports the missing-runner condition.
         self.subagent_handle = Some(handle.clone());

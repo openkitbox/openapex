@@ -270,7 +270,12 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
     let db = Db::open(&config.db_path).await?;
     let bus = EventBus::new(db.clone());
     tools.register_todowrite(db.clone());
-    tools.register_subagent(db.clone(), bus.clone(), config.subagent.depth);
+    tools.register_subagent(
+        db.clone(),
+        bus.clone(),
+        config.subagent.depth,
+        config.subagent.max_active,
+    );
     // Background `shell` completions need the same db/bus; the runner attaches
     // its waker when it is built below.
     tools.register_shell_completion(db.clone(), bus.clone());

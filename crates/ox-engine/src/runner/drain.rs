@@ -96,10 +96,9 @@ impl InboxRow {
 #[derive(Clone)]
 pub(crate) struct DrainCtx {
     pub session_id: String,
-    /// Whether this session was spawned by another session. Resolved once
-    /// when the actor starts, so prompt assembly does not query the DB per
-    /// step.
-    pub is_subagent: bool,
+    /// Main session, subagent, or read-only subagent. Resolved once when the
+    /// actor starts, so prompt assembly does not query the DB per step.
+    pub kind: super::services::SessionKind,
     pub directory: std::path::PathBuf,
     /// The ox home directory (`~/.ox`) the global AGENTS.md lives in.
     pub home: std::path::PathBuf,
@@ -144,7 +143,7 @@ impl DrainCtx {
         self.chat = Arc::clone(&svc.chat);
         self.model_catalog = Arc::clone(&svc.model_catalog);
         self.mcp = Arc::clone(&svc.mcp);
-        self.tools = svc.tools_for(self.is_subagent);
+        self.tools = svc.tools_for(self.kind);
         self.generation = svc.generation;
     }
 }
