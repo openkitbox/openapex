@@ -77,6 +77,58 @@ pub(crate) async fn recent_turns(
     Ok(messages)
 }
 
+/// The two rows a settled subagent is judged by: its newest idle row and its
+/// newest final-reply assistant row (per [`ox_tools::subagent::is_final_reply`]).
+/// Either may be absent.
+///
+/// Rows stream newest first and every other row is dropped as soon as it is
+/// decoded, so the read holds at most two messages however long the child
+/// ran. Loading the whole child transcript here cost a full-transcript read
+/// per finished subagent, and children settling together held several
+/// transcripts at once. The answer equals scanning the full transcript from
+/// the end, which is what the settle path did before.
+pub(crate) async fn settled_tail(db: &ox_db::Db, session_id: &str) -> Result<Vec<Message>> {
+    let conn = db.acquire().await?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, type, data FROM session_message
+             WHERE session_id = ?1 AND type IN ('assistant', 'idle')
+             ORDER BY seq DESC",
+        )
+        .await?;
+    let mut rows = stmt.query([session_id]).await?;
+    let mut idle: Option<Message> = None;
+    let mut reply: Option<Message> = None;
+    while let Some(row) = rows.next().await? {
+        let kind: String = row.get(1)?;
+        let wanted = match kind.as_str() {
+            "idle" => idle.is_none(),
+            _ => reply.is_none(),
+        };
+        if !wanted {
+            continue;
+        }
+        let id: String = row.get(0)?;
+        let data: String = row.get(2)?;
+        let mut value: Value =
+            serde_json::from_str(&data).context("decode session_message.data")?;
+        Message::merge_row_columns(&id, &kind, &mut value);
+        let message = decode_row_owned(value)?;
+        if matches!(message, Message::Idle { .. }) {
+            idle = Some(message);
+        } else if ox_tools::subagent::is_final_reply(&message) {
+            reply = Some(message);
+        }
+        if idle.is_some() && reply.is_some() {
+            break;
+        }
+    }
+    // At most one of each kind, and both settle-path readers search by kind
+    // (`child_outcome` the idle row, `final_text` the reply), so the order
+    // of the two does not matter to either.
+    Ok(reply.into_iter().chain(idle).collect())
+}
+
 /// Load a session transcript above `floor`: rows with a greater ordinal. The
 /// magic-context head stands in for everything at or below the floor it
 /// reports, so the request carries only the live tail.

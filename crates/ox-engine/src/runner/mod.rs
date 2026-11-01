@@ -1009,8 +1009,8 @@ impl ox_tools::subagent::SubagentSpawner for Runner {
         Runner::interrupt(self, session_id)
     }
 
-    fn load_history<'a>(&'a self, session_id: &'a str) -> ox_tools::subagent::LoadHistory<'a> {
-        Box::pin(crate::runner::step::load_history(
+    fn settled_tail<'a>(&'a self, session_id: &'a str) -> ox_tools::subagent::SettledTail<'a> {
+        Box::pin(crate::runner::step::settled_tail(
             &self.inner.db,
             session_id,
         ))

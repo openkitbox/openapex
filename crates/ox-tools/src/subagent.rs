@@ -77,12 +77,15 @@ pub trait SubagentSpawner: Send + Sync {
     fn is_active(&self, session_id: &str) -> bool;
     /// Cancel the session's busy period.
     fn interrupt(&self, session_id: &str) -> bool;
-    /// The session transcript, projected from the database.
-    fn load_history<'a>(&'a self, session_id: &'a str) -> LoadHistory<'a>;
+    /// The rows a settled child is judged by: its newest idle row and its
+    /// newest [`is_final_reply`] assistant row, each optional. Never the
+    /// whole transcript: several children settling together must not hold
+    /// several transcripts at once.
+    fn settled_tail<'a>(&'a self, session_id: &'a str) -> SettledTail<'a>;
 }
 
-/// The boxed future [`SubagentSpawner::load_history`] answers with.
-pub type LoadHistory<'a> = std::pin::Pin<
+/// The boxed future [`SubagentSpawner::settled_tail`] answers with.
+pub type SettledTail<'a> = std::pin::Pin<
     Box<
         dyn std::future::Future<Output = anyhow::Result<Vec<ox_schema::message::Message>>>
             + Send
@@ -479,18 +482,18 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
     }
     drop(guard);
 
-    let history = match spawner.load_history(&child_id).await {
-        Ok(history) => history,
+    let tail = match spawner.settled_tail(&child_id).await {
+        Ok(tail) => tail,
         Err(error) => {
             return fail(format!(
                 "Child session finished but its transcript is unreadable: {error}"
             ));
         }
     };
-    match child_outcome(&history) {
+    match child_outcome(&tail) {
         ChildOutcome::Completed => {
             let fold = transcript_fold(
-                &history,
+                &tail,
                 &child_id,
                 &ox_core::config::ox_home().join(SUBAGENT_OUTPUT_DIR),
             );
@@ -715,14 +718,14 @@ fn spawn_completion_watcher(
             while spawner.is_active(&child_id) {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            let Ok(history) = spawner.load_history(&child_id).await else {
+            let Ok(tail) = spawner.settled_tail(&child_id).await else {
                 tracing::warn!(child = %child_id, "subagent finished but its transcript is unreadable; dropping notification");
                 return;
             };
-            match child_outcome(&history) {
+            match child_outcome(&tail) {
                 ChildOutcome::Completed => (
                     "completed",
-                    final_text(&history).unwrap_or_else(|| {
+                    final_text(&tail).unwrap_or_else(|| {
                         "Subagent completed without a text response.".to_owned()
                     }),
                 ),
@@ -909,33 +912,45 @@ fn child_outcome(messages: &[ox_schema::message::Message]) -> ChildOutcome {
     }
 }
 
+/// Whether `message` can carry a child's final reply: an assistant row
+/// without an error and with at least one non-blank text part. The engine's
+/// settle-tail read keeps the newest such row; [`final_text`] reads it.
+#[must_use]
+pub fn is_final_reply(message: &ox_schema::message::Message) -> bool {
+    reply_text(message).is_some()
+}
+
+/// The non-blank text parts of an error-free assistant row, joined.
+fn reply_text(message: &ox_schema::message::Message) -> Option<String> {
+    use ox_schema::message::{AssistantContent, Message};
+    let Message::Assistant(assistant) = message else {
+        return None;
+    };
+    if assistant.error.is_some() {
+        return None;
+    }
+    let parts: Vec<&str> = assistant
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            AssistantContent::Text { text, .. } if !text.trim().is_empty() => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
 /// The newest completed assistant text, whole (no preview) — the notification
 /// body for background completions, matching upstream's completion text.
 fn final_text(messages: &[ox_schema::message::Message]) -> Option<String> {
-    use ox_schema::message::{AssistantContent, Message};
-    messages.iter().rev().find_map(|message| match message {
-        Message::Assistant(assistant) if assistant.error.is_none() => {
-            let parts: Vec<&str> = assistant
-                .content
-                .iter()
-                .filter_map(|content| match content {
-                    AssistantContent::Text { text, .. } if !text.trim().is_empty() => {
-                        Some(text.as_str())
-                    }
-                    _ => None,
-                })
-                .collect();
-            (!parts.is_empty()).then(|| parts.join("\n\n"))
-        }
-        _ => None,
-    })
+    messages.iter().rev().find_map(reply_text)
 }
 
 /// The child's reply for the parent: only the final assistant message, whole
 /// when it fits [`SUBAGENT_FOLD_INLINE_BYTES`]; otherwise its head plus a
 /// pointer to the full output spilled under `output_dir` (one
-/// `<child sessionID>.md`). Pure over an already-loaded transcript apart
-/// from the spill, so the caller loads history once.
+/// `<child sessionID>.md`). Pure over the child's settled tail apart from the
+/// spill, so the caller reads that tail once.
 fn transcript_fold(
     messages: &[ox_schema::message::Message],
     child_id: &str,
@@ -1052,7 +1067,7 @@ mod tests {
             true
         }
 
-        fn load_history<'a>(&'a self, _session_id: &'a str) -> LoadHistory<'a> {
+        fn settled_tail<'a>(&'a self, _session_id: &'a str) -> SettledTail<'a> {
             Box::pin(async { Ok(Vec::new()) })
         }
     }
