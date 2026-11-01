@@ -12,8 +12,7 @@
 //!   queue is empty (the Select has no disabled rows);
 //! - `Switch session` is always suggested (upstream: only when sessions exist;
 //!   ox has no cached session list at hand);
-//! - `Toggle sidebar` has one fixed title (upstream switches between
-//!   `Show sidebar` and `Hide sidebar`);
+//! - no `Toggle sidebar` row: ox has no sidebar;
 //! - filtering keeps the category headers (upstream flattens the list and
 //!   shows `group · keys` as the footer).
 
@@ -39,7 +38,6 @@ const ORDER: &[CommandAction] = &[
     CommandAction::Subagents,
     CommandAction::QueuedPrompts,
     CommandAction::Shells,
-    CommandAction::ToggleSidebar,
     CommandAction::Models,
     CommandAction::Agents,
     CommandAction::Status,
@@ -54,7 +52,6 @@ const SESSION_ONLY: &[CommandAction] = &[
     CommandAction::Subagents,
     CommandAction::QueuedPrompts,
     CommandAction::Shells,
-    CommandAction::ToggleSidebar,
 ];
 
 /// What the palette needs to know about the app.

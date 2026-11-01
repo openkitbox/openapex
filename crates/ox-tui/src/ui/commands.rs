@@ -41,8 +41,6 @@ pub enum CommandAction {
     Shells,
     /// Open the queued-prompts dialog (upstream `session.queued_prompts`).
     QueuedPrompts,
-    /// Show or hide the session sidebar (upstream `session.sidebar.toggle`).
-    ToggleSidebar,
 }
 
 /// One registered command. `aliases` are rendered as their own menu rows,
@@ -157,14 +155,6 @@ pub const COMMANDS: &[Command] = &[
         title: "Jump to message",
         group: "Session",
         action: CommandAction::Timeline,
-    },
-    Command {
-        name: "sidebar",
-        aliases: &[],
-        description: "Toggle sidebar",
-        title: "Toggle sidebar",
-        group: "Session",
-        action: CommandAction::ToggleSidebar,
     },
     Command {
         name: "status",

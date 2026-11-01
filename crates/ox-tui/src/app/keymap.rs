@@ -8,11 +8,13 @@
 //! `command.palette.show = ctrl+p`, `leader = ctrl+x` with a 2000ms timeout
 //! (`context/keymap.tsx:143`), `session.new = <leader>n`,
 //! `session.list = <leader>l`, `session.child.first = <leader>down`, `model.list = <leader>m`, `agent.list = <leader>a`,
-//! `opencode.status = <leader>s`, `session.sidebar.toggle = <leader>b`,
+//! `opencode.status = <leader>s`,
 //! `session.queued_prompts = <leader>q`
 //! (upstream's `app.exit` also lists `<leader>q`: the queue command takes
 //! the key while prompts are queued, otherwise it declines and the app
 //! exits; `App::run_command` makes that choice).
+//! ox has no sidebar, so `<leader>b` (upstream `session.sidebar.toggle`)
+//! opens the Shells list instead.
 //! A key that does not continue a pending leader sequence cancels it and is
 //! swallowed (upstream `registerEscapeClearsPendingSequence` plus the
 //! timed-leader's `clearPendingSequence`).
@@ -37,7 +39,7 @@ const LEADER_KEYS: &[(KeyCode, CommandAction)] = &[
     (KeyCode::Char('s'), CommandAction::Status),
     (KeyCode::Char('q'), CommandAction::QueuedPrompts),
     (KeyCode::Down, CommandAction::Subagents),
-    (KeyCode::Char('b'), CommandAction::ToggleSidebar),
+    (KeyCode::Char('b'), CommandAction::Shells),
 ];
 
 /// What a global binding asks the app to do.

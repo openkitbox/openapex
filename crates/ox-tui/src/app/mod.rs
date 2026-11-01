@@ -36,7 +36,6 @@ use crate::ui::queued_dialog;
 use crate::ui::selection::Outcome;
 use crate::ui::session_dialog;
 use crate::ui::shell_dialog;
-use crate::ui::sidebar::{self, TodoOpen};
 use crate::ui::subagent_dialog;
 use crate::ui::timeline::Transcript;
 use crate::ui::timeline_dialog;
@@ -148,44 +147,6 @@ pub struct App {
     queued_dock_area: Rect,
     /// Whether the pointer is over the queued-prompt dock.
     dock_hover: DockHover,
-    /// Whether the session sidebar shows (upstream `session.sidebar` config
-    /// plus the in-memory `sidebarOpen`). Not persisted.
-    sidebar_pref: SidebarPref,
-    /// The sidebar Todo section's open state (upstream plugin storage).
-    todo_open: TodoOpen,
-    /// Where the sidebar was last drawn (empty when hidden), for the pointer.
-    sidebar_area: Rect,
-    /// Screen row of the clickable Todo header, when the sidebar drew one.
-    sidebar_header: Option<u16>,
-    /// The open session has a parent: upstream never shows its sidebar.
-    session_child: bool,
-    /// Width of the last session frame; decides docked vs overlay sidebar.
-    screen_width: u16,
-}
-
-/// Upstream `session.sidebar` (`auto` | `hide`) folded with `sidebarOpen`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum SidebarPref {
-    /// Shown when the screen is wide.
-    #[default]
-    Auto,
-    /// Shown at any width (an overlay when narrow).
-    Open,
-    Hidden,
-}
-
-/// Upstream `wide`: past this width the sidebar docks beside the session.
-const WIDE_SCREEN: u16 = 120;
-
-/// Upstream `sidebarVisible` for a root session, minus the panels and
-/// terminals ox does not have.
-#[must_use]
-fn sidebar_visible(pref: SidebarPref, width: u16) -> bool {
-    match pref {
-        SidebarPref::Open => true,
-        SidebarPref::Auto => width > WIDE_SCREEN,
-        SidebarPref::Hidden => false,
-    }
 }
 
 /// Which shell dialog an in-flight request will open.
@@ -251,12 +212,6 @@ impl App {
             shell_syncs: 0,
             queued_dock_area: Rect::default(),
             dock_hover: DockHover::Off,
-            sidebar_pref: SidebarPref::default(),
-            todo_open: TodoOpen::default(),
-            sidebar_area: Rect::default(),
-            sidebar_header: None,
-            session_child: false,
-            screen_width: 0,
         }
     }
 
@@ -328,7 +283,6 @@ impl App {
                 // 切走之后迟到的答案不能覆盖新会话的显示。
                 if self.session.as_deref() == Some(session.as_str()) {
                     self.session_title = selection.title.clone();
-                    self.session_child = selection.child;
                     self.prompt.set_selection(
                         selection.agent,
                         selection.model,
@@ -483,7 +437,6 @@ impl App {
         }
         self.settled_forms.clear();
         self.session_title = None;
-        self.session_child = false;
         self.seq_tx.send_replace(None);
         self.request_forms();
     }
@@ -640,18 +593,6 @@ impl App {
             inbox,
             reason,
         });
-    }
-
-    /// Whether the sidebar shows on the last drawn screen.
-    fn sidebar_shown(&self) -> bool {
-        self.route == Route::Session
-            && !self.session_child
-            && sidebar_visible(self.sidebar_pref, self.screen_width)
-    }
-
-    /// The sidebar shows over the transcript because the screen is narrow.
-    fn sidebar_overlaid(&self) -> bool {
-        self.sidebar_shown() && self.screen_width <= WIDE_SCREEN
     }
 
     /// The queued-prompt dock shows above the prompt while prompts wait and
@@ -974,18 +915,6 @@ impl App {
             return;
         }
 
-        // The narrow overlay sidebar closes on esc / ctrl+c before anything
-        // else sees them (upstream `index.tsx:256-260`, layer priority 10).
-        if self.sidebar_overlaid()
-            && key.kind != crossterm::event::KeyEventKind::Release
-            && (key.code == KeyCode::Esc || keymap::is_cancel(&key))
-        {
-            self.keymap.reset();
-            self.sidebar_pref = SidebarPref::Hidden;
-            self.dirty = true;
-            return;
-        }
-
         // The search prompt owns the keyboard while it is open.
         if let Mode::SearchInput(boxed) = &mut self.mode {
             self.keymap.reset();
@@ -1247,15 +1176,6 @@ impl App {
                     let _ = self.commands.send(AppCommand::ListShells { session });
                 }
             }
-            CommandAction::ToggleSidebar => {
-                // Upstream `toggleSidebar`: hide what shows, open what does not.
-                self.sidebar_pref = if self.sidebar_shown() {
-                    SidebarPref::Hidden
-                } else {
-                    SidebarPref::Open
-                };
-                self.dirty = true;
-            }
             CommandAction::Rename => {
                 if let Some(session) = self.session.clone() {
                     let title = self.session_title.clone().unwrap_or_default();
@@ -1511,14 +1431,6 @@ impl App {
             self.run_command(CommandAction::QueuedPrompts);
             return;
         }
-        if contains(self.sidebar_area, x, y) {
-            self.transcript.release();
-            if self.sidebar_header == Some(y) {
-                self.todo_open = self.todo_open.toggled();
-            }
-            self.dirty = true;
-            return;
-        }
         match self.transcript.release() {
             Outcome::Click => {
                 // A subagent notice opens its child session; the owned id
@@ -1699,23 +1611,9 @@ impl App {
     }
 
     /// One frame of the session route: transcript, docks, prompt, then the
-    /// sidebar, dialog and toast on top.
+    /// dialog and toast on top.
     fn draw_session(&mut self, frame: &mut ratatui::Frame) {
-        let screen = frame.area();
-        self.screen_width = screen.width;
-        let sidebar = self.sidebar_shown().then(|| Rect {
-            x: screen.right().saturating_sub(sidebar::SIDEBAR_WIDTH),
-            width: screen.width.min(sidebar::SIDEBAR_WIDTH),
-            ..screen
-        });
-        // Wide: the session column gives the sidebar its width.
-        let full = match sidebar {
-            Some(panel) if !self.sidebar_overlaid() => Rect {
-                width: screen.width.saturating_sub(panel.width),
-                ..screen
-            },
-            _ => screen,
-        };
+        let full = frame.area();
         let searching = matches!(self.mode, Mode::SearchInput(_));
         let prompt_h = self
             .prompt
@@ -1754,21 +1652,11 @@ impl App {
             .render(frame, layout::padded(timeline_area, full.width));
         let line = dock::status_line(&self.store, self.status_mode());
         frame.render_widget(ratatui::widgets::Paragraph::new(line), dock_area);
-        self.sidebar_area = sidebar.unwrap_or_default();
-        self.sidebar_header = sidebar.and_then(|panel| {
-            sidebar::render(
-                self.session_title.as_deref().unwrap_or("New session"),
-                self.store.session_todos(),
-                self.todo_open,
-                panel,
-                frame.buffer_mut(),
-            )
-        });
         if let Some(dialog) = &self.dialog {
-            crate::ui::dialog::render(frame, screen, dialog);
+            crate::ui::dialog::render(frame, full, dialog);
         }
         if let Some(toast) = &self.toast {
-            toast::render(frame.buffer_mut(), screen, toast, crate::theme::palette());
+            toast::render(frame.buffer_mut(), full, toast, crate::theme::palette());
         }
     }
 

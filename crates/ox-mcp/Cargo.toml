@@ -4,7 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-anyhow.workspace = true
 futures-util.workspace = true
 ox-core.workspace = true
 ox-schema.workspace = true
@@ -17,9 +16,6 @@ tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 
 [dev-dependencies]
-salvo = { workspace = true, features = ["server", "http1", "http2", "affix-state", "logging"] }
-sha2.workspace = true
-tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [lints]

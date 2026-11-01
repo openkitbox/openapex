@@ -657,43 +657,6 @@ fn cases() -> Vec<Case> {
                 },
             ]
         }),
-        // Session sidebar: open on the left, folded on the right.
-        Case {
-            name: "sidebar",
-            height: 12,
-            draw: Box::new(|frame, area| {
-                use ox_client::todo::{Todo, TodoStatus::*};
-                use ox_tui::ui::sidebar::{self, SIDEBAR_WIDTH, TodoOpen};
-                let todo = |content: &str, status| Todo {
-                    content: content.into(),
-                    status,
-                };
-                let todos = [
-                    todo("Write the failing tests", Completed),
-                    todo("Implement the store projection", InProgress),
-                    todo("Drop the abandoned spike", Cancelled),
-                    todo(
-                        "Wire the sidebar into the session frame and check that a long todo wraps",
-                        Pending,
-                    ),
-                ];
-                let title = "Align the sidebar with upstream";
-                let width = area.width.min(SIDEBAR_WIDTH);
-                let open = Rect { width, ..area };
-                let _ = sidebar::render(title, &todos, TodoOpen::Open, open, frame.buffer_mut());
-                let x = area.x + SIDEBAR_WIDTH + 2;
-                if x + SIDEBAR_WIDTH <= area.right() {
-                    let closed = Rect { x, width, ..area };
-                    let _ = sidebar::render(
-                        title,
-                        &todos,
-                        TodoOpen::Closed,
-                        closed,
-                        frame.buffer_mut(),
-                    );
-                }
-            }),
-        },
         transcript_case("todo-inline-states", 8, {
             let row = |id: &str, state| Block::Todo {
                 id: id.into(),

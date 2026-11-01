@@ -13,7 +13,6 @@ tracing.workspace = true
 turso = { version = "0.9.0-pre.1", default-features = false, features = ["fts"] }
 
 [dev-dependencies]
-tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 
 [lints]

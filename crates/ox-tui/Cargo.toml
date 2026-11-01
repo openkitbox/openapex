@@ -22,7 +22,6 @@ crossterm = { workspace = true, features = ["bracketed-paste"] }
 syntect = { version = "5.3", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }
 tui-textarea-2 = { version = "0.13", default-features = false, features = ["crossterm"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
-futures-util.workspace = true
 serde_json.workspace = true
 textwrap.workspace = true
 unicode-width.workspace = true
@@ -33,7 +32,6 @@ anyhow.workspace = true
 base64.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 
 [lints]

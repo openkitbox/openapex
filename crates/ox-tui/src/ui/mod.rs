@@ -28,7 +28,6 @@ pub mod session_dialog;
 pub mod shell_block;
 pub mod shell_collapse;
 pub mod shell_dialog;
-pub mod sidebar;
 pub mod spinner;
 pub mod subagent_dialog;
 pub mod table;

@@ -33,8 +33,6 @@ pub struct Selection {
     pub variant: Option<String>,
     /// 会话标题（`/rename` 的预填值）。
     pub title: Option<String>,
-    /// Whether the session has a parent; the sidebar never shows for one.
-    pub child: bool,
 }
 
 /// 纯函数：存储的会话 + provider 目录 → 展示用选择。provider 取目录里的显示名，
@@ -59,7 +57,6 @@ pub fn selection_of(info: &SessionInfo, providers: &[ProviderRef]) -> Selection 
             .clone()
             .filter(|variant| !variant.is_empty() && variant != "default"),
         title: info.title.clone(),
-        child: info.parent_id.is_some(),
     }
 }
 
