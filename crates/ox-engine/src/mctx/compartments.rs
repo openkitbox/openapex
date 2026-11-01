@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::mctx::decay_render::DecayRenderCompartment;
 use ox_db::Db;
+use ox_db::WriteTx;
 
 /// The paraphrase tiers and heading fields of one compartment — the `tiers`
 /// JSON column. `p1..p4` are the paraphrase ladder; `p1` absent or empty
@@ -217,44 +218,63 @@ pub async fn insert_all(db: &Db, compartments: &[NewCompartment<'_>]) -> Result<
     // `serde` failure must not leave a started transaction to roll back, and
     // the bind values are then borrowed straight from these owners.
     let now = ox_schema::id::now_millis();
-    let tiers = compartments
-        .iter()
-        .map(|compartment| {
-            serde_json::to_string(compartment.tiers).context("serialize compartment tiers")
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let tiers = serialize_tiers(compartments)?;
     let session_id = compartments[0].session_id;
     let count = compartments.len();
     let written = async {
         let tx = db.begin().await?;
-        {
-            let mut stmt = tx
-                .prepare(
-                    "INSERT INTO mc_compartments
-                         (id, session_id, coverage_end, importance, tiers, search_text, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                )
-                .await?;
-            for (compartment, tiers) in compartments.iter().zip(&tiers) {
-                let coverage_end = compartment.tiers.end_message.to_string();
-                let search_text = search_text(compartment.tiers);
-                stmt.execute((
-                    compartment.id,
-                    compartment.session_id,
-                    coverage_end.as_str(),
-                    compartment.importance,
-                    tiers.as_str(),
-                    search_text.as_str(),
-                    now,
-                ))
-                .await?;
-            }
-        }
+        insert_all_in(&tx, compartments, &tiers, now).await?;
         tx.commit().await?;
         Ok::<(), anyhow::Error>(())
     }
     .await;
     written
         .with_context(|| format!("insert {count} mc_compartments rows for session {session_id}"))?;
+    Ok(())
+}
+
+/// The `tiers` JSON of each compartment, in order. Called before a transaction
+/// opens, so a `serde` failure never leaves one to roll back.
+pub(crate) fn serialize_tiers(compartments: &[NewCompartment<'_>]) -> Result<Vec<String>> {
+    compartments
+        .iter()
+        .map(|compartment| {
+            serde_json::to_string(compartment.tiers).context("serialize compartment tiers")
+        })
+        .collect()
+}
+
+/// Append compartments inside the caller's transaction, in the order given.
+///
+/// `tiers` is [`serialize_tiers`] of the same `compartments`, computed before
+/// the transaction opened; `now` stamps every row. The caller owns commit and
+/// rollback, so these rows land together with whatever else it writes.
+pub(crate) async fn insert_all_in(
+    tx: &WriteTx<'_>,
+    compartments: &[NewCompartment<'_>],
+    tiers: &[String],
+    now: i64,
+) -> Result<()> {
+    let mut stmt = tx
+        .prepare(
+            "INSERT INTO mc_compartments
+                 (id, session_id, coverage_end, importance, tiers, search_text, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .await?;
+    for (compartment, tiers) in compartments.iter().zip(tiers) {
+        let coverage_end = compartment.tiers.end_message.to_string();
+        let search_text = search_text(compartment.tiers);
+        stmt.execute((
+            compartment.id,
+            compartment.session_id,
+            coverage_end.as_str(),
+            compartment.importance,
+            tiers.as_str(),
+            search_text.as_str(),
+            now,
+        ))
+        .await?;
+    }
     Ok(())
 }

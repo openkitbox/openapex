@@ -94,6 +94,9 @@ pub mod historian;
 /// coverage/boundary rules that decide what is safe to publish.
 pub mod historian_validate;
 
+/// Promotion of the historian's `<facts>` into project memory, with dedup.
+mod promotion;
+
 /// `ctx_search`: unified retrieval over memories, notes and compartments.
 pub mod search;
 

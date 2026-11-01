@@ -118,12 +118,15 @@
 //!   terminal-boundary arc check) are inert in production. They are still
 //!   ported and unit-tested in [`crate::mctx::historian_validate`], and become
 //!   live the moment the chunker exposes invocation/result pairs.
-//! - **The parsed side channels are not persisted.** [`historian_validate`]
-//!   parses `<facts>`/`<events>` and returns them on `ValidatedChunk`, but
-//!   `mc_compartments` has no session-level column for them (the reference
-//!   keeps them on its assembly snapshot) and nothing consumes them until
-//!   Task 8/Task 3, so publication writes the neutral `{}`/`[]` payloads
-//!   instead of duplicating a run-level list onto every row.
+//! - **The side channels live on the run row, and facts are promoted at
+//!   publish.** [`historian_validate`] parses `<facts>`/`<events>` and returns
+//!   them on `ValidatedChunk`. `mc_compartments` has no session-level column
+//!   for them (the reference keeps them on its assembly snapshot), so
+//!   [`settle_run`] stores both on the producing `mc_historian_run` row. The
+//!   facts are also promoted into `mc_memory` by
+//!   [`crate::mctx::promotion`], inside the same transaction that publishes
+//!   the compartments (as the reference's incremental runner does); events
+//!   have no consumer yet.
 
 use std::sync::Arc;
 
@@ -135,6 +138,7 @@ use crate::mctx::budget::Budget;
 use crate::mctx::compartments::{self, NewCompartment, Tiers};
 use crate::mctx::historian_validate::{self, ValidateOptions};
 use crate::mctx::memory::MemoryRow;
+use crate::mctx::promotion;
 use ox_core::config::Config;
 use ox_llm::cardinal::chat::Chat;
 use ox_llm::cardinal::stream::StreamEvent;
@@ -1469,6 +1473,8 @@ pub struct RunCtx<'a> {
 pub struct RunPlan<'a> {
     /// Owning session.
     pub session_id: &'a str,
+    /// The session's project: promoted facts land in its memories.
+    pub project: &'a str,
     /// The chunk to summarize, with the ordinals validation checks against.
     pub chunk: &'a Chunk,
     /// The first attempt this run makes; a retry increments the row's attempt.
@@ -1600,7 +1606,7 @@ pub async fn run(ctx: &RunCtx<'_>, plan: &RunPlan<'_>) -> Result<Option<RunOutco
                     ..
                 } = validated;
                 let compartment_ids =
-                    match publish_compartments(ctx.db, plan.session_id, &mut compartments).await {
+                    match publish_compartments(ctx.db, plan, &mut compartments, &facts).await {
                         Ok(ids) => ids,
                         Err(error) => {
                             settle_failed(ctx.db, &run_id, &error).await;
@@ -1679,20 +1685,25 @@ async fn stored_ranges(
         .collect())
 }
 
-/// Publish validated compartments and return the minted row ids.
+/// Publish validated compartments, promote the run's facts, and return the
+/// minted compartment row ids.
 ///
 /// Coverage is derived from these rows, so writing the chunk's range is what
-/// advances the floor a later pass reads. The rows go in one transaction: a
-/// partial publish would advance coverage past content that was never
-/// summarized.
+/// advances the floor a later pass reads. Everything goes in one transaction:
+/// a partial publish would advance coverage past content that was never
+/// summarized, and the promoted memories commit or roll back with the
+/// compartments that produced them. Promotion runs only when the prompt asked
+/// for facts (`memory_enabled`) and the model returned some.
 ///
 /// Consumes the compartments' strings (`&mut` is ownership transfer here):
 /// validation already produced them and the publish plan is not read again.
 async fn publish_compartments(
     db: &ox_db::Db,
-    session_id: &str,
+    plan: &RunPlan<'_>,
     compartments: &mut [historian_validate::ValidatedCompartment],
+    facts: &[historian_validate::FactCandidate],
 ) -> Result<Vec<String>> {
+    let session_id = plan.session_id;
     let mut pending: Vec<(String, Tiers, f64)> = Vec::with_capacity(compartments.len());
     for compartment in compartments {
         pending.push((
@@ -1723,7 +1734,37 @@ async fn publish_compartments(
             tiers,
         })
         .collect();
-    compartments::insert_all(db, &rows).await?;
+    // Serialized before the transaction opens (see `compartments::insert_all`).
+    let tiers = compartments::serialize_tiers(&rows)?;
+    let now = now_millis();
+    let promote = plan.prompt.memory_enabled && !facts.is_empty();
+    let tx = db.begin().await?;
+    compartments::insert_all_in(&tx, &rows, &tiers, now)
+        .await
+        .with_context(|| {
+            format!(
+                "insert {} mc_compartments rows for session {session_id}",
+                rows.len()
+            )
+        })?;
+    let promoted = if promote {
+        Some(promotion::apply(&tx, plan.project, facts, now).await?)
+    } else {
+        None
+    };
+    tx.commit()
+        .await
+        .with_context(|| format!("commit historian publish for session {session_id}"))?;
+    if let Some(summary) = promoted {
+        tracing::info!(
+            session = %session_id,
+            project = %plan.project,
+            facts = facts.len(),
+            inserted = summary.inserted,
+            bumped = summary.bumped,
+            "historian facts promoted"
+        );
+    }
     Ok(pending.into_iter().map(|(id, _, _)| id).collect())
 }
 
@@ -1862,9 +1903,10 @@ async fn settle_run(
     side_channels: Option<&SideChannels>,
 ) -> Result<()> {
     // The run row owns the side channels: the historian emits `<facts>` and
-    // `<events>` once per run, for the memory-promotion pass that consumes them
-    // (a compartment has no such fields). Serialized before the write, so a
-    // serialization failure never leaves a half-settled row.
+    // `<events>` once per run (a compartment has no such fields); the facts
+    // were already promoted at publish, and this row keeps the record.
+    // Serialized before the write, so a serialization failure never leaves a
+    // half-settled row.
     let facts = match side_channels {
         Some(channels) => Some(
             serde_json::to_string(&channels.facts).context("serialize run facts side channel")?,

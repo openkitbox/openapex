@@ -69,7 +69,7 @@ use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 
 use crate::runner::{Tool, ToolContext, ToolOutput};
-use ox_db::{Db, optional};
+use ox_db::{Db, WriteTx, optional};
 use ox_schema::id::now_millis;
 use ox_schema::wire::ToolDef;
 use ox_tools::{object_param, ok_text};
@@ -160,13 +160,7 @@ pub(crate) async fn write_memory(
     let now = now_millis();
     let result: Result<String> = async {
         let tx = db.begin().await?;
-        let next = {
-            let mut stmt = tx
-                .prepare("SELECT COALESCE(MAX(CAST(id AS INTEGER)), 0) + 1 FROM mc_memory")
-                .await?;
-            stmt.query_row(()).await?.get::<i64>(0)?
-        };
-        let id = next.to_string();
+        let id = next_memory_id(&tx).await?.to_string();
         tx.execute(
             "INSERT INTO mc_memory
                  (id, project, content, category, created_at, updated_at, status)
@@ -179,6 +173,80 @@ pub(crate) async fn write_memory(
     }
     .await;
     result.with_context(|| context)
+}
+
+/// The next free memory id: `MAX(id) + 1` over the whole table.
+///
+/// Read inside the writing transaction; the write gate serializes
+/// transactions, so no other writer can claim the id before commit.
+pub(crate) async fn next_memory_id(tx: &WriteTx<'_>) -> Result<i64> {
+    let mut stmt = tx
+        .prepare("SELECT COALESCE(MAX(CAST(id AS INTEGER)), 0) + 1 FROM mc_memory")
+        .await?;
+    Ok(stmt.query_row(()).await?.get::<i64>(0)?)
+}
+
+/// One stored memory as the historian's fact promotion compares it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromotionRow {
+    /// `#N` handle body.
+    pub id: String,
+    /// One of [`CATEGORIES`].
+    pub category: String,
+    /// The fact text.
+    pub content: String,
+}
+
+/// The project's active and archived memories, read inside `tx` for
+/// [`crate::mctx::promotion`]'s dedup.
+pub(crate) async fn promotion_rows(tx: &WriteTx<'_>, project: &str) -> Result<Vec<PromotionRow>> {
+    let mut stmt = tx
+        .prepare(
+            "SELECT id, category, content FROM mc_memory
+             WHERE project = ?1 AND status IN ('active', 'archived')",
+        )
+        .await?;
+    let mut cursor = stmt.query([project]).await?;
+    let mut rows = Vec::new();
+    while let Some(row) = cursor.next().await? {
+        rows.push(PromotionRow {
+            id: row.get(0)?,
+            category: row.get(1)?,
+            content: row.get(2)?,
+        });
+    }
+    Ok(rows)
+}
+
+/// Count one more sighting of memory `id`, inside `tx`.
+pub(crate) async fn bump_seen_count(tx: &WriteTx<'_>, id: &str, now: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE mc_memory SET seen_count = seen_count + 1, updated_at = ?2
+         WHERE id = ?1",
+        (id, now),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Insert a historian-promoted memory under `id` (from [`next_memory_id`]),
+/// inside `tx`.
+pub(crate) async fn insert_promoted(
+    tx: &WriteTx<'_>,
+    id: &str,
+    project: &str,
+    category: &str,
+    content: &str,
+    now: i64,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO mc_memory
+             (id, project, content, category, created_at, updated_at, status, source)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, 'active', 'historian')",
+        (id, project, content, category, now),
+    )
+    .await?;
+    Ok(())
 }
 
 /// Rewrite one memory. `category` omitted keeps the stored one. `false` =

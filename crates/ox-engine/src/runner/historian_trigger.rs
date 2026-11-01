@@ -565,6 +565,7 @@ impl Firing<'_> {
         };
         let plan = historian::RunPlan {
             session_id,
+            project,
             chunk: &chunk,
             attempt: 1,
             prompt,

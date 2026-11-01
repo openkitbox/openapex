@@ -414,6 +414,54 @@ const MIGRATION_V15: &str = r#"
 ALTER TABLE session_v2 ADD COLUMN time_busy integer;
 "#;
 
+/// V16: provenance and dedup weight for `mc_memory`, written by the historian's
+/// facts promotion (see `.ox/plans/2026-11-01-mctx-parity-gaps.md`, ③).
+///
+/// `seen_count` counts dedup hits: a promoted fact whose normalized form
+/// matches an existing row bumps that row instead of inserting a duplicate.
+/// `source` records where the row came from; the `'manual'` default describes
+/// every pre-V16 row (written by hand or by the dreamer), and historian
+/// promotion writes `'historian'`. Purely additive, so it applies onto any
+/// V15-stamped database.
+const MIGRATION_V16: &str = r#"
+ALTER TABLE mc_memory ADD COLUMN seen_count integer NOT NULL DEFAULT 1;
+ALTER TABLE mc_memory ADD COLUMN source text NOT NULL DEFAULT 'manual';
+"#;
+
+/// V17: rebuild the three mctx FTS indexes (V7) with turso's `ngram`
+/// tokenizer so CJK text is searchable.
+///
+/// The default tokenizer splits on non-alphanumeric characters, and every Han
+/// character is alphanumeric, so a whole Chinese run became one term; runs over
+/// 40 bytes (about 13 characters) were dropped outright and a 2–4 character
+/// query matched only a run equal to it. ngram(2, 3) indexes every 2- and
+/// 3-character window, and queries pass through the same tokenizer.
+///
+/// Trade-offs, measured on a copy of the production database
+/// (`.ox/plans/2026-11-01-mctx-parity-gaps.md`, R1/R2):
+///
+/// - ngram gives every gram position 0, so a quoted multi-gram query (what
+///   `fts_match_expression` emits for each token) means "all of these grams
+///   occur in the row", not strict adjacency. A phrase made of grams that
+///   each occur but never side by side can match.
+/// - `min_gram = 2` indexes no single characters, so a one-character query
+///   (e.g. `锁`) recalls nothing; `min_gram = 1` would grow the index per
+///   ASCII character too.
+/// - English words are split into grams as well: BM25 still ranks whole-word
+///   hits first, but the tail gains partial-word matches.
+///
+/// `DROP INDEX` + `CREATE INDEX … USING fts` is turso's rebuild path; the
+/// CREATE backfills from the base table. Index names and columns are
+/// unchanged, so an older binary still queries these indexes without error.
+const MIGRATION_V17: &str = r#"
+DROP INDEX IF EXISTS mc_memory_fts;
+DROP INDEX IF EXISTS mc_note_fts;
+DROP INDEX IF EXISTS mc_compartments_fts;
+CREATE INDEX IF NOT EXISTS mc_memory_fts ON mc_memory USING fts (content) WITH (tokenizer = 'ngram', min_gram = 2, max_gram = 3);
+CREATE INDEX IF NOT EXISTS mc_note_fts ON mc_note USING fts (title, body, surface_condition) WITH (tokenizer = 'ngram', min_gram = 2, max_gram = 3);
+CREATE INDEX IF NOT EXISTS mc_compartments_fts ON mc_compartments USING fts (search_text) WITH (tokenizer = 'ngram', min_gram = 2, max_gram = 3);
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
@@ -433,6 +481,8 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (13, MIGRATION_V13),
     (14, MIGRATION_V14),
     (15, MIGRATION_V15),
+    (16, MIGRATION_V16),
+    (17, MIGRATION_V17),
 ];
 
 /// Async handle to the database.

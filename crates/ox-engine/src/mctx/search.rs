@@ -13,7 +13,9 @@
 //!   (see [`search_commits`]; there is no commit index).
 //!
 //! The first three are each served by their own Tantivy-backed FTS index
-//! (migration V7): `mc_memory_fts`, `mc_note_fts` and `mc_compartments_fts`.
+//! (migration V7, rebuilt with the `ngram` tokenizer in V17 so CJK text is
+//! split into 2–3 character grams): `mc_memory_fts`, `mc_note_fts` and
+//! `mc_compartments_fts`.
 //! The table itself is the source, so there is no shared shadow table and no
 //! `source`/`ref` columns to join on: each lane queries its own table.
 //! The transcript is deliberately NOT indexed: it is the live, un-folded tail
@@ -974,8 +976,9 @@ fn query_tokens(query: &str) -> Vec<String> {
     tokens
 }
 
-/// Whether `ch` may appear inside a token. Alphanumeric is Unicode-wide so
-/// non-ASCII words (e.g. CJK) stay searchable.
+/// Whether `ch` may appear inside a token. Alphanumeric is Unicode-wide, so a
+/// CJK run stays one token here; the index's ngram tokenizer (migration V17)
+/// splits it into 2–3 character grams on both the indexing and query side.
 fn is_token_char(ch: char) -> bool {
     ch.is_alphanumeric() || matches!(ch, '_' | '.' | '/' | ':' | '-')
 }
