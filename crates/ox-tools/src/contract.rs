@@ -107,36 +107,6 @@ pub trait Tool: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>>;
 }
 
-/// The `agent` a read-only subagent session is created with. The `subagent`
-/// tool writes it; the engine reads it back to pick [`READ_ONLY_TOOLS`]. Named
-/// after upstream opencode's read-only `explore` agent.
-pub const READ_ONLY_AGENT: &str = "explore";
-
-/// The toolset of a read-only subagent (`subagent` with `read_only: true`).
-///
-/// Rule: a built-in tool belongs here only if it cannot change the workspace
-/// or start other work. Reading files and the web, loading skills, searching
-/// the tool catalog, and the `ctx_*` context tools (their writes stay in ox's
-/// own database; `ctx_memory` is project-wide, the rest per session) qualify. Excluded: `shell`,
-/// `write`, `edit`, `patch` (workspace writes), `todowrite` (parent-facing
-/// plan state), `subagent` (a read-only child must not spawn a full one),
-/// `question` (no UI watches a child), and every MCP tool, whose side effects
-/// cannot be judged statically. Enforced by registry membership, so a call to
-/// an excluded tool fails as an unknown tool.
-pub const READ_ONLY_TOOLS: &[&str] = &[
-    "capability_search",
-    "ctx_expand",
-    "ctx_memory",
-    "ctx_note",
-    "ctx_reduce",
-    "ctx_search",
-    "glob",
-    "grep",
-    "read",
-    "skill",
-    "webfetch",
-];
-
 /// Name-keyed tool registry. Definitions iterate in name order so the wire
 /// `tools` array is stable across steps (keeps the provider's cached prefix).
 #[derive(Default)]

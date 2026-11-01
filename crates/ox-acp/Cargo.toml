@@ -10,6 +10,7 @@ bytes.workspace = true
 futures-util.workspace = true
 ox-core.workspace = true
 ox-server.workspace = true
+ox-tools.workspace = true
 reqwest.workspace = true
 salvo = { workspace = true, features = ["server", "http1", "affix-state"] }
 serde_json.workspace = true

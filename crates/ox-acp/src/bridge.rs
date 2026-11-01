@@ -17,6 +17,7 @@ use agent_client_protocol::schema::v1::{
     PromptCapabilities, PromptRequest, SessionId, SessionMode, SessionModeId, SessionModeState,
     SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason,
 };
+use ox_tools::agent::DEFAULT_AGENT;
 use serde_json::{Value, json};
 
 use super::internal;
@@ -484,8 +485,9 @@ impl Bridge {
             .ok_or_else(|| internal(format!("unknown session `{session}`")))
     }
 
-    /// ox agents → ACP modes (from `GET /api/agent`); ox's default agent is
-    /// `build` when present, else the first reported.
+    /// User-selectable ox agents → ACP modes (from `GET /api/agent`, skipping
+    /// subagent-mode and hidden agents, as upstream's TUI does); the default
+    /// is `DEFAULT_AGENT` when present, else the first reported.
     async fn modes(&self) -> (Vec<SessionMode>, SessionModeId) {
         let names: Vec<String> = match self
             .http
@@ -499,6 +501,7 @@ impl Bridge {
                     .and_then(Value::as_array)
                     .into_iter()
                     .flatten()
+                    .filter(|agent| user_selectable(agent))
                     .filter_map(|agent| agent.get("name")?.as_str().map(str::to_owned))
                     .collect(),
                 Err(error) => {
@@ -517,12 +520,20 @@ impl Bridge {
             .collect();
         let current = modes
             .iter()
-            .find(|mode| mode.id.to_string() == "build")
+            .find(|mode| mode.id.to_string() == DEFAULT_AGENT)
             .or_else(|| modes.first())
             .map(|mode| mode.id.clone())
-            .unwrap_or_else(|| SessionModeId::new("build"));
+            .unwrap_or_else(|| SessionModeId::new(DEFAULT_AGENT));
         (modes, current)
     }
+}
+
+/// Upstream TUI's agent filter: `mode !== "subagent" && !hidden`; missing
+/// fields keep the agent.
+fn user_selectable(agent: &Value) -> bool {
+    let subagent = agent.get("mode").and_then(Value::as_str) == Some("subagent");
+    let hidden = agent.get("hidden").and_then(Value::as_bool) == Some(true);
+    !subagent && !hidden
 }
 
 /// Percent-encode everything outside the unreserved set (query value).

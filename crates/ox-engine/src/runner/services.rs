@@ -10,8 +10,7 @@
 //!
 //! Invariants: `generation` increases by exactly one per successful
 //! [`Live::replace`]; a failed build leaves the current snapshot untouched;
-//! `child_tools` and `read_only_tools` are derived from `tools` once, at
-//! construction.
+//! `agent_tools` is derived from `tools` once, at construction.
 
 use std::future::Future;
 use std::sync::{Arc, RwLock};
@@ -20,11 +19,12 @@ use anyhow::Result;
 use ox_core::config::Config;
 use ox_llm::model_catalog::ModelCatalog;
 use ox_mcp::Hub;
-use ox_tools::contract::READ_ONLY_AGENT;
-use ox_tools::contract::READ_ONLY_TOOLS;
+use ox_tools::agent;
+use ox_tools::agent::Agent;
+use ox_tools::agent::Tools;
 use tokio::sync::Mutex as AsyncMutex;
 
-use super::{Chat, SUBAGENT_EXCLUDED_TOOLS, ToolRegistry};
+use super::{Chat, ToolRegistry};
 
 /// Inputs for one generation: everything a reload rebuilds.
 pub struct ServiceSet {
@@ -42,54 +42,18 @@ pub struct Services {
     pub chat: Arc<dyn Chat>,
     pub model_catalog: Arc<ModelCatalog>,
     pub mcp: Arc<Hub>,
-    /// Toolset for main sessions.
+    /// The registry every agent toolset is derived from.
     pub tools: Arc<ToolRegistry>,
-    /// Toolset for subagent children: `tools` minus [`SUBAGENT_EXCLUDED_TOOLS`].
-    pub child_tools: Arc<ToolRegistry>,
-    /// Toolset for read-only children: only [`READ_ONLY_TOOLS`].
-    pub read_only_tools: Arc<ToolRegistry>,
-}
-
-/// Which toolset and prompt profile a session runs with. Resolved from the
-/// session row at the start of each busy period: the parent link is fixed,
-/// but the agent can be switched between periods.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionKind {
-    /// A root session the user drives.
-    Main,
-    /// A child spawned by `subagent`.
-    Subagent,
-    /// A child spawned by `subagent` with `read_only: true`.
-    ReadOnlySubagent,
-}
-
-impl SessionKind {
-    /// Classify a session row. Only a child gets the read-only tier: a root
-    /// session whose agent happens to be named `explore` stays [`Main`].
-    ///
-    /// [`Main`]: SessionKind::Main
-    #[must_use]
-    pub fn of(parent_id: Option<&str>, agent: Option<&str>) -> Self {
-        match (parent_id, agent) {
-            (None, _) => Self::Main,
-            (Some(_), Some(agent)) if agent == READ_ONLY_AGENT => Self::ReadOnlySubagent,
-            (Some(_), _) => Self::Subagent,
-        }
-    }
-
-    /// Whether the session was spawned by another session.
-    #[must_use]
-    pub fn is_subagent(self) -> bool {
-        !matches!(self, Self::Main)
-    }
+    /// One toolset per built-in agent, in agent-table order. Derived once here
+    /// so [`Services::tools_for`] is a lookup, never a rebuild.
+    agent_tools: Vec<(&'static Agent, Arc<ToolRegistry>)>,
 }
 
 impl Services {
-    /// Move `set` into a generation and derive the child registries once.
+    /// Move `set` into a generation and derive one toolset per agent.
     #[must_use]
     pub fn new(generation: u64, set: ServiceSet) -> Arc<Self> {
-        let child_tools = Arc::new(set.tools.without(SUBAGENT_EXCLUDED_TOOLS));
-        let read_only_tools = Arc::new(set.tools.only(READ_ONLY_TOOLS));
+        let agent_tools = derive_agent_tools(&set.tools);
         Arc::new(Self {
             generation,
             config: set.config,
@@ -97,25 +61,57 @@ impl Services {
             model_catalog: set.model_catalog,
             mcp: set.mcp,
             tools: set.tools,
-            child_tools,
-            read_only_tools,
+            agent_tools,
         })
     }
 
     /// The registry a session's turns advertise and dispatch against: the
-    /// shared one, `child_tools` for a subagent, or `read_only_tools` for a
-    /// read-only child. A form opened by a child has no UI behind it and ox
-    /// has no foreground tool timeout, so `question` there would hang the
-    /// parent's `subagent` call. A read-only child calling a tool outside its
-    /// registry gets the registry's unknown-tool error.
+    /// toolset of `agent`'s record.
+    ///
+    /// Membership is the only gate — a call to a tool outside the registry
+    /// fails as an unknown tool. A child session must not see `question`: no UI
+    /// watches it and ox has no foreground tool timeout, so the form would hang
+    /// the parent's `subagent` call.
+    ///
+    /// # Panics
+    ///
+    /// If `agent` is not a built-in record. Every agent a session can resolve to
+    /// comes from [`agent::all`], so a caller passing anything else is a wiring
+    /// bug, not a runtime condition: falling back to a wider toolset here would
+    /// hand a session tools its agent withholds.
     #[must_use]
-    pub fn tools_for(&self, kind: SessionKind) -> Arc<ToolRegistry> {
-        Arc::clone(match kind {
-            SessionKind::Main => &self.tools,
-            SessionKind::Subagent => &self.child_tools,
-            SessionKind::ReadOnlySubagent => &self.read_only_tools,
-        })
+    pub fn tools_for(&self, agent: &'static Agent) -> Arc<ToolRegistry> {
+        self.derived_tools(agent.id).expect(
+            "every agent a session resolves to is a built-in record derived at construction",
+        )
     }
+
+    /// The derived toolset for one agent id, if this generation derived it.
+    fn derived_tools(&self, id: &str) -> Option<Arc<ToolRegistry>> {
+        self.agent_tools
+            .iter()
+            .find(|(known, _)| known.id == id)
+            .map(|(_, tools)| Arc::clone(tools))
+    }
+}
+
+/// One toolset per built-in agent, applying each record's [`Tools`] rule to
+/// `tools`. `Tools::All` shares the source registry rather than copying it;
+/// the filtered sets rebuild the name map once per generation (spawn-time work,
+/// never on a hot path) while sharing the tool `Arc`s.
+#[must_use]
+fn derive_agent_tools(tools: &Arc<ToolRegistry>) -> Vec<(&'static Agent, Arc<ToolRegistry>)> {
+    agent::all()
+        .iter()
+        .map(|agent| {
+            let set = match agent.tools {
+                Tools::All => Arc::clone(tools),
+                Tools::Without(names) => Arc::new(tools.without(names)),
+                Tools::Only(names) => Arc::new(tools.only(names)),
+            };
+            (agent, set)
+        })
+        .collect()
 }
 
 /// Holder of the current [`Services`] generation.
@@ -163,5 +159,70 @@ impl Live {
         let next = Services::new(old.generation + 1, set);
         *self.current.write().unwrap_or_else(|p| p.into_inner()) = Arc::clone(&next);
         Ok(next)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A toolset's names, in the registry's (name) order.
+    fn names(registry: &ToolRegistry) -> Vec<&str> {
+        registry.guidances().map(|(name, _)| name).collect()
+    }
+
+    fn derived_for(registry: &Arc<ToolRegistry>, agent: &'static Agent) -> Arc<ToolRegistry> {
+        derive_agent_tools(registry)
+            .into_iter()
+            .find(|(known, _)| known.id == agent.id)
+            .map(|(_, tools)| tools)
+            .expect("the built-in agent table contains its own agents")
+    }
+
+    #[test]
+    fn the_general_child_drops_question_and_keeps_the_writers() {
+        let registry = Arc::new(ToolRegistry::with_builtins());
+        let tools = derived_for(&registry, agent::subagent_default());
+        assert!(
+            !names(&tools).contains(&"question"),
+            "a child must not open a form only the user can answer: {:?}",
+            names(&tools)
+        );
+        assert!(
+            names(&tools).contains(&"write"),
+            "the general child keeps the writing tools: {:?}",
+            names(&tools)
+        );
+    }
+
+    #[test]
+    fn the_explore_child_sees_exactly_its_allow_list() {
+        // The built-in registry lacks the `ctx_*` tools (they join at wiring
+        // time when magic context is on), so the read-only set over it is the
+        // six built-in readers, spelled out so a typo in the table fails here.
+        let registry = Arc::new(ToolRegistry::with_builtins());
+        let tools = derived_for(&registry, agent::read_only());
+        assert_eq!(
+            names(&tools),
+            [
+                "capability_search",
+                "glob",
+                "grep",
+                "read",
+                "skill",
+                "webfetch"
+            ],
+            "the read-only agent's toolset is its complete allow-list, nothing else"
+        );
+    }
+
+    #[test]
+    fn the_build_agent_sees_the_whole_registry() {
+        let registry = Arc::new(ToolRegistry::with_builtins());
+        let tools = derived_for(&registry, agent::default_agent());
+        assert!(
+            Arc::ptr_eq(&tools, &registry),
+            "Tools::All shares the source registry instead of copying it"
+        );
     }
 }

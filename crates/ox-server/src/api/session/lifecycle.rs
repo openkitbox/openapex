@@ -48,6 +48,14 @@ pub(crate) async fn create(req: &mut Request, depot: &mut Depot, res: &mut Respo
     let Some(body) = parse_body::<CreateBody>(req, res).await else {
         return;
     };
+    // An explicit agent must be a built-in record; an inherited parent agent is
+    // already on a row, and the runner downgrades a child's primary agent.
+    if let Some(agent) = body.agent.as_deref()
+        && ox_tools::agent::get(agent).is_none()
+    {
+        invalid_request(res, &format!("Unknown agent `{agent}`"));
+        return;
+    }
 
     let session_id = body.id.clone().unwrap_or_else(|| id::id("ses"));
 

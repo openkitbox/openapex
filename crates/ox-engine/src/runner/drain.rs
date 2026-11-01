@@ -42,6 +42,7 @@ use ox_schema::id;
 use ox_schema::inbox::{Delivery, Item};
 use ox_schema::message::{CompactionReason, Message};
 use ox_schema::support::{FinishReason, SessionError};
+use ox_tools::agent::Agent;
 
 use super::ToolRegistry;
 use super::compaction;
@@ -96,9 +97,10 @@ impl InboxRow {
 #[derive(Clone)]
 pub(crate) struct DrainCtx {
     pub session_id: String,
-    /// Main session, subagent, or read-only subagent. Resolved once when the
-    /// actor starts, so prompt assembly does not query the DB per step.
-    pub kind: super::services::SessionKind,
+    /// The session's agent record: it picks the toolset and the static
+    /// system layer. Resolved once per busy period, so prompt assembly does
+    /// not query the DB per step.
+    pub agent: &'static Agent,
     pub directory: std::path::PathBuf,
     /// The ox home directory (`~/.ox`) the global AGENTS.md lives in.
     pub home: std::path::PathBuf,
@@ -143,7 +145,7 @@ impl DrainCtx {
         self.chat = Arc::clone(&svc.chat);
         self.model_catalog = Arc::clone(&svc.model_catalog);
         self.mcp = Arc::clone(&svc.mcp);
-        self.tools = svc.tools_for(self.kind);
+        self.tools = svc.tools_for(self.agent);
         self.generation = svc.generation;
     }
 }

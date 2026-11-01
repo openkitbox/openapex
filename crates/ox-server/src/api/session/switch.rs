@@ -102,6 +102,10 @@ pub(crate) async fn switch_agent(req: &mut Request, depot: &mut Depot, res: &mut
         invalid_request(res, "Missing agent");
         return;
     };
+    if ox_tools::agent::get(&agent).is_none() {
+        invalid_request(res, &format!("Unknown agent `{agent}`"));
+        return;
+    }
 
     let session = match load_session(&app.db, &session_id).await {
         Ok(Some(row)) => row,

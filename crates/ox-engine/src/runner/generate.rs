@@ -37,7 +37,7 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
         super::resolve_selection(&inner.db, session_id, &svc.config, &svc.model_catalog).await?;
     let ctx = DrainCtx {
         session_id: session_id.to_owned(),
-        kind: super::services::SessionKind::Main,
+        agent: ox_tools::agent::default_agent(),
         directory: inner.directory.clone(),
         home: inner.home.clone(),
         config: Arc::clone(&svc.config),
@@ -83,8 +83,7 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
         ctx.mcp.instructions_block().as_deref(),
     );
     let guidance: Vec<(&str, Option<&'static str>)> = ctx.tools.guidances().collect();
-    let system_static =
-        crate::prompt::system_static(&guidance, crate::prompt::WorkflowProfile::Parent);
+    let system_static = crate::prompt::system_static(&guidance, ctx.agent);
     let instructions = super::instructions::baseline(&observed).initial_render;
     let mut messages = super::step::build_chat_messages(
         &system_static,

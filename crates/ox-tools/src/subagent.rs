@@ -16,7 +16,8 @@
 use serde_json::{Value, json};
 use std::borrow::Cow;
 
-use crate::contract::{READ_ONLY_AGENT, Tool, ToolContext, ToolOutput};
+use crate::agent::{Agent, Mode, SUBAGENT_AGENT};
+use crate::contract::{Tool, ToolContext, ToolOutput};
 use crate::jobs::Jobs;
 use ox_schema::event::SessionEventData;
 use ox_schema::support::{LocationRef, ModelRef, SessionMetadata};
@@ -179,7 +180,7 @@ impl Tool for SubagentTool {
             "subagent",
             "Spawn a child session, delegate a prompt to it, and wait for its final reply. The child has its own context window and transcript; only its final message returns to this conversation. The output includes a sessionID you can pass back later to continue that specific conversation with the subagent. New child sessions start with fresh context, so include all relevant context and instructions when you don't pass a sessionID.\n\n\
              Foreground (default) runs the subagent to completion and returns its result. Background mode (background=true) launches it asynchronously and returns immediately; ox notifies you in this conversation when it finishes. Use background only for independent work that can run while you continue elsewhere.\n\n\
-             Several subagent calls in one turn run in parallel, up to a server-wide limit of active subagents; calls beyond it wait in order for a free slot rather than failing. Passing the sessionID of a subagent that is still running redirects it with the new prompt and returns its final reply. Set read_only=true for exploration or review that must not change anything; the child then cannot run shell or edit files.\n\n\
+             Several subagent calls in one turn run in parallel, up to a server-wide limit of active subagents; calls beyond it wait in order for a free slot rather than failing. Passing the sessionID of a subagent that is still running redirects it with the new prompt and returns its final reply. Set agent=\"explore\" for exploration or review that must not change anything; the child then cannot run shell or edit files.\n\n\
              When to use: an isolated research or exploration burst whose intermediate steps would flood this context (read a broad area, then summarize), or an independent subtask that needs the full toolkit but not this conversation's history.\n\
              When NOT to use: a question a single read or grep answers (do it directly), work that needs the parent's context, or several rounds of back-and-forth — the child gets one prompt and answers once.",
             object_param(
@@ -213,10 +214,10 @@ impl Tool for SubagentTool {
                         ),
                     ),
                     (
-                        "read_only",
+                        "agent",
                         param(
-                            "boolean",
-                            "Start the subagent with a read-only toolset (read, glob, grep, webfetch, skill and context tools; no shell, write, edit, patch or nested subagent). Use it for exploration and research that must not change anything. Only for a new subagent: a continued sessionID keeps the toolset it started with.",
+                            "string",
+                            "Subagent profile: `general` (full toolkit) or `explore` (read-only search: no shell, write, edit, patch or nested subagent). Defaults to `general`. Only for a new subagent: a continued sessionID keeps the agent it started with.",
                         ),
                     ),
                 ],
@@ -250,6 +251,62 @@ fn required(input: &Value, key: &str) -> Result<String, ToolOutput> {
     }
 }
 
+/// The agent a new child runs as: the `agent` field's id, or `general` when
+/// none is given. Only built-in subagent-mode ids are accepted, and an explicit
+/// id is refused on a resumed call (the child keeps the agent it started with).
+/// The removed `read_only` key fails loudly instead of being ignored.
+fn requested_agent(input: &Value, resumed: bool) -> Result<&'static Agent, ToolOutput> {
+    let invalid = |key: &str, message: String| {
+        Err(super::invalid_arguments(
+            "subagent",
+            &[(key, message)],
+            input,
+        ))
+    };
+    if input.get("read_only").is_some() {
+        return invalid(
+            "read_only",
+            "`read_only` was removed; pass `agent: \"explore\"` for a read-only subagent"
+                .to_owned(),
+        );
+    }
+    let given = match input.get("agent") {
+        Some(Value::String(id)) if !id.trim().is_empty() => Some(id.trim()),
+        Some(Value::String(_) | Value::Null) | None => None,
+        Some(other) => return invalid("agent", format!("Expected a string, got {other}")),
+    };
+    if given.is_some() && resumed {
+        return invalid(
+            "agent",
+            "Cannot be combined with `sessionID`: a continued subagent keeps the agent it started with"
+                .to_owned(),
+        );
+    }
+    let id = given.unwrap_or(SUBAGENT_AGENT);
+    let available = || {
+        let ids: Vec<&str> = crate::agent::all()
+            .iter()
+            .filter(|agent| agent.mode == Mode::Subagent)
+            .map(|agent| agent.id)
+            .collect();
+        ids.join(", ")
+    };
+    match crate::agent::get(id) {
+        None => invalid(
+            "agent",
+            format!("Unknown agent `{id}`; available: {}", available()),
+        ),
+        Some(agent) if agent.mode == Mode::Subagent => Ok(agent),
+        Some(_) => invalid(
+            "agent",
+            format!(
+                "Agent `{id}` cannot run as a subagent; available: {}",
+                available()
+            ),
+        ),
+    }
+}
+
 async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutput {
     let runner_missing =
         || fail("The subagent runner is not attached; the server is mis-configured".to_owned());
@@ -275,29 +332,11 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
             );
         }
     };
-    let read_only = match input.get("read_only") {
-        Some(Value::Bool(flag)) => *flag,
-        None | Some(Value::Null) => false,
-        Some(other) => {
-            return super::invalid_arguments(
-                "subagent",
-                &[("read_only", format!("Expected a boolean, got {other}"))],
-                input,
-            );
-        }
-    };
-    if read_only && resume_id.is_some() {
-        return super::invalid_arguments(
-            "subagent",
-            &[(
-                "read_only",
-                "Cannot be combined with `sessionID`: a continued subagent keeps the toolset it started with"
-                    .to_owned(),
-            )],
-            input,
-        );
-    }
     let resumed = resume_id.is_some();
+    let agent = match requested_agent(input, resumed) {
+        Ok(agent) => agent,
+        Err(output) => return output,
+    };
     let background = matches!(input.get("background"), Some(Value::Bool(true)));
 
     // Nesting guard first, mirroring upstream's order: the parent's ancestor
@@ -372,8 +411,15 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
     let child_id = match target {
         Target::Resume(id) => id,
         Target::New(parent) => {
-            let agent = read_only.then_some(READ_ONLY_AGENT);
-            match create_child(&tool.handle, &ctx.session_id, &description, parent, agent).await {
+            match create_child(
+                &tool.handle,
+                &ctx.session_id,
+                &description,
+                parent,
+                agent.id,
+            )
+            .await
+            {
                 Ok(id) => id,
                 Err(message) => return fail(message),
             }
@@ -611,14 +657,14 @@ async fn acquire_slot(
 /// Create the child session row under `parent_session_id` through the same
 /// event as `POST /api/session {parentID}`. Delegation facts ride the title
 /// and the parent link; `metadata` stays empty (upstream keeps it
-/// host-owned). `agent` is `Some` only for a read-only child; the engine picks
-/// the child's toolset from it.
+/// host-owned). `agent` is the child's agent id; the engine picks the child's
+/// system prompt and toolset from it.
 async fn create_child(
     handle: &SubagentHandle,
     parent_session_id: &str,
     description: &str,
     parent: ParentTuple,
-    agent: Option<&str>,
+    agent: &str,
 ) -> Result<String, String> {
     let (project_id, directory, workspace_id, subpath, model) = parent;
     let child_id = ox_schema::id::id("ses");
@@ -633,7 +679,7 @@ async fn create_child(
         parent_id: Some(parent_session_id.to_owned()),
         slug: ox_schema::slug::create(),
         title: Some(description.to_owned()),
-        agent: agent.map(str::to_owned),
+        agent: Some(agent.to_owned()),
         model,
         metadata: Some(SessionMetadata::default()),
         permissions: None,

@@ -662,8 +662,8 @@ async fn provider_list(req: &mut Request, depot: &mut Depot, res: &mut Response)
 // ---------------------------------------------------------------------------
 
 /// Upstream `Agent.Info` envelope: `{ location: { directory }, data: [...] }`.
-/// Static single `build` agent for the skeleton; agent definitions land in a
-/// later task.
+/// One entry per built-in agent ([`ox_tools::agent::all`]), in display order;
+/// clients filter subagents and hidden entries out of their pickers.
 #[derive(Serialize)]
 struct AgentList {
     location: LocationRef,
@@ -672,8 +672,8 @@ struct AgentList {
 
 #[derive(Serialize)]
 struct AgentInfo {
-    id: String,
-    name: String,
+    id: &'static str,
+    name: &'static str,
     request: AgentRequest,
     mode: &'static str,
     hidden: bool,
@@ -692,24 +692,34 @@ async fn agent_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let Some(_state) = state(depot, res) else {
         return;
     };
-    let build = AgentInfo {
-        id: "build".to_owned(),
-        name: "build".to_owned(),
+    let data: Vec<AgentInfo> = ox_tools::agent::all().iter().map(agent_info).collect();
+    res.render(Json(AgentList {
+        location: LocationRef {
+            directory: compat::directory_of(req),
+        },
+        data,
+    }));
+}
+
+/// The wire shape of one agent record. `name` is the id: clients capitalize
+/// it for display. ox has no permission rule sets yet, so `permissions` is
+/// always empty.
+fn agent_info(agent: &'static ox_tools::agent::Agent) -> AgentInfo {
+    AgentInfo {
+        id: agent.id,
+        name: agent.id,
         request: AgentRequest {
             settings: serde_json::json!({}),
             headers: serde_json::json!({}),
             body: serde_json::json!({}),
         },
-        mode: "primary",
+        mode: match agent.mode {
+            ox_tools::agent::Mode::Primary => "primary",
+            ox_tools::agent::Mode::Subagent => "subagent",
+        },
         hidden: false,
         permissions: Vec::new(),
-    };
-    res.render(Json(AgentList {
-        location: LocationRef {
-            directory: compat::directory_of(req),
-        },
-        data: vec![build],
-    }));
+    }
 }
 
 /// Build the salvo router with all `/api` endpoints mounted.

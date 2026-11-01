@@ -23,7 +23,7 @@
 //! real tools; the registry ships empty until task 7 fills it.
 
 pub use ox_llm::cardinal::chat::Chat;
-pub use services::{Live, ServiceSet, Services, SessionKind};
+pub use services::{Live, ServiceSet, Services};
 
 pub mod compaction;
 pub mod drain;
@@ -57,6 +57,9 @@ use ox_core::event_bus::EventBus;
 use ox_db::Db;
 use ox_schema::event::{InterruptReason, SessionEventData};
 use ox_schema::support::SessionError;
+use ox_tools::agent;
+use ox_tools::agent::Agent;
+use ox_tools::agent::Mode;
 
 /// Messages the per-session actor mailbox accepts.
 #[derive(Debug)]
@@ -77,12 +80,6 @@ pub enum ActorMsg {
 /// Actor mailbox capacity. Prompt dispatch is one message per turn, so a
 /// small bounded queue is ample; a full mailbox means a runaway client.
 const MAILBOX_CAPACITY: usize = 64;
-
-/// Tools a subagent session must not have. `question` opens a form only the
-/// user can answer; no UI watches a child session and a foreground tool call
-/// has no timeout, so the child would wait forever — and the parent's
-/// `subagent` call with it. A fail-closed exclusion, not a permission model.
-const SUBAGENT_EXCLUDED_TOOLS: &[&str] = &["question"];
 
 // ---------------------------------------------------------------------------
 // Runner registry
@@ -633,22 +630,22 @@ impl ActorTask {
             // before the background fold; `run_turn` also does so at each
             // step boundary.
             // Resolved per busy period, not per actor: the session's agent
-            // can be switched (`SessionAgentSelected`), which moves a child
-            // in or out of the read-only tier from its next busy period.
-            // Each generation precomputes the registries (see
+            // can be switched (`SessionAgentSelected`), which changes its
+            // toolset and system layer from its next busy period. Each
+            // generation precomputes the registries (see
             // [`Services::tools_for`]).
-            let kind = self.session_kind().await;
+            let agent = self.session_agent().await;
             let svc = self.inner.live.current();
             let mut ctx = drain::DrainCtx {
                 session_id: self.session_id.clone(),
-                kind,
+                agent,
                 directory: self.session_directory().await,
                 home: self.inner.home.clone(),
                 config: Arc::clone(&svc.config),
                 db: self.inner.db.clone(),
                 bus: self.inner.bus.clone(),
                 chat: Arc::clone(&svc.chat),
-                tools: svc.tools_for(kind),
+                tools: svc.tools_for(agent),
                 model_catalog: Arc::clone(&svc.model_catalog),
                 mcp: Arc::clone(&svc.mcp),
                 live: Arc::clone(&self.inner.live),
@@ -758,12 +755,12 @@ impl ActorTask {
         self.inner.forget(&self.session_id);
     }
 
-    /// The session's kind, from its `parent_id` and `agent` (see
-    /// [`SessionKind::of`]). A missing row or a failed lookup answers
-    /// [`SessionKind::ReadOnlySubagent`], the narrowest toolset: the row
-    /// might be a read-only child, and a missing tool for one busy period is
-    /// cheaper than a writer the parent asked to withhold.
-    async fn session_kind(&self) -> SessionKind {
+    /// The session's agent record, from its `agent` and `parent_id` (see
+    /// [`agent_of`]). A missing row or a failed lookup answers the read-only
+    /// agent, the narrowest toolset: the row might be a read-only child, and a
+    /// missing tool for one busy period is cheaper than a writer the parent
+    /// asked to withhold.
+    async fn session_agent(&self) -> &'static Agent {
         type Row = (Option<String>, Option<String>);
         let looked_up: anyhow::Result<Option<Row>> = async {
             let conn = self.inner.db.acquire().await?;
@@ -781,21 +778,21 @@ impl ActorTask {
         }
         .await;
         match looked_up {
-            Ok(Some((parent_id, agent))) => SessionKind::of(parent_id.as_deref(), agent.as_deref()),
+            Ok(Some((parent_id, agent))) => agent_of(parent_id.as_deref(), agent.as_deref()),
             Ok(None) => {
                 tracing::warn!(
                     session = %self.session_id,
                     "session row missing; running with the read-only toolset"
                 );
-                SessionKind::ReadOnlySubagent
+                agent::read_only()
             }
             Err(error) => {
                 tracing::warn!(
                     session = %self.session_id,
                     error = %error,
-                    "session kind lookup failed; running with the read-only toolset"
+                    "session agent lookup failed; running with the read-only toolset"
                 );
-                SessionKind::ReadOnlySubagent
+                agent::read_only()
             }
         }
     }
@@ -891,6 +888,22 @@ pub(crate) fn unknown_error(message: impl Into<String>) -> SessionError {
     }
 }
 
+/// Resolve a session row's agent record. An unnamed or unknown agent id runs
+/// the default agent. A child (a row with a parent) never runs a primary
+/// agent: it is downgraded to the subagent default, because a primary agent's
+/// full toolset includes `question`, whose form would hang the parent's
+/// `subagent` call.
+#[must_use]
+fn agent_of(parent_id: Option<&str>, agent: Option<&str>) -> &'static Agent {
+    let resolved = agent
+        .and_then(agent::get)
+        .unwrap_or_else(agent::default_agent);
+    if parent_id.is_some() && resolved.mode == Mode::Primary {
+        return agent::subagent_default();
+    }
+    resolved
+}
+
 /// Resolve the session's agent + model (`context.resolveModel`): the projected
 /// selection when set, else the config's default model (`default_model`,
 /// falling back to the first `[[models]]` entry), else the cardinal
@@ -935,7 +948,10 @@ pub(crate) async fn resolve_selection(
             },
         },
     };
-    Ok((agent.unwrap_or_else(|| "build".to_owned()), model))
+    Ok((
+        agent.unwrap_or_else(|| agent::DEFAULT_AGENT.to_owned()),
+        model,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1014,5 +1030,37 @@ impl ox_tools::subagent::SubagentSpawner for Runner {
             &self.inner.db,
             session_id,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_root_session_runs_its_named_agent_or_the_default() {
+        assert_eq!(agent_of(None, Some("explore")).id, "explore");
+        assert_eq!(agent_of(None, None).id, agent::DEFAULT_AGENT);
+        assert_eq!(
+            agent_of(None, Some("nope")).id,
+            agent::DEFAULT_AGENT,
+            "an unknown id runs the default agent"
+        );
+    }
+
+    #[test]
+    fn a_child_never_runs_a_primary_agent() {
+        // A child created straight through `POST /api/session {parentID}`
+        // inherits the parent's `build`; its toolset must still drop `question`.
+        for named in [None, Some("build"), Some("nope")] {
+            let resolved = agent_of(Some("ses_parent"), named);
+            assert_eq!(
+                resolved.mode,
+                Mode::Subagent,
+                "child named {named:?} resolved to primary `{}`",
+                resolved.id
+            );
+        }
+        assert_eq!(agent_of(Some("ses_parent"), Some("explore")).id, "explore");
     }
 }

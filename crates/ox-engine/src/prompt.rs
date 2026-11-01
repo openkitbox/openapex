@@ -9,6 +9,9 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use ox_tools::agent::Agent;
+use ox_tools::agent::Mode;
+
 /// The skills block embeds user-controlled text in an XML-ish envelope; a raw
 /// `<` would let a skill description break the block out early.
 fn escape(text: &str) -> String {
@@ -93,28 +96,24 @@ const SUBAGENT_WORKFLOW: &str = concat!(
     "\nExecute only the assigned task. Do not create a plan or worktree, change scope, maintain a separate todo list, or restart parent orchestration. Work only within the assigned scope; in a worktree use absolute paths and do not use codegraph there. Review or exploration: edit and commit nothing; report findings. Implementation: make the focused change, add tests, run fmt/clippy and the relevant tests with CARGO_TARGET_DIR=<worktree>/target, and commit only that task's files with `git commit -m <message> -- <its files>`. Sibling subagents may be editing other files in the same worktree: do not touch their files, retry a commit when `index.lock` is held, and rerun a build that fails in a file you do not own instead of fixing it. Report outcome, evidence, and caveats. Do not build, deploy, or restart.\n",
 );
 
-/// Which workflow contract the static system layer should carry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WorkflowProfile {
-    /// A top-level session that owns the full development workflow.
-    Parent,
-    /// A child session that executes one assigned task.
-    Subagent,
-}
-
-/// Build the static system layer from the registered tools: their names drive
-/// the upstream bullets, and any guidance they contribute (see
-/// [`ox_tools::contract::Tool::guidance`]) follows them. The two built-in
-/// sections — engineering standards and the profile's workflow — follow the
-/// harness template (`.ox/plans/2026-10-26-built-in-development-workflow-analysis.md`).
+/// Build the static system layer for one agent. An agent that carries its own
+/// system text ([`Agent::system`], upstream `agent.system`) replaces the whole
+/// layer; otherwise the layer is assembled from the registered tools — their
+/// names drive the upstream bullets and any guidance they contribute (see
+/// [`ox_tools::contract::Tool::guidance`]) — followed by the two built-in
+/// sections: engineering standards and the workflow contract the agent's
+/// [`Mode`] implies (`.ox/plans/2026-10-26-built-in-development-workflow-analysis.md`).
 #[must_use]
-pub fn system_static(tools: &[(&str, Option<&'static str>)], profile: WorkflowProfile) -> String {
+pub fn system_static(tools: &[(&str, Option<&'static str>)], agent: &Agent) -> String {
+    if let Some(system) = agent.system {
+        return system.to_owned();
+    }
     let mut static_layer =
         HARNESS_TEMPLATE.replace("${OPENCODE_TOOL_GUIDANCE}", &tool_guidance(tools));
     static_layer.push_str(ENGINEERING_STANDARDS);
-    static_layer.push_str(match profile {
-        WorkflowProfile::Parent => DEVELOPMENT_WORKFLOW,
-        WorkflowProfile::Subagent => SUBAGENT_WORKFLOW,
+    static_layer.push_str(match agent.mode {
+        Mode::Primary => DEVELOPMENT_WORKFLOW,
+        Mode::Subagent => SUBAGENT_WORKFLOW,
     });
     static_layer
 }
@@ -1042,4 +1041,48 @@ fn local_date(timestamp_ms: i64, zone: &jiff::tz::TimeZone) -> String {
         .to_zoned(zone.clone())
         .date()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use ox_tools::agent;
+
+    #[test]
+    fn the_default_agent_gets_the_harness_layer() {
+        let layer = system_static(&[], agent::default_agent());
+        assert!(
+            layer.contains("\n# Working in codebases\n"),
+            "the build agent keeps the harness layer: {layer}"
+        );
+        assert!(
+            layer.contains("# Development workflow"),
+            "a primary agent carries the parent workflow"
+        );
+    }
+
+    #[test]
+    fn a_subagent_mode_record_carries_the_subagent_workflow() {
+        let layer = system_static(&[], agent::subagent_default());
+        assert!(
+            layer.contains("# Subagent workflow") && !layer.contains("# Development workflow"),
+            "the general child carries only the subagent workflow"
+        );
+    }
+
+    #[test]
+    fn an_agent_system_text_replaces_the_whole_layer() {
+        let explore = agent::get("explore").expect("explore is a built-in agent");
+        let layer = system_static(&[], explore);
+        assert_eq!(
+            layer,
+            agent::EXPLORE_SYSTEM,
+            "agent.system replaces the static layer"
+        );
+        assert!(
+            !layer.contains("git commit"),
+            "the read-only prompt names no write workflow"
+        );
+    }
 }

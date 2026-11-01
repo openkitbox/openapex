@@ -20,6 +20,7 @@
 //!   is ~650 lines of htmlparser2 handling. Text extraction and all
 //!   guards (content-type, size, timeout) are exact.
 
+pub mod agent;
 pub mod capability_search;
 pub mod contract;
 pub mod diff;
