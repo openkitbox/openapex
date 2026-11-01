@@ -67,12 +67,12 @@ mod history;
 mod request;
 mod stream;
 mod tool;
-mod usage;
+pub(crate) mod usage;
 
 pub(crate) use attempt::{StepOutcome, StepParams, fail_step, run};
 pub(crate) use content::user_prompt_text;
-pub(crate) use context::{build_chat_messages, mctx_head, tool_input};
+pub(crate) use context::{build_chat_messages, compaction_boundary, mctx_head, tool_input};
 pub(crate) use history::{
     decode_row, last_assistant_text, load_history, load_history_after, load_overlaid_tail,
-    recent_turns, rows_after_with_seq, settled_tail,
+    load_overlaid_tail_with_ordinals, recent_turns, rows_after_with_seq, settled_tail,
 };

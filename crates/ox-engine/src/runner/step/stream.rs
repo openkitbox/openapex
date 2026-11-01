@@ -408,14 +408,56 @@ async fn flush_blocks(
     Ok(())
 }
 
-/// Map cardinal's raw `finish_reason` to the upstream literal union.
+/// Map a stream's raw finish reason to the upstream literal union.
+///
+/// Both wire vocabularies land here: a Chat Completions endpoint reports
+/// `stop`/`length`/`tool_calls`, while a Messages endpoint reports Anthropic's
+/// `end_turn`/`max_tokens`/`tool_use`/`stop_sequence`. An unmapped value is
+/// [`FinishReason::Unknown`], which the step treats as a truncated stream, so a
+/// missing vocabulary entry turns every turn of that protocol into
+/// `provider.invalid-output` rather than a visible protocol error.
 fn map_finish(raw: &str) -> FinishReason {
     match raw {
-        "stop" => FinishReason::Stop,
-        "length" => FinishReason::Length,
-        "tool_calls" | "tool-calls" => FinishReason::ToolCalls,
-        "content_filter" | "content-filter" => FinishReason::ContentFilter,
+        "stop" | "end_turn" | "stop_sequence" => FinishReason::Stop,
+        "length" | "max_tokens" => FinishReason::Length,
+        "tool_calls" | "tool-calls" | "tool_use" => FinishReason::ToolCalls,
+        "content_filter" | "content-filter" | "refusal" => FinishReason::ContentFilter,
+        // A server-side tool pause ends the turn as far as ox is concerned: it
+        // runs no server tools, so there is nothing to resume.
+        "pause_turn" => FinishReason::Stop,
         "error" => FinishReason::Error,
         _ => FinishReason::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both wire vocabularies must map, because one mapper serves both streams;
+    /// an unmapped reason silently degrades the turn to `provider.invalid-output`
+    /// (that is how DeepSeek's `end_turn` broke every Messages turn).
+    #[test]
+    fn finish_reasons_from_both_wire_vocabularies_map() {
+        for (raw, expected) in [
+            ("stop", FinishReason::Stop),
+            ("end_turn", FinishReason::Stop),
+            ("stop_sequence", FinishReason::Stop),
+            ("pause_turn", FinishReason::Stop),
+            ("length", FinishReason::Length),
+            ("max_tokens", FinishReason::Length),
+            ("tool_calls", FinishReason::ToolCalls),
+            ("tool_use", FinishReason::ToolCalls),
+            ("content_filter", FinishReason::ContentFilter),
+            ("refusal", FinishReason::ContentFilter),
+            ("error", FinishReason::Error),
+            ("something-new", FinishReason::Unknown),
+        ] {
+            assert_eq!(
+                map_finish(raw),
+                expected,
+                "finish reason {raw:?} must map to {expected:?}"
+            );
+        }
     }
 }

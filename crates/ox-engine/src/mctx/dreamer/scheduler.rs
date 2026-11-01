@@ -329,7 +329,7 @@ impl Dreamer {
         let request = dreamer_request(&model, system, user_prompt);
         // Dreamer has no parent session policy; the request carries no
         // reasoning effort deliberately, leaving the provider's default.
-        let text = collect_completion(&self.chat, &request)
+        let text = collect_completion(&self.chat, &request, "dreamer")
             .await
             .map_err(|error| TaskFailure {
                 class: FailureClass::ProviderError,

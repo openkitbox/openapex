@@ -319,7 +319,7 @@ async fn generate_inner(
         vec![ChatMessage::system(PROMPT_TITLE), ChatMessage::user(text)],
     );
     request.apply_reasoning_effort(model.variant.as_deref());
-    let response = crate::mctx::historian::collect_completion(&chat, &request).await?;
+    let response = crate::mctx::historian::collect_completion(&chat, &request, "title").await?;
     let Some(title) = extract_title(&response) else {
         return Ok(());
     };

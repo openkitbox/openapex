@@ -587,6 +587,21 @@ pub struct MctxConfig {
     /// project actually holds memories whose cited files changed.
     #[serde(default = "default_enabled")]
     pub dreamer_enabled: bool,
+    /// Whether the historian's hidden completion reuses the live request's wire
+    /// prefix instead of sending the chunk as an independent two-message
+    /// request. Off by default, because the independent shape already measures
+    /// well: on DeepSeek-V4.1-Flash the fold's chunk is served ~95–97% from the
+    /// provider cache, the endpoint matching repeated spans rather than only a
+    /// request prefix.
+    ///
+    /// Turn it on for an endpoint whose cache is prefix-only (the OpenAI and
+    /// Gemini families document that contract): there the independent chunk is
+    /// a full miss while the prefixed shape re-reads the conversation's opening
+    /// bytes at the cache price. Measured on DeepSeek, the prefixed shape served
+    /// 97.9% of a 28.9k-token fold from cache but sent ~1.7× the tokens the
+    /// independent shape sends, so it is not a win where spans already hit.
+    #[serde(default)]
+    pub historian_prefix_cache: bool,
     /// Semantic search for project memories (off unless configured).
     #[serde(default)]
     pub embedding: EmbeddingConfig,
@@ -712,6 +727,7 @@ impl Default for MctxConfig {
             soft_threshold: default_soft_threshold(),
             hard_threshold: default_hard_threshold(),
             dreamer_enabled: default_enabled(),
+            historian_prefix_cache: false,
             embedding: EmbeddingConfig::default(),
             dreamer_interval_minutes: default_dreamer_interval_minutes(),
         }

@@ -80,10 +80,20 @@ async fn latest_seq(db: &ox_db::Db, session_id: &str) -> Result<i64> {
 /// Upstream `messageEntries`: history starts at the latest completed
 /// compaction row, so the checkpoint replaces everything before it. Shared
 /// by `build_chat_messages` and the instruction wire fold.
-pub(crate) fn compaction_boundary(messages: &[Message]) -> usize {
+///
+/// The answer is an *index into the rows it was given*, and 0 reads as "no
+/// completed checkpoint here" (the render starts at the first row either way).
+/// A caller that indexes the same history by ordinal maps this index back
+/// through its own rows — the historian's region load does exactly that, so both
+/// renderers start the conversation at the same row. The rows are an iterator so
+/// such a caller does not have to build a vector of references first.
+pub(crate) fn compaction_boundary<'row>(
+    messages: impl DoubleEndedIterator<Item = &'row Message> + ExactSizeIterator,
+) -> usize {
+    let len = messages.len();
     messages
-        .iter()
-        .rposition(|message| {
+        .rev()
+        .position(|message| {
             matches!(
                 message,
                 Message::Compaction(CompactionMessage {
@@ -92,7 +102,7 @@ pub(crate) fn compaction_boundary(messages: &[Message]) -> usize {
                 })
             )
         })
-        .unwrap_or(0)
+        .map_or(0, |from_end| len - 1 - from_end)
 }
 
 /// The provider-reported context cost of one decoded row: the decoded twin
@@ -153,13 +163,18 @@ fn effective_end_ms(message: &Message) -> i64 {
 /// - A `user` turn more than [`temporal::TEMPORAL_THRESHOLD_SECONDS`] after the
 ///   previous row's effective end is prefixed with `<!-- +2h -->\n`
 ///   (temporal awareness; the marker is never stored).
+///
+/// The historian's prefix reuse (`mctx::historian::prefixed_request`) depends on
+/// this function staying the single renderer for both paths: the hidden
+/// completion's request must start with these exact bytes, so any change here
+/// moves the live request and the fold together or not at all.
 pub(crate) fn build_chat_messages(
     system_static: &str,
     instructions: &str,
     head: &[Option<&str>],
     messages: &[Message],
 ) -> Vec<ChatMessage> {
-    let boundary = compaction_boundary(messages);
+    let boundary = compaction_boundary(messages.iter());
     let mut out = vec![ChatMessage::System {
         content: system_static.to_owned(),
     }];

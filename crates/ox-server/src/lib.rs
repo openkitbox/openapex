@@ -361,8 +361,44 @@ fn spawn_runner_memory_stats(runner: Runner) {
             interval.tick().await;
             let (sessions, baselines) = runner.diagnostic_table_sizes();
             tracing::info!(sessions, baselines, "OX_RUNNER_STATS");
+            log_cache_stats(&runner);
         }
     });
+}
+
+/// Emit the runner's prompt-cache ledger: one aggregate `OX_CACHE_STATS` line,
+/// plus one `debug` line per session so `RUST_LOG=debug` can inspect a single
+/// session that the aggregate hides. `sessions` counts the sessions the ledger
+/// has provider-reported numbers for, not the registry size.
+///
+/// Diagnostic-only: no request path reads this, and nothing is persisted. When
+/// no session has reported usage yet, `read + uncached` is zero and `hit_ratio`
+/// is logged as `None` rather than a `0.0` that would read as a total miss.
+fn log_cache_stats(runner: &Runner) {
+    let ledger = runner.diagnostic_cache_ledger();
+    let mut read = 0i64;
+    let mut uncached = 0i64;
+    for (session, cache) in &ledger {
+        read += cache.read;
+        uncached += cache.uncached;
+        tracing::debug!(
+            session = %session,
+            cache_read = cache.read,
+            cache_uncached = cache.uncached,
+            "OX_CACHE_STATS"
+        );
+    }
+    let hit_ratio = match read + uncached {
+        0 => None,
+        measured => Some(read as f64 / measured as f64),
+    };
+    tracing::info!(
+        sessions = ledger.len(),
+        cache_read = read,
+        cache_uncached = uncached,
+        hit_ratio = ?hit_ratio,
+        "OX_CACHE_STATS"
+    );
 }
 
 /// Serve the composed router on an already-bound listener — the `ox acp`

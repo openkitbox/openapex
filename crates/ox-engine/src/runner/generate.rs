@@ -51,6 +51,7 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
         generation: svc.generation,
         instruction_baselines: Arc::clone(&inner.instruction_baselines),
         calibrations: Arc::clone(&inner.calibrations),
+        cache_ledger: Arc::clone(&inner.cache_ledger),
         // The session handle's cached git-toplevel anchor (the same slot the
         // busy period's steps use); no live registry entry keeps a fresh,
         // unused cache.
@@ -96,5 +97,5 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
     let mut request = ChatRequest::new(model.id.clone(), messages);
     request.tools = ctx.tools.definitions_shared();
     request.apply_reasoning_effort(model.variant.as_deref());
-    crate::mctx::historian::collect_completion(&ctx.chat, &request).await
+    crate::mctx::historian::collect_completion(&ctx.chat, &request, "generate").await
 }

@@ -484,10 +484,29 @@ pub fn build_request(
     let (thinking, output_config) =
         policy.thinking(&request.model, request.reasoning_effort.as_deref());
 
+    // `system` is the *join* of every `System` message in the list, so a
+    // request carrying one more or one fewer of them opens differently even
+    // when the message bodies agree — and a prompt cache keys on exactly that,
+    // so a divergence here costs the whole prefix. Logged as counts and hashes
+    // rather than text, which keeps the line safe to leave on.
+    let system_blocks = system.len();
+    let system = (!system.is_empty()).then(|| system.join("\n\n"));
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        let joined = system.as_deref().unwrap_or_default();
+        tracing::debug!(
+            system_blocks,
+            system_bytes = joined.len(),
+            system_hash = hash_bytes(joined.as_bytes()),
+            tools = tools.len(),
+            messages = messages.len(),
+            "messages request shape"
+        );
+    }
+
     Ok(MessagesRequest {
         model: request.model.clone(),
         max_tokens: policy.max_tokens_for(&request.model, request.max_tokens),
-        system: (!system.is_empty()).then(|| system.join("\n\n")),
+        system,
         messages,
         tools,
         tool_choice,
@@ -580,6 +599,15 @@ fn parse_arguments(arguments: &str) -> Value {
         return json!({});
     }
     serde_json::from_str(arguments).unwrap_or_else(|_| json!({}))
+}
+
+/// FNV-1a over a byte slice: a stable, dependency-free fingerprint for the
+/// debug line above. Collisions are irrelevant here; it only has to tell two
+/// renderings apart within one log.
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x1000_0000_01b3)
+    })
 }
 
 #[cfg(test)]

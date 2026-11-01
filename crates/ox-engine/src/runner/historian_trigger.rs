@@ -29,14 +29,46 @@ use crate::mctx::historian::{self, ChunkLimits};
 use crate::mctx::memory;
 use crate::mctx::tokens;
 use crate::runner::drain::DrainCtx;
-use crate::runner::step::rows_after_with_seq;
+use crate::runner::step::{
+    compaction_boundary, load_overlaid_tail_with_ordinals, rows_after_with_seq,
+};
 use ox_core::config::Config;
 use ox_db::Db;
 use ox_llm::cardinal::chat::Chat;
+use ox_llm::cardinal::wire::ToolDef;
+use ox_schema::message::Message;
 
 // ---------------------------------------------------------------------------
 // Historian trigger (step boundary)
 // ---------------------------------------------------------------------------
+
+/// The live step request a fold can continue (plan A3): the bytes the provider
+/// already holds for this conversation, so the historian's hidden completion
+/// re-reads them at the prompt-cache price instead of paying a full miss.
+///
+/// Owned, not borrowed: the fold is detached and outlives the step that fired
+/// it. `system_static` and `instructions` are `Arc<str>` so handing them to that
+/// task is a refcount bump, not a copy of the static layer on every step
+/// boundary — the step made this allocation anyway, and the common case is a
+/// fold that never starts.
+pub(crate) struct PrefixContext {
+    /// The request's first message: the static system layer.
+    pub(crate) system_static: Arc<str>,
+    /// The request's second message: the session's initial instruction render.
+    pub(crate) instructions: Arc<str>,
+    /// The frozen head halves (`m[0]`, `m[1]`), as the live request sent them.
+    pub(crate) head_m0: Option<String>,
+    pub(crate) head_m1: Option<String>,
+    /// The session's model id: a hidden completion that routes anywhere else
+    /// cannot reuse these bytes, because the prefix is model-scoped.
+    pub(crate) model_id: String,
+    /// The tool definitions the step request advertises
+    /// (`ctx.tools.definitions_shared()`, the same `Arc` the request itself
+    /// carries). They are part of the prefix: providers render the tools array
+    /// ahead of the system prompt and the messages, so a fold that offered none
+    /// would share no cached prefix at all.
+    pub(crate) tools: Arc<Vec<ToolDef>>,
+}
 
 /// Fire the historian when the live tail has reached a pressure band.
 ///
@@ -45,6 +77,11 @@ use ox_llm::cardinal::chat::Chat;
 /// pressure is not the one that must wait for it. The pass in the next step
 /// picks up whatever compartments the run published.
 ///
+/// `live` is the step request's own prefix, handed over so a run can continue
+/// it rather than re-send the conversation as a flat chunk. The fail-open rule
+/// lives in [`request_shape`]: anything that cannot reuse the prefix byte for
+/// byte sends the flat shape instead.
+///
 /// Every failure here is logged and swallowed: context assembly must never fail
 /// a turn (upstream's transform has the same contract).
 pub(crate) fn mctx_historian(
@@ -52,6 +89,7 @@ pub(crate) fn mctx_historian(
     budget: Budget,
     floor: i64,
     reasoning_effort: Option<String>,
+    live: PrefixContext,
 ) {
     if !ctx.config.magic_context.enabled {
         return;
@@ -77,6 +115,7 @@ pub(crate) fn mctx_historian(
             project: &project,
             ratio,
             reasoning_effort,
+            prefix: Some(live),
         };
         match firing.run(floor).await {
             Ok(Some(published)) => {
@@ -247,6 +286,12 @@ fn tail_load_skippable(usage: NewestUsage, tail_bytes: i64, budget: &Budget, rat
 /// compartments (the floor advanced); `Ok(false)` covers every benign skip —
 /// a run already in flight, an empty tail, the fence. Errors are the
 /// caller's cue to fall back (the template path), not retried here.
+///
+/// This path sends the flat shape: it runs from the compaction drain, which has
+/// no step request in hand (see [`FlatReason::NoLiveContext`]). Reassembling one
+/// here — a second `prompt::system_static`, a second baseline read — would be a
+/// second renderer of the bytes the next step sends, so the patch keeps the
+/// fail-open request instead.
 pub(crate) async fn patch_fold(
     ctx: &DrainCtx,
     budget: Budget,
@@ -264,6 +309,7 @@ pub(crate) async fn patch_fold(
         project: &project,
         ratio: calibration::ratio_for(&ctx.calibrations, &ctx.session_id),
         reasoning_effort,
+        prefix: None,
     };
     match firing.patch(floor).await {
         Ok(Some(published)) => {
@@ -278,6 +324,151 @@ pub(crate) async fn patch_fold(
         Ok(None) => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+/// Which request shape a historian run sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestShape {
+    /// The live request's own bytes, then the historian's task tail: the shape
+    /// an endpoint with automatic prefix caching bills at the cache price.
+    Prefixed,
+    /// The independent two-message request: the chunk is rendered into the
+    /// prompt and no prefix is reused. This is the fail-open shape, and the
+    /// reason says why a run fell back to it.
+    FlatChunk(FlatReason),
+}
+
+/// Why a run sends the flat shape. Each variant is a distinct operator signal:
+/// two are routine, three mean the feature could not do its job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlatReason {
+    /// `magic_context.historian_prefix_cache = false`: expected, quiet.
+    ConfiguredOff,
+    /// The calling path never held a step request (the background fold's patch).
+    /// Structural, not a degradation.
+    NoLiveContext,
+    /// The hidden completion is not routed to the session's model, so the
+    /// prefix it would reuse belongs to a different model's byte history.
+    ModelDiffers,
+    /// The live render starts after the fold's last ordinal — a completed
+    /// compaction row sits above it — so the region has nothing the model was
+    /// shown, let alone a shared prefix.
+    FoldBelowLiveStart,
+    /// The fold's region renders no transcript at all: there is no conversation
+    /// above the instruction to fold.
+    EmptyRegion,
+}
+
+impl FlatReason {
+    /// The reason as a log field value.
+    #[must_use]
+    fn as_str(self) -> &'static str {
+        match self {
+            FlatReason::ConfiguredOff => "historian_prefix_cache is off",
+            FlatReason::NoLiveContext => "no live step request on this path",
+            FlatReason::ModelDiffers => {
+                "the hidden completion is not routed to the session's model"
+            }
+            FlatReason::FoldBelowLiveStart => {
+                "the live render starts after the fold's last ordinal"
+            }
+            FlatReason::EmptyRegion => "the fold's region renders no transcript",
+        }
+    }
+
+    /// Whether falling back is a degradation worth a warning. A switch the
+    /// operator turned off and a path that never had a prefix are how the system
+    /// is supposed to work; a lost prefix on a path that had one is not.
+    #[must_use]
+    fn is_degradation(self) -> bool {
+        match self {
+            FlatReason::ConfiguredOff | FlatReason::NoLiveContext => false,
+            FlatReason::ModelDiffers | FlatReason::FoldBelowLiveStart | FlatReason::EmptyRegion => {
+                true
+            }
+        }
+    }
+}
+
+/// The facts [`request_shape`] reads. Named fields, because five positional
+/// flags at a call site are a swap waiting to happen.
+#[derive(Debug, Clone, Copy)]
+struct ShapeFacts {
+    /// `magic_context.historian_prefix_cache`.
+    switch_on: bool,
+    /// Whether the caller held the step request's prefix.
+    live_context: bool,
+    /// Whether the hidden completion resolves to the session's own model.
+    same_model: bool,
+    /// Whether the live render starts past the fold's last ordinal
+    /// ([`region_start`]). Read before `region_len` because a boundary above the
+    /// fold also empties the region, and the two are different signals: one is a
+    /// checkpoint the fold has not reached, the other a fold with nothing to
+    /// fold. Only the caller that loaded the region can answer it.
+    fold_below_live_start: bool,
+    /// The region's row count. Only read once the checks above hold: a caller
+    /// that skipped the load passes 0, and an earlier check decides.
+    region_len: usize,
+}
+
+/// Which shape a run sends, decided by the first failing precondition — in the
+/// order the checks cost (a switch and a caller's context are free, the model is
+/// a config/catalog lookup, the region is a tail load).
+///
+/// Pure on purpose: the whole fallback ladder is testable without a session, and
+/// the caller keeps the only side effects — the load and the log line.
+#[must_use]
+fn request_shape(facts: ShapeFacts) -> RequestShape {
+    if !facts.switch_on {
+        return RequestShape::FlatChunk(FlatReason::ConfiguredOff);
+    }
+    if !facts.live_context {
+        return RequestShape::FlatChunk(FlatReason::NoLiveContext);
+    }
+    if !facts.same_model {
+        return RequestShape::FlatChunk(FlatReason::ModelDiffers);
+    }
+    if facts.fold_below_live_start {
+        return RequestShape::FlatChunk(FlatReason::FoldBelowLiveStart);
+    }
+    if facts.region_len == 0 {
+        return RequestShape::FlatChunk(FlatReason::EmptyRegion);
+    }
+    RequestShape::Prefixed
+}
+
+/// The ordinal the fold's region starts at: where the live render starts, never
+/// below `floor + 1`.
+///
+/// The live render does not begin at the history floor. `build_chat_messages`
+/// starts at the newest *completed compaction* row (`compaction_boundary`), so
+/// a checkpoint above the fold makes a region starting at `floor + 1` summarize
+/// rows the model was never shown — and share no prefix with the request it is
+/// supposed to continue. The boundary is reported as an index into the rows it
+/// was given, so the index is mapped back through those very rows; index 0 means
+/// "no completed checkpoint in the tail", which the render reads as "start at
+/// the first row", and an empty tail keeps the floor.
+///
+/// `rows` are the live tail's `(ordinal, message)` pairs, in ordinal order.
+#[must_use]
+fn region_start(rows: &[(i64, Message)], floor: i64) -> i64 {
+    let boundary = compaction_boundary(rows.iter().map(|(_, message)| message));
+    let start = rows
+        .get(boundary)
+        .map_or(floor + 1, |(ordinal, _)| *ordinal);
+    start.max(floor + 1)
+}
+
+/// The fold's region: the rows inside `start..=end`, moved out of the loaded
+/// tail rather than copied.
+///
+/// Empty when `start > end` — the live render starts past the fold's last
+/// ordinal — which is the case [`FlatReason::FoldBelowLiveStart`] names.
+fn region_rows(rows: Vec<(i64, Message)>, start: i64, end: i64) -> Vec<Message> {
+    rows.into_iter()
+        .filter(|(ordinal, _)| (start..=end).contains(ordinal))
+        .map(|(_, message)| message)
+        .collect()
 }
 
 /// One firing decision's context: the session, its derived budgets, and the
@@ -298,6 +489,9 @@ struct Firing<'a> {
     ratio: f64,
     /// Snapshot of the owning session's reasoning policy for this firing.
     reasoning_effort: Option<String>,
+    /// The step request this firing may continue; `None` on the background
+    /// fold's patch path, which has no step request in hand.
+    prefix: Option<PrefixContext>,
 }
 
 impl Firing<'_> {
@@ -444,7 +638,7 @@ impl Firing<'_> {
             }
             return Ok(None);
         };
-        self.execute(chunk, Some(trigger)).await
+        self.execute(chunk, Some(trigger), floor).await
     }
 
     /// One synchronous patch run for the background fold (plan D6): fold the
@@ -515,7 +709,7 @@ impl Firing<'_> {
             );
             return Ok(None);
         };
-        self.execute(chunk, None).await
+        self.execute(chunk, None, floor).await
     }
 
     /// The prompt assembly and the run itself, shared by the detached
@@ -525,6 +719,7 @@ impl Firing<'_> {
         self,
         chunk: historian::Chunk,
         trigger: Option<historian::Trigger>,
+        floor: i64,
     ) -> Result<Option<Published>> {
         let Firing {
             db,
@@ -534,6 +729,7 @@ impl Firing<'_> {
             session_id,
             project,
             reasoning_effort,
+            prefix: live,
             ..
         } = self;
         let compartments = compartments::load(db, session_id).await?;
@@ -563,12 +759,74 @@ impl Firing<'_> {
             catalog,
             reasoning_effort,
         };
+        // The request shape, decided before the region is loaded because only a
+        // prefix-shaped run pays for it. `same_model` reads the same resolver the
+        // run itself uses, so the two can never disagree about the route.
+        let switch_on = config.magic_context.historian_prefix_cache;
+        let live = live.as_ref();
+        let same_model = live.is_some_and(|live| {
+            historian::historian_model(config, catalog).is_ok_and(|model| model == live.model_id)
+        });
+        let (region, fold_below_live_start) = if switch_on && live.is_some() && same_model {
+            // THE REGION MUST START WHERE THE LIVE RENDER STARTS, and `floor` is
+            // not that point. `build_chat_messages` skips rows it cannot render,
+            // but every row still advances its temporal-marker cursor, so a slice
+            // that starts later loses the `<!-- +2h -->` marker the live request
+            // rendered and stops being a byte prefix of what the provider cached
+            // — the whole point of this shape. The render also skips everything
+            // up to the newest *completed compaction* row, which can sit above
+            // `floor`; [`region_start`] maps that boundary back to an ordinal over
+            // the same rows the live request decided it over, so the whole tail is
+            // loaded here (exactly what the live step loaded) rather than the
+            // chunk's window.
+            let tail = load_overlaid_tail_with_ordinals(db, session_id, floor).await?;
+            let start = region_start(&tail, floor);
+            // The other side of the window: the historian may not read ordinals
+            // the fold does not cover.
+            let end = *chunk.covered.end();
+            (region_rows(tail, start, end), start > end)
+        } else {
+            (Vec::new(), false)
+        };
+        let shape = request_shape(ShapeFacts {
+            switch_on,
+            live_context: live.is_some(),
+            same_model,
+            fold_below_live_start,
+            region_len: region.len(),
+        });
+        let prefix = match shape {
+            RequestShape::Prefixed => live.map(|live| historian::Prefix {
+                system_static: live.system_static.as_ref(),
+                instructions: live.instructions.as_ref(),
+                head: [live.head_m0.as_deref(), live.head_m1.as_deref()],
+                region: &region,
+                tools: &live.tools,
+            }),
+            RequestShape::FlatChunk(reason) => {
+                if reason.is_degradation() {
+                    tracing::warn!(
+                        session = %session_id,
+                        reason = reason.as_str(),
+                        "historian sends the flat chunk instead of the cached prefix"
+                    );
+                } else {
+                    tracing::debug!(
+                        session = %session_id,
+                        reason = reason.as_str(),
+                        "historian sends the flat chunk"
+                    );
+                }
+                None
+            }
+        };
         let plan = historian::RunPlan {
             session_id,
             project,
             chunk: &chunk,
             attempt: 1,
             prompt,
+            prefix,
         };
         tracing::debug!(
             session = %session_id,
@@ -576,6 +834,8 @@ impl Firing<'_> {
             chunk_end = chunk.end_ordinal,
             chunk_tokens = chunk.token_estimate,
             present = chunk.present_ordinals.len(),
+            shape = ?shape,
+            region = region.len(),
             "historian chunk"
         );
         let Some(outcome) = historian::run(&run_ctx, &plan).await? else {
@@ -604,4 +864,217 @@ struct Published {
     covered: String,
     /// Compartments the run published.
     compartments: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shape(
+        switch_on: bool,
+        live_context: bool,
+        same_model: bool,
+        region_len: usize,
+    ) -> RequestShape {
+        request_shape(ShapeFacts {
+            switch_on,
+            live_context,
+            same_model,
+            fold_below_live_start: false,
+            region_len,
+        })
+    }
+
+    /// The default is a behavior, not an implementation detail: the independent
+    /// chunk shape already measures 95–97% cache reuse on DeepSeek-V4.1-Flash,
+    /// while the prefixed shape sends ~1.7× the prompt tokens there. Flipping
+    /// this default must be a deliberate decision with new measurements.
+    #[test]
+    fn the_prefixed_shape_is_opt_in() {
+        assert!(
+            !ox_core::config::MctxConfig::default().historian_prefix_cache,
+            "the prefixed historian shape must stay opt-in"
+        );
+    }
+
+    #[test]
+    fn every_precondition_must_hold_for_the_prefix_shape() {
+        assert_eq!(
+            shape(true, true, true, 1),
+            RequestShape::Prefixed,
+            "one rendered row is enough to be a prefix of the live request"
+        );
+        assert_eq!(
+            shape(false, true, true, 1),
+            RequestShape::FlatChunk(FlatReason::ConfiguredOff),
+            "the switch is absolute: a disabled prefix cache never sends one"
+        );
+        assert_eq!(
+            shape(true, false, true, 1),
+            RequestShape::FlatChunk(FlatReason::NoLiveContext),
+            "a path without the step request cannot invent a prefix"
+        );
+        assert_eq!(
+            shape(true, true, false, 1),
+            RequestShape::FlatChunk(FlatReason::ModelDiffers),
+            "the cached prefix is model-scoped, so another model cannot reuse it"
+        );
+        assert_eq!(
+            shape(true, true, true, 0),
+            RequestShape::FlatChunk(FlatReason::EmptyRegion),
+            "an empty region leaves nothing above the instruction to fold"
+        );
+    }
+
+    #[test]
+    fn the_first_failing_precondition_names_the_reason() {
+        // Every combination of failing preconditions reports the earliest one,
+        // so a log line always names the check that actually decided.
+        assert_eq!(
+            shape(false, false, false, 0),
+            RequestShape::FlatChunk(FlatReason::ConfiguredOff),
+            "the switch is checked before the caller's context"
+        );
+        assert_eq!(
+            shape(true, false, false, 0),
+            RequestShape::FlatChunk(FlatReason::NoLiveContext),
+            "the caller's context is checked before the model route"
+        );
+        assert_eq!(
+            shape(true, true, false, 0),
+            RequestShape::FlatChunk(FlatReason::ModelDiffers),
+            "the model route is checked before the region is measured"
+        );
+    }
+
+    #[test]
+    fn only_a_lost_prefix_on_a_path_that_had_one_is_a_degradation() {
+        // The two routine fallbacks stay at debug: an operator's switch and a
+        // path that never held a request are how the system is meant to work.
+        assert!(!FlatReason::ConfiguredOff.is_degradation());
+        assert!(!FlatReason::NoLiveContext.is_degradation());
+        // These three are the feature failing to do its job, so they warn.
+        assert!(FlatReason::ModelDiffers.is_degradation());
+        assert!(FlatReason::FoldBelowLiveStart.is_degradation());
+        assert!(FlatReason::EmptyRegion.is_degradation());
+    }
+
+    #[test]
+    fn a_checkpoint_above_the_fold_falls_open_with_its_own_reason() {
+        let facts = ShapeFacts {
+            switch_on: true,
+            live_context: true,
+            same_model: true,
+            fold_below_live_start: true,
+            region_len: 0,
+        };
+        assert_eq!(
+            request_shape(facts),
+            RequestShape::FlatChunk(FlatReason::FoldBelowLiveStart),
+            "a checkpoint past the fold is a different signal from a fold with nothing above it"
+        );
+        assert_eq!(
+            request_shape(ShapeFacts {
+                fold_below_live_start: false,
+                ..facts
+            }),
+            RequestShape::FlatChunk(FlatReason::EmptyRegion),
+            "without a checkpoint above it, an empty region is what the log should say"
+        );
+        assert_eq!(
+            request_shape(ShapeFacts {
+                same_model: false,
+                ..facts
+            }),
+            RequestShape::FlatChunk(FlatReason::ModelDiffers),
+            "the model route is still decided before the region"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Region window
+    // -----------------------------------------------------------------------
+
+    /// A user row with a frozen timestamp: two seconds apart, so no temporal
+    /// marker is rendered and the assertions stay about the window.
+    fn user_row(ordinal: i64) -> (i64, Message) {
+        let value = serde_json::json!({
+            "id": format!("msg_{ordinal}"),
+            "type": "user",
+            "time": { "created": ordinal * 1_000 },
+            "text": format!("prompt {ordinal}"),
+        });
+        (
+            ordinal,
+            crate::runner::step::decode_row(&value).expect("the user fixture decodes"),
+        )
+    }
+
+    /// A *completed* compaction row: the row `build_chat_messages` starts the
+    /// live render at. Built through the production decoder so it has exactly
+    /// the shape a stored row has.
+    fn completed_compaction(ordinal: i64) -> (i64, Message) {
+        let value = serde_json::json!({
+            "id": format!("msg_{ordinal}"),
+            "type": "compaction",
+            "time": { "created": ordinal * 1_000 },
+            "status": "completed",
+            "reason": "manual",
+            "summary": "the checkpoint",
+            "recent": "what survived it",
+        });
+        (
+            ordinal,
+            crate::runner::step::decode_row(&value).expect("the compaction fixture decodes"),
+        )
+    }
+
+    #[test]
+    fn the_region_starts_at_the_floor_without_a_checkpoint() {
+        let tail = vec![user_row(4), user_row(5), user_row(6)];
+        assert_eq!(
+            region_start(&tail, 3),
+            4,
+            "with no completed checkpoint the live render starts at the first row above the floor"
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_above_the_fold_moves_the_region_start() {
+        // The fold ended at 4, but the live render begins at the completed
+        // checkpoint at 5: summarizing from the floor would cover a row the model
+        // was never shown, and share no prefix with the request it continues.
+        let tail = vec![user_row(4), completed_compaction(5), user_row(6)];
+        let start = region_start(&tail, 3);
+        assert_eq!(
+            start, 5,
+            "the region must start at the checkpoint, not at the floor"
+        );
+        let region = region_rows(tail, start, 4);
+        assert!(
+            region.is_empty(),
+            "a checkpoint past the fold's last ordinal leaves the region empty, got {} rows",
+            region.len()
+        );
+    }
+
+    #[test]
+    fn the_region_is_the_window_the_fold_covers() {
+        let tail = vec![user_row(1), user_row(2), user_row(3), user_row(4)];
+        let region = region_rows(tail, 2, 3);
+        let rendered =
+            crate::runner::step::build_chat_messages("static layer", "", &[None, None], &region);
+        let users: Vec<&str> = rendered
+            .iter()
+            .filter_map(|message| match message {
+                ox_llm::cardinal::wire::ChatMessage::User { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            users,
+            ["prompt 2", "prompt 3"],
+            "the region must hold exactly the rows inside the fold's window"
+        );
+    }
 }

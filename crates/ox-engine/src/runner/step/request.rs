@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 
 use crate::mctx::search;
@@ -34,15 +36,6 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
     // starts after the covered range.
     let budget = crate::mctx::budget_for(&ctx.config, &ctx.model_catalog, &params.model.id);
     let (head_m0, head_m1, floor) = mctx_head(ctx, budget).await;
-    // Pressure is checked after the pass: the floor it reports is what the
-    // live tail is measured above. Both windows were resolved once, when
-    // the budget was derived.
-    super::super::historian_trigger::mctx_historian(
-        ctx,
-        budget,
-        floor,
-        params.model.variant.clone(),
-    );
     let rows = if ctx.config.magic_context.enabled {
         // The §N§ overlay (tag prefixes + drop placeholders) is part of the
         // integration: with it off the request must stay byte-identical to
@@ -76,30 +69,59 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
         project_root.as_deref(),
         ctx.mcp.instructions_block().as_deref(),
     );
-    let (system_static, tool_count) = {
+    let (system_static, tool_count): (Arc<str>, usize) = {
         let guidance: Vec<(&str, Option<&'static str>)> = ctx.tools.guidances().collect();
         // The baseline log's tool count is the registry size; the names
         // iterate in the same order the definitions do.
         let count = guidance.len();
-        (prompt::system_static(&guidance, ctx.agent), count)
+        (
+            Arc::from(prompt::system_static(&guidance, ctx.agent)),
+            count,
+        )
     };
     // The baseline log needs the static layer's size, so it is built
     // before the sync: assembling it is pure string work over the
     // registry's guidance, unaffected by the keyed sources.
     let instruction_update =
         sync_instructions(ctx, &observed, &rows, system_static.len(), tool_count).await;
-    let instructions_initial = {
+    let instructions_initial: Arc<str> = {
         let baselines = super::super::lock(&ctx.instruction_baselines);
         baselines
             .get(&ctx.session_id)
-            .map(|b| b.initial_render.clone())
-            .unwrap_or_default()
+            .map(|b| Arc::from(b.initial_render.as_str()))
+            .unwrap_or_else(|| Arc::from(""))
     };
     let mut chat_messages = build_chat_messages(
         &system_static,
         &instructions_initial,
         &[head_m0.as_deref(), head_m1.as_deref()],
         &rows,
+    );
+    // Pressure is checked after the pass: the floor it reports is what the
+    // live tail is measured above. Both windows were resolved once, when the
+    // budget was derived. The trigger is called here rather than next to
+    // `mctx_head`, because the historian's prefix-reusing request continues
+    // *this* request: it reuses the frozen head, the static system layer and
+    // the session's initial instruction render, so the bytes it sends are the
+    // bytes this step sends. The head halves and the two static layers are
+    // handed over by move / `Arc<str>` clone, so a step that fires no fold pays
+    // no copy of the prefix it just rendered.
+    super::super::historian_trigger::mctx_historian(
+        ctx,
+        budget,
+        floor,
+        params.model.variant.clone(),
+        super::super::historian_trigger::PrefixContext {
+            system_static: Arc::clone(&system_static),
+            instructions: Arc::clone(&instructions_initial),
+            head_m0,
+            head_m1,
+            model_id: params.model.id.clone(),
+            // The same `Arc` the request below advertises, by refcount: providers
+            // render the tools array *before* the system prompt, so a fold that
+            // offered none would share no cached prefix at all.
+            tools: ctx.tools.definitions_shared(),
+        },
     );
     // The delta row is durable for future steps; this step's already-loaded
     // rows predate it, so the text rides this request in memory (upstream
@@ -251,7 +273,7 @@ async fn sync_instructions(
         let baseline = baselines
             .entry(ctx.session_id.clone())
             .or_insert_with(|| instructions::baseline(observed));
-        let wire = instructions::fold(rows, compaction_boundary(rows));
+        let wire = instructions::fold(rows, compaction_boundary(rows.iter()));
         let deltas = instructions::diff(observed, &wire, baseline);
         let sizes = fresh.then(|| prompt::injection_sizes(observed, system0_bytes, tool_count));
         (deltas, sizes)

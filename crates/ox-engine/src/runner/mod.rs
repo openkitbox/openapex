@@ -24,6 +24,7 @@
 
 pub use ox_llm::cardinal::chat::Chat;
 pub use services::{Live, ServiceSet, Services};
+pub use step::usage::SessionCache;
 
 pub mod compaction;
 pub mod drain;
@@ -60,6 +61,7 @@ use ox_schema::support::SessionError;
 use ox_tools::agent;
 use ox_tools::agent::Agent;
 use ox_tools::agent::Mode;
+use step::usage::CacheLedger;
 
 /// Messages the per-session actor mailbox accepts.
 #[derive(Debug)]
@@ -111,6 +113,9 @@ struct Inner {
     /// Per-session provider ÷ local token ratio (the budget's unit correction).
     /// Process memory only: a restart re-measures in one turn.
     calibrations: crate::mctx::calibration::Store,
+    /// Per-session prompt-cache accounting, reported per attempt and read only
+    /// by diagnostics ([`Runner::diagnostic_cache_ledger`]).
+    cache_ledger: Arc<CacheLedger>,
     sessions: DashMap<String, SessionHandle>,
 }
 
@@ -242,10 +247,11 @@ const RUNNER_IDLE_TTL_MS: u64 = 30 * 60 * 1000;
 
 impl Inner {
     /// Drop every runner-side table entry for one session: the registry entry
-    /// (channels and flags), its keyed-instruction baseline and its token
-    /// calibration. The single owner of "what is kept per session", shared by
-    /// the actor's shutdown, the idle sweep and a session delete — a new
-    /// per-session table must be forgotten here or it outlives its session.
+    /// (channels and flags), its keyed-instruction baseline, its token
+    /// calibration and its prompt-cache ledger. The single owner of "what is
+    /// kept per session", shared by the actor's shutdown, the idle sweep and a
+    /// session delete — a new per-session table must be forgotten here or it
+    /// outlives its session.
     ///
     /// Only process state goes: the session's rows, events and compartments are
     /// the database's, and a later dispatch of an evicted session rebuilds the
@@ -254,6 +260,7 @@ impl Inner {
         self.sessions.remove(session_id);
         lock(&self.instruction_baselines).remove(session_id);
         crate::mctx::calibration::forget(&self.calibrations, session_id);
+        self.cache_ledger.forget(session_id);
     }
 }
 
@@ -340,6 +347,7 @@ impl Runner {
             live,
             instruction_baselines: Default::default(),
             calibrations: Default::default(),
+            cache_ledger: Default::default(),
             sessions: DashMap::new(),
         });
         let tools = inner.live.current().tools.clone();
@@ -409,6 +417,19 @@ impl Runner {
     pub fn diagnostic_table_sizes(&self) -> (usize, usize) {
         let baselines = lock(&self.inner.instruction_baselines).len();
         (self.inner.sessions.len(), baselines)
+    }
+
+    /// Per-session prompt-cache accounting for the sessions this runner still
+    /// holds, sorted by session id: `read` is the prompt prefix the provider
+    /// served from its cache, `uncached` the part it had to prefill. A
+    /// diagnostic log line reads this; nothing in a request depends on it. An
+    /// entry evicted from the registry is left out even if its ledger row has
+    /// not been reaped yet.
+    #[must_use]
+    pub fn diagnostic_cache_ledger(&self) -> Vec<(String, SessionCache)> {
+        self.inner
+            .cache_ledger
+            .snapshot(|session| self.inner.sessions.contains_key(session))
     }
 
     /// Wake the session's actor for a drain: spawn one if parked, otherwise
@@ -652,6 +673,7 @@ impl ActorTask {
                 generation: svc.generation,
                 instruction_baselines: self.inner.instruction_baselines.clone(),
                 calibrations: self.inner.calibrations.clone(),
+                cache_ledger: Arc::clone(&self.inner.cache_ledger),
                 instruction_root: self.handle.instruction_root.clone(),
                 fold_in_flight: Arc::clone(&self.handle.fold_in_flight),
             };

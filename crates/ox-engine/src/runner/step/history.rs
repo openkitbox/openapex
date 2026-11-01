@@ -147,26 +147,78 @@ pub(crate) async fn load_history_after(
 /// The tail with the magic-context §N§ overlay applied: tags minted (stable
 /// across passes), tag prefixes rendered beside each taggable item, and the
 /// content of an applied drop replaced by its placeholder.
+///
+/// The live step request renders from this. Two readers need two projections of
+/// the *same* rows — messages alone here, messages paired with their ordinals in
+/// [`load_overlaid_tail_with_ordinals`] — and both take the overlay below, so the
+/// historian's region can never render differently from the live request it is
+/// prefixed onto.
 pub(crate) async fn load_overlaid_tail(
     db: &ox_db::Db,
     session_id: &str,
     floor: i64,
 ) -> Result<Vec<Message>> {
-    let mut rows = rows_after(db, session_id, floor).await?;
+    let mut rows: Vec<serde_json::Value> = rows_after_with_seq(db, session_id, floor)
+        .await?
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect();
+    apply_request_overlay(db, session_id, &mut rows).await?;
+    rows.into_iter().map(decode_row_owned).collect()
+}
+
+/// As [`load_overlaid_tail`], but every message keeps the ordinal it was loaded
+/// at.
+///
+/// The historian needs the pairing because the start of the live render is
+/// reported as a *position* in the row list
+/// ([`compaction_boundary`](super::context::compaction_boundary)), while the
+/// fold's region is sliced by ordinal: without it there is no way to map one to
+/// the other. Everything else about the load — the window, the tag pass, the drop
+/// overlay, the decode — is the same, so the rows stay byte-compatible with what
+/// the live request rendered.
+pub(crate) async fn load_overlaid_tail_with_ordinals(
+    db: &ox_db::Db,
+    session_id: &str,
+    floor: i64,
+) -> Result<Vec<(i64, Message)>> {
+    let rows = rows_after_with_seq(db, session_id, floor).await?;
+    // The overlay addresses rows by position, so the ordinals ride alongside it
+    // and rejoin their rows after it.
+    let (ordinals, mut values): (Vec<i64>, Vec<serde_json::Value>) = rows.into_iter().unzip();
+    apply_request_overlay(db, session_id, &mut values).await?;
+    ordinals
+        .into_iter()
+        .zip(values)
+        .map(|(ordinal, value)| Ok((ordinal, decode_row_owned(value)?)))
+        .collect()
+}
+
+/// The §N§ overlay applied in place to one window of row JSON: tags minted in
+/// ordinal order, tag prefixes rendered beside each taggable item, and the
+/// content of an applied drop replaced by its placeholder.
+///
+/// Shared by both loaders above so the two windows can never disagree about how
+/// a row renders.
+async fn apply_request_overlay(
+    db: &ox_db::Db,
+    session_id: &str,
+    rows: &mut [serde_json::Value],
+) -> Result<()> {
     let tags = crate::mctx::tagger::Tagger
-        .assign(db, session_id, &rows)
+        .assign(db, session_id, rows)
         .await
         .context("assign §N§ tags")?;
     let drops = crate::mctx::tagger::drops(db, session_id)
         .await
         .context("load drops")?;
     crate::mctx::tagger::apply_overlay(
-        &mut rows,
+        rows,
         &tags,
         &drops,
         crate::mctx::tagger::OverlayMode::Request,
     );
-    rows.into_iter().map(decode_row_owned).collect()
+    Ok(())
 }
 
 /// One `session_message` row as the decoded message JSON: the row's `data`

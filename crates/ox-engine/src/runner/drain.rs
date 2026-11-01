@@ -48,6 +48,7 @@ use super::ToolRegistry;
 use super::compaction;
 use super::loop_guard::{LoopGuard, Verdict};
 use super::resolve_selection;
+use super::step::usage::CacheLedger;
 use super::unknown_error;
 
 /// Which delivery classes a drain pass may promote. Upstream `Promotable`:
@@ -124,6 +125,9 @@ pub(crate) struct DrainCtx {
     /// Per-session provider ÷ local token ratio (see
     /// [`crate::mctx::calibration`]): the unit every budget walk is measured in.
     pub calibrations: crate::mctx::calibration::Store,
+    /// Process-wide per-session prompt-cache accounting ([`CacheLedger`]):
+    /// diagnostics only, never read on the request path.
+    pub cache_ledger: Arc<CacheLedger>,
     /// The session's cached git-toplevel anchor, cloned from the session
     /// handle so step and generate share the same per-directory slot.
     pub instruction_root: super::InstructionRootCache,
