@@ -46,6 +46,37 @@ pub(crate) async fn last_assistant_text(
     })
 }
 
+/// The newest `limit` user/assistant rows, newest first. Reads only those
+/// rows, so a check that looks at the last few turns stays cheap on long
+/// sessions instead of decoding the whole transcript.
+pub(crate) async fn recent_turns(
+    db: &ox_db::Db,
+    session_id: &str,
+    limit: usize,
+) -> Result<Vec<Message>> {
+    let limit = i64::try_from(limit).context("recent_turns limit overflows i64")?;
+    let conn = db.acquire().await?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, type, data FROM session_message
+             WHERE session_id = ?1 AND type IN ('user', 'assistant')
+             ORDER BY seq DESC LIMIT ?2",
+        )
+        .await?;
+    let mut rows = stmt.query((session_id, limit)).await?;
+    let mut messages = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let id: String = row.get(0)?;
+        let kind: String = row.get(1)?;
+        let data: String = row.get(2)?;
+        let mut value: Value =
+            serde_json::from_str(&data).context("decode session_message.data")?;
+        Message::merge_row_columns(&id, &kind, &mut value);
+        messages.push(decode_row_owned(value)?);
+    }
+    Ok(messages)
+}
+
 /// Load a session transcript above `floor`: rows with a greater ordinal. The
 /// magic-context head stands in for everything at or below the floor it
 /// reports, so the request carries only the live tail.

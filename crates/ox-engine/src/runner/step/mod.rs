@@ -74,5 +74,5 @@ pub(crate) use content::user_prompt_text;
 pub(crate) use context::{build_chat_messages, mctx_head, tool_input};
 pub(crate) use history::{
     decode_row, last_assistant_text, load_history, load_history_after, load_overlaid_tail,
-    rows_after_with_seq,
+    recent_turns, rows_after_with_seq,
 };

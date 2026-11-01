@@ -488,13 +488,10 @@ const OUTPUT_LIMIT_STRIKES: usize = 3;
 /// length-truncated assistants (upstream llm.ts OutputLimit exhaustion
 /// check; compaction/other rows break the streak).
 async fn output_limit_exhausted(db: &Db, session_id: &str) -> Result<bool> {
-    let rows = super::step::load_history(db, session_id).await?;
-    let recent: Vec<&Message> = rows
-        .iter()
-        .filter(|message| matches!(message, Message::User { .. } | Message::Assistant(_)))
-        .rev()
-        .take(OUTPUT_LIMIT_STRIKES)
-        .collect();
+    // Only the newest strikes-worth of user/assistant rows matter; reading
+    // the whole transcript here would spike memory on long sessions.
+    let recent: Vec<Message> =
+        super::step::recent_turns(db, session_id, OUTPUT_LIMIT_STRIKES).await?;
     Ok(recent.len() == OUTPUT_LIMIT_STRIKES
         && recent.iter().all(|message| {
             matches!(
