@@ -27,6 +27,7 @@ pub mod edit;
 pub mod form;
 pub mod glob;
 pub mod grep;
+pub mod jobs;
 pub mod patch;
 pub mod question;
 pub mod read;
@@ -99,7 +100,12 @@ impl ToolRegistry {
         depth_limit: usize,
         max_active: usize,
     ) {
-        let handle = std::sync::Arc::new(subagent::SubagentHandle::new(db, bus, max_active));
+        let handle = std::sync::Arc::new(subagent::SubagentHandle::new(
+            db,
+            bus,
+            max_active,
+            Arc::clone(&self.jobs),
+        ));
         // The runner looks the handle up here when it is built and attaches
         // itself; until then the tool reports the missing-runner condition.
         self.subagent_handle = Some(handle.clone());
@@ -120,9 +126,11 @@ impl ToolRegistry {
     pub fn register_shell_completion(&mut self, db: ox_db::Db, bus: ox_core::event_bus::EventBus) {
         let completion = Arc::new(shell::completion::ShellCompletion::new(db, bus));
         self.remove("shell");
-        self.register_all(vec![
-            Arc::new(shell::ShellTool::new().with_completion(completion.sink())) as Arc<dyn Tool>,
-        ]);
+        self.register_all(vec![Arc::new(
+            shell::ShellTool::new()
+                .with_completion(completion.sink())
+                .with_jobs(Arc::clone(&self.jobs)),
+        ) as Arc<dyn Tool>]);
         self.shell_completion = Some(completion);
     }
 }

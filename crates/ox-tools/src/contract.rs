@@ -153,6 +153,9 @@ pub struct ToolRegistry {
     /// The completion sink the registered `shell` tool reports through, so the
     /// runner can attach its waker the moment it exists.
     pub shell_completion: Option<std::sync::Arc<crate::shell::completion::ShellCompletion>>,
+    /// Shared blocking-job registry; the server's `session.background`
+    /// endpoint reaches the foreground tools' registrations through here.
+    pub jobs: Arc<crate::jobs::Jobs>,
 }
 
 impl ToolRegistry {
@@ -200,6 +203,7 @@ impl ToolRegistry {
             definitions_cache: std::sync::OnceLock::new(),
             subagent_handle: self.subagent_handle.clone(),
             shell_completion: self.shell_completion.clone(),
+            jobs: Arc::clone(&self.jobs),
         }
     }
 
@@ -219,6 +223,7 @@ impl ToolRegistry {
             definitions_cache: std::sync::OnceLock::new(),
             subagent_handle: self.subagent_handle.clone(),
             shell_completion: self.shell_completion.clone(),
+            jobs: Arc::clone(&self.jobs),
         }
     }
 

@@ -23,6 +23,11 @@
 //! rewritten; a rewritten foreground command that outlives its yield window
 //! says so in its "still running" notice. Commands run with stdin at
 //! `/dev/null`, so interactive commands fail fast on EOF instead of hanging.
+//!
+//! A foreground run with a completion sink also registers as a job in the
+//! registry's [`crate::jobs::Jobs`], so `session.background` can end its
+//! yield window early and hand it back exactly as an overflowing run is
+//! (upstream `jobs.block` in `shell.ts`).
 
 pub mod completion;
 pub mod events;
@@ -31,6 +36,7 @@ pub mod sessions;
 mod process;
 
 use crate::contract::{Tool, ToolContext, ToolOutput};
+use crate::jobs::Jobs;
 use crate::rtk::RtkRewriter;
 use ox_schema::wire::ToolDef;
 use serde_json::{Value, json};
@@ -74,6 +80,8 @@ pub struct ShellTool {
     completion: Option<completion::SessionSink>,
     /// Optional pre-execution RTK rewrite; a disabled rewriter is a no-op.
     rtk: Arc<RtkRewriter>,
+    /// Optional job registry a blocking foreground run registers in.
+    jobs: Option<Arc<Jobs>>,
 }
 
 impl ShellTool {
@@ -83,6 +91,7 @@ impl ShellTool {
             sessions: sessions::shared(),
             completion: None,
             rtk: Arc::new(RtkRewriter::new()),
+            jobs: None,
         }
     }
 
@@ -93,6 +102,7 @@ impl ShellTool {
             sessions,
             completion: None,
             rtk: Arc::new(RtkRewriter::new()),
+            jobs: None,
         }
     }
 
@@ -106,6 +116,14 @@ impl ShellTool {
     /// Install the sink background runs report their terminal state through.
     pub fn with_completion(mut self, completion: completion::SessionSink) -> Self {
         self.completion = Some(completion);
+        self
+    }
+
+    /// Install the job registry `session.background` uses to hand a blocking
+    /// foreground run to the background. Only runs that also have a
+    /// completion sink register, so a backgrounded run is always notified.
+    pub fn with_jobs(mut self, jobs: Arc<Jobs>) -> Self {
+        self.jobs = Some(jobs);
         self
     }
 }
@@ -298,8 +316,9 @@ async fn run(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> ToolOutput {
 }
 
 /// Start one command. Fast commands settle inside the yield window and return
-/// their whole output; a command still running when the window closes returns
-/// its `session_id` and keeps running for `interact`.
+/// their whole output; a command still running when the window closes (or
+/// when `session.background` releases its job) returns its `session_id` and
+/// keeps running in the background.
 async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> ToolOutput {
     let command = match required_str("shell", input, "command") {
         Ok(command) => command,
@@ -361,7 +380,7 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
     // (`background=true` or `yield_time_ms=0`): their value is streaming
     // output, which RTK would buffer until the command exits.
     let mut rewritten = false;
-    let command = if yield_ms == 0 {
+    let to_run = if yield_ms == 0 {
         command.to_owned()
     } else {
         match tool.rtk.rewrite(command).await {
@@ -382,7 +401,7 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
         Arc::new(move |completion| sink(&session_id, completion)) as sessions::CompletionCallback
     });
     let session = match tool.sessions.spawn(sessions::SpawnRequest {
-        command,
+        command: to_run,
         cwd: workdir,
         timeout_ms: Some(timeout_ms).filter(|timeout| *timeout > 0),
         completion,
@@ -395,11 +414,28 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
         Ok(session) => session,
         Err(_) => return wrap("spawn failed".to_owned()),
     };
-    // Wait for the yield window, an interruption, or a fast exit.
+    // A foreground run that can be notified blocks its session as a job, so
+    // `session.background` can end the window early (upstream `jobs.block`,
+    // titled with the command the model sent, before any RTK rewrite).
+    let guard = match &tool.jobs {
+        Some(jobs) if yield_ms > 0 && tool.completion.is_some() => {
+            Some(jobs.block(&session.id, "shell", command, &ctx.session_id))
+        }
+        _ => None,
+    };
+    // Wait for the yield window, an interruption, a fast exit, or a
+    // user-requested background; the last one takes the overflow path below.
     if yield_ms > 0 {
+        let backgrounded = async {
+            match &guard {
+                Some(guard) => guard.backgrounded().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
         tokio::select! {
             _ = session.wait_settled(Duration::from_millis(yield_ms)) => {}
             () = ctx.cancellation.cancelled() => {}
+            () = backgrounded => {}
         }
     }
     if ctx.cancellation.is_cancelled() {
@@ -679,4 +715,77 @@ pub(crate) fn truncate_output(raw: &str) -> (String, bool, usize, usize) {
         page.to_owned()
     };
     (text, truncated, total, shown)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Instant;
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::contract::ToolRegistry;
+    use crate::jobs::JobInfo;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_background_hands_a_blocking_run_back() {
+        let sessions = Arc::new(sessions::ShellSessions::new());
+        let jobs = Arc::new(Jobs::default());
+        let sink: completion::SessionSink = Arc::new(|_: &str, _| {});
+        let tool = ShellTool::with_sessions(Arc::clone(&sessions))
+            .with_rewriter(RtkRewriter::disabled())
+            .with_completion(sink)
+            .with_jobs(Arc::clone(&jobs));
+        let ctx = ToolContext {
+            session_id: "ses_test".to_owned(),
+            directory: std::env::temp_dir(),
+            call_id: "call_test".to_owned(),
+            cancellation: CancellationToken::new(),
+            registry: Arc::new(ToolRegistry::new()),
+        };
+        // Outlives the 5 s bound below, so only the backgrounding can return it.
+        let command = "sleep 10";
+        let input = json!({ "command": command, "yield_time_ms": 30_000 });
+
+        let background = async {
+            let started = Instant::now();
+            loop {
+                let moved = jobs.background_all("ses_test");
+                if !moved.is_empty() {
+                    return moved;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "the foreground run never registered as a job",
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        let run = tokio::time::timeout(Duration::from_secs(5), run(&tool, &ctx, &input));
+        let (output, moved) = tokio::join!(run, background);
+        let output = output.expect("a backgrounded run must return before its yield window");
+
+        let metadata = output
+            .metadata
+            .expect("a background result carries metadata");
+        assert_eq!(metadata["status"], "running", "metadata: {metadata}");
+        let text = output.content.as_str().expect("text content");
+        assert!(
+            text.starts_with("Command moved to the background (shell ID:"),
+            "unexpected text: {text}",
+        );
+        let shell_id = metadata["shellID"].as_str().expect("shellID").to_owned();
+        assert_eq!(
+            moved,
+            vec![JobInfo {
+                id: shell_id.clone(),
+                kind: "shell",
+                title: command.to_owned(),
+            }],
+        );
+
+        if let Some(session) = sessions.get(&shell_id) {
+            session.stop(true).await;
+        }
+    }
 }

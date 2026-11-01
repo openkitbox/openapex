@@ -812,6 +812,7 @@ pub fn build_router(state: AppState) -> Router {
                                     ),
                                 )
                                 .push(Router::with_path("interrupt").post(session::interrupt))
+                                .push(Router::with_path("background").post(session::background))
                                 .push(Router::with_path("permission").get(session::permission_list))
                                 .push(
                                     Router::with_path("form")

@@ -7,11 +7,17 @@
 //! inbox/drain pipeline (`InboxEnqueued` + `runner.dispatch`), which is exactly
 //! how an HTTP prompt drives a session. The tool waits for the child to go
 //! idle and then reads its transcript back through the projector.
+//!
+//! A foreground wait registers as a job in the registry's
+//! [`crate::jobs::Jobs`] (id = child sessionID), so `session.background` can
+//! hand it to the background exactly as `background=true` would (upstream
+//! `subagent.ts` `jobs.block`).
 
 use serde_json::{Value, json};
 use std::borrow::Cow;
 
 use crate::contract::{READ_ONLY_AGENT, Tool, ToolContext, ToolOutput};
+use crate::jobs::Jobs;
 use ox_schema::event::SessionEventData;
 use ox_schema::support::{LocationRef, ModelRef, SessionMetadata};
 use ox_schema::wire::ToolDef;
@@ -96,13 +102,22 @@ pub struct SubagentHandle {
     /// child holds its permit from dispatch until it settles; tokio's
     /// semaphore wakes waiters in FIFO order.
     slots: Arc<Semaphore>,
+    /// The registry's job table; a foreground call blocks its parent on it.
+    jobs: Arc<Jobs>,
 }
 
 impl SubagentHandle {
     /// `max_active` is the config's `[subagent] max_active`, validated `>= 1`
     /// at load; `0` would queue every call forever, so it is refused here too.
+    /// `jobs` is the registry's shared job table, so `session.background` can
+    /// hand a blocking foreground call to the background.
     #[must_use]
-    pub fn new(db: ox_db::Db, bus: ox_core::event_bus::EventBus, max_active: usize) -> Self {
+    pub fn new(
+        db: ox_db::Db,
+        bus: ox_core::event_bus::EventBus,
+        max_active: usize,
+        jobs: Arc<Jobs>,
+    ) -> Self {
         assert!(
             max_active >= 1,
             "subagent max_active must be at least 1, got {max_active}"
@@ -112,6 +127,7 @@ impl SubagentHandle {
             bus,
             spawner: std::sync::Arc::new(std::sync::OnceLock::new()),
             slots: Arc::new(Semaphore::new(max_active)),
+            jobs,
         }
     }
 
@@ -400,23 +416,12 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
     if background {
         // The watcher outlives this turn by design: the child keeps working
         // and the parent is woken when it settles.
-        let (start, status, lead) = if queued_in_background {
-            (
-                WatcherStart::Queued {
-                    inbox_id: message_id,
-                },
-                "queued",
-                format!(
-                    "All subagent slots are busy, so the subagent is queued (sessionID: {child_id}) \
-                     and starts when a slot frees. "
-                ),
-            )
+        let start = if queued_in_background {
+            WatcherStart::Queued {
+                inbox_id: message_id,
+            }
         } else {
-            (
-                WatcherStart::Running(permit),
-                "running",
-                format!("The subagent is working in the background (sessionID: {child_id}). "),
-            )
+            WatcherStart::Running(permit)
         };
         spawn_completion_watcher(
             tool.handle.clone(),
@@ -425,23 +430,20 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
             description.clone(),
             start,
         );
-        return ok_text(format!(
-            "{lead}You will be notified automatically when it finishes.\n\
-             DO NOT sleep, poll for progress, ask the subagent for status, or duplicate \
-             this subagent's work; avoid working with the same files or topics it is using.\n\
-             Work on non-overlapping tasks, or briefly tell the user what you launched and \
-             end your response."
-        ))
-        .with_metadata(json!({
-            "sessionID": child_id,
-            "status": status,
-            "description": description,
-        }));
+        return background_output(&child_id, &description, queued_in_background);
     }
 
-    // Held until this function returns on any path, so the slot frees on
-    // success, failure, and cancellation alike.
-    let _permit = permit;
+    // `permit` is held until this function returns on any path, so the slot
+    // frees on success, failure, and cancellation alike, unless
+    // `session.background` hands it to a completion watcher below.
+    //
+    // The wait blocks the parent session as a job (upstream `jobs.block`,
+    // id = child sessionID), so `session.background` can turn this call
+    // into a background one.
+    let guard = tool
+        .handle
+        .jobs
+        .block(&child_id, "subagent", &description, &ctx.session_id);
 
     // Wait for the child to settle (or the parent's turn to be interrupted —
     // the child is cancelled with it, so nothing keeps running). Upstream has
@@ -460,7 +462,22 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
             spawner.interrupt(&child_id);
             return fail(CANCELLED_SENTINEL);
         }
+        () = guard.backgrounded() => {
+            // Same hand-off as `background=true`: the watcher takes the slot
+            // and notifies the parent when the child settles. A child that
+            // settled at this instant is reported by the watcher, once.
+            drop(guard);
+            spawn_completion_watcher(
+                tool.handle.clone(),
+                ctx.session_id.clone(),
+                child_id.clone(),
+                description.clone(),
+                WatcherStart::Running(permit),
+            );
+            return background_output(&child_id, &description, false);
+        }
     }
+    drop(guard);
 
     let history = match spawner.load_history(&child_id).await {
         Ok(history) => history,
@@ -496,6 +513,38 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         }
         ChildOutcome::Interrupted => fail(format!("Subagent cancelled (sessionID: {child_id})")),
     }
+}
+
+/// The tool result for a child handed to the background, by `background=true`
+/// or by `session.background`: `queued` when it still waits for a slot,
+/// otherwise `running`.
+fn background_output(child_id: &str, description: &str, queued: bool) -> ToolOutput {
+    let (status, lead) = if queued {
+        (
+            "queued",
+            format!(
+                "All subagent slots are busy, so the subagent is queued (sessionID: {child_id}) \
+                 and starts when a slot frees. "
+            ),
+        )
+    } else {
+        (
+            "running",
+            format!("The subagent is working in the background (sessionID: {child_id}). "),
+        )
+    };
+    ok_text(format!(
+        "{lead}You will be notified automatically when it finishes.\n\
+         DO NOT sleep, poll for progress, ask the subagent for status, or duplicate \
+         this subagent's work; avoid working with the same files or topics it is using.\n\
+         Work on non-overlapping tasks, or briefly tell the user what you launched and \
+         end your response."
+    ))
+    .with_metadata(json!({
+        "sessionID": child_id,
+        "status": status,
+        "description": description,
+    }))
 }
 
 /// What a call runs against once validated.
@@ -965,4 +1014,123 @@ fn escape(raw: &str, needs_escape: fn(char) -> bool) -> Cow<'_, str> {
         }
     }
     Cow::Owned(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    use ox_core::event_bus::EventBus;
+
+    use super::*;
+    use crate::contract::ToolRegistry;
+    use crate::jobs::JobInfo;
+
+    /// A child that stays active until `settled` flips.
+    #[derive(Default)]
+    struct StuckChild {
+        settled: AtomicBool,
+    }
+
+    impl SubagentSpawner for StuckChild {
+        fn dispatch<'a>(
+            &'a self,
+            _session_id: &'a str,
+            _inbox_id: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn is_active(&self, _session_id: &str) -> bool {
+            !self.settled.load(Ordering::SeqCst)
+        }
+
+        fn interrupt(&self, _session_id: &str) -> bool {
+            self.settled.store(true, Ordering::SeqCst);
+            true
+        }
+
+        fn load_history<'a>(&'a self, _session_id: &'a str) -> LoadHistory<'a> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn session_background_hands_a_blocking_child_back() {
+        let db = ox_db::Db::open_in_memory().await.expect("temp database");
+        let bus = EventBus::new(db.clone());
+        bus.publish(SessionEventData::SessionCreated {
+            session_id: "ses_parent".to_owned(),
+            project_id: "global".to_owned(),
+            location: LocationRef {
+                directory: std::env::temp_dir().display().to_string(),
+                workspace_id: None,
+            },
+            subpath: None,
+            parent_id: None,
+            slug: ox_schema::slug::create(),
+            title: None,
+            agent: None,
+            model: None,
+            metadata: None,
+            permissions: None,
+            version: "test".to_owned(),
+        })
+        .await
+        .expect("parent session row");
+        let jobs = Arc::new(Jobs::default());
+        let handle = Arc::new(SubagentHandle::new(db, bus, 4, Arc::clone(&jobs)));
+        let child = Arc::new(StuckChild::default());
+        handle.attach(Arc::clone(&child) as Arc<dyn SubagentSpawner>);
+        let tool = SubagentTool::new(handle, 3);
+        let ctx = ToolContext {
+            session_id: "ses_parent".to_owned(),
+            directory: std::env::temp_dir(),
+            call_id: "call_test".to_owned(),
+            cancellation: CancellationToken::new(),
+            registry: Arc::new(ToolRegistry::new()),
+        };
+        let input = json!({ "prompt": "research", "description": "look around" });
+
+        let background = async {
+            let started = Instant::now();
+            loop {
+                let moved = jobs.background_all("ses_parent");
+                if !moved.is_empty() {
+                    return moved;
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "the foreground subagent never registered as a job",
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        // The child never settles on its own, so only the backgrounding can
+        // return the call within the bound.
+        let call = tokio::time::timeout(Duration::from_secs(5), run(&tool, &ctx, &input));
+        let (output, moved) = tokio::join!(call, background);
+        let output = output.expect("a backgrounded subagent must return while its child runs");
+
+        let metadata = output
+            .metadata
+            .expect("a background result carries metadata");
+        assert_eq!(metadata["status"], "running", "metadata: {metadata}");
+        let child_id = metadata["sessionID"]
+            .as_str()
+            .expect("sessionID")
+            .to_owned();
+        assert_eq!(
+            moved,
+            vec![JobInfo {
+                id: child_id,
+                kind: "subagent",
+                title: "look around".to_owned(),
+            }],
+        );
+        // Let the detached watcher finish.
+        child.settled.store(true, Ordering::SeqCst);
+    }
 }

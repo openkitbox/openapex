@@ -2276,6 +2276,94 @@ pub(crate) async fn interrupt(req: &mut Request, depot: &mut Depot, res: &mut Re
 }
 
 // ---------------------------------------------------------------------------
+// session.background — POST /api/session/{sessionID}/background
+// ---------------------------------------------------------------------------
+
+/// Upstream `session.background` ("Move active foreground backgroundable
+/// tools for this session into background observation. Idle requests are a
+/// no-op."): every job blocking the session is handed to the background, and
+/// when any moved, a steer synthetic tells the model not to wait on it
+/// (`packages/core/src/session.ts` `Session.background`). Always 204.
+#[handler] // operation_id: session.background
+pub(crate) async fn background(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(app) = state(depot, res) else {
+        return;
+    };
+    let Some(session_id) = req.param::<String>("sessionID") else {
+        invalid_request(res, "Missing sessionID");
+        return;
+    };
+    match load_session(&app.db, &session_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            session_not_found(res, &session_id);
+            return;
+        }
+        Err(error) => {
+            unknown_error(res, &error);
+            return;
+        }
+    }
+    let moved = app.services().tools.jobs.background_all(&session_id);
+    if moved.is_empty() {
+        no_content(res);
+        return;
+    }
+
+    let message_id = id::id("msg");
+    let item = ox_schema::inbox::Item::Synthetic {
+        payload: ox_schema::inbox::SyntheticPayload {
+            text: background_notice(&moved),
+            description: None,
+            metadata: None,
+        },
+        delivery: ox_schema::inbox::Delivery::Steer,
+    };
+    if let Err(error) = app
+        .bus
+        .publish(SessionEventData::InboxEnqueued {
+            session_id: session_id.clone(),
+            inbox_id: message_id.clone(),
+            item,
+        })
+        .await
+    {
+        unknown_error(res, &error);
+        return;
+    }
+    if let Err(error) = app.runner.dispatch(&session_id, &message_id).await {
+        unknown_error(res, &error);
+        return;
+    }
+    no_content(res);
+}
+
+/// The synthetic text upstream `Session.background` writes, verbatim: one
+/// `- {type}: {title or id}` line per backgrounded job.
+fn background_notice(moved: &[ox_tools::jobs::JobInfo]) -> String {
+    use std::fmt::Write;
+
+    let mut text = String::from(
+        "User requested that active blocking work be moved to the background.\n\nBackgrounded work:\n",
+    );
+    for job in moved {
+        let label = if job.title.is_empty() {
+            &job.id
+        } else {
+            &job.title
+        };
+        writeln!(text, "- {}: {label}", job.kind).expect("writing to a String cannot fail");
+    }
+    text.push_str(
+        "\nThe backgrounded work is still unfinished. Move on to other work if you can. \
+         If there is nothing else useful to do, finish your response. Do not wait, sleep, \
+         poll, or report the backgrounded work as complete until a later completion \
+         notification is added to the conversation.",
+    );
+    text
+}
+
+// ---------------------------------------------------------------------------
 // Permission / form listings + experimental wait (client compatibility)
 // ---------------------------------------------------------------------------
 
@@ -3139,4 +3227,35 @@ fn sanitize_tool_content(content: &mut Value, id: &str) {
     }
     redact_key(map, "uri", "tool-file-uri", id);
     redact_key(map, "name", "tool-file-name", id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn background_notice_matches_upstream_text() {
+        let moved = [
+            ox_tools::jobs::JobInfo {
+                id: "shell_1".to_owned(),
+                kind: "shell",
+                title: "sleep 60".to_owned(),
+            },
+            ox_tools::jobs::JobInfo {
+                id: "ses_child".to_owned(),
+                kind: "subagent",
+                title: String::new(),
+            },
+        ];
+        assert_eq!(
+            background_notice(&moved),
+            "User requested that active blocking work be moved to the background.\n\
+             \n\
+             Backgrounded work:\n\
+             - shell: sleep 60\n\
+             - subagent: ses_child\n\
+             \n\
+             The backgrounded work is still unfinished. Move on to other work if you can. If there is nothing else useful to do, finish your response. Do not wait, sleep, poll, or report the backgrounded work as complete until a later completion notification is added to the conversation.",
+        );
+    }
 }
