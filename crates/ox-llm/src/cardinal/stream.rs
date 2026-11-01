@@ -21,8 +21,11 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use super::{CardinalError, MAX_EVENT_BYTES, MAX_LINE_BYTES};
+use super::ChatError;
 use crate::cardinal::wire::Usage;
+use crate::sse::SseDecoder;
+
+pub use crate::sse::SseFramer;
 
 /// One increment of a streaming chat response.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -55,129 +58,6 @@ pub enum StreamEvent {
     Done,
 }
 
-/// Incremental SSE framer: feed bytes, receive complete `data` payloads.
-///
-/// Only the `data` field is collected; `event:`/`id:` and any unknown field
-/// are ignored, and `:`-prefixed comment lines (cardinal's keep-alives) are
-/// dropped — the same tolerance cardinal's framer shows.
-#[derive(Debug, Default)]
-pub struct SseFramer {
-    line: Vec<u8>,
-    data: Vec<u8>,
-    event_bytes: usize,
-    skip_lf: bool,
-    started: bool,
-}
-
-impl SseFramer {
-    /// A fresh framer.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Feed one byte chunk, appending every completed payload to `out`.
-    pub fn push(&mut self, chunk: &[u8], out: &mut Vec<String>) -> Result<(), CardinalError> {
-        let mut bytes = chunk;
-        if !self.started {
-            self.started = true;
-            if bytes.len() >= 3 && bytes[..3] == [0xEF, 0xBB, 0xBF] {
-                bytes = &bytes[3..];
-            }
-        }
-        for byte in bytes {
-            if self.skip_lf {
-                self.skip_lf = false;
-                if *byte == b'\n' {
-                    continue;
-                }
-            }
-            match byte {
-                b'\n' => self.end_line(out)?,
-                b'\r' => {
-                    self.end_line(out)?;
-                    self.skip_lf = true;
-                }
-                _ => {
-                    self.line.push(*byte);
-                    if self.line.len() > MAX_LINE_BYTES {
-                        return Err(CardinalError::Sse(format!(
-                            "SSE line exceeds {MAX_LINE_BYTES} bytes"
-                        )));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Flush a trailing partial line/event (a connection that closed without a
-    /// final blank line). Returns any final payload via `out`.
-    pub fn finish(&mut self, out: &mut Vec<String>) {
-        if !self.line.is_empty() {
-            // Ignore framing errors on the flush path: the event boundary is
-            // best-effort, and an oversized trailing line is reported on the
-            // next `push` anyway.
-            let _ = self.end_line(out);
-        }
-        if !self.data.is_empty() {
-            out.push(self.take_event());
-        }
-    }
-
-    fn end_line(&mut self, out: &mut Vec<String>) -> Result<(), CardinalError> {
-        let line = std::mem::take(&mut self.line);
-        if line.is_empty() {
-            if !self.data.is_empty() {
-                out.push(self.take_event());
-            }
-            return Ok(());
-        }
-        // Comment (keep-alive) lines: everything up to the first `:` is the
-        // field; a leading `:` means the whole line is a comment.
-        if line[0] == b':' {
-            return Ok(());
-        }
-        let value = match line.iter().position(|byte| *byte == b':') {
-            Some(position) => {
-                let mut value = &line[position + 1..];
-                if value.first() == Some(&b' ') {
-                    value = &value[1..];
-                }
-                value
-            }
-            // A line without a colon is a field with an empty value; for a
-            // `data`-only consumer it carries nothing.
-            None => return Ok(()),
-        };
-        if line[0] != b'd' || !line.starts_with(b"data:") {
-            // `event:`, `id:`, and unknown fields are ignored.
-            return Ok(());
-        }
-        let value = std::str::from_utf8(value)
-            .map_err(|_| CardinalError::Sse("SSE payload is not valid UTF-8".to_owned()))?;
-        self.event_bytes += value.len() + 1;
-        if self.event_bytes > MAX_EVENT_BYTES {
-            return Err(CardinalError::Sse(format!(
-                "SSE event exceeds {MAX_EVENT_BYTES} bytes"
-            )));
-        }
-        self.data.extend_from_slice(value.as_bytes());
-        self.data.push(b'\n');
-        Ok(())
-    }
-
-    fn take_event(&mut self) -> String {
-        if self.data.last() == Some(&b'\n') {
-            self.data.pop();
-        }
-        self.event_bytes = 0;
-        let payload = String::from_utf8_lossy(&self.data).into_owned();
-        self.data.clear();
-        payload
-    }
-}
-
 /// Decodes cardinal's Chat SSE payloads into [`StreamEvent`]s.
 ///
 /// Mirrors `cardinal/src/protocol/openai_chat.rs`'s `StreamDecoder`: text and
@@ -187,6 +67,12 @@ impl SseFramer {
 #[derive(Debug, Default)]
 pub struct ChunkDecoder {
     tool_index: u32,
+}
+
+impl SseDecoder for ChunkDecoder {
+    fn decode(&mut self, payload: &str, out: &mut Vec<StreamEvent>) -> Result<(), ChatError> {
+        ChunkDecoder::decode(self, payload, out)
+    }
 }
 
 impl ChunkDecoder {
@@ -201,12 +87,8 @@ impl ChunkDecoder {
     /// `[DONE]` yields [`StreamEvent::Done`]; an empty payload yields nothing.
     /// A payload that is not valid JSON is fatal (cardinal returns a failed
     /// turn for it too); an in-band `error` object becomes
-    /// [`CardinalError::Upstream`].
-    pub fn decode(
-        &mut self,
-        payload: &str,
-        out: &mut Vec<StreamEvent>,
-    ) -> Result<(), CardinalError> {
+    /// [`ChatError::Upstream`].
+    pub fn decode(&mut self, payload: &str, out: &mut Vec<StreamEvent>) -> Result<(), ChatError> {
         let data = payload.trim();
         if data.is_empty() {
             return Ok(());
@@ -216,11 +98,11 @@ impl ChunkDecoder {
             return Ok(());
         }
         let value: serde_json::Value = serde_json::from_str(data)
-            .map_err(|error| CardinalError::Sse(format!("invalid JSON payload: {error}")))?;
+            .map_err(|error| ChatError::Sse(format!("invalid JSON payload: {error}")))?;
         if let Some(error) = value.get("error")
             && !error.is_null()
         {
-            return Err(CardinalError::Upstream(describe_error(error)));
+            return Err(ChatError::Upstream(describe_error(error)));
         }
         if let Some(usage) = usage_from(&value) {
             out.push(StreamEvent::Usage(usage));

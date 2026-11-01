@@ -6,7 +6,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use ox_core::copied_tags::strip_copied_tag_notation;
-use ox_llm::cardinal::CardinalError;
+use ox_llm::cardinal::ChatError;
 use ox_llm::cardinal::chat::BoxChatStream;
 use ox_llm::cardinal::stream::StreamEvent;
 use ox_llm::cardinal::wire::{ChatRequest, Usage};
@@ -73,7 +73,7 @@ pub(super) async fn consume(
 
     loop {
         enum Next {
-            Event(Option<Result<StreamEvent, CardinalError>>),
+            Event(Option<Result<StreamEvent, ChatError>>),
             Cancelled,
         }
         let next = tokio::select! {

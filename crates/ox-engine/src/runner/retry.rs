@@ -1,6 +1,6 @@
 //! Retry policy for transient provider failures.
 //!
-//! Owns two decisions and nothing else: which [`CardinalError`]s are worth
+//! Owns two decisions and nothing else: which [`ChatError`]s are worth
 //! retrying ([`classify`]) and how long to wait, or whether to give up
 //! ([`Backoff::on_failure`]). Pure, no I/O; the caller (`step.rs`) owns
 //! events, sleeping and settlement.
@@ -18,12 +18,12 @@
 //!
 //! Deliberate deviations from upstream `model-retry.ts`: network-class errors
 //! retry without limit, the per-step continuation cap, and there is no jitter
-//! and no `retry-after` handling (`CardinalError::Http` carries no headers;
+//! and no `retry-after` handling (`ChatError::Http` carries no headers;
 //! single user, no thundering herd).
 
 use std::time::Duration;
 
-use ox_llm::cardinal::CardinalError;
+use ox_llm::cardinal::ChatError;
 
 /// Maximum consecutive failures for [`RetryKind::Bounded`] errors (upstream
 /// `model-retry.ts` `recurs(10)`).
@@ -51,9 +51,9 @@ pub(crate) enum RetryKind {
 
 /// Classify a provider error. Exhaustive on purpose: a new variant must get an
 /// explicit decision here.
-pub(crate) fn classify(error: &CardinalError) -> RetryKind {
+pub(crate) fn classify(error: &ChatError) -> RetryKind {
     match error {
-        CardinalError::Transport(e) => {
+        ChatError::Transport(e) => {
             // `is_decode()` is a body read failure (reqwest wraps every
             // `Response::chunk()` error as decode; ox-llm never parses JSON
             // through reqwest), so it falls through to `Network`.
@@ -65,13 +65,13 @@ pub(crate) fn classify(error: &CardinalError) -> RetryKind {
                 RetryKind::Network
             }
         }
-        CardinalError::EarlyClose => RetryKind::Network,
-        CardinalError::Http { status, .. } => match *status {
+        ChatError::EarlyClose => RetryKind::Network,
+        ChatError::Http { status, .. } => match *status {
             408 | 429 | 500.. => RetryKind::Bounded,
             _ => RetryKind::Never,
         },
-        CardinalError::Upstream(_) | CardinalError::Sse(_) => RetryKind::Bounded,
-        CardinalError::NoRoute { .. } => RetryKind::Never,
+        ChatError::Upstream(_) | ChatError::Sse(_) => RetryKind::Bounded,
+        ChatError::NoRoute { .. } => RetryKind::Never,
     }
 }
 

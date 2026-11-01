@@ -637,11 +637,19 @@ async fn provider_list(req: &mut Request, depot: &mut Depot, res: &mut Response)
         if data.iter().any(|p| p.id == m.provider) {
             continue;
         }
-        // Display name: capitalize the provider id ("cardinal" → "Cardinal").
-        let mut name = m.provider.clone();
-        if let Some(first) = name.chars().next() {
-            name = first.to_uppercase().collect::<String>() + &name[first.len_utf8()..];
-        }
+        // Display name: the builtin's own label when there is one
+        // ("deepseek" → "DeepSeek"), else the capitalized id
+        // ("cardinal" → "Cardinal").
+        let name = match ox_llm::config::builtin(&m.provider) {
+            Some(builtin) => builtin.label.to_owned(),
+            None => {
+                let mut name = m.provider.clone();
+                if let Some(first) = name.chars().next() {
+                    name = first.to_uppercase().collect::<String>() + &name[first.len_utf8()..];
+                }
+                name
+            }
+        };
         data.push(ProviderInfo {
             id: m.provider.clone(),
             name,

@@ -21,7 +21,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
 
-use crate::config::{CandidateConfig, DEFAULT_PROVIDER_NAME, LlmConfig};
+use crate::config::{
+    BuiltinProvider, CandidateConfig, DEFAULT_PROVIDER_NAME, LlmConfig, SeedModel,
+};
 
 /// One model as the client sees it, built from the gateway's model list
 /// ([`crate::model_catalog`]).
@@ -73,8 +75,11 @@ pub struct ReasoningLevel {
 /// that wants a fresh list after a change restarts or waits one TTL.
 const CATALOG_TTL: Duration = Duration::from_secs(300);
 
-/// `GET /v1/models` — the OpenAI list shape each endpoint serves.
+/// `GET /v1/models` — the OpenAI list shape each gateway serves.
 const MODELS_PATH: &str = "/v1/models";
+/// `GET /models` — where a builtin provider publishes its list (origin root,
+/// no version segment and no protocol prefix).
+const BUILTIN_MODELS_PATH: &str = "/models";
 
 /// One endpoint to list models from.
 struct CatalogEndpoint {
@@ -82,6 +87,15 @@ struct CatalogEndpoint {
     name: String,
     base_url: String,
     api_key: Option<String>,
+    /// Where the endpoint lists models (`/v1/models` for OpenAI-compatible
+    /// gateways, `/models` for DeepSeek, which publishes it at the origin).
+    models_path: &'static str,
+    /// Metadata this build ships for the endpoint's models, used to fill gaps
+    /// in the endpoint's own list and as the whole list when it is unreachable.
+    seeds: &'static [SeedModel],
+    /// Set for a credential-resolved builtin provider: the table row, so the
+    /// merge can report its label and the provider name it owns.
+    builtin: Option<&'static BuiltinProvider>,
 }
 
 /// A fetched model catalogue with a TTL cache.
@@ -123,6 +137,9 @@ impl ModelCatalog {
                 name: DEFAULT_PROVIDER_NAME.to_owned(),
                 base_url: config.cardinal_url.trim_end_matches('/').to_owned(),
                 api_key: config.cardinal_key.clone().filter(|key| !key.is_empty()),
+                models_path: MODELS_PATH,
+                seeds: &[],
+                builtin: None,
             },
         );
         // A [providers.cardinal] section overrides the implicit endpoint.
@@ -133,6 +150,33 @@ impl ModelCatalog {
                     name: name.clone(),
                     base_url: provider.base_url.trim_end_matches('/').to_owned(),
                     api_key: provider.api_key.clone().filter(|key| !key.is_empty()),
+                    models_path: MODELS_PATH,
+                    seeds: &[],
+                    builtin: None,
+                },
+            );
+        }
+        // Builtin providers list from their own origin: DeepSeek publishes
+        // `GET /models` at the root, and its Messages base carries an
+        // `/anthropic` prefix that the listing must not inherit.
+        for (name, resolved) in &config.builtins {
+            endpoints.insert(
+                name.clone(),
+                CatalogEndpoint {
+                    name: name.clone(),
+                    base_url: resolved
+                        .builtin
+                        .models_base_url
+                        .trim_end_matches('/')
+                        .to_owned(),
+                    api_key: resolved
+                        .config
+                        .api_key
+                        .clone()
+                        .filter(|key| !key.is_empty()),
+                    models_path: BUILTIN_MODELS_PATH,
+                    seeds: resolved.builtin.models,
+                    builtin: Some(resolved.builtin),
                 },
             );
         }
@@ -200,45 +244,7 @@ impl ModelCatalog {
     /// gateway decides), else the first model by id. `None` only when the
     /// catalogue is empty and nothing is configured.
     pub fn default_entry(&self, config: &LlmConfig) -> Option<ModelEntry> {
-        let entries = self.cached();
-        if let Some(qualified) = &config.default_model {
-            let (provider, id) = qualified
-                .split_once('/')
-                .unwrap_or((DEFAULT_PROVIDER_NAME, qualified.as_str()));
-            if let Some(found) = entries
-                .iter()
-                .find(|entry| entry.id == id && entry.provider == provider)
-            {
-                if Self::is_chat_compatible(found) {
-                    return Some(found.clone());
-                }
-                return entries
-                    .iter()
-                    .find(|entry| Self::is_chat_compatible(entry))
-                    .cloned();
-            }
-            return Some(ModelEntry {
-                provider: provider.to_owned(),
-                id: id.to_owned(),
-                name: None,
-                model_type: None,
-                context: None,
-                input: None,
-                output: None,
-                temperature: None,
-                reasoning: false,
-                supported_reasoning_levels: Vec::new(),
-            });
-        }
-        entries
-            .iter()
-            .find(|entry| {
-                matches!(
-                    entry.model_type.as_deref().unwrap_or("chat"),
-                    "chat" | "text"
-                )
-            })
-            .cloned()
+        pick_default(&self.cached(), config)
     }
 
     fn is_chat_compatible(entry: &ModelEntry) -> bool {
@@ -284,6 +290,18 @@ impl ModelCatalog {
         for endpoint in &self.endpoints {
             match self.fetch_endpoint(endpoint).await {
                 Ok(mut fetched) => entries.append(&mut fetched),
+                // A builtin ships its model table, so an unreachable list is a
+                // degraded start, not an empty catalogue: the seeds are the
+                // same entries the endpoint would have reported, minus any it
+                // added since this build.
+                Err(error) if !endpoint.seeds.is_empty() => {
+                    tracing::warn!(
+                        provider = %endpoint.name,
+                        error = %error,
+                        "model list fetch failed; serving the built-in model seeds"
+                    );
+                    entries.extend(seeded_entries(endpoint));
+                }
                 Err(error) => {
                     failures += 1;
                     tracing::warn!(
@@ -339,27 +357,36 @@ impl ModelCatalog {
 
     /// Fetch and parse one endpoint's model list.
     async fn fetch_endpoint(&self, endpoint: &CatalogEndpoint) -> Result<Vec<ModelEntry>> {
-        let mut request = self
-            .client
-            .get(format!("{}{MODELS_PATH}", endpoint.base_url));
+        let url = format!("{}{}", endpoint.base_url, endpoint.models_path);
+        let mut request = self.client.get(&url);
         if let Some(key) = &endpoint.api_key {
             request = request.bearer_auth(key);
         }
-        let response = request.send().await.context("call GET /v1/models")?;
+        let response = request
+            .send()
+            .await
+            .with_context(|| format!("call GET {url}"))?;
         let status = response.status();
         let body = response.text().await.context("read the model list")?;
         if !status.is_success() {
             anyhow::bail!(
-                "GET /v1/models returned HTTP {status}: {}",
+                "GET {url} returned HTTP {status}: {}",
                 body.chars().take(200).collect::<String>()
             );
         }
         let list: ModelList = serde_json::from_str(&body).context("parse the model list")?;
-        Ok(list
+        let mut entries: Vec<ModelEntry> = list
             .data
             .into_iter()
             .map(|row| row.into_entry(&endpoint.name))
-            .collect())
+            .collect();
+        for entry in &mut entries {
+            merge_seed(entry, endpoint.seeds);
+        }
+        if entries.is_empty() && !endpoint.seeds.is_empty() {
+            entries = seeded_entries(endpoint);
+        }
+        Ok(entries)
     }
 
     /// The served model face when `[models]` is configured: one entry per
@@ -403,6 +430,120 @@ impl ModelCatalog {
     }
 }
 
+/// The default-model decision over one catalogue snapshot.
+///
+/// Pure — no cache and no IO — so the rule can be exercised without a gateway:
+/// `config.default_model` when the snapshot reports it, the configured
+/// reference verbatim when it does not (the endpoint decides), a materialized
+/// builtin's first model when nothing is pinned, else the first chat-capable
+/// entry.
+fn pick_default(entries: &[ModelEntry], config: &LlmConfig) -> Option<ModelEntry> {
+    if let Some(qualified) = &config.default_model {
+        let (provider, id) = qualified
+            .split_once('/')
+            .unwrap_or((DEFAULT_PROVIDER_NAME, qualified.as_str()));
+        if let Some(found) = entries
+            .iter()
+            .find(|entry| entry.id == id && entry.provider == provider)
+        {
+            if ModelCatalog::is_chat_compatible(found) {
+                return Some(found.clone());
+            }
+            return entries
+                .iter()
+                .find(|entry| ModelCatalog::is_chat_compatible(entry))
+                .cloned();
+        }
+        return Some(ModelEntry {
+            provider: provider.to_owned(),
+            id: id.to_owned(),
+            name: None,
+            model_type: None,
+            context: None,
+            input: None,
+            output: None,
+            temperature: None,
+            reasoning: false,
+            supported_reasoning_levels: Vec::new(),
+        });
+    }
+    // A materialized builtin exists only because the operator supplied a
+    // credential for it, which is a stronger statement of intent than the
+    // implicit gateway: its first model wins when nothing is pinned.
+    entries
+        .iter()
+        .find(|entry| ModelCatalog::is_chat_compatible(entry) && config.is_builtin(&entry.provider))
+        .or_else(|| {
+            entries
+                .iter()
+                .find(|entry| ModelCatalog::is_chat_compatible(entry))
+        })
+        .cloned()
+}
+
+/// The seed entries that stand in for an endpoint whose list is unreachable.
+///
+/// The provider label is the builtin's own id, the same string its listing
+/// puts in `owned_by`, so the projection and the routing agree about who owns
+/// these models.
+fn seeded_entries(endpoint: &CatalogEndpoint) -> Vec<ModelEntry> {
+    endpoint
+        .seeds
+        .iter()
+        .map(|seed| seed_entry(endpoint, seed))
+        .collect()
+}
+
+/// One seed rendered as a catalogue entry.
+fn seed_entry(endpoint: &CatalogEndpoint, seed: &SeedModel) -> ModelEntry {
+    ModelEntry {
+        provider: endpoint
+            .builtin
+            .map_or_else(|| endpoint.name.clone(), |builtin| builtin.id.to_owned()),
+        id: seed.id.to_owned(),
+        name: None,
+        model_type: None,
+        context: Some(seed.context),
+        input: None,
+        output: Some(seed.output),
+        temperature: Some(false),
+        reasoning: !seed.reasoning.is_empty(),
+        supported_reasoning_levels: seed
+            .reasoning
+            .iter()
+            .map(|effort| ReasoningLevel {
+                effort: (*effort).to_owned(),
+            })
+            .collect(),
+    }
+}
+
+/// Fill an endpoint-reported entry from the build's seed for the same id.
+///
+/// The endpoint wins wherever it states something (a newer context window is
+/// real); the seed only fills what the listing left out — which, for
+/// DeepSeek's short rows, is the output cap and every reasoning level.
+fn merge_seed(entry: &mut ModelEntry, seeds: &'static [SeedModel]) {
+    let Some(seed) = seeds.iter().find(|seed| seed.id == entry.id) else {
+        return;
+    };
+    entry.context = entry.context.or(Some(seed.context));
+    entry.output = entry.output.or(Some(seed.output));
+    entry.temperature.get_or_insert(false);
+    if !seed.reasoning.is_empty() {
+        entry.reasoning = true;
+        if entry.supported_reasoning_levels.is_empty() {
+            entry.supported_reasoning_levels = seed
+                .reasoning
+                .iter()
+                .map(|effort| ReasoningLevel {
+                    effort: (*effort).to_owned(),
+                })
+                .collect();
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct ModelList {
     data: Vec<ModelRow>,
@@ -424,6 +565,11 @@ struct ModelRow {
     context_window: Option<i64>,
     #[serde(default)]
     max_input_tokens: Option<i64>,
+    /// Output cap, as DeepSeek's listing reports it.
+    #[serde(default)]
+    max_output_tokens: Option<i64>,
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     temperature: Option<bool>,
     /// Reasoning metadata, present only on rows whose upstream members
@@ -440,18 +586,103 @@ impl ModelRow {
             provider: self
                 .owned_by
                 .unwrap_or_else(|| fallback_provider.to_owned()),
-            name: None,
+            name: self.name,
             model_type: self.model_type,
             context: self
                 .context_length
                 .or(self.context_window)
                 .or(self.max_input_tokens),
             input: self.max_input_tokens,
-            output: None,
+            output: self.max_output_tokens,
             temperature: self.temperature,
             id: self.id,
             reasoning: self.reasoning,
             supported_reasoning_levels: self.supported_reasoning_levels,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(provider: &str, id: &str, model_type: Option<&str>) -> ModelEntry {
+        ModelEntry {
+            provider: provider.to_owned(),
+            id: id.to_owned(),
+            name: None,
+            model_type: model_type.map(str::to_owned),
+            context: Some(1_000),
+            input: None,
+            output: Some(100),
+            temperature: Some(false),
+            reasoning: false,
+            supported_reasoning_levels: Vec::new(),
+        }
+    }
+
+    /// A config whose `deepseek` builtin materialized from the credential store
+    /// — never from the environment, so the assertion cannot depend on whether
+    /// the host exports `DEEPSEEK_API_KEY`.
+    fn config_with_deepseek_builtin() -> LlmConfig {
+        let mut credentials = crate::credentials::Credentials::default();
+        credentials.set(crate::config::DEEPSEEK, "sk-test");
+        let mut config = LlmConfig::default();
+        config.apply_credentials(&credentials);
+        config
+    }
+
+    #[test]
+    fn an_unpinned_default_prefers_the_materialized_builtin() {
+        let config = config_with_deepseek_builtin();
+        let entries = [
+            entry("cardinal", "k3-256k", None),
+            entry("deepseek", "deepseek-flash", None),
+        ];
+        let picked = pick_default(&entries, &config).expect("a chat entry");
+        assert_eq!(
+            (picked.provider.as_str(), picked.id.as_str()),
+            ("deepseek", "deepseek-flash"),
+            "a supplied provider key states intent more strongly than the implicit gateway"
+        );
+    }
+
+    #[test]
+    fn a_pinned_default_wins_over_the_builtin() {
+        let mut config = config_with_deepseek_builtin();
+        config.default_model = Some("cardinal/k3-256k".to_owned());
+        let entries = [
+            entry("cardinal", "k3-256k", None),
+            entry("deepseek", "deepseek-flash", None),
+        ];
+        let picked = pick_default(&entries, &config).expect("a chat entry");
+        assert_eq!(picked.provider, "cardinal");
+    }
+
+    #[test]
+    fn a_pinned_default_the_catalogue_lacks_is_returned_verbatim() {
+        let mut config = config_with_deepseek_builtin();
+        config.default_model = Some("deepseek/deepseek-v9".to_owned());
+        let entries = [entry("cardinal", "k3-256k", None)];
+        let picked = pick_default(&entries, &config).expect("the configured reference");
+        assert_eq!(
+            (picked.provider.as_str(), picked.id.as_str()),
+            ("deepseek", "deepseek-v9"),
+            "an unreported id is sent verbatim: the endpoint decides whether it exists"
+        );
+    }
+
+    #[test]
+    fn without_a_builtin_the_first_chat_entry_wins() {
+        let config = LlmConfig::default();
+        let entries = [
+            entry("cardinal", "embed-1", Some("embedding")),
+            entry("cardinal", "k3-256k", None),
+        ];
+        let picked = pick_default(&entries, &config).expect("a chat entry");
+        assert_eq!(
+            picked.id, "k3-256k",
+            "an embedding must never become the default chat model"
+        );
     }
 }

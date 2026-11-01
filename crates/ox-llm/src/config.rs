@@ -9,7 +9,9 @@ use std::num::{NonZeroU64, NonZeroUsize};
 use std::time::Duration;
 
 use anyhow::Result;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+
+use crate::credentials::Credentials;
 
 const DEFAULT_CARDINAL_URL: &str = "http://127.0.0.1:10202";
 
@@ -84,21 +86,216 @@ impl EndpointLimits {
     }
 }
 
+/// The wire protocol an endpoint speaks.
+///
+/// The protocol decides both the request shape and the path ox appends to
+/// `base_url`, so the two can never disagree:
+///
+/// | protocol | path appended to `base_url` |
+/// |---|---|
+/// | [`Protocol::ChatCompletions`] | `/v1/chat/completions` (and `/v1/models`) |
+/// | [`Protocol::Messages`] | `/v1/messages` (and `/v1/models`) |
+///
+/// `base_url` is still "the part before the version suffix": for a Messages
+/// endpoint that already carries its own path prefix (DeepSeek publishes
+/// `https://api.deepseek.com/anthropic`), configure that whole prefix — ox
+/// only appends `/v1/messages`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum Protocol {
+    /// OpenAI Chat Completions — the historical ox default.
+    #[default]
+    #[serde(rename = "chat_completions", alias = "completions")]
+    ChatCompletions,
+    /// Anthropic Messages (also served by DeepSeek under `/anthropic`).
+    #[serde(rename = "messages")]
+    Messages,
+}
+
+impl Protocol {
+    /// The path ox appends to a provider's `base_url` for a streaming chat
+    /// request.
+    #[must_use]
+    pub fn chat_path(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "/v1/chat/completions",
+            Self::Messages => "/v1/messages",
+        }
+    }
+
+    /// The path ox appends to a provider's `base_url` to list models.
+    #[must_use]
+    pub fn models_path(self) -> &'static str {
+        "/v1/models"
+    }
+}
+
 /// One configured outbound endpoint (`[providers.<name>]`).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ProviderConfig {
-    /// OpenAI-compatible base URL **without** the `/v1` suffix: ox appends
-    /// `/v1/chat/completions` and `/v1/models` itself. For vendors publishing
-    /// `…/v1` or `…/v4` bases, configure the part before the suffix
-    /// (`https://api.moonshot.ai`, `https://open.bigmodel.cn/api/paas`).
+    /// Base URL **without** the version suffix: ox appends the protocol's
+    /// path (see [`Protocol`]). For vendors publishing `…/v1` or `…/v4`
+    /// bases, configure the part before the suffix (`https://api.moonshot.ai`,
+    /// `https://open.bigmodel.cn/api/paas`); a vendor that publishes a
+    /// protocol prefix (`https://api.deepseek.com/anthropic`) keeps it.
+    ///
+    /// Omitting it is only valid for a builtin id, which then takes the
+    /// builtin's own endpoint (see [`LlmConfig::apply_credentials`]).
+    #[serde(default)]
     pub base_url: String,
     /// Bearer key for `Authorization`; omitted for gateways that need none.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Wire protocol this endpoint speaks. Unstated resolves to chat
+    /// completions, except for a `[providers.<id>]` section that omits
+    /// `base_url` for a builtin id: that section inherits the builtin's
+    /// endpoint *and* protocol (see [`LlmConfig::apply_credentials`]).
+    #[serde(default)]
+    pub protocol: Option<Protocol>,
     /// `max_concurrent` / `stall_timeout_secs` for this endpoint; see
     /// [`EndpointLimits`].
     #[serde(default, flatten)]
     pub limits: EndpointLimits,
+}
+
+impl ProviderConfig {
+    /// The protocol this endpoint speaks: the stated one, else the historical
+    /// chat-completions default.
+    #[must_use]
+    pub fn protocol(&self) -> Protocol {
+        self.protocol.unwrap_or_default()
+    }
+}
+
+/// One model a builtin provider ships metadata for.
+///
+/// The catalogue still prefers what the endpoint reports (`GET /v1/models`);
+/// these seeds carry what a list often omits (output limits, reasoning levels)
+/// and stand in when the list is unreachable on a fresh start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SeedModel {
+    /// Wire model id.
+    pub id: &'static str,
+    /// Context window in tokens.
+    pub context: i64,
+    /// Maximum output tokens.
+    pub output: i64,
+    /// Reasoning variant names the model accepts, in display order; empty for
+    /// a model that does not think.
+    pub reasoning: &'static [&'static str],
+}
+
+/// A provider ox ships defaults for: base URLs, protocol, credential
+/// environment variable and model seeds.
+///
+/// Unlike `[providers.<name>]` (the operator's own endpoints), a builtin is
+/// only materialized when it has a credential — from `ox.toml`, the
+/// credential file, or its environment variable. A builtin without one does
+/// not exist at all, so it cannot shadow the implicit `cardinal_url` endpoint
+/// or advertise models that cannot answer.
+#[derive(Debug, Clone, Copy)]
+pub struct BuiltinProvider {
+    /// Provider id (`deepseek`); also the `[providers.<id>]` key that
+    /// overrides it and the `provider` the catalogue reports.
+    pub id: &'static str,
+    /// Human name for the `/connect` dialog and provider listing.
+    pub label: &'static str,
+    /// Base URL for [`Protocol::ChatCompletions`] — no version suffix.
+    pub completions_base_url: &'static str,
+    /// Base URL for [`Protocol::Messages`] — may carry a path prefix
+    /// (`https://api.deepseek.com/anthropic`), still no version suffix.
+    pub messages_base_url: &'static str,
+    /// Base URL answering `GET /v1/models`.
+    pub models_base_url: &'static str,
+    /// The protocol used when the operator has not chosen one.
+    pub protocol: Protocol,
+    /// Environment variable that can supply the key
+    /// (`DEEPSEEK_API_KEY`).
+    pub env_key: &'static str,
+    /// Seed models, first one first — the default model when nothing is
+    /// selected.
+    pub models: &'static [SeedModel],
+}
+
+impl BuiltinProvider {
+    /// The base URL for `protocol`.
+    #[must_use]
+    pub fn base_url(&self, protocol: Protocol) -> &'static str {
+        match protocol {
+            Protocol::ChatCompletions => self.completions_base_url,
+            Protocol::Messages => self.messages_base_url,
+        }
+    }
+
+    /// Whether `model` belongs to this provider's namespace: one of the seeds,
+    /// or an id carrying the provider's own prefix (`deepseek-…`).
+    ///
+    /// The prefix rule is what routes a model the endpoint added after this
+    /// build shipped, without a `[models]` route for it: provider ids are
+    /// chosen to prefix their model ids for exactly this reason.
+    #[must_use]
+    pub fn owns(&self, model: &str) -> bool {
+        self.models.iter().any(|seed| seed.id == model)
+            || model
+                .strip_prefix(self.id)
+                .is_some_and(|rest| rest.starts_with('-') || rest.starts_with('/'))
+    }
+}
+
+/// Every provider ox ships defaults for.
+pub static BUILTINS: &[BuiltinProvider] = &[BuiltinProvider {
+    id: DEEPSEEK,
+    label: "DeepSeek",
+    completions_base_url: "https://api.deepseek.com",
+    messages_base_url: "https://api.deepseek.com/anthropic",
+    models_base_url: "https://api.deepseek.com",
+    protocol: Protocol::Messages,
+    env_key: ENV_DEEPSEEK_KEY,
+    models: &[
+        SeedModel {
+            id: "deepseek-flash",
+            context: 1_048_576,
+            output: 256_000,
+            reasoning: &["off", "low", "high", "max"],
+        },
+        SeedModel {
+            id: "deepseek-v4-pro",
+            context: 1_048_576,
+            output: 256_000,
+            reasoning: &["off", "high", "max"],
+        },
+    ],
+}];
+
+/// The key for `builtin`: the credential file first, then its environment
+/// variable. An empty value counts as absent.
+fn stored_key(credentials: &Credentials, builtin: &BuiltinProvider) -> Option<String> {
+    if let Some(key) = credentials.key(builtin.id) {
+        return Some(key.to_owned());
+    }
+    std::env::var(builtin.env_key)
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+}
+
+/// The DeepSeek provider id.
+pub const DEEPSEEK: &str = "deepseek";
+
+/// The environment variable that can supply the DeepSeek key.
+pub const ENV_DEEPSEEK_KEY: &str = "DEEPSEEK_API_KEY";
+
+/// The builtin provider with `id`, if one exists.
+#[must_use]
+pub fn builtin(id: &str) -> Option<&'static BuiltinProvider> {
+    BUILTINS.iter().find(|builtin| builtin.id == id)
+}
+
+/// A builtin provider whose credentials resolved at load time.
+#[derive(Debug, Clone)]
+pub struct ResolvedBuiltin {
+    /// The table row this was materialized from.
+    pub builtin: &'static BuiltinProvider,
+    /// The endpoint it contributes: base URL, key, protocol.
+    pub config: ProviderConfig,
 }
 
 /// One ordered fallback target inside a `[models.<id>]` route.
@@ -139,6 +336,11 @@ pub struct LlmConfig {
     /// the implicit `cardinal_url` endpoint serves everything (legacy mode).
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
+    /// Builtin providers whose credentials resolved at load time (see
+    /// [`BuiltinProvider`]). Never read from `ox.toml`: a section there is a
+    /// normal `[providers]` entry and wins outright.
+    #[serde(skip)]
+    pub builtins: BTreeMap<String, ResolvedBuiltin>,
     /// ox's logical model surface with ordered candidate routes
     /// (`[models.<id>]`). Explicit candidates win over the implicit
     /// endpoint; once `[providers]` is non-empty, unrouted models are
@@ -170,6 +372,7 @@ impl Default for LlmConfig {
             cardinal_key: None,
             cardinal_limits: EndpointLimits::default(),
             providers: BTreeMap::new(),
+            builtins: BTreeMap::new(),
             models: BTreeMap::new(),
             context_caps: BTreeMap::new(),
             default_model: None,
@@ -178,6 +381,86 @@ impl Default for LlmConfig {
 }
 
 impl LlmConfig {
+    /// Resolve every builtin provider's credentials and materialize the ones
+    /// that have a key.
+    ///
+    /// Precedence for a builtin: a `[providers.<id>] api_key` in `ox.toml`,
+    /// then the credential file (`/connect`'s store), then the provider's
+    /// environment variable. A builtin with no key is *not* materialized at
+    /// all — it cannot shadow the implicit `cardinal_url` endpoint, cannot
+    /// advertise models that would 401, and never turns a missing key into a
+    /// silent fallback. A `[providers.<id>]` section that exists but has no key
+    /// gets the same resolution, so `[providers.deepseek] base_url = "…"`
+    /// alone still works with `DEEPSEEK_API_KEY` set.
+    pub fn apply_credentials(&mut self, credentials: &Credentials) {
+        for builtin in BUILTINS {
+            if let Some(provider) = self.providers.get_mut(builtin.id) {
+                // `[providers.deepseek]` without a `base_url` is the one-line
+                // override form: it means "the builtin's own endpoint", so the
+                // base URL and the protocol both come from the builtin. Naming
+                // a base URL makes the section an ordinary endpoint, where an
+                // unstated protocol is chat completions.
+                if provider.base_url.trim().is_empty() {
+                    let protocol = provider.protocol.unwrap_or(builtin.protocol);
+                    provider.protocol = Some(protocol);
+                    provider.base_url = builtin.base_url(protocol).to_owned();
+                }
+                if provider.api_key.as_deref().is_none_or(str::is_empty) {
+                    provider.api_key = stored_key(credentials, builtin);
+                }
+                continue;
+            }
+            let Some(api_key) = stored_key(credentials, builtin) else {
+                continue;
+            };
+            let protocol = builtin.protocol;
+            self.builtins.insert(
+                builtin.id.to_owned(),
+                ResolvedBuiltin {
+                    builtin,
+                    config: ProviderConfig {
+                        base_url: builtin.base_url(protocol).to_owned(),
+                        api_key: Some(api_key),
+                        protocol: Some(protocol),
+                        limits: EndpointLimits::default(),
+                    },
+                },
+            );
+        }
+    }
+
+    /// The endpoint configuration for `name`, whether the operator wrote it
+    /// under `[providers]` or it was materialized from a builtin.
+    #[must_use]
+    pub fn provider(&self, name: &str) -> Option<&ProviderConfig> {
+        self.providers
+            .get(name)
+            .or_else(|| self.builtins.get(name).map(|builtin| &builtin.config))
+    }
+
+    /// Whether `name` came from a builtin table rather than `[providers]`.
+    #[must_use]
+    pub fn is_builtin(&self, name: &str) -> bool {
+        self.builtins.contains_key(name)
+    }
+
+    /// Every usable endpoint: the operator's `[providers]` first, then the
+    /// credential-resolved builtins, both in name order.
+    #[must_use]
+    pub fn endpoints(&self) -> Vec<(&str, &ProviderConfig)> {
+        let mut endpoints: Vec<(&str, &ProviderConfig)> = self
+            .providers
+            .iter()
+            .map(|(name, provider)| (name.as_str(), provider))
+            .collect();
+        endpoints.extend(
+            self.builtins
+                .iter()
+                .map(|(name, builtin)| (name.as_str(), &builtin.config)),
+        );
+        endpoints
+    }
+
     /// Apply the `OX_CARDINAL_URL`, `OX_CARDINAL_KEY` and `OX_DEFAULT_MODEL`
     /// environment overrides.
     pub fn apply_env(&mut self) {
@@ -204,9 +487,14 @@ impl LlmConfig {
     fn validate_providers(&self) -> Result<()> {
         for (name, provider) in &self.providers {
             if provider.base_url.is_empty() {
-                anyhow::bail!("providers.{name}.base_url is empty");
+                anyhow::bail!(
+                    "providers.{name}.base_url is empty: set it, or drop the section and put only \
+                     `api_key` to use the builtin provider of that id"
+                );
             }
-            if provider.base_url.ends_with("/v1") {
+            if provider.protocol() == Protocol::ChatCompletions
+                && provider.base_url.ends_with("/v1")
+            {
                 anyhow::bail!(
                     "providers.{name}.base_url must not end with /v1: ox appends /v1/chat/completions itself"
                 );
@@ -226,10 +514,11 @@ impl LlmConfig {
                     anyhow::bail!("models.{id}: candidate model must not be empty");
                 }
                 if candidate.provider != DEFAULT_PROVIDER_NAME
-                    && !self.providers.contains_key(&candidate.provider)
+                    && self.provider(&candidate.provider).is_none()
                 {
                     anyhow::bail!(
-                        "models.{id}: candidate provider `{}` is not configured under [providers]",
+                        "models.{id}: candidate provider `{}` is neither under [providers] nor a \
+                         credential-resolved builtin",
                         candidate.provider
                     );
                 }
@@ -246,5 +535,75 @@ impl LlmConfig {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::credentials::Credentials;
+
+    fn parse(doc: &str) -> LlmConfig {
+        toml::from_str(doc).expect("parse the config slice")
+    }
+
+    #[test]
+    fn a_builtin_section_needs_only_the_key() {
+        let mut config = parse("[providers.deepseek]\napi_key = \"sk-test\"\n");
+        config.apply_credentials(&Credentials::default());
+        let provider = config.provider(DEEPSEEK).expect("the section resolved");
+        assert_eq!(
+            provider.base_url, "https://api.deepseek.com/anthropic",
+            "an omitted base URL means the builtin's own endpoint"
+        );
+        assert_eq!(
+            provider.protocol(),
+            Protocol::Messages,
+            "the protocol travels with the base URL it belongs to"
+        );
+        assert_eq!(provider.api_key.as_deref(), Some("sk-test"));
+    }
+
+    #[test]
+    fn a_stated_base_url_keeps_chat_completions() {
+        let mut config = parse("[providers.deepseek]\nbase_url = \"https://proxy.test\"\n");
+        config.apply_credentials(&Credentials::default());
+        let provider = config.provider(DEEPSEEK).expect("the section resolved");
+        assert_eq!(provider.base_url, "https://proxy.test");
+        assert_eq!(
+            provider.protocol(),
+            Protocol::ChatCompletions,
+            "stating a base URL makes this an ordinary endpoint, protocol unstated"
+        );
+    }
+
+    #[test]
+    fn a_v1_base_is_rejected_only_for_chat_completions() {
+        let completions = parse("[providers.x]\nbase_url = \"https://gw.test/v1\"\n");
+        let error = completions
+            .validate()
+            .expect_err("a /v1 base would double the version segment");
+        assert!(
+            error.to_string().contains("must not end with /v1"),
+            "unexpected message: {error}"
+        );
+
+        let messages =
+            parse("[providers.x]\nbase_url = \"https://gw.test/v1\"\nprotocol = \"messages\"\n");
+        messages
+            .validate()
+            .expect("the Messages URL builder takes a base that already carries /v1");
+    }
+
+    #[test]
+    fn a_missing_base_url_names_both_ways_out() {
+        let config = parse("[providers.x]\napi_key = \"sk-test\"\n");
+        let error = config.validate().expect_err("no base URL anywhere");
+        assert!(
+            error
+                .to_string()
+                .contains("use the builtin provider of that id"),
+            "the message must offer the builtin form: {error}"
+        );
     }
 }

@@ -23,7 +23,7 @@ use std::time::Duration;
 use futures_core::Stream;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use super::CardinalError;
+use super::ChatError;
 use super::chat::{BoxChatStream, Chat, ChatFuture};
 use super::stream::StreamEvent;
 use super::wire::ChatRequest;
@@ -107,7 +107,7 @@ struct PermitStream {
 }
 
 impl Stream for PermitStream {
-    type Item = Result<StreamEvent, CardinalError>;
+    type Item = Result<StreamEvent, ChatError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let polled = self.inner.as_mut().poll_next(cx);

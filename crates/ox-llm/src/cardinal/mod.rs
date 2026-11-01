@@ -23,7 +23,7 @@
 //! (the transport seam), [`limit`] (per-endpoint concurrency gate), and
 //! [`router`] (multi-endpoint candidate routing).
 //!
-//! Errors: [`CardinalError`] — an HTTP error carries the status and a body
+//! Errors: [`ChatError`] — an HTTP error carries the status and a body
 //! snippet; framing-level junk lines are skipped per the SSE spec, while a
 //! `data:` payload that is not valid JSON is fatal (matching cardinal's own
 //! verdict on a misbehaving upstream).
@@ -40,53 +40,6 @@ pub use router::EndpointRouter;
 pub use stream::{AssembledMessage, AssembledToolCall, Assembler, ChunkDecoder, StreamEvent};
 pub use wire::{ChatMessage, ChatRequest, ToolCall, ToolDef, Usage};
 
-use thiserror::Error;
-
-/// Everything that can go wrong while talking to cardinal.
-#[derive(Debug, Error)]
-pub enum CardinalError {
-    /// Non-2xx HTTP status from cardinal. `body` is a truncated snippet of the
-    /// response body for diagnostics.
-    #[error("cardinal returned HTTP {status}: {body}")]
-    Http {
-        /// HTTP status code.
-        status: u16,
-        /// Truncated response body (at most [`HTTP_BODY_SNIPPET_BYTES`]).
-        body: String,
-    },
-    /// A chunk carried an `error` object (cardinal forwards upstream
-    /// failures in-band once the stream has started).
-    #[error("cardinal stream error: {0}")]
-    Upstream(String),
-    /// The connection closed before any terminal signal — no `finish_reason`
-    /// and no `data: [DONE]` — so the response is incomplete and must not be
-    /// treated as a successful turn. A seen `finish_reason` counts as a
-    /// terminal even without `[DONE]` (cardinal's verdict) and ends the
-    /// stream cleanly instead.
-    #[error("cardinal stream closed before [DONE]")]
-    EarlyClose,
-    /// A `data:` payload was not valid JSON (fatal, like cardinal's
-    /// `InvalidUpstreamResponse`), or an SSE framing limit was exceeded.
-    #[error("malformed stream payload: {0}")]
-    Sse(String),
-    /// Transport-level failure (connect, read, body decode).
-    #[error("cardinal transport error: {0}")]
-    Transport(#[from] reqwest::Error),
-    /// The requested model has no candidates: no `[models]` route names it
-    /// and `[providers]` is configured, so the implicit passthrough endpoint
-    /// is disabled.
-    #[error("no candidates configured for model `{model}`: add a [models.\"{model}\"] route")]
-    NoRoute {
-        /// The logical model id ox could not route.
-        model: String,
-    },
-}
-
-/// Maximum bytes of a non-2xx response body kept in [`CardinalError::Http`].
-pub const HTTP_BODY_SNIPPET_BYTES: usize = 512;
-
-/// Maximum bytes in one SSE line (mirrors cardinal's `MAX_LINE_BYTES`).
-pub(crate) const MAX_LINE_BYTES: usize = 64 * 1024;
-/// Maximum bytes accumulated for one SSE event (mirrors cardinal's
-/// `MAX_EVENT_BYTES`).
-pub(crate) const MAX_EVENT_BYTES: usize = 4 * 1024 * 1024;
+/// The shared transport error lives at the crate root: both wire protocols
+/// return it, so it cannot belong to either one.
+pub use crate::error::{ChatError, HTTP_BODY_SNIPPET_BYTES};

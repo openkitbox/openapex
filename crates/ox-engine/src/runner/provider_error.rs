@@ -20,7 +20,7 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
-use ox_llm::cardinal::CardinalError;
+use ox_llm::cardinal::ChatError;
 
 /// Upstream `patterns`: one [`Regex`] source per line, all case-insensitive.
 const PATTERN_SOURCES: &[&str] = &[
@@ -139,9 +139,9 @@ pub(crate) fn is_payload_too_large(message: &str) -> bool {
 /// `classifyProviderFailure`: the overflow classification is scoped to
 /// client-side 4xx rejections; an in-band upstream failure carries no status
 /// and matches on the body alone).
-pub(crate) fn is_overflow_error(error: &CardinalError) -> bool {
+pub(crate) fn is_overflow_error(error: &ChatError) -> bool {
     match error {
-        CardinalError::Http { status, body } => {
+        ChatError::Http { status, body } => {
             (400..=499).contains(status)
                 && (*status == 413
                     || is_payload_too_large(body)
@@ -149,7 +149,7 @@ pub(crate) fn is_overflow_error(error: &CardinalError) -> bool {
                     // overflow phrase (Cerebras: "too many tokens processed").
                     || (*status != 429 && is_context_overflow(body)))
         }
-        CardinalError::Upstream(body) => is_context_overflow(body) || is_payload_too_large(body),
+        ChatError::Upstream(body) => is_context_overflow(body) || is_payload_too_large(body),
         _ => false,
     }
 }

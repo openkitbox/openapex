@@ -1,4 +1,4 @@
-use ox_llm::cardinal::CardinalError;
+use ox_llm::cardinal::ChatError;
 use ox_llm::cardinal::wire::{ChatMessage, ChatRequest};
 use ox_schema::support::{SessionError, SessionErrorResponse};
 /// Upstream `TOOLS_INTERRUPTED` as an `aborted` session error.
@@ -78,9 +78,9 @@ pub(super) fn tool_call_digest(request: &ChatRequest) -> String {
 /// Map a cardinal failure to a session error (upstream `toSessionError`):
 /// the provider taxonomy for HTTP/stream failures, upstream's transport
 /// family for connection-level faults.
-pub(super) fn to_session_error(error: &CardinalError) -> SessionError {
+pub(super) fn to_session_error(error: &ChatError) -> SessionError {
     let (kind, status, response) = match error {
-        CardinalError::Http { status, body } => (
+        ChatError::Http { status, body } => (
             // Any remaining 4xx is a deterministic rejection of this request;
             // server-side statuses report a provider failure.
             if (400..500).contains(status) {
@@ -91,13 +91,13 @@ pub(super) fn to_session_error(error: &CardinalError) -> SessionError {
             Some(*status),
             Some(SessionErrorResponse { body: body.clone() }),
         ),
-        CardinalError::Upstream(body) => (
+        ChatError::Upstream(body) => (
             // An in-band provider failure forwarded by cardinal.
             "provider.unknown",
             None,
             Some(SessionErrorResponse { body: body.clone() }),
         ),
-        CardinalError::NoRoute { .. } => (
+        ChatError::NoRoute { .. } => (
             // A routing configuration error: deterministic, request-shaped,
             // and independent of any endpoint, so it recurs identically on
             // retry — the same bucket as a 4xx rejection.
@@ -105,7 +105,7 @@ pub(super) fn to_session_error(error: &CardinalError) -> SessionError {
             None,
             None,
         ),
-        CardinalError::EarlyClose | CardinalError::Sse(_) | CardinalError::Transport(_) => {
+        ChatError::EarlyClose | ChatError::Sse(_) | ChatError::Transport(_) => {
             ("provider.transport", None, None)
         }
     };

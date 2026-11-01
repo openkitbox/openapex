@@ -1,6 +1,8 @@
 //! LLM endpoint access for ox: the endpoint configuration schema
-//! ([`config`]), the model catalogue ([`model_catalog`]), the streaming chat
-//! transport with multi-endpoint routing ([`cardinal`]), and the outbound HTTP
+//! ([`config`]), provider credentials ([`credentials`]), the model catalogue
+//! ([`model_catalog`]), the two streaming chat protocols ([`cardinal`] for
+//! OpenAI chat completions, [`messages`] for Anthropic Messages), their shared
+//! SSE framing ([`sse`]) and error type ([`error`]), and the outbound HTTP
 //! identity ([`http_client`]).
 //!
 //! Depends only on the contract crate (`ox-schema`) — never on `ox-core`,
@@ -9,7 +11,11 @@
 
 pub mod cardinal;
 pub mod config;
+pub mod credentials;
+pub mod error;
+pub mod messages;
 pub mod model_catalog;
+pub mod sse;
 
 use std::time::Duration;
 

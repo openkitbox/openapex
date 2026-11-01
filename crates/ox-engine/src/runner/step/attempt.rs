@@ -3,7 +3,7 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
-use ox_llm::cardinal::CardinalError;
+use ox_llm::cardinal::ChatError;
 use ox_llm::cardinal::wire::ChatRequest;
 use ox_schema::event::SessionEventData;
 use ox_schema::id;
@@ -79,7 +79,7 @@ pub(super) enum Attempt {
 pub(super) enum AttemptFailure {
     /// A transport-grade failure: connect error, mid-stream read failure
     /// (`EarlyClose`), malformed SSE framing, or a connection error.
-    Transport(CardinalError),
+    Transport(ChatError),
     /// The stream ended without a recognized finish reason (upstream
     /// `unknownFinish` → `InvalidProviderOutput` classified
     /// `incomplete-stream`).
@@ -105,13 +105,13 @@ impl AttemptFailure {
     fn is_interrupted_stream(&self) -> bool {
         match self {
             AttemptFailure::Transport(
-                CardinalError::EarlyClose | CardinalError::Sse(_) | CardinalError::Transport(_),
+                ChatError::EarlyClose | ChatError::Sse(_) | ChatError::Transport(_),
             ) => true,
             AttemptFailure::Transport(
-                CardinalError::Http { .. }
-                | CardinalError::Upstream(_)
+                ChatError::Http { .. }
+                | ChatError::Upstream(_)
                 // A configuration error, not a stream event.
-                | CardinalError::NoRoute { .. },
+                | ChatError::NoRoute { .. },
             ) => false,
             AttemptFailure::IncompleteStream => true,
             // Retried through the `!published` arm, never as a continuation.
@@ -135,7 +135,7 @@ impl AttemptFailure {
         match self {
             AttemptFailure::Transport(error) => to_session_error(error),
             AttemptFailure::IncompleteStream => invalid_output_error(),
-            AttemptFailure::EmptyStream => to_session_error(&CardinalError::EarlyClose),
+            AttemptFailure::EmptyStream => to_session_error(&ChatError::EarlyClose),
         }
     }
 }
@@ -184,7 +184,7 @@ pub(crate) async fn run(
                 // unanswered. One log line decides ox-vs-downstream on the
                 // next recurrence — the id the upstream complained about
                 // cannot be in `sent` if the fault is not ours.
-                if let CardinalError::Http { status: 400, body } = &error {
+                if let ChatError::Http { status: 400, body } = &error {
                     let complained = pairing_rejection_ids(body);
                     let rejected = complained.is_some()
                         || body.contains("tool_call_id")

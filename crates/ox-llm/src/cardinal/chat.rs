@@ -5,11 +5,11 @@
 //! stream itself is boxed: the client's `ChatStream` owns a live
 //! `reqwest::Response` and cannot be fabricated offline, so the trait
 //! returns a pinned `dyn Stream` with the same
-//! `Result<StreamEvent, CardinalError>` item type. The real client boxes
+//! `Result<StreamEvent, ChatError>` item type. The real client boxes
 //! its `ChatStream` unchanged.
 //!
 //! The trait shape is intentionally one method — `stream_chat(&ChatRequest)
-//! -> Result<stream, CardinalError>` — mirroring the client; only the stream
+//! -> Result<stream, ChatError>` — mirroring the client; only the stream
 //! type is erased.
 
 use std::future::Future;
@@ -17,18 +17,18 @@ use std::pin::Pin;
 
 use futures_core::Stream;
 
-use super::CardinalError;
+use super::ChatError;
 use super::client::CardinalClient;
 use super::stream::StreamEvent;
 use super::wire::ChatRequest;
 
 /// The erased stream every [`Chat`] implementation hands back.
-pub type BoxChatStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, CardinalError>> + Send>>;
+pub type BoxChatStream = Pin<Box<dyn Stream<Item = Result<StreamEvent, ChatError>> + Send>>;
 
 /// The boxed future [`Chat::stream_chat`] returns (async-fn-in-trait is not
 /// dyn-compatible).
 pub type ChatFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<BoxChatStream, CardinalError>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<BoxChatStream, ChatError>> + Send + 'a>>;
 
 /// The streaming chat-completions seam. See the [module docs](self).
 pub trait Chat: Send + Sync {
