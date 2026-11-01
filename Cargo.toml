@@ -71,19 +71,6 @@ tracing-subscriber = "0.3"
 unicode-width = "0.2"
 url = "2"
 
-[patch.crates-io]
-# Every turso crate must come from the fork at one rev: the crates.io
-# turso_sdk_kit calls DatabaseOpts methods that the fork's newer core removed.
-# turso = { git = "https://github.com/openkitbox/turso", branch = "ox" }
-# turso_core = { git = "https://github.com/openkitbox/turso", branch = "ox" }
-# turso_ext = { git = "https://github.com/openkitbox/turso", branch = "ox" }
-# turso_macros = { git = "https://github.com/openkitbox/turso", branch = "ox" }
-# turso_parser = { git = "https://github.com/openkitbox/turso", branch = "ox" }
-# turso_sdk_kit = { git = "https://github.com/openkitbox/turso", branch = "ox" }
-# turso_sdk_kit_macros = { git = "https://github.com/openkitbox/turso", branch = "ox" }
-# turso_sync_engine = { git = "https://github.com/openkitbox/turso", branch = "ox" }
-# turso_sync_sdk_kit = { git = "https://github.com/openkitbox/turso", branch = "ox" }
-
 [package]
 name = "ox"
 version.workspace = true
