@@ -436,6 +436,15 @@ const MIGRATIONS: &[(u32, &str)] = &[
 ];
 
 /// Async handle to the database.
+///
+/// Exclusive ownership invariant: at most one process has `ox.db` open for
+/// writing at any moment. turso enforces this with an exclusive file lock
+/// taken at open, and mctx crash recovery (`settle_running_runs`) plus the
+/// startup migrations rely on it: both assume every run or row they find was
+/// left by a process that is no longer running. Any switch that bypasses the
+/// lock, including turning on `experimental_multiprocess_wal` in the future,
+/// breaks mctx crash recovery and requires a redesign first, which is why
+/// [`Db::open`] refuses to run with `LIMBO_DISABLE_FILE_LOCK` set.
 #[derive(Clone)]
 pub struct Db {
     database: turso::Database,
@@ -482,6 +491,10 @@ const MAX_IDLE: usize = 2;
 /// smaller number here would silently read back as 200 anyway.
 pub const PAGE_CACHE_PAGES: i64 = 200;
 
+/// turso_core's `ENV_DISABLE_FILE_LOCK` (io/common.rs): when set, turso opens
+/// the database without its exclusive file lock.
+const DISABLE_FILE_LOCK_ENV: &str = "LIMBO_DISABLE_FILE_LOCK";
+
 impl Db {
     /// Open (creating if needed) the database at `path` and apply migrations.
     /// Parent directories are created automatically.
@@ -517,6 +530,16 @@ impl Db {
     }
 
     async fn open_path(path: &str) -> Result<Self> {
+        // turso skips its exclusive file lock whenever this variable is set
+        // (`std::env::var(..).is_err()` gates `lock_file` in turso_core's
+        // io/unix.rs). Checking `var_os` refuses even a non-UTF-8 value, so
+        // the guard is at least as strict as turso's own test.
+        if std::env::var_os(DISABLE_FILE_LOCK_ENV).is_some() {
+            anyhow::bail!(
+                "{DISABLE_FILE_LOCK_ENV} is set, refusing to open {path}: \
+                 mctx crash recovery requires exclusive database ownership"
+            );
+        }
         // `experimental_index_method` is required for `CREATE INDEX … USING
         // fts`, which is how the search indexes are declared.
         let database = Builder::new_local(path)

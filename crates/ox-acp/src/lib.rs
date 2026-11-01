@@ -10,6 +10,15 @@
 //! `GET /api/info`, otherwise own the server runtime in-process on an
 //! ephemeral loopback port (turso holds an exclusive lock on `ox.db`, so a
 //! spawned child server could never coexist with the user's server).
+//!
+//! Known limitation: the idle server the TUI spawns (`--exit-when-idle`)
+//! binds only the unix socket (the `exit_when_idle` branch of
+//! `ox_server::run_with`), while the probe here only tries TCP on
+//! `config.listen`. The probe therefore misses that server and falls through
+//! to own-mode, where opening `ox.db` fails on turso's exclusive lock and
+//! `ox acp` exits. This fails closed (two processes never share the
+//! database), but attach does not work; the fix is to probe the unix socket
+//! too.
 
 mod bridge;
 mod stream;
