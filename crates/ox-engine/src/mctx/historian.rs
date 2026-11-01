@@ -295,10 +295,16 @@ impl ChunkLimits {
 /// and the run stops at the first block that would cross the request budget
 /// (unless nothing has been emitted yet, in which case a single oversize block
 /// is admitted so the run is never empty). Returning `None` means the eligible
-/// range held nothing worth a run.
+/// range held nothing worth a run, or its first message alone crosses the
+/// context ceiling.
 ///
 /// See [`ChunkLimits`] for the two ceilings. The context one is absolute: a
 /// block that would cross it is never admitted, not even as the first one.
+///
+/// A same-role run is cut at a message boundary before it would cross either
+/// ceiling (the reference keeps the run whole; ox cuts it so an agent's long
+/// autonomous stretch cannot stall the fold behind one unadmittable block).
+/// Under [`ChunkLimits::unbounded`] nothing is ever cut.
 ///
 /// `count_tokens` is the session's calibrated counter
 /// ([`crate::mctx::tokens::counter_fn`]). Both ceilings come from the model
@@ -364,6 +370,13 @@ struct Block {
     /// Tool-result body tokens the block's messages carry (see
     /// [`tool_result_tokens`]): not rendered, but spent.
     result_tokens: usize,
+    /// Running upper bound on what [`format_block`] renders (without the
+    /// commit suffix, which [`Builder::absorbs`] bounds separately), kept so
+    /// deciding whether a message still fits does not re-render the block
+    /// (which would make a long same-role run quadratic). An upper bound,
+    /// not an estimate: an under-count would let a first block grow past a
+    /// ceiling that [`Builder::flush`] then refuses, stalling the chunk.
+    rendered_tokens: usize,
     /// Message id of the last message absorbed into the block.
     last_message_id: String,
 }
@@ -377,6 +390,9 @@ struct Builder<'a> {
     /// The session's calibrated counter, so the rendered text and the collapsed
     /// tool bodies are measured in the same unit as [`ChunkLimits`].
     count_tokens: &'a dyn Fn(&str) -> usize,
+    /// [`commit_suffix_cap_tokens`] under `count_tokens`, measured once per
+    /// chunk rather than per message.
+    commit_suffix_tokens: usize,
     total_tokens: usize,
     /// Tool-result body tokens over the emitted blocks, kept apart from
     /// `total_tokens` because only that one is what the request costs.
@@ -400,6 +416,7 @@ impl<'a> Builder<'a> {
         Self {
             limits,
             count_tokens,
+            commit_suffix_tokens: commit_suffix_cap_tokens(count_tokens),
             total_tokens: 0,
             total_result_tokens: 0,
             lines: Vec::new(),
@@ -426,22 +443,30 @@ impl<'a> Builder<'a> {
             self.pending_noise.push((ordinal, message.id().to_owned()));
             return true;
         }
-        if self
-            .current
-            .as_ref()
-            .is_some_and(|block| block.role == compact_role)
-        {
+        let count = self.count_tokens;
+        let parts_tokens = rendered_parts_tokens(&parts, count);
+        // Joining an open block adds this message's parts after a ` / `.
+        let joined_tokens = parts_tokens + piece_tokens(" / ", count);
+        let brings_hashes = !commit_hashes.is_empty();
+        if self.current.as_ref().is_some_and(|block| {
+            block.role == compact_role
+                && self.absorbs(block, joined_tokens, result_tokens, brings_hashes)
+        }) {
             let block = self.current.as_mut().expect("block checked above");
             block.end_ordinal = ordinal;
             block.parts.extend(parts);
             block.commit_hashes = merge_commit_hashes(&block.commit_hashes, commit_hashes);
             block.result_tokens += result_tokens;
+            block.rendered_tokens += joined_tokens;
             block.last_message_id = message.id().to_owned();
             // Any noise between the two messages falls inside the block's
             // range, so it is absorbed rather than held for the next block.
             self.pending_noise.clear();
             return true;
         }
+        // A role switch, or a same-role message that would carry the open
+        // block across a ceiling: the open block ends here, at a message
+        // boundary, and this message opens the next one.
         if !self.flush() {
             return false;
         }
@@ -451,6 +476,10 @@ impl<'a> Builder<'a> {
             .map(|(ordinal, _)| *ordinal)
             .unwrap_or(ordinal);
         self.pending_noise.clear();
+        // Measured once, at the widest range the block could grow to, so the
+        // end ordinal gaining digits never outgrows the bound.
+        let header_tokens =
+            piece_tokens(&format!("[{start}-{}] {compact_role}: ", i64::MAX), count);
         self.current = Some(Block {
             role: compact_role,
             start_ordinal: start,
@@ -458,9 +487,38 @@ impl<'a> Builder<'a> {
             parts,
             commit_hashes,
             result_tokens,
+            rendered_tokens: header_tokens + parts_tokens,
             last_message_id: message.id().to_owned(),
         });
         true
+    }
+
+    /// Whether `block` can absorb one more message of `joined_tokens` rendered
+    /// and `result_tokens` collapsed tokens without the chunk crossing either
+    /// ceiling. Decided on [`Block::rendered_tokens`] plus, when the block
+    /// carries commit hashes, the widest suffix they can render as;
+    /// [`Self::flush`] re-measures the real text and has the final word.
+    fn absorbs(
+        &self,
+        block: &Block,
+        joined_tokens: usize,
+        result_tokens: usize,
+        brings_hashes: bool,
+    ) -> bool {
+        let count = self.count_tokens;
+        let separator_tokens = if self.lines.is_empty() {
+            0
+        } else {
+            piece_tokens("\n", count)
+        };
+        let suffix_tokens = if brings_hashes || !block.commit_hashes.is_empty() {
+            self.commit_suffix_tokens
+        } else {
+            0
+        };
+        let rendered = separator_tokens + block.rendered_tokens + suffix_tokens + joined_tokens;
+        let context = self.context_tokens() + rendered + block.result_tokens + result_tokens;
+        context <= self.limits.context && self.total_tokens + rendered <= self.limits.request
     }
 
     /// Emit the open block if it fits. Ported from
@@ -725,6 +783,32 @@ fn format_block(block: &Block) -> String {
         commit_suffix,
         block.parts.join(" / ")
     )
+}
+
+/// Upper bound on what one message's `parts` add to a [`format_block`] line:
+/// each part plus the ` / ` joining it to the next.
+fn rendered_parts_tokens(parts: &[String], count_tokens: &dyn Fn(&str) -> usize) -> usize {
+    let separators = parts.len().saturating_sub(1) * piece_tokens(" / ", count_tokens);
+    let texts: usize = parts
+        .iter()
+        .map(|part| piece_tokens(part, count_tokens))
+        .sum();
+    texts + separators
+}
+
+/// One piece of a line, counted alone, plus one token. The production counter
+/// rounds up, so pieces already sum to an upper bound; the slack covers any
+/// counter that rounds down (`len / 4`), which undercounts a sum of pieces by
+/// under one token per piece against the joined text.
+fn piece_tokens(piece: &str, count_tokens: &dyn Fn(&str) -> usize) -> usize {
+    count_tokens(piece) + 1
+}
+
+/// Upper bound on the ` commits: …` suffix [`format_block`] appends: the most
+/// hashes a block keeps, each at the longest length the extractor accepts.
+fn commit_suffix_cap_tokens(count_tokens: &dyn Fn(&str) -> usize) -> usize {
+    let widest = vec!["f".repeat(12); MAX_COMMITS_PER_BLOCK].join(", ");
+    piece_tokens(&format!(" commits: {widest}"), count_tokens)
 }
 
 /// `historian_chunk.rs::format_tool_summary`.
@@ -2013,4 +2097,153 @@ pub(crate) async fn collect_completion(
         }
     }
     Ok(text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The raw `bytes / 4` estimate: the unit both limits are written in here.
+    fn count(text: &str) -> usize {
+        text.len() / 4
+    }
+
+    /// About `tokens` tokens of prose under [`count`].
+    fn prose(tokens: usize) -> String {
+        "word ".repeat(tokens * 4 / 5)
+    }
+
+    fn user_row(ordinal: i64, text: &str) -> (i64, serde_json::Value) {
+        (
+            ordinal,
+            serde_json::json!({
+                "id": format!("msg_{ordinal}"),
+                "type": "user",
+                "time": { "created": ordinal },
+                "text": text,
+            }),
+        )
+    }
+
+    fn assistant_row(ordinal: i64, text: &str) -> (i64, serde_json::Value) {
+        (
+            ordinal,
+            serde_json::json!({
+                "id": format!("msg_{ordinal}"),
+                "type": "assistant",
+                "time": { "created": ordinal },
+                "agent": "build",
+                "model": { "id": "model", "providerID": "provider" },
+                "content": [ { "type": "text", "text": text } ],
+            }),
+        )
+    }
+
+    /// Ordinal 1 is a user prompt, 2..=41 are 40 assistant messages of about
+    /// 1000 tokens each: an agent working on its own between two prompts.
+    fn assistant_run() -> Vec<(i64, serde_json::Value)> {
+        let text = prose(1_000);
+        let mut rows = vec![user_row(1, "do the work")];
+        rows.extend((2..=41).map(|ordinal| assistant_row(ordinal, &text)));
+        rows
+    }
+
+    fn block_roles(chunk: &Chunk) -> Vec<&str> {
+        chunk
+            .text
+            .lines()
+            .filter_map(|line| line.split_once("] ").map(|(_, rest)| rest))
+            .filter_map(|rest| rest.split_once(':').map(|(role, _)| role))
+            .collect()
+    }
+
+    #[test]
+    fn same_role_run_is_split_at_the_context_fence() {
+        let rows = assistant_run();
+        let limits = ChunkLimits {
+            request: usize::MAX,
+            context: 10_000,
+        };
+        let chunk = chunk(&rows, 1, 42, limits, &count)
+            .expect("a run of ordinary messages must yield a chunk");
+        assert!(
+            chunk.context_tokens <= 10_000,
+            "the fence is absolute, got {}",
+            chunk.context_tokens
+        );
+        assert!(
+            (2..=41).contains(&chunk.end_ordinal),
+            "the chunk must reach into the assistant run, ended at {}",
+            chunk.end_ordinal
+        );
+    }
+
+    #[test]
+    fn same_role_run_without_a_prompt_is_split_at_the_context_fence() {
+        let rows: Vec<_> = assistant_run().into_iter().skip(1).collect();
+        let limits = ChunkLimits {
+            request: usize::MAX,
+            context: 10_000,
+        };
+        let chunk = chunk(&rows, 2, 42, limits, &count)
+            .expect("an assistant-only run must not stall the chunker");
+        assert!(
+            chunk.context_tokens <= 10_000,
+            "the fence is absolute, got {}",
+            chunk.context_tokens
+        );
+        assert!(
+            chunk.end_ordinal < 41,
+            "the run must be cut, ended at {}",
+            chunk.end_ordinal
+        );
+    }
+
+    #[test]
+    fn same_role_run_is_split_at_the_request_budget() {
+        let rows = assistant_run();
+        let limits = ChunkLimits {
+            request: 5_000,
+            context: usize::MAX,
+        };
+        let chunk =
+            chunk(&rows, 1, 42, limits, &count).expect("a bounded request must yield a chunk");
+        assert!(
+            chunk.token_estimate <= 5_000 + 1_000,
+            "the request may overshoot by at most one message, got {}",
+            chunk.token_estimate
+        );
+        assert!(
+            (2..41).contains(&chunk.end_ordinal),
+            "the assistant run must be cut inside, ended at {}",
+            chunk.end_ordinal
+        );
+    }
+
+    #[test]
+    fn single_message_over_the_fence_yields_nothing() {
+        let rows = vec![assistant_row(1, &prose(1_000))];
+        let limits = ChunkLimits {
+            request: usize::MAX,
+            context: 500,
+        };
+        assert!(
+            chunk(&rows, 1, 2, limits, &count).is_none(),
+            "one message larger than the fence cannot be folded"
+        );
+    }
+
+    #[test]
+    fn unbounded_keeps_the_same_role_run_in_one_block() {
+        let rows = assistant_run();
+        let chunk = chunk(&rows, 1, 42, ChunkLimits::unbounded(), &count)
+            .expect("an unbounded chunk covers the whole tail");
+        assert_eq!(
+            block_roles(&chunk),
+            ["U", "A"],
+            "an unbounded run must not be split: {:?}",
+            chunk.text.get(..200)
+        );
+        assert_eq!(chunk.end_ordinal, 41, "the whole run is covered");
+    }
 }
