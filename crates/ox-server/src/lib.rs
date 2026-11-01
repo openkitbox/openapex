@@ -197,6 +197,7 @@ pub(crate) async fn register_mcp_tools(
 }
 
 /// Build the salvo router for the given state.
+#[must_use]
 pub fn build_router(state: AppState) -> Router {
     api::build_router(state)
 }

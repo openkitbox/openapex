@@ -96,6 +96,7 @@ pub enum WorkflowProfile {
 /// [`ox_tools::contract::Tool::guidance`]) follows them. The two built-in
 /// sections — engineering standards and the profile's workflow — follow the
 /// harness template (`.ox/plans/2026-10-26-built-in-development-workflow-analysis.md`).
+#[must_use]
 pub fn system_static(tools: &[(&str, Option<&'static str>)], profile: WorkflowProfile) -> String {
     let mut static_layer =
         HARNESS_TEMPLATE.replace("${OPENCODE_TOOL_GUIDANCE}", &tool_guidance(tools));

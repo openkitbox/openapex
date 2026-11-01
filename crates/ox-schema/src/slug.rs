@@ -17,6 +17,7 @@ const NOUNS: [&str; 30] = [
 ];
 
 /// `Slug.create()`: a random `"adjective-noun"` pair.
+#[must_use]
 pub fn create() -> String {
     let mut rng = rand::rng();
     let adjective = ADJECTIVES[rng.random_range(..ADJECTIVES.len())];

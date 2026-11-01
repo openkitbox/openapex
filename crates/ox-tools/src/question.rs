@@ -348,6 +348,7 @@ pub const NOT_AVAILABLE_SENTINEL: &str =
 pub const CANCELLED_SENTINEL: &str = "(user cancelled the question)";
 
 /// Build the answer value a client's reply body carries for one question.
+#[must_use]
 pub fn single_option_answer(field: &Field, value: &str) -> FormValue {
     match field {
         Field::Multiselect { .. } => FormValue::Multiple(vec![value.to_owned()]),

@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 ///
 /// A path outside `home` (or a relative one) is returned borrowed and
 /// byte-identical — the common case allocates nothing.
+#[must_use]
 pub fn redact_home<'a>(path: &'a Path, home: &Path) -> Cow<'a, str> {
     match path.strip_prefix(home) {
         Ok(rest) if rest.as_os_str().is_empty() => Cow::Borrowed("~"),
@@ -46,6 +47,7 @@ pub fn redact_home<'a>(path: &'a Path, home: &Path) -> Cow<'a, str> {
 ///
 /// `~/..`-style escapes resolve like the shell would (`~/..` is the parent of
 /// home); this is plain path arithmetic, not a sandbox.
+#[must_use]
 pub fn expand_tilde(path: &str, home: &Path) -> Option<PathBuf> {
     match path {
         "~" => Some(home.to_path_buf()),

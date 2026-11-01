@@ -201,6 +201,7 @@ impl App {
         self.prompt.set_history(history);
     }
 
+    #[must_use]
     pub fn new(
         route: Route,
         session: Option<String>,

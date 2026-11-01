@@ -16,6 +16,7 @@ use super::sessions::{self, Notice};
 /// `(event type, data)` for one notice, in the upstream shapes:
 /// `shell.created { info }`, `shell.exited { id, exit?, status }`,
 /// `shell.deleted { id }`.
+#[must_use]
 pub fn frame(notice: Notice) -> (&'static str, Value) {
     match notice {
         Notice::Created(info) => ("shell.created", json!({ "info": info })),

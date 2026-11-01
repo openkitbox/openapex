@@ -194,6 +194,7 @@ pub struct Row {
 
 /// Width every `display` is padded to: the longest `/name` in the whole
 /// registry plus two columns (upstream `commands()` memo).
+#[must_use]
 pub fn padded_width() -> usize {
     COMMANDS
         .iter()
@@ -210,6 +211,7 @@ pub fn padded_width() -> usize {
 /// rows are ordered by score (prefix beats substring beats subsequence), ties
 /// broken alphabetically — upstream's fuzzysort with the `×2` prefix bonus,
 /// reduced to a deterministic scale.
+#[must_use]
 pub fn rows(query: &str) -> Vec<Row> {
     let query = query.trim().to_ascii_lowercase();
     let width = padded_width();

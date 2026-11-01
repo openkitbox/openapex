@@ -50,6 +50,7 @@ pub const DEFAULT_TIMEOUT_MS: u64 = 2 * 60 * 1_000;
 /// ? (timeout ?? 0) : (timeout ?? DEFAULT_TIMEOUT_MS)`. An `owned` run is
 /// handed back at once (`background=true` or `yield_time_ms=0`) and has no
 /// deadline unless the caller asks for one; a foreground run keeps the default.
+#[must_use]
 pub fn default_timeout_ms(owned: bool) -> u64 {
     if owned { 0 } else { DEFAULT_TIMEOUT_MS }
 }
@@ -76,6 +77,7 @@ pub struct ShellTool {
 }
 
 impl ShellTool {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             sessions: sessions::shared(),

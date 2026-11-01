@@ -188,6 +188,7 @@ pub struct CtxReduceTool {
 
 impl CtxReduceTool {
     /// The tool over `db` (tag/drop tables).
+    #[must_use]
     pub fn new(db: Db) -> Self {
         Self { db }
     }
@@ -310,6 +311,7 @@ pub struct CtxExpandTool {
 
 impl CtxExpandTool {
     /// The tool over `db` (tag/drop tables).
+    #[must_use]
     pub fn new(db: Db) -> Self {
         Self { db }
     }

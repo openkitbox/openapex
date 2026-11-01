@@ -494,6 +494,7 @@ fn media_mime_for(absolute: &Path) -> Option<&'static str> {
 }
 
 /// Media MIME by magic bytes for `MEDIA_MIMES` (PNG/JPEG/GIF/WebP/PDF).
+#[must_use]
 pub fn sniff_media(bytes: &[u8]) -> Option<&'static str> {
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         Some("image/png")

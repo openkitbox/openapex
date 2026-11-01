@@ -573,6 +573,7 @@ pub fn validate_historian_output(
 
 /// Validate already-persisted ranges before appending new output
 /// (`historian_validate.rs::validate_stored_compartments`).
+#[must_use]
 pub fn validate_stored_compartments(compartments: &[MessageRange]) -> Option<String> {
     let first = compartments.first()?;
     if first.end < first.start {

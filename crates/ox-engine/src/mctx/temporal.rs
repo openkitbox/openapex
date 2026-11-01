@@ -35,6 +35,7 @@ const SECONDS_PER_WEEK: i64 = 7 * 24 * 60 * 60;
 /// - else → `+{w}w {d}d`, or `+{w}w` when the day part is 0.
 ///
 /// Every unit is floored, never rounded.
+#[must_use]
 pub fn format_gap(seconds: i64) -> Option<String> {
     if seconds < TEMPORAL_THRESHOLD_SECONDS {
         return None;
@@ -76,6 +77,7 @@ pub fn format_gap(seconds: i64) -> Option<String> {
 
 /// The HTML comment line that precedes a user turn (`<!-- +1h 5m -->\n`), or
 /// `None` when the gap is below the threshold. Upstream `temporalMarkerPrefix`.
+#[must_use]
 pub fn marker_prefix(seconds: i64) -> Option<String> {
     Some(format!("<!-- {} -->\n", format_gap(seconds)?))
 }

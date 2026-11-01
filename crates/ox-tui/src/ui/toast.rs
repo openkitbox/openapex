@@ -77,6 +77,7 @@ impl Toast {
         Self::new(Variant::Error, Some(title.into()), message, now)
     }
 
+    #[must_use]
     pub fn expired(&self, now: Instant) -> bool {
         now >= self.expires_at
     }

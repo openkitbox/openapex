@@ -37,6 +37,7 @@ const PANEL_BORDER_CHAR: char = '┃';
 const INTERRUPT_WINDOW: Duration = Duration::from_secs(5);
 
 /// Upstream placeholder shape: `Ask anything… "<random phrase>"`.
+#[must_use]
 pub fn placeholder_line(idx: usize) -> String {
     format!(
         "Ask anything… \"{}\"",
@@ -75,6 +76,7 @@ fn footer_available(width: u16) -> usize {
 /// seeds `randomIndex(list.length)` (`component/prompt/index.tsx:366`).
 /// `OX_TUI_PLACEHOLDER=<n>` pins the index so parity captures are repeatable;
 /// tests pass their own index to [`placeholder_line`] instead.
+#[must_use]
 pub fn pick_placeholder() -> usize {
     let pinned = std::env::var("OX_TUI_PLACEHOLDER")
         .ok()
@@ -207,6 +209,7 @@ pub struct Prompt {
 }
 
 impl Prompt {
+    #[must_use]
     pub fn new(placeholder: &str, chrome: Chrome, footer: Footer) -> Self {
         Self {
             composer: Composer::new_with_placeholder(placeholder),

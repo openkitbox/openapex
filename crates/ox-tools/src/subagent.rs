@@ -135,6 +135,7 @@ pub struct SubagentTool {
 }
 
 impl SubagentTool {
+    #[must_use]
     pub fn new(handle: std::sync::Arc<SubagentHandle>, depth_limit: usize) -> Self {
         Self {
             handle,

@@ -1,6 +1,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 
 /// timeline | composer | dock
+#[must_use]
 pub fn split(area: Rect, composer_height: u16) -> (Rect, Rect, Rect) {
     let chunks = Layout::vertical([
         Constraint::Min(1),
@@ -31,6 +32,7 @@ pub fn split_with_queue(
 
 /// Upstream's session screen padding: two columns each side, one below 44
 /// columns wide (`routes/session/index.tsx`).
+#[must_use]
 pub fn padded(area: Rect, screen_width: u16) -> Rect {
     let pad: u16 = if screen_width < 44 { 1 } else { 2 };
     Rect {

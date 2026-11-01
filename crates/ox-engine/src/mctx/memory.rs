@@ -1116,6 +1116,7 @@ pub struct CtxMemoryTool {
 
 impl CtxMemoryTool {
     /// The tool over `db` (the `mc_memory` table).
+    #[must_use]
     pub fn new(db: Db, embedder: Option<Arc<crate::mctx::embed::Embedder>>) -> Self {
         Self { db, embedder }
     }
@@ -1434,6 +1435,7 @@ pub struct CtxNoteTool {
 
 impl CtxNoteTool {
     /// The tool over `db` (the `mc_note` table).
+    #[must_use]
     pub fn new(db: Db) -> Self {
         Self { db }
     }

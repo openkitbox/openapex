@@ -20,6 +20,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::jsonrpc::{self, Incoming, Notification, Request};
+use super::sync;
 use super::transport::{CallError, ProtocolMode, RequestMetadata, Rpc, modern_params};
 
 type Pending = HashMap<u64, oneshot::Sender<Result<Value, CallError>>>;
@@ -132,7 +133,7 @@ impl StdioRpc {
                 let Some(bytes) = bytes else { break };
                 if stdin.write_all(&bytes).await.is_err() {
                     writer_closed.store(true, Ordering::SeqCst);
-                    for (_, sender) in writer_pending.lock().unwrap().drain() {
+                    for (_, sender) in sync::lock(&writer_pending).drain() {
                         let _ = sender.send(Err(CallError::Closed));
                     }
                     break;
@@ -202,7 +203,7 @@ impl StdioRpc {
                         let Some(id) = id.as_u64() else {
                             continue;
                         };
-                        let Some(sender) = reader_pending.lock().unwrap().remove(&id) else {
+                        let Some(sender) = sync::lock(&reader_pending).remove(&id) else {
                             continue;
                         };
                         let outcome = match error {
@@ -217,7 +218,7 @@ impl StdioRpc {
             // EOF means the server is gone: mark the transport closed under
             // the pending lock so a request cannot slip in between the flag
             // and the drain and then wait forever for an answer.
-            let mut pending = reader_pending.lock().unwrap();
+            let mut pending = sync::lock(&reader_pending);
             reader_closed.store(true, Ordering::SeqCst);
             for (_, sender) in pending.drain() {
                 let _ = sender.send(Err(CallError::Closed));
@@ -263,7 +264,7 @@ enum Wait {
 
 impl Rpc for StdioRpc {
     fn set_protocol(&self, protocol: ProtocolMode) {
-        *self.protocol.lock().unwrap() = protocol;
+        *sync::lock(&self.protocol) = protocol;
     }
 
     fn request<'a>(
@@ -277,7 +278,7 @@ impl Rpc for StdioRpc {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             let (sender, receiver) = oneshot::channel();
             {
-                let mut pending = self.pending.lock().unwrap();
+                let mut pending = sync::lock(&self.pending);
                 // Checked while holding the lock the reader takes before it
                 // marks the transport closed, so a dead server can never
                 // leave a call waiting for a reply that cannot arrive.
@@ -286,7 +287,7 @@ impl Rpc for StdioRpc {
                 }
                 pending.insert(id, sender);
             }
-            let params = match *self.protocol.lock().unwrap() {
+            let params = match *sync::lock(&self.protocol) {
                 ProtocolMode::Legacy => params,
                 ProtocolMode::Modern => modern_params(metadata, params),
             };
@@ -302,18 +303,18 @@ impl Rpc for StdioRpc {
             let send_result = tokio::select! {
                 result = &mut send => result,
                 () = cancel.cancelled() => {
-                    self.pending.lock().unwrap().remove(&id);
+                    sync::lock(&self.pending).remove(&id);
                     self.send_cancel(id);
                     return Err(CallError::Cancelled);
                 }
                 () = sleep_until_optional(deadline) => {
-                    self.pending.lock().unwrap().remove(&id);
+                    sync::lock(&self.pending).remove(&id);
                     self.send_cancel(id);
                     return Err(CallError::Timeout);
                 }
             };
             if send_result.is_err() {
-                self.pending.lock().unwrap().remove(&id);
+                sync::lock(&self.pending).remove(&id);
                 return Err(CallError::Closed);
             }
             let outcome = tokio::select! {
@@ -325,12 +326,12 @@ impl Rpc for StdioRpc {
                 Wait::Done(Ok(result)) => result,
                 Wait::Done(Err(_)) => Err(CallError::Closed),
                 Wait::Cancelled => {
-                    self.pending.lock().unwrap().remove(&id);
+                    sync::lock(&self.pending).remove(&id);
                     self.send_cancel(id);
                     Err(CallError::Cancelled)
                 }
                 Wait::TimedOut => {
-                    self.pending.lock().unwrap().remove(&id);
+                    sync::lock(&self.pending).remove(&id);
                     self.send_cancel(id);
                     Err(CallError::Timeout)
                 }
@@ -359,7 +360,7 @@ impl Rpc for StdioRpc {
     fn shutdown<'a>(&'a self) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             self.closed.store(true, Ordering::SeqCst);
-            let child = self.child.lock().unwrap().take();
+            let child = sync::lock(&self.child).take();
             if let Some(mut child) = child {
                 let _ = child.start_kill();
                 let _ = child.wait().await;
@@ -367,7 +368,7 @@ impl Rpc for StdioRpc {
             self.reader.abort();
             self.writer_task.abort();
             self.stderr.abort();
-            for (_, sender) in self.pending.lock().unwrap().drain() {
+            for (_, sender) in sync::lock(&self.pending).drain() {
                 let _ = sender.send(Err(CallError::Closed));
             }
         })
@@ -378,7 +379,7 @@ impl Drop for StdioRpc {
     fn drop(&mut self) {
         // `kill_on_drop` already covers the child; this makes the intent
         // explicit and reaps the process when the last tool handle goes away.
-        let child = self.child.lock().unwrap().take();
+        let child = sync::lock(&self.child).take();
         if let Some(mut child) = child {
             let _ = child.start_kill();
         }

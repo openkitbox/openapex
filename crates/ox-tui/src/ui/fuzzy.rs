@@ -8,6 +8,7 @@
 ///
 /// `None` means no match. Otherwise: `3` prefix, `2` substring, `1`
 /// subsequence. An empty query matches everything with `0`.
+#[must_use]
 pub fn score(query: &str, text: &str) -> Option<u32> {
     if query.is_empty() {
         return Some(0);

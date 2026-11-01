@@ -84,6 +84,7 @@ pub enum Item {
 
 impl Item {
     /// The wire tag for this item.
+    #[must_use]
     pub fn kind(&self) -> &'static str {
         match self {
             Item::User { .. } => "user",
@@ -94,6 +95,7 @@ impl Item {
     }
 
     /// The item's delivery policy.
+    #[must_use]
     pub fn delivery(&self) -> Delivery {
         match self {
             Item::User { delivery, .. }
@@ -107,6 +109,7 @@ impl Item {
     /// the `session_inbox` / `data` column of the `session_pending` tables).
     /// Constructed via an untagged-shaped map so a `CompactionPayload` round
     /// trip stays `{}` on the wire.
+    #[must_use]
     pub fn payload(&self) -> serde_json::Value {
         use serde_json::Value;
         use serde_json::json;

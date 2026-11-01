@@ -20,6 +20,7 @@ pub struct Todo {
 
 /// Lenient, like upstream `parseTodos`: a non-array is an empty list, an
 /// unknown status reads as pending, and an entry without content is dropped.
+#[must_use]
 pub fn parse_todos(value: Option<&Value>) -> Vec<Todo> {
     let Some(Value::Array(items)) = value else {
         return Vec::new();

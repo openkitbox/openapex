@@ -12,6 +12,7 @@ pub const TAG: &str = "timeline";
 
 /// `messages` are `(entry index, text)` oldest first; the row value is the
 /// entry index.
+#[must_use]
 pub fn timeline(messages: &[(usize, &str)]) -> Dialog {
     let items = messages
         .iter()

@@ -56,6 +56,7 @@ impl LimitedChat {
     }
 
     /// Permits not currently held (a leak check for tests and logs).
+    #[must_use]
     pub fn available(&self) -> usize {
         self.permits.available_permits()
     }

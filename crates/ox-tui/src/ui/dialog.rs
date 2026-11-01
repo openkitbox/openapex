@@ -151,6 +151,7 @@ pub struct Info {
 
 /// Upstream `DialogStatus`: one row per MCP server, the detail being the
 /// status text (and the error message when the connection failed).
+#[must_use]
 pub fn status(servers: &[McpRef]) -> Dialog {
     let summary = match servers.len() {
         0 => None,
@@ -307,6 +308,7 @@ impl Item {
         }
     }
 
+    #[must_use]
     pub fn unfiltered_only(mut self) -> Self {
         self.unfiltered_only = true;
         self
@@ -688,11 +690,13 @@ impl Input {
         }
     }
 
+    #[must_use]
     pub fn tag(mut self, tag: &'static str) -> Self {
         self.tag = Some(tag);
         self
     }
 
+    #[must_use]
     pub fn text(&self) -> &str {
         &self.text
     }

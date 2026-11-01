@@ -268,6 +268,7 @@ impl From<Vec<UserPart>> for UserContent {
 impl UserContent {
     /// The plain-text view: the text itself; a parts list has none, and reads
     /// as empty.
+    #[must_use]
     pub fn as_str(&self) -> &str {
         match self {
             Self::Text(text) => text,
@@ -334,6 +335,7 @@ impl ChatMessage {
     }
 
     /// Assistant turn carrying only tool calls (`content: null` on the wire).
+    #[must_use]
     pub fn assistant_tool_calls(tool_calls: Vec<ToolCall>) -> Self {
         Self::Assistant {
             content: None,

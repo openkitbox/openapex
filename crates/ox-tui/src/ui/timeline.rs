@@ -214,11 +214,13 @@ pub enum Block {
 }
 
 impl Block {
+    #[must_use]
     pub fn user(text: &str) -> Self {
         Block::User {
             text: std::sync::Arc::from(text),
         }
     }
+    #[must_use]
     pub fn assistant(id: &str, version: u64, text: &str) -> Self {
         Block::Assistant {
             id: id.to_owned(),
@@ -227,6 +229,7 @@ impl Block {
             footer: None,
         }
     }
+    #[must_use]
     pub fn reasoning(id: &str, version: u64, text: &str, done: bool) -> Self {
         Block::Reasoning {
             id: id.to_owned(),
@@ -498,6 +501,7 @@ pub struct SearchState {
 }
 
 impl Transcript {
+    #[must_use]
     pub fn new(width: u16, height: u16) -> Self {
         Self {
             entries: Vec::new(),
@@ -637,6 +641,7 @@ impl Transcript {
     /// The child session a click at screen cell (`x`, `y`) opens: the title
     /// row of a Completion notice that carries a `child_id` (upstream
     /// `routes/session/index.tsx:2090-2151`). `None` anywhere else.
+    #[must_use]
     pub fn child_at(&self, x: u16, y: u16) -> Option<&str> {
         // Row 0 is the block's blank margin; row 1 is the title.
         let (index, 1) = self.locate(x, y)? else {
@@ -1119,6 +1124,7 @@ impl Transcript {
         self.scroll = self.max_scroll();
     }
 
+    #[must_use]
     pub fn search(&self) -> &SearchState {
         &self.search
     }
@@ -1178,6 +1184,7 @@ impl Transcript {
     }
 
     /// The user messages as `(entry index, text)`, oldest first.
+    #[must_use]
     pub fn user_messages(&self) -> Vec<(usize, &str)> {
         self.entries
             .iter()
@@ -1199,10 +1206,12 @@ impl Transcript {
         true
     }
 
+    #[must_use]
     pub fn entry_generation(&self, index: usize) -> u64 {
         self.entries[index].generation
     }
 
+    #[must_use]
     pub fn total_lines(&self) -> usize {
         self.entries.iter().map(|entry| entry.lines.len()).sum()
     }

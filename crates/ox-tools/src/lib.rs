@@ -51,6 +51,7 @@ use ox_db::Db;
 /// The eight built-in tools, registered under their upstream names.
 impl ToolRegistry {
     /// A registry containing every built-in tool.
+    #[must_use]
     pub fn with_builtins() -> Self {
         let mut registry = Self::new();
         registry.register_all([
@@ -152,6 +153,7 @@ pub fn fail(message: impl Into<String>) -> ToolOutput {
 
 /// Upstream `runtime.ts` `formatInputIssues`: the model-facing error for
 /// arguments that fail input validation.
+#[must_use]
 pub fn invalid_arguments(tool: &str, issues: &[(&str, String)], input: &Value) -> ToolOutput {
     let shown: Vec<String> = issues
         .iter()
@@ -300,6 +302,7 @@ pub fn optional_number(tool: &str, input: &Value, key: &str) -> Result<Option<f6
 /// absolute paths pass through, relative ones join the session directory
 /// (upstream `FileAccess.resolvePath`). `~user` is not expanded. `.` and
 /// empty components are normalized away so result paths render cleanly.
+#[must_use]
 pub fn resolve_path(directory: &Path, path: &str) -> PathBuf {
     let candidate = match ox_core::home_paths::expand_tilde(path, &ox_core::config::user_home()) {
         Some(expanded) => expanded,
@@ -325,6 +328,7 @@ pub fn resolve_path(directory: &Path, path: &str) -> PathBuf {
 
 /// Upstream `FileAccess` `resource`: the slash-form path relative to the
 /// session directory when inside it, the absolute slash path otherwise.
+#[must_use]
 pub fn resource_of(directory: &Path, absolute: &Path) -> String {
     match absolute.strip_prefix(directory) {
         Ok(relative) => {
@@ -340,6 +344,7 @@ pub fn resource_of(directory: &Path, absolute: &Path) -> String {
 }
 
 /// Forward-slash form of a path (upstream `slash`).
+#[must_use]
 pub fn to_slash(path: &Path) -> String {
     let parts: Vec<String> = path
         .components()
@@ -358,6 +363,7 @@ pub fn to_slash(path: &Path) -> String {
 /// Upstream `normalizeForMatch` (edit.ts / patch.ts): 1:1 character
 /// replacements so match positions are preserved. Compares typographic
 /// quotes, dashes, and whitespace variants as their ASCII counterparts.
+#[must_use]
 pub fn normalize_typographic(value: &[char]) -> Vec<char> {
     value
         .iter()
@@ -373,11 +379,13 @@ pub fn normalize_typographic(value: &[char]) -> Vec<char> {
 }
 
 /// A JSON-Schema fragment helper: `{"type": ..., "description": ...}`.
+#[must_use]
 pub fn param(kind: &str, description: &str) -> Value {
     json!({ "type": kind, "description": description })
 }
 
 /// A JSON-Schema integer fragment with a minimum.
+#[must_use]
 pub fn int_param(minimum: u64, description: &str) -> Value {
     json!({ "type": "integer", "minimum": minimum, "description": description })
 }
@@ -385,6 +393,7 @@ pub fn int_param(minimum: u64, description: &str) -> Value {
 /// An object parameter schema: `{"type":"object","properties":{…},
 /// "required":[…],"additionalProperties":false}` — the shape upstream's
 /// Effect Struct schemas produce (excess properties are an error there).
+#[must_use]
 pub fn object_param(properties: Vec<(&str, Value)>, required: &[&str]) -> Value {
     let mut object = serde_json::Map::new();
     object.insert("type".to_owned(), json!("object"));

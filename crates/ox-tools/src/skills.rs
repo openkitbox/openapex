@@ -103,6 +103,7 @@ fn dirs_home() -> Option<PathBuf> {
 
 /// Discover every skill visible from `directory`. Unreadable roots and files
 /// are skipped, never fatal — a broken skill dir must not break the toolset.
+#[must_use]
 pub fn discover(directory: &Path) -> Vec<Skill> {
     discover_in(&roots(directory))
 }
@@ -110,6 +111,7 @@ pub fn discover(directory: &Path) -> Vec<Skill> {
 /// The catalog view of every skill visible from `directory`: id, name and
 /// description only. The bodies are never retained, so a step's catalog walk
 /// costs frontmatter parsing rather than one body allocation per skill.
+#[must_use]
 pub fn list(directory: &Path) -> Vec<SkillMeta> {
     list_in(&roots(directory))
 }
@@ -488,6 +490,7 @@ fn boolean_value(frontmatter: &str, key: &str) -> Option<bool> {
 /// ([`ox_core::reminder_tags::neutralize_reminder_tags`], batch D): system[0]
 /// tells the model those blocks are harness-authored. Tag-free bodies render
 /// byte-identically.
+#[must_use]
 pub fn render_content(skill: &Skill, directory: &Path, files: &[PathBuf], home: &Path) -> String {
     let directory = ox_core::home_paths::redact_home(directory, home);
     let mut lines = vec![
@@ -563,6 +566,7 @@ fn base_directory(skill: &Skill) -> &Path {
 /// directory yields an empty file list rather than an error — this module's
 /// "unreadable is never fatal" contract, where upstream's `fs.scan` would
 /// propagate the failure.
+#[must_use]
 pub fn companion_files(skill: &Skill) -> Vec<PathBuf> {
     if !is_directory_skill(skill) {
         return Vec::new();
@@ -615,6 +619,7 @@ pub struct PreparedSkill {
 /// one scan, and tests can decide without a filesystem. The only I/O left is
 /// [`companion_files`], which is per-skill and unavoidable. `home` is threaded
 /// through to [`render_content`]'s base-directory redaction.
+#[must_use]
 pub fn prepare_from(skills: &[Skill], id: &str, home: &Path) -> Option<PreparedSkill> {
     let skill = skills.iter().find(|skill| skill.id == id)?;
     let directory = base_directory(skill).to_path_buf();
@@ -634,6 +639,7 @@ pub fn prepare_from(skills: &[Skill], id: &str, home: &Path) -> Option<PreparedS
 /// pairs [`discover`] with [`prepare_from`] to answer several ids per scan.
 /// Both end in [`render_content`], the only producer of the envelope, so the
 /// two can never drift.
+#[must_use]
 pub fn prepare(directory: &Path, id: &str, home: &Path) -> Option<PreparedSkill> {
     prepare_from(&discover(directory), id, home)
 }

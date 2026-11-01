@@ -6,11 +6,13 @@ use std::path::{Path, PathBuf};
 /// Text as it should land in an input: `\r\n` and lone `\r` become `\n`, and
 /// ANSI escape sequences (colours copied from a terminal, cursor moves) are
 /// removed. Everything else, including Unicode text, is kept as is.
+#[must_use]
 pub fn normalize(text: &str) -> String {
     clean(text, '\n')
 }
 
 /// [`normalize`] for single-line inputs: every line break becomes a space.
+#[must_use]
 pub fn single_line(text: &str) -> String {
     clean(text, ' ')
 }
@@ -85,6 +87,7 @@ pub struct Pasted {
 /// paste that is too long to show inline, `None` for one that stays as is.
 /// Upstream (`pasteInputText`) judges the trimmed text: at least
 /// [`FOLD_MIN_LINES`] lines, or more than [`FOLD_OVER_CHARS`] characters.
+#[must_use]
 pub fn fold_label(text: &str) -> Option<String> {
     let text = text.trim();
     let lines = text.matches('\n').count() + 1;
@@ -108,6 +111,7 @@ pub fn unique_label(base: &str, taken: impl Fn(&str) -> bool) -> String {
 }
 
 /// Whether `uri` is an inline image (`data:image/…`).
+#[must_use]
 pub fn is_image_uri(uri: &str) -> bool {
     uri.starts_with("data:image/")
 }
@@ -115,6 +119,7 @@ pub fn is_image_uri(uri: &str) -> bool {
 /// The base label of an attached file, upstream `promptAttachmentLabel`:
 /// `[Image n]` where `n` is one past the images already attached, `[PDF: name]`
 /// for a PDF, `[File: name]` for anything else.
+#[must_use]
 pub fn attachment_label(uri: &str, name: &str, images_attached: usize) -> String {
     if is_image_uri(uri) {
         format!("[Image {}]", images_attached + 1)
@@ -126,6 +131,7 @@ pub fn attachment_label(uri: &str, name: &str, images_attached: usize) -> String
 }
 
 /// The base label of an SVG pasted as text.
+#[must_use]
 pub fn svg_label(name: &str) -> String {
     format!("[SVG: {name}]")
 }
@@ -135,6 +141,7 @@ pub fn svg_label(name: &str) -> String {
 /// occurrence only (a second copy typed by hand stays literal), and where
 /// labels share a prefix (`[Pasted ~3 lines]`, `[Pasted ~3 lines] #2`) the
 /// longest match wins. Entries whose label is gone from `text` are ignored.
+#[must_use]
 pub fn expand(text: &str, pasted: &[Pasted]) -> String {
     let mut used = vec![false; pasted.len()];
     let mut out = String::with_capacity(text.len());
@@ -167,6 +174,7 @@ pub fn expand(text: &str, pasted: &[Pasted]) -> String {
 /// appear. Each label counts once, at its first free occurrence, and where
 /// labels share a prefix (`[PDF: a.pdf]`, `[PDF: a.pdf] #2`) the longest match
 /// wins, as in [`expand`].
+#[must_use]
 pub fn labels_in_order(text: &str, labels: &[&str]) -> Vec<usize> {
     let mut used = vec![false; labels.len()];
     let mut order = Vec::new();
@@ -193,6 +201,7 @@ pub fn labels_in_order(text: &str, labels: &[&str]) -> Vec<usize> {
 /// The entry to expand when `content` is pasted again right after its label:
 /// `before_cursor` ends with the label of an entry whose text is `content`
 /// (trimmed). Upstream's keyboard path for unfolding a placeholder.
+#[must_use]
 pub fn expandable_before(before_cursor: &str, content: &str, pasted: &[Pasted]) -> Option<usize> {
     let content = content.trim();
     pasted
@@ -220,6 +229,7 @@ const MAX_PASTED_PATH_TEXT_BYTES: usize = MAX_PASTED_FILEPATHS * 4096;
 
 /// Extension (case-insensitive) → MIME type for what a pasted path may
 /// attach: the images and PDFs upstream's `mimeTypes` table lists.
+#[must_use]
 pub fn mime_of_ext(ext: &str) -> Option<&'static str> {
     const MIMES: [(&str, &str); 8] = [
         ("png", "image/png"),
@@ -243,6 +253,7 @@ pub fn mime_of_ext(ext: &str) -> Option<&'static str> {
 /// extension [`mime_of_ext`] knows. Empty for anything else, including a
 /// URL, so the caller pastes the text as it is. Whether the files exist is
 /// not decided here.
+#[must_use]
 pub fn pasted_attachment_paths(text: &str) -> Vec<PathBuf> {
     if text.len() > MAX_PASTED_PATH_TEXT_BYTES {
         return Vec::new();
@@ -283,6 +294,7 @@ fn attachable(path: &Path) -> bool {
 /// URL decoded (`None` when it is not a local file), otherwise backslash
 /// escapes (`\ `) undone. Port of upstream `normalizePastedFilepath`, unix
 /// branch.
+#[must_use]
 pub fn normalize_path(value: &str) -> Option<String> {
     let raw = value.trim_matches(['\'', '"']);
     if raw.starts_with("file://") {
@@ -344,6 +356,7 @@ fn percent_decode(text: &str) -> Option<String> {
 /// a local file (upstream keeps such an item raw; here it fails closed). With
 /// a `file://` in the text, `#` comment lines (as in a `text/uri-list`) are
 /// dropped first. Port of upstream `parsePastedFilepaths`, unix branch.
+#[must_use]
 pub fn parse_paths(value: &str) -> Vec<PathBuf> {
     let uri_list;
     let input = if value.contains("file://") {

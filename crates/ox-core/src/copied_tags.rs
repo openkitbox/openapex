@@ -59,6 +59,7 @@ static STRAY_SECTION_SIGN: LazyLock<Regex> =
 /// Text without a `§` is returned borrowed and byte-identical: trimming clean
 /// text would change bytes for no reason (upstream's wrapper has the same
 /// guard).
+#[must_use]
 pub fn strip_copied_tag_notation(text: &str) -> Cow<'_, str> {
     if !text.contains('§') {
         return Cow::Borrowed(text);

@@ -364,16 +364,19 @@ impl Runner {
     /// and the actor's first poll installing the cancellation token.
     /// The chat transport this runner issues completions through. Background
     /// work that must not open a second transport (the dreamer) borrows it.
+    #[must_use]
     pub fn chat(&self) -> Arc<dyn Chat> {
         Arc::clone(&self.inner.live.current().chat)
     }
 
     /// The holder of the current config-derived services; a reload installs
     /// the next generation through it.
+    #[must_use]
     pub fn live(&self) -> Arc<Live> {
         Arc::clone(&self.inner.live)
     }
 
+    #[must_use]
     pub fn is_active(&self, session_id: &str) -> bool {
         self.inner
             .sessions
@@ -382,6 +385,7 @@ impl Runner {
     }
 
     /// Whether any session has work scheduled or in flight.
+    #[must_use]
     pub fn has_active(&self) -> bool {
         self.inner
             .sessions
@@ -392,6 +396,7 @@ impl Runner {
     /// Process-local per-session table sizes (registry entries, keyed-instruction
     /// baselines), for isolated allocator profiling and for tests that need to
     /// see eviction — no HTTP surface exposes what a session costs the process.
+    #[must_use]
     pub fn diagnostic_table_sizes(&self) -> (usize, usize) {
         let baselines = lock(&self.inner.instruction_baselines).len();
         (self.inner.sessions.len(), baselines)
@@ -445,13 +450,13 @@ impl Runner {
     /// Answer `prompt` from the session's current context without mutating it
     /// (upstream `session.generate`, the TUI's `/btw` dependency). Nothing is
     /// persisted, no event is published and no tool loop runs.
-    #[must_use]
     pub async fn generate(&self, session_id: &str, prompt: &str) -> Result<String> {
         generate::run(&self.inner, session_id, prompt).await
     }
 
     /// Cancel the session's in-flight busy period. Returns whether one was
     /// running (idle interruption is a no-op, matching upstream).
+    #[must_use]
     pub fn interrupt(&self, session_id: &str) -> bool {
         let Some(handle) = self.inner.sessions.get(session_id) else {
             return false;

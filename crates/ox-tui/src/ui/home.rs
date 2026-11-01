@@ -71,6 +71,7 @@ fn mask_line(line: &str, ink: Style, pal: &theme::Palette, bold: bool) -> Line<'
 
 /// Upstream `Logo` (`component/logo.tsx:51-79`): hidden below 12 rows, the go
 /// mark below 22 columns, left/right stacked below 44, side by side otherwise.
+#[must_use]
 pub fn logo_lines(width: u16, height: u16, pal: theme::Palette) -> Vec<Line<'static>> {
     if height < 12 {
         return Vec::new();
@@ -119,6 +120,7 @@ fn side_pad(width: u16) -> u16 {
 
 /// 内容列：上游 composer 的 `width=100% maxWidth=75`，外层 padding 2
 /// （终端宽 <44 时收为 1），在内缩后的屏宽里居中。
+#[must_use]
 pub fn column_rect(area: Rect) -> Rect {
     let pad = side_pad(area.width);
     let inner = area.width.saturating_sub(pad * 2).max(1);

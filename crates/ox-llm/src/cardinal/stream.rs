@@ -71,6 +71,7 @@ pub struct SseFramer {
 
 impl SseFramer {
     /// A fresh framer.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -190,6 +191,7 @@ pub struct ChunkDecoder {
 
 impl ChunkDecoder {
     /// A fresh decoder.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -370,6 +372,7 @@ pub struct Assembler {
 
 impl Assembler {
     /// A fresh assembler.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -413,6 +416,7 @@ impl Assembler {
 
     /// Consume the assembler and return the assembled message with tool calls
     /// in `index` order.
+    #[must_use]
     pub fn finish(mut self) -> AssembledMessage {
         self.message.tool_calls = self.tool_calls.into_values().collect();
         self.message

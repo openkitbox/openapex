@@ -31,6 +31,7 @@ pub enum FormValue {
 
 impl FormValue {
     /// The answer as display text, for the model-facing result.
+    #[must_use]
     pub fn display(&self) -> String {
         match self {
             FormValue::String(text) => text.clone(),
@@ -189,11 +190,13 @@ pub struct Forms {
 }
 
 impl Forms {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// A registry that broadcasts every transition on `bus`.
+    #[must_use]
     pub fn with_bus(bus: EventBus) -> Self {
         let forms = Self::new();
         forms.set_bus(bus);

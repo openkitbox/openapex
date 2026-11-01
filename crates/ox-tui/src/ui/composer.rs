@@ -54,10 +54,12 @@ struct Attached {
 }
 
 impl Composer {
+    #[must_use]
     pub fn new() -> Self {
         Self::new_with_placeholder("输入消息…")
     }
 
+    #[must_use]
     pub fn new_with_placeholder(placeholder: &str) -> Self {
         Self {
             textarea: empty_textarea(),
@@ -350,6 +352,7 @@ fn take_width(text: &str, width: usize) -> &str {
 }
 
 /// Upstream: `Math.max(6, Math.floor(terminalHeight / 3))`.
+#[must_use]
 pub fn max_height(terminal_height: u16) -> u16 {
     (terminal_height / 3).max(6)
 }
@@ -395,6 +398,7 @@ pub struct SearchBox {
 }
 
 impl SearchBox {
+    #[must_use]
     pub fn new() -> Self {
         let mut textarea = empty_textarea();
         textarea.set_placeholder_text("搜索…");

@@ -7,6 +7,7 @@ pub struct FrameParser {
 }
 
 impl FrameParser {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -87,6 +88,7 @@ pub enum StreamMsg {
 
 /// Spawn the reconnect loop. `seq_rx` carries the focused session's last
 /// durable seq (updated by the store as events arrive; per-session only).
+#[must_use]
 pub fn spawn_events(
     client: Client,
     session: String,
@@ -131,6 +133,7 @@ pub struct Attachment {
 
 impl Attachment {
     /// Nothing is connected until [`Attachment::attach`].
+    #[must_use]
     pub fn new(
         client: Client,
         seq_rx: watch::Receiver<Option<i64>>,
@@ -156,6 +159,7 @@ impl Attachment {
     }
 
     /// True while a stream task is alive (it may be between reconnects).
+    #[must_use]
     pub fn is_attached(&self) -> bool {
         self.task.as_ref().is_some_and(|task| !task.is_finished())
     }

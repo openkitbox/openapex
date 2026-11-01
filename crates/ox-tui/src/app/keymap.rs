@@ -98,12 +98,14 @@ impl Keymap {
     }
 
     /// Whether a leader is waiting for its follow-up key (ignoring the timeout).
+    #[must_use]
     pub fn is_armed(&self) -> bool {
         self.armed.is_some()
     }
 }
 
 /// The key hint of `action` (`ctrl+x l`), if it has a binding.
+#[must_use]
 pub fn hint(action: CommandAction) -> Option<String> {
     LEADER_KEYS
         .iter()
@@ -116,17 +118,20 @@ pub fn hint(action: CommandAction) -> Option<String> {
 }
 
 /// `ctrl+c`: interrupt a running turn, otherwise quit. Works in every mode.
+#[must_use]
 pub fn is_cancel(key: &KeyEvent) -> bool {
     has_ctrl(key, 'c')
 }
 
 /// `ctrl+f`: open the transcript search (an ox addition; upstream has none).
+#[must_use]
 pub fn is_search(key: &KeyEvent) -> bool {
     has_ctrl(key, 'f')
 }
 
 /// `ctrl+v`: paste from the system clipboard (upstream `prompt.paste`,
 /// `config/keybind.ts`: `ctrl+v`). Only the prompt acts on it.
+#[must_use]
 pub fn is_paste(key: &KeyEvent) -> bool {
     key.kind != KeyEventKind::Release && is_ctrl(key, 'v')
 }

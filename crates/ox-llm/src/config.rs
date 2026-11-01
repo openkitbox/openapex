@@ -74,6 +74,7 @@ impl EndpointLimits {
     /// The silence bound to install on the endpoint's HTTP client: the
     /// explicit value if given, else [`DEFAULT_LIMITED_STALL`] when a
     /// concurrency limit is set, else `None`.
+    #[must_use]
     pub fn stall_timeout(&self) -> Option<Duration> {
         match (self.stall_timeout_secs, self.max_concurrent) {
             (Some(secs), _) => Some(Duration::from_secs(secs.get())),

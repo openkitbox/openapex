@@ -121,6 +121,7 @@ impl Default for McpTimeout {
 }
 
 impl McpServerConfig {
+    #[must_use]
     pub fn disabled(&self) -> bool {
         match self {
             Self::Local(local) => local.disabled,
@@ -128,6 +129,7 @@ impl McpServerConfig {
         }
     }
 
+    #[must_use]
     pub fn timeout(&self) -> &McpTimeout {
         match self {
             Self::Local(local) => &local.timeout,
@@ -135,6 +137,7 @@ impl McpServerConfig {
         }
     }
 
+    #[must_use]
     pub fn protocol(&self) -> McpProtocol {
         match self {
             Self::Local(local) => local.protocol,
@@ -388,12 +391,14 @@ impl Default for Config {
 /// This is the one home source for model-visible paths: injected text renders
 /// it as `~` and [`crate::home_paths::expand_tilde`] expands it back, so a
 /// redacted path stays resolvable.
+#[must_use]
 pub fn user_home() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// The ox home directory (`~/.ox`), falling back to `./.ox` when the home
 /// directory cannot be determined.
+#[must_use]
 pub fn ox_home() -> PathBuf {
     user_home().join(".ox")
 }
@@ -416,6 +421,7 @@ fn parse_error(path: &Path, raw: &str, error: &toml::de::Error) -> anyhow::Error
 
 impl Config {
     /// Default config file location: `~/.ox/ox.toml`.
+    #[must_use]
     pub fn default_path() -> PathBuf {
         ox_home().join("ox.toml")
     }
@@ -656,9 +662,11 @@ impl MctxConfig {
     }
 }
 
+#[must_use]
 pub fn default_execute_threshold_percentage() -> f64 {
     65.0
 }
+#[must_use]
 pub fn default_history_budget_percentage() -> f64 {
     0.15
 }
@@ -730,6 +738,7 @@ pub struct EmbeddingConfig {
 
 impl EmbeddingConfig {
     /// Whether semantic search can run at all.
+    #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.provider == EmbeddingProvider::OpenAiCompatible
             && self.endpoint.as_deref().is_some_and(|v| !v.is_empty())
@@ -739,6 +748,7 @@ impl EmbeddingConfig {
     /// The identity written beside a stored vector: the model plus the
     /// document prefix, because the same model with a different prefix
     /// produces an incomparable vector space.
+    #[must_use]
     pub fn identity(&self) -> String {
         match self.document_prefix.as_deref().filter(|p| !p.is_empty()) {
             Some(prefix) => format!("{}|{prefix}", self.model.as_deref().unwrap_or("")),

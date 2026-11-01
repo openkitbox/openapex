@@ -11,6 +11,7 @@ pub(crate) mod client;
 pub(crate) mod http;
 pub(crate) mod jsonrpc;
 pub(crate) mod stdio;
+mod sync;
 pub(crate) mod tool;
 pub(crate) mod transport;
 
@@ -106,6 +107,7 @@ const TOOL_NAMING_LINE: &str = "Use tools from these servers directly by their `
 impl Hub {
     /// A hub with no servers. `Runner::new` uses this so tests that build a
     /// runner directly get the pre-MCP behavior.
+    #[must_use]
     pub fn empty() -> Self {
         Self {
             servers: RwLock::new(BTreeMap::new()),
@@ -134,20 +136,14 @@ impl Hub {
         let mut seen = HashSet::new();
         for outcome in outcomes {
             let name = outcome.name.clone();
-            self.servers
-                .write()
-                .unwrap()
-                .insert(name.clone(), outcome.status);
+            sync::write(&self.servers).insert(name.clone(), outcome.status);
             if let Some(metadata) = outcome.metadata {
-                self.metadata
-                    .write()
-                    .unwrap()
-                    .insert(name.clone(), metadata);
+                sync::write(&self.metadata).insert(name.clone(), metadata);
             }
-            self.resources.write().unwrap().extend(outcome.resources);
-            self.templates.write().unwrap().extend(outcome.templates);
+            sync::write(&self.resources).extend(outcome.resources);
+            sync::write(&self.templates).extend(outcome.templates);
             if let Some(rpc) = outcome.rpc {
-                self.connections.write().unwrap().insert(name.clone(), rpc);
+                sync::write(&self.connections).insert(name.clone(), rpc);
             }
             for tool in outcome.tools {
                 let tool_name = tool.name().to_owned();
@@ -169,18 +165,18 @@ impl Hub {
     /// registered (a name that collided with an existing tool is skipped and
     /// must not be listed). Replaces the previous record.
     pub fn record_registered_tools(&self, names: Vec<String>) {
-        *self.tool_names.write().unwrap() = names;
+        *sync::write(&self.tool_names) = names;
     }
 
     /// Names recorded by [`Self::record_registered_tools`]: exactly the tools
     /// a reload may remove from a registry without touching a builtin.
     pub fn tool_names(&self) -> Vec<String> {
-        self.tool_names.read().unwrap().clone()
+        sync::read(&self.tool_names).clone()
     }
 
     pub fn servers(&self) -> Vec<ServerView> {
-        let servers = self.servers.read().unwrap();
-        let metadata = self.metadata.read().unwrap();
+        let servers = sync::read(&self.servers);
+        let metadata = sync::read(&self.metadata);
         servers
             .iter()
             .map(|(name, status)| {
@@ -196,8 +192,8 @@ impl Hub {
 
     pub fn resources(&self) -> (Vec<ResourceInfo>, Vec<TemplateInfo>) {
         (
-            self.resources.read().unwrap().clone(),
-            self.templates.read().unwrap().clone(),
+            sync::read(&self.resources).clone(),
+            sync::read(&self.templates).clone(),
         )
     }
 
@@ -206,7 +202,7 @@ impl Hub {
     /// The upstream block bytes are a strict prefix; [`TOOL_NAMING_LINE`]
     /// follows as the one documented deviation.
     pub fn instructions_block(&self) -> Option<String> {
-        let metadata = self.metadata.read().unwrap();
+        let metadata = sync::read(&self.metadata);
         let instructions = metadata.iter().filter_map(|(name, connection)| {
             connection
                 .instructions

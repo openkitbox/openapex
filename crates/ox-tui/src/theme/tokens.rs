@@ -219,6 +219,7 @@ pub enum Mode {
 }
 
 impl Mode {
+    #[must_use]
     pub fn of_background(background: Rgb) -> Self {
         if background.luminance() > 127.5 {
             Self::Light
@@ -323,6 +324,7 @@ pub struct Tokens {
 
 impl Tokens {
     /// Upstream's default theme in `mode`, resolved from the v2 document.
+    #[must_use]
     pub fn opencode(mode: Mode) -> Self {
         let dark = mode == Mode::Dark;
         let hues = if dark { &DARK } else { &LIGHT };
@@ -429,6 +431,7 @@ impl Tokens {
     /// body text as the terminal foreground, surfaces from the derived gray
     /// ramp (`system.ts:46-99`, then v1 migration puts `grays[2]`/`grays[3]`
     /// at `raised.base`/`raised.high`, `v1-migrate.ts:73-76`).
+    #[must_use]
     pub fn system(system: &System, colors: &TerminalColors) -> Self {
         let fg = colors.foreground.unwrap_or_else(|| colors.slot(7));
         let (red, green, yellow, blue, magenta, cyan) = (

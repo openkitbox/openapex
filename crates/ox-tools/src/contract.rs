@@ -70,12 +70,14 @@ pub struct ToolOutput {
 
 impl ToolOutput {
     /// A successful output carrying client-facing `metadata`.
+    #[must_use]
     pub fn with_metadata(mut self, metadata: Value) -> Self {
         self.metadata = Some(metadata);
         self
     }
 
     /// A successful output carrying model-visible attachments.
+    #[must_use]
     pub fn with_attachments(mut self, attachments: Vec<Attachment>) -> Self {
         self.attachments = Some(attachments);
         self
@@ -155,6 +157,7 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     /// An empty registry.
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }

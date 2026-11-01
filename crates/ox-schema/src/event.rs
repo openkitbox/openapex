@@ -101,6 +101,7 @@ impl EventEnvelope<Value> {
     /// Parse the envelope's `data` into the typed event union based on the
     /// `type` string. Unknown types come back as [`SessionEventData::Unknown`]
     /// with the raw data preserved.
+    #[must_use]
     pub fn parse_typed(&self) -> EventEnvelope<SessionEventData> {
         EventEnvelope {
             id: self.id.clone(),
@@ -116,6 +117,7 @@ impl EventEnvelope<Value> {
 
 impl EventEnvelope<SessionEventData> {
     /// Lower a typed envelope back to the generic wire form.
+    #[must_use]
     pub fn into_generic(self) -> EventEnvelope<Value> {
         EventEnvelope {
             id: self.id,
@@ -676,6 +678,7 @@ impl SessionEventData {
     /// falls back to [`SessionEventData::Unknown`] (verbatim), mirroring
     /// upstream's lenient `schemaCodec` bus decode. Only non-object data or
     /// other structural failures produce an error.
+    #[must_use]
     pub fn from_parts(kind: &str, data: Value) -> Self {
         let adapter = serde_json::json!({ "type": kind, "data": data });
         serde_json::from_value(adapter).unwrap_or_else(|_| SessionEventData::Unknown {
@@ -692,6 +695,7 @@ impl SessionEventData {
     /// fallback, an *unknown* type string is captured as
     /// [`SessionEventData::Unknown`] together with the tag, so the invariant
     /// holds even for unknown events.
+    #[must_use]
     pub fn kind(&self) -> &str {
         match self {
             SessionEventData::SessionCreated { .. } => "session.created",
@@ -748,6 +752,7 @@ impl SessionEventData {
     }
 
     /// Extract the raw `data` payload.
+    #[must_use]
     pub fn into_data(self) -> Value {
         if let SessionEventData::Unknown { data, .. } = self {
             return data;
@@ -759,6 +764,7 @@ impl SessionEventData {
     /// The borrowed twin of [`Self::into_data`]: publishers that keep the
     /// typed event (the envelope) need the `data` subtree without giving up
     /// ownership. Same output, no clone of the union.
+    #[must_use]
     pub fn to_data(&self) -> Value {
         if let SessionEventData::Unknown { data, .. } = self {
             return data.clone();
@@ -768,6 +774,7 @@ impl SessionEventData {
     }
 
     /// The session this event belongs to, when the variant carries it.
+    #[must_use]
     pub fn session_id(&self) -> Option<&str> {
         match self {
             SessionEventData::SessionCreated { session_id, .. }

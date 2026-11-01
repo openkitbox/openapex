@@ -186,6 +186,7 @@ pub fn lang_for_path(path: &str) -> Option<&str> {
 
 /// `code` as one span list per line. An unknown language, or a line the
 /// engine cannot lex, comes back as plain text in the palette's text colour.
+#[must_use]
 pub fn highlight(lang: &str, code: &str, palette: &Palette) -> Vec<Vec<Span<'static>>> {
     let Some(syntax) = syntax_for(lang) else {
         return code.lines().map(|line| plain(line, palette)).collect();

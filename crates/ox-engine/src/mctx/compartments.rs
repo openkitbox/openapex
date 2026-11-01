@@ -77,6 +77,7 @@ pub struct Compartment {
 
 impl Compartment {
     /// The coverage end as a number, or `None` when the column is malformed.
+    #[must_use]
     pub fn end_ordinal(&self) -> Option<i64> {
         self.coverage_end.trim().parse::<i64>().ok()
     }
@@ -84,6 +85,7 @@ impl Compartment {
     /// Projection into the historian prompt's reference shape (the
     /// `<session_references>` block: coverage range plus every paraphrase
     /// tier, no row id and no dates).
+    #[must_use]
     pub fn reference_input(&self) -> crate::mctx::historian::ReferenceCompartment<'_> {
         crate::mctx::historian::ReferenceCompartment {
             start_message: self.tiers.start_message,
@@ -102,6 +104,7 @@ impl Compartment {
     }
 
     /// Projection into the decay renderer's input shape.
+    #[must_use]
     pub fn render_input(&self) -> DecayRenderCompartment<'_> {
         DecayRenderCompartment {
             start_message: self.tiers.start_message,

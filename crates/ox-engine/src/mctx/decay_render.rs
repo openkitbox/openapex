@@ -96,6 +96,7 @@ pub struct DecayRenderCompartment<'a> {
 impl DecayRenderCompartment<'_> {
     /// Empty payload rows advance coverage but are not summaries or decay
     /// inputs.
+    #[must_use]
     pub fn is_no_content(&self) -> bool {
         self.title.is_empty()
             && self.content.is_empty()
@@ -252,6 +253,7 @@ fn legacy_tier(c: &DecayRenderCompartment<'_>) -> u8 {
 /// Render a single compartment at an explicit tier. Exposed for the m1 "new
 /// compartments" block, which always renders newest compartments at P1 (full
 /// fidelity — no decay applies to brand-new deltas).
+#[must_use]
 pub fn render_compartment_at_tier(c: &DecayRenderCompartment<'_>, tier: u8) -> String {
     render_one_compartment(c, tier)
 }

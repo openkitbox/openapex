@@ -110,6 +110,7 @@ impl ModelCatalog {
     /// [`Self::warm`] does that, so building state never blocks on the network.
     /// The config must have passed provider validation ([`crate::config::LlmConfig::validate`]
     /// runs it): candidate lists are non-empty and their providers resolve.
+    #[must_use]
     pub fn new(config: &LlmConfig) -> Arc<Self> {
         let client = crate::http_client()
             .timeout(Duration::from_secs(10))
@@ -150,6 +151,7 @@ impl ModelCatalog {
 
     /// A catalogue seeded with `entries` and no fetch — the seam tests use to
     /// pin a model list without a gateway.
+    #[must_use]
     pub fn from_entries(entries: Vec<ModelEntry>) -> Self {
         Self {
             client: crate::http_client().build().unwrap_or_default(),

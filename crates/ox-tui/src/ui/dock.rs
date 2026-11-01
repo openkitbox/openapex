@@ -145,6 +145,7 @@ fn clip(text: &str, room: usize) -> (String, usize) {
 
 /// Upstream `Locale.number`: `1.2M`, `12.4K`, or the plain count. The prompt
 /// footer shows context usage with this.
+#[must_use]
 pub fn format_tokens(tokens: i64) -> String {
     if tokens >= 999_950 {
         format!("{:.1}M", tokens as f64 / 1_000_000.0)
@@ -157,6 +158,7 @@ pub fn format_tokens(tokens: i64) -> String {
 
 /// Upstream `formatContextUsage`: `12.4K (8%)`, or the bare count when the
 /// model's window is unknown. `tokens / limit` rounds half up like `Math.round`.
+#[must_use]
 pub fn format_context(tokens: i64, limit: Option<i64>) -> String {
     let value = format_tokens(tokens);
     match limit.filter(|limit| *limit > 0) {

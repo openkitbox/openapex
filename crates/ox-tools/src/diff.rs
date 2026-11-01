@@ -68,6 +68,7 @@ impl Serialize for FileDiff {
 
 /// The diff between two texts of one file. `before` is empty for a created
 /// file and `after` is empty for a deleted one; `status` names which.
+#[must_use]
 pub fn file_diff(file: &str, before: &str, after: &str, status: DiffStatus) -> FileDiff {
     let before_lines = split_lines(before);
     let after_lines = split_lines(after);
@@ -90,6 +91,7 @@ pub fn file_diff(file: &str, before: &str, after: &str, status: DiffStatus) -> F
 }
 
 /// A file removed in full: an all-deletions hunk against `/dev/null`.
+#[must_use]
 pub fn deleted_file(file: &str, before: &str) -> FileDiff {
     file_diff(file, before, "", DiffStatus::Deleted)
 }

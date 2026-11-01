@@ -187,6 +187,7 @@ pub enum Trigger {
 /// work on the first step of a session, before any completion has reported a
 /// usage number; the usage comparison is what catches a window that is filling
 /// up with head+tail together rather than with tail alone.
+#[must_use]
 pub fn trigger(
     usage_pct: Option<f64>,
     tail_tokens: f64,
@@ -269,6 +270,7 @@ pub struct ChunkLimits {
 
 impl ChunkLimits {
     /// No ceiling at all: for measuring a whole tail, and for tests.
+    #[must_use]
     pub const fn unbounded() -> Self {
         Self {
             request: usize::MAX,
@@ -966,6 +968,7 @@ pub fn reference_seeds() -> &'static [ReferenceSeed] {
 }
 
 /// `historian_prompt.rs::escape_xml_attr`.
+#[must_use]
 pub fn escape_xml_attr(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('"', "&quot;")
@@ -975,6 +978,7 @@ pub fn escape_xml_attr(s: &str) -> String {
 }
 
 /// `historian_prompt.rs::escape_xml_content`.
+#[must_use]
 pub fn escape_xml_content(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -984,6 +988,7 @@ pub fn escape_xml_content(s: &str) -> String {
 /// FNV-1a over JavaScript UTF-16 code units
 /// (`historian_prompt.rs::fnv1a`): a retried chunk must see the same
 /// calibration examples, so the seed is a stable hash of session + chunk start.
+#[must_use]
 pub fn fnv1a(input: &str) -> u32 {
     let mut h = 0x811c_9dc5_u32;
     for unit in input.encode_utf16() {
@@ -1074,6 +1079,7 @@ fn select_seed_indices(
 /// The seeds for one run (`historian_prompt.rs::select_seeds`). Borrowed from
 /// the process-wide static corpus: the examples are read-only and the run only
 /// renders them, so no seed block is copied per run.
+#[must_use]
 pub fn select_seeds(
     session_id: &str,
     chunk_start: i64,
@@ -1087,6 +1093,7 @@ pub fn select_seeds(
 }
 
 /// `historian_prompt.rs::render_seed_examples_block`.
+#[must_use]
 pub fn render_seed_examples_block(seeds: &[&ReferenceSeed]) -> String {
     if seeds.is_empty() {
         return String::new();
@@ -1104,6 +1111,7 @@ pub fn render_seed_examples_block(seeds: &[&ReferenceSeed]) -> String {
 /// `historian_prompt.rs::render_session_ref_compartment`: episode type is
 /// always shown, importance only on the diverse (older) examples — the newest
 /// scores cause anchoring in one-compartment runs.
+#[must_use]
 pub fn render_session_ref_compartment(
     c: &ReferenceCompartment<'_>,
     show_importance: bool,
@@ -1170,6 +1178,7 @@ fn is_no_content_compartment(c: &ReferenceCompartment<'_>) -> bool {
 /// `historian_prompt.rs::select_session_references`: the recent window first
 /// (chronological), then the least-represented older bands. The input must be
 /// chronological.
+#[must_use]
 pub fn select_session_references<'a>(
     all_compartments: &[ReferenceCompartment<'a>],
     seeds: &[&ReferenceSeed],
@@ -1217,6 +1226,7 @@ pub fn select_session_references<'a>(
 /// `historian_prompt.rs::render_session_references_block_window`: drop diverse
 /// examples before recent ones, then the oldest recent first. Select once
 /// before fitting so trimming never reshuffles the examples.
+#[must_use]
 pub fn render_session_references_block_window(
     selected: &[ReferenceCompartment<'_>],
     window: usize,
@@ -1246,12 +1256,14 @@ pub fn render_session_references_block_window(
 }
 
 /// `historian_prompt.rs::render_session_references_block`.
+#[must_use]
 pub fn render_session_references_block(selected: &[ReferenceCompartment<'_>]) -> String {
     render_session_references_block_window(selected, SESSION_REF_LIMIT)
 }
 
 /// The two calibration blocks for one run
 /// (`historian_prompt.rs::build_reference_blocks`).
+#[must_use]
 pub fn build_reference_blocks(
     session_id: &str,
     chunk_start: i64,
@@ -1274,6 +1286,7 @@ pub fn build_reference_blocks(
 /// wire render (`#id: fact`): the historian uses it only for content-based
 /// deduplication and contradiction reporting, and never addresses a memory by
 /// id.
+#[must_use]
 pub fn render_historian_memory_block(memories: &[MemoryRow]) -> String {
     let mut sections = Vec::new();
     for category in HISTORIAN_MEMORY_CATEGORY_PRIORITY {
@@ -1305,6 +1318,7 @@ pub fn render_historian_memory_block(memories: &[MemoryRow]) -> String {
 /// prompt. Block order is load-bearing (it is what the model was tuned on):
 /// calibration examples, session references, project memory, the toggles, the
 /// transcript, then the guard.
+#[must_use]
 pub fn build_compartment_agent_prompt(inputs: &CompartmentPromptInputs<'_>) -> String {
     let mut parts = Vec::new();
     if !inputs.seed_examples.is_empty() {
@@ -1336,6 +1350,7 @@ pub fn build_compartment_agent_prompt(inputs: &CompartmentPromptInputs<'_>) -> S
 /// The historian's hidden completion request with an already-assembled user
 /// prompt: the system prompt role-scoped, plus `user_prompt` verbatim. No tools —
 /// a hidden sub-completion has none.
+#[must_use]
 pub fn historian_request_with_prompt(
     model: &str,
     user_prompt: &str,
@@ -1358,6 +1373,7 @@ pub fn historian_request_with_prompt(
 
 /// [`historian_request_with_prompt`] with the user prompt assembled from the
 /// run's context blocks.
+#[must_use]
 pub fn historian_request(
     model: &str,
     chunk_text: &str,
@@ -1383,6 +1399,7 @@ pub fn historian_request(
 ///
 /// `previous_output` is the model's own rejected text; it is echoed back as data
 /// under a plain label, never as instructions.
+#[must_use]
 pub fn build_historian_repair_prompt(
     original_prompt: &str,
     previous_output: &str,
@@ -1423,6 +1440,7 @@ pub enum RunState {
 
 impl RunState {
     /// The column spelling.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             RunState::Running => "running",

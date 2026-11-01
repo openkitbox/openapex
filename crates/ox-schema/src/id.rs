@@ -36,6 +36,7 @@ static STATE: Mutex<(u64, u64)> = Mutex::new((0, 0));
 
 /// Milliseconds since the Unix epoch (0 on clock skew before the epoch).
 /// Shared by ID generation and API handlers.
+#[must_use]
 pub fn now_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -77,6 +78,7 @@ fn ascending_body(timestamp: u64) -> String {
 
 /// Generate an ascending ID with the given prefix, e.g. `id("ses")` ->
 /// `"ses_019a2b..."`.
+#[must_use]
 pub fn id(prefix: &str) -> String {
     format!("{prefix}_{}", ascending_body(now_millis() as u64))
 }
@@ -88,6 +90,7 @@ pub fn id(prefix: &str) -> String {
 /// replaying the same event reproduces the same message row (replay
 /// idempotency). Non-`evt_` inputs are passed through with the prefix swapped
 /// only when present; otherwise the body is reused verbatim.
+#[must_use]
 pub fn from_event(event_id: &str) -> String {
     match event_id.strip_prefix("evt_") {
         Some(body) => format!("msg_{body}"),

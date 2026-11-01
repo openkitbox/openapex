@@ -266,6 +266,7 @@ impl ChildRef {
     /// subagent tool puts `{sessionID, status, description}` in its result
     /// metadata, both for a background launch and a foreground completion.
     /// Other tools' metadata is never read.
+    #[must_use]
     pub fn from_metadata(
         tool: &str,
         metadata: Option<&ox_schema::support::Record>,
@@ -599,6 +600,7 @@ impl DataStore {
 
     /// Authoritative replacement after a reconnect/reload.
     /// The form the UI should show: the oldest still pending.
+    #[must_use]
     pub fn pending_form(&self) -> Option<&FormInfo> {
         self.pending_forms.first()
     }
@@ -632,11 +634,13 @@ impl DataStore {
     /// Something is running for this session: its own turn, or a child
     /// session it delegated to. Display only; interrupts keep using
     /// `running_since`, which child events never touch.
+    #[must_use]
     pub fn busy(&self) -> bool {
         self.running_since.is_some() || !self.running_children.is_empty()
     }
 
     /// Whether `session_id` is a known child whose turn is in flight.
+    #[must_use]
     pub fn is_child_running(&self, session_id: &str) -> bool {
         self.running_children.contains(session_id)
     }
@@ -785,6 +789,7 @@ impl DataStore {
     }
 
     /// Every child session the items name, once each, in first-seen order.
+    #[must_use]
     pub fn referenced_children(&self) -> Vec<String> {
         let mut seen = HashSet::new();
         let mut children = Vec::new();
@@ -806,6 +811,7 @@ impl DataStore {
     }
 
     /// The child of tool part `part_id` inside assistant message `message_id`.
+    #[must_use]
     pub fn tool_child(&self, message_id: &str, part_id: &str) -> Option<&ChildRef> {
         let index = *self.assistant_index.get(message_id)?;
         let Item::Assistant(assistant) = self.items.get(index)? else {
@@ -869,12 +875,14 @@ impl DataStore {
     }
 
     /// Context-window size after the latest step that reported one.
+    #[must_use]
     pub fn context_tokens(&self) -> Option<i64> {
         self.context_usage().map(|(tokens, _)| tokens)
     }
 
     /// Like [`Self::context_tokens`], plus the `providerID/id` of the model
     /// that produced the figure (upstream looks the window up by that model).
+    #[must_use]
     pub fn context_usage(&self) -> Option<(i64, Option<&str>)> {
         self.items.iter().rev().find_map(|item| match item {
             Item::Assistant(assistant) if assistant.context_tokens > 0 => {
@@ -886,6 +894,7 @@ impl DataStore {
 
     /// Session spend (USD): derived from the messages rather than kept as
     /// separate state, so history reloads cannot make it drift.
+    #[must_use]
     pub fn total_cost(&self) -> f64 {
         self.items
             .iter()
@@ -1458,6 +1467,7 @@ fn finish_last_assistant(store: &mut DataStore, done_ms: i64) {
 }
 
 /// Everything one step put in the context window.
+#[must_use]
 pub fn total_tokens(tokens: &TokenUsage) -> i64 {
     tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
 }

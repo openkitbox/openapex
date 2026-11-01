@@ -66,6 +66,7 @@ fn relative(now: &Zoned, then: &Zoned) -> String {
 
 /// The session list, newest first as the server sent it. `current` is the
 /// session being viewed (marked `●`, cursor starts on it).
+#[must_use]
 pub fn list(
     sessions: &[SessionSummary],
     current: Option<&str>,
@@ -100,6 +101,7 @@ pub fn list(
 }
 
 /// `DialogSessionRename`: a prompt prefilled with the row's title.
+#[must_use]
 pub fn rename(session: &str, title: &str) -> Dialog {
     Dialog::Input(
         Input::new("Rename session", "Session title", session, title.trim()).tag(RENAME_TAG),

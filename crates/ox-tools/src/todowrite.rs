@@ -31,6 +31,7 @@ pub struct TodoWriteTool {
 }
 
 impl TodoWriteTool {
+    #[must_use]
     pub fn new(db: Db) -> Self {
         Self { db }
     }
@@ -112,6 +113,7 @@ impl Tool for TodoWriteTool {
 /// `kv` key for the per-session reminder counter. The list itself is not
 /// stored server-side — `todowrite` echoes and the TUI reads the transcript —
 /// so this counter is the only todo-related kv row left.
+#[must_use]
 pub fn reminder_key(session_id: &str) -> String {
     format!("todo:reminders:{session_id}")
 }

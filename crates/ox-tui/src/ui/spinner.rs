@@ -117,6 +117,7 @@ pub struct Cell {
 }
 
 /// The eight cells of `frame` (wrapped into one cycle).
+#[must_use]
 pub fn cells(frame: usize) -> [Cell; WIDTH] {
     let state = state(frame % FRAMES);
     // The fade applied to inactive dots (`createKnightRiderTrail`).
@@ -155,6 +156,7 @@ fn scale(rgb: Rgb, brightness: f64) -> Rgb {
 /// The footer spinner as spans. Truecolor blends the agent colour over the
 /// backdrop like opentui; otherwise active cells take the agent style and the
 /// rest the dim style.
+#[must_use]
 pub fn spans(frame: usize, pal: &Palette) -> Vec<Span<'static>> {
     let blend = match (pal.agent.fg, pal.backdrop) {
         (Some(Color::Rgb(r, g, b)), Some(backdrop)) => Some((Rgb::new(r, g, b), backdrop)),

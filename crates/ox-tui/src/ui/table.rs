@@ -28,6 +28,7 @@ const MIN_COL: usize = 3;
 /// Final widths for columns whose natural widths (padding included) are
 /// `natural`, given `target` cells available for all columns together
 /// (borders already subtracted by the caller).
+#[must_use]
 pub fn column_widths(natural: &[usize], target: usize) -> Vec<usize> {
     if natural.is_empty() {
         return Vec::new();

@@ -93,6 +93,7 @@ const BOUNDARY_ABSENT: &str = "\u{0}absent";
 /// Rules 4 and 5 are byte comparisons made by the caller ([`crate::mctx::pass`])
 /// against the frozen units: the baseline's inputs are open-ended, so "did the
 /// head change" is answered by the bytes rather than by enumerating causes.
+#[must_use]
 pub fn classify(state: Option<&CoreState>, signals: &Signals) -> Action {
     // 1. First-ever pass: nothing frozen yet, mint a baseline.
     let Some(state) = state else {
@@ -228,6 +229,7 @@ pub enum PassOutcome {
 
 impl PassOutcome {
     /// The cached prefix after the pass, or `None` on a panicked pass.
+    #[must_use]
     pub fn prefix(&self) -> Option<&str> {
         match self {
             PassOutcome::DeferReplayed { prefix } | PassOutcome::BustApplied { prefix } => {
@@ -254,6 +256,7 @@ impl McCache {
     }
 
     /// The session this handle serves.
+    #[must_use]
     pub fn session_id(&self) -> &str {
         &self.session_id
     }
@@ -441,6 +444,7 @@ fn lkg_key(session_id: &str) -> String {
 
 impl Lkg {
     /// An LKG store over `db`.
+    #[must_use]
     pub fn new(db: Db) -> Self {
         Self { db }
     }

@@ -27,6 +27,7 @@ impl Deck {
     /// truecolor is claimed only when `COLORTERM` says so (the conservative
     /// reading — a terminal that supports 256 colours but not RGB lands on
     /// `Ansi16`, which the system theme expresses with named hues only).
+    #[must_use]
     pub fn from_env() -> Self {
         let no_color = std::env::var_os("NO_COLOR")
             .map(|value| !value.is_empty())
@@ -266,6 +267,7 @@ impl Palette {
     /// Upstream's default `opencode` theme in `mode`. The mode only matters on
     /// a truecolor deck: the 16-colour and colourless decks name their colours
     /// by role, which reads the same on either polarity.
+    #[must_use]
     pub fn opencode(deck: Deck, mode: Mode) -> Self {
         match deck {
             Deck::Truecolor => Self::from_tokens(&Tokens::opencode(mode)),
@@ -324,10 +326,12 @@ impl Palette {
 
     /// The static palette when nothing is known about the terminal: the
     /// default theme, dark.
+    #[must_use]
     pub fn for_deck(deck: Deck) -> Self {
         Self::opencode(deck, Mode::Dark)
     }
 
+    #[must_use]
     pub fn from_env() -> Self {
         Self::for_deck(Deck::from_env())
     }
@@ -371,6 +375,7 @@ impl Palette {
     /// derived from its reported background. `None` when there is nothing to
     /// derive from (no probe, or `NO_COLOR` wins), so the caller keeps the
     /// static palette above.
+    #[must_use]
     pub fn system(colors: &TerminalColors, deck: Deck) -> Option<Self> {
         if deck == Deck::NoColor {
             return None;
@@ -421,6 +426,7 @@ impl Palette {
 
     /// Paint `style` over `base`: the palette decides colour, the caller decides
     /// weight (bold labels keep their bold in `NO_COLOR` mode).
+    #[must_use]
     pub fn paint(&self, base: Style, role: Style) -> Style {
         base.patch(role)
     }

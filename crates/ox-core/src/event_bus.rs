@@ -159,6 +159,7 @@ pub struct EventBus {
 }
 
 impl EventBus {
+    #[must_use]
     pub fn new(db: Db) -> Self {
         let (tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         Self {
@@ -174,6 +175,7 @@ impl EventBus {
     /// Envelopes are broadcast in the generic wire form
     /// (`EventEnvelope<Value>`); call `.parse_typed()` to recover the typed
     /// `SessionEventData`.
+    #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<EventEnvelope> {
         self.tx.subscribe()
     }
@@ -363,6 +365,7 @@ impl EventBus {
     }
 
     /// The database handle (read-only fixtures in tests).
+    #[must_use]
     pub fn db(&self) -> &Db {
         &self.db
     }

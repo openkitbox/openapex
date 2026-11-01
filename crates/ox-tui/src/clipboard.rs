@@ -64,6 +64,7 @@ pub struct Cmd {
 
 /// The commands to try on `os` (a `std::env::consts::OS` value), images before
 /// text, first usable answer wins. Empty means unsupported.
+#[must_use]
 pub fn read_plan(os: &str) -> Vec<Cmd> {
     const OSASCRIPT: Cmd = Cmd {
         program: "osascript",
@@ -104,6 +105,7 @@ pub fn read_plan(os: &str) -> Vec<Cmd> {
 
 /// What `output` of a command printing `format` means. [`Clip::Empty`] when it
 /// holds no PNG (bad magic, bad hex) or no text, or is over the size cap.
+#[must_use]
 pub fn classify(format: Format, output: Vec<u8>) -> Clip {
     match format {
         Format::PngBytes => png_clip(&output),
@@ -156,6 +158,7 @@ fn hex_digit(byte: u8) -> Option<u8> {
 
 /// The commands that copy stdin to the clipboard on `os`, first working one
 /// wins. Empty means unsupported.
+#[must_use]
 pub fn write_plan(os: &str) -> Vec<(&'static str, &'static [&'static str])> {
     match os {
         "macos" => vec![("pbcopy", &[])],
@@ -180,6 +183,7 @@ fn without_nul(text: &str) -> Cow<'_, str> {
 /// The terminal sequence (`ESC ] 52 ; c ; <base64> BEL`) that makes the
 /// terminal set its clipboard, which reaches the local machine over ssh.
 /// `None` for empty text or a payload over [`MAX_OSC52_PAYLOAD`].
+#[must_use]
 pub fn osc52(text: &str) -> Option<String> {
     let text = without_nul(text);
     if text.is_empty() || text.len().div_ceil(3) * 4 > MAX_OSC52_PAYLOAD {
@@ -239,6 +243,7 @@ fn pipe_into(program: &str, args: &[&str], input: &[u8], timeout: Duration) -> b
 }
 
 /// Read the clipboard with the commands of this platform. Blocks.
+#[must_use]
 pub fn read() -> Clip {
     let plan = read_plan(std::env::consts::OS);
     if plan.is_empty() {
@@ -263,6 +268,7 @@ pub fn read() -> Clip {
 /// Stdout is drained on a helper thread so a full pipe cannot stall the child.
 /// After a kill the thread ends when the pipe closes; a grandchild that holds
 /// the pipe open only delays that, never this call.
+#[must_use]
 pub fn run_with_timeout(cmd: &Cmd, timeout: Duration) -> Option<Vec<u8>> {
     let mut child = Command::new(cmd.program)
         .args(cmd.args)

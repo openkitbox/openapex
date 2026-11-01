@@ -39,6 +39,7 @@ pub struct Embedder {
 impl Embedder {
     /// Build from config, or `None` when semantic search is off or the config
     /// is incomplete.
+    #[must_use]
     pub fn from_config(config: &EmbeddingConfig) -> Option<Arc<Self>> {
         if !config.is_enabled() {
             return None;
@@ -70,6 +71,7 @@ impl Embedder {
     }
 
     /// The identity stored beside this embedder's vectors.
+    #[must_use]
     pub fn identity(&self) -> &str {
         &self.identity
     }

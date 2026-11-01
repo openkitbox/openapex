@@ -141,19 +141,23 @@ impl FormState {
         state
     }
 
+    #[must_use]
     pub fn id(&self) -> &str {
         &self.id
     }
 
+    #[must_use]
     pub fn session(&self) -> &str {
         &self.session
     }
 
+    #[must_use]
     pub fn title(&self) -> &str {
         &self.title
     }
 
     /// The transient validation message, empty when there is none.
+    #[must_use]
     pub fn error(&self) -> &str {
         &self.error
     }
@@ -885,6 +889,7 @@ fn plain(value: &FormValue) -> String {
 }
 
 /// Port of `formValidateValue` for the keywords `ox-client` models.
+#[must_use]
 pub fn validate(field: &FormField, value: Option<&FormValue>) -> Option<String> {
     let required = required_of(field);
     let Some(value) = value else {

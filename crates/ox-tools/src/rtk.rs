@@ -58,6 +58,7 @@ pub struct RtkRewriter {
 
 impl RtkRewriter {
     /// A rewriter that resolves (and probes) the binary on first use.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             binary: OnceCell::new(),
@@ -67,6 +68,7 @@ impl RtkRewriter {
 
     /// A rewriter that never rewrites: the fail-open path made explicit, for
     /// callers whose output must not depend on the host's rtk installation.
+    #[must_use]
     pub fn disabled() -> Self {
         let rewriter = Self::new();
         let _ = rewriter.binary.set(None);
@@ -75,6 +77,7 @@ impl RtkRewriter {
 
     /// A rewriter over an explicit binary, skipping the `PATH` lookup and the
     /// capability probe. Tests point this at a mock so no host rtk is needed.
+    #[must_use]
     pub fn with_binary(path: PathBuf) -> Self {
         let rewriter = Self::new();
         let _ = rewriter.binary.set(Some(path));

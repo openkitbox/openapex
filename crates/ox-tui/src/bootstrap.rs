@@ -126,6 +126,7 @@ pub async fn chrome(client: &Client, directory: &str, session: Option<&str>) -> 
 /// 上游 `home_footer` 的 Mcp 段：没有配置任何 server 时为 `None`（整段隐藏，
 /// 而不是显示 0）；否则给出 `connected` 数与 `failed` 数——任一失败时上游把
 /// 圆点染红并把文案换成失败数。
+#[must_use]
 pub fn mcp_summary(servers: &[McpRef]) -> Option<McpSummary> {
     if servers.is_empty() {
         return None;
@@ -142,6 +143,7 @@ pub fn mcp_summary(servers: &[McpRef]) -> Option<McpSummary> {
 }
 
 /// 显示名：首字母大写（上游 `build` → `Build`）。
+#[must_use]
 pub fn display_agent(name: &str) -> String {
     let mut chars = name.chars();
     match chars.next() {

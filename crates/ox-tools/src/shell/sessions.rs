@@ -90,6 +90,7 @@ impl Default for OutputBuffer {
 }
 
 impl OutputBuffer {
+    #[must_use]
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             capacity,
@@ -101,11 +102,13 @@ impl OutputBuffer {
     }
 
     /// Bytes appended so far, including dropped ones.
+    #[must_use]
     pub fn size(&self) -> u64 {
         self.total
     }
 
     /// The first retained byte's absolute offset.
+    #[must_use]
     pub fn dropped(&self) -> u64 {
         self.total - self.bytes.len() as u64
     }
@@ -129,6 +132,7 @@ impl OutputBuffer {
 
     /// Read `limit` bytes starting at absolute `cursor`. The returned text is
     /// the only allocation; the buffer is only read.
+    #[must_use]
     pub fn page(&self, cursor: u64, limit: usize) -> OutputPage {
         let dropped = self.dropped();
         let truncated = cursor < dropped;
@@ -149,17 +153,20 @@ impl OutputBuffer {
     }
 
     /// The newest `limit` retained bytes as text (a completion's bounded tail).
+    #[must_use]
     pub fn recent_text(&self, limit: usize) -> String {
         let start = self.bytes.len().saturating_sub(limit);
         String::from_utf8_lossy(&self.bytes[start..]).into_owned()
     }
 
     /// The whole retained tail, for the model-facing tool result.
+    #[must_use]
     pub fn tail_text(&self) -> String {
         String::from_utf8_lossy(&self.bytes).into_owned()
     }
 
     /// Bytes currently retained.
+    #[must_use]
     pub fn retained(&self) -> usize {
         self.bytes.len()
     }
@@ -677,6 +684,7 @@ impl Default for ShellSessions {
 }
 
 impl ShellSessions {
+    #[must_use]
     pub fn new() -> Self {
         let shell = process::select_shell();
         let shell_name = shell

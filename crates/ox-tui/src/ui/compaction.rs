@@ -46,6 +46,7 @@ fn usage(view: &View<'_>) -> Option<String> {
     })
 }
 
+#[must_use]
 pub fn lines(view: &View<'_>, width: u16) -> Vec<Line<'static>> {
     let palette = theme::palette();
     let failed = view.status == CompactionStatus::Failed && !view.cancelled;

@@ -35,17 +35,20 @@ pub enum DialogPurpose {
 
 /// `provider/model` — the value a model row carries through the dialog.
 /// Provider ids never contain `/`, so the first one splits the pair.
+#[must_use]
 pub fn encode(provider_id: &str, model_id: &str) -> String {
     format!("{provider_id}/{model_id}")
 }
 
 /// Inverse of [`encode`].
+#[must_use]
 pub fn decode(value: &str) -> Option<(&str, &str)> {
     value.split_once('/')
 }
 
 /// The provider's display name, falling back to its id when the catalogue has
 /// no entry (or an empty name) for it.
+#[must_use]
 pub fn provider_label<'a>(providers: &'a [ProviderRef], provider_id: &'a str) -> &'a str {
     providers
         .iter()
@@ -57,6 +60,7 @@ pub fn provider_label<'a>(providers: &'a [ProviderRef], provider_id: &'a str) ->
 
 /// Which model row is the current one, matched the way the prompt chrome
 /// stores it: the model id plus the provider's display name.
+#[must_use]
 pub fn current_model_value(
     models: &[ModelInfo],
     providers: &[ProviderRef],
@@ -75,6 +79,7 @@ pub fn current_model_value(
 
 /// Selectable models as dialog rows: disabled models dropped, grouped under
 /// the provider's display name (groups sorted by name, server order inside).
+#[must_use]
 pub fn model_items(models: &[ModelInfo], providers: &[ProviderRef]) -> Vec<Item> {
     let mut rows: Vec<(&str, &ModelInfo)> = models
         .iter()
@@ -96,6 +101,7 @@ pub fn model_items(models: &[ModelInfo], providers: &[ProviderRef]) -> Vec<Item>
 }
 
 /// The `/models` dialog; `current` is the value to mark and start on.
+#[must_use]
 pub fn model_select(
     models: &[ModelInfo],
     providers: &[ProviderRef],
@@ -109,6 +115,7 @@ pub fn model_select(
 }
 
 /// Agents the user may switch between: visible primary ones, server order.
+#[must_use]
 pub fn primary_agents(all: Vec<AgentRef>) -> Vec<AgentRef> {
     all.into_iter()
         .filter(|agent| !agent.hidden && agent.mode.as_deref() != Some("subagent"))
@@ -125,6 +132,7 @@ fn current_index(agents: &[AgentRef], current: Option<&str>) -> Option<usize> {
 /// The agent after (`step > 0`) or before (`step < 0`) the current one,
 /// wrapping. `None` when there is nothing to switch to (fewer than two
 /// agents). An unknown current agent counts as the first, the server default.
+#[must_use]
 pub fn next_agent<'a>(
     agents: &'a [AgentRef],
     current: Option<&str>,
@@ -139,6 +147,7 @@ pub fn next_agent<'a>(
 }
 
 /// The `/agents` dialog; `current` is the chrome's agent display name.
+#[must_use]
 pub fn agent_select(agents: &[AgentRef], current: Option<&str>) -> Select {
     let items = agents
         .iter()

@@ -73,18 +73,22 @@ pub struct Autocomplete {
 }
 
 impl Autocomplete {
+    #[must_use]
     pub fn visible(&self) -> bool {
         self.open.is_some()
     }
 
+    #[must_use]
     pub fn query(&self) -> &str {
         self.open.as_ref().map_or("", |(_, query)| query)
     }
 
+    #[must_use]
     pub fn trigger(&self) -> Option<Trigger> {
         self.open.as_ref().map(|(trigger, _)| *trigger)
     }
 
+    #[must_use]
     pub fn selected(&self) -> usize {
         self.selected
     }
@@ -137,6 +141,7 @@ pub struct FileRow {
 /// Order the server's matches for the menu: directories first, then the
 /// better fuzzy match (prefix, substring, subsequence), then the shorter path,
 /// then alphabetically. Matches the fuzzy scale of the slash menu.
+#[must_use]
 pub fn order_files(query: &str, entries: &[ox_client::rest::FileEntry]) -> Vec<FileRow> {
     let mut scored: Vec<(u32, FileRow)> = entries
         .iter()
@@ -163,6 +168,7 @@ pub fn order_files(query: &str, entries: &[ox_client::rest::FileEntry]) -> Vec<F
 
 /// Shorten `text` to `width` columns by replacing its middle with `…`
 /// (upstream `Locale.truncateMiddle`).
+#[must_use]
 pub fn truncate_middle(text: &str, width: usize) -> String {
     if text.width() <= width {
         return text.to_owned();
@@ -198,6 +204,7 @@ pub fn truncate_middle(text: &str, width: usize) -> String {
 }
 
 /// Wrap-around index arithmetic shared by the menu (and later any picker).
+#[must_use]
 pub fn step(selected: usize, count: usize, delta: isize) -> usize {
     if count == 0 {
         return 0;

@@ -23,6 +23,7 @@ pub(crate) fn marker(status: TodoStatus) -> &'static str {
 /// (`SplitBorder`, `borderColor=background.base`), one padded row above and
 /// below, content two columns past the rail, and a blank row between the
 /// `# Todos` header and the list (`gap=1`).
+#[must_use]
 pub fn lines(todos: &[Todo], width: u16) -> Vec<Line<'static>> {
     let palette = theme::palette();
     let raised = palette.raised_base;

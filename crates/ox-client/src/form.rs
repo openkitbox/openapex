@@ -114,6 +114,7 @@ pub enum FormField {
 impl FormField {
     /// The answer-map key this field fills; empty for [`FormField::Unsupported`],
     /// which never contributes an answer.
+    #[must_use]
     pub fn key(&self) -> &str {
         match self {
             FormField::String { key, .. }

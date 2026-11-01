@@ -239,6 +239,7 @@ impl CompactionMessage {
     /// Encode for the `session_message.data` column without re-wrapping the
     /// value in [`Message`]; byte-identical to
     /// `Message::Compaction(msg).to_row_data()`.
+    #[must_use]
     pub fn row_data(&self) -> serde_json::Value {
         row_data_of(self)
     }
@@ -401,6 +402,7 @@ impl AssistantMessage {
     /// Encode for the `session_message.data` column without re-wrapping the
     /// value in [`Message`] (which would require a full clone); byte-identical
     /// to `Message::Assistant(Box::new(msg.clone())).to_row_data()`.
+    #[must_use]
     pub fn row_data(&self) -> serde_json::Value {
         row_data_of(self)
     }
@@ -429,6 +431,7 @@ pub enum IdleOutcome {
 
 impl Message {
     /// The wire tag for this message (matches the upstream `type` literal).
+    #[must_use]
     pub fn kind(&self) -> &'static str {
         match self {
             Message::AgentSwitched { .. } => "agent-switched",
@@ -446,6 +449,7 @@ impl Message {
     }
 
     /// The message id.
+    #[must_use]
     pub fn id(&self) -> &str {
         match self {
             Message::AgentSwitched { id, .. }
@@ -464,6 +468,7 @@ impl Message {
 
     /// The `time.created` value (also the `session_message.time_created`
     /// column).
+    #[must_use]
     pub fn time_created(&self) -> i64 {
         match self {
             Message::AgentSwitched { time, .. }
@@ -483,6 +488,7 @@ impl Message {
     /// Encode for the `session_message.data` column: the full message JSON
     /// minus `id` and `type` (upstream
     /// `DistributiveOmit<Info.Encoded, "type" | "id">`).
+    #[must_use]
     pub fn to_row_data(&self) -> serde_json::Value {
         let mut value = serde_json::to_value(self).unwrap_or(serde_json::Value::Null);
         if let serde_json::Value::Object(map) = &mut value {

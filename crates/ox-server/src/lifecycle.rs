@@ -26,6 +26,7 @@ pub enum Decision {
 
 /// Exit exactly when no client holds a lease, no turn is running, and the
 /// server has been idle for at least `grace`.
+#[must_use]
 pub fn decide(s: &Snapshot, grace: Duration) -> Decision {
     if s.leases == 0 && !s.turn_active && s.idle_for >= grace {
         Decision::Exit
@@ -60,6 +61,7 @@ pub struct Lifecycle {
 }
 
 impl Lifecycle {
+    #[must_use]
     pub fn new(now: Instant) -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(Inner {

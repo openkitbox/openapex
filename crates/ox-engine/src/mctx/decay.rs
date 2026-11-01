@@ -110,6 +110,7 @@ fn should_archive(
 /// Final rendered tier combining base tier + archive protection. Archived
 /// compartments return 5; non-archived ones render at most P4 (the
 /// verbose-to-anchor ladder caps at 4 — P5 is reserved for actual archival).
+#[must_use]
 pub fn rendered_tier(
     compartment_index: u32,
     importance: i32,
@@ -131,6 +132,7 @@ pub fn rendered_tier(
 /// Because `H ∝ 1/p`, the per-tier compartment counts scale as `1/p`, so
 /// `C(p) ≈ C(1)/p`; setting `p = C(1)/B` gives `C(p) ≈ B`. Overshoots up to
 /// ~30% at very tight budgets (<8K).
+#[must_use]
 pub fn compute_budget_pressure(compartments: &[DecayInput], history_budget: f64) -> f64 {
     if history_budget <= 0.0 {
         return 1.0;

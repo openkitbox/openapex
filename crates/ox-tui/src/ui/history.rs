@@ -26,6 +26,7 @@ use serde_json::{Value, json};
 pub const MAX_ENTRIES: usize = 50;
 
 /// Default location: `~/.local/state/ox-tui/history.jsonl`.
+#[must_use]
 pub fn default_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(Path::new(&home).join(".local/state/ox-tui/history.jsonl"))
@@ -41,12 +42,14 @@ pub struct History {
 
 impl History {
     /// History that is never written to disk.
+    #[must_use]
     pub fn in_memory() -> Self {
         Self::default()
     }
 
     /// Read `path` (missing or corrupt lines are skipped), keep the newest
     /// [`MAX_ENTRIES`], and rewrite the file so corruption heals.
+    #[must_use]
     pub fn load(path: PathBuf) -> Self {
         let text = std::fs::read_to_string(&path).unwrap_or_default();
         let entries = parse(&text);
@@ -61,14 +64,17 @@ impl History {
         history
     }
 
+    #[must_use]
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
+    #[must_use]
     pub fn entries(&self) -> &[String] {
         &self.entries
     }

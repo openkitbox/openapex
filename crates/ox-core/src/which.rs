@@ -14,6 +14,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// Resolve `name` on the process `PATH`.
+#[must_use]
 pub fn find_on_path(name: &str) -> Option<PathBuf> {
     find_in(&std::env::var_os("PATH")?, name)
 }

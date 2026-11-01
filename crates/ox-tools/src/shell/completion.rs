@@ -68,6 +68,7 @@ pub struct ShellCompletion {
 }
 
 impl ShellCompletion {
+    #[must_use]
     pub fn new(db: Db, bus: EventBus) -> Self {
         Self {
             db,
@@ -150,6 +151,7 @@ async fn parent_exists(db: &Db, session_id: &str) -> Result<bool, String> {
 ///
 /// State mapping follows [`classify`]. Metadata carries `source`, `shellID`,
 /// `state`, `truncated`, and `exit` / `timeout` when they apply.
+#[must_use]
 pub fn payload(completion: &Completion) -> SyntheticPayload {
     let (state, notice) = classify(completion);
     // The tail is already bounded by the session; apply the model-facing line

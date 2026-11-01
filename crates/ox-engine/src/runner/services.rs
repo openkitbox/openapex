@@ -86,6 +86,7 @@ impl SessionKind {
 
 impl Services {
     /// Move `set` into a generation and derive the child registries once.
+    #[must_use]
     pub fn new(generation: u64, set: ServiceSet) -> Arc<Self> {
         let child_tools = Arc::new(set.tools.without(SUBAGENT_EXCLUDED_TOOLS));
         let read_only_tools = Arc::new(set.tools.only(READ_ONLY_TOOLS));
@@ -126,6 +127,7 @@ pub struct Live {
 
 impl Live {
     /// Start at generation 0.
+    #[must_use]
     pub fn new(set: ServiceSet) -> Self {
         Self {
             current: RwLock::new(Services::new(0, set)),

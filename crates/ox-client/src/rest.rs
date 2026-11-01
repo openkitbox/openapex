@@ -86,6 +86,7 @@ pub struct FileEntry {
 }
 
 impl FileEntry {
+    #[must_use]
     pub fn is_dir(&self) -> bool {
         self.kind == "directory"
     }
@@ -181,6 +182,7 @@ impl SessionTime {
     /// (`idle` absent or older). The server stamps `busy` on
     /// `execution.started` and `idle` (strictly after `busy`) on every end
     /// (`projector.rs`). A crashed server can leave a stale `true` behind.
+    #[must_use]
     pub fn is_running(&self) -> bool {
         match (self.busy, self.idle) {
             (None, _) => false,

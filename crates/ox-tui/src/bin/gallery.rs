@@ -1403,7 +1403,7 @@ fn form_case(name: &'static str, height: u16, kind: FormKind) -> Case {
                 "id": "frm_gallery", "sessionID": "ses_gallery", "title": "Pick a stack",
                 "fields": fields
             }))
-            .unwrap();
+            .expect("the gallery form sample is a valid FormInfo");
             let mut form = FormState::new(&info);
             let press = |form: &mut FormState, code: KeyCode| {
                 form.on_key(KeyEvent::new(code, KeyModifiers::NONE));

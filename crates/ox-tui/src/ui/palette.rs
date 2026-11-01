@@ -115,6 +115,7 @@ pub fn select(context: Context, hint_of: HintOf) -> Select {
 }
 
 /// The action behind a palette row's value.
+#[must_use]
 pub fn action_of(value: &str) -> Option<CommandAction> {
     let name = value.strip_prefix(SUGGESTED).unwrap_or(value);
     COMMANDS

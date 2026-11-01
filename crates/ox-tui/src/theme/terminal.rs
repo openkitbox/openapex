@@ -26,12 +26,14 @@ pub struct Rgb {
 }
 
 impl Rgb {
+    #[must_use]
     pub const fn new(r: u8, g: u8, b: u8) -> Self {
         Self { r, g, b }
     }
 
     /// `base` moved `alpha` of the way to `overlay`, rounded per channel
     /// (upstream `tint`, `theme/color.ts:43`).
+    #[must_use]
     pub fn tint(base: Self, overlay: Self, alpha: f64) -> Self {
         let mix = |from: u8, to: u8| {
             (f64::from(from) + (f64::from(to) - f64::from(from)) * alpha).round() as u8
@@ -44,6 +46,7 @@ impl Rgb {
     }
 
     /// Rec.601 luma on the 0-255 scale (upstream `system.ts:106`).
+    #[must_use]
     pub fn luminance(self) -> f64 {
         0.299 * f64::from(self.r) + 0.587 * f64::from(self.g) + 0.114 * f64::from(self.b)
     }
@@ -80,6 +83,7 @@ pub struct TerminalColors {
 impl TerminalColors {
     /// A palette slot, falling back to the xterm default like upstream's
     /// `col(i)` helper (`system.ts:17-21`).
+    #[must_use]
     pub fn slot(&self, index: usize) -> Rgb {
         self.palette
             .get(index)
@@ -91,6 +95,7 @@ impl TerminalColors {
 
 /// Ask the terminal for its colours. Returns `None` when stdin or stdout is not
 /// a terminal (pipes, tests, `cargo run | cat`).
+#[must_use]
 pub fn query() -> Option<TerminalColors> {
     use std::io::{IsTerminal, Write};
 

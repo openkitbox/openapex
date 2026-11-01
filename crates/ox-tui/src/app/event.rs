@@ -158,6 +158,7 @@ impl AppEvent {
     /// Which terminal events the UI acts on. Everything else (focus, other
     /// mouse kinds) is dropped here, in one place, instead of in the reader
     /// thread. Paste is accepted here only; the app routes it like a key.
+    #[must_use]
     pub fn from_terminal(event: Event) -> Option<Self> {
         match event {
             Event::Key(key) => Some(AppEvent::Key(key)),

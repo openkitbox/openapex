@@ -30,6 +30,7 @@ pub enum Transport {
     Unix,
 }
 
+#[must_use]
 pub fn transport_of(server_arg: Option<String>) -> Transport {
     match server_arg {
         Some(url) => Transport::Explicit(url),
@@ -38,6 +39,7 @@ pub fn transport_of(server_arg: Option<String>) -> Transport {
 }
 
 /// Arguments for the self-exec'd server process.
+#[must_use]
 pub fn server_args(log_file: &Path) -> Vec<OsString> {
     vec![
         "serve".into(),

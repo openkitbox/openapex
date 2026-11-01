@@ -1175,6 +1175,7 @@ pub struct CtxSearchTool {
 
 impl CtxSearchTool {
     /// The tool over `db` (the `mc_*` tables and their search indexes).
+    #[must_use]
     pub fn new(db: Db, embedder: Option<Arc<super::embed::Embedder>>) -> Self {
         Self { db, embedder }
     }

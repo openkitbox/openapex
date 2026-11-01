@@ -444,6 +444,7 @@ impl DreamTask {
     ];
 
     /// The `task` column spelling.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             DreamTask::Verify => "verify",
@@ -457,6 +458,7 @@ impl DreamTask {
 
 /// Build a dreamer's hidden completion request. Dreamer has no parent session,
 /// so the request deliberately leaves reasoning effort unset.
+#[must_use]
 pub fn dreamer_request(model: &str, system: &str, user_prompt: &str) -> ChatRequest {
     ChatRequest::new(
         model.to_owned(),
@@ -490,6 +492,7 @@ pub enum FailureClass {
 
 impl FailureClass {
     /// The spelling recorded in `mc_dream_state.last_error`.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             FailureClass::ParseFailed => "parse_failed",

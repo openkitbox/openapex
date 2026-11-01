@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use ox_core::config::McpRemoteConfig;
 
+use super::sync;
 use super::transport::modern_params;
 use super::transport::{CallError, ProtocolMode, RequestMetadata, Rpc};
 
@@ -75,7 +76,7 @@ impl HttpRpc {
     }
 
     fn builder(&self, body: &Value, metadata: RequestMetadata<'_>) -> reqwest::RequestBuilder {
-        let state = self.state.lock().unwrap();
+        let state = sync::lock(&self.state);
         let protocol = state.protocol;
         let session = state.session.clone();
         drop(state);
@@ -112,7 +113,7 @@ impl HttpRpc {
     }
 
     fn remember_session(&self, response: &reqwest::Response) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = sync::lock(&self.state);
         if state.protocol != ProtocolMode::Legacy {
             return;
         }
@@ -240,7 +241,7 @@ async fn read_sse(
 
 impl Rpc for HttpRpc {
     fn set_protocol(&self, protocol: ProtocolMode) {
-        let mut state = self.state.lock().unwrap();
+        let mut state = sync::lock(&self.state);
         state.protocol = protocol;
         if protocol == ProtocolMode::Modern {
             state.session.take();
@@ -259,7 +260,7 @@ impl Rpc for HttpRpc {
                 return Err(CallError::Closed);
             }
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            let protocol = self.state.lock().unwrap().protocol;
+            let protocol = sync::lock(&self.state).protocol;
             let params = match protocol {
                 ProtocolMode::Legacy => params,
                 ProtocolMode::Modern => modern_params(metadata, params),
@@ -311,7 +312,7 @@ impl Rpc for HttpRpc {
     ) -> BoxFuture<'a, Result<(), CallError>> {
         Box::pin(async move {
             let metadata = RequestMetadata::new(method);
-            let protocol = self.state.lock().unwrap().protocol;
+            let protocol = sync::lock(&self.state).protocol;
             let params = match protocol {
                 ProtocolMode::Legacy => params,
                 ProtocolMode::Modern => modern_params(metadata, params),

@@ -16,21 +16,25 @@ fn ox_home() -> PathBuf {
 }
 
 /// Directory holding the socket and the start-up lock (`~/.ox/run`).
+#[must_use]
 pub fn run_dir() -> PathBuf {
     ox_home().join("run")
 }
 
 /// The server's unix domain socket (`~/.ox/run/ox.sock`).
+#[must_use]
 pub fn socket_path() -> PathBuf {
     run_dir().join("ox.sock")
 }
 
 /// The lock file serialising server start-up (`~/.ox/run/ox.lock`).
+#[must_use]
 pub fn lock_path() -> PathBuf {
     run_dir().join("ox.lock")
 }
 
 /// Where a detached server writes its log (`~/.ox/ox.log`).
+#[must_use]
 pub fn server_log_path() -> PathBuf {
     ox_home().join("ox.log")
 }

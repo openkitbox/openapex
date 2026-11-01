@@ -33,6 +33,7 @@ pub struct WebFetchTool {
 impl WebFetchTool {
     /// The shared client: redirects follow up to the default policy cap;
     /// the timeout is per-request (upstream `Effect.timeoutOrElse`).
+    #[must_use]
     pub fn new() -> Self {
         let client = reqwest::Client::builder()
             .user_agent("opencode")

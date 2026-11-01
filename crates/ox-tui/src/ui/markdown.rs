@@ -49,6 +49,7 @@ pub enum Tone {
     Muted,
 }
 
+#[must_use]
 pub fn render(text: &str, width: u16, indent: usize) -> Vec<Line<'static>> {
     render_toned(text, width, indent, Tone::Normal)
 }

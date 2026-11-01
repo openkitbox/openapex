@@ -167,6 +167,7 @@ pub enum Switch {
 
 impl Switch {
     /// Toast title when the server refuses this change.
+    #[must_use]
     pub fn failure_title(&self) -> &'static str {
         match self {
             Switch::Model { .. } => "Failed to switch model",

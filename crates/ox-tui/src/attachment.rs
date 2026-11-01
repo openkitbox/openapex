@@ -34,6 +34,7 @@ pub enum Loaded {
 /// regular file, not an image/PDF, or the files together exceed
 /// [`MAX_LOCAL_ATTACHMENT_BYTES`]. All or nothing: the caller then pastes the
 /// text as typed.
+#[must_use]
 pub fn load(paths: &[PathBuf]) -> Option<Vec<Loaded>> {
     load_with_budget(paths, MAX_LOCAL_ATTACHMENT_BYTES)
 }

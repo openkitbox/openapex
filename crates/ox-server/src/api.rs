@@ -53,6 +53,7 @@ pub struct AppState {
 impl AppState {
     /// The current config-derived snapshot. Take it once per request so a
     /// handler never mixes two generations.
+    #[must_use]
     pub fn services(&self) -> Arc<Services> {
         self.live.current()
     }
@@ -711,6 +712,7 @@ async fn agent_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
 }
 
 /// Build the salvo router with all `/api` endpoints mounted.
+#[must_use]
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .hoop(affix_state::inject(state))

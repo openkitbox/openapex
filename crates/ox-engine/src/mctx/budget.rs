@@ -105,6 +105,7 @@ impl Budget {
     /// pre-budget numbers ([`FALLBACK_TRIGGER`] and friends) rather than to a
     /// different code path: the "gateway is down" case must not change the
     /// compression strategy, only where its numbers come from.
+    #[must_use]
     pub fn derive(config: &MctxConfig, window: Option<u32>, historian: Option<u32>) -> Self {
         // The config is validated where it is loaded, but this is `pub` and
         // `MctxConfig` is plain data: a NaN carried in from a test or a future
@@ -172,6 +173,7 @@ impl Budget {
     /// `prompt_tokens` is what the provider reported for that turn —
     /// `tokens.input + tokens.cache.read`, the same sum the client's footer
     /// divides by this same window.
+    #[must_use]
     pub fn usage_percentage(&self, prompt_tokens: i64) -> Option<f64> {
         let window = self.window?;
         Some(prompt_tokens as f64 / f64::from(window) * 100.0)
@@ -183,6 +185,7 @@ impl Budget {
     ///
     /// `usage_pct` shrinks the target as the window fills — at high pressure
     /// the alternative to a big fold is an overflow.
+    #[must_use]
     pub fn protected_tail(&self, usage_pct: f64) -> u32 {
         if self.usable == 0 {
             // No known window: nothing to protect against, and protecting a
@@ -227,6 +230,7 @@ pub const MEMORY_BUDGET_MAX: usize = 8_000;
 ///
 /// A non-finite history budget takes the floor: the selection is conservative
 /// on spend, and a zero budget would silently drop every memory.
+#[must_use]
 pub fn memory_budget(history_tokens: f64) -> usize {
     if !history_tokens.is_finite() {
         return MEMORY_BUDGET_MIN;

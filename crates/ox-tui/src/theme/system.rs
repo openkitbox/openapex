@@ -33,6 +33,7 @@ pub struct System {
 impl System {
     /// `None` when the terminal reported no background at all: there is nothing
     /// to derive the ramp from, so the caller keeps its static palette.
+    #[must_use]
     pub fn derive(colors: &TerminalColors) -> Option<Self> {
         let background = colors.background.or(colors.palette[0])?;
         let is_light = background.luminance() > 127.5;
