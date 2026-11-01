@@ -895,60 +895,69 @@ fn merge_commit_hashes(existing: &[String], next: Vec<String>) -> Vec<String> {
     merged
 }
 
+// Regex accessors return a clone so the lazy-DFA cache is dropped after the
+// call instead of living on per worker thread (see `historian_validate.rs`).
 /// `historian_chunk.rs::system_reminder_regex`.
-fn system_reminder_regex() -> &'static Regex {
+fn system_reminder_regex() -> Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"(?is)<system-reminder>[\s\S]*?</system-reminder>").expect("reminder regex")
     })
+    .clone()
 }
 
 /// `historian_chunk.rs::commit_hash_extract_regex`. ASCII boundaries and ASCII
 /// case folding, as its TypeScript twin (a hash right after a letter such as
 /// `é` is not a commit reference).
-fn commit_hash_extract_regex() -> &'static Regex {
+fn commit_hash_extract_regex() -> Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?i-u)`?\b([0-9a-f]{7,12})\b`?").expect("commit hash regex"))
+        .clone()
 }
 
 /// `historian_chunk.rs::commit_verb_regex` — the gate for hash stripping: only
 /// prose that talks about committing collapses its hashes.
-fn commit_verb_regex() -> &'static Regex {
+fn commit_verb_regex() -> Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"(?i-u)\b(?:commit(?:ted|ting|s)?|cherry-?pick(?:ed|ing|s)?|merge[ds]?|merging|rebas(?:e|ed|es|ing))\b")
             .expect("commit verb regex")
-    })
+    }).clone()
 }
 
 /// `historian_chunk.rs::empty_parens_regex`.
-fn empty_parens_regex() -> &'static Regex {
+fn empty_parens_regex() -> Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\(\s*\)").expect("empty parens regex"))
+        .clone()
 }
 
 /// `historian_chunk.rs::space_before_comma_regex`.
-fn space_before_comma_regex() -> &'static Regex {
+fn space_before_comma_regex() -> Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\s+,").expect("space before comma regex"))
+        .clone()
 }
 
 /// `historian_chunk.rs::repeated_comma_regex`.
-fn repeated_comma_regex() -> &'static Regex {
+fn repeated_comma_regex() -> Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| Regex::new(r",\s*,+").expect("repeated comma regex"))
+        .clone()
 }
 
 /// `historian_chunk.rs::repeated_space_regex`.
-fn repeated_space_regex() -> &'static Regex {
+fn repeated_space_regex() -> Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\s{2,}").expect("repeated space regex"))
+        .clone()
 }
 
 /// `historian_chunk.rs::space_before_punct_regex`.
-fn space_before_punct_regex() -> &'static Regex {
+fn space_before_punct_regex() -> Regex {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     RE.get_or_init(|| Regex::new(r"\s+([,.;:])").expect("space before punct regex"))
+        .clone()
 }
 
 // ---------------------------------------------------------------------------

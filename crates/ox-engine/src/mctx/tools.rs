@@ -50,21 +50,25 @@ const DROP_REQUIRED: &str = "Error: 'drop' must be provided.";
 /// The `§N§` handle-normalization patterns, compiled once. All three are
 /// constant and valid (asserted by a unit test); matching the reference,
 /// `[0-9]` is used instead of `\d` so only ASCII digits normalize.
-fn handle_patterns() -> &'static Vec<Regex> {
+/// Returned as a clone so each call's lazy-DFA caches drop with it
+/// (see `historian_validate.rs`'s regex section).
+fn handle_patterns() -> Vec<Regex> {
     static PATTERNS: OnceLock<Vec<Regex>> = OnceLock::new();
-    PATTERNS.get_or_init(|| {
-        // provider_error.rs convention: an invalid pattern degrades to a
-        // no-op instead of panicking. Order is load-bearing (dropped
-        // handles first, prose handles, then bare §N§ sections).
-        [
-            r"\[dropped\s+§([0-9]+)§\]",
-            r"tag\s+([0-9]+)",
-            r"§([0-9]+)§?",
-        ]
-        .iter()
-        .filter_map(|pattern| Regex::new(pattern).ok())
-        .collect()
-    })
+    PATTERNS
+        .get_or_init(|| {
+            // provider_error.rs convention: an invalid pattern degrades to a
+            // no-op instead of panicking. Order is load-bearing (dropped
+            // handles first, prose handles, then bare §N§ sections).
+            [
+                r"\[dropped\s+§([0-9]+)§\]",
+                r"tag\s+([0-9]+)",
+                r"§([0-9]+)§?",
+            ]
+            .iter()
+            .filter_map(|pattern| Regex::new(pattern).ok())
+            .collect()
+        })
+        .clone()
 }
 
 /// Normalize the tag handles a model copies verbatim out of the transcript

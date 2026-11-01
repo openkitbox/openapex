@@ -97,7 +97,8 @@ pub(super) fn render_retrospective_prompt(project: &str, turns: &[String]) -> St
 /// task asked for at most one, so a list means the model drifted from the
 /// contract).
 pub(super) fn parse_retrospective(text: &str) -> Result<Option<RetrospectiveLesson>, String> {
-    let mut elements = memory_element_regex().captures_iter(text);
+    let element = memory_element_regex();
+    let mut elements = element.captures_iter(text);
     let Some(captures) = elements.next() else {
         if memory_open_regex().is_match(text) {
             return Err("retrospective answer carries an unclosed <memory> element".to_owned());
@@ -314,15 +315,19 @@ pub(super) async fn fact_recorded(db: &Db, project: &str, content: &str) -> Resu
     result.with_context(|| context)
 }
 
-fn memory_element_regex() -> &'static Regex {
+// Regex accessors return a clone so the lazy-DFA cache is dropped after the
+// call instead of living on per worker thread (see `historian_validate.rs`).
+fn memory_element_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"(?is)<memory\b([^>]*?)(?:/>|>(.*?)</memory\s*>)")
             .expect("retrospective memory element regex")
     })
+    .clone()
 }
 
-fn memory_open_regex() -> &'static Regex {
+fn memory_open_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?is)<memory\b").expect("retrospective memory open regex"))
+        .clone()
 }

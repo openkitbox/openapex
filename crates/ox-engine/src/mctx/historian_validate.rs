@@ -248,13 +248,13 @@ pub fn parse_compartment_output(
         let attrs = element.attrs;
         let inner = element.inner;
 
-        let Some(start_message) = capture_i64(attr_start_regex(), attrs) else {
+        let Some(start_message) = capture_i64(&attr_start_regex(), attrs) else {
             continue;
         };
-        let Some(end_message) = capture_i64(attr_end_regex(), attrs) else {
+        let Some(end_message) = capture_i64(&attr_end_regex(), attrs) else {
             continue;
         };
-        let title = match capture_string(attr_title_regex(), attrs) {
+        let title = match capture_string(&attr_title_regex(), attrs) {
             Some(value) if !value.is_empty() => unescape_xml(value),
             _ => continue,
         };
@@ -262,8 +262,8 @@ pub fn parse_compartment_output(
             continue;
         }
 
-        let episode_type = capture_string(attr_episode_regex(), attrs).map(unescape_xml);
-        let importance = capture_i64(attr_importance_regex(), attrs);
+        let episode_type = capture_string(&attr_episode_regex(), attrs).map(unescape_xml);
+        let importance = capture_i64(&attr_importance_regex(), attrs);
 
         let mut tiers = extract_tiers(inner);
         if let Some(p1_value) = tiers.remove(&1).filter(|value| !value.is_empty()) {
@@ -328,7 +328,7 @@ pub fn parse_compartment_output(
     let mut facts = Vec::new();
     let mut dropped_fact_blocks = 0;
     let mut dropped_facts = 0;
-    for (category, block) in paired_elements(&facts_scope, category_open_regex()) {
+    for (category, block) in paired_elements(&facts_scope, &category_open_regex()) {
         if !HISTORIAN_CATEGORIES.contains(&category) {
             let count = fact_item_regex()
                 .captures_iter(block)
@@ -359,7 +359,7 @@ pub fn parse_compartment_output(
         }
     }
 
-    let unprocessed_from = capture_i64(unprocessed_regex(), &outside);
+    let unprocessed_from = capture_i64(&unprocessed_regex(), &outside);
 
     let mut events = parse_events(&outside);
 
@@ -759,7 +759,7 @@ fn parse_events(text: &str) -> Vec<ParsedEvent> {
         let body = &block[body_start..body_start + relative_body_end];
 
         let mut fields = BTreeMap::new();
-        for (name, raw_value) in paired_elements(body, event_field_open_regex()) {
+        for (name, raw_value) in paired_elements(body, &event_field_open_regex()) {
             let value = unescape_xml(raw_value.trim());
             if !value.is_empty() {
                 fields.insert(name.to_string(), value);
@@ -1073,16 +1073,18 @@ fn find_matching_tier_close(
     digit: u32,
     found: &BTreeMap<u32, String>,
 ) -> Option<(usize, usize)> {
+    let close_follower = tier_close_follower_regex();
+    let open_regex = tier_open_regex();
     for close in tier_close_regex().captures_iter(&inner[body_start..]) {
         let whole = close.get(0)?;
         let (start, end) = (body_start + whole.start(), body_start + whole.end());
         if tier_digit(&close) != digit {
             continue;
         }
-        if !tier_close_follower_regex().is_match(&inner[end..]) {
+        if !close_follower.is_match(&inner[end..]) {
             continue;
         }
-        let otherwise_missing = tier_open_regex()
+        let otherwise_missing = open_regex
             .captures_iter(&inner[body_start..start])
             .any(|open| {
                 let other = tier_digit(&open);
@@ -1107,7 +1109,8 @@ fn find_matching_tier_close(
 fn extract_tiers(inner: &str) -> BTreeMap<u32, String> {
     let mut tiers = BTreeMap::new();
     let mut pos = 0;
-    while let Some(open) = tier_open_regex().captures_at(inner, pos) {
+    let open_regex = tier_open_regex();
+    while let Some(open) = open_regex.captures_at(inner, pos) {
         let Some(whole) = open.get(0) else {
             break;
         };
@@ -1163,12 +1166,14 @@ fn find_compartment_elements(text: &str) -> Vec<CompartmentElement<'_>> {
     let find_close_from = |from: usize| text[from..].find(CLOSE_TAG).map(|at| from + at);
     let mut elements = Vec::new();
     let mut cursor = 0;
-    while let Some(open) = compartment_open_regex().captures_at(text, cursor) {
+    let open_regex = compartment_open_regex();
+    let close_follower = compartment_close_follower_regex();
+    while let Some(open) = open_regex.captures_at(text, cursor) {
         let Some(whole) = open.get(0) else {
             break;
         };
         let body_start = whole.end();
-        let window_end = compartment_open_regex()
+        let window_end = open_regex
             .find_at(text, body_start)
             .map_or(text.len(), |next| next.start());
         let Some(first_close) = find_close_from(body_start) else {
@@ -1177,7 +1182,7 @@ fn find_compartment_elements(text: &str) -> Vec<CompartmentElement<'_>> {
         let mut close_at = first_close;
         let mut candidate = Some(first_close);
         while let Some(at) = candidate.filter(|at| *at < window_end) {
-            if compartment_close_follower_regex().is_match(&text[at + CLOSE_TAG.len()..]) {
+            if close_follower.is_match(&text[at + CLOSE_TAG.len()..]) {
                 close_at = at;
                 break;
             }
@@ -1272,161 +1277,191 @@ fn format_dropped_fact_category(category: &str, count: usize) -> String {
 
 // ---------------------------------------------------------------------------
 // Regexes (each mirrors the reference's identically named one)
+//
+// Each accessor hands out a clone of the compiled-once regex. A clone shares
+// the compiled program (one `Arc` bump) but owns a fresh, empty lazy-DFA
+// cache pool, which is dropped with the clone. Handing out `&'static Regex`
+// instead keeps one cache per tokio worker thread that ever ran the regex, for
+// the life of the process: the only live-heap growth left in the isolated
+// attribution (`.ox/plans/memory-growth-analysis.md`). Rebuilding the cache
+// costs microseconds per parse, and these parses run a few times per fold.
 // ---------------------------------------------------------------------------
 
-fn xml_entity_regex() -> &'static Regex {
+fn xml_entity_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"&(amp|apos|quot|lt|gt);").expect("xml entity regex"))
+        .clone()
 }
 
-fn output_document_regex() -> &'static Regex {
+fn output_document_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"(?is)\A\s*<output(?:\s[^>]*)?>(?P<body>.*)</output\s*>\s*\z")
             .expect("output document regex")
     })
+    .clone()
 }
 
-fn output_tag_regex() -> &'static Regex {
+fn output_tag_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?is)</?output(?:\s[^>]*)?>").expect("output tag regex"))
+        .clone()
 }
 
 /// Compartment open tag; group 1 is the attribute string. Quoted attribute values
 /// are consumed whole, so a raw `>` inside one does not end the open tag, and a
 /// value may not span a line so a stray quote cannot swallow the body.
-fn compartment_open_regex() -> &'static Regex {
+fn compartment_open_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r#"<compartment\s+((?:[^>"]|"[^"\n]*")*?)\s*>"#).expect("compartment open regex")
     })
+    .clone()
 }
 
 /// What may follow a compartment's real closing tag: the next compartment, the
 /// end of the list or document, or one of the output's own blocks.
-fn compartment_close_follower_regex() -> &'static Regex {
+fn compartment_close_follower_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
             r"\A\s*(?:\z|<(?:compartment\s|/compartments\s*>|/output\s*>|(?:facts|events|meta|user_observations|primer_candidates|unprocessed_from)\s*>))",
         )
         .expect("compartment close follower regex")
-    })
+    }).clone()
 }
 
-fn attr_start_regex() -> &'static Regex {
+fn attr_start_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r#"\bstart="(\d+)""#).expect("attr start regex"))
+        .clone()
 }
 
-fn attr_end_regex() -> &'static Regex {
+fn attr_end_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r#"\bend="(\d+)""#).expect("attr end regex"))
+        .clone()
 }
 
-fn attr_title_regex() -> &'static Regex {
+fn attr_title_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r#"\btitle="([^"]*)""#).expect("attr title regex"))
+        .clone()
 }
 
-fn attr_episode_regex() -> &'static Regex {
+fn attr_episode_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r#"\bepisode_type="([^"]*)""#).expect("attr episode regex"))
+        .clone()
 }
 
-fn attr_importance_regex() -> &'static Regex {
+fn attr_importance_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r#"\bimportance="(\d+)""#).expect("attr importance regex"))
+        .clone()
 }
 
 /// Tier opener: `<p1>` / `<p1 >` (group 2 empty) or the self-close `<p4/>`
 /// (group 2 = "/"). Group 1 is the tier digit, ASCII to match JavaScript's `\d`.
-fn tier_open_regex() -> &'static Regex {
+fn tier_open_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"<p([0-9])\s*(/?)>").expect("tier open regex"))
+        .clone()
 }
 
-fn tier_close_regex() -> &'static Regex {
+fn tier_close_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"</p([0-9])\s*>").expect("tier close regex"))
+        .clone()
 }
 
 /// What may follow a tier's real closing tag: another tier tag or the end of the
 /// compartment.
-fn tier_close_follower_regex() -> &'static Regex {
+fn tier_close_follower_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"\A\s*(?:\z|</?p[0-9]\s*/?>)").expect("tier close follower regex")
     })
+    .clone()
 }
 
 /// Lenient fallback bound: the start of any tier's closing tag.
-fn tier_close_any_regex() -> &'static Regex {
+fn tier_close_any_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"</p[0-9]").expect("any tier close regex"))
+        .clone()
 }
 
 /// The over-capture guard: the start of any tier's opening tag.
-fn tier_open_any_regex() -> &'static Regex {
+fn tier_open_any_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"<p[0-9]").expect("any tier open regex"))
+        .clone()
 }
 
-fn facts_side_channel_regex() -> &'static Regex {
+fn facts_side_channel_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"(?s)<meta>.*?</meta>|<user_observations>.*?</user_observations>|<primer_candidates>.*?</primer_candidates>")
             .expect("facts side channel regex")
-    })
+    }).clone()
 }
 
-fn facts_envelope_regex() -> &'static Regex {
+fn facts_envelope_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"</?(?:output|compartments)>").expect("facts envelope regex"))
+        .clone()
 }
 
-fn facts_block_regex() -> &'static Regex {
+fn facts_block_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?s)<facts>(.*?)</facts>").expect("facts block regex"))
+        .clone()
 }
 
-fn events_block_regex() -> &'static Regex {
+fn events_block_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?s)<events>(.*?)</events>").expect("events block regex"))
+        .clone()
 }
 
 /// Opening tag of a fact category block; group 1 is the category name.
-fn category_open_regex() -> &'static Regex {
+fn category_open_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"<([A-Za-z_][A-Za-z0-9_-]*)>").expect("category open regex"))
+        .clone()
 }
 
-fn fact_item_regex() -> &'static Regex {
+fn fact_item_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?m)^\s*\*\s*(.+)$").expect("fact item regex"))
+        .clone()
 }
 
-fn unprocessed_regex() -> &'static Regex {
+fn unprocessed_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"<unprocessed_from>(\d+)</unprocessed_from>").expect("unprocessed regex")
     })
+    .clone()
 }
 
-fn event_open_regex() -> &'static Regex {
+fn event_open_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r#"<([a-z_]+)\s+at_compartment="(\d+)"\s*>"#).expect("event open regex")
     })
+    .clone()
 }
 
 /// Opening tag of an event field; group 1 is the field name.
-fn event_field_open_regex() -> &'static Regex {
+fn event_field_open_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"<([a-z_]+)\s*>").expect("event field open regex"))
+        .clone()
 }
 
-fn side_channel_anchor_regex() -> &'static Regex {
+fn side_channel_anchor_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(
@@ -1434,4 +1469,5 @@ fn side_channel_anchor_regex() -> &'static Regex {
         )
         .expect("side channel anchor regex")
     })
+    .clone()
 }

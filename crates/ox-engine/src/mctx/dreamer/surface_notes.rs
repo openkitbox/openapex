@@ -198,9 +198,13 @@ pub(super) fn parse_ready_ids(text: &str, batch_ids: &[&str]) -> Result<Vec<Stri
 /// covers a missing attribute and an empty value: neither addresses a note.
 fn ready_id_attr(attrs: &str) -> Option<String> {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        Regex::new(r#"(?i)\bid\s*=\s*(?:"([^"]*)"|'([^']*)')"#).expect("ready id attr regex")
-    });
+    // A clone drops its lazy-DFA cache with this call (see
+    // `historian_validate.rs`'s regex section).
+    let re = RE
+        .get_or_init(|| {
+            Regex::new(r#"(?i)\bid\s*=\s*(?:"([^"]*)"|'([^']*)')"#).expect("ready id attr regex")
+        })
+        .clone();
     let captures = re.captures(attrs)?;
     let value = captures.get(1).or_else(|| captures.get(2))?.as_str().trim();
     (!value.is_empty()).then(|| value.to_owned())
@@ -238,14 +242,18 @@ pub(super) async fn apply_surfaced(db: &Db, ids: &[String], at: i64) -> Result<u
     result.with_context(|| context)
 }
 
+// Regex accessors return a clone so the lazy-DFA cache is dropped after the
+// call instead of living on per worker thread (see `historian_validate.rs`).
 /// The `<ready` opener (any of `/>`, `>`, or a truncated element).
-fn ready_open_regex() -> &'static Regex {
+fn ready_open_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?is)<ready\b").expect("ready open regex"))
+        .clone()
 }
 
 /// One complete `<ready …>` element's attribute string.
-fn ready_element_regex() -> &'static Regex {
+fn ready_element_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?is)<ready\b([^>]*?)/?>").expect("ready element regex"))
+        .clone()
 }

@@ -219,12 +219,15 @@ fn normalize_lexically(path: &Path) -> Option<PathBuf> {
 /// recognizer errs toward finding paths.
 fn referenced_paths(content: &str) -> Vec<String> {
     static RE: OnceLock<Regex> = OnceLock::new();
+    // A clone drops its lazy-DFA cache with this call (see
+    // `historian_validate.rs`'s regex section).
     let re = RE.get_or_init(|| {
         Regex::new(
             r"(?:~|\.\.?|[\w._\-]+)?/[\w._\-/@]+\.[A-Za-z0-9]{1,8}|\b[\w._\-]+\.(?:rs|toml|lock|md|json|yaml|yml|ts|tsx|js|jsx|sql|go|py|sh|cfg|ini|txt|proto|graphql)",
         )
         .expect("memory path regex")
-    });
+    })
+    .clone();
     let mut seen: Vec<String> = Vec::new();
     for found in re.find_iter(content) {
         let path = found.as_str().trim_end_matches(|c: char| {
