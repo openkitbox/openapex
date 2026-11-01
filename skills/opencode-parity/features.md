@@ -25,7 +25,7 @@
 | behavior | session-rows | routes/session/index.tsx:2022 | crates/ox-tui/src/ui/timeline.rs:1604 | partial | Error 挂在消息下;Retry 倒计时;agent/model/location 切换行;Instructions updated;Skill;Compaction queued;压缩 spinner。偏差见 store.rs/pipeline.rs 模块文档 |
 | behavior | shell-background-output | routes/session/index.tsx:3015 | crates/ox-tui/src/shell_captures.rs:114 | partial | 展开时每秒拉取一页、在飞不重发,退出后 drain 一次,超 1 MiB 保留尾部并显示 [earlier output omitted]。偏差:复用 33ms UI tick 节流;折叠块不轮询;按原始字节计限,绘制时去 ANSI;失败不立即重试;后台调用无输出前不显示结果文本;失败调用只显示错误 |
 | behavior | shell-block | routes/session/index.tsx:2969 | crates/ox-tui/src/ui/shell_block.rs:173 | partial | BlockTool 框、`$ [cd wd && ]cmd`、运行 spinner、Writing command…、折叠 10 行带 (N earlier lines)、点击/o 展开、Background 徽标、失败 error 已做(接线 ui/timeline.rs:1467)。偏差:前台完成调用显示工具结果;Background 仅在 shell 仍存活时显示;无部分输入解析;hover 用 palette.panel;无权限色;[ ] 焦点画 hover 带;spinner 只改缓存行的 spinner span |
-| behavior | shell-message | routes/session/index.tsx:2322 |  | n/a | ox 服务端从不产生 Message::Shell(仅 schema 有),TUI 也没有 ! 输入模式,故不渲染 |
+| behavior | shell-message | routes/session/index.tsx:2322 |  | missing | 服务端已产生 Message::Shell(session.shell,crates/ox-core/src/projector/message_updater.rs 投影,60cdfa5);ox-tui 未渲染历史 shell 行,也没有 ! 输入模式 |
 | behavior | sidebar-todo | routes/session/sidebar.tsx:1 | crates/ox-tui/src/ui/sidebar.rs:68 | partial | 42 列侧栏,宽>120 停靠右侧、否则浮层(Esc 先关),子会话不显示;Todo 节 ▼/▶ 折叠、(N remaining)、取最后一次成功 todowrite。偏差见 sidebar.rs 模块文档:无 revert 边界、不持久化、无滚动、只有 Todo 节、浮层无暗化背景 |
 | behavior | subagent-background-badge | routes/session/index.tsx:3289 | crates/ox-tui/src/ui/timeline.rs:1626 | aligned | 子会话运行时子代理工具行显示转圈和 Background |
 | behavior | tool-inline-texts | routes/session/index.tsx:3143 | crates/ox-tui/src/ui/tool_text.rs:93 | deviation | Read/Glob/Grep/WebFetch/Skill/Subagent/Question/Generic 文案已移植。偏差:Generic 键序按字母;子代理模型显示原始 provider/model,无 agent 名时为 General;展开体限 TOOL_OUTPUT_MAX_LINES |
@@ -219,12 +219,12 @@
 | keybind | server.pair | config/keybind.ts:61 |  | todo |  |
 | keybind | service.restart | config/keybind.ts:62 |  | todo |  |
 | keybind | session.aside | config/keybind.ts:131 |  | todo |  |
-| keybind | session.background | config/keybind.ts:129 |  | missing | 服务端没有 session.background 路由,需先做服务端 |
+| keybind | session.background | config/keybind.ts:129 |  | missing | 服务端路由已有(crates/ox-server/src/api/session/control.rs:47);ox-tui 尚未绑定 ctrl+b |
 | keybind | session.cd | config/keybind.ts:132 |  | todo |  |
 | keybind | session.child.first | config/keybind.ts:138 | crates/ox-tui/src/ui/subagent_dialog.rs:45 | partial | 只做了 Subagents 选择器(ctrl+x ↓),没有 first/next/previous 的会话间直接切换键 |
 | keybind | session.child.next | config/keybind.ts:139 |  | todo |  |
 | keybind | session.child.previous | config/keybind.ts:140 |  | todo |  |
-| keybind | session.compact | config/keybind.ts:130 |  | todo |  |
+| keybind | session.compact | config/keybind.ts:130 |  | missing | 服务端路由已有(crates/ox-server/src/api/session/compaction.rs,60cdfa5);ox-tui 尚未绑定 |
 | keybind | session.copy | config/keybind.ts:107 |  | todo |  |
 | keybind | session.copy.id | config/keybind.ts:108 |  | todo |  |
 | keybind | session.delete | config/keybind.ts:124 |  | todo |  |
@@ -312,18 +312,23 @@
 | keybind | which-key.scroll.up | config/keybind.ts:297 |  | todo |  |
 | keybind | which-key.toggle | config/keybind.ts:292 |  | todo |  |
 | sdk_call | credential.activate | component/dialog-integration.tsx:231 |  | todo |  |
+| sdk_call | experimental.mcp.connect | component/dialog-mcp.tsx:124 |  | partial | 服务端已对齐(crates/ox-server/src/api/mcp.rs,60cdfa5);偏差 D4-D6;ox-tui 未调用 |
+| sdk_call | experimental.mcp.disconnect | component/dialog-mcp.tsx:124 |  | partial | 服务端已对齐(crates/ox-server/src/api/mcp.rs,60cdfa5);ox-tui 未调用 |
+| sdk_call | experimental.usage.limits | component/usage.tsx:37 |  | partial | 服务端返回 data:null(无 Console 账号,即上游未登录答案;crates/ox-server/src/api/compat.rs,60cdfa5);ox-tui 未调用 |
 | sdk_call | file.find | component/prompt/autocomplete.tsx:378 |  | todo |  |
 | sdk_call | file.list | app.tsx:227 |  | todo |  |
 | sdk_call | location.get | app.tsx:229 |  | todo |  |
 | sdk_call | server.info | component/devtools-bar.tsx:57 |  | todo |  |
 | sdk_call | server.pair | component/dialog-pair.tsx:22 |  | todo |  |
-| sdk_call | session.background | component/prompt/index.tsx:544 |  | missing | 服务端没有对应路由 |
+| sdk_call | session.active | component/dialog-open.tsx:179 |  | partial | 服务端已对齐,返回运行中会话(crates/ox-server/src/api/session/switch.rs,60cdfa5);ox-tui 未调用 |
+| sdk_call | session.background | component/prompt/index.tsx:544 |  | partial | 服务端已对齐(crates/ox-server/src/api/session/control.rs:47,04229b4);ox-client/ox-tui 未调用 |
 | sdk_call | session.command | component/prompt/index.tsx:1325 |  | todo |  |
+| sdk_call | session.compact | routes/session/index.tsx:1092 |  | partial | 服务端已对齐(crates/ox-server/src/api/session/compaction.rs,60cdfa5);偏差:跳过 SessionRevert.commit、进程级准入锁;ox-tui 未调用 |
 | sdk_call | session.environment | component/prompt/index.tsx:1255 |  | todo |  |
 | sdk_call | session.interrupt | component/prompt/index.tsx:524 |  | todo |  |
 | sdk_call | session.list | component/dialog-session-list.tsx:63 |  | todo |  |
 | sdk_call | session.move | component/dialog-workspaces.tsx:318 |  | todo |  |
-| sdk_call | session.shell | component/prompt/index.tsx:1315 |  | todo |  |
+| sdk_call | session.shell | component/prompt/index.tsx:1315 |  | partial | 服务端已对齐(crates/ox-server/src/api/session/user_shell.rs,60cdfa5);偏差 D1-D3 见 .ox/plans/2026-11-01-cheap-parity-gaps.md;ox-client/ox-tui 未调用 |
 | sdk_call | session.switchAgent | component/prompt/index.tsx:1288 |  | todo |  |
 | sdk_call | session.switchModel | component/prompt/index.tsx:1294 |  | todo |  |
 | sdk_call | session.synthetic | component/prompt/index.tsx:1352 |  | todo |  |
@@ -398,10 +403,10 @@
 | sse_event | queued.prompts | mini/footer.ts:506 |  | n/a | mini 精简 TUI 的内部发射器名,不是服务端 SSE 事件 |
 | sse_event | server.connected | context/client-mcp.tsx:108 |  | todo |  |
 | sse_event | session.agent.selected | context/local.tsx:71 |  | todo |  |
-| sse_event | session.compaction.delta | mini/stream-v2.transport.ts:1113 |  | todo |  |
-| sse_event | session.compaction.ended | mini/stream-v2.transport.ts:1120 |  | todo |  |
-| sse_event | session.compaction.failed | mini/stream-v2.transport.ts:1133 |  | todo |  |
-| sse_event | session.compaction.started | mini/stream-v2.transport.ts:1105 |  | todo |  |
+| sse_event | session.compaction.delta | mini/stream-v2.transport.ts:1113 |  | partial | 服务端已发射(crates/ox-schema/src/event.rs:622-655),ox-client 消费(crates/ox-client/src/store.rs:43);字段未逐项核对 |
+| sse_event | session.compaction.ended | mini/stream-v2.transport.ts:1120 |  | partial | 服务端已发射(crates/ox-schema/src/event.rs:622-655),ox-client 消费(crates/ox-client/src/store.rs:43);字段未逐项核对 |
+| sse_event | session.compaction.failed | mini/stream-v2.transport.ts:1133 |  | partial | 服务端已发射(crates/ox-schema/src/event.rs:622-655),ox-client 消费(crates/ox-client/src/store.rs:43);字段未逐项核对 |
+| sse_event | session.compaction.started | mini/stream-v2.transport.ts:1105 |  | partial | 服务端已发射(crates/ox-schema/src/event.rs:622-655),ox-client 消费(crates/ox-client/src/store.rs:43);字段未逐项核对 |
 | sse_event | session.deleted | app.tsx:1366 |  | todo |  |
 | sse_event | session.execution.failed | feature-plugins/system/notifications.ts:79 |  | todo |  |
 | sse_event | session.execution.interrupted | feature-plugins/system/notifications.ts:78 |  | todo |  |
@@ -419,8 +424,8 @@
 | sse_event | session.reasoning.started | mini/stream-v2.subagent.ts:722 |  | todo |  |
 | sse_event | session.renamed | mini/stream-v2.transport.ts:1055 |  | todo |  |
 | sse_event | session.retry.scheduled | routes/session/rows.ts:303 |  | todo |  |
-| sse_event | session.shell.ended | mini/stream-v2.transport.ts:1165 |  | todo |  |
-| sse_event | session.shell.started | mini/stream-v2.transport.ts:1144 |  | todo |  |
+| sse_event | session.shell.ended | mini/stream-v2.transport.ts:1165 |  | partial | 服务端发射并投影(crates/ox-schema/src/event.rs,60cdfa5);ox-client 未消费 |
+| sse_event | session.shell.started | mini/stream-v2.transport.ts:1144 |  | partial | 服务端发射并投影,事件 id = body.id 的 msg_→evt_(crates/ox-server/src/api/session/user_shell.rs,60cdfa5);ox-client 未消费 |
 | sse_event | session.skill.activated | mini/stream-v2.transport.ts:1097 |  | todo |  |
 | sse_event | session.step.ended | mini/stream-v2.subagent.ts:903 |  | todo |  |
 | sse_event | session.step.failed | mini/stream-v2.subagent.ts:904 |  | todo |  |
