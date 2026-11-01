@@ -631,14 +631,6 @@ impl DataStore {
         &[]
     }
 
-    /// Something is running for this session: its own turn, or a child
-    /// session it delegated to. Display only; interrupts keep using
-    /// `running_since`, which child events never touch.
-    #[must_use]
-    pub fn busy(&self) -> bool {
-        self.running_since.is_some() || !self.running_children.is_empty()
-    }
-
     /// Whether `session_id` is a known child whose turn is in flight.
     #[must_use]
     pub fn is_child_running(&self, session_id: &str) -> bool {

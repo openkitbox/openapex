@@ -1344,16 +1344,11 @@ impl App {
         self.dirty = true;
     }
 
-    /// What the footer shows as going on. Display only: the own turn
-    /// (`running_since`) wins, otherwise running child sessions still light
-    /// the scanner. `press_esc` and `interrupt_or_quit` below deliberately
-    /// stay on `running_since`: child events never touch it, so Esc / ctrl+c
-    /// keep acting on the own turn alone.
+    /// What the footer shows as going on: the focused session's own turn
+    /// only, like upstream. Running children are shown on their tool rows.
     fn activity(&self) -> Activity {
         if self.store.running_since.is_some() {
             Activity::Turn
-        } else if self.store.busy() {
-            Activity::Children
         } else {
             Activity::Idle
         }

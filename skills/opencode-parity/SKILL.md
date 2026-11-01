@@ -17,7 +17,7 @@ description: 对比上游 opencode（TUI 与 server API）和 ox 的差异并推
 |---|---|
 | 上游升版（如 v2.2.3 → v2.3.0），问"要跟进什么" | A：升版 |
 | 对齐一个具体功能或组件 | B：单功能 |
-| 像素/单元格级的外观对齐 | C：视觉，直接用 `crates/ox-tui/tests/parity/`（见其 README），不要在这里重做 |
+| 像素/单元格级的外观对齐 | C：视觉，直接用 `visual/`（见 `visual/README.md`，`visual/diff-session.sh <session-id>` 一键对比），不要在这里重做 |
 
 ## 场景 A：升版
 

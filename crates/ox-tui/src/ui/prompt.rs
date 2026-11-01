@@ -168,16 +168,13 @@ pub enum PromptAction {
     Esc,
 }
 
-/// What the footer reports as going on. `Turn` is the focused session's own
-/// turn: Esc / ctrl+c interrupt it, so the footer advertises that. `Children`
-/// is only background subagents running: the scanner shows (upstream
-/// `session-tabs.tsx:170` rolls children into "busy") but no interrupt hint,
-/// because nothing here would be interrupted. Display only; the interrupt
-/// keys themselves stay on `DataStore::running_since`.
+/// What the footer reports as going on: the focused session's own turn.
+/// Upstream keys the scanner on that session's status alone
+/// (`component/prompt/index.tsx:1913`), so background subagents leave the
+/// footer still while the parent waits for them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Activity {
     Idle,
-    Children,
     Turn,
 }
 
@@ -680,9 +677,7 @@ impl Prompt {
                 let mut spans = vec![Span::raw(" ")];
                 spans.extend(spinner::spans(self.spin_frame, &pal));
                 spans.push(Span::raw(" "));
-                if activity == Activity::Children {
-                    // Nothing of ours to interrupt: scanner only.
-                } else if self.interrupt_armed.is_some() {
+                if self.interrupt_armed.is_some() {
                     spans.push(Span::styled("esc ", pal.warning));
                     spans.push(Span::styled("again to interrupt", pal.warning));
                 } else {
@@ -693,7 +688,11 @@ impl Prompt {
             } else {
                 vec![Span::styled(self.location(), pal.dim)]
             };
-            let right: Option<Vec<Span<'static>>> = if running {
+            // Upstream `showDetails`: usage and hints stay up during a turn and
+            // only yield to an armed interrupt on a narrow terminal
+            // (`component/prompt/index.tsx:1614`).
+            let details = self.interrupt_armed.is_none() || full.width >= 80;
+            let right: Option<Vec<Span<'static>>> = if !details {
                 None
             } else {
                 match self.footer {
