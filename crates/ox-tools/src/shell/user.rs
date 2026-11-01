@@ -130,7 +130,7 @@ mod tests {
 
     /// Spawn `command` with no owner.
     fn spawn(command: &str, timeout_ms: Option<u64>) -> std::sync::Arc<ShellSession> {
-        let sessions = ShellSessions::new();
+        let sessions = std::sync::Arc::new(ShellSessions::new());
         sessions
             .spawn(SpawnRequest {
                 command: command.to_owned(),

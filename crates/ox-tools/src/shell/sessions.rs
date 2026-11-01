@@ -20,10 +20,12 @@
 //! their teardown, and signals only ever go to the group this session spawned.
 
 use std::collections::HashMap;
+use std::mem;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Notify;
@@ -35,10 +37,18 @@ use super::process::{self, Signal, Spawned};
 /// Newest bytes retained per session. Upstream keeps the whole capture in a
 /// file; the tail is what a client renders and what the model needs.
 pub const OUTPUT_CAPACITY: usize = 8 * 1024 * 1024;
-/// How long a settled session stays listed before the next spawn reaps it.
+/// How long a settled session stays readable before a sweep (after a settle
+/// or on spawn) reaps it.
 /// A running session never ages out: there is no completion timestamp to
 /// measure from, and its output is still being written.
 pub const SHELL_SESSION_TTL_MS: i64 = 60 * 60 * 1000;
+/// Settled sessions kept readable through `get`/`output`, newest first
+/// (upstream `packages/core/src/shell.ts` `EXITED_LIMIT`).
+pub const EXITED_LIMIT: usize = 25;
+/// Bytes all settled captures may retain together. ox keeps output in memory
+/// rather than in a file, so finished captures also share a byte budget
+/// (plan deviation D1); the oldest give up their bytes first.
+const SETTLED_OUTPUT_BUDGET: usize = 32 * 1024 * 1024;
 /// Default page size for one `output` read.
 pub const DEFAULT_PAGE_BYTES: usize = 64 * 1024;
 /// How long the output pipe may keep delivering after the shell exited before
@@ -172,6 +182,79 @@ impl OutputBuffer {
     pub fn shrink_to_retained(&mut self) {
         self.bytes.shrink_to_fit();
     }
+
+    /// Free the retained bytes while keeping `size()`, so an old cursor reads
+    /// as truncated instead of as a capture that never had output.
+    pub fn release(&mut self) {
+        drop(mem::take(&mut self.bytes));
+    }
+}
+
+/// What the retention policy needs to know about one settled session.
+#[derive(Debug, Clone, Copy)]
+struct SettledCapture {
+    /// `Exit.completed` in epoch milliseconds.
+    completed: i64,
+    /// [`OutputBuffer::retained`] at snapshot time.
+    retained: usize,
+}
+
+/// Indices into the [`SettledCapture`] slice the plan was made from.
+#[derive(Debug, Default)]
+struct EvictionPlan {
+    /// Sessions to drop from the table.
+    remove: Vec<usize>,
+    /// Surviving sessions whose output is released.
+    release: Vec<usize>,
+}
+
+/// Decide which settled sessions to drop (past the TTL, then beyond
+/// [`EXITED_LIMIT`], oldest first) and which survivors release their output
+/// to fit [`SETTLED_OUTPUT_BUDGET`], oldest first.
+fn eviction_plan(settled: &[SettledCapture], now_ms: i64) -> EvictionPlan {
+    plan_with(
+        settled,
+        now_ms,
+        SHELL_SESSION_TTL_MS,
+        EXITED_LIMIT,
+        SETTLED_OUTPUT_BUDGET,
+    )
+}
+
+/// [`eviction_plan`] with explicit limits, so tests can use small numbers.
+fn plan_with(
+    settled: &[SettledCapture],
+    now_ms: i64,
+    ttl_ms: i64,
+    limit: usize,
+    budget: usize,
+) -> EvictionPlan {
+    let mut plan = EvictionPlan::default();
+    let mut survivors: Vec<usize> = Vec::with_capacity(settled.len());
+    for (index, capture) in settled.iter().enumerate() {
+        if now_ms.saturating_sub(capture.completed) > ttl_ms {
+            plan.remove.push(index);
+        } else {
+            survivors.push(index);
+        }
+    }
+    // Oldest first; equal completion times fall back to slice order.
+    survivors.sort_by_key(|&index| (settled[index].completed, index));
+    let excess = survivors.len().saturating_sub(limit);
+    plan.remove.extend(survivors.drain(..excess));
+
+    let mut total: usize = survivors.iter().map(|&index| settled[index].retained).sum();
+    for &index in &survivors {
+        if total <= budget {
+            break;
+        }
+        let retained = settled[index].retained;
+        if retained > 0 {
+            plan.release.push(index);
+            total -= retained;
+        }
+    }
+    plan
 }
 
 /// Terminal state of a session.
@@ -238,6 +321,9 @@ pub struct ShellSession {
     /// The table's observer as of spawn. Cloned once per session, so a
     /// session reports through the sink that was installed when it started.
     observer: Option<Observer>,
+    /// The table this session lives in, so `drive` can run the retention
+    /// sweep right after the settle. `Weak`: the table owns its sessions.
+    table: Weak<ShellSessions>,
 }
 
 /// Whether a settling session reports a completion. The gate and the terminal
@@ -361,6 +447,21 @@ impl ShellSession {
     /// Bytes appended so far.
     pub fn size(&self) -> u64 {
         self.output.lock().map(|buffer| buffer.size()).unwrap_or(0)
+    }
+
+    /// Bytes the capture currently retains (what the settled budget counts).
+    fn retained(&self) -> usize {
+        self.output
+            .lock()
+            .map(|buffer| buffer.retained())
+            .unwrap_or(0)
+    }
+
+    /// Free the retained capture, keeping its size (see [`OutputBuffer::release`]).
+    fn release_output(&self) {
+        if let Ok(mut buffer) = self.output.lock() {
+            buffer.release();
+        }
     }
 
     /// Terminal state, or the default (still running) state.
@@ -690,7 +791,7 @@ impl ShellSessions {
 
     /// Spawn one session and start capturing its output. The caller decides
     /// how long to wait before returning control to the model.
-    pub fn spawn(&self, request: SpawnRequest) -> std::io::Result<Arc<ShellSession>> {
+    pub fn spawn(self: &Arc<Self>, request: SpawnRequest) -> std::io::Result<Arc<ShellSession>> {
         let (events, _) = broadcast::channel(32);
         let spawned = process::spawn(&self.shell, &request.command, &request.cwd)?;
         let session = Arc::new(ShellSession {
@@ -722,6 +823,7 @@ impl ShellSessions {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone(),
+            table: Arc::downgrade(self),
         });
         if let Some(timeout) = request.timeout_ms.filter(|timeout| *timeout > 0) {
             let handle = tokio::spawn(deadline_timer(
@@ -799,19 +901,49 @@ impl ShellSessions {
         })
     }
 
-    /// Reap settled sessions whose completion is older than
-    /// [`SHELL_SESSION_TTL_MS`]. Running sessions never age out: `Exit.completed`
-    /// only exists once a session settles. Called from [`Self::spawn`] so the
-    /// table is bounded by live work plus an hour of recent history instead of
-    /// the process lifetime.
+    /// Bound the settled history: drop sessions settled longer than
+    /// [`SHELL_SESSION_TTL_MS`] ago or beyond the newest [`EXITED_LIMIT`], then
+    /// release the output of the oldest survivors until all settled captures
+    /// fit [`SETTLED_OUTPUT_BUDGET`]. Running sessions are never touched:
+    /// `Exit.completed` only exists once a session settles. Removal is silent
+    /// (no `deleted` notice, plan D2). Runs after every settle and on spawn.
+    ///
+    /// Lock order: table, then each session's `exit`/`output`; the plan is a
+    /// pure decision over a snapshot of completion times and retained bytes.
     pub fn evict_idle(&self, now_ms: i64) {
-        let Ok(mut table) = self.sessions.lock() else {
-            return;
+        let removed: Vec<Arc<ShellSession>> = {
+            let Ok(mut table) = self.sessions.lock() else {
+                return;
+            };
+            let mut settled: Vec<Arc<ShellSession>> = Vec::new();
+            for session in table.values() {
+                if session.exit().completed.is_some() {
+                    settled.push(Arc::clone(session));
+                }
+            }
+            // Ids ascend with creation, so equal completion times break ties
+            // by spawn order instead of by map iteration order.
+            settled.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+            let captures: Vec<SettledCapture> = settled
+                .iter()
+                .map(|session| SettledCapture {
+                    completed: session.exit().completed.unwrap_or_default(),
+                    retained: session.retained(),
+                })
+                .collect();
+            let plan = eviction_plan(&captures, now_ms);
+            // Released under the table lock, so a concurrent sweep never plans
+            // from a snapshot that predates these releases.
+            for &index in &plan.release {
+                settled[index].release_output();
+            }
+            plan.remove
+                .iter()
+                .filter_map(|&index| table.remove(&settled[index].id))
+                .collect()
         };
-        table.retain(|_, session| match session.exit().completed {
-            None => true,
-            Some(completed) => now_ms.saturating_sub(completed) <= SHELL_SESSION_TTL_MS,
-        });
+        // A removed session may drop its last reference here, off the lock.
+        drop(removed);
     }
 
     /// Subscribe to lifecycle changes instead of polling.
@@ -948,6 +1080,212 @@ async fn drive(session: Arc<ShellSession>, spawned: Spawned) {
             }
         }
     });
-    // `guard` drops here: it publishes the terminal state, runs the completion
-    // callback, and wakes every waiter, after the drained output is final.
+    // Publishes the terminal state, runs the completion callback, and wakes
+    // every waiter, after the drained output is final.
+    drop(guard);
+    // Only now is this session part of the settled history; an unwind skips
+    // this and the next spawn sweeps instead.
+    if let Some(table) = session.table.upgrade() {
+        table.evict_idle(ox_schema::id::now_millis());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn capture(completed: i64, retained: usize) -> SettledCapture {
+        SettledCapture {
+            completed,
+            retained,
+        }
+    }
+
+    #[test]
+    fn release_keeps_size_and_reports_truncation() {
+        let mut buffer = OutputBuffer::with_capacity(16);
+        buffer.append(b"hello world");
+        buffer.release();
+        assert_eq!(
+            buffer.size(),
+            11,
+            "release must keep total, got {}",
+            buffer.size()
+        );
+        assert_eq!(
+            buffer.retained(),
+            0,
+            "release must free bytes, got {}",
+            buffer.retained()
+        );
+        let old = buffer.page(0, 8);
+        assert!(
+            old.output.is_empty() && old.truncated && old.cursor == 11,
+            "old cursor must read empty and truncated, got {old:?}"
+        );
+        let eof = buffer.page(11, 8);
+        assert!(
+            eof.output.is_empty() && !eof.truncated && eof.cursor == 11,
+            "tail cursor must read EOF, got {eof:?}"
+        );
+    }
+
+    #[test]
+    fn ttl_removes_only_expired() {
+        let now = SHELL_SESSION_TTL_MS + 1_000;
+        let settled = [capture(999, 1), capture(1_000, 1), capture(now, 1)];
+        let plan = eviction_plan(&settled, now);
+        assert_eq!(
+            plan.remove,
+            vec![0],
+            "only entries past the TTL go, got {plan:?}"
+        );
+        assert!(plan.release.is_empty(), "nothing over budget, got {plan:?}");
+    }
+
+    #[test]
+    fn count_cap_keeps_newest() {
+        // Newest first in the slice, so index order and age order differ.
+        let settled: Vec<SettledCapture> = (0..EXITED_LIMIT + 3)
+            .map(|index| capture(100 - index as i64, 0))
+            .collect();
+        let plan = eviction_plan(&settled, 100);
+        let oldest: Vec<usize> = (EXITED_LIMIT..EXITED_LIMIT + 3).collect();
+        let mut removed = plan.remove.clone();
+        removed.sort_unstable();
+        assert_eq!(removed, oldest, "the three oldest must go, got {plan:?}");
+        assert!(plan.release.is_empty(), "no bytes retained, got {plan:?}");
+    }
+
+    #[test]
+    fn budget_releases_oldest_survivors_first() {
+        // Index 0 expires, index 1 is the oldest beyond the count limit of 3;
+        // neither may be released. Survivors 2..=4 hold 30 bytes against 15.
+        let settled = [
+            capture(0, 100),
+            capture(10, 100),
+            capture(20, 10),
+            capture(40, 10),
+            capture(30, 10),
+        ];
+        let plan = plan_with(&settled, 50, 45, 3, 15);
+        assert_eq!(
+            plan.remove,
+            vec![0, 1],
+            "TTL then count removal, got {plan:?}"
+        );
+        assert_eq!(
+            plan.release,
+            vec![2, 4],
+            "oldest survivors released, got {plan:?}"
+        );
+    }
+
+    #[test]
+    fn under_limits_is_noop() {
+        let settled = [capture(10, 1024), capture(20, 2048)];
+        let plan = eviction_plan(&settled, 30);
+        assert!(
+            plan.remove.is_empty() && plan.release.is_empty(),
+            "nothing over limit, got {plan:?}"
+        );
+    }
+
+    fn spawn_quick(table: &Arc<ShellSessions>, command: &str) -> Arc<ShellSession> {
+        table
+            .spawn(SpawnRequest {
+                command: command.to_owned(),
+                cwd: std::env::temp_dir(),
+                timeout_ms: None,
+                completion: None,
+                foreground: false,
+                owner: None,
+                metadata: Record::new(),
+            })
+            .expect("spawn shell")
+    }
+
+    async fn settle(session: &ShellSession) {
+        assert!(
+            session
+                .wait_settled(std::time::Duration::from_secs(5))
+                .await,
+            "session {} did not settle",
+            session.id
+        );
+    }
+
+    fn settled_count(table: &ShellSessions) -> usize {
+        table
+            .sessions
+            .lock()
+            .map(|table| table.values().filter(|session| session.settled()).count())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn settle_bounds_the_table_by_count() {
+        let table = Arc::new(ShellSessions::new());
+        let mut ids = Vec::new();
+        for _ in 0..EXITED_LIMIT + 2 {
+            let session = spawn_quick(&table, "true");
+            settle(&session).await;
+            ids.push(session.id.clone());
+        }
+        // The sweep runs right after the settle publication, so poll for it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while settled_count(&table) > EXITED_LIMIT && std::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        let count = settled_count(&table);
+        assert!(
+            count <= EXITED_LIMIT,
+            "settled sessions over the limit: {count}"
+        );
+        for id in &ids[..2] {
+            assert!(
+                table.get(id).is_none(),
+                "oldest session {id} must be evicted"
+            );
+        }
+        let newest = &ids[ids.len() - 1];
+        assert!(
+            table.get(newest).is_some(),
+            "newest session {newest} must stay"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn released_output_reads_as_truncated() {
+        let table = Arc::new(ShellSessions::new());
+        let session = spawn_quick(&table, "printf hello");
+        settle(&session).await;
+        session.release_output();
+        let (page, _) = session.poll(0, 64);
+        assert!(
+            page.output.is_empty() && page.truncated && page.size == 5,
+            "released capture must read empty and truncated, got {page:?}"
+        );
+        assert!(
+            table.get(&session.id).is_some(),
+            "a released session stays readable"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn running_session_is_never_evicted() {
+        let table = Arc::new(ShellSessions::new());
+        let running = spawn_quick(&table, "sleep 5");
+        for _ in 0..EXITED_LIMIT + 1 {
+            let session = spawn_quick(&table, "true");
+            settle(&session).await;
+        }
+        table.evict_idle(ox_schema::id::now_millis());
+        assert!(
+            table.get(&running.id).is_some(),
+            "running session {} was evicted",
+            running.id
+        );
+        running.stop(true).await;
+    }
 }
