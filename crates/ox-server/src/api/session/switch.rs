@@ -226,12 +226,16 @@ fn variant_of(model: &ModelRef) -> &str {
 
 #[handler] // operation_id: session.active
 pub(crate) async fn active(_req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let Some(_app) = state(depot, res) else {
+    let Some(app) = state(depot, res) else {
         return;
     };
-    // Upstream reports the in-process `SessionExecution.active` set. ox has no
-    // execution engine yet (a later task) so nothing can be running and the map
-    // is always empty.
-    let data: Map<String, Value> = Map::new();
+    // Upstream reports the in-process `SessionExecution.active` set as
+    // `{<sessionID>: {type: "running"}}` (`handlers/session.ts` `active`).
+    let data: Map<String, Value> = app
+        .runner
+        .active_sessions()
+        .into_iter()
+        .map(|id| (id, json!({ "type": "running" })))
+        .collect();
     res.render(Json(json!({ "data": data })));
 }

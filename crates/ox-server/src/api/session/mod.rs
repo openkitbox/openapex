@@ -12,10 +12,10 @@
 //! Deliberate scope limits (documented inline at each site):
 //! - `session.update` with an empty title triggers upstream title generation
 //!   (a whole model-backed subsystem) — not implemented here.
-//! - `session.active` reports the in-process execution set, which ox has no
-//!   engine for yet, so it is always empty.
 //! - `session.fork` does not snapshot instruction state.
+//! - `session.compact` skips upstream's `SessionRevert.commit` (no revert).
 
+mod compaction;
 mod control;
 mod cursor;
 mod inbox;
@@ -27,7 +27,9 @@ mod response;
 mod session_row;
 mod switch;
 mod transfer;
+mod user_shell;
 
+pub(crate) use compaction::compact;
 pub(crate) use control::{
     background, command, generate, interrupt, move_session, permission_list, synthetic, wait_idle,
 };
@@ -40,3 +42,4 @@ pub(crate) use response::{invalid_request, session_not_found};
 pub(crate) use session_row::resolve_project;
 pub(crate) use switch::{active, switch_agent, switch_model, view};
 pub(crate) use transfer::{export, import};
+pub(crate) use user_shell::shell;

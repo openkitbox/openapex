@@ -24,10 +24,8 @@ use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
-
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use serde::Serialize;
 use tokio::sync::Notify;
 use tokio::sync::broadcast;
 use tokio::task::AbortHandle;
@@ -52,15 +50,11 @@ const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 /// escalates to SIGKILL.
 const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Upstream `Shell.Status`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Status {
-    Running,
-    Exited,
-    Timeout,
-    Killed,
-}
+/// Upstream `Shell.Status`, re-exported from the shared wire schema.
+pub use ox_schema::support::ShellStatus as Status;
+pub use ox_schema::support::{ShellInfo, ShellInfoTime as Time};
+
+use ox_schema::support::Record;
 
 /// The bounded tail of a session's merged stdout/stderr.
 #[derive(Debug)]
@@ -238,6 +232,9 @@ pub struct ShellSession {
     /// notices. A run without an owner has no location, so it is never
     /// announced.
     owner: Option<Owner>,
+    /// Extra tags merged into `ShellInfo.metadata` (upstream
+    /// `CreateInput.metadata`), besides the owner's `sessionID`.
+    metadata: Record,
     /// The table's observer as of spawn. Cloned once per session, so a
     /// session reports through the sink that was installed when it started.
     observer: Option<Observer>,
@@ -610,43 +607,19 @@ impl ShellSession {
             pid: Some(self.pgid),
             exit: exit.code,
             signal: exit.signal.map(|signal| signal.to_string()),
-            metadata: self
-                .owner
-                .iter()
-                .map(|owner| ("sessionID".to_owned(), serde_json::json!(owner.session_id)))
-                .collect(),
+            metadata: {
+                let mut metadata = self.metadata.clone();
+                if let Some(owner) = &self.owner {
+                    metadata.insert("sessionID".to_owned(), serde_json::json!(owner.session_id));
+                }
+                metadata
+            },
             time: Time {
                 started: self.started,
                 completed: exit.completed,
             },
         }
     }
-}
-
-/// Upstream `Shell.Info`.
-#[derive(Debug, Clone, Serialize)]
-pub struct ShellInfo {
-    pub id: String,
-    pub status: Status,
-    pub command: String,
-    pub cwd: String,
-    pub shell: String,
-    pub file: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pid: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exit: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub signal: Option<String>,
-    pub metadata: HashMap<String, serde_json::Value>,
-    pub time: Time,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct Time {
-    pub started: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub completed: Option<i64>,
 }
 
 /// What `spawn` needs to start one session.
@@ -663,6 +636,9 @@ pub struct SpawnRequest {
     pub foreground: bool,
     /// The calling session; `None` for a run that belongs to no session.
     pub owner: Option<Owner>,
+    /// Extra opaque tags merged into `ShellInfo.metadata` (upstream
+    /// `CreateInput.metadata`); `info()` adds `sessionID` on top.
+    pub metadata: Record,
 }
 
 /// The process-wide session table, cloned as an `Arc` by the tool and the API.
@@ -740,6 +716,7 @@ impl ShellSessions {
             timed_out: AtomicBool::new(false),
             deadline: Mutex::new(None),
             owner: request.owner,
+            metadata: request.metadata,
             observer: self
                 .observer
                 .lock()

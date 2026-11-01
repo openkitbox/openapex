@@ -25,6 +25,7 @@ pub mod family;
 pub mod files;
 pub mod form;
 pub mod lease;
+mod mcp;
 pub mod session;
 pub mod shell;
 pub mod skill;
@@ -801,6 +802,8 @@ pub fn build_router(state: AppState) -> Router {
                                         ),
                                 )
                                 .push(Router::with_path("prompt").post(session::prompt))
+                                .push(Router::with_path("compact").post(session::compact))
+                                .push(Router::with_path("shell").post(session::shell))
                                 .push(Router::with_path("command").post(session::command))
                                 .push(Router::with_path("generate").post(session::generate))
                                 .push(Router::with_path("move").post(session::move_session))

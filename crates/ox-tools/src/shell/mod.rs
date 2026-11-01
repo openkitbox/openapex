@@ -32,12 +32,14 @@
 pub mod completion;
 pub mod events;
 pub mod sessions;
+pub mod user;
 
 mod process;
 
 use crate::contract::{Tool, ToolContext, ToolOutput};
 use crate::jobs::Jobs;
 use crate::rtk::RtkRewriter;
+use ox_schema::support::Record;
 use ox_schema::wire::ToolDef;
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -410,6 +412,7 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
             session_id: ctx.session_id.clone(),
             directory: ctx.directory.to_string_lossy().into_owned(),
         }),
+        metadata: Record::new(),
     }) {
         Ok(session) => session,
         Err(_) => return wrap("spawn failed".to_owned()),
@@ -667,7 +670,7 @@ pub(crate) fn exit_notice_parts(code: Option<i32>, signal: Option<i32>) -> Optio
     }
 }
 
-fn signal_name_of(signal: i32) -> Option<&'static str> {
+pub(crate) fn signal_name_of(signal: i32) -> Option<&'static str> {
     Some(match signal {
         2 => "SIGINT",
         6 => "SIGABRT",

@@ -270,6 +270,8 @@ pub async fn project(
         // Message-updater events.
         E::SessionInstructionsUpdated { .. }
         | E::SessionSynthetic { .. }
+        | E::SessionShellStarted { .. }
+        | E::SessionShellEnded { .. }
         | E::SessionRetryScheduled { .. }
         | E::SessionMessageContentUpdated { .. }
         | E::StepStarted { .. }

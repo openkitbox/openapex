@@ -84,9 +84,16 @@ pub struct Hub {
     connections: RwLock<BTreeMap<String, Arc<dyn Rpc>>>,
     resources: RwLock<Vec<ResourceInfo>>,
     templates: RwLock<Vec<TemplateInfo>>,
-    /// Names of the tools the owner registered from this hub; see
-    /// [`Hub::record_registered_tools`].
-    tool_names: RwLock<Vec<String>>,
+    /// Names of the tools the owner registered from this hub, per server; see
+    /// [`Hub::record_server_tools`].
+    tool_names: RwLock<BTreeMap<String, Vec<String>>>,
+}
+
+/// The tools one server returned, so the owner can record registrations
+/// against the server that owns them.
+pub struct ServerTools {
+    pub server: String,
+    pub tools: Vec<Arc<dyn Tool>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,13 +122,13 @@ impl Hub {
             connections: RwLock::new(BTreeMap::new()),
             resources: RwLock::new(Vec::new()),
             templates: RwLock::new(Vec::new()),
-            tool_names: RwLock::new(Vec::new()),
+            tool_names: RwLock::new(BTreeMap::new()),
         }
     }
 
     /// Connect every configured server concurrently and return the tools to
     /// register. Failures become statuses; this function never returns Err.
-    pub async fn connect_all(&self, config: &McpConfig, directory: &Path) -> Vec<Arc<dyn Tool>> {
+    pub async fn connect_all(&self, config: &McpConfig, directory: &Path) -> Vec<ServerTools> {
         let mut pending = FuturesUnordered::new();
         for (name, server) in &config.servers {
             pending.push(connect_one(name, server, directory));
@@ -132,23 +139,15 @@ impl Hub {
         }
         outcomes.sort_by(|left, right| left.name.cmp(&right.name));
 
-        let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
+        let mut tools: Vec<ServerTools> = Vec::new();
         let mut seen = HashSet::new();
         for outcome in outcomes {
             let name = outcome.name.clone();
-            sync::write(&self.servers).insert(name.clone(), outcome.status);
-            if let Some(metadata) = outcome.metadata {
-                sync::write(&self.metadata).insert(name.clone(), metadata);
-            }
-            sync::write(&self.resources).extend(outcome.resources);
-            sync::write(&self.templates).extend(outcome.templates);
-            if let Some(rpc) = outcome.rpc {
-                sync::write(&self.connections).insert(name.clone(), rpc);
-            }
-            for tool in outcome.tools {
+            let mut owned: Vec<Arc<dyn Tool>> = Vec::new();
+            for tool in install(self, outcome) {
                 let tool_name = tool.name().to_owned();
                 if seen.insert(tool_name.clone()) {
-                    tools.push(tool);
+                    owned.push(tool);
                 } else {
                     tracing::warn!(
                         tool = %tool_name,
@@ -157,21 +156,82 @@ impl Hub {
                     );
                 }
             }
+            tools.push(ServerTools {
+                server: name,
+                tools: owned,
+            });
         }
         tools
     }
 
-    /// Record which of the tools `connect_all` returned the owner actually
+    /// Record which of the tools a server offered the owner actually
     /// registered (a name that collided with an existing tool is skipped and
-    /// must not be listed). Replaces the previous record.
-    pub fn record_registered_tools(&self, names: Vec<String>) {
-        *sync::write(&self.tool_names) = names;
+    /// must not be listed). Replaces the server's previous record; an empty
+    /// list drops it.
+    pub fn record_server_tools(&self, server: &str, names: Vec<String>) {
+        let mut tool_names = sync::write(&self.tool_names);
+        if names.is_empty() {
+            tool_names.remove(server);
+        } else {
+            tool_names.insert(server.to_owned(), names);
+        }
     }
 
-    /// Names recorded by [`Self::record_registered_tools`]: exactly the tools
-    /// a reload may remove from a registry without touching a builtin.
+    /// Names recorded by [`Self::record_server_tools`], flattened: exactly
+    /// the tools a reload may remove from a registry without touching a
+    /// builtin.
     pub fn tool_names(&self) -> Vec<String> {
-        sync::read(&self.tool_names).clone()
+        sync::read(&self.tool_names)
+            .values()
+            .flatten()
+            .cloned()
+            .collect()
+    }
+
+    /// Whether the hub tracks a server under this name, including disabled
+    /// and failed ones.
+    pub fn has_server(&self, server: &str) -> bool {
+        sync::read(&self.servers).contains_key(server)
+    }
+
+    /// Force a status, e.g. `disabled` after a manual disconnect.
+    pub fn set_status(&self, server: &str, status: Status) {
+        sync::write(&self.servers).insert(server.to_owned(), status);
+    }
+
+    /// Tear down one server. Does nothing (and returns `None`) unless it was
+    /// connected; otherwise shuts the transport down, drops its tools,
+    /// resources, templates and metadata, and returns the registered tool
+    /// names the owner must remove from the registry. The status is left to
+    /// the caller, matching upstream `stopServer`.
+    pub async fn stop(&self, server: &str) -> Option<Vec<String>> {
+        let rpc = sync::write(&self.connections).remove(server);
+        let rpc = rpc?;
+        rpc.shutdown().await;
+        sync::write(&self.metadata).remove(server);
+        sync::write(&self.resources).retain(|entry| entry.server != server);
+        sync::write(&self.templates).retain(|entry| entry.server != server);
+        let names = sync::write(&self.tool_names)
+            .remove(server)
+            .unwrap_or_default();
+        Some(names)
+    }
+
+    /// Connect one already-known server, bypassing the config `disabled`
+    /// flag (upstream `startServer` is the manual override). Returns the
+    /// tools to register, or `None` when the connection failed: a failure is
+    /// a `failed` status and no tools, never an error. Any previous state
+    /// for the server is replaced.
+    pub async fn start(
+        &self,
+        server: &str,
+        config: &McpServerConfig,
+        directory: &Path,
+    ) -> Option<Vec<Arc<dyn Tool>>> {
+        let outcome = connect_enabled(server, config, directory).await;
+        let connected = outcome.rpc.is_some();
+        let tools = install(self, outcome);
+        connected.then_some(tools)
     }
 
     pub fn servers(&self) -> Vec<ServerView> {
@@ -235,6 +295,31 @@ fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+/// Move one connect outcome into the hub: status, instructions, catalog and
+/// live connection. A failure clears the previous connection and metadata so
+/// a reconnect can never leave the old server's instructions or connection
+/// behind. The previous catalog entries must already be gone (connect_all
+/// starts empty, [`Hub::stop`] clears them for a restart).
+fn install(hub: &Hub, outcome: Connected) -> Vec<Arc<dyn Tool>> {
+    let name = outcome.name.clone();
+    sync::write(&hub.servers).insert(name.clone(), outcome.status);
+    let mut metadata = sync::write(&hub.metadata);
+    match outcome.metadata {
+        Some(connection) => metadata.insert(name.clone(), connection),
+        None => metadata.remove(&name),
+    };
+    drop(metadata);
+    sync::write(&hub.resources).extend(outcome.resources);
+    sync::write(&hub.templates).extend(outcome.templates);
+    let mut connections = sync::write(&hub.connections);
+    match outcome.rpc {
+        Some(rpc) => connections.insert(name, rpc),
+        None => connections.remove(&name),
+    };
+    drop(connections);
+    outcome.tools
 }
 
 struct Connected {
@@ -333,6 +418,11 @@ async fn connect_one(name: &str, server: &McpServerConfig, directory: &Path) -> 
     if server.disabled() {
         return Connected::disabled(name);
     }
+    connect_enabled(name, server, directory).await
+}
+
+/// Spawn or open the transport and handshake, ignoring the `disabled` flag.
+async fn connect_enabled(name: &str, server: &McpServerConfig, directory: &Path) -> Connected {
     let timeout = server.timeout();
     match server {
         McpServerConfig::Local(local) => {
@@ -400,5 +490,73 @@ fn friendly(name: &str, error: &CallError) -> String {
         CallError::Rpc(error) => format!("MCP server `{name}` rejected the handshake: {error}"),
         CallError::Transport(message) => format!("MCP server `{name}`: {message}"),
         CallError::Unsupported(message) => format!("MCP server `{name}`: {message}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn disabled_config(names: &[&str]) -> McpConfig {
+        let servers = names
+            .iter()
+            .map(|name| {
+                let server: McpServerConfig = serde_json::from_value(serde_json::json!({
+                    "type": "local",
+                    "command": ["true"],
+                    "disabled": true,
+                }))
+                .expect("a disabled local server config deserializes");
+                ((*name).to_owned(), server)
+            })
+            .collect();
+        McpConfig { servers }
+    }
+
+    #[tokio::test]
+    async fn tool_records_are_kept_per_server() {
+        let hub = Hub::empty();
+        let offered = hub
+            .connect_all(&disabled_config(&["alpha", "beta"]), Path::new("."))
+            .await;
+        let servers: Vec<&str> = offered.iter().map(|entry| entry.server.as_str()).collect();
+        assert_eq!(
+            servers,
+            ["alpha", "beta"],
+            "one entry per configured server, sorted"
+        );
+        assert!(hub.has_server("alpha"), "a disabled server is still known");
+        assert!(
+            !hub.has_server("gamma"),
+            "an unconfigured server is unknown"
+        );
+
+        hub.record_server_tools("alpha", vec!["alpha_a".to_owned()]);
+        hub.record_server_tools("beta", vec!["beta_b".to_owned()]);
+        assert_eq!(
+            hub.tool_names(),
+            ["alpha_a", "beta_b"],
+            "reload sees the flat union"
+        );
+
+        assert_eq!(
+            hub.stop("alpha").await,
+            None,
+            "stop is a no-op for a server that is not connected"
+        );
+        hub.record_server_tools("alpha", Vec::new());
+        assert_eq!(
+            hub.tool_names(),
+            ["beta_b"],
+            "an empty record drops the server's tools"
+        );
+
+        hub.set_status("beta", Status::Pending);
+        let beta = hub.servers().into_iter().find(|view| view.name == "beta");
+        assert_eq!(
+            beta.map(|view| view.status),
+            Some(Status::Pending),
+            "set_status replaces the status"
+        );
     }
 }

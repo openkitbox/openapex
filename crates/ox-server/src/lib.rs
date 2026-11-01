@@ -171,19 +171,32 @@ pub async fn build_state_on_with_bus(
 /// Connect every configured MCP server through `hub` and register its tools.
 /// A server that fails to connect is a status, never an error; a tool that
 /// collides with an existing one is skipped with a warning. The names
-/// actually registered are recorded on the hub, so a reload removes exactly
-/// those and never a builtin that shadowed a skipped MCP tool.
+/// actually registered are recorded on the hub per server, so a reload or a
+/// disconnect removes exactly those and never a builtin that shadowed a
+/// skipped MCP tool.
 pub(crate) async fn register_mcp_tools(
     hub: &ox_mcp::Hub,
     config: &ox_core::config::McpConfig,
     directory: &std::path::Path,
     tools: &mut runner::ToolRegistry,
 ) {
+    for server in hub.connect_all(config, directory).await {
+        let registered = register_server_tools(tools, server.tools);
+        hub.record_server_tools(&server.server, registered);
+    }
+}
+
+/// Register one server's tools into `tools`, skipping names that already
+/// exist (a server must never shadow a builtin), and return the names that
+/// were actually registered. `ToolRegistry::register` replaces before it
+/// reports the duplicate, so the existence check must come first.
+pub(crate) fn register_server_tools(
+    tools: &mut runner::ToolRegistry,
+    offered: Vec<std::sync::Arc<dyn runner::Tool>>,
+) -> Vec<String> {
     let mut registered = Vec::new();
-    for tool in hub.connect_all(config, directory).await {
+    for tool in offered {
         let name = tool.name().to_owned();
-        // `ToolRegistry::register` replaces before it reports the duplicate,
-        // so check first: a server must never shadow a builtin.
         if tools.get(&name).is_some() {
             tracing::warn!(tool = %name, "MCP tool collides with an existing tool; skipped");
             continue;
@@ -193,7 +206,7 @@ pub(crate) async fn register_mcp_tools(
             Err(error) => tracing::warn!(tool = %name, %error, "MCP tool skipped"),
         }
     }
-    hub.record_registered_tools(registered);
+    registered
 }
 
 /// Build the salvo router for the given state.

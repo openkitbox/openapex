@@ -12,7 +12,7 @@
 //! - `location.ts`       -> [`LocationRef`]
 //! - `session-fork.ts`   -> [`ForkBoundary`]
 //! - `permission.ts`     -> [`Rule`], [`Effect`]
-//! - `shell.ts`          -> [`ShellStatus`], [`ShellOutput`]
+//! - `shell.ts`          -> [`ShellStatus`], [`ShellOutput`], [`ShellInfo`]
 //! - `session-metadata.ts` -> [`SessionMetadata`]
 //!
 //! Wire convention (verified against upstream): upstream's
@@ -339,7 +339,7 @@ pub struct Rule {
 }
 
 // ---------------------------------------------------------------------------
-// shell.ts — Status / Output (Shell.Info events are out of scope)
+// shell.ts — Status / Output / Info
 // ---------------------------------------------------------------------------
 
 /// Upstream `Shell.Status` literal union.
@@ -359,6 +359,33 @@ pub struct ShellOutput {
     pub cursor: i64,
     pub size: i64,
     pub truncated: bool,
+}
+
+/// Upstream `Shell.Info`: the wire shape of a live shell session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ShellInfo {
+    pub id: String,
+    pub status: ShellStatus,
+    pub command: String,
+    pub cwd: String,
+    pub shell: String,
+    pub file: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal: Option<String>,
+    pub metadata: Record,
+    pub time: ShellInfoTime,
+}
+
+/// Epoch milliseconds of `Shell.Info.time`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShellInfoTime {
+    pub started: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed: Option<i64>,
 }
 
 // ---------------------------------------------------------------------------

@@ -393,6 +393,18 @@ impl Runner {
             .any(|entry| handle_is_active(entry.value()))
     }
 
+    /// Ids of every session with work scheduled or in flight (upstream
+    /// `SessionExecution.active`).
+    #[must_use]
+    pub fn active_sessions(&self) -> Vec<String> {
+        self.inner
+            .sessions
+            .iter()
+            .filter(|entry| handle_is_active(entry.value()))
+            .map(|entry| entry.key().clone())
+            .collect()
+    }
+
     /// Process-local per-session table sizes (registry entries, keyed-instruction
     /// baselines), for isolated allocator profiling and for tests that need to
     /// see eviction — no HTTP surface exposes what a session costs the process.

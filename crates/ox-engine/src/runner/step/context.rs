@@ -348,6 +348,9 @@ pub(crate) fn build_chat_messages(
                 });
             }
             Message::Compaction(_) => {}
+            // Every ox shell row is a background user shell, and upstream
+            // skips background shells; the result reaches the model as the
+            // `source: "shell"` synthetic instead.
             Message::Idle { .. }
             | Message::Shell { .. }
             | Message::AgentSwitched { .. }

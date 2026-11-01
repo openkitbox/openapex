@@ -19,8 +19,8 @@
 //!
 //! Scope: the event groups the chat path actually emits (Session lifecycle,
 //! Execution, Inbox, Step, Text, Reasoning, Tool, RetryScheduled, Synthetic,
-//! InstructionsUpdated, MessageContentUpdated). Skill/Shell event groups and
-//! the revert group are NOT ported and fall back to `Unknown`.
+//! InstructionsUpdated, MessageContentUpdated, Shell). The Skill event group
+//! and the revert group are NOT ported and fall back to `Unknown`.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,7 +29,7 @@ use crate::inbox::{Delivery, Item, MovePayload};
 use crate::message::{AssistantContent, ProviderState};
 use crate::support::{
     Content, FinishReason, ForkBoundary, LocationRef, ModelRef, MoneyUsd, ProviderContext, Record,
-    Rule, SessionError, SessionMetadata, SnapshotId, TokenUsage,
+    Rule, SessionError, SessionMetadata, ShellInfo, ShellOutput, SnapshotId, TokenUsage,
 };
 
 // ---------------------------------------------------------------------------
@@ -169,7 +169,7 @@ pub enum StepFailedFinish {
 /// adapter shape used by [`SessionEventData::from_parts`] /
 /// [`SessionEventData::into_parts`]; it never appears on the wire as-is.
 ///
-/// Unknown event types (including the un-ported groups: skill/shell events
+/// Unknown event types (including the un-ported groups: skill events
 /// and `session.revert.*`) deserialize losslessly as
 /// [`SessionEventData::Unknown`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -267,6 +267,22 @@ pub enum SessionEventData {
         description: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         metadata: Option<Record>,
+    },
+    /// A user shell command (`session.shell`) started.
+    #[serde(rename = "session.shell.started")]
+    SessionShellStarted {
+        #[serde(rename = "sessionID")]
+        session_id: String,
+        shell: ShellInfo,
+    },
+    /// A user shell command reached its terminal state; `output` is the
+    /// preview page the transcript shows.
+    #[serde(rename = "session.shell.ended")]
+    SessionShellEnded {
+        #[serde(rename = "sessionID")]
+        session_id: String,
+        shell: ShellInfo,
+        output: ShellOutput,
     },
     #[serde(rename = "session.retry.scheduled")]
     SessionRetryScheduled {
@@ -706,6 +722,8 @@ impl SessionEventData {
             SessionEventData::SessionUsageUpdated { .. } => "session.usage.updated",
             SessionEventData::SessionInstructionsUpdated { .. } => "session.instructions.updated",
             SessionEventData::SessionSynthetic { .. } => "session.synthetic",
+            SessionEventData::SessionShellStarted { .. } => "session.shell.started",
+            SessionEventData::SessionShellEnded { .. } => "session.shell.ended",
             SessionEventData::SessionRetryScheduled { .. } => "session.retry.scheduled",
             SessionEventData::SessionMessageContentUpdated { .. } => {
                 "session.message.content.updated"
@@ -785,6 +803,8 @@ impl SessionEventData {
             | SessionEventData::SessionUsageUpdated { session_id, .. }
             | SessionEventData::SessionInstructionsUpdated { session_id, .. }
             | SessionEventData::SessionSynthetic { session_id, .. }
+            | SessionEventData::SessionShellStarted { session_id, .. }
+            | SessionEventData::SessionShellEnded { session_id, .. }
             | SessionEventData::SessionRetryScheduled { session_id, .. }
             | SessionEventData::SessionMessageContentUpdated { session_id, .. }
             | SessionEventData::SessionMoved { session_id, .. }

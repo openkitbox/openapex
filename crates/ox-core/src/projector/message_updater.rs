@@ -15,7 +15,7 @@ use ox_schema::id;
 use ox_schema::message::{
     AssistantContent, AssistantMessage, AssistantRetry, AssistantSnapshot, AssistantTime,
     Compaction, CompactionCompleted, CompactionMessage, IdleOutcome, LocationSwitch, Message,
-    TimeCreated, ToolState, ToolTime,
+    ShellTime, TimeCreated, ToolState, ToolTime,
 };
 use ox_schema::support::{FinishReason, ModelRef, Record};
 
@@ -69,6 +69,26 @@ fn decode_assistant(id: &str, data: &str) -> Result<AssistantMessage> {
         Message::Assistant(a) => Ok(*a),
         other => Err(anyhow!("expected assistant row, got {}", other.kind())),
     }
+}
+
+/// The latest shell row of `shell_id` in a session (upstream adapter
+/// `getShell`): newest seq first, so a re-used shell id settles its last row.
+async fn load_shell(tx: &Connection, session_id: &str, shell_id: &str) -> Result<Option<Message>> {
+    let row = optional_row(
+        tx,
+        "SELECT id, data FROM session_message
+         WHERE session_id = ?1 AND type = 'shell' AND json_extract(data, '$.shellID') = ?2
+         ORDER BY seq DESC LIMIT 1",
+        (session_id, shell_id),
+    )
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let id: String = row.get(0)?;
+    let data: String = row.get(1)?;
+    let value: Value = serde_json::from_str(&data)?;
+    Ok(Some(Message::from_row_data(&id, "shell", value)?))
 }
 
 /// Load the current assistant message for a session. Port of upstream
@@ -446,6 +466,61 @@ pub async fn run(tx: &Connection, env: &EventEnvelope<SessionEventData>) -> Resu
                 description: description.clone(),
             };
             insert_message(tx, session_id, seq, &msg).await?;
+        }
+
+        E::SessionShellStarted { session_id, shell } => {
+            // Upstream message-updater.ts `session.shell.started`.
+            let metadata = if shell.metadata.get("background") == Some(&Value::Bool(true)) {
+                let mut metadata = env.metadata.clone().unwrap_or_default();
+                metadata.insert("background".to_owned(), Value::Bool(true));
+                Some(metadata)
+            } else {
+                env.metadata.clone()
+            };
+            let msg = Message::Shell {
+                id: id::from_event(&env.id),
+                metadata,
+                shell_id: shell.id.clone(),
+                command: shell.command.clone(),
+                status: shell.status,
+                exit: None,
+                output: None,
+                time: ShellTime {
+                    created,
+                    completed: None,
+                },
+            };
+            insert_message(tx, session_id, seq, &msg).await?;
+        }
+
+        E::SessionShellEnded {
+            session_id,
+            shell,
+            output,
+        } => {
+            // Upstream: settle the latest row of this shell in place; a shell
+            // without a started row is ignored.
+            if let Some(mut msg) = load_shell(tx, session_id, &shell.id).await?
+                && let Message::Shell {
+                    status,
+                    exit,
+                    output: row_output,
+                    time,
+                    ..
+                } = &mut msg
+            {
+                *status = shell.status;
+                *exit = shell.exit.map(i64::from);
+                *row_output = Some(output.clone());
+                time.completed = Some(created);
+                let data = msg.to_row_data().to_string();
+                tx.execute(
+                    "UPDATE session_message SET data = ?3, time_updated = ?4
+                     WHERE id = ?1 AND session_id = ?2",
+                    (msg.id(), session_id.as_str(), data.as_str(), created),
+                )
+                .await?;
+            }
         }
 
         E::SessionRetryScheduled {
@@ -1079,4 +1154,182 @@ struct ToolRefMut<'a> {
     provider_result_state: &'a mut Option<Record>,
     state: &'a mut ToolState,
     time: &'a mut ToolTime,
+}
+
+#[cfg(test)]
+mod tests {
+    use ox_db::Db;
+    use ox_schema::support::{LocationRef, ShellInfo, ShellInfoTime, ShellOutput, ShellStatus};
+    use serde_json::json;
+
+    use super::*;
+    use crate::event_bus::EventBus;
+
+    const SESSION: &str = "ses_shell";
+
+    async fn bus_with_session() -> EventBus {
+        let db = Db::open_in_memory().await.expect("temp database");
+        let bus = EventBus::new(db);
+        bus.publish(SessionEventData::SessionCreated {
+            session_id: SESSION.to_owned(),
+            project_id: "global".to_owned(),
+            location: LocationRef {
+                directory: std::env::temp_dir().display().to_string(),
+                workspace_id: None,
+            },
+            subpath: None,
+            parent_id: None,
+            slug: ox_schema::slug::create(),
+            title: None,
+            agent: None,
+            model: None,
+            metadata: None,
+            permissions: None,
+            version: "test".to_owned(),
+        })
+        .await
+        .expect("session row");
+        bus
+    }
+
+    fn info(id: &str, status: ShellStatus, exit: Option<i32>) -> ShellInfo {
+        let mut metadata = Record::new();
+        metadata.insert("sessionID".to_owned(), json!(SESSION));
+        metadata.insert("background".to_owned(), json!(true));
+        ShellInfo {
+            id: id.to_owned(),
+            status,
+            command: "echo hi".to_owned(),
+            cwd: "/tmp".to_owned(),
+            shell: "zsh".to_owned(),
+            file: format!("ox-shell://{id}"),
+            pid: Some(1),
+            exit,
+            signal: None,
+            metadata,
+            time: ShellInfoTime {
+                started: 1,
+                completed: None,
+            },
+        }
+    }
+
+    /// Every shell row of the session: `(id, seq, data)`.
+    async fn shell_rows(bus: &EventBus) -> Vec<(String, i64, Value)> {
+        let conn = bus.db().acquire().await.expect("connection");
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, seq, data FROM session_message
+                 WHERE session_id = ?1 AND type = 'shell' ORDER BY seq",
+            )
+            .await
+            .expect("prepare");
+        let mut rows = stmt.query([SESSION]).await.expect("query");
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.expect("row") {
+            let data: String = row.get(2).expect("data");
+            out.push((
+                row.get(0).expect("id"),
+                row.get(1).expect("seq"),
+                serde_json::from_str(&data).expect("json data"),
+            ));
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn shell_started_inserts_a_background_row() {
+        let bus = bus_with_session().await;
+        bus.publish_as(
+            SessionEventData::SessionShellStarted {
+                session_id: SESSION.to_owned(),
+                shell: info("sh_1", ShellStatus::Running, None),
+            },
+            "evt_user1".to_owned(),
+        )
+        .await
+        .expect("started");
+
+        let rows = shell_rows(&bus).await;
+        assert_eq!(rows.len(), 1, "one shell row, got {rows:?}");
+        let (id, _, data) = &rows[0];
+        assert_eq!(id, "msg_user1", "row id derives from the caller's event id");
+        assert_eq!(data["shellID"], json!("sh_1"), "row keeps the shell id");
+        assert_eq!(data["command"], json!("echo hi"), "row keeps the command");
+        assert_eq!(data["status"], json!("running"), "started rows are running");
+        assert_eq!(
+            data["metadata"],
+            json!({ "background": true }),
+            "background shells are tagged",
+        );
+        assert!(
+            data["time"].get("completed").is_none(),
+            "still running: {data}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_ended_settles_the_row_in_place() {
+        let bus = bus_with_session().await;
+        bus.publish(SessionEventData::SessionShellStarted {
+            session_id: SESSION.to_owned(),
+            shell: info("sh_1", ShellStatus::Running, None),
+        })
+        .await
+        .expect("started");
+        let before = shell_rows(&bus).await;
+
+        let output = ShellOutput {
+            output: "hi\n".to_owned(),
+            cursor: 3,
+            size: 3,
+            truncated: false,
+        };
+        bus.publish(SessionEventData::SessionShellEnded {
+            session_id: SESSION.to_owned(),
+            shell: info("sh_1", ShellStatus::Exited, Some(0)),
+            output: output.clone(),
+        })
+        .await
+        .expect("ended");
+
+        let after = shell_rows(&bus).await;
+        assert_eq!(after.len(), 1, "ended updates, never appends: {after:?}");
+        assert_eq!(after[0].0, before[0].0, "same row id");
+        assert_eq!(after[0].1, before[0].1, "seq is kept");
+        let data = &after[0].2;
+        assert_eq!(
+            data["status"],
+            json!("exited"),
+            "ended sets the terminal status"
+        );
+        assert_eq!(data["exit"], json!(0), "ended records the exit code");
+        assert_eq!(
+            data["output"],
+            serde_json::to_value(&output).expect("output json"),
+            "ended stores the output preview",
+        );
+        assert!(
+            data["time"]["completed"].is_i64(),
+            "completed stamped: {data}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_ended_without_a_row_is_a_no_op() {
+        let bus = bus_with_session().await;
+        bus.publish(SessionEventData::SessionShellEnded {
+            session_id: SESSION.to_owned(),
+            shell: info("sh_missing", ShellStatus::Exited, Some(0)),
+            output: ShellOutput {
+                output: String::new(),
+                cursor: 0,
+                size: 0,
+                truncated: false,
+            },
+        })
+        .await
+        .expect("ended without a row still commits");
+        assert!(shell_rows(&bus).await.is_empty(), "no row is created");
+    }
 }

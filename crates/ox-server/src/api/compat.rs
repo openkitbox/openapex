@@ -83,6 +83,14 @@ pub(crate) async fn migration_status(res: &mut Response) {
     res.render(Json(json!({ "status": "completed" })));
 }
 
+/// `GET /api/experimental/usage/limits` — upstream `experimental.usage
+/// .limits`. Limits come from an OpenCode Console account, which ox does not
+/// have, so `data` is `null` (upstream's signed-out answer).
+#[handler] // operation_id: experimental.usage.limits
+pub(crate) async fn usage_limits(req: &mut Request, res: &mut Response) {
+    res.render(Json(envelope(&directory_of(req), serde_json::Value::Null)));
+}
+
 /// `GET /api/config` — upstream `config.get`. ox has no user config model;
 /// an empty entry list.
 #[handler] // operation_id: config.get
@@ -277,12 +285,21 @@ pub(crate) fn mount(api: Router) -> Router {
             .push(Router::with_path("rpc/{rpcID}/{method}").post(rpc_call))
             .push(Router::with_path("mcp").get(mcp_list))
             .push(Router::with_path("mcp/resource").get(mcp_resource_catalog))
+            .push(
+                Router::with_path("experimental/mcp/{server}/connect")
+                    .post(super::mcp::mcp_connect),
+            )
+            .push(
+                Router::with_path("experimental/mcp/{server}/disconnect")
+                    .post(super::mcp::mcp_disconnect),
+            )
             .push(Router::with_path("provider").get(super::provider_list))
             .push(Router::with_path("reference").get(reference_list))
             .push(Router::with_path("plugin").get(plugin_list))
             .push(Router::with_path("integration").get(integration_list))
             .push(Router::with_path("fs/list").get(fs_list))
             .push(Router::with_path("fs/find").get(fs_find))
-            .push(Router::with_path("experimental/migration/v1").get(migration_status)),
+            .push(Router::with_path("experimental/migration/v1").get(migration_status))
+            .push(Router::with_path("experimental/usage/limits").get(usage_limits)),
     )
 }

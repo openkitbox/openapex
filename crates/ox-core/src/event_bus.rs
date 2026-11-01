@@ -209,7 +209,14 @@ impl EventBus {
     /// broadcast channel (never cloned): callers observe the event through
     /// the bus, not through the return value.
     pub async fn publish(&self, data: SessionEventData) -> Result<()> {
-        self.publish_durable(data, true).await
+        self.publish_durable(data, true, None).await
+    }
+
+    /// [`Self::publish`] with a caller-supplied envelope id, so a client can
+    /// correlate the event it caused (upstream `bus.publish(.., { id })`).
+    /// Ephemeral kinds ignore the id and get a fresh one.
+    pub async fn publish_as(&self, data: SessionEventData, event_id: String) -> Result<()> {
+        self.publish_durable(data, true, Some(event_id)).await
     }
 
     /// Publish an event without broadcasting it to live subscribers.
@@ -227,14 +234,20 @@ impl EventBus {
     /// reconnecting client replaying the event log still sees the event
     /// (deliberate: sequence integrity is never sacrificed for silence).
     pub async fn publish_quiet(&self, data: SessionEventData) -> Result<()> {
-        self.publish_durable(data, false).await
+        self.publish_durable(data, false, None).await
     }
 
     /// Shared publish path. `fanout == false` suppresses only the post-commit
     /// broadcast of the published envelope itself; the post-commit secondary
     /// effects below are shared verbatim (they fire only when the projector
-    /// reports recorded usage, which no quiet caller produces).
-    async fn publish_durable(&self, data: SessionEventData, fanout: bool) -> Result<()> {
+    /// reports recorded usage, which no quiet caller produces). `event_id`
+    /// overrides the generated id of a durable envelope.
+    async fn publish_durable(
+        &self,
+        data: SessionEventData,
+        fanout: bool,
+        event_id: Option<String>,
+    ) -> Result<()> {
         let kind = data.kind().to_string();
         let created = now_millis();
 
@@ -265,7 +278,7 @@ impl EventBus {
             .clone();
         let _guard = lock.lock().await;
 
-        let env_id = self.next_evt_id();
+        let env_id = event_id.unwrap_or_else(|| self.next_evt_id());
         let version = durable_version(&kind) as i64;
         let data_value = data.to_data();
         let type_str = format!("{kind}@v{version}");
@@ -515,6 +528,8 @@ pub(crate) fn session_id_of(data: &SessionEventData) -> Option<&str> {
         | E::SessionUsageUpdated { session_id, .. }
         | E::SessionInstructionsUpdated { session_id, .. }
         | E::SessionSynthetic { session_id, .. }
+        | E::SessionShellStarted { session_id, .. }
+        | E::SessionShellEnded { session_id, .. }
         | E::SessionRetryScheduled { session_id, .. }
         | E::SessionMessageContentUpdated { session_id, .. }
         | E::SessionMoved { session_id, .. }

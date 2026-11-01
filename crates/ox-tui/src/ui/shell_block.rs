@@ -31,8 +31,8 @@
 //! - No permission colour: ox has no permission prompts on tool rows (V2).
 //! - ox addition: the `[` / `]` tool focus draws the block on the hover band,
 //!   so keyboard focus is visible without a pointer.
-//! - history `Message::Shell` (user `!` shell) not rendered: ox server never
-//!   produces it (only schema).
+//! - history `Message::Shell` (user `!` shell, projected by the server from
+//!   `session.shell.*`) is not rendered by this block yet.
 //! - A spinner frame rewrites only the spinner span of the cached rows
 //!   ([`Rendered::spinner_row`]); upstream re-renders reactively, which ox
 //!   cannot afford for up to 1 MiB of expanded output at 12 frames a second.
