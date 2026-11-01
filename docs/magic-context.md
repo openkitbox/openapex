@@ -16,7 +16,7 @@ no dreamer).
 | Historian | At a step boundary, when the live tail passes a pressure band (or exceeds its trigger budget) and still has content outside the protected tail, ox folds the oldest part of the tail into compartments with a hidden completion through cardinal. |
 | Drops | A `ctx_reduce` stamp is applied by the next head rebuild *and* by the read path: the session API renders an applied drop's content as `[dropped §N§]`, the same placeholder the model sees. |
 | Dreamer | Every `dreamer_interval_minutes`, per project with memories: `verify` (do cited files still back the claims?) and `curate` (merge duplicates, archive redundancy). |
-| `ctx_search` | Memories, notes, compartments (turso FTS indexes) and a transcript scan. With `[magic_context.embedding]` configured, the **memory lane** ranks by cosine similarity instead. |
+| `ctx_search` | Memories and notes (turso FTS indexes), compartments (a scan of this session's rows, or with `scope: "project"` every session in the directory, ranked by BM25 over the scanned rows) and a transcript scan. With `[magic_context.embedding]` configured, the **memory lane** ranks by cosine similarity instead. |
 
 ## Configuration
 

@@ -144,6 +144,9 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
         let request = search::SearchRequest {
             project: project.as_ref(),
             session_id: &ctx.session_id,
+            // Recall stays on this session: a wider scope adds noise and
+            // puts a project-wide scan on every turn.
+            compartment_scope: search::CompartmentScope::Session,
             query: &query,
             sources: search::SourceFilter::RECALL,
             limit: RECALL_LIMIT,

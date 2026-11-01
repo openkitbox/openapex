@@ -462,6 +462,27 @@ CREATE INDEX IF NOT EXISTS mc_note_fts ON mc_note USING fts (title, body, surfac
 CREATE INDEX IF NOT EXISTS mc_compartments_fts ON mc_compartments USING fts (search_text) WITH (tokenizer = 'ngram', min_gram = 2, max_gram = 3);
 "#;
 
+/// V18: drop `mc_compartments_fts`; index `session_v2.directory`.
+///
+/// Every compartment query is scoped to one session (or one project
+/// directory), but turso's FTS matches against the whole index before any
+/// `WHERE` filter applies and keeps the index's segments resident across
+/// statements. On a copy of the production database the warmed compartment
+/// index held about 13 MB of heap and grew with every session ever folded,
+/// while scanning one session's rows was faster (0.74 ms vs 1.53 ms warm) and
+/// held nothing afterwards. The compartment lane of `ctx_search` therefore
+/// reads its scope's rows through `mc_compartments_session_idx` (or the
+/// directory index added here) and ranks them in Rust. `search_text` stays: it
+/// is the scan's input. `mc_memory_fts` and `mc_note_fts` are unchanged.
+///
+/// Rollback: an older binary queries `fts_match(search_text, …)` and fails
+/// without the index; recreate it with the `mc_compartments_fts` line of
+/// `MIGRATION_V17` before running one.
+const MIGRATION_V18: &str = r#"
+DROP INDEX IF EXISTS mc_compartments_fts;
+CREATE INDEX IF NOT EXISTS session_v2_directory_idx ON session_v2 (directory);
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
@@ -483,6 +504,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (15, MIGRATION_V15),
     (16, MIGRATION_V16),
     (17, MIGRATION_V17),
+    (18, MIGRATION_V18),
 ];
 
 /// Async handle to the database.

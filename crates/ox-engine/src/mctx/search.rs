@@ -2,7 +2,7 @@
 //!
 //! # Sources
 //!
-//! Five labels, four of them indexed:
+//! Five labels, two of them indexed:
 //!
 //! - `memory` — durable project facts (`mc_memory`),
 //! - `note` — session-scoped parked intentions (`mc_note`),
@@ -12,12 +12,18 @@
 //! - `commit` — recent git history, read from the repository at query time
 //!   (see [`search_commits`]; there is no commit index).
 //!
-//! The first three are each served by their own Tantivy-backed FTS index
+//! Memories and notes are each served by their own Tantivy-backed FTS index
 //! (migration V7, rebuilt with the `ngram` tokenizer in V17 so CJK text is
-//! split into 2–3 character grams): `mc_memory_fts`, `mc_note_fts` and
-//! `mc_compartments_fts`.
+//! split into 2–3 character grams): `mc_memory_fts` and `mc_note_fts`.
 //! The table itself is the source, so there is no shared shadow table and no
 //! `source`/`ref` columns to join on: each lane queries its own table.
+//!
+//! Compartments had an index too (`mc_compartments_fts`) until V18 dropped it:
+//! turso matches the whole index before the session filter applies and keeps
+//! its segments resident, so a lane that only ever reads one session (or one
+//! project) paid for every session ever folded. [`search_compartments`] reads
+//! the scope's rows instead, matches case-insensitive substrings and ranks
+//! with BM25 computed over exactly the rows it scanned.
 //! The transcript is deliberately NOT indexed: it is the live, un-folded tail
 //! that changes on every turn and belongs to `session_v2`, not to the
 //! magic-context store. ox reads it directly with a case-insensitive `LIKE`
@@ -34,7 +40,8 @@
 //! write-through in the store functions is needed: every write path, including
 //! ones added later, is indexed without call-site discipline. The one derived
 //! value is `mc_compartments.search_text`, written by the compartment store
-//! because `tiers` is JSON rather than searchable columns.
+//! because `tiers` is JSON rather than searchable columns; the compartment
+//! scan matches against it.
 //!
 //! # Query hygiene
 //!
@@ -51,10 +58,11 @@
 //! Tokens are joined by the `OR` operator, not by the implicit AND: a
 //! natural-language question carries words the corpus does not ("where is the
 //! opencode source code path?"), and requiring all of them would return
-//! nothing. Every hit is still ranked by the FTS score, which orders rows
-//! matching more of the query's words first, so a row containing all of them
-//! outranks one matching a single coincidental word. This also matches the
-//! reference's note lane, whose `LIKE` predicates are joined by `OR`.
+//! nothing. Every hit is still ranked by BM25 (the FTS score for memories and
+//! notes, ox's own for compartments), which orders rows matching more — and
+//! rarer — query words first, so a row containing all of them outranks one
+//! matching a single coincidental word. This also matches the reference's
+//! note lane, whose `LIKE` predicates are joined by `OR`.
 //!
 //! # Automatic recall (the per-turn hint)
 //!
@@ -73,8 +81,8 @@
 //! - **Semantic search only where it pays: the memory lane.** When
 //!   `[magic_context.embedding]` is configured, project memories are ranked by
 //!   cosine similarity to the query; notes, compartments and the transcript
-//!   keep their index (`LIKE`/FTS) because their corpora are small and
-//!   session-scoped. There is no blended score: cosine either replaces the
+//!   stay lexical (FTS, substring scan, `LIKE`) because their corpora are
+//!   small and session- or project-scoped. There is no blended score: cosine either replaces the
 //!   memory lane's BM25 order or, with the embedder off, BM25 is what runs.
 //!   Automatic recall reuses the same lanes (see [`render_recall_block`]) but
 //!   runs without an embedder: the step that assembles a request has none, so
@@ -91,8 +99,13 @@
 //! - **No result suppression.** The reference hides memories already visible
 //!   in `<project-memory>` and messages still in the live tail; ox returns
 //!   every match with its id so the model can decide.
+//! - **Compartments are scanned, not indexed, and can span the project.**
+//!   The reference also scans them (a session-scoped `LIKE`) but ranks by hit
+//!   count; ox ranks by BM25 over the scanned rows. `ctx_search` takes
+//!   `scope: "project"` to search every session in the current directory;
+//!   automatic recall always stays on the current session.
 //! - **Ranking is per-source and deterministic**, not a blended score:
-//!   `fts_score` is not comparable across sources, so each source
+//!   BM25 scores are not comparable across sources, so each source
 //!   contributes hits in its own relevance order and they merge by descending
 //!   band, then within-source rank, then id.
 //! - **Dates are `YYYY-MM-DD` only** (the reference also accepts full ISO
@@ -101,7 +114,9 @@
 //! - **`limit` is clamped to 1..=25** (the reference is unbounded) to keep an
 //!   accidental large `limit` from flooding the context window.
 
+use std::collections::HashSet;
 use std::future::Future;
+use std::mem;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -206,12 +221,37 @@ impl SourceFilter {
     }
 }
 
+/// Which sessions the compartment lane searches. Only compartments have a
+/// scope choice: memories are project-wide already, and notes and the
+/// transcript always belong to the current session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompartmentScope {
+    /// The current session only (the default, and what recall uses).
+    Session,
+    /// Every session whose directory equals the current project directory,
+    /// child sessions included.
+    Project,
+}
+
+impl CompartmentScope {
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "session" => Some(CompartmentScope::Session),
+            "project" => Some(CompartmentScope::Project),
+            _ => None,
+        }
+    }
+}
+
 /// One search request. Borrowed so the tool need not clone its inputs.
 pub(crate) struct SearchRequest<'a> {
     /// Project scope (the working directory key memories are written under).
     pub(crate) project: &'a str,
-    /// Session scope: notes, compartments and the transcript.
+    /// The current session: scopes notes and the transcript, and compartments
+    /// unless `compartment_scope` widens them to the project.
     pub(crate) session_id: &'a str,
+    /// Whether compartments come from this session or the whole project.
+    pub(crate) compartment_scope: CompartmentScope,
     /// The raw user query.
     pub(crate) query: &'a str,
     /// Which sources to search.
@@ -253,8 +293,10 @@ pub(crate) struct SearchHit {
 
 impl SearchHit {
     /// The header line: `[n] [source] id=… ` plus the source-specific context
-    /// a model needs to follow up with `ctx_expand` or another tool.
-    fn header(&self, index: usize) -> String {
+    /// a model needs to follow up with `ctx_expand` or another tool. A
+    /// compartment from a session other than `current_session` names its
+    /// session; one from the current session prints exactly as before.
+    fn header(&self, index: usize, current_session: &str) -> String {
         let source = self.source.label();
         match self.source {
             Source::Memory => format!(
@@ -269,11 +311,16 @@ impl SearchHit {
             ),
             Source::Compartment => {
                 let (start, end) = self.range.unwrap_or((0, 0));
-                format!(
+                let mut header = format!(
                     "[{index}] [{source}] id={} range={start}-{end} title={}",
                     self.id,
                     self.title.as_deref().unwrap_or("")
-                )
+                );
+                if self.scope != current_session {
+                    header.push_str(" session=");
+                    header.push_str(&self.scope);
+                }
+                header
             }
             Source::Transcript => format!(
                 "[{index}] [{source}] id={} ordinal={}",
@@ -310,12 +357,120 @@ struct NoteRow {
     created_at: i64,
 }
 
-/// One indexed compartment row: the tiers JSON holds title, paraphrases and
-/// the covered ordinal range.
+/// One scanned compartment row that matched at least one query token. Rows
+/// that match nothing are dropped as they are read; `tiers` holds the title,
+/// paraphrases and covered range; `search_text` identifies a fork's copy.
 struct CompartmentRow {
     id: String,
+    session_id: String,
     tiers: String,
+    search_text: String,
     created_at: i64,
+    stats: DocStats,
+}
+
+/// BM25 `k1`: how quickly repeated occurrences of a term saturate.
+const BM25_K1: f64 = 1.2;
+/// BM25 `b`: how strongly a document's length normalizes its score.
+const BM25_B: f64 = 0.75;
+
+/// One document's BM25 inputs: the occurrence count of each query token (in
+/// token order) and the document length in characters. Characters, not words:
+/// CJK text has no spaces, and BM25 only needs one consistent unit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DocStats {
+    term_frequency: Vec<u32>,
+    length: usize,
+}
+
+impl DocStats {
+    /// Count every needle in `lowered`, which the caller lowercased once.
+    /// `needles` are the lowercased query tokens (never empty strings).
+    fn new(lowered: &str, needles: &[String]) -> Self {
+        let term_frequency = needles
+            .iter()
+            .map(|needle| {
+                u32::try_from(lowered.matches(needle.as_str()).count()).unwrap_or(u32::MAX)
+            })
+            .collect();
+        Self {
+            term_frequency,
+            length: lowered.chars().count(),
+        }
+    }
+
+    /// Whether any query token occurs in the document.
+    fn matches(&self) -> bool {
+        self.term_frequency.iter().any(|&tf| tf > 0)
+    }
+}
+
+/// Corpus statistics for BM25, taken from exactly the rows one scan read: the
+/// rarity of a term and the average length are relative to the searched scope
+/// (one session, or one project), not to the whole database.
+#[derive(Debug, Clone, PartialEq)]
+struct Bm25Corpus {
+    /// Rows scanned, matched or not (`N`).
+    documents: usize,
+    /// Mean document length in characters (`avgdl`).
+    average_length: f64,
+    /// Per-token count of matched documents containing it (`df`).
+    document_frequency: Vec<usize>,
+}
+
+impl Bm25Corpus {
+    /// `scanned`/`total_length` cover every row read; `matched` are the
+    /// documents kept. A dropped row contains no token, so it adds to no
+    /// document frequency.
+    fn new<'a>(
+        scanned: usize,
+        total_length: usize,
+        matched: impl IntoIterator<Item = &'a DocStats>,
+        tokens: usize,
+    ) -> Self {
+        let mut document_frequency = vec![0; tokens];
+        for doc in matched {
+            for (df, &tf) in document_frequency.iter_mut().zip(&doc.term_frequency) {
+                if tf > 0 {
+                    *df += 1;
+                }
+            }
+        }
+        let average_length = if scanned == 0 {
+            0.0
+        } else {
+            total_length as f64 / scanned as f64
+        };
+        Self {
+            documents: scanned,
+            average_length,
+            document_frequency,
+        }
+    }
+
+    /// Lucene's BM25: `Σ idf · tf·(k1+1) / (tf + k1·(1 − b + b·dl/avgdl))`
+    /// with `idf = ln(1 + (N − df + 0.5) / (df + 0.5))`, never negative.
+    #[must_use]
+    fn score(&self, doc: &DocStats) -> f64 {
+        let documents = self.documents as f64;
+        let relative_length = if self.average_length > 0.0 {
+            doc.length as f64 / self.average_length
+        } else {
+            1.0
+        };
+        let norm = BM25_K1 * (1.0 - BM25_B + BM25_B * relative_length);
+        doc.term_frequency
+            .iter()
+            .zip(&self.document_frequency)
+            .filter(|(tf, _)| **tf > 0)
+            .map(|(&tf, &df)| {
+                let df = df as f64;
+                let idf = (1.0 + (documents - df + 0.5) / (df + 0.5)).ln();
+                let tf = f64::from(tf);
+                idf * tf * (BM25_K1 + 1.0) / (tf + norm)
+            })
+            .sum()
+    }
 }
 
 /// One raw transcript row. `kind` is `session_message.type`; with `id` it
@@ -623,80 +778,162 @@ async fn search_notes(
         .collect())
 }
 
-/// Compartments of the session matching every token. A title match outranks
-/// a body-only match (the reference's two bands).
+/// Compartments in the request's scope (this session, or every session in
+/// the project directory) matching any token. A title match outranks a
+/// body-only match (the reference's two bands); within a band rows order by
+/// BM25 over the scanned scope.
+///
+/// No full-text index: the scope's rows are read through
+/// `mc_compartments_session_idx` (project scope finds its sessions through
+/// `session_v2_directory_idx` first) and matched as case-insensitive substrings
+/// here (see `MIGRATION_V18` for why the FTS index was dropped). Rows stream;
+/// one that matches nothing contributes to the corpus statistics and is
+/// dropped at once, so a query holds one row plus its hits.
 async fn search_compartments(
     db: &Db,
     request: &SearchRequest<'_>,
     tokens: &[String],
 ) -> Result<Vec<RankedHit>> {
-    let Some(match_expr) = fts_match_expression(tokens) else {
+    if tokens.is_empty() {
         return Ok(Vec::new());
+    }
+    let needles: Vec<String> = tokens.iter().map(|token| token.to_lowercase()).collect();
+    // Session scope reads through `mc_compartments_session_idx`; project
+    // scope finds the project's sessions through `session_v2_directory_idx`.
+    // The date filter is in SQL so the BM25 corpus is exactly the rows the
+    // scope and range make visible.
+    let (sql, key) = match request.compartment_scope {
+        CompartmentScope::Session => (
+            "SELECT id, session_id, tiers, search_text, created_at
+               FROM mc_compartments
+              WHERE session_id = ?1
+                AND (?2 IS NULL OR created_at >= ?2)
+                AND (?3 IS NULL OR created_at <= ?3)",
+            request.session_id,
+        ),
+        CompartmentScope::Project => (
+            "SELECT c.id, c.session_id, c.tiers, c.search_text, c.created_at
+               FROM session_v2 s
+               JOIN mc_compartments c ON c.session_id = s.id
+              WHERE s.directory = ?1
+                AND (?2 IS NULL OR c.created_at >= ?2)
+                AND (?3 IS NULL OR c.created_at <= ?3)",
+            request.project,
+        ),
     };
-    // `search_text` is the derived column the compartment store fills from
-    // `tiers`; matching it is what makes a compartment reachable.
-    let rows = async {
+    let (rows, corpus) = async {
         let conn = db.acquire().await?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, tiers, created_at
-                   FROM mc_compartments
-                  WHERE fts_match(search_text, ?1)
-                    AND session_id = ?2
-                  ORDER BY fts_score(search_text, ?1) DESC, rowid
-                  LIMIT ?3",
-            )
-            .await?;
-        let mut candidates = stmt
-            .query((match_expr.as_str(), request.session_id, SOURCE_FETCH_LIMIT))
-            .await?;
+        let mut stmt = conn.prepare(sql).await?;
+        let mut candidates = stmt.query((key, request.from_ms, request.to_ms)).await?;
         let mut rows = Vec::new();
+        let mut scanned = 0_usize;
+        let mut total_length = 0_usize;
         while let Some(row) = candidates.next().await? {
+            let search_text: String = row.get(3)?;
+            let stats = DocStats::new(&search_text.to_lowercase(), &needles);
+            scanned += 1;
+            total_length += stats.length;
+            if !stats.matches() {
+                continue;
+            }
             rows.push(CompartmentRow {
                 id: row.get(0)?,
-                tiers: row.get(1)?,
-                created_at: row.get(2)?,
+                session_id: row.get(1)?,
+                tiers: row.get(2)?,
+                search_text,
+                created_at: row.get(4)?,
+                stats,
             });
         }
-        Ok::<_, anyhow::Error>(rows)
+        let corpus = Bm25Corpus::new(
+            scanned,
+            total_length,
+            rows.iter().map(|row| &row.stats),
+            needles.len(),
+        );
+        Ok::<_, anyhow::Error>((rows, corpus))
     }
     .await
-    .context("search indexed compartments")?;
+    .context("scan compartments")?;
 
-    Ok(rows
+    let mut scored: Vec<ScoredCompartment> = rows
         .into_iter()
-        .enumerate()
-        .filter_map(|(rank, row)| {
-            if !in_range(row.created_at, request.from_ms, request.to_ms) {
-                return None;
-            }
-            // The index is built from the same `tiers` fields the renderer
-            // reads; a malformed row degrades to empty text exactly as the
-            // store does, so it is skipped rather than failing the query.
-            let Ok(tiers) = serde_json::from_str::<Tiers>(&row.tiers) else {
-                return None;
-            };
-            let body = compartment_body(&tiers);
-            let title_hit = tokens
+        .filter_map(|row| {
+            // The search text is built from the same `tiers` fields the
+            // renderer reads; a malformed row degrades to empty text exactly
+            // as the store does, so it is skipped rather than failing the
+            // query.
+            let tiers = serde_json::from_str::<Tiers>(&row.tiers).ok()?;
+            let title_hit = needles
                 .iter()
-                .any(|token| first_match(&tiers.title, token).is_some());
-            Some(RankedHit {
+                .any(|needle| first_match(&tiers.title, needle).is_some());
+            Some(ScoredCompartment {
+                band: if title_hit { 95 } else { 90 },
+                bm25: corpus.score(&row.stats),
+                current_session: row.session_id == request.session_id,
+                row,
+                tiers,
+            })
+        })
+        .collect();
+    scored.sort_by(ScoredCompartment::order);
+    // A fork copies its parent's compartments verbatim, so project scope can
+    // see the same text twice. Identical text scores identically, so the
+    // order above keeps the current session's copy, else the newest (a fork
+    // keeps `created_at`, so "newest" falls to the later, larger id).
+    // The text moves into the set; nothing reads it afterwards.
+    let mut seen: HashSet<String> = HashSet::new();
+    let unique = scored.into_iter().filter_map(|mut candidate| {
+        seen.insert(mem::take(&mut candidate.row.search_text))
+            .then_some(candidate)
+    });
+
+    Ok(unique
+        .take(SOURCE_FETCH_LIMIT as usize)
+        .enumerate()
+        .map(|(rank, scored)| {
+            let body = compartment_body(&scored.tiers);
+            RankedHit {
                 rank,
                 hit: SearchHit {
                     source: Source::Compartment,
-                    id: row.id,
+                    id: scored.row.id,
                     snippet: snippet_around_tokens(&body, tokens),
-                    score: if title_hit { 95 } else { 90 },
-                    scope: request.session_id.to_owned(),
+                    score: scored.band,
+                    scope: scored.row.session_id,
                     category: None,
                     status: None,
-                    title: Some(tiers.title),
-                    range: Some((tiers.start_message, tiers.end_message)),
+                    title: Some(scored.tiers.title),
+                    range: Some((scored.tiers.start_message, scored.tiers.end_message)),
                     ordinal: None,
                 },
-            })
+            }
         })
         .collect())
+}
+
+/// A matched compartment with its sort keys.
+struct ScoredCompartment {
+    band: i64,
+    bm25: f64,
+    current_session: bool,
+    row: CompartmentRow,
+    tiers: Tiers,
+}
+
+impl ScoredCompartment {
+    /// Band, then BM25 (descending), then the current session first, then
+    /// newest first, then id descending: a total, deterministic order. Ids
+    /// ascend with creation time, so when a fork copy shares its parent's
+    /// `created_at` the later copy still sorts first.
+    fn order(a: &Self, b: &Self) -> std::cmp::Ordering {
+        b.band
+            .cmp(&a.band)
+            .then_with(|| b.bm25.total_cmp(&a.bm25))
+            .then_with(|| b.current_session.cmp(&a.current_session))
+            .then_with(|| b.row.created_at.cmp(&a.row.created_at))
+            .then_with(|| b.row.id.cmp(&a.row.id))
+    }
 }
 
 /// The transcript fallback: a case-insensitive `LIKE` over `session_message`
@@ -977,8 +1214,10 @@ fn query_tokens(query: &str) -> Vec<String> {
 }
 
 /// Whether `ch` may appear inside a token. Alphanumeric is Unicode-wide, so a
-/// CJK run stays one token here; the index's ngram tokenizer (migration V17)
-/// splits it into 2–3 character grams on both the indexing and query side.
+/// CJK run stays one token here. The memory and note indexes' ngram tokenizer
+/// (migration V17) splits it into 2–3 character grams on both the indexing
+/// and query side; the compartment scan matches the whole token as one
+/// contiguous substring, so a single CJK character is a usable query there.
 fn is_token_char(ch: char) -> bool {
     ch.is_alphanumeric() || matches!(ch, '_' | '.' | '/' | ':' | '-')
 }
@@ -1093,7 +1332,7 @@ fn first_match(text: &str, query: &str) -> Option<(usize, usize)> {
 
 /// Render the merged hits for the model: `Found N results` then one block per
 /// hit (a header line plus its snippet).
-fn render_hits(query: &str, hits: &[SearchHit]) -> String {
+fn render_hits(query: &str, hits: &[SearchHit], current_session: &str) -> String {
     if hits.is_empty() {
         return format!(
             "No results found for \"{query}\" across memories, notes, compartments, transcript, or commits."
@@ -1106,7 +1345,7 @@ fn render_hits(query: &str, hits: &[SearchHit]) -> String {
     )];
     for (index, hit) in hits.iter().enumerate() {
         lines.push(String::new());
-        lines.push(hit.header(index + 1));
+        lines.push(hit.header(index + 1, current_session));
         lines.push(hit.snippet.clone());
     }
     lines.join("\n")
@@ -1172,7 +1411,8 @@ fn recall_snippet(snippet: &str) -> String {
 /// `ctx_search` — unified retrieval over the magic-context store.
 pub struct CtxSearchTool {
     db: Db,
-    /// `None` when semantic search is off: every lane then uses its index.
+    /// `None` when semantic search is off: the memory lane then uses its
+    /// full-text index like the note lane.
     embedder: Option<Arc<super::embed::Embedder>>,
 }
 
@@ -1199,9 +1439,9 @@ impl Tool for CtxSearchTool {
             "Search the archive — everything that ever happened in this project, not just \
              what is on your desk: project memories, session notes, folded conversation \
              summaries, and raw transcript text the historian has not folded yet.\n\n\
-             Retrieval matches exact words (full-text indexes over memories, notes and \
-             compartments; a case-insensitive substring match over the raw transcript \
-             for anything not yet indexed). Phrase `query` as a natural-language question \
+             Retrieval matches exact words (full-text indexes over memories and notes; \
+             a case-insensitive substring match over compartments and the raw \
+             transcript). Phrase `query` as a natural-language question \
              that still carries the exact terms you expect in the answer (paths, symbols, \
              config keys, error strings); a bare keyword stack finds less.\n\n\
              Sources (omit for all):\n\
@@ -1211,7 +1451,8 @@ impl Tool for CtxSearchTool {
              - transcript — raw messages not yet folded; \"did we discuss this\"\n\
              - commit — git history: scans the last 500 commits on HEAD, newest first, \
              matching each commit's summary line; \"why was this changed\"\n\
-             Use from/to to restrict every source to an inclusive UTC date range.",
+             Use from/to to restrict every source to an inclusive UTC date range. \
+             Compartments come from this session unless scope is \"project\".",
             object_param(
                 vec![
                     (
@@ -1241,6 +1482,18 @@ impl Tool for CtxSearchTool {
                             },
                             "description": "Restrict to these sources; omitting it or \
                                             passing [] searches every source.",
+                        }),
+                    ),
+                    (
+                        "scope",
+                        json!({
+                            "type": "string",
+                            "enum": ["session", "project"],
+                            "description": "Compartments only: \"session\" (default) searches \
+                                            this session's summaries, \"project\" every \
+                                            session in this directory. Memories are \
+                                            project-wide; notes and transcript are always \
+                                            this session.",
                         }),
                     ),
                     (
@@ -1305,9 +1558,14 @@ async fn run_search(
         Err(message) => return ok_text(message),
     };
     let project = ctx.directory.to_string_lossy().into_owned();
+    let compartment_scope = match parse_scope(input) {
+        Ok(scope) => scope,
+        Err(message) => return ok_text(message),
+    };
     let request = SearchRequest {
         project: &project,
         session_id: &ctx.session_id,
+        compartment_scope,
         query,
         sources,
         limit,
@@ -1315,8 +1573,22 @@ async fn run_search(
         to_ms,
     };
     match search(db, embedder, &request).await {
-        Ok(hits) => ok_text(render_hits(query, &hits)),
+        Ok(hits) => ok_text(render_hits(query, &hits, &ctx.session_id)),
         Err(error) => internal_error("search", &error),
+    }
+}
+
+/// `scope`: absent or null means the current session; otherwise `"session"`
+/// or `"project"`, anything else rejected.
+fn parse_scope(input: &Value) -> std::result::Result<CompartmentScope, String> {
+    match input.get("scope") {
+        None | Some(Value::Null) => Ok(CompartmentScope::Session),
+        Some(value) => value
+            .as_str()
+            .and_then(CompartmentScope::parse)
+            .ok_or_else(|| {
+                format!("Error: 'scope' must be \"session\" or \"project\" (got {value}).")
+            }),
     }
 }
 
@@ -1465,4 +1737,90 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
         month_prime - 9
     };
     (year + i64::from(month <= 2), month, day)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn needles(tokens: &[&str]) -> Vec<String> {
+        tokens.iter().map(|token| token.to_lowercase()).collect()
+    }
+
+    /// Score every document against a corpus made of exactly those documents.
+    fn scores(docs: &[&str], tokens: &[&str]) -> Vec<f64> {
+        let needles = needles(tokens);
+        let stats: Vec<DocStats> = docs
+            .iter()
+            .map(|doc| DocStats::new(&doc.to_lowercase(), &needles))
+            .collect();
+        let total_length = stats.iter().map(|doc| doc.length).sum();
+        let corpus = Bm25Corpus::new(docs.len(), total_length, &stats, needles.len());
+        stats.iter().map(|doc| corpus.score(doc)).collect()
+    }
+
+    #[test]
+    fn rare_term_outranks_common_term() {
+        let docs = [
+            "turso FTS 缓存 overview",
+            "session session notes",
+            "session handling",
+            "session cleanup",
+            "session restore",
+        ];
+        let scores = scores(&docs, &["turso", "FTS", "缓存", "session"]);
+        assert!(
+            scores[0] > scores[1],
+            "rare terms must outrank the common one: {scores:?}"
+        );
+    }
+
+    #[test]
+    fn term_frequency_saturates() {
+        let once = format!("lock {}", "x".repeat(45));
+        let ten = "lock ".repeat(10);
+        let scores = scores(
+            &[&once, &ten, "unrelated text of similar size here...."],
+            &["lock"],
+        );
+        assert!(
+            scores[1] > scores[0],
+            "more occurrences score higher: {scores:?}"
+        );
+        assert!(
+            scores[1] < 10.0 * scores[0],
+            "ten occurrences must score under ten times one: {scores:?}"
+        );
+    }
+
+    #[test]
+    fn shorter_document_wins_at_equal_frequency() {
+        let short = "lock held";
+        let long = format!("lock held {}", "padding ".repeat(30));
+        let scores = scores(&[short, &long, "nothing here"], &["lock"]);
+        assert!(scores[0] > scores[1], "length must normalize: {scores:?}");
+    }
+
+    #[test]
+    fn single_cjk_character_matches_and_counts() {
+        let stats = DocStats::new("获取锁失败，锁被占用", &needles(&["锁"]));
+        assert_eq!(stats.term_frequency, vec![2], "both 锁 occurrences count");
+        assert_eq!(
+            stats.length, 10,
+            "length is in characters, got {}",
+            stats.length
+        );
+        assert!(stats.matches(), "a single CJK character is a usable token");
+    }
+
+    #[test]
+    fn matching_is_case_insensitive() {
+        let text = "Turso FTS and turso again";
+        let stats = DocStats::new(&text.to_lowercase(), &needles(&["TURSO", "fts"]));
+        assert_eq!(
+            stats.term_frequency,
+            vec![2, 1],
+            "case must not affect counts"
+        );
+    }
 }
