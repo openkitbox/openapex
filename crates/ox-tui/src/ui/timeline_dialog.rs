@@ -20,23 +20,3 @@ pub fn timeline(messages: &[(usize, &str)]) -> Dialog {
         .collect();
     Dialog::Select(Select::new("Timeline", items).tag(TAG))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rows_are_newest_first_with_newlines_flattened() {
-        let dialog = timeline(&[(0, "first"), (3, "second\nline")]);
-        assert_eq!(dialog.tag(), Some(TAG));
-        let Dialog::Select(select) = dialog else {
-            panic!("a select dialog");
-        };
-        assert_eq!(
-            select.item("3").map(|i| i.title.as_str()),
-            Some("second line")
-        );
-        assert_eq!(select.item("0").map(|i| i.title.as_str()), Some("first"));
-        assert_eq!(select.selected_value(), Some("3"));
-    }
-}

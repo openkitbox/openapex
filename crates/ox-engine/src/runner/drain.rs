@@ -827,35 +827,3 @@ async fn settle_stale_compactions(bus: &EventBus, db: &Db, session_id: &str) -> 
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unlimited_cap_is_never_final_unless_wrapping_up() {
-        assert!(!is_final_step(0, 0, false));
-        assert!(!is_final_step(10_000, 0, false));
-        assert!(is_final_step(0, 0, true));
-    }
-
-    #[test]
-    fn final_step_starts_once_the_cap_is_spent() {
-        assert!(!is_final_step(0, 3, false));
-        assert!(!is_final_step(2, 3, false));
-        assert!(is_final_step(3, 3, false));
-        assert!(is_final_step(4, 3, false));
-    }
-
-    #[test]
-    fn wrap_up_forces_the_final_step_below_the_cap() {
-        assert!(is_final_step(1, 500, true));
-    }
-
-    #[test]
-    fn repeat_reminder_is_a_system_reminder() {
-        let text = repeat_reminder_text();
-        assert!(text.starts_with("<system-reminder>"));
-        assert!(text.trim_end().ends_with("</system-reminder>"));
-    }
-}

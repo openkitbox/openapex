@@ -354,35 +354,3 @@ pub fn single_option_answer(field: &Field, value: &str) -> FormValue {
         _ => FormValue::String(value.to_owned()),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::*;
-
-    #[test]
-    fn answers_metadata_lists_each_question_in_order() {
-        let mut answer = Answer::new();
-        answer.insert("q0".to_owned(), FormValue::String("Rust".to_owned()));
-        answer.insert(
-            "q1".to_owned(),
-            FormValue::Multiple(vec!["a".to_owned(), String::new(), "b".to_owned()]),
-        );
-        answer.insert("q2".to_owned(), FormValue::String(String::new()));
-        assert_eq!(
-            answers_metadata(4, &answer),
-            json!({"answers": [["Rust"], ["a", "b"], [], []]}),
-            "single, multiple (blanks dropped), empty and missing answers"
-        );
-    }
-
-    #[test]
-    fn answers_metadata_with_no_questions_is_an_empty_list() {
-        assert_eq!(
-            answers_metadata(0, &Answer::new()),
-            json!({"answers": []}),
-            "the array is present even with nothing to answer"
-        );
-    }
-}

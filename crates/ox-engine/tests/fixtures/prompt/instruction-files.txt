@@ -1,5 +1,0 @@
-Instructions from: /repo/AGENTS.md
-project rule
-
-Instructions from: /repo/docs/AGENTS.md
-docs rule

@@ -445,6 +445,7 @@ impl Runner {
     /// Answer `prompt` from the session's current context without mutating it
     /// (upstream `session.generate`, the TUI's `/btw` dependency). Nothing is
     /// persisted, no event is published and no tool loop runs.
+    #[must_use]
     pub async fn generate(&self, session_id: &str, prompt: &str) -> Result<String> {
         generate::run(&self.inner, session_id, prompt).await
     }

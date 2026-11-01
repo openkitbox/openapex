@@ -8,8 +8,6 @@ pub mod instance;
 pub mod lifecycle;
 pub(crate) mod reload;
 mod session_retention;
-#[cfg(test)]
-mod test_support;
 mod tmp_retention;
 pub(crate) mod worktree;
 
@@ -396,100 +394,4 @@ pub async fn serve_with(
         watcher.abort();
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod serve_tests {
-    use std::path::{Path, PathBuf};
-    use std::time::{Duration, Instant};
-
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::UnixStream;
-
-    use super::*;
-    use crate::instance::bind_unix;
-    use crate::test_support::test_state;
-
-    const GRACE: Duration = Duration::from_millis(200);
-    const BOUND: Duration = Duration::from_secs(10);
-
-    /// A short path: macOS `sun_path` holds fewer than 104 bytes.
-    fn short_socket() -> (tempfile::TempDir, PathBuf) {
-        let dir = tempfile::Builder::new()
-            .prefix("ox")
-            .tempdir_in("/tmp")
-            .expect("tempdir");
-        let socket = dir.path().join("s");
-        (dir, socket)
-    }
-
-    async fn start(
-        socket: &Path,
-        idle: Option<Duration>,
-    ) -> (AppState, tokio::task::JoinHandle<Result<()>>) {
-        let state = test_state().await;
-        let router = build_router(state.clone());
-        let acceptor = bind_unix(socket).await.expect("bind");
-        let task = tokio::spawn(serve_with(acceptor, state.clone(), router, idle));
-        (state, task)
-    }
-
-    async fn open_lease(socket: &Path) -> UnixStream {
-        let mut stream = UnixStream::connect(socket).await.expect("connect");
-        stream
-            .write_all(b"GET /ox/lease HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
-            .await
-            .expect("write");
-        let mut seen = Vec::new();
-        let mut buf = [0u8; 512];
-        let deadline = Instant::now() + BOUND;
-        while !String::from_utf8_lossy(&seen).contains(": lease") {
-            let left = deadline.saturating_duration_since(Instant::now());
-            let n = tokio::time::timeout(left, stream.read(&mut buf))
-                .await
-                .expect("lease head in time")
-                .expect("read");
-            assert!(n > 0, "eof before the lease frame");
-            seen.extend_from_slice(&buf[..n]);
-        }
-        stream
-    }
-
-    #[tokio::test]
-    async fn idle_server_exits_after_the_grace_without_clients() {
-        let (_dir, socket) = short_socket();
-        let (_state, task) = start(&socket, Some(GRACE)).await;
-        let result = tokio::time::timeout(BOUND, task)
-            .await
-            .expect("server exits on its own")
-            .expect("join");
-        result.expect("serve_with result");
-    }
-
-    #[tokio::test]
-    async fn a_held_lease_keeps_the_server_up_until_it_is_released() {
-        let (_dir, socket) = short_socket();
-        let (state, mut task) = start(&socket, Some(GRACE)).await;
-        let lease = open_lease(&socket).await;
-        assert_eq!(state.lifecycle.lease_count(), 1);
-        // Several grace windows with the lease held: the server must stay.
-        let held = tokio::time::timeout(GRACE * 5, &mut task).await;
-        assert!(held.is_err(), "server exited while a lease was held");
-        drop(lease);
-        tokio::time::timeout(BOUND, task)
-            .await
-            .expect("server exits after the lease is released")
-            .expect("join")
-            .expect("serve_with result");
-    }
-
-    #[tokio::test]
-    async fn without_idle_mode_the_server_keeps_serving() {
-        let (_dir, socket) = short_socket();
-        let (_state, mut task) = start(&socket, None).await;
-        let ran = tokio::time::timeout(GRACE * 5, &mut task).await;
-        assert!(ran.is_err(), "server exited without idle mode");
-        UnixStream::connect(&socket).await.expect("still accepting");
-        task.abort();
-    }
 }

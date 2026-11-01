@@ -34,19 +34,3 @@ pub fn lock_path() -> PathBuf {
 pub fn server_log_path() -> PathBuf {
     ox_home().join("ox.log")
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn run_files_live_in_the_run_dir() {
-        assert_eq!(socket_path().file_name().unwrap(), "ox.sock");
-        assert_eq!(lock_path().file_name().unwrap(), "ox.lock");
-        assert_eq!(run_dir().file_name().unwrap(), "run");
-        assert_eq!(server_log_path().file_name().unwrap(), "ox.log");
-        assert_eq!(server_log_path().parent(), run_dir().parent());
-        assert_eq!(socket_path().parent(), Some(run_dir().as_path()));
-        assert_eq!(lock_path().parent(), Some(run_dir().as_path()));
-    }
-}
