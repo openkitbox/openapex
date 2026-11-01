@@ -1636,6 +1636,10 @@ impl App {
         } else {
             queued_area
         };
+        // The transcript goes first: the slash menu pops up over it and must
+        // end up on top (upstream draws the menu at `zIndex={100}`).
+        self.transcript
+            .render(frame, layout::padded(timeline_area, full.width));
         if queued_h > 0 {
             let lines = dock::queued_dock(&self.store.queued, queued_area.width, self.dock_hover);
             frame.render_widget(ratatui::widgets::Paragraph::new(lines), queued_area);
@@ -1648,8 +1652,6 @@ impl App {
                 self.prompt.render(frame, prompt_area, full, activity);
             }
         }
-        self.transcript
-            .render(frame, layout::padded(timeline_area, full.width));
         let line = dock::status_line(&self.store, self.status_mode());
         frame.render_widget(ratatui::widgets::Paragraph::new(line), dock_area);
         if let Some(dialog) = &self.dialog {

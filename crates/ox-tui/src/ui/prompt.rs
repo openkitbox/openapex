@@ -11,7 +11,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Widget};
+use ratatui::widgets::{Clear, Paragraph, Widget};
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
@@ -788,10 +788,12 @@ impl Prompt {
         let pal = *theme::palette();
         let mention = matches!(self.auto.trigger(), Some(Trigger::Mention { .. }));
         let rows = self.menu_items((area.width as usize).saturating_sub(4));
-        let wanted = (rows.len().clamp(1, 10) + 2) as u16;
+        // Upstream has no top or bottom border: the popup is exactly as tall
+        // as its rows, capped at ten (`component/prompt/autocomplete.tsx`).
+        let wanted = rows.len().clamp(1, 10) as u16;
         let available = area.y.saturating_sub(full.y);
         let height = wanted.min(available);
-        if height < 3 || area.width < 4 {
+        if height == 0 || area.width < 4 {
             return;
         }
         let rect = Rect {
@@ -800,19 +802,46 @@ impl Prompt {
             width: area.width,
             height,
         };
-        Block::bordered()
-            .border_style(pal.menu_border)
-            .style(pal.menu)
-            .render(rect, frame.buffer_mut());
-
+        // Wipe what is underneath: styling alone keeps the old glyphs.
+        Clear.render(rect, frame.buffer_mut());
+        let buf = frame.buffer_mut();
+        // Only the surface between the rails takes the menu background.
+        buf.set_style(
+            Rect {
+                x: rect.x + 1,
+                width: rect.width.saturating_sub(2),
+                ..rect
+            },
+            pal.menu,
+        );
         let inner = Rect {
-            x: rect.x + 1,
-            y: rect.y + 1,
-            width: rect.width.saturating_sub(2),
-            height: rect.height.saturating_sub(2),
+            // One border cell plus one padding cell on either side.
+            x: rect.x + 2,
+            y: rect.y,
+            width: rect.width.saturating_sub(4),
+            height: rect.height,
         };
         if inner.width == 0 || inner.height == 0 {
             return;
+        }
+        let visible = inner.height as usize;
+        let offset = self
+            .auto
+            .selected()
+            .saturating_sub(visible.saturating_sub(1));
+        for index in 0..inner.height {
+            let selected = !rows.is_empty() && offset + index as usize == self.auto.selected();
+            for (x, left) in [(rect.x, true), (rect.right() - 1, false)] {
+                let cell = &mut buf[(x, rect.y + index)];
+                cell.set_char('┃');
+                // The rails stay transparent like upstream's border; only
+                // the content surface uses the raised menu background.
+                cell.set_style(if selected && left {
+                    pal.accent
+                } else {
+                    pal.menu_border
+                });
+            }
         }
         if rows.is_empty() {
             let empty = if mention {
@@ -820,14 +849,11 @@ impl Prompt {
             } else {
                 "No matching commands"
             };
-            frame.render_widget(
-                Paragraph::new(Line::styled(empty, pal.dim)).style(pal.menu),
-                inner,
-            );
+            Paragraph::new(Line::styled(empty, pal.dim))
+                .style(pal.menu)
+                .render(inner, buf);
             return;
         }
-        let visible = inner.height as usize;
-        let offset = self.auto.selected().saturating_sub(visible - 1);
         {
             let buf = frame.buffer_mut();
             for (index, (display, description)) in
