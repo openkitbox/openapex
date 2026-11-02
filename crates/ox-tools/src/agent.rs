@@ -51,6 +51,9 @@ pub(crate) const SUBAGENT_AGENT: &str = "general";
 /// engine's fail-closed fallback when a session's agent cannot be read. Named
 /// after upstream opencode's read-only `explore` agent.
 pub(crate) const READ_ONLY_AGENT: &str = "explore";
+/// The routing primary agent: it decomposes the request, dispatches every task
+/// to a `subagent`, and judges what comes back instead of implementing.
+pub const APEX_ID: &str = "apex";
 
 /// Tools a subagent session must not have. `question` opens a form only the
 /// user can answer; no UI watches a child session and a foreground tool call
@@ -83,6 +86,34 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "webfetch",
 ];
 
+/// The toolset of the `apex` routing agent.
+///
+/// Rule: a tool belongs here only if it cannot change the workspace and it
+/// serves dispatching a task or judging what came back. `subagent` must be
+/// in it — dispatching is the whole job — next to the read-only exploration
+/// tools (`read`, `grep`, `glob`), the user-facing task board (`todowrite`),
+/// `question` (a primary agent has a user watching it), and the context and
+/// discovery tools an exploration needs. Excluded: `write`, `edit`, `patch`,
+/// `shell` (the router never implements) and every MCP tool, whose side
+/// effects cannot be judged statically. Enforced by registry membership, so a
+/// call to an excluded tool fails as an unknown tool.
+pub(crate) const APEX_TOOLS: &[&str] = &[
+    "capability_search",
+    "ctx_expand",
+    "ctx_memory",
+    "ctx_note",
+    "ctx_reduce",
+    "ctx_search",
+    "glob",
+    "grep",
+    "question",
+    "read",
+    "skill",
+    "subagent",
+    "todowrite",
+    "webfetch",
+];
+
 /// The static system layer of the `explore` agent. Adapted from upstream
 /// opencode `PROMPT_EXPLORE` (packages/core/src/plugin/agent.ts); the shell
 /// bullets are dropped because the read-only toolset has no shell.
@@ -99,8 +130,29 @@ pub const EXPLORE_SYSTEM: &str = concat!(
     "Report your findings clearly and concisely in your final message; it is the only thing the caller sees.\n",
 );
 
+/// The static system layer of the `apex` routing agent.
+///
+/// The router's whole layer is this text ([`Agent::system`] replaces the
+/// assembled one), so it never receives the implementing parent's workflow:
+/// planning in a document, creating a worktree, and landing the branch are
+/// steps for whoever implements, and this agent implements nothing.
+pub const APEX_SYSTEM: &str = concat!(
+    "You are the routing agent in ox. You decompose the user's request into tasks, dispatch each task to a subagent, judge what comes back, and dispatch the next one.\n",
+    "\n",
+    "Rules:\n",
+    "- You do not implement. Your toolset has no writer and no shell, so every change to the workspace is a subagent's job; a request you cannot answer by reading is a dispatch, not something you attempt.\n",
+    "- Read-only work you may do yourself with `read`, `grep`, and `glob`: locating code, reading a diff, checking that a child's claim matches the source. That is how you write a dispatchable task and how you check one.\n",
+    "- `todowrite` is the only task board. Put every task on it before dispatching, keep the items in flight `in_progress`, and mark an item `completed` only after you have judged its result. The user reads that list; a prose status message does not replace it.\n",
+    "- One task per `subagent` call. A dispatch states the self-contained context (paths, findings, constraints — the child starts fresh and sees none of this conversation), the exact deliverable, the acceptance criteria you will check, and the files or directories it owns.\n",
+    "- Dispatch independent tasks in parallel in one message with `background=true`, then judge each result as it arrives. A task that needs another's output waits for it.\n",
+    "- After a child returns, judge it against the acceptance criteria by reading the files it changed. If it fell short, dispatch a correction that names the specific gap; if it holds, mark the task done and dispatch what it unblocked.\n",
+    "- Do not write a plan document, create a worktree, build, or land anything yourself. Design notes, branches, worktrees, builds, and commits belong to the conversation's own workflow or to the subagent you assign them to.\n",
+    "- Cite `file_path:line_number` when you report on code, and say plainly when something is unverified.\n",
+    "\nA subagent's final message is the only thing you receive from it. Say in the dispatch exactly what that message must contain — outcome, evidence (paths, commands, numbers), and open caveats — because whatever it leaves out is invisible to you.\n",
+);
+
 /// The built-in agents in display order. The first entry is the default agent.
-static AGENTS: [Agent; 3] = [
+static AGENTS: [Agent; 4] = [
     Agent {
         id: DEFAULT_AGENT,
         mode: Mode::Primary,
@@ -118,6 +170,12 @@ static AGENTS: [Agent; 3] = [
         mode: Mode::Subagent,
         system: Some(EXPLORE_SYSTEM),
         tools: Tools::Only(READ_ONLY_TOOLS),
+    },
+    Agent {
+        id: APEX_ID,
+        mode: Mode::Primary,
+        system: Some(APEX_SYSTEM),
+        tools: Tools::Only(APEX_TOOLS),
     },
 ];
 
@@ -155,4 +213,96 @@ pub fn read_only() -> &'static Agent {
 /// Look up an id the table is known to contain.
 fn builtin(id: &str) -> &'static Agent {
     get(id).expect("the built-in agent table always contains its named ids")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::contract::ToolRegistry;
+
+    #[test]
+    fn the_router_is_a_primary_agent_that_owns_its_layer() {
+        let apex = get(APEX_ID).expect("apex is a built-in agent");
+        assert_eq!(
+            apex.mode,
+            Mode::Primary,
+            "a router is chosen by the user as the top-level agent, so it must be primary"
+        );
+        assert!(
+            matches!(apex.tools, Tools::Only(_)),
+            "the router withholds the writers through registry membership, never through prompt \
+             discipline: {:?}",
+            apex.tools
+        );
+        assert_eq!(
+            apex.system,
+            Some(APEX_SYSTEM),
+            "the router states its own routing contract instead of the assembled layer"
+        );
+    }
+
+    #[test]
+    fn the_router_can_dispatch_but_not_write() {
+        for required in ["subagent", "todowrite", "read", "grep", "glob"] {
+            assert!(
+                APEX_TOOLS.contains(&required),
+                "a router that cannot {required} cannot route: {APEX_TOOLS:?}"
+            );
+        }
+        for excluded in ["write", "edit", "patch", "shell"] {
+            assert!(
+                !APEX_TOOLS.contains(&excluded),
+                "the router must not change the workspace itself, so {excluded} stays out of its \
+                 allow-list: {APEX_TOOLS:?}"
+            );
+        }
+        // The real path: `Services` applies `Tools::Only` over the wired
+        // registry, so deriving the set here proves the writers are gone from
+        // the model's tool list rather than merely absent from a constant. The
+        // registry built here lacks the tools that join at wiring time
+        // (`subagent`, `todowrite`, the `ctx_*` family), so the names spelled
+        // out are the built-in subset.
+        let derived = ToolRegistry::with_builtins().only(APEX_TOOLS);
+        let visible: Vec<&str> = derived.guidances().map(|(name, _)| name).collect();
+        assert_eq!(
+            visible,
+            [
+                "capability_search",
+                "glob",
+                "grep",
+                "question",
+                "read",
+                "skill",
+                "webfetch"
+            ],
+            "the router's visible built-in toolset is exactly the allow-list intersection, so a \
+             typo drops a tool and a writer leaking in fails here"
+        );
+    }
+
+    #[test]
+    fn the_default_agent_is_still_the_first_entry() {
+        // Both the literal and the constant are pinned: renaming the constant
+        // alone would move the default agent without any other test noticing.
+        assert_eq!(
+            DEFAULT_AGENT, "build",
+            "the default agent's name is the published one sessions and configs \
+             already use"
+        );
+        assert_eq!(
+            AGENTS[0].id, "build",
+            "the table's first entry is the build agent, and adding the router must \
+             not promote it"
+        );
+        assert_eq!(
+            AGENTS[0].id, DEFAULT_AGENT,
+            "the table's first entry is the default agent"
+        );
+        assert_eq!(
+            default_agent().id,
+            "build",
+            "an unnamed session keeps running the build agent"
+        );
+    }
 }

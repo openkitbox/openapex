@@ -13,6 +13,7 @@ pub mod event_bus;
 pub mod home_paths;
 pub mod projector;
 pub mod reminder_tags;
+pub mod text;
 pub mod which;
 
 pub use ox_llm::{USER_AGENT, http_client};

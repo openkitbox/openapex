@@ -363,10 +363,12 @@ pub(crate) async fn remove(req: &mut Request, depot: &mut Depot, res: &mut Respo
 /// Delete `root` and every descendant: descendants first (deepest last-found
 /// first), then the root. Each session goes through a `SessionDeleted` event
 /// (so the projection, the event log and SSE subscribers all agree), then its
-/// durable event log is purged and the runner forgets it. Stops at the first
-/// error; sessions already deleted stay deleted and the root is still present,
-/// so a retry finishes the job. Shared by the HTTP handler and any internal
-/// caller that must delete exactly as the API does.
+/// durable event log is purged and the runner forgets it. Spilled subagent
+/// reports are removed with their owning session; cleanup is best-effort so a
+/// filesystem error cannot interrupt deletion of the remaining tree. Stops at
+/// the first event-store error; sessions already deleted stay deleted and the
+/// root is still present, so a retry finishes the job. Shared by the HTTP
+/// handler and any internal caller that must delete exactly as the API does.
 pub(crate) async fn delete_session_tree(app: &crate::api::AppState, root: &str) -> Result<()> {
     let mut order = collect_descendants(&app.db, root).await?;
     order.reverse();
@@ -379,6 +381,9 @@ pub(crate) async fn delete_session_tree(app: &crate::api::AppState, root: &str) 
             })
             .await?;
         app.bus.remove(&target).await?;
+        if let Err(error) = ox_tools::subagent::purge_spill(&target) {
+            tracing::warn!(session = %target, error = %error, "unable to purge subagent spill files");
+        }
         // Drop the runner's per-session tables now rather than waiting for the
         // idle sweep's 30-minute TTL (the sweep only runs inside a dispatch, so
         // a deleted session's entry could otherwise outlive it indefinitely).

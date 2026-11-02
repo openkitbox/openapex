@@ -327,6 +327,9 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
     // Background `shell` completions need the same db/bus; the runner attaches
     // its waker when it is built below.
     tools.register_shell_completion(db.clone(), bus.clone());
+    // Captured before the registry is handed to the runner: the completion
+    // replay below runs on the same handle the `subagent` tool uses.
+    let subagent = tools.subagent_handle.clone();
     let chat = chat_transport(&config)?;
     let state =
         build_state_on_with_bus(config, chat, tools, db, bus, ox_core::config::ox_home()).await?;
@@ -358,6 +361,14 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
         Err(error) => {
             tracing::warn!(error = %error, "settle interrupted historian runs failed");
         }
+    }
+    // A background child's completion lives only in the watcher task that
+    // waits for it, so a child that settled while the previous process was
+    // dying never woke its parent. Replay exactly those notices now: no child
+    // is running yet, and the runner is attached. Best-effort like the settle
+    // above — startup recovery never blocks serving.
+    if let Some(subagent) = subagent {
+        subagent.backfill_completions().await;
     }
     // Replay-log retention: the `event` table is history for SSE reconnect, not
     // state, so old rows are swept on a fixed window (`[events] retention_days`,
