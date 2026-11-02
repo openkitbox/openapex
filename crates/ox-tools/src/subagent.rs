@@ -1227,16 +1227,16 @@ fn backfill_plan(children: &[PendingChild]) -> BackfillPlan<'_> {
 /// parent's transcript (a delivered notice), a synthetic inbox item still
 /// queued (a notice waiting for the parent's next turn), or a foreground tool
 /// result whose metadata names the child (the parent already holds that
-/// outcome). A parent row that is gone reports `parent_exists = false` rather
+/// outcome). The first two are cheap indexed lookups in this query; the
+/// foreground fact needs a transcript JSON scan and is filled in afterwards,
+/// only for children that pass every other gate. A parent row that is gone
+/// reports `parent_exists = false` rather
 /// than disappearing from the result, so the decision stays in [`backfill_plan`].
 ///
 /// The `WHERE` clause only narrows the rows: a child with no `idle` row can
 /// never be due, so it need not be materialized. The settled decision itself
 /// stays in [`backfill_plan`].
 ///
-/// The foreground branch's statuses are exactly [`STATUS_COMPLETED`],
-/// [`STATUS_ERROR`] and [`STATUS_CANCELLED`]: a `running`/`queued` hand-off
-/// names the child too, but its watcher still owes the notice.
 const PENDING_CHILDREN_SQL: &str = "\
     SELECT c.id, c.parent_id, c.title, p.id IS NOT NULL, COALESCE(p.time_updated, 0), \
            COALESCE((SELECT MAX(a.time_created) FROM session_message a \
@@ -1253,18 +1253,25 @@ const PENDING_CHILDREN_SQL: &str = "\
                     WHERE i.session_id = c.parent_id AND i.type = 'synthetic' \
                       AND json_extract(i.payload, '$.metadata.source') = 'subagent' \
                       AND json_extract(i.payload, '$.metadata.childID') = c.id) \
-        OR EXISTS (SELECT 1 FROM session_message t, \
-                          json_each(t.data, '$.content') AS part \
-                    WHERE t.session_id = c.parent_id AND t.type = 'assistant' \
-                      AND json_extract(part.value, '$.type') = 'tool' \
-                      AND json_extract(part.value, '$.state.metadata.sessionID') = c.id \
-                      AND json_extract(part.value, '$.state.metadata.status') \
-                          IN ('completed', 'error', 'cancelled')) \
       FROM session_v2 c \
       LEFT JOIN session_v2 p ON p.id = c.parent_id \
      WHERE c.parent_id IS NOT NULL \
        AND EXISTS (SELECT 1 FROM session_message s \
                     WHERE s.session_id = c.id AND s.type = 'idle')";
+
+/// The foreground delivery fact for one child. Its statuses are exactly
+/// [`STATUS_COMPLETED`], [`STATUS_ERROR`] and [`STATUS_CANCELLED`]: a
+/// `running`/`queued` hand-off names the child too, but its watcher still owes
+/// the notice. `json_each` materializes the parent's transcript JSON, so this
+/// must stay out of the all-children query above.
+const FOREGROUND_DELIVERY_SQL: &str = "\
+    SELECT 1 FROM session_message t, json_each(t.data, '$.content') AS part \
+     WHERE t.session_id = ?1 AND t.type = 'assistant' \
+       AND json_extract(part.value, '$.type') = 'tool' \
+       AND json_extract(part.value, '$.state.metadata.sessionID') = ?2 \
+       AND json_extract(part.value, '$.state.metadata.status') \
+           IN ('completed', 'error', 'cancelled') \
+     LIMIT 1";
 
 /// Read every child session's replay candidacy. Read-only, and quiet about
 /// nothing: a database error is the caller's to warn about.
@@ -1290,14 +1297,36 @@ async fn pending_children(db: &ox_db::Db) -> Result<Vec<PendingChild>, String> {
             delivered: row.get::<i64>(7).map_err(|error| error.to_string())? != 0,
         });
     }
+    // A foreground result settles into the parent's existing assistant row, so
+    // it moves no clock the `parent_waiting` gate can see. Check it only for a
+    // child that can still be due — settled, not yet notified, with a living
+    // parent still waiting — rather than rescanning every parent's transcript
+    // for every child that ever ran. On a database whose parents all moved on,
+    // this loop is empty.
+    let mut foreground = conn
+        .prepare(FOREGROUND_DELIVERY_SQL)
+        .await
+        .map_err(|error| error.to_string())?;
+    for child in &mut children {
+        if !child.settled || child.delivered || !child.parent_exists || !child.parent_waiting {
+            continue;
+        }
+        child.delivered = ox_db::optional(
+            &mut foreground,
+            (child.parent_id.clone(), child.child_id.clone()),
+        )
+        .await
+        .map_err(|error| error.to_string())?
+        .is_some();
+    }
     Ok(children)
 }
 
 impl SubagentHandle {
     /// Replay the child completions a restart lost: children that settled while
     /// the previous process was going down, whose notification never reached
-    /// the parent. Called once from the server's startup path, after the runner
-    /// attached itself.
+    /// the parent. Spawned once from the server's startup path, after the
+    /// runner attached itself, so recovery never delays the listener.
     ///
     /// Each replay publishes the same envelope and inbox item the live watcher
     /// would have, marked `backfilled` for troubleshooting, and wakes the
@@ -2763,6 +2792,20 @@ mod tests {
         output: &ToolOutput,
     ) {
         start_step(bus, session_id, assistant_message_id).await;
+        settle_tool_result(bus, session_id, assistant_message_id, call_id, output).await;
+    }
+
+    /// The settlement written into a row that already exists. Production opens
+    /// the assistant row before the call runs, so a foreground result rewrites
+    /// that row in place and moves no clock — the shape [`pending_children`]
+    /// must read as delivered while the parent still looks waiting.
+    async fn settle_tool_result(
+        bus: &EventBus,
+        session_id: &str,
+        assistant_message_id: &str,
+        call_id: &str,
+        output: &ToolOutput,
+    ) {
         let started = SessionEventData::ToolInputStarted {
             session_id: session_id.to_owned(),
             assistant_message_id: assistant_message_id.to_owned(),
@@ -2841,6 +2884,10 @@ mod tests {
             dispatched: std::sync::Mutex::new(Vec::new()),
         });
         handle.attach(Arc::clone(&spawner) as Arc<dyn SubagentSpawner>);
+        // The parent's assistant row is opened before the call, exactly as the
+        // runner does it, so the settlement below rewrites it in place and
+        // leaves the parent parked on this child.
+        start_step(&bus, "ses_parent", "msg_assistant").await;
         let tool = SubagentTool::new(Arc::clone(&handle), 3);
         let ctx = ToolContext {
             session_id: "ses_parent".to_owned(),
@@ -2871,7 +2918,7 @@ mod tests {
         })
         .await
         .expect("child idle row");
-        record_tool_result(
+        settle_tool_result(
             &bus,
             "ses_parent",
             "msg_assistant",
@@ -2909,6 +2956,10 @@ mod tests {
             dispatched: std::sync::Mutex::new(Vec::new()),
         });
         handle.attach(Arc::clone(&spawner) as Arc<dyn SubagentSpawner>);
+        // The parent's assistant row is opened before the call, exactly as the
+        // runner does it, so the settlement below rewrites it in place and
+        // leaves the parent parked on this child.
+        start_step(&bus, "ses_parent", "msg_assistant").await;
         let tool = SubagentTool::new(Arc::clone(&handle), 3);
         let ctx = ToolContext {
             session_id: "ses_parent".to_owned(),
@@ -2938,7 +2989,7 @@ mod tests {
             reason: ox_schema::event::InterruptReason::User,
         };
         bus.publish(idle).await.expect("child interrupted row");
-        record_tool_result(
+        settle_tool_result(
             &bus,
             "ses_parent",
             "msg_assistant",

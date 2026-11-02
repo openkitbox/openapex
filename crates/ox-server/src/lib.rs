@@ -32,7 +32,7 @@ use crate::api::AppState;
 use ox_core::config::Config;
 use ox_core::event_bus::EventBus;
 use ox_db::Db;
-use ox_engine::runner::{Runner, ToolRegistryExt};
+use ox_engine::runner::{Runner, ServiceSet, ToolRegistryExt};
 use ox_llm::cardinal::client::CardinalClient;
 use ox_llm::cardinal::router::EndpointRouter;
 
@@ -145,13 +145,37 @@ async fn build_state_on(
 
 /// [`build_state_on`] over a caller-supplied event bus, so the composition
 /// root can publish to the same bus it registers tools against.
+/// Whether state construction waits for the configured MCP servers.
+///
+/// `Await` is the historical behavior and what tests and `ox acp` build with.
+/// `Deferred` leaves the hub empty so the caller can serve first and install
+/// the handshakes later through `Live::replace` (the same generation swap a
+/// reload uses), which is what the HTTP server does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum McpStartup {
+    Await,
+    Deferred,
+}
+
 pub async fn build_state_on_with_bus(
+    config: Config,
+    chat: std::sync::Arc<dyn runner::Chat>,
+    tools: runner::ToolRegistry,
+    db: Db,
+    bus: EventBus,
+    home: std::path::PathBuf,
+) -> Result<AppState> {
+    build_state_with_mode(config, chat, tools, db, bus, home, McpStartup::Await).await
+}
+
+async fn build_state_with_mode(
     config: Config,
     chat: std::sync::Arc<dyn runner::Chat>,
     mut tools: runner::ToolRegistry,
     db: Db,
     bus: EventBus,
     home: std::path::PathBuf,
+    mcp_startup: McpStartup,
 ) -> Result<AppState> {
     if config.magic_context.enabled {
         let embedder = mctx::embed::Embedder::from_config(&config.magic_context.embedding);
@@ -162,9 +186,12 @@ pub async fn build_state_on_with_bus(
     // MCP servers connect before the runner exists: their tools must be in
     // the registry the runner snapshots, and the same hub is shared with the
     // HTTP layer. A server that fails to connect is a status, never a
-    // startup error.
+    // startup error. `Deferred` keeps the hub empty here so `compose` can open
+    // the listener first and install the handshakes through a generation swap.
     let mcp = Arc::new(ox_mcp::Hub::empty());
-    register_mcp_tools(&mcp, &config.mcp, &directory, &mut tools).await;
+    if mcp_startup == McpStartup::Await {
+        register_mcp_tools(&mcp, &config.mcp, &directory, &mut tools).await;
+    }
     let model_catalog = model_catalog::ModelCatalog::new(&config.llm);
     // The TUI renders its question dialog purely from the ephemeral
     // `form.created` / `form.replied` / `form.cancelled` frames, so the
@@ -331,14 +358,32 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
     // replay below runs on the same handle the `subagent` tool uses.
     let subagent = tools.subagent_handle.clone();
     let chat = chat_transport(&config)?;
-    let state =
-        build_state_on_with_bus(config, chat, tools, db, bus, ox_core::config::ox_home()).await?;
+    let state = build_state_with_mode(
+        config,
+        chat,
+        tools,
+        db,
+        bus,
+        ox_core::config::ox_home(),
+        McpStartup::Deferred,
+    )
+    .await?;
     spawn_runner_memory_stats(state.runner.clone());
-    // Fetch the model list before serving, so the first client that asks
-    // (`/api/model` at TUI startup) gets models instead of an empty list. A
-    // failure only warns: the request path retries on its own TTL.
+    // Warm the catalogue without holding the listener: the first client that
+    // asks (`/api/model` at TUI startup) gets models, and a client that beats
+    // the warm-up gets the same refresh the request path already performs on
+    // its own TTL.
     let svc = state.services();
-    svc.model_catalog.warm().await;
+    {
+        let catalog = Arc::clone(&svc.model_catalog);
+        tokio::spawn(async move {
+            catalog.warm().await;
+        });
+    }
+    // MCP handshakes have their own 30 s per-server budget; finishing them
+    // here would keep clients from connecting for that entire window. Install
+    // them after the listener is up instead.
+    spawn_mcp_startup(&state);
     // Background memory consolidation. Idle unless `[magic_context]` enables
     // it, and deliberately not part of `build_state_with`: tests must not
     // acquire a background loop that writes to their database.
@@ -366,9 +411,12 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
     // waits for it, so a child that settled while the previous process was
     // dying never woke its parent. Replay exactly those notices now: no child
     // is running yet, and the runner is attached. Best-effort like the settle
-    // above — startup recovery never blocks serving.
+    // above, and spawned: startup recovery must never delay the listener, so a
+    // slow database cannot keep clients from connecting.
     if let Some(subagent) = subagent {
-        subagent.backfill_completions().await;
+        tokio::spawn(async move {
+            subagent.backfill_completions().await;
+        });
     }
     // Replay-log retention: the `event` table is history for SSE reconnect, not
     // state, so old rows are swept on a fixed window (`[events] retention_days`,
@@ -390,7 +438,54 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
     Ok((state, router))
 }
 
-/// Emit runner-owned table sizes alongside the binary's allocator statistics.
+/// Install the MCP tools after the listener is already serving.
+///
+/// The runner snapshots its tool registry when it is built, so MCP tools can
+/// only join through the same generation swap a reload uses: connect into a
+/// fresh hub, then `Live::replace` a `ServiceSet` that differs from the current
+/// one only in `mcp` and `tools`. Actors read `live.current()` on every step,
+/// so the next turn sees the tools without a restart.
+///
+/// A reload that lands first has already connected MCP itself and installed
+/// generation 1; this task then steps aside rather than overwriting it with a
+/// handshake built from the config it started with.
+fn spawn_mcp_startup(state: &AppState) {
+    let live = Arc::clone(&state.live);
+    let directory = state.directory.clone();
+    let servers = state.services().config.mcp.clone();
+    tokio::spawn(async move {
+        let base = live.current();
+        let none: [&str; 0] = [];
+        let mut tools = base.tools.without(&none);
+        let mcp = Arc::new(ox_mcp::Hub::empty());
+        register_mcp_tools(&mcp, &servers, &directory, &mut tools).await;
+        let registered = mcp.tool_names().len();
+        let installed = live
+            .replace(move |old| async move {
+                if old.generation != 0 {
+                    anyhow::bail!("MCP startup superseded by a config reload");
+                }
+                Ok(ServiceSet {
+                    config: Arc::clone(&old.config),
+                    chat: Arc::clone(&old.chat),
+                    model_catalog: Arc::clone(&old.model_catalog),
+                    mcp,
+                    tools: Arc::new(tools),
+                })
+            })
+            .await;
+        match installed {
+            Ok(_) => {
+                tracing::info!(
+                    tools = registered,
+                    "MCP servers connected; their tools are live"
+                )
+            }
+            Err(error) => tracing::info!(%error, "MCP startup left the current generation alone"),
+        }
+    });
+}
+
 /// Disabled unless `OX_MEMORY_STATS_MS` selects a positive interval.
 fn spawn_runner_memory_stats(runner: Runner) {
     let Ok(raw) = std::env::var("OX_MEMORY_STATS_MS") else {
