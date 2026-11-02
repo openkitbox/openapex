@@ -1073,8 +1073,8 @@ mod tests {
     #[test]
     fn a_child_never_runs_a_primary_agent() {
         // A child created straight through `POST /api/session {parentID}`
-        // inherits the parent's `build`; its toolset must still drop `question`.
-        for named in [None, Some("build"), Some("nope")] {
+        // inherits the parent's `apex`; its toolset must still drop `question`.
+        for named in [None, Some("apex"), Some("nope")] {
             let resolved = agent_of(Some("ses_parent"), named);
             assert_eq!(
                 resolved.mode,

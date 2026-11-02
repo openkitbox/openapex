@@ -9,7 +9,7 @@ use ox_schema::support::{Record, TokenUsage};
 /// the stats line.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnFooter {
-    /// Agent that produced the turn (`build`); shown title-cased.
+    /// Agent that produced the turn (`apex`); shown title-cased.
     pub agent: Option<String>,
     /// `providerID/id`.
     pub model: Option<String>,

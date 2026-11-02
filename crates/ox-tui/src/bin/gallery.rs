@@ -447,7 +447,7 @@ fn cases() -> Vec<Case> {
             10,
             vec![
                 Block::Switch(Switch::Agent {
-                    agent: Arc::from("build"),
+                    agent: Arc::from("apex"),
                     previous: Some(Arc::from("plan")),
                 }),
                 Block::Switch(Switch::Location {
@@ -814,7 +814,7 @@ fn agent_dialog() -> dialog::Select {
         mode: Some("primary".into()),
         hidden: false,
     };
-    ox_tui::ui::models::agent_select(&[agent("build"), agent("plan")], Some("Plan"))
+    ox_tui::ui::models::agent_select(&[agent("apex"), agent("plan")], Some("Plan"))
 }
 
 /// 对话区组件统一走公开入口：Transcript::sync + render。
@@ -920,7 +920,7 @@ fn assistant(text: &str, reasoning: &str, done: bool) -> Vec<Block> {
         version: 1,
         text: Arc::new(text.to_owned()),
         footer: done.then(|| TurnFooter {
-            agent: Some("build".into()),
+            agent: Some("apex".into()),
             model: Some("provider/model".into()),
             duration_ms: Some(4_200),
             tokens_per_second: Some(70.0),

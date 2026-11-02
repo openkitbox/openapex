@@ -217,7 +217,7 @@ mod tests {
     }
 
     #[test]
-    fn the_build_agent_sees_the_whole_registry() {
+    fn the_default_agent_sees_the_whole_registry() {
         let registry = Arc::new(ToolRegistry::with_builtins());
         let tools = derived_for(&registry, agent::default_agent());
         assert!(

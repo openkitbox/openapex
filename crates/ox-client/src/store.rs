@@ -463,7 +463,7 @@ pub struct AssistantItem {
     pub active_ms: i64,
     /// Money spent on this message (USD), summed over its steps.
     pub cost_usd: f64,
-    /// Agent that produced the message (`build`), from the wire message or
+    /// Agent that produced the message (`apex`), from the wire message or
     /// `step.started`.
     pub agent: Option<String>,
     /// `providerID/id` of the model that produced it.

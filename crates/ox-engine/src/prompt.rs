@@ -1054,7 +1054,7 @@ mod tests {
         let layer = system_static(&[], agent::default_agent());
         assert!(
             layer.contains("\n# Working in codebases\n"),
-            "the build agent keeps the harness layer: {layer}"
+            "the default agent keeps the harness layer: {layer}"
         );
         assert!(
             layer.contains("# Development workflow"),
@@ -1084,51 +1084,6 @@ mod tests {
             !layer.contains("git commit"),
             "the read-only prompt names no write workflow"
         );
-    }
-
-    #[test]
-    fn the_router_carries_a_routing_contract_instead_of_the_implementing_workflow() {
-        let apex = agent::get(agent::APEX_ID).expect("apex is a built-in agent");
-        let layer = system_static(&[], apex);
-        assert_eq!(
-            layer,
-            agent::APEX_SYSTEM,
-            "the router replaces the whole static layer with its own contract"
-        );
-        for required in [
-            "You do not implement",
-            "One task per `subagent` call",
-            "`todowrite` is the only task board",
-            "final message is the only thing you receive",
-        ] {
-            assert!(
-                layer.contains(required),
-                "a routing agent must state {required:?}, or it has no dispatch contract: {layer}"
-            );
-        }
-
-        // Ruled out by naming the build agent's actual text, not by assuming
-        // which words a routing layer happens to avoid: these are the steps an
-        // implementing parent runs, and a router that inherited them would
-        // spend its turn planning and landing work it is supposed to dispatch.
-        let implementing = [
-            "\n# Development workflow\n",
-            "\n# Engineering standards\n",
-            "Write one document at `.ox/plans/YYYY-MM-DD-<topic>.md`",
-            "create `.ox/worktrees/<branch>` from the default branch",
-            "squash-merge as one conventional commit",
-        ];
-        let build_layer = system_static(&[], agent::default_agent());
-        for step in implementing {
-            assert!(
-                build_layer.contains(step),
-                "this test can only rule out a step the build agent really carries: {step:?}"
-            );
-            assert!(
-                !layer.contains(step),
-                "the router must not inherit the implementing parent's step {step:?}"
-            );
-        }
     }
 
     #[test]

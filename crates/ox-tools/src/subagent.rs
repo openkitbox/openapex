@@ -1995,7 +1995,7 @@ mod tests {
             "type": "assistant",
             "id": "msg_reply",
             "time": { "created": 1 },
-            "agent": "build",
+            "agent": "apex",
             "model": { "id": "m", "providerID": "p" },
             "content": [{ "type": "text", "text": text }]
         }))
@@ -2390,7 +2390,7 @@ mod tests {
                 "type": "assistant",
                 "id": "msg_reply",
                 "time": { "created": 1 },
-                "agent": "build",
+                "agent": "apex",
                 "model": { "id": "m", "providerID": "p" },
                 "content": [{ "type": "text", "text": "Outcome: backfilled." }]
             },
@@ -2738,7 +2738,7 @@ mod tests {
         let step = SessionEventData::StepStarted {
             session_id: session_id.to_owned(),
             assistant_message_id: assistant_message_id.to_owned(),
-            agent: "build".to_owned(),
+            agent: "apex".to_owned(),
             model: ModelRef {
                 id: "m".to_owned(),
                 provider_id: "p".to_owned(),

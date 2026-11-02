@@ -139,7 +139,7 @@ pub fn mcp_summary(servers: &[McpRef]) -> Option<McpSummary> {
     Some(McpSummary { connected, failed })
 }
 
-/// 显示名：首字母大写（上游 `build` → `Build`）。
+/// 显示名：首字母大写（上游 `apex` → `Apex`）。
 #[must_use]
 pub fn display_agent(name: &str) -> String {
     let mut chars = name.chars();

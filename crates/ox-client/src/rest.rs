@@ -250,7 +250,7 @@ struct StoredModel {
 pub struct SessionInfo {
     /// `location.directory`.
     pub directory: Option<String>,
-    /// Agent id (`build`).
+    /// Agent id (`apex`).
     pub agent: Option<String>,
     pub model_id: Option<String>,
     pub provider_id: Option<String>,

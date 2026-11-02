@@ -2521,7 +2521,7 @@ mod tests {
                 "id": format!("msg_{ordinal}"),
                 "type": "assistant",
                 "time": { "created": ordinal },
-                "agent": "build",
+                "agent": "apex",
                 "model": { "id": "model", "providerID": "provider" },
                 "content": [ { "type": "text", "text": text } ],
             }),
@@ -2820,7 +2820,7 @@ mod tests {
                 "id": "msg_2",
                 "type": "assistant",
                 "time": { "created": 1_001_000 },
-                "agent": "build",
+                "agent": "apex",
                 "model": { "id": "model", "providerID": "provider" },
                 "content": [ { "type": "text", "text": "working on it" } ],
             })),
@@ -2834,7 +2834,7 @@ mod tests {
                 "id": "msg_4",
                 "type": "assistant",
                 "time": { "created": 8_202_000 },
-                "agent": "build",
+                "agent": "apex",
                 "model": { "id": "model", "providerID": "provider" },
                 "content": [ { "type": "text", "text": "done" } ],
             })),
@@ -3038,7 +3038,7 @@ mod tests {
                 "id": "msg_2",
                 "type": "assistant",
                 "time": { "created": 1_001_000 },
-                "agent": "build",
+                "agent": "apex",
                 "model": { "id": "model", "providerID": "provider" },
                 "content": [
                     { "type": "text", "text": "reading the harness" },
@@ -3056,7 +3056,7 @@ mod tests {
                 "id": "msg_3",
                 "type": "assistant",
                 "time": { "created": 1_002_000 },
-                "agent": "build",
+                "agent": "apex",
                 "model": { "id": "model", "providerID": "provider" },
                 "content": [
                     tool_part(
@@ -3237,7 +3237,7 @@ mod tests {
                 "id": "msg_2",
                 "type": "assistant",
                 "time": { "created": 1_001_000 },
-                "agent": "build",
+                "agent": "apex",
                 "model": { "id": "model", "providerID": "provider" },
                 "content": [{
                     "type": "tool",
