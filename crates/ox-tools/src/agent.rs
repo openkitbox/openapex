@@ -54,6 +54,9 @@ pub(crate) const READ_ONLY_AGENT: &str = "explore";
 /// The routing primary agent: it decomposes the request, dispatches every task
 /// to a `subagent`, and judges what comes back instead of implementing.
 pub const APEX_ID: &str = "apex";
+/// The review agent (`subagent` with `agent: "review"`): it judges work it did
+/// not do and reports a verdict, and its toolset keeps it out of the workspace.
+pub(crate) const REVIEW_AGENT: &str = "review";
 
 /// Tools a subagent session must not have. `question` opens a form only the
 /// user can answer; no UI watches a child session and a foreground tool call
@@ -151,8 +154,55 @@ pub const APEX_SYSTEM: &str = concat!(
     "\nA subagent's final message is the only thing you receive from it. Say in the dispatch exactly what that message must contain — outcome, evidence (paths, commands, numbers), and open caveats — because whatever it leaves out is invisible to you.\n",
 );
 
+/// The toolset of the `review` agent (`subagent` with `agent: "review"`).
+///
+/// Rule: the review toolset is [`READ_ONLY_TOOLS`] plus `shell`. A reviewer
+/// needs two things the read-only set cannot give it — reading a committed diff
+/// (`git show`, `git log`, `git diff`) and re-running the suite to check a claim
+/// instead of trusting it. `shell` is therefore a documented deviation from
+/// strict read-only: a review stays read-only by instruction (the layer says
+/// which commands) and by the absence of the structured writers (`write`,
+/// `edit`, `patch`), which fail here as unknown tools. Also excluded:
+/// `todowrite` (parent-facing plan state), `subagent` (a reviewer must not
+/// dispatch the work it is judging), `question` (no UI watches a child), and
+/// every MCP tool, whose side effects cannot be judged statically.
+pub(crate) const REVIEW_TOOLS: &[&str] = &[
+    "capability_search",
+    "ctx_expand",
+    "ctx_memory",
+    "ctx_note",
+    "ctx_reduce",
+    "ctx_search",
+    "glob",
+    "grep",
+    "read",
+    "shell",
+    "skill",
+    "webfetch",
+];
+
+/// The static system layer of the `review` agent.
+///
+/// Like [`EXPLORE_SYSTEM`] and [`APEX_SYSTEM`] it replaces the assembled layer,
+/// so a reviewer never receives the implementing workflow it is supposed to
+/// judge, and it carries the review contract every dispatch would otherwise
+/// have to restate: verdict first, one evidence-bearing line per criterion,
+/// numbered must-fix items, and an explicit account of what was not verified.
+pub const REVIEW_SYSTEM: &str = concat!(
+    "You are a code reviewer in ox. You judge work you did not do, and your verdict is the only thing the caller reads. You change nothing.\n",
+    "\n",
+    "Rules:\n",
+    "- Read-only. You have no `write`, `edit`, or `patch`: do not commit, create a worktree, edit a plan, or adjust the code you are judging. `shell` is for read-only commands only — `git show`, `git log`, `git diff`, `rg`, `cargo test`, `cargo clippy`, `cargo fmt --check`. Never run a command that mutates the tree.\n",
+    "- Verdict first. Open with `APPROVED` or `NEEDS_FIX`, then one line per criterion: `PASS` or `FAIL` followed by half a sentence of evidence and `file_path:line_number`. A `FAIL` that names no location is not actionable.\n",
+    "- For `NEEDS_FIX`, list numbered must-fix items and separate them from optional ones. Do not re-emit the whole report and do not paste code blocks; the caller acts on the list.\n",
+    "- Judge against the criteria the dispatch gives you plus the design document it names. Do not invent criteria, and do not approve work because it looks plausible: cite the source that proves each claim.\n",
+    "- Report only what you verified in this session and close with what you did not verify, and why. \"The tests pass\" describes output you saw run; if you did not run it, say so.\n",
+    "- When the source contradicts the task description or the plan, say so instead of assuming the description is right.\n",
+    "\nYour final message is the only thing the caller sees: put the verdict, the evidence, and the must-fix list in it.\n",
+);
+
 /// The built-in agents in display order. The first entry is the default agent.
-static AGENTS: [Agent; 4] = [
+static AGENTS: [Agent; 5] = [
     Agent {
         id: DEFAULT_AGENT,
         mode: Mode::Primary,
@@ -176,6 +226,12 @@ static AGENTS: [Agent; 4] = [
         mode: Mode::Primary,
         system: Some(APEX_SYSTEM),
         tools: Tools::Only(APEX_TOOLS),
+    },
+    Agent {
+        id: REVIEW_AGENT,
+        mode: Mode::Subagent,
+        system: Some(REVIEW_SYSTEM),
+        tools: Tools::Only(REVIEW_TOOLS),
     },
 ];
 
@@ -304,5 +360,101 @@ mod tests {
             "build",
             "an unnamed session keeps running the build agent"
         );
+    }
+
+    #[test]
+    fn the_reviewer_keeps_the_read_only_set_plus_a_shell() {
+        let review = get(REVIEW_AGENT).expect("review is a built-in agent");
+        assert_eq!(
+            review.mode,
+            Mode::Subagent,
+            "a review is dispatched by `subagent`, so it must be a subagent-mode agent"
+        );
+        assert_eq!(
+            review.system,
+            Some(REVIEW_SYSTEM),
+            "the reviewer states its own verdict contract instead of the implementing workflow"
+        );
+
+        // Exactly the read-only set plus `shell`: if a future read-only tool is
+        // added for `explore` and not here, this fails and the reviewer silently
+        // loses it.
+        let mut expected: Vec<&str> = READ_ONLY_TOOLS.to_vec();
+        expected.push("shell");
+        expected.sort_unstable();
+        let mut actual: Vec<&str> = REVIEW_TOOLS.to_vec();
+        actual.sort_unstable();
+        assert_eq!(
+            actual, expected,
+            "the review toolset is the read-only set plus `shell`, and nothing else"
+        );
+
+        for excluded in [
+            "write",
+            "edit",
+            "patch",
+            "todowrite",
+            "subagent",
+            "question",
+        ] {
+            assert!(
+                !REVIEW_TOOLS.contains(&excluded),
+                "a reviewer must not be able to {excluded}; the exclusion is registry \
+                 membership, not prompt discipline: {REVIEW_TOOLS:?}"
+            );
+        }
+
+        // The real path: `Tools::Only` over the wired registry. Names not built
+        // in (`ctx_*`) never appear, so the assertion pins the subset a reviewer
+        // is guaranteed to keep.
+        let derived = ToolRegistry::with_builtins().only(REVIEW_TOOLS);
+        let mut visible: Vec<&str> = derived.guidances().map(|(name, _)| name).collect();
+        visible.sort_unstable();
+        assert_eq!(
+            visible,
+            [
+                "capability_search",
+                "glob",
+                "grep",
+                "read",
+                "shell",
+                "skill",
+                "webfetch"
+            ],
+            "a reviewer that cannot read a diff or run a test cannot produce evidence"
+        );
+    }
+
+    #[test]
+    fn the_review_layer_carries_the_verdict_contract() {
+        for required in [
+            "APPROVED",
+            "NEEDS_FIX",
+            "`PASS`",
+            "`FAIL`",
+            "file_path:line_number",
+            "do not commit",
+            "only thing the caller reads",
+        ] {
+            assert!(
+                REVIEW_SYSTEM.contains(required),
+                "the review layer must state {required:?}, or every dispatch has to restate it: \
+                 {REVIEW_SYSTEM}"
+            );
+        }
+        // Ruled out by naming what the implementing workflow actually contains,
+        // not by guessing which words a review layer avoids: "create a worktree"
+        // would be wrong here, since the review layer legitimately forbids it.
+        for implementing in [
+            "# Development workflow",
+            "# Engineering standards",
+            "squash-merge",
+            "Write one document at",
+        ] {
+            assert!(
+                !REVIEW_SYSTEM.contains(implementing),
+                "a reviewer must not receive the implementing workflow step {implementing:?}"
+            );
+        }
     }
 }

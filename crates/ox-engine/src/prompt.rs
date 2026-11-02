@@ -82,8 +82,8 @@ const DEVELOPMENT_WORKFLOW: &str = concat!(
     "1. Analyze first. Inspect requirements and code, cite file:line evidence, and make no edits.\n",
     "2. Write one document at `.ox/plans/YYYY-MM-DD-<topic>.md` with `## 分析与方案` (decisions, evidence, rejected alternatives) followed by `## 实施任务` (self-contained tasks with exact files, tests, commands). Record each task's files and the tasks it depends on: those file sets and dependency edges are what decide the parallel batches. Record module boundaries, ownership, invariants, and the ownership/copy strategy; reject speculative abstraction. Obtain user approval before implementation unless it was already given.\n",
     "3. Before the first edit, create `.ox/worktrees/<branch>` from the default branch. Keep the main checkout clean. Do not use codegraph in a worktree; use absolute paths with rg/read/git. Run Rust tests and builds with `CARGO_TARGET_DIR=<worktree>/target`: the target directory must live inside the worktree so removing the worktree removes its artifacts; never use a shared host target directory.\n",
-    "4. Execute todo items in parallel batches, one fresh subagent per item. A batch holds every ready item whose dependencies are done and whose files are disjoint from every other item in the batch; items that share a file or need another's result wait for a later batch. Give each subagent the full task text, context, worktree path, and the files it owns. It implements, tests, runs fmt/clippy, and commits only its own files with `git commit -m <message> -- <its files>` so a sibling's staged files never ride along; it retries when `index.lock` is held, and a build failure in a sibling's file is a reason to rerun, not to edit that file. After each task, run its spec-compliance and code-quality reviews in parallel; fix findings before the next batch starts.\n",
-    "5. After all tasks, review the whole diff with a general code reviewer plus the matching domain expert (`rust-expert` for Rust), running both in parallel. Fix and re-review until clean. If the expert is unavailable, automatically fall back to the general review and disclose that no domain-expert review occurred.\n",
+    "4. Execute todo items in parallel batches, one fresh subagent per item. A batch holds every ready item whose dependencies are done and whose files are disjoint from every other item in the batch; items that share a file or need another's result wait for a later batch. Give each subagent the full task text, context, worktree path, and the files it owns. It implements, tests, runs fmt/clippy, and commits only its own files with `git commit -m <message> -- <its files>` so a sibling's staged files never ride along; it retries when `index.lock` is held, and a build failure in a sibling's file is a reason to rerun, not to edit that file. After each task, dispatch its spec-compliance and code-quality reviews in parallel as `subagent` calls with `agent: \"review\"`. A review may run alongside the next batch when its files are disjoint from it, because read-only work contends with nothing; a task's findings are fixed before landing, and before any later batch that touches the files it failed on.\n",
+    "5. After all tasks, review the whole diff with a general code reviewer plus the matching domain expert (`rust-expert` for Rust), both as `review` subagents running in parallel. Fix and re-review until clean. If the expert is unavailable, automatically fall back to the general review and disclose that no domain-expert review occurred.\n",
     "6. Land only when green: run the full suite in the worktree, rebase onto the default branch, squash-merge as one conventional commit, rerun the suite on the merged result, remove the worktree, and delete the branch with `git branch -D`. If the main checkout has unrelated uncommitted changes, stop and ask; never stash, overwrite, or discard them. Do not present merge/PR/keep menus; those happen only on explicit request. The workflow ends here: do not build, deploy, sync binaries, or restart services unless the user separately requests it.\n",
     "\nSubagents execute only their assigned task. They do not create worktrees, change the plan, or restart this orchestration. Read-only questions need no pipeline. Single-step or simple changes may edit the main checkout directly and remain uncommitted unless the user asks for a commit.\n",
 );
@@ -1129,5 +1129,24 @@ mod tests {
                 "the router must not inherit the implementing parent's step {step:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_review_step_names_the_review_agent_and_allows_overlap() {
+        let layer = system_static(&[], agent::default_agent());
+        // Naming the agent is the point: without it every dispatch restates the
+        // read-only contract, and a `general` child could edit the code it judges.
+        assert!(
+            layer.contains("`agent: \"review\"`"),
+            "the workflow must dispatch reviews to the review agent: {layer}"
+        );
+        assert!(
+            layer.contains("may run alongside the next batch"),
+            "a review holds no shared state, so serializing it against the next batch buys nothing"
+        );
+        assert!(
+            layer.contains("before any later batch that touches the files it failed on"),
+            "an unfixed finding must still block a later batch that touches those files"
+        );
     }
 }
