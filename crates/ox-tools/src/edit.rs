@@ -2,9 +2,12 @@
 //! replacement with three match tiers (exact → typographic-variant →
 //! line/trailing-whitespace), uniqueness enforcement, `replaceAll`, and
 //! CRLF-preserving region replacement.
+use std::collections::HashMap;
+
 use serde_json::{Value, json};
 
 use crate::contract::{Tool, ToolContext, ToolOutput};
+use crate::file_state::Verdict;
 use ox_schema::wire::ToolDef;
 
 use super::diff::{self as Diff, DiffStatus};
@@ -108,6 +111,14 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
     if metadata.is_dir() {
         return fail(format!("Path is a directory, not a file: {path}"));
     }
+    // Refuse to write over content that changed since this session read it: the
+    // replaced text came from a stale view, so the edit would clobber whatever
+    // replaced it.
+    if ctx.registry.files.check(&ctx.session_id, &absolute) == Verdict::Changed {
+        return fail(format!(
+            "Failed to edit {path}: the file changed since your last read of it. Read it again before editing."
+        ));
+    }
     let bytes = match std::fs::read(&absolute) {
         Ok(bytes) => bytes,
         Err(_) => return fail(format!("Unable to edit {path}")),
@@ -137,9 +148,7 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
     };
     let replacements = matches.len();
     if replacements == 0 {
-        return fail(format!(
-            "Could not find oldString in {path}. It must match exactly, including whitespace and indentation."
-        ));
+        return fail(miss_message(path, &text, old_string, new_string));
     }
     if replacements > 1 && !replace_all {
         return fail(format!(
@@ -174,6 +183,7 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
     if std::fs::write(&absolute, output_text.as_bytes()).is_err() {
         return fail(format!("Unable to edit {path}"));
     }
+    ctx.registry.files.record(&ctx.session_id, &absolute);
     let resource = resource_of(&ctx.directory, &absolute);
     // The client renders this diff card; the model reads the text below.
     let diff = Diff::file_diff(&resource, &text, &output_text, DiffStatus::Modified);
@@ -319,6 +329,20 @@ fn count_before(positions: &[usize], offset: usize) -> usize {
     positions.partition_point(|&position| position < offset)
 }
 
+/// The LF view Read shows the model: CRLF pairs collapse to LF, a lone `\r`
+/// stays (upstream `replaceAll(crlf, "\n")`).
+fn lf_view(chars: impl Iterator<Item = char>) -> Chars {
+    let mut view: Chars = Vec::with_capacity(chars.size_hint().0);
+    let mut iter = chars.peekable();
+    while let Some(c) = iter.next() {
+        if c == '\r' && iter.peek() == Some(&'\n') {
+            continue;
+        }
+        view.push(c);
+    }
+    view
+}
+
 /// Upstream `matchView`: matches against the LF view Read shows the model,
 /// then maps offsets back to the source. Returns the mapped matches, the
 /// LF-form replacement text, and the file's fallback ending.
@@ -336,22 +360,9 @@ fn match_view(
             view.push(c);
         }
     }
-    let lf = |value: &[char]| -> Chars {
-        let mut out = Chars::new();
-        let mut index = 0;
-        while index < value.len() {
-            if value[index] == '\r' && value.get(index + 1) == Some(&'\n') {
-                index += 1;
-                continue;
-            }
-            out.push(value[index]);
-            index += 1;
-        }
-        out
-    };
     let file_ending = line_ending(source, "\n");
-    let search = lf(old_string);
-    let replacement = lf(new_string);
+    let search = lf_view(old_string.iter().copied());
+    let replacement = lf_view(new_string.iter().copied());
     let exact = find_occurrences(&view, &search);
     // The 1:1 typographic mapping preserves positions in the LF view.
     let unicode = if exact.is_empty() {
@@ -515,11 +526,341 @@ fn flush(result: &mut [Option<usize>], gap_before: &mut Vec<usize>, gap_after: &
     gap_after.clear();
 }
 
-/// JS `trimEnd`: Unicode whitespace plus the byte-order mark.
+/// JS whitespace: Unicode whitespace plus the byte-order mark.
+fn is_js_space(c: char) -> bool {
+    c.is_whitespace() || c == '\u{FEFF}'
+}
+
+/// JS `trimEnd`: JS whitespace without the leading side.
 fn js_trim_end(line: &[char]) -> &[char] {
     let mut end = line.len();
-    while end > 0 && (line[end - 1].is_whitespace() || line[end - 1] == '\u{FEFF}') {
+    while end > 0 && is_js_space(line[end - 1]) {
         end -= 1;
     }
     &line[..end]
+}
+
+/// JS `trim`: JS whitespace on both ends.
+fn js_trim(line: &[char]) -> &[char] {
+    let mut start = 0;
+    let mut end = line.len();
+    while start < end && is_js_space(line[start]) {
+        start += 1;
+    }
+    while end > start && is_js_space(line[end - 1]) {
+        end -= 1;
+    }
+    &line[start..end]
+}
+
+/// Upstream `missHint`'s display budget: at most this many lines of the file,
+/// each clipped to this many characters (upstream counts UTF-16 code units,
+/// this port counts characters, like the rest of the offset handling here).
+const HINT_LINES: usize = 12;
+const HINT_LINE_LENGTH: usize = 200;
+/// Upper bound on the (oldString line, file line) votes one hint may cast, so a
+/// file that repeats those lines cannot turn the diagnostic into a quadratic
+/// scan. Over budget the hint is dropped; the failure message is unaffected.
+const VOTE_BUDGET: usize = 1 << 20;
+
+/// The 0-match failure message: upstream's sentence, plus the miss hint when
+/// one is found (upstream appends `\n\n${hint}`). Without a hint the wording
+/// stays exactly what it was before the hint existed.
+fn miss_message(path: &str, source: &str, old_string: &str, new_string: &str) -> String {
+    let base = format!(
+        "Could not find oldString in {path}. It must match exactly, including whitespace and indentation."
+    );
+    match miss_hint(source, old_string, new_string) {
+        Some(hint) => format!("{base}\n\n{hint}"),
+        None => base,
+    }
+}
+
+/// A hint for an oldString miss, so the next attempt can succeed without
+/// rereading the file: either newString is already there (often an edit that
+/// already applied), or the lines closest to oldString numbered like Read
+/// output. Lines vote for where oldString starts when they match ignoring all
+/// whitespace; at least half of oldString's content lines must agree. Only the
+/// span from the first to the last line that matched is shown, so padding
+/// oldString cannot reveal the lines after it (upstream `missHint`; its
+/// `readable` permission gate is omitted because ox has no permission system).
+fn miss_hint(source: &str, old_string: &str, new_string: &str) -> Option<String> {
+    let view = lf_view(source.chars());
+    let replacement = lf_view(new_string.chars());
+    if js_trim(&replacement).len() >= 20
+        && !find_occurrences(
+            &normalize_typographic(&view),
+            &normalize_typographic(&replacement),
+        )
+        .is_empty()
+    {
+        return Some(
+            "newString is already in the file, so this edit may already be applied.".to_owned(),
+        );
+    }
+    // Borrow the lines out of `view`: the hint path runs once per failed edit,
+    // and copying every line again would double the file's transient footprint.
+    let lines: Vec<&[char]> = view.split(|&c| c == '\n').collect();
+    let search = lf_view(old_string.chars());
+    let keys: Vec<Chars> = search.split(|&c| c == '\n').map(hint_key).collect();
+    let mut positions: HashMap<Chars, Vec<usize>> = HashMap::new();
+    for (index, line) in lines.iter().enumerate() {
+        let value = hint_key(line);
+        if hint_distinct(&value) {
+            positions.entry(value).or_default().push(index);
+        }
+    }
+    let mut votes: Vec<(isize, usize)> = Vec::new();
+    let mut voted: HashMap<isize, usize> = HashMap::new();
+    let mut wanted = 0usize;
+    let mut budget = VOTE_BUDGET;
+    for (offset, value) in keys.iter().enumerate() {
+        if !hint_distinct(value) {
+            continue;
+        }
+        wanted += 1;
+        let Some(found) = positions.get(value) else {
+            continue;
+        };
+        for &index in found {
+            // A file that repeats oldString's content lines many times makes the
+            // voting pass quadratic. The hint is best effort, so drop it instead
+            // of stalling a failed edit on a pathological file.
+            if budget == 0 {
+                return None;
+            }
+            budget -= 1;
+            let start = index as isize - offset as isize;
+            match voted.get(&start) {
+                Some(&position) => votes[position].1 += 1,
+                None => {
+                    voted.insert(start, votes.len());
+                    votes.push((start, 1));
+                }
+            }
+        }
+    }
+    // Ties keep the first start that collected the highest vote count.
+    let mut best = (0isize, 0usize);
+    for &(start, count) in &votes {
+        if count > best.1 {
+            best = (start, count);
+        }
+    }
+    let (start, count) = best;
+    if count == 0 || count * 2 < wanted {
+        return None;
+    }
+    let mut matched: Vec<usize> = Vec::new();
+    for (offset, value) in keys.iter().enumerate() {
+        let Ok(index) = usize::try_from(start + offset as isize) else {
+            continue;
+        };
+        if index < lines.len() && !value.is_empty() && &hint_key(lines[index]) == value {
+            matched.push(index);
+        }
+    }
+    let from = *matched.first()?;
+    let to = (matched.last()? + 1).min(from + HINT_LINES);
+    let mut hint = vec!["The closest lines in the file:".to_owned()];
+    for (offset, line) in lines[from..to].iter().enumerate() {
+        let mut text: String = line[..line.len().min(HINT_LINE_LENGTH)].iter().collect();
+        if line.len() > HINT_LINE_LENGTH {
+            text.push('…');
+        }
+        hint.push(format!("{}: {text}", from + offset + 1));
+    }
+    Some(hint.join("\n"))
+}
+
+/// Upstream `missHint`'s line `key`: typographic variants folded, every run of
+/// whitespace collapsed to one space, then trimmed.
+fn hint_key(line: &[char]) -> Chars {
+    let mut key: Chars = Vec::with_capacity(line.len());
+    let mut pending_space = false;
+    for c in normalize_typographic(line) {
+        if is_js_space(c) {
+            pending_space = !key.is_empty();
+            continue;
+        }
+        if pending_space {
+            key.push(' ');
+            pending_space = false;
+        }
+        key.push(c);
+    }
+    key
+}
+
+/// Upstream `missHint`'s `distinct`: the line carries at least one Unicode
+/// letter or digit, so whitespace- and punctuation-only lines neither vote nor
+/// count towards the threshold (`\p{L}\p{N}` approximated by
+/// `char::is_alphanumeric`).
+fn hint_distinct(key: &[char]) -> bool {
+    key.iter().any(|c| c.is_alphanumeric())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::contract::ToolRegistry;
+
+    #[test]
+    fn a_new_string_already_in_the_file_is_reported_as_applied() {
+        // The source is in CRLF form, as Read shows it after the CRLF→LF view.
+        let source = "fn run() {\r\n    let total = compute(1, 2);\r\n}\r\n";
+        let hint = miss_hint(
+            source,
+            "let total = compute(1);\n",
+            "    let total = compute(1, 2);\n",
+        );
+
+        assert_eq!(
+            hint.as_deref(),
+            Some("newString is already in the file, so this edit may already be applied."),
+            "a newString already present in the file means the edit likely already applied"
+        );
+    }
+
+    #[test]
+    fn the_span_starts_at_the_voted_line_and_is_numbered_like_read() {
+        let source = "line 1\nline 2\nline 3\nline 4\nline 5\nline 6\n";
+        let hint = miss_hint(source, "line 4\nline 5 \n", "replacement goes here");
+
+        assert_eq!(
+            hint.as_deref(),
+            Some("The closest lines in the file:\n4: line 4\n5: line 5"),
+            "matching lines vote for oldString's start line, and only that span is shown"
+        );
+    }
+
+    #[test]
+    fn the_shown_span_is_capped_at_twelve_lines() {
+        let source: String = (1..=20).map(|n| format!("item {n} = {n};\n")).collect();
+        let old: String = (1..=14).map(|n| format!("item {n}  =  {n};\n")).collect();
+        let hint = miss_hint(&source, &old, "replacement goes here").expect("most lines match");
+        let shown: Vec<&str> = hint.lines().collect();
+
+        assert_eq!(shown.first(), Some(&"The closest lines in the file:"));
+        assert_eq!(
+            shown.len(),
+            1 + HINT_LINES,
+            "the hint adds no more than 12 lines"
+        );
+        assert_eq!(shown.get(1), Some(&"1: item 1 = 1;"));
+        assert_eq!(shown.last(), Some(&"12: item 12 = 12;"));
+    }
+
+    #[test]
+    fn each_shown_line_is_clipped_to_two_hundred_characters() {
+        let long = format!("{} tail", "x".repeat(300));
+        let source = format!("{long}\nnext line\n");
+        let old = format!("{}    tail\n", "x".repeat(300));
+        let hint = miss_hint(&source, &old, "replacement goes here").expect("the line votes");
+
+        assert_eq!(hint.lines().count(), 2, "only the matched line is shown");
+        assert_eq!(
+            hint.lines().last(),
+            Some(format!("1: {}…", "x".repeat(HINT_LINE_LENGTH)).as_str()),
+            "a long line is clipped to 200 characters plus an ellipsis"
+        );
+    }
+
+    #[test]
+    fn an_unrelated_old_string_keeps_the_verbatim_message() {
+        let source = "fn main() {\n    let total = 0;\n}\n";
+        let old = "totally different text\nwith two lines\n";
+        let new = "something else entirely";
+
+        assert_eq!(
+            miss_hint(source, old, new),
+            None,
+            "no content line of oldString appears in the file, so there is no span to show"
+        );
+        assert_eq!(
+            miss_message("a.rs", source, old, new),
+            "Could not find oldString in a.rs. It must match exactly, including whitespace and indentation.",
+            "with no hint the message is unchanged from the pre-hint wording"
+        );
+    }
+
+    #[test]
+    fn a_minority_of_matching_lines_casts_no_hint() {
+        // Three content lines of oldString, one of which appears in the file: one
+        // vote out of three does not clear upstream's half-of-the-lines threshold.
+        let source = "fn main() {\n    let total = 0;\n}\n";
+        let old = "let total = 0;\nalpha beta gamma;\ndelta epsilon zeta;\n";
+
+        assert_eq!(
+            miss_hint(source, old, "replacement goes here"),
+            None,
+            "fewer than half of oldString's content lines matched, so no span is shown"
+        );
+    }
+
+    /// Distinguishes this process's fixtures without reading the clock: the pid
+    /// separates concurrent `cargo test` runs, the counter separates tests.
+    static FIXTURE: AtomicUsize = AtomicUsize::new(0);
+
+    #[tokio::test]
+    async fn an_edit_is_refused_when_the_file_changed_since_the_read() {
+        let root = std::env::temp_dir().join(format!(
+            "ox-edit-stale-{}-{}",
+            std::process::id(),
+            FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).expect("create the isolated edit fixture");
+        let path = root.join("note.txt");
+        std::fs::write(&path, "one\n").expect("write the fixture");
+        let registry = Arc::new(ToolRegistry::with_builtins());
+        let ctx = ToolContext {
+            session_id: "ses_test".to_owned(),
+            directory: root.clone(),
+            call_id: "call_test".to_owned(),
+            cancellation: CancellationToken::new(),
+            registry: Arc::clone(&registry),
+        };
+        let read = registry.get("read").expect("read is registered");
+        let edit = registry.get("edit").expect("edit is registered");
+        let output = read
+            .execute(ctx.clone(), json!({ "path": "note.txt" }))
+            .await;
+        assert_eq!(output.error, None, "the read itself must succeed");
+
+        // Another writer replaces the file behind the session's back.
+        std::fs::write(&path, "one\ntwo\n").expect("rewrite the fixture");
+        let input = json!({ "path": "note.txt", "oldString": "one\n", "newString": "uno\n" });
+        let output = edit.execute(ctx.clone(), input.clone()).await;
+        assert_eq!(
+            output.error.as_deref(),
+            Some(
+                "Failed to edit note.txt: the file changed since your last read of it. \
+                 Read it again before editing."
+            ),
+            "an edit must not overwrite content that changed since the read"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read the fixture back"),
+            "one\ntwo\n",
+            "the refused edit writes nothing"
+        );
+
+        // Reading again records the new state, so the same edit now applies.
+        let output = read
+            .execute(ctx.clone(), json!({ "path": "note.txt" }))
+            .await;
+        assert_eq!(output.error, None, "the second read must succeed");
+        let output = edit.execute(ctx, input).await;
+        assert_eq!(output.error, None, "after a re-read the edit applies");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read the fixture back"),
+            "uno\ntwo\n"
+        );
+        std::fs::remove_dir_all(root).expect("remove the isolated edit fixture");
+    }
 }

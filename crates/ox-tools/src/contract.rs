@@ -126,6 +126,11 @@ pub struct ToolRegistry {
     /// Shared blocking-job registry; the server's `session.background`
     /// endpoint reaches the foreground tools' registrations through here.
     pub jobs: Arc<crate::jobs::Jobs>,
+    /// Per-session file stamps: `read` records what it served, and the writing
+    /// tools (`edit`, `write`, `patch`) refuse a file that changed since. One
+    /// store per process, keyed by session, so a derived registry
+    /// ([`ToolRegistry::without`] / [`ToolRegistry::only`]) shares it.
+    pub files: Arc<crate::file_state::FileStates>,
 }
 
 impl ToolRegistry {
@@ -174,6 +179,7 @@ impl ToolRegistry {
             subagent_handle: self.subagent_handle.clone(),
             shell_completion: self.shell_completion.clone(),
             jobs: Arc::clone(&self.jobs),
+            files: Arc::clone(&self.files),
         }
     }
 
@@ -194,6 +200,7 @@ impl ToolRegistry {
             subagent_handle: self.subagent_handle.clone(),
             shell_completion: self.shell_completion.clone(),
             jobs: Arc::clone(&self.jobs),
+            files: Arc::clone(&self.files),
         }
     }
 

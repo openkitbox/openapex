@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::contract::{Tool, ToolContext, ToolOutput};
+use crate::file_state::Verdict;
 use ox_schema::wire::ToolDef;
 
 use super::diff::{self as Diff, DiffStatus};
@@ -157,6 +158,39 @@ impl Prepared {
     }
 }
 
+/// Make a write target's parent directory and reject a target that cannot be
+/// written: an existing directory.
+///
+/// Write permission is not probed here: Unix mode bits alone do not decide it
+/// (root and ACLs can write a `444` file, a read-only mount rejects a `644`), so
+/// a guessed refusal would be wrong more often than the write's own error.
+fn preflight_write(target: &std::path::Path) -> std::io::Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::metadata(target) {
+        Ok(metadata) if metadata.is_dir() => Err(std::io::Error::new(
+            std::io::ErrorKind::IsADirectory,
+            "path is a directory",
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Reject a delete target that is missing or is a directory.
+fn preflight_delete(target: &std::path::Path) -> std::io::Result<()> {
+    match std::fs::metadata(target) {
+        Ok(metadata) if metadata.is_dir() => Err(std::io::Error::new(
+            std::io::ErrorKind::IsADirectory,
+            "path is a directory",
+        )),
+        Ok(_) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 fn apply(ctx: &ToolContext, hunks: Vec<Hunk>) -> ToolOutput {
     // ---- prepare (no writes) ----
     let mut prepared: Vec<Prepared> = Vec::new();
@@ -245,6 +279,85 @@ fn apply(ctx: &ToolContext, hunks: Vec<Hunk>) -> ToolOutput {
         }
     }
 
+    // ---- preflight (no file contents written) ----
+    // Catch predictable target failures before the first byte is written, so
+    // a patch that cannot fully apply does not leave earlier changes behind.
+    // Missing parent directories are created here, so a preflight failure can
+    // still leave an empty directory. See `preflight_write`.
+    //
+    // Freshness runs first and covers every path the patch would write,
+    // including a move destination, so a target that changed since this session
+    // read it is refused before any directory is created for it.
+    let stale = |operation: &str, resource: &str, target: &std::path::Path| {
+        (ctx.registry.files.check(&ctx.session_id, target) == Verdict::Changed).then(|| {
+            fail(format!(
+                "Failed to {operation} {resource}: the file changed since your last read of it. Read it again before patching."
+            ))
+        })
+    };
+    for change in &prepared {
+        let refusal = match change.kind {
+            "delete" => stale("delete", &change.resource, &change.target),
+            _ => stale("write", &change.resource, &change.target).or_else(|| {
+                change
+                    .move_to
+                    .as_ref()
+                    .and_then(|(target, resource)| stale("write", resource, target))
+            }),
+        };
+        if let Some(output) = refusal {
+            return output;
+        }
+    }
+    for change in &prepared {
+        match change.kind {
+            "delete" => {
+                if let Err(error) = preflight_delete(&change.target) {
+                    return fail(format!(
+                        "Failed to delete {}: {}",
+                        change.resource,
+                        cause_of(&error, &change.target)
+                    ));
+                }
+            }
+            "update" => match &change.move_to {
+                Some((move_target, move_resource)) => {
+                    if let Err(error) = preflight_write(move_target) {
+                        return fail(format!(
+                            "Failed to write {move_resource}: {}",
+                            cause_of(&error, move_target)
+                        ));
+                    }
+                    if let Err(error) = preflight_delete(&change.target) {
+                        return fail(format!(
+                            "Failed to delete {}: {}",
+                            change.resource,
+                            cause_of(&error, &change.target)
+                        ));
+                    }
+                }
+                None => {
+                    if let Err(error) = preflight_write(&change.target) {
+                        return fail(format!(
+                            "Failed to write {}: {}",
+                            change.resource,
+                            cause_of(&error, &change.target)
+                        ));
+                    }
+                }
+            },
+            _ => {
+                if let Err(error) = preflight_write(&change.target) {
+                    return fail(format!(
+                        "Failed to write {}: {}",
+                        change.resource,
+                        cause_of(&error, &change.target)
+                    ));
+                }
+            }
+        }
+    }
+
     // ---- apply in order ----
     let mut applied: Vec<(&'static str, String)> = Vec::new();
     let failure =
@@ -272,6 +385,9 @@ fn apply(ctx: &ToolContext, hunks: Vec<Hunk>) -> ToolOutput {
                     );
                 }
                 applied.push(("delete", change.resource.clone()));
+                // The path is gone: drop its stamp so a recreated file is not
+                // compared against content that no longer exists.
+                ctx.registry.files.forget(&ctx.session_id, &change.target);
             }
             "update" => match &change.move_to {
                 Some((move_target, move_resource)) => {
@@ -293,6 +409,11 @@ fn apply(ctx: &ToolContext, hunks: Vec<Hunk>) -> ToolOutput {
                             &applied,
                         );
                     }
+                    // The update moved the content to the destination, so that
+                    // is the path whose state this session now knows; the source
+                    // no longer exists.
+                    ctx.registry.files.record(&ctx.session_id, move_target);
+                    ctx.registry.files.forget(&ctx.session_id, &change.target);
                     applied.push(("update", move_resource.clone()));
                 }
                 None => {
@@ -303,6 +424,7 @@ fn apply(ctx: &ToolContext, hunks: Vec<Hunk>) -> ToolOutput {
                             &applied,
                         );
                     }
+                    ctx.registry.files.record(&ctx.session_id, &change.target);
                     applied.push(("update", change.resource.clone()));
                 }
             },
@@ -314,6 +436,7 @@ fn apply(ctx: &ToolContext, hunks: Vec<Hunk>) -> ToolOutput {
                         &applied,
                     );
                 }
+                ctx.registry.files.record(&ctx.session_id, &change.target);
                 applied.push((change.kind, change.resource.clone()));
             }
         }
@@ -830,4 +953,141 @@ fn normalized(left: &str, right: &str) -> bool {
     let left: Vec<char> = super::normalize_typographic(&left.trim().chars().collect::<Vec<_>>());
     let right: Vec<char> = super::normalize_typographic(&right.trim().chars().collect::<Vec<_>>());
     left == right
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::contract::ToolRegistry;
+
+    /// Distinguishes this process's fixtures without reading the clock: the pid
+    /// separates concurrent `cargo test` runs, the counter separates tests.
+    static FIXTURE: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn preflight_failure_writes_no_earlier_changes() {
+        let root = std::env::temp_dir().join(format!(
+            "ox-patch-preflight-{}-{}",
+            std::process::id(),
+            FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).expect("create the isolated patch fixture");
+        std::fs::create_dir(root.join("blocked")).expect("make the second target a directory");
+        let ctx = ToolContext {
+            session_id: "ses_test".to_owned(),
+            directory: root.clone(),
+            call_id: "call_test".to_owned(),
+            cancellation: CancellationToken::new(),
+            registry: Arc::new(ToolRegistry::new()),
+        };
+        let input = json!({ "patchText": "*** Begin Patch\n*** Add File: first.txt\n+first\n*** Add File: blocked\n+second\n*** End Patch" });
+
+        let output = run(&ctx, &input);
+
+        assert!(
+            !root.join("first.txt").exists(),
+            "a later preflight failure must leave the first file unwritten"
+        );
+        assert_eq!(
+            output.error.as_deref(),
+            Some("Failed to write blocked: path is a directory")
+        );
+        std::fs::remove_dir_all(root).expect("remove the isolated patch fixture");
+    }
+
+    #[tokio::test]
+    async fn a_changed_update_target_rejects_the_whole_patch() {
+        let root = std::env::temp_dir().join(format!(
+            "ox-patch-stale-{}-{}",
+            std::process::id(),
+            FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).expect("create the isolated patch fixture");
+        std::fs::write(root.join("a.txt"), "alpha\n").expect("write the first fixture");
+        std::fs::write(root.join("b.txt"), "beta\n").expect("write the second fixture");
+        let registry = Arc::new(ToolRegistry::with_builtins());
+        let ctx = ToolContext {
+            session_id: "ses_test".to_owned(),
+            directory: root.clone(),
+            call_id: "call_test".to_owned(),
+            cancellation: CancellationToken::new(),
+            registry: Arc::clone(&registry),
+        };
+        let read = registry.get("read").expect("read is registered");
+        for file in ["a.txt", "b.txt"] {
+            let output = read.execute(ctx.clone(), json!({ "path": file })).await;
+            assert_eq!(output.error, None, "the read of {file} must succeed");
+        }
+        // b.txt changes after the session read it.
+        std::fs::write(root.join("b.txt"), "beta\ngamma\n").expect("rewrite the second fixture");
+        let input = json!({ "patchText": "*** Begin Patch\n*** Update File: a.txt\n@@\n-alpha\n+ALPHA\n*** Update File: b.txt\n@@\n-beta\n+BETA\n*** End Patch" });
+
+        let output = run(&ctx, &input);
+
+        assert_eq!(
+            output.error.as_deref(),
+            Some(
+                "Failed to write b.txt: the file changed since your last read of it. \
+                 Read it again before patching."
+            ),
+            "a stale update target is refused before anything is written"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).expect("read the first fixture back"),
+            "alpha\n",
+            "a stale later target leaves the earlier change unwritten"
+        );
+        std::fs::remove_dir_all(root).expect("remove the isolated patch fixture");
+    }
+
+    #[tokio::test]
+    async fn a_stale_add_target_rejects_the_whole_patch() {
+        // `Add File` over an existing path overwrites it, so it is a write to a
+        // file the session may already have read: the same guard applies.
+        let root = std::env::temp_dir().join(format!(
+            "ox-patch-stale-add-{}-{}",
+            std::process::id(),
+            FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&root).expect("create the isolated patch fixture");
+        std::fs::write(root.join("target.txt"), "original\n").expect("write the fixture");
+        let registry = Arc::new(ToolRegistry::with_builtins());
+        let ctx = ToolContext {
+            session_id: "ses_test".to_owned(),
+            directory: root.clone(),
+            call_id: "call_test".to_owned(),
+            cancellation: CancellationToken::new(),
+            registry: Arc::clone(&registry),
+        };
+        let read = registry.get("read").expect("read is registered");
+        let output = read
+            .execute(ctx.clone(), json!({ "path": "target.txt" }))
+            .await;
+        assert_eq!(output.error, None, "the read must succeed before it stales");
+        std::fs::write(root.join("target.txt"), "changed out of band\n")
+            .expect("rewrite the fixture behind the session's back");
+        let input = json!({ "patchText": "*** Begin Patch\n*** Add File: target.txt\n+replaced\n*** End Patch" });
+
+        let output = run(&ctx, &input);
+
+        assert_eq!(
+            output.error.as_deref(),
+            Some(
+                "Failed to write target.txt: the file changed since your last read of it. \
+                 Read it again before patching."
+            ),
+            "an add that would overwrite a stale file is refused"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("target.txt")).expect("read the fixture back"),
+            "changed out of band\n",
+            "the refused add leaves the stale file untouched"
+        );
+        std::fs::remove_dir_all(root).expect("remove the isolated patch fixture");
+    }
 }

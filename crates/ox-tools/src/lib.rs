@@ -25,6 +25,7 @@ pub mod capability_search;
 pub mod contract;
 pub mod diff;
 pub mod edit;
+pub mod file_state;
 pub mod form;
 pub mod glob;
 pub mod grep;

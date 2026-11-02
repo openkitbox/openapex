@@ -147,7 +147,20 @@ fn read_path(ctx: &ToolContext, path: &str, page: &Page) -> ToolOutput {
     if let Some(mime) = media_mime_for(&absolute) {
         return media_output(path, &absolute, &resource, mime, metadata.len());
     }
-    read_text(path, &absolute, &resource, page)
+    let output = read_text(path, &absolute, &resource, page);
+    // Only a served text page is remembered: it is the content a later edit
+    // would replace. Media is attached rather than edited, and a directory has
+    // no stamp to compare. The stamp comes from the metadata this call already
+    // read, so it costs no extra syscall; a write that lands between this stat
+    // and the bytes being served shows up as a changed stamp on the next write,
+    // which only ever refuses, never overlooks.
+    if output.error.is_none() {
+        let stamp = crate::file_state::Stamp::of(&metadata);
+        ctx.registry
+            .files
+            .record_stamp(&ctx.session_id, &absolute, stamp);
+    }
+    output
 }
 
 /// Attach a media file as a model-visible `file` content part.
