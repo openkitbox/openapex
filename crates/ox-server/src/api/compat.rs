@@ -1,7 +1,8 @@
 //! Catalog endpoints the clients probe at startup that ox answers with
 //! empty or trivially-derived data. Shapes follow upstream's protocol
 //! (`packages/protocol/openapi.json`); semantics are the ox MVP subset —
-//! no plugins, commands, skills, forms, or integrations exist; MCP is real
+//! no plugins, commands, skills or forms exist (integrations are real:
+//! `src/integration`), MCP is real
 //! (src/mcp), and config is not yet modeled. Unlike upstream, these endpoints
 //! answer 200
 //! with empty data for unknown locations instead of 404
@@ -98,9 +99,9 @@ pub(crate) async fn config_get(res: &mut Response) {
     res.render(Json(json!([])));
 }
 
-/// Empty catalog lists: command / reference / plugin / integration.
+/// Empty catalog lists: command / reference / plugin.
 /// (`provider` has a real handler in the parent module — the configured
-/// model catalog.)
+/// model catalog; `integration` lives in `src/integration`.)
 macro_rules! empty_catalog {
     ($name:ident, $operation:literal) => {
         #[handler] // operation_id: $operation
@@ -114,7 +115,6 @@ macro_rules! empty_catalog {
 empty_catalog!(command_list, "command.list");
 empty_catalog!(reference_list, "reference.list");
 empty_catalog!(plugin_list, "plugin.list");
-empty_catalog!(integration_list, "integration.list");
 
 /// `POST /api/rpc/{rpcID}/{method}` — upstream `rpc.call`. ox registers no
 /// plugin RPCs, so every call gets upstream's unregistered-RPC reply
@@ -296,7 +296,6 @@ pub(crate) fn mount(api: Router) -> Router {
             .push(Router::with_path("provider").get(super::provider_list))
             .push(Router::with_path("reference").get(reference_list))
             .push(Router::with_path("plugin").get(plugin_list))
-            .push(Router::with_path("integration").get(integration_list))
             .push(Router::with_path("fs/list").get(fs_list))
             .push(Router::with_path("fs/find").get(fs_find))
             .push(Router::with_path("experimental/migration/v1").get(migration_status))

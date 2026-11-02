@@ -24,6 +24,7 @@ pub mod event;
 pub mod family;
 pub mod files;
 pub mod form;
+mod integration;
 pub mod lease;
 mod mcp;
 pub mod session;
@@ -773,6 +774,11 @@ pub fn build_router(state: AppState) -> Router {
                         .push(Router::with_path("init").post(vcs::init)),
                 )
                 .push(compat::mount(Router::new()))
+                .push(Router::with_path("integration").get(integration::list))
+                .push(
+                    Router::with_path("integration/{integrationID}/connect/key")
+                        .post(integration::connect_key),
+                )
                 .push(Router::with_path("form").get(form::list))
                 .push(Router::with_path("skill").get(skill::list))
                 .push(

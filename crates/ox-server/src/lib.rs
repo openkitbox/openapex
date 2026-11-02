@@ -48,6 +48,23 @@ fn chat_transport(config: &Config) -> Result<Arc<dyn runner::Chat>> {
     Ok(Arc::new(router))
 }
 
+/// Apply the keys `/connect` stored (the `credential` table) to the endpoint
+/// config.
+///
+/// Called as soon as the database is open and **before** the chat transport
+/// and the model catalogue are built: a builtin provider is only materialized
+/// once it can authenticate, so a key that arrives later would produce a
+/// catalogue entry with no route behind it. A database read failure is
+/// propagated, not swallowed — running without the user's credentials would
+/// silently drop their providers.
+async fn apply_credentials(db: &Db, config: &mut Config) -> Result<()> {
+    let credentials = ox_core::credential::load(db)
+        .await
+        .map_err(|error| anyhow::anyhow!("loading stored credentials failed: {error:#}"))?;
+    config.llm.apply_credentials(&credentials);
+    Ok(())
+}
+
 /// Build application state: open the DB, run migrations, canonicalize the
 /// working directory once (falls back to the raw path on error), and register
 /// the eight built-in tools plus the magic-context tools when enabled (the
@@ -57,8 +74,20 @@ fn chat_transport(config: &Config) -> Result<Arc<dyn runner::Chat>> {
 /// `codebase-memory-mcp` binary is probed at the composition root ([`run`]),
 /// so tests get a deterministic toolset regardless of the host's `PATH`.
 pub async fn build_state(config: Config) -> Result<AppState> {
+    let mut config = config;
+    let db = Db::open(&config.db_path).await?;
+    apply_credentials(&db, &mut config).await?;
     let chat = chat_transport(&config)?;
-    build_state_with(config, chat, runner::ToolRegistry::with_builtins()).await
+    let _ = std::fs::create_dir_all(ox_core::config::ox_home().join("tmp"));
+    let home = ox_core::config::ox_home();
+    build_state_on(
+        config,
+        chat,
+        runner::ToolRegistry::with_builtins(),
+        db,
+        home,
+    )
+    .await
 }
 
 /// [`build_state`] with an injected chat transport and tool registry —
@@ -88,7 +117,12 @@ pub async fn build_state_with_home(
     tools: runner::ToolRegistry,
     home: std::path::PathBuf,
 ) -> Result<AppState> {
+    let mut config = config;
     let db = Db::open(&config.db_path).await?;
+    // The injected transport was built by the caller; applying the credentials
+    // here still matters, because the model catalogue is built from this config
+    // and must describe the same providers the transport routes to.
+    apply_credentials(&db, &mut config).await?;
     // The env block advertises <ox_home>/tmp as the preferred scratch space
     // (upstream `global.tmp`); create it once at boot.
     let _ = std::fs::create_dir_all(ox_core::config::ox_home().join("tmp"));
@@ -280,6 +314,8 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
     // exists after `build_state_on`, so `run` registers it through the
     // runner's handle slot and the registry here.
     let db = Db::open(&config.db_path).await?;
+    let mut config = config;
+    apply_credentials(&db, &mut config).await?;
     let bus = EventBus::new(db.clone());
     tools.register_todowrite(db.clone());
     tools.register_subagent(

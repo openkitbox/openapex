@@ -47,6 +47,14 @@ pub(crate) async fn run(state: &AppState, directory: &str) -> Result<()> {
         .replace(|old| async move {
             let mut next = Config::load_from(state.config_path.clone())
                 .with_context(|| format!("reload {}", state.config_path.display()))?;
+            // Keys `/connect` stored live in the database, not in `ox.toml`, so
+            // every reload re-reads them before the transport is rebuilt —
+            // otherwise a hot reload would forget a provider connected in this
+            // process' lifetime.
+            let credentials = ox_core::credential::load(&state.db)
+                .await
+                .context("loading stored credentials")?;
+            next.llm.apply_credentials(&credentials);
             for name in next.pin_restart_only(&old.config) {
                 tracing::warn!(
                     key = name,

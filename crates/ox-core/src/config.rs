@@ -420,12 +420,6 @@ fn parse_error(path: &Path, raw: &str, error: &toml::de::Error) -> anyhow::Error
 }
 
 impl Config {
-    /// Default credential-file location: `~/.ox/credentials.toml`.
-    #[must_use]
-    pub fn default_credentials_path() -> PathBuf {
-        ox_llm::credentials::path_in(&ox_home())
-    }
-
     /// Default config file location: `~/.ox/ox.toml`.
     #[must_use]
     pub fn default_path() -> PathBuf {
@@ -439,13 +433,13 @@ impl Config {
     }
 
     /// Load config from an explicit path, then apply env overrides.
+    ///
+    /// Stored credentials (the `credential` table `/connect` writes) are
+    /// **not** applied here: opening the database is async and happens after
+    /// this synchronous load, so the server calls
+    /// `LlmConfig::apply_credentials` itself once the DB is open. Until then a
+    /// builtin provider with only a stored key is intentionally absent.
     pub fn load_from(path: PathBuf) -> Result<Self> {
-        Self::load_from_with_credentials(path, &Self::default_credentials_path())
-    }
-
-    /// [`Self::load_from`] with an explicit credential file, so tests (and the
-    /// connect smoke runs) never read the developer's real keys.
-    pub fn load_from_with_credentials(path: PathBuf, credentials: &Path) -> Result<Self> {
         let mut config = if path.exists() {
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("failed to read config file {}", path.display()))?;
@@ -455,13 +449,6 @@ impl Config {
         };
 
         config.llm.apply_env();
-        // `/connect`'s store: keys the user entered at runtime, kept out of
-        // `ox.toml`. Applied after the environment so an explicit connection
-        // wins over an inherited variable, and before validation so a builtin
-        // provider only exists once it can authenticate.
-        config
-            .llm
-            .apply_credentials(&ox_llm::credentials::Credentials::load(credentials));
         if let Ok(db) = std::env::var(ENV_DB_PATH) {
             config.db_path = PathBuf::from(db);
         }

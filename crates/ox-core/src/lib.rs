@@ -8,6 +8,7 @@
 
 pub mod config;
 pub mod copied_tags;
+pub mod credential;
 pub mod event_bus;
 pub mod home_paths;
 pub mod projector;

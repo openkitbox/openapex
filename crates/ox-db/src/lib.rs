@@ -483,6 +483,26 @@ DROP INDEX IF EXISTS mc_compartments_fts;
 CREATE INDEX IF NOT EXISTS session_v2_directory_idx ON session_v2 (directory);
 "#;
 
+/// V19: `/connect`'s credential store, mirroring upstream opencode's
+/// `credential` table (`packages/core/src/credential/sql.ts`, migration
+/// `20260611192811_lush_chimera`) so a database written by either server stays
+/// readable by the other. ox stores one active `key` row per integration.
+/// No unique index on `integration_id`: upstream dropped that index in the
+/// same migration, so adding one here would make upstream writes fail.
+const MIGRATION_V19: &str = r#"
+CREATE TABLE IF NOT EXISTS credential (
+  id text PRIMARY KEY,
+  integration_id text,
+  label text NOT NULL,
+  value text NOT NULL,
+  connector_id text,
+  method_id text,
+  active integer,
+  time_created integer NOT NULL,
+  time_updated integer NOT NULL
+);
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
@@ -505,6 +525,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (16, MIGRATION_V16),
     (17, MIGRATION_V17),
     (18, MIGRATION_V18),
+    (19, MIGRATION_V19),
 ];
 
 /// Async handle to the database.
@@ -567,6 +588,41 @@ pub const PAGE_CACHE_PAGES: i64 = 200;
 /// the database without its exclusive file lock.
 const DISABLE_FILE_LOCK_ENV: &str = "LIMBO_DISABLE_FILE_LOCK";
 
+/// Make the database file (and its `-wal` / `-shm` companions) owner-only.
+///
+/// The `credential` table holds provider API keys, so a world-readable
+/// `ox.db` would hand them to every local user — a weaker posture than the
+/// `0600` file this store replaced. A failure only warns: refusing to open a
+/// database over a permission bit would cost the user their session, and the
+/// warning names the file so it is fixable.
+fn restrict_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let mut targets = vec![path.to_path_buf()];
+        for suffix in ["-wal", "-shm"] {
+            targets.push(path.with_file_name(format!("{name}{suffix}")));
+        }
+        for target in targets {
+            match std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    path = %target.display(),
+                    %error,
+                    "could not restrict database permissions; provider keys may be readable by other users"
+                ),
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 impl Db {
     /// Open (creating if needed) the database at `path` and apply migrations.
     /// Parent directories are created automatically.
@@ -626,6 +682,7 @@ impl Db {
             write_gate: Arc::new(Mutex::new(())),
         };
         db.migrate().await?;
+        restrict_permissions(Path::new(path));
         Ok(db)
     }
 
