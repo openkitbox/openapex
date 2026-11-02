@@ -18,9 +18,9 @@
 //! [`RtkRewriter`] rewrites the command itself (`git status` →
 //! `rtk git status`), so the capture, the paged output and the model-facing
 //! text are all the same bytes — there is no second, minimized copy. RTK
-//! buffers a wrapped command's output until it exits, so commands that return
-//! an owned session at once (`background=true` or `yield_time_ms=0`) are never
-//! rewritten; a rewritten foreground command that outlives its yield window
+//! buffers a wrapped command's output until it exits, so a command that returns
+//! an owned session at once (`yield_time_ms=0`) is never rewritten; a rewritten
+//! foreground command that outlives its yield window
 //! says so in its "still running" notice. Commands run with stdin at
 //! `/dev/null`, so interactive commands fail fast on EOF instead of hanging.
 //!
@@ -54,10 +54,11 @@ use super::{
 /// Upstream `ShellTool.DEFAULT_TIMEOUT_MS`.
 pub const DEFAULT_TIMEOUT_MS: u64 = 2 * 60 * 1_000;
 
-/// The timeout a call gets when it passes none. Upstream: `background === true
-/// ? (timeout ?? 0) : (timeout ?? DEFAULT_TIMEOUT_MS)`. An `owned` run is
-/// handed back at once (`background=true` or `yield_time_ms=0`) and has no
-/// deadline unless the caller asks for one; a foreground run keeps the default.
+/// The timeout a call gets when it passes none. Upstream keyed this on
+/// `background === true ? (timeout ?? 0) : (timeout ?? DEFAULT_TIMEOUT_MS)`,
+/// which this surface expresses as `yield_time_ms=0`. An `owned` run is handed
+/// back at once and has no deadline unless the caller asks for one; a
+/// foreground run keeps the default.
 #[must_use]
 pub fn default_timeout_ms(owned: bool) -> u64 {
     if owned { 0 } else { DEFAULT_TIMEOUT_MS }
@@ -177,7 +178,7 @@ impl Tool for ShellTool {
                 .to_owned(),
         );
         lines.push(
-            "When NOT to use: read, write, edit, glob, or grep a file (each has a dedicated tool), print a file with cat, or search text with grep or rg. Never detach with &, nohup, or setsid; use the background parameter instead."
+            "When NOT to use: read, write, edit, glob, or grep a file (each has a dedicated tool), print a file with cat, or search text with grep or rg. Never detach with &, nohup, or setsid; pass yield_time_ms=0 instead."
                 .to_owned(),
         );
         ToolDef::function(
@@ -211,7 +212,7 @@ impl Tool for ShellTool {
                         "timeout",
                         super::int_param(
                             0,
-                            "Timeout in milliseconds for the whole session. Set to 0 to disable the timeout. Defaults to 120000 for foreground commands and to 0 (no timeout) for background commands (background=true or yield_time_ms=0). A foreground command that outlives its yield window and moves to the background loses its timeout and runs until it exits or is stopped.",
+                            "Timeout in milliseconds for the whole session. Set to 0 to disable the timeout. Defaults to 120000 for foreground commands and to 0 (no timeout) for a command that returns at once (yield_time_ms=0). A foreground command that outlives its yield window and moves to the background loses its timeout and runs until it exits or is stopped.",
                         ),
                     ),
                     (
@@ -243,7 +244,7 @@ impl Tool for ShellTool {
                         ),
                     ),
                 ],
-                &["action"],
+                &[],
             ),
         )
     }
@@ -334,14 +335,24 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
         Ok(value) => value,
         Err(output) => return output,
     };
-    let yield_time_ms = match optional_nonneg_int("shell", input, "yield_time_ms") {
+    // `background` was a parameter before the session model replaced it with a
+    // zero yield window. The schema no longer offers it, so a call that still
+    // sends it is answered with what to use instead of being run in the
+    // foreground for its whole yield window.
+    if let Some(sent) = input.get("background").filter(|value| !value.is_null()) {
+        return super::invalid_arguments(
+            "shell",
+            &[(
+                "background",
+                format!("Not a parameter; pass yield_time_ms=0 instead (got {sent})"),
+            )],
+            input,
+        );
+    }
+    // A zero yield window hands the run back as an owned session at once; any
+    // other value waits out the window.
+    let yield_ms = match optional_nonneg_int("shell", input, "yield_time_ms") {
         Ok(value) => value.unwrap_or(DEFAULT_YIELD_MS),
-        Err(output) => return output,
-    };
-    // `background` from the pre-session schema: keep it as "return at once",
-    // which the session model expresses as a zero yield window.
-    let background = match optional_bool("shell", input, "background") {
-        Ok(value) => value.unwrap_or(false),
         Err(output) => return output,
     };
     // Upstream prepare() failures and spawn failures are both wrapped by the
@@ -368,9 +379,6 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
         }
         None => ctx.directory.clone(),
     };
-    // A background request starts a session and returns at once; a foreground
-    // request waits out its yield window.
-    let yield_ms = if background { 0 } else { yield_time_ms };
     let timeout_ms = timeout.unwrap_or_else(|| default_timeout_ms(yield_ms == 0));
     if yield_ms == 0 && tool.completion.is_none() {
         return fail(
@@ -378,9 +386,9 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
         );
     }
     // RTK rewrites the command itself before execution; any failure leaves it
-    // unchanged. Commands that return an owned session at once are exempt
-    // (`background=true` or `yield_time_ms=0`): their value is streaming
-    // output, which RTK would buffer until the command exits.
+    // unchanged. A command that returns an owned session at once
+    // (`yield_time_ms=0`) is exempt: its value is streaming output, which RTK
+    // would buffer until the command exits.
     let mut rewritten = false;
     let to_run = if yield_ms == 0 {
         command.to_owned()
@@ -790,5 +798,54 @@ mod tests {
         if let Some(session) = sessions.get(&shell_id) {
             session.stop(true).await;
         }
+    }
+
+    /// `background` was replaced by `yield_time_ms=0`: the definition must stop
+    /// offering it (in prose as well as in the schema), and a leftover call
+    /// must be answered with the replacement instead of a foreground run.
+    #[tokio::test]
+    async fn background_is_not_a_parameter() {
+        let tool = ShellTool::new();
+        let definition = tool.definition().function;
+        assert!(
+            !definition.description.contains("background parameter"),
+            "the description must not name a parameter the schema does not declare",
+        );
+        let properties = definition.parameters["properties"]
+            .as_object()
+            .expect("shell parameters declare properties");
+        assert!(
+            !properties.contains_key("background"),
+            "the schema must not offer a parameter the parser rejects",
+        );
+        assert!(
+            properties.contains_key("yield_time_ms"),
+            "the yield window is the parameter that replaced background",
+        );
+        assert!(
+            definition.parameters["required"].is_null(),
+            "action defaults to run, so the schema must not require it",
+        );
+
+        let ctx = ToolContext {
+            session_id: "ses_test".to_owned(),
+            directory: std::env::temp_dir(),
+            call_id: "call_test".to_owned(),
+            cancellation: CancellationToken::new(),
+            registry: Arc::new(ToolRegistry::new()),
+        };
+        let output = run(
+            &tool,
+            &ctx,
+            &json!({"command": "true", "background": "true"}),
+        )
+        .await;
+        let message = output
+            .error
+            .expect("a leftover background call is rejected");
+        assert!(
+            message.contains("pass yield_time_ms=0 instead"),
+            "the error must name the replacement parameter: {message}",
+        );
     }
 }
