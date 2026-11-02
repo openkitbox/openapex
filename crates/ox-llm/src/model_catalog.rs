@@ -51,6 +51,14 @@ pub struct ModelEntry {
     /// Maximum output tokens, when the provider states one.
     #[serde(default)]
     pub output: Option<i64>,
+    /// Input modalities the model accepts (`text`, `image`), as the endpoint's
+    /// own listing reports them. Empty means the listing said nothing, and the
+    /// API projection then falls back to `text`.
+    #[serde(default)]
+    pub input_modalities: Vec<String>,
+    /// Output modalities the model produces. Empty as above.
+    #[serde(default)]
+    pub output_modalities: Vec<String>,
     /// Whether the model accepts a sampling temperature parameter.
     #[serde(default)]
     pub temperature: Option<bool>,
@@ -374,9 +382,8 @@ impl ModelCatalog {
                 body.chars().take(200).collect::<String>()
             );
         }
-        let list: ModelList = serde_json::from_str(&body).context("parse the model list")?;
-        let mut entries: Vec<ModelEntry> = list
-            .data
+        let rows = parse_list(&body)?;
+        let mut entries: Vec<ModelEntry> = rows
             .into_iter()
             .map(|row| row.into_entry(&endpoint.name))
             .collect();
@@ -417,6 +424,12 @@ impl ModelCatalog {
                     context: donor.and_then(|entry| entry.context),
                     input: donor.and_then(|entry| entry.input),
                     output: donor.and_then(|entry| entry.output),
+                    input_modalities: donor
+                        .map(|entry| entry.input_modalities.clone())
+                        .unwrap_or_default(),
+                    output_modalities: donor
+                        .map(|entry| entry.output_modalities.clone())
+                        .unwrap_or_default(),
                     name: donor.and_then(|entry| entry.name.clone()),
                     model_type: donor.and_then(|entry| entry.model_type.clone()),
                     temperature: donor.and_then(|entry| entry.temperature),
@@ -462,6 +475,8 @@ fn pick_default(entries: &[ModelEntry], config: &LlmConfig) -> Option<ModelEntry
             context: None,
             input: None,
             output: None,
+            input_modalities: Vec::new(),
+            output_modalities: Vec::new(),
             temperature: None,
             reasoning: false,
             supported_reasoning_levels: Vec::new(),
@@ -506,6 +521,8 @@ fn seed_entry(endpoint: &CatalogEndpoint, seed: &SeedModel) -> ModelEntry {
         context: Some(seed.context),
         input: None,
         output: Some(seed.output),
+        input_modalities: Vec::new(),
+        output_modalities: Vec::new(),
         temperature: Some(false),
         reasoning: !seed.reasoning.is_empty(),
         supported_reasoning_levels: seed
@@ -531,22 +548,80 @@ fn merge_seed(entry: &mut ModelEntry, seeds: &'static [SeedModel]) {
     entry.output = entry.output.or(Some(seed.output));
     entry.temperature.get_or_insert(false);
     if !seed.reasoning.is_empty() {
-        entry.reasoning = true;
-        if entry.supported_reasoning_levels.is_empty() {
-            entry.supported_reasoning_levels = seed
-                .reasoning
-                .iter()
-                .map(|effort| ReasoningLevel {
-                    effort: (*effort).to_owned(),
-                })
-                .collect();
-        }
+        entry.supported_reasoning_levels =
+            merge_levels(&entry.supported_reasoning_levels, seed.reasoning);
+        entry.reasoning = !entry.supported_reasoning_levels.is_empty();
     }
 }
 
-#[derive(Deserialize)]
-struct ModelList {
-    data: Vec<ModelRow>,
+/// Merge the seed's levels into whatever the endpoint reported.
+///
+/// The endpoint states which levels it accepts (DeepSeek lists `low`, `high`,
+/// `max`); the seed adds the levels only the harness can express — `off` is
+/// the absence of thinking, which a listing never mentions. Ordered by a
+/// canonical ladder so the picker stays stable when both sources contribute.
+fn merge_levels(endpoint: &[ReasoningLevel], seed: &[&'static str]) -> Vec<ReasoningLevel> {
+    let mut efforts: Vec<&str> = endpoint.iter().map(|level| level.effort.as_str()).collect();
+    for effort in seed {
+        if !efforts
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(effort))
+        {
+            efforts.push(effort);
+        }
+    }
+    efforts.sort_by_key(|effort| level_rank(effort));
+    efforts
+        .into_iter()
+        .map(|effort| ReasoningLevel {
+            effort: effort.to_owned(),
+        })
+        .collect()
+}
+
+/// Rank a reasoning level on the canonical ladder; unknown levels sort last
+/// and keep their relative order.
+fn level_rank(effort: &str) -> u8 {
+    match effort.to_ascii_lowercase().as_str() {
+        "off" | "none" | "disabled" => 0,
+        "minimal" => 1,
+        "low" => 2,
+        "medium" => 3,
+        "high" => 4,
+        "xhigh" => 5,
+        "max" => 6,
+        _ => u8::MAX,
+    }
+}
+
+/// Decode one endpoint's model list, dropping rows this build cannot read.
+///
+/// A provider may report a field of its own, or change a type under a name we
+/// decode; one unreadable row must not cost the rest of the list. Dropped rows
+/// are counted and warned so a shape change still shows up in the log rather
+/// than silently shrinking the catalogue.
+fn parse_list(body: &str) -> Result<Vec<ModelRow>> {
+    let value: serde_json::Value = serde_json::from_str(body).context("parse the model list")?;
+    let rows = value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .context("the model list has no `data` array")?;
+    let mut decoded = Vec::with_capacity(rows.len());
+    let mut unreadable = 0usize;
+    for row in rows {
+        match serde_json::from_value::<ModelRow>(row.clone()) {
+            Ok(row) => decoded.push(row),
+            Err(_) => unreadable += 1,
+        }
+    }
+    if unreadable > 0 {
+        tracing::warn!(
+            unreadable,
+            decoded = decoded.len(),
+            "skipped model rows this build cannot read"
+        );
+    }
+    Ok(decoded)
 }
 
 /// One entry of cardinal's model list. Every field but `id` is optional: a
@@ -570,6 +645,16 @@ struct ModelRow {
     max_output_tokens: Option<i64>,
     #[serde(default)]
     name: Option<String>,
+    /// Modalities the listing advertises; DeepSeek reports `["text","image"]`
+    /// for its multimodal models and omits the fields entirely for the rest.
+    #[serde(default)]
+    input_modalities: Vec<String>,
+    #[serde(default)]
+    output_modalities: Vec<String>,
+    /// DeepSeek states effort levels in one object; cardinal states them in
+    /// `supported_reasoning_levels`. Both are read.
+    #[serde(default)]
+    effort: Option<ModelEffort>,
     #[serde(default)]
     temperature: Option<bool>,
     /// Reasoning metadata, present only on rows whose upstream members
@@ -580,8 +665,29 @@ struct ModelRow {
     supported_reasoning_levels: Vec<ReasoningLevel>,
 }
 
+/// DeepSeek's effort block on a model row: the levels the model accepts.
+///
+/// `default_level` is ignored rather than parsed: upstream `Model.Info` has no
+/// field for it, so the catalogue would have nowhere to publish it.
+#[derive(Deserialize)]
+struct ModelEffort {
+    #[serde(default)]
+    supported_levels: Vec<String>,
+}
+
 impl ModelRow {
     fn into_entry(self, fallback_provider: &str) -> ModelEntry {
+        let mut supported_reasoning_levels = self.supported_reasoning_levels;
+        if let Some(effort) = self.effort {
+            for level in effort.supported_levels {
+                let known = supported_reasoning_levels
+                    .iter()
+                    .any(|existing| existing.effort.eq_ignore_ascii_case(&level));
+                if !known {
+                    supported_reasoning_levels.push(ReasoningLevel { effort: level });
+                }
+            }
+        }
         ModelEntry {
             provider: self
                 .owned_by
@@ -594,10 +700,12 @@ impl ModelRow {
                 .or(self.max_input_tokens),
             input: self.max_input_tokens,
             output: self.max_output_tokens,
+            input_modalities: self.input_modalities,
+            output_modalities: self.output_modalities,
             temperature: self.temperature,
             id: self.id,
-            reasoning: self.reasoning,
-            supported_reasoning_levels: self.supported_reasoning_levels,
+            reasoning: self.reasoning || !supported_reasoning_levels.is_empty(),
+            supported_reasoning_levels,
         }
     }
 }
@@ -615,6 +723,8 @@ mod tests {
             context: Some(1_000),
             input: None,
             output: Some(100),
+            input_modalities: Vec::new(),
+            output_modalities: Vec::new(),
             temperature: Some(false),
             reasoning: false,
             supported_reasoning_levels: Vec::new(),
@@ -683,6 +793,83 @@ mod tests {
         assert_eq!(
             picked.id, "k3-256k",
             "an embedding must never become the default chat model"
+        );
+    }
+
+    /// DeepSeek's own row shape: modalities and effort stated on the row, no
+    /// `supported_reasoning_levels` and no `temperature`.
+    const DEEPSEEK_BODY: &str = r#"{
+        "object": "list",
+        "data": [
+            {
+                "id": "deepseek-flash",
+                "object": "model",
+                "owned_by": "deepseek",
+                "name": "DeepSeek V4.1 Flash",
+                "context_window": 1048576,
+                "max_output_tokens": 393216,
+                "input_modalities": ["text", "image"],
+                "output_modalities": ["text"],
+                "effort": {"supported_levels": ["low", "high", "max"], "default_level": "high"}
+            }
+        ]
+    }"#;
+
+    #[test]
+    fn a_deepseek_row_states_its_modalities_and_effort_levels() {
+        let rows = parse_list(DEEPSEEK_BODY).expect("the body decodes");
+        let entries: Vec<ModelEntry> = rows
+            .into_iter()
+            .map(|row| row.into_entry("deepseek"))
+            .collect();
+        let flash = &entries[0];
+        assert_eq!(flash.input_modalities, ["text", "image"]);
+        assert_eq!(flash.output_modalities, ["text"]);
+        assert!(
+            flash.reasoning,
+            "an effort block is a reasoning claim even without the cardinal field"
+        );
+        let efforts: Vec<&str> = flash
+            .supported_reasoning_levels
+            .iter()
+            .map(|level| level.effort.as_str())
+            .collect();
+        assert_eq!(efforts, ["low", "high", "max"]);
+        assert_eq!(flash.context, Some(1_048_576));
+        assert_eq!(flash.output, Some(393_216));
+    }
+
+    #[test]
+    fn one_unreadable_row_does_not_drop_the_list() {
+        let body = r#"{"data": [{"id": "good-1"}, {"name": "no id at all"}, {"id": "good-2"}]}"#;
+        let rows = parse_list(body).expect("the list decodes");
+        let ids: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["good-1", "good-2"],
+            "a row this build cannot read is dropped, not fatal to its siblings"
+        );
+    }
+
+    #[test]
+    fn a_seed_level_the_endpoint_cannot_state_leads_the_ladder() {
+        let mut flash = parse_list(DEEPSEEK_BODY)
+            .expect("the body decodes")
+            .remove(0)
+            .into_entry("deepseek");
+        let seeds = crate::config::builtin(crate::config::DEEPSEEK)
+            .expect("the deepseek builtin ships seeds")
+            .models;
+        merge_seed(&mut flash, seeds);
+        let efforts: Vec<&str> = flash
+            .supported_reasoning_levels
+            .iter()
+            .map(|level| level.effort.as_str())
+            .collect();
+        assert_eq!(
+            efforts,
+            ["off", "low", "high", "max"],
+            "`off` is the absence of thinking, which no listing reports, so the seed adds it first"
         );
     }
 }

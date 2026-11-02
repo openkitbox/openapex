@@ -465,8 +465,8 @@ struct ModelInfo {
 struct ModelCapabilities {
     tools: bool,
     temperature: bool,
-    input: Vec<&'static str>,
-    output: Vec<&'static str>,
+    input: Vec<String>,
+    output: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -549,8 +549,8 @@ fn model_info(m: &ox_llm::model_catalog::ModelEntry, catalog: &ModelCatalog) -> 
         capabilities: ModelCapabilities {
             tools: true,
             temperature: m.temperature.unwrap_or(false),
-            input: vec!["text"],
-            output: vec!["text"],
+            input: modalities(&m.input_modalities),
+            output: modalities(&m.output_modalities),
         },
         variants: if m.reasoning {
             m.supported_reasoning_levels
@@ -573,6 +573,21 @@ fn model_info(m: &ox_llm::model_catalog::ModelEntry, catalog: &ModelCatalog) -> 
             input: m.input.unwrap_or(0),
             output: m.output.unwrap_or(0),
         },
+    }
+}
+
+/// The modalities to advertise for a model.
+///
+/// The endpoint's own list wins: DeepSeek reports `["text","image"]` for the
+/// models that accept images. A listing that states nothing is a listing that
+/// makes no claim, so it falls back to `text` — every chat model reads and
+/// writes text, and advertising an image input the endpoint never offered
+/// would make the client attach one and the request fail.
+fn modalities(reported: &[String]) -> Vec<String> {
+    if reported.is_empty() {
+        vec!["text".to_owned()]
+    } else {
+        reported.to_vec()
     }
 }
 
