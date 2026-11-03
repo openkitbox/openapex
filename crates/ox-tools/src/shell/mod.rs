@@ -159,17 +159,17 @@ impl Tool for ShellTool {
             "Rely on automatic truncation unless filtering the output is more useful.".to_owned(),
         );
         lines.push(
-            "Commands accept an optional timeout, background commands have no timeout by default."
+            "Commands accept an optional timeout; a command handed back at once (yield_time_ms=0) has no timeout by default."
                 .to_owned(),
         );
         if self.completion.is_some() {
             lines.push(
-                "Background commands return immediately, and you will be notified when they complete."
+                "Pass yield_time_ms=0 to return at once with an owned session and be notified when the command completes; that is this tool's only way to run a command in the background."
                     .to_owned(),
             );
         } else {
             lines.push(
-                "Background completion notifications are unavailable in this runtime; use a foreground command or an existing session."
+                "Passing yield_time_ms=0 is unavailable in this runtime (no completion notifications); use a foreground command or an existing session."
                     .to_owned(),
             );
         }
@@ -810,6 +810,13 @@ mod tests {
         assert!(
             !definition.description.contains("background parameter"),
             "the description must not name a parameter the schema does not declare",
+        );
+        assert!(
+            definition
+                .description
+                .contains("handed back at once (yield_time_ms=0)"),
+            "the prose about a handed-back run must name the parameter that does it: {}",
+            definition.description,
         );
         let properties = definition.parameters["properties"]
             .as_object()
