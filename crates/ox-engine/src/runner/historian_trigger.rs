@@ -145,6 +145,116 @@ fn fold_step(input: FoldInput) -> FoldStep {
     FoldStep::Fold
 }
 
+/// The accounting of one pressure event.
+///
+/// A pressure event may fold several chunks back to back. This type owns the
+/// numbers that event has to stay honest about — how deep it is, which ordinals
+/// it covered, how many compartments it published, and what the prompt is
+/// estimated to be after those folds — so the loop body stays orchestration and
+/// the invariants sit in one place: the floor only advances, the aggregate range
+/// is contiguous, and a fold that published nothing cannot grow the count.
+///
+/// The estimate is a lower bound: a fold adds its compartment summary back into
+/// `m[0]`, which the subtraction does not account for, so an event may stop
+/// slightly early and never late — the cap still bounds it.
+struct EventFolds {
+    /// The floor the next chunk starts above.
+    floor: i64,
+    /// Folds published so far in this event.
+    folds: usize,
+    /// The ordinal range the event folded, `first..last`.
+    covered: Option<(i64, i64)>,
+    /// Compartments the event published.
+    compartments: usize,
+    /// The low-water target; `None` when the model window is unknown, which
+    /// means there is no low-water stop rather than "fold once".
+    target: Option<u32>,
+    /// Estimated prompt after the folds so far. `None` when no completion has
+    /// reported a usage number: the event then folds once, because there is
+    /// nothing to subtract the folds from.
+    remaining: Option<i64>,
+}
+
+impl EventFolds {
+    /// Start an event at `floor` with `remaining` as the estimated prompt.
+    fn new(floor: i64, target: Option<u32>, remaining: Option<i64>) -> Self {
+        Self {
+            floor,
+            folds: 0,
+            covered: None,
+            compartments: 0,
+            target,
+            remaining,
+        }
+    }
+
+    /// The facts [`fold_step`] reads for the pass about to run.
+    fn fold_input(&self, trigger: historian::Trigger, foldable: usize) -> FoldInput {
+        FoldInput {
+            trigger,
+            foldable,
+            remaining: self.remaining,
+            target: self.target,
+            folds: self.folds,
+        }
+    }
+
+    /// Record one published fold: advance the floor, extend the range, add the
+    /// compartments, and subtract what the fold removed from the estimate.
+    fn record(&mut self, start: i64, executed: &Executed) {
+        // A fold may not move the floor backwards: the chunker cuts above the
+        // requested start, so a violation means the coverage bookkeeping broke,
+        // and carrying on would re-fold or skip ordinals.
+        debug_assert!(
+            executed.covered_end >= self.floor,
+            "a fold must advance the floor: covered_end {} is below the floor {}",
+            executed.covered_end,
+            self.floor
+        );
+        self.floor = executed.covered_end;
+        self.folds += 1;
+        self.compartments += executed.compartments;
+        self.covered = Some(match self.covered {
+            None => (start, executed.covered_end),
+            Some((first, _)) => (first, executed.covered_end),
+        });
+        self.remaining = self
+            .remaining
+            .map(|remaining| remaining.saturating_sub(executed.context_tokens as i64));
+    }
+
+    /// The floor the next chunk starts above.
+    fn floor(&self) -> i64 {
+        self.floor
+    }
+
+    /// Folds published so far in this event.
+    fn folds(&self) -> usize {
+        self.folds
+    }
+
+    /// The estimated prompt after the folds so far.
+    fn remaining(&self) -> Option<i64> {
+        self.remaining
+    }
+
+    /// The ordinal range the event folded, `first..last`.
+    fn covered(&self) -> Option<(i64, i64)> {
+        self.covered
+    }
+
+    /// What the event folded, as the transcript notice reports it: one row for
+    /// the whole event, not one per chunk.
+    #[must_use]
+    fn published(self) -> Option<Published> {
+        let (first, last) = self.covered?;
+        Some(Published {
+            covered: format!("{first}..{last}"),
+            compartments: self.compartments,
+        })
+    }
+}
+
 /// The live step request a fold can continue (plan A3): the bytes the provider
 /// already holds for this conversation, so the historian's hidden completion
 /// re-reads them at the prompt-cache price instead of paying a full miss.
@@ -653,14 +763,17 @@ impl Firing<'_> {
         let target = budget.target;
         // The provider's usage number is stale until the next completion, so
         // each pass's estimate subtracts what this event's folds covered.
-        let mut remaining: Option<i64> = usage;
-        let mut floor = event_floor;
-        let mut folds = 0usize;
-        let mut covered: Option<(i64, i64)> = None;
-        let mut compartments = 0usize;
+        let mut event = EventFolds::new(event_floor, target, usage);
+        // Why the event started, kept for the single line that summarises it:
+        // the trigger falls to `No` as the event folds, and the entry
+        // measurement is the one an operator needs when asking "why did this
+        // session fold thirty times".
+        let mut first_trigger: Option<historian::Trigger> = None;
+        let mut first_foldable: Option<usize> = None;
         loop {
             // Zero-copy: re-measure the tail above the current floor as a
             // subslice of the rows already loaded — no fresh load, no clone.
+            let floor = event.floor();
             let start = rows.partition_point(|(ordinal, _)| *ordinal <= floor);
             let above = &rows[start..];
             // The whole tail's estimate, measured by the chunker itself so the
@@ -684,6 +797,8 @@ impl Firing<'_> {
             let protected = budget.protected_tail(usage_pct.unwrap_or(0.0));
             let foldable = whole.context_tokens.saturating_sub(protected as usize);
             let trigger = historian::trigger(usage_pct, foldable as f64, budget.trigger, &budget);
+            first_trigger.get_or_insert(trigger);
+            first_foldable.get_or_insert(foldable);
             tracing::debug!(
                 session = %session_id,
                 tail_tokens = whole.context_tokens,
@@ -695,30 +810,24 @@ impl Firing<'_> {
                 trigger_budget = budget.trigger,
                 trigger = ?trigger,
                 target = ?target,
-                remaining = ?remaining,
+                remaining = ?event.remaining(),
                 messages = above.len(),
                 bytes = whole.text.len(),
                 first_ordinal = above.first().map(|(ordinal, _)| *ordinal),
                 last_ordinal = above.last().map(|(ordinal, _)| *ordinal),
                 floor,
-                folds,
+                folds = event.folds(),
                 "historian pressure"
             );
-            match fold_step(FoldInput {
-                trigger,
-                foldable,
-                remaining,
-                target,
-                folds,
-            }) {
+            match fold_step(event.fold_input(trigger, foldable)) {
                 FoldStep::Fold => {}
                 FoldStep::Stop(reason) => {
                     tracing::debug!(
                         session = %session_id,
                         reason = ?reason,
-                        folds,
+                        folds = event.folds(),
                         foldable,
-                        remaining = ?remaining,
+                        remaining = ?event.remaining(),
                         target = ?target,
                         "historian event stopped"
                     );
@@ -777,13 +886,13 @@ impl Firing<'_> {
                     break;
                 }
                 Err(error) => {
-                    let covered_so_far = covered.map_or_else(
+                    let covered_so_far = event.covered().map_or_else(
                         || "none".to_owned(),
                         |(first, last)| format!("{first}..{last}"),
                     );
                     tracing::warn!(
                         session = %session_id,
-                        folds,
+                        folds = event.folds(),
                         // The chunk this iteration failed on, not just the
                         // aggregate already folded: the two ranges separate a
                         // first-fold failure from a later one.
@@ -795,24 +904,32 @@ impl Firing<'_> {
                     break;
                 }
             };
-            floor = executed.covered_end;
-            folds += 1;
-            compartments += executed.compartments;
-            covered = Some(match covered {
-                None => (*chunk.covered.start(), executed.covered_end),
-                Some((first, _)) => (first, executed.covered_end),
-            });
-            remaining = remaining.map(|r| r.saturating_sub(executed.context_tokens as i64));
+            event.record(*chunk.covered.start(), &executed);
         }
-        let Some((first, last)) = covered else {
+        let folds = event.folds();
+        let last_remaining = event.remaining();
+        let covered_to = event.floor();
+        let Some(published) = event.published() else {
             return Ok(None);
         };
-        // One notice for the whole event: the transcript shows the range the
-        // pressure folded, not one row per chunk.
-        Ok(Some(Published {
-            covered: format!("{first}..{last}"),
-            compartments,
-        }))
+        // One line per event, at `info` because production runs at that level:
+        // how many hidden completions the pressure bought, why it started, and
+        // where the estimate landed. The transcript notice reports the fact to
+        // the human; this line is what answers "did the policy converge"
+        // without opening the database.
+        tracing::info!(
+            session = %session_id,
+            folds,
+            trigger = ?first_trigger,
+            first_foldable = ?first_foldable,
+            last_remaining = ?last_remaining,
+            target = ?target,
+            covered = %published.covered,
+            covered_to,
+            compartments = published.compartments,
+            "historian fold event"
+        );
+        Ok(Some(published))
     }
 
     /// One synchronous patch run for the background fold (plan D6): fold the
@@ -1438,5 +1555,108 @@ mod tests {
             FoldStep::Stop(FoldStop::Cap),
             "the cap decides first: it bounds one event no matter what remains"
         );
+    }
+
+    /// One fold's published result, as the historian run reports it.
+    fn executed(covered_end: i64, context_tokens: usize, compartments: usize) -> Executed {
+        Executed {
+            covered_end,
+            context_tokens,
+            compartments,
+        }
+    }
+
+    #[test]
+    fn event_aggregates_three_folds_into_one_contiguous_range() {
+        let mut event = EventFolds::new(9, Some(73_400), Some(139_000));
+        event.record(10, &executed(20, 33_000, 2));
+        event.record(21, &executed(30, 33_000, 1));
+        event.record(31, &executed(40, 33_000, 1));
+        assert_eq!(event.folds(), 3, "three recorded folds must count three");
+        assert_eq!(event.floor(), 40, "the floor is the last covered end");
+        assert_eq!(
+            event.covered(),
+            Some((10, 40)),
+            "the aggregate spans the first start to the last end, so the notice \
+             cannot claim a gap the event never folded"
+        );
+        let published = event.published().expect("three folds produce a range");
+        assert_eq!(published.covered, "10..40");
+        assert_eq!(
+            published.compartments, 4,
+            "compartments sum across the event"
+        );
+    }
+
+    #[test]
+    fn event_tracks_the_target_across_folds() {
+        let mut event = EventFolds::new(0, Some(73_400), Some(139_000));
+        event.record(1, &executed(10, 33_000, 1));
+        assert_eq!(
+            event
+                .fold_input(historian::Trigger::Speculative, 40_000)
+                .remaining,
+            Some(106_000),
+            "one fold subtracts exactly what it removed"
+        );
+        assert_eq!(
+            fold_step(event.fold_input(historian::Trigger::Speculative, 40_000)),
+            FoldStep::Fold,
+            "106k is still above the 73.4k target, so the event folds again"
+        );
+        event.record(11, &executed(20, 33_000, 1));
+        assert_eq!(
+            fold_step(event.fold_input(historian::Trigger::Speculative, 40_000)),
+            FoldStep::Stop(FoldStop::TargetReached),
+            "73k is at the target: a second fold reached it, so the event stops"
+        );
+    }
+
+    #[test]
+    fn event_counts_down_to_the_cap() {
+        let mut event = EventFolds::new(0, Some(1), Some(10_000_000));
+        for coverage in 0..MAX_FOLDS_PER_EVENT {
+            let end = coverage as i64 + 1;
+            event.record(end, &executed(end, 1, 1));
+        }
+        assert_eq!(event.folds(), MAX_FOLDS_PER_EVENT);
+        assert_eq!(
+            fold_step(event.fold_input(historian::Trigger::Speculative, 40_000)),
+            FoldStep::Stop(FoldStop::Cap),
+            "an event that met its cap stops even with pressure and foldable tail left"
+        );
+    }
+
+    #[test]
+    fn event_folds_once_without_a_reported_usage() {
+        let mut event = EventFolds::new(0, Some(73_400), None);
+        assert_eq!(
+            fold_step(event.fold_input(historian::Trigger::Speculative, 40_000)),
+            FoldStep::Fold,
+            "with no usage number the first pass still folds, as the tail-size \
+             trigger did before the loop existed"
+        );
+        event.record(1, &executed(10, 40_000, 1));
+        assert_eq!(
+            event.remaining(),
+            None,
+            "there is nothing to subtract from, so the estimate stays unknown"
+        );
+        assert_eq!(
+            fold_step(event.fold_input(historian::Trigger::Speculative, 40_000)),
+            FoldStep::Stop(FoldStop::NoUsage),
+            "the second pass stops: the target cannot be measured"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a fold must advance the floor")]
+    fn event_refuses_a_fold_that_moves_the_floor_backwards() {
+        let mut event = EventFolds::new(10, None, Some(100_000));
+        event.record(11, &executed(20, 10, 1));
+        // A floor that regresses would re-fold ordinals the event already
+        // covered; the invariant is the only thing standing between a broken
+        // chunker and duplicate compartments.
+        event.record(21, &executed(15, 10, 1));
     }
 }
