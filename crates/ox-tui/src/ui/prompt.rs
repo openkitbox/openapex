@@ -758,15 +758,14 @@ impl Prompt {
         }
     }
 
-    /// The rail and its `╹` foot. Upstream tints the border from the agent
-    /// colour (`component/prompt/index.tsx:1610`); on the home route the
-    /// prompt is the only surface, so it shows that colour undiluted. The
-    /// session route keeps the quieter `panel_border`.
+    /// The rail and its `╹` foot, in the agent colour: upstream takes it from
+    /// the selected agent (`component/prompt/index.tsx:1610`; captured in
+    /// 2.2.5 as the same magenta `#b294bb` on the home route and on a root
+    /// session) and falls back to `border.base` only without an agent colour.
     fn rail_style(&self, pal: &theme::Palette) -> Style {
-        match (self.footer, pal.agent.fg) {
-            (Footer::Home, Some(fg)) => Style::default().fg(fg),
-            _ => pal.panel_border,
-        }
+        pal.agent
+            .fg
+            .map_or(pal.panel_border, |fg| Style::default().fg(fg))
     }
 
     /// The decoration the prompt was built with (the home footer reads the MCP
