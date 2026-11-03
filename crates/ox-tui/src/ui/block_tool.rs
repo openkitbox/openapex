@@ -9,9 +9,9 @@
 //! Deviations:
 //! - Hover uses `palette.panel` (`raised.high`) rather than computing
 //!   `decrease(raised.base)` per frame (plan V7); the user block does the same.
-//! - The rail is upstream's `background.base`. When the deck does not know
-//!   that colour as RGB (16-colour, colourless) the rail is a blank cell on
-//!   the band instead of a default-coloured bar.
+//! - The rail is invisible: 2.2.5 paints the box border in the theme's
+//!   transparent `background`, so the glyph carries the band colour. The user
+//!   message keeps its own visible rail (`palette.agent`), as upstream's does.
 //! - `path` titles (`FilePath` truncation) are not ported; callers pass a
 //!   finished title string. Tool permission (warning-coloured title) is not
 //!   ported either. `headerColor`/`errorColor` are [`BlockSpec::title_fg`] /
@@ -142,14 +142,17 @@ pub fn lines(spec: &BlockSpec<'_>, body: Vec<Line<'static>>, width: u16) -> Vec<
         }
         rows.extend(part);
     }
-    frame(rows, &rail(palette, band), band, width)
+    frame(rows, &rail(band), band, width)
 }
 
-/// Upstream's rail: `background.base` on the band, or a blank cell when that
-/// colour is unknown.
-fn rail(palette: &theme::Palette, band: Style) -> Span<'static> {
-    match palette.backdrop {
-        Some(base) => Span::styled(RAIL, band.fg(Color::Rgb(base.r, base.g, base.b))),
+/// Upstream's rail: 2.2.5 draws the box border in the theme's `background`,
+/// which the system theme defines as transparent, so the glyph takes the band
+/// colour and vanishes into it. (The newer upstream source paints it
+/// `background.base`; the installed 2.2.5 capture shows `fg == band bg`, and
+/// parity follows 2.2.5.)
+fn rail(band: Style) -> Span<'static> {
+    match band.bg {
+        Some(bg) => Span::styled(RAIL, band.fg(bg)),
         None => Span::styled(" ", band),
     }
 }

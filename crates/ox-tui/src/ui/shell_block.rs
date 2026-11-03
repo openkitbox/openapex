@@ -7,16 +7,19 @@
 //! a spinner in place of `$ ` while running, or `Writing command…` before the
 //! command is known), the muted output, the `Background` badge; then the
 //! frame's own gap and the failure text. Collapsed, the command is
-//! character-wrapped to at most 2 rows and command + output share the
-//! `collapse_shell_output` budget (`max_lines = 10`,
-//! `max_chars = 10 × max(20, width − 6 − (running ? 2 : 0))`); expanded, the
+//! character-wrapped to at most 2 rows and a call without a shell shares the
+//! `collapse_shell_output` budget with its output (`max_lines = 10`,
+//! `max_chars = 10 × max(20, width − 6 − (running ? 2 : 0))`); a call bound to
+//! a shell shows no output while collapsed, exactly as upstream's
+//! `output={metadata.shellID ? undefined : output}` does. Expanded, the
 //! command word-wraps and the output is shown whole.
 //!
 //! Deviations:
 //! - Output source: the pipeline picks the tool result or the bound shell's
 //!   fetched output (`crate::shell_captures`, which lists its deviations).
-//!   Upstream never shows the tool result of a call with a `shellID`; ox
-//!   shows it for a completed foreground call, whose result is the output.
+//!   Upstream reads the same fetched output only when a call has no
+//!   `shellID`; for a shell-bound call it fetches the shell's output on
+//!   expand, and ox does the same through the tool result it already holds.
 //! - The `Background` badge shows while the call returned early *and* the
 //!   shell is still alive (`DataStore::is_shell_running`); upstream shows it
 //!   whenever `completed && metadata.status == "running"`, i.e. forever,
@@ -165,10 +168,14 @@ pub fn render(spec: &ShellSpec<'_>, width: u16) -> Rendered {
     let collapsed =
         shell_collapse::collapse_shell_output(&input, &output, MAX_LINES, spec.max_chars(width));
     let expandable = spec.has_shell || collapsed.overflow;
-    let (shown_input, shown_output): (&str, &str) = if spec.expanded {
-        (&input, &output)
-    } else {
-        (&collapsed.input, &collapsed.output)
+    // Upstream hands `Shell` `output={metadata.shellID ? undefined : output}`
+    // (`index.tsx:2991`): a call bound to a shell shows its command only and
+    // the output arrives when the block is expanded. Captured against 2.2.5,
+    // the same call is two command rows there and a collapsed tail in ox.
+    let (shown_input, shown_output): (&str, &str) = match (spec.expanded, spec.has_shell) {
+        (true, _) => (&input, &output),
+        (false, true) => (&collapsed.input, ""),
+        (false, false) => (&collapsed.input, &collapsed.output),
     };
 
     let usable = block_tool::content_width(width);

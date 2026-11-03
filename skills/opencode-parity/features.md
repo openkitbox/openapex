@@ -6,7 +6,7 @@
 
 | kind | id | 上游 | ox | 状态 | 备注 |
 |---|---|---|---|---|---|
-| behavior | block-tool | routes/session/index.tsx:2883 | crates/ox-tui/src/ui/block_tool.rs:68 | partial | ┃ 轨、上下空行、内容缩进 2 列、整块同色带,与用户消息共用 frame。偏差:hover 用 palette.panel;16 色/无色主题轨为空格;未移植 path 标题截断、headerColor/errorColor、权限色;无动画时不显示 ⋯ |
+| behavior | block-tool | routes/session/index.tsx:2883 | crates/ox-tui/src/ui/block_tool.rs:68 | partial | ┃ 轨、上下空行、内容缩进 2 列、整块同色带,与用户消息共用 frame。轨与色带同色故不可见(2.2.5 的 borderColor 是透明 background)。偏差:hover 用 palette.panel;未移植 path 标题截断、headerColor/errorColor、权限色;无动画时不显示 ⋯ |
 | behavior | completion-notice | routes/session/index.tsx:2090 | crates/ox-tui/src/pipeline.rs:58 | partial | `↳ Shell/Subagent finished · ...` 历史与实时两路都做了,子代理行可点击跳转。偏差:标题固定为 Subagent(ox 元数据无 agent 名);hover 只提亮标题 |
 | behavior | diff-block | routes/session/index.tsx:3439 | crates/ox-tui/src/ui/diff.rs:208 | partial | unified/split（按 width-4 选视图）、行号 gutter（pad,号,符号,pad）、hunk 行、12 个 diff 主题色、解析失败回退原文。偏差见 diff.rs:20-41:无语法高亮、无词级高亮、无 diffwrap 切换 |
 | behavior | edit-block | routes/session/index.tsx:3439 | crates/ox-tui/src/ui/edit_block.rs:38 | partial | `← Edit path` BlockTool + diff。偏差:非成功态仍为单行 tool_text;无 diagnostics(服务端无);不可展开点击 |
@@ -24,7 +24,7 @@
 | behavior | reasoning-markdown | routes/session/message-parts.tsx:59 | crates/ox-tui/src/ui/markdown.rs:57 | partial | 展开的思考正文按 muted markdown 渲染,`   ┃ ` 前缀、宽度 width-5(markdown::Tone::Muted) |
 | behavior | session-rows | routes/session/index.tsx:2022 | crates/ox-tui/src/ui/timeline.rs:1604 | partial | Error 挂在消息下;Retry 倒计时;agent/model/location 切换行;Instructions updated;Skill;Compaction queued;压缩 spinner。偏差见 store.rs/pipeline.rs 模块文档 |
 | behavior | shell-background-output | routes/session/index.tsx:3015 | crates/ox-tui/src/shell_captures.rs:114 | partial | 展开时每秒拉取一页、在飞不重发,退出后 drain 一次,超 1 MiB 保留尾部并显示 [earlier output omitted]。偏差:复用 33ms UI tick 节流;折叠块不轮询;按原始字节计限,绘制时去 ANSI;失败不立即重试;后台调用无输出前不显示结果文本;失败调用只显示错误 |
-| behavior | shell-block | routes/session/index.tsx:2969 | crates/ox-tui/src/ui/shell_block.rs:173 | partial | BlockTool 框、`$ [cd wd && ]cmd`、运行 spinner、Writing command…、折叠 10 行带 (N earlier lines)、点击/o 展开、Background 徽标、失败 error 已做(接线 ui/timeline.rs:1467)。偏差:前台完成调用显示工具结果;Background 仅在 shell 仍存活时显示;无部分输入解析;hover 用 palette.panel;无权限色;[ ] 焦点画 hover 带;spinner 只改缓存行的 spinner span |
+| behavior | shell-block | routes/session/index.tsx:2969 | crates/ox-tui/src/ui/shell_block.rs:173 | partial | BlockTool 框、`$ [cd wd && ]cmd`、运行 spinner、Writing command…、折叠 10 行带 (N earlier lines)、点击/o 展开、Background 徽标、失败 error 已做(接线 ui/timeline.rs:1467)。偏差:有 shellID 的调用折叠时只显示命令、展开才显示输出(对齐 2.2.5 的 `output={metadata.shellID ? undefined : output}`);Background 仅在 shell 仍存活时显示;无部分输入解析;hover 用 palette.panel;无权限色;[ ] 焦点画 hover 带;spinner 只改缓存行的 spinner span |
 | behavior | shell-message | routes/session/index.tsx:2322 |  | missing | 服务端已产生 Message::Shell(session.shell,crates/ox-core/src/projector/message_updater.rs 投影,60cdfa5);ox-tui 未渲染历史 shell 行,也没有 ! 输入模式 |
 | behavior | sidebar-todo | routes/session/sidebar.tsx:1 | crates/ox-tui/src/ui/sidebar.rs:68 | partial | 42 列侧栏,宽>120 停靠右侧、否则浮层(Esc 先关),子会话不显示;Todo 节 ▼/▶ 折叠、(N remaining)、取最后一次成功 todowrite。偏差见 sidebar.rs 模块文档:无 revert 边界、不持久化、无滚动、只有 Todo 节、浮层无暗化背景 |
 | behavior | subagent-background-badge | routes/session/index.tsx:3289 | crates/ox-tui/src/ui/timeline.rs:1626 | aligned | 子会话运行时子代理工具行显示转圈和 Background |
