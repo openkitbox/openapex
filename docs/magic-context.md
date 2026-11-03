@@ -27,12 +27,17 @@ enabled = true
 # Model for hidden completions (historian + dreamer), as provider/id.
 # Unset = ox's default model.
 historian_model = "cardinal/k3-256k"
-# Context usage (percent of the model window) at which folding is due. Every
-# other number is derived from it: the proactive floor is `execute - 2`, the
+# Context usage (percent of the model window) at which folding is due. The
+# pressure numbers derive from it: the proactive floor is `execute - 2`, the
 # force band is `max(85, execute + 2)`, the trigger budget is 5% of the usable
 # window (floor 5k tokens), the historian's chunk budget is 25% of ITS OWN
-# window, and the protected tail is 30% of the usable window. Range 20-90.
-execute_threshold_percentage = 65.0
+# window, and the protected tail is 30% of the usable window. The trigger
+# measures the foldable tail outside that protected fence, not the whole tail.
+# Range 20-90.
+execute_threshold_percentage = 55.0
+# Low-water target (percent of the model window): one pressure event folds up
+# to 4 chunks until the estimated prompt is at or below this. Range 5-80.
+fold_target_percentage = 28.0
 # Share of the usable window the m[0] history block may carry before the decay
 # ladder demotes older compartments. Range 0.05-0.5.
 history_budget_percentage = 0.15

@@ -17,6 +17,20 @@
 //! boundary from the model catalogue — never a module constant. A 1M-window
 //! model folds in 8.5k-token tail steps and one historian run reads at most a
 //! quarter of *its own* window; a 32k model folds much sooner.
+//!
+//! One pressure event may fold several chunks back to back, until the
+//! low-water target ([`Budget::target`]). Two details make that loop honest:
+//! the trigger measures the **foldable** part of the tail (the whole tail minus
+//! the protected fence), not the whole tail — the fence alone used to keep the
+//! trigger armed, so every step boundary folded again; and the post-fold
+//! estimate is `reported usage − Σ chunk.context_tokens`, because the
+//! provider's usage number is stale until the next completion and re-reading it
+//! would show the same pressure forever. That estimate is a lower bound: it
+//! does not count the compartment summaries added back into `m[0]`.
+//! [`MAX_FOLDS_PER_EVENT`] bounds what one event may spend. Each pass
+//! deliberately re-renders the remaining tail in memory, up to four times per
+//! event; the trade is repeated estimation work for correctness, not a memory
+//! leak.
 
 use std::sync::Arc;
 
@@ -41,6 +55,95 @@ use ox_schema::message::Message;
 // ---------------------------------------------------------------------------
 // Historian trigger (step boundary)
 // ---------------------------------------------------------------------------
+
+/// How many folds one pressure event may run back to back. Four times the
+/// historian's chunk budget (32k rendered tokens by default) covers a descent
+/// from a 139k-token prompt to the 73k low-water target of a 262,144-token
+/// window; the cap is what bounds the hidden-completion cost of a single event
+/// when the tail keeps offering foldable history.
+const MAX_FOLDS_PER_EVENT: usize = 4;
+
+/// Whether one pressure event folds another chunk or stops, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FoldStep {
+    /// Fold the next chunk: pressure, foldable history, and headroom above the
+    /// low-water target all remain.
+    Fold,
+    /// Stop the event; the reason names which condition ended it.
+    Stop(FoldStop),
+}
+
+/// Why a pressure event stopped folding. Each variant is a distinct log signal:
+/// only some mean "there was nothing to do".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+enum FoldStop {
+    /// The event has spent [`MAX_FOLDS_PER_EVENT`] folds. Anything left waits
+    /// for the next step boundary rather than making one event unbounded.
+    Cap,
+    /// The foldable tail is below both pressure bands: nothing is large enough
+    /// to be worth another hidden completion.
+    NoPressure,
+    /// Everything left sits inside the protected tail, which a fold may never
+    /// touch — the model keeps what it is working on verbatim.
+    NothingFoldable,
+    /// The post-fold estimate is at or below the low-water target: the event
+    /// has done its job and further folds would only buy prompt-cache misses.
+    TargetReached,
+    /// No completion has reported usage, so the target cannot be measured
+    /// against anything. The first pass still folds once, exactly as before
+    /// the loop; a later pass stops here.
+    NoUsage,
+}
+
+/// The facts [`fold_step`] reads. Named fields keep the trigger, remaining
+/// estimate, target, and fold count from being swapped at a call site.
+#[derive(Debug, Clone, Copy)]
+struct FoldInput {
+    /// Current pressure classification.
+    trigger: historian::Trigger,
+    /// Context tokens outside the protected tail.
+    foldable: usize,
+    /// Post-fold estimate (`reported usage − Σ folded context tokens`).
+    remaining: Option<i64>,
+    /// Low-water target; `None` means there is no low-water stop.
+    target: Option<u32>,
+    /// Folds already completed in this pressure event.
+    folds: usize,
+}
+
+/// Decide the next step of a pressure event.
+///
+/// Pure on purpose: the whole stop ladder is testable without a session, and
+/// the caller keeps the side effects — the render, the run, the log line. The
+/// check order is the contract: the cap and the cheap gates decide before the
+/// target arithmetic. Without usage the first pass folds once; only a later
+/// pass stops, because the target still cannot be consulted.
+#[must_use]
+fn fold_step(input: FoldInput) -> FoldStep {
+    if input.folds >= MAX_FOLDS_PER_EVENT {
+        return FoldStep::Stop(FoldStop::Cap);
+    }
+    if input.trigger == historian::Trigger::No {
+        return FoldStep::Stop(FoldStop::NoPressure);
+    }
+    if input.foldable == 0 {
+        return FoldStep::Stop(FoldStop::NothingFoldable);
+    }
+    let Some(remaining) = input.remaining else {
+        if input.folds == 0 {
+            return FoldStep::Fold;
+        }
+        return FoldStep::Stop(FoldStop::NoUsage);
+    };
+    if input
+        .target
+        .is_some_and(|target| remaining <= i64::from(target))
+    {
+        return FoldStep::Stop(FoldStop::TargetReached);
+    }
+    FoldStep::Fold
+}
 
 /// The live step request a fold can continue (plan A3): the bytes the provider
 /// already holds for this conversation, so the historian's hidden completion
@@ -495,15 +598,19 @@ struct Firing<'a> {
 }
 
 impl Firing<'_> {
-    /// Measure the tail, classify the pressure, pick the chunk and run it.
-    async fn run(self, floor: i64) -> Result<Option<Published>> {
-        let Self {
-            db,
-            budget,
-            session_id,
-            ratio,
-            ..
-        } = self;
+    /// Measure the tail, classify the pressure, and fold down to the low-water
+    /// target: one pressure event may run several folds back to back.
+    ///
+    /// Each pass re-measures the tail above the current floor, so the trigger
+    /// and the fence both speak about the history that is actually left. What
+    /// cannot be re-measured is the provider's usage number — stale until the
+    /// next completion — so the post-fold estimate subtracts what the folds
+    /// covered instead ([`fold_step`]).
+    async fn run(&self, event_floor: i64) -> Result<Option<Published>> {
+        let db = self.db;
+        let budget = self.budget;
+        let session_id = self.session_id;
+        let ratio = self.ratio;
         // One pending run per session: a second step in the same burst must not
         // summarize the same range twice. This pre-check is only a shortcut —
         // it avoids loading the whole tail while a run is in flight; the
@@ -520,8 +627,8 @@ impl Firing<'_> {
         // assistant row answer "could this possibly fire?" in O(1) memory;
         // only a tail that might fire pays the full load below.
         let (tail_bytes, gate_usage) = tokio::try_join!(
-            tail_bytes(db, session_id, floor),
-            newest_reported_usage(db, session_id, floor)
+            tail_bytes(db, session_id, event_floor),
+            newest_reported_usage(db, session_id, event_floor)
         )?;
         if tail_load_skippable(gate_usage, tail_bytes, &budget, ratio) {
             tracing::debug!(
@@ -531,114 +638,181 @@ impl Firing<'_> {
             );
             return Ok(None);
         }
-        let rows = rows_after_with_seq(db, session_id, floor).await?;
-        if rows.is_empty() {
-            return Ok(None);
-        }
+        let rows = rows_after_with_seq(db, session_id, event_floor).await?;
         // The tail's usage as the provider last reported it — `None` before the
         // session's first completion, when the tail size is the only signal.
         let usage = rows.iter().rev().find_map(|(_, row)| prompt_tokens(row));
         let usage_pct = usage.and_then(|tokens| budget.usage_percentage(tokens));
-        // The whole tail's estimate, measured by the chunker itself so the pressure
-        // and the budget speak the same units.
-        let count = tokens::counter_fn(ratio);
-        let Some(whole) =
-            historian::chunk(&rows, floor + 1, i64::MAX, ChunkLimits::unbounded(), &count)
-        else {
-            return Ok(None);
-        };
-        // What a run could actually fold: the tail's real size minus the fence.
-        // Both numbers are context tokens (`Chunk::context_tokens`), the unit the
-        // provider's usage speaks — a tool result counts by the body it cost, not
-        // by the `TC:` line that renders it. Decided before the trigger so a tail
-        // that is large but wholly protected (a short session, a huge newest
-        // turn) is skipped with a visible reason instead of firing a run that
-        // cannot start.
-        let protected = budget.protected_tail(usage_pct.unwrap_or(0.0));
-        let foldable = whole.context_tokens.saturating_sub(protected as usize);
-        if foldable == 0 {
-            tracing::debug!(
-                session = %session_id,
-                tail_tokens = whole.context_tokens,
-                protected_tail = protected,
-                "historian skipped: nothing outside the protected tail"
-            );
-            return Ok(None);
-        }
-        let trigger = historian::trigger(
-            usage_pct,
-            whole.context_tokens as f64,
-            budget.trigger,
-            &budget,
-        );
-        tracing::debug!(
-            session = %session_id,
-            tail_tokens = whole.context_tokens,
-            rendered_tokens = whole.token_estimate,
-            // `None` = no completion has reported usage yet; it is not 0%.
-            usage_pct = ?usage_pct,
-            trigger_budget = budget.trigger,
-            trigger = ?trigger,
-            messages = rows.len(),
-            bytes = whole.text.len(),
-            first_ordinal = rows.first().map(|(ordinal, _)| *ordinal),
-            last_ordinal = rows.last().map(|(ordinal, _)| *ordinal),
-            floor,
-            "historian pressure"
-        );
-        if trigger == historian::Trigger::No {
-            return Ok(None);
-        }
-
         // The newest row is never covered: it is the turn in flight. Everything
         // older competes for the chunk budget, which stops the run at the fence.
         let Some((last_ordinal, _)) = rows.last() else {
             return Ok(None);
         };
         let eligible_end = *last_ordinal;
-        // The chunk is cut against two limits: the historian's read budget (the
-        // rendered text it sends) and the fence (what the region may cost the
-        // conversation). Nothing fitting means the oldest eligible block alone
-        // would leave less than the fence's worth of verbatim tail; a fold that
-        // did that would hand the model a summarized old block plus almost no
-        // recent history, so the run waits instead.
-        let Some(chunk) = historian::chunk(
-            &rows,
-            floor + 1,
-            eligible_end,
-            ChunkLimits {
-                request: budget.historian_chunk as usize,
-                context: foldable,
-            },
-            &count,
-        ) else {
-            // Under real pressure this is the one shape mctx cannot resolve by
-            // itself, so it is an operator signal, not just a trace: a tail
-            // dominated by a single block stays unfolded until it grows past the
-            // fence. Below the pressure band the same skip is routine (a short
-            // session whose whole tail is protected), hence debug.
-            let message =
-                "historian skipped: the oldest eligible block alone crosses the protected tail";
-            if usage_pct.unwrap_or(0.0) >= budget.soft_pct {
-                tracing::warn!(
-                    session = %session_id,
-                    foldable,
-                    protected_tail = protected,
-                    usage_pct = ?usage_pct,
-                    "{message}"
-                );
-            } else {
-                tracing::debug!(
-                    session = %session_id,
-                    foldable,
-                    protected_tail = protected,
-                    usage_pct = ?usage_pct,
-                    "{message}"
-                );
+        let count = tokens::counter_fn(ratio);
+        let target = budget.target;
+        // The provider's usage number is stale until the next completion, so
+        // each pass's estimate subtracts what this event's folds covered.
+        let mut remaining: Option<i64> = usage;
+        let mut floor = event_floor;
+        let mut folds = 0usize;
+        let mut covered: Option<(i64, i64)> = None;
+        let mut compartments = 0usize;
+        loop {
+            // Zero-copy: re-measure the tail above the current floor as a
+            // subslice of the rows already loaded — no fresh load, no clone.
+            let start = rows.partition_point(|(ordinal, _)| *ordinal <= floor);
+            let above = &rows[start..];
+            // The whole tail's estimate, measured by the chunker itself so the
+            // pressure and the budget speak the same units. `None` (nothing
+            // renderable above the floor) ends the event: on the first pass
+            // that is the old empty-tail answer, later it means the fold is
+            // done — the aggregate below answers `Ok(None)` either way when
+            // nothing folded.
+            let Some(whole) =
+                historian::chunk(above, floor + 1, i64::MAX, ChunkLimits::unbounded(), &count)
+            else {
+                break;
+            };
+            // What a run could actually fold: the tail's real size minus the
+            // fence. Both numbers are context tokens (`Chunk::context_tokens`),
+            // the unit the provider's usage speaks — a tool result counts by
+            // the body it cost, not by the `TC:` line that renders it. The
+            // trigger reads this, not the whole tail: the fence is history a
+            // fold can never remove, so counting it would keep the trigger
+            // armed no matter how much the event already folded.
+            let protected = budget.protected_tail(usage_pct.unwrap_or(0.0));
+            let foldable = whole.context_tokens.saturating_sub(protected as usize);
+            let trigger = historian::trigger(usage_pct, foldable as f64, budget.trigger, &budget);
+            tracing::debug!(
+                session = %session_id,
+                tail_tokens = whole.context_tokens,
+                foldable,
+                protected_tail = protected,
+                rendered_tokens = whole.token_estimate,
+                // `None` = no completion has reported usage yet; it is not 0%.
+                usage_pct = ?usage_pct,
+                trigger_budget = budget.trigger,
+                trigger = ?trigger,
+                target = ?target,
+                remaining = ?remaining,
+                messages = above.len(),
+                bytes = whole.text.len(),
+                first_ordinal = above.first().map(|(ordinal, _)| *ordinal),
+                last_ordinal = above.last().map(|(ordinal, _)| *ordinal),
+                floor,
+                folds,
+                "historian pressure"
+            );
+            match fold_step(FoldInput {
+                trigger,
+                foldable,
+                remaining,
+                target,
+                folds,
+            }) {
+                FoldStep::Fold => {}
+                FoldStep::Stop(reason) => {
+                    tracing::debug!(
+                        session = %session_id,
+                        reason = ?reason,
+                        folds,
+                        foldable,
+                        remaining = ?remaining,
+                        target = ?target,
+                        "historian event stopped"
+                    );
+                    break;
+                }
             }
+
+            // The chunk is cut against two limits: the historian's read budget
+            // (the rendered text it sends) and the fence (what the region may
+            // cost the conversation). Nothing fitting means the oldest eligible
+            // block alone would leave less than the fence's worth of verbatim
+            // tail; a fold that did that would hand the model a summarized old
+            // block plus almost no recent history, so the run waits instead.
+            let Some(chunk) = historian::chunk(
+                above,
+                floor + 1,
+                eligible_end,
+                ChunkLimits {
+                    request: budget.historian_chunk as usize,
+                    context: foldable,
+                },
+                &count,
+            ) else {
+                // Under real pressure this is the one shape mctx cannot resolve
+                // by itself, so it is an operator signal, not just a trace: a
+                // tail dominated by a single block stays unfolded until it
+                // grows past the fence. Below the pressure band the same skip
+                // is routine (a short session whose whole tail is protected),
+                // hence debug.
+                let message =
+                    "historian skipped: the oldest eligible block alone crosses the protected tail";
+                if usage_pct.unwrap_or(0.0) >= budget.soft_pct {
+                    tracing::warn!(
+                        session = %session_id,
+                        foldable,
+                        protected_tail = protected,
+                        usage_pct = ?usage_pct,
+                        "{message}"
+                    );
+                } else {
+                    tracing::debug!(
+                        session = %session_id,
+                        foldable,
+                        protected_tail = protected,
+                        usage_pct = ?usage_pct,
+                        "{message}"
+                    );
+                }
+                break;
+            };
+            let executed = match self.execute(&chunk, Some(trigger), event_floor).await {
+                Ok(Some(executed)) => executed,
+                Ok(None) => {
+                    // Another run holds the claim; it will publish, and the next
+                    // pass picks the compartments up.
+                    break;
+                }
+                Err(error) => {
+                    let covered_so_far = covered.map_or_else(
+                        || "none".to_owned(),
+                        |(first, last)| format!("{first}..{last}"),
+                    );
+                    tracing::warn!(
+                        session = %session_id,
+                        folds,
+                        // The chunk this iteration failed on, not just the
+                        // aggregate already folded: the two ranges separate a
+                        // first-fold failure from a later one.
+                        chunk = %format!("{}..{}", chunk.covered.start(), chunk.covered.end()),
+                        covered = %covered_so_far,
+                        error = %error,
+                        "historian event stopped by a failed fold"
+                    );
+                    break;
+                }
+            };
+            floor = executed.covered_end;
+            folds += 1;
+            compartments += executed.compartments;
+            covered = Some(match covered {
+                None => (*chunk.covered.start(), executed.covered_end),
+                Some((first, _)) => (first, executed.covered_end),
+            });
+            remaining = remaining.map(|r| r.saturating_sub(executed.context_tokens as i64));
+        }
+        let Some((first, last)) = covered else {
             return Ok(None);
         };
-        self.execute(chunk, Some(trigger), floor).await
+        // One notice for the whole event: the transcript shows the range the
+        // pressure folded, not one row per chunk.
+        Ok(Some(Published {
+            covered: format!("{first}..{last}"),
+            compartments,
+        }))
     }
 
     /// One synchronous patch run for the background fold (plan D6): fold the
@@ -648,14 +822,15 @@ impl Firing<'_> {
     /// decided a fold must happen (the checkpoint's recent budget is busted).
     /// One attempt, no retry; the single-flight claim stays `historian::run`'s,
     /// so a detached run already in flight wins and this returns `Ok(None)`.
-    async fn patch(self, floor: i64) -> Result<Option<Published>> {
-        let Self {
-            db,
-            budget,
-            session_id,
-            ratio,
-            ..
-        } = self;
+    ///
+    /// Deliberately single-fold, unlike [`Firing::run`]: this path repairs one
+    /// checkpoint whose recent budget overflowed, and it has no live usage
+    /// number to measure a low-water target against — one drain, one fold.
+    async fn patch(&self, floor: i64) -> Result<Option<Published>> {
+        let db = self.db;
+        let budget = self.budget;
+        let session_id = self.session_id;
+        let ratio = self.ratio;
         // Shortcut, not the authority: the claim below is one statement, so a
         // run started after this check simply loses it and returns `None`.
         if historian::has_running_run(db, session_id).await? {
@@ -709,29 +884,41 @@ impl Firing<'_> {
             );
             return Ok(None);
         };
-        self.execute(chunk, None, floor).await
+        let covered = format!("{}..{}", chunk.start_ordinal, chunk.end_ordinal);
+        Ok(self
+            .execute(&chunk, None, floor)
+            .await?
+            .map(|executed| Published {
+                covered,
+                compartments: executed.compartments,
+            }))
     }
 
     /// The prompt assembly and the run itself, shared by the detached
     /// pressure trigger and the background fold's patch path. `trigger` is
     /// logged — `Some` for a pressure-band firing, `None` for a patch run.
+    ///
+    /// The chunk is borrowed: the pressure loop needs its range and context
+    /// cost after the run, and its rendered text is tens of KB — copying it
+    /// just to hand it over would be the event's largest allocation. The run's
+    /// outcome comes back as [`Executed`] instead.
+    ///
+    /// `prefix_floor` is the event's original floor: the prefix region must
+    /// still be loaded and bounded from where the live request was rendered.
+    /// The borrowed chunk already carries the current floor's advanced bounds.
     async fn execute(
-        self,
-        chunk: historian::Chunk,
+        &self,
+        chunk: &historian::Chunk,
         trigger: Option<historian::Trigger>,
-        floor: i64,
-    ) -> Result<Option<Published>> {
-        let Firing {
-            db,
-            config,
-            chat,
-            catalog,
-            session_id,
-            project,
-            reasoning_effort,
-            prefix: live,
-            ..
-        } = self;
+        prefix_floor: i64,
+    ) -> Result<Option<Executed>> {
+        let db = self.db;
+        let config = self.config;
+        let chat = self.chat;
+        let catalog = self.catalog;
+        let session_id = self.session_id;
+        let project = self.project;
+        let live = self.prefix.as_ref();
         let compartments = compartments::load(db, session_id).await?;
         let references: Vec<historian::ReferenceCompartment<'_>> = compartments
             .iter()
@@ -757,19 +944,24 @@ impl Firing<'_> {
             config,
             chat,
             catalog,
-            reasoning_effort,
+            // The policy is borrowed: `Firing` lives for the whole pressure
+            // event and lends the same string to every run it executes, so
+            // the field never outlives the event it came from.
+            reasoning_effort: self.reasoning_effort.as_deref(),
         };
         // The request shape, decided before the region is loaded because only a
         // prefix-shaped run pays for it. `same_model` reads the same resolver the
         // run itself uses, so the two can never disagree about the route.
         let switch_on = config.magic_context.historian_prefix_cache;
-        let live = live.as_ref();
         let same_model = live.is_some_and(|live| {
             historian::historian_model(config, catalog).is_ok_and(|model| model == live.model_id)
         });
         let (region, fold_below_live_start) = if switch_on && live.is_some() && same_model {
-            // THE REGION MUST START WHERE THE LIVE RENDER STARTS, and `floor` is
-            // not that point. `build_chat_messages` skips rows it cannot render,
+            // THE REGION MUST START WHERE THE LIVE RENDER STARTS. The loop's
+            // current `floor` is not that point: after the first fold it has
+            // advanced past rows the live request still contains, so the load
+            // and its boundary stay anchored at `prefix_floor`.
+            // `build_chat_messages` skips rows it cannot render,
             // but every row still advances its temporal-marker cursor, so a slice
             // that starts later loses the `<!-- +2h -->` marker the live request
             // rendered and stops being a byte prefix of what the provider cached
@@ -779,8 +971,8 @@ impl Firing<'_> {
             // the same rows the live request decided it over, so the whole tail is
             // loaded here (exactly what the live step loaded) rather than the
             // chunk's window.
-            let tail = load_overlaid_tail_with_ordinals(db, session_id, floor).await?;
-            let start = region_start(&tail, floor);
+            let tail = load_overlaid_tail_with_ordinals(db, session_id, prefix_floor).await?;
+            let start = region_start(&tail, prefix_floor);
             // The other side of the window: the historian may not read ordinals
             // the fold does not cover.
             let end = *chunk.covered.end();
@@ -823,7 +1015,7 @@ impl Firing<'_> {
         let plan = historian::RunPlan {
             session_id,
             project,
-            chunk: &chunk,
+            chunk,
             attempt: 1,
             prompt,
             prefix,
@@ -851,18 +1043,31 @@ impl Firing<'_> {
             compartments = outcome.compartment_ids.len(),
             "historian published"
         );
-        Ok(Some(Published {
-            covered: format!("{}..{}", chunk.start_ordinal, chunk.end_ordinal),
+        Ok(Some(Executed {
+            covered_end: *chunk.covered.end(),
+            context_tokens: chunk.context_tokens,
             compartments: outcome.compartment_ids.len(),
         }))
     }
 }
 
-/// What one published run folded, for the transcript notice.
-struct Published {
-    /// Ordinal range the run covered (`a..b`).
-    covered: String,
+/// What one executed fold covered, handed back so the pressure loop can
+/// advance its floor and keep the event's accounting without cloning the chunk.
+struct Executed {
+    /// Last ordinal the fold covered: the next pass's floor.
+    covered_end: i64,
+    /// Context tokens the fold removed, subtracted from the usage estimate.
+    context_tokens: usize,
     /// Compartments the run published.
+    compartments: usize,
+}
+
+/// What one pressure event or patch published, for the transcript notice.
+struct Published {
+    /// Aggregate ordinal range covered (`a..b`), spanning every chunk when a
+    /// pressure event folded more than one.
+    covered: String,
+    /// Compartments the event or patch published.
     compartments: usize,
 }
 
@@ -1075,6 +1280,163 @@ mod tests {
             users,
             ["prompt 2", "prompt 3"],
             "the region must hold exactly the rows inside the fold's window"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Pressure-event fold loop
+    // -----------------------------------------------------------------------
+
+    /// A budget over the production window, with the execute threshold the
+    /// caller's scenario assumes (the default moved from 65 to 55 with the
+    /// low-water target, and the measured production numbers are the 65 ones).
+    fn budget(execute: f64) -> Budget {
+        let config = ox_core::config::MctxConfig {
+            execute_threshold_percentage: execute,
+            ..ox_core::config::MctxConfig::default()
+        };
+        Budget::derive(&config, Some(262_144), None)
+    }
+
+    #[test]
+    fn the_trigger_measures_the_foldable_tail_not_the_whole_tail() {
+        // Regression pin for the fold storm: at the old 65% default a
+        // 262,144-token window gives trigger 8,520, and at 40% usage the fence
+        // protects 30,671 tokens. The *whole* tail (30,671 + 10,000 = 40,671)
+        // crosses 3 × 8,520 = 25,560, so measuring it returned Speculative on
+        // every step boundary even though a fold could only ever remove the
+        // 10,000 tokens outside the fence. That is the bug being pinned.
+        let budget = budget(65.0);
+        assert_eq!(
+            budget.trigger, 8_520,
+            "the pin assumes the measured production geometry"
+        );
+        assert_eq!(
+            budget.protected_tail(40.0),
+            30_671,
+            "the fence alone was what kept the whole-tail trigger armed"
+        );
+        assert_eq!(
+            historian::trigger(Some(40.0), 40_671.0, budget.trigger, &budget),
+            historian::Trigger::Speculative,
+            "the whole-tail measurement still crosses the tail-size band"
+        );
+        let trigger = historian::trigger(Some(40.0), 10_000.0, budget.trigger, &budget);
+        assert_eq!(
+            fold_step(FoldInput {
+                trigger,
+                foldable: 10_000,
+                remaining: Some(104_858),
+                target: budget.target,
+                folds: 0,
+            }),
+            FoldStep::Stop(FoldStop::NoPressure),
+            "only 10,000 tokens are foldable, far below 3 × 8,520: the event must not fire"
+        );
+    }
+
+    #[test]
+    fn the_event_folds_while_pressure_and_headroom_remain() {
+        let budget = budget(55.0);
+        assert_eq!(
+            budget.target,
+            Some(73_400),
+            "the low-water target is 28% of the window, got {:?}",
+            budget.target
+        );
+        assert_eq!(
+            fold_step(FoldInput {
+                trigger: historian::Trigger::Speculative,
+                foldable: 10_000,
+                remaining: Some(100_000),
+                target: budget.target,
+                folds: 0,
+            }),
+            FoldStep::Fold,
+            "pressure, foldable history and an estimate above the target mean another fold"
+        );
+        assert_eq!(
+            fold_step(FoldInput {
+                trigger: historian::Trigger::Speculative,
+                foldable: 10_000,
+                remaining: Some(0),
+                target: None,
+                folds: 0,
+            }),
+            FoldStep::Fold,
+            "an unknown window has no target, so the estimate can never stop the event early"
+        );
+    }
+
+    #[test]
+    fn every_stop_reason_ends_the_event() {
+        let budget = budget(55.0);
+        let target = budget.target;
+        assert_eq!(
+            fold_step(FoldInput {
+                trigger: historian::Trigger::No,
+                foldable: 10_000,
+                remaining: Some(100_000),
+                target,
+                folds: 0,
+            }),
+            FoldStep::Stop(FoldStop::NoPressure),
+            "a foldable tail below both bands is not worth a hidden completion"
+        );
+        assert_eq!(
+            fold_step(FoldInput {
+                trigger: historian::Trigger::Speculative,
+                foldable: 0,
+                remaining: Some(100_000),
+                target,
+                folds: 0,
+            }),
+            FoldStep::Stop(FoldStop::NothingFoldable),
+            "everything left is protected, so no fold may start"
+        );
+        assert_eq!(
+            fold_step(FoldInput {
+                trigger: historian::Trigger::Speculative,
+                foldable: 10_000,
+                remaining: None,
+                target,
+                folds: 0,
+            }),
+            FoldStep::Fold,
+            "the first pass without usage must still fold once, as before the loop"
+        );
+        assert_eq!(
+            fold_step(FoldInput {
+                trigger: historian::Trigger::Speculative,
+                foldable: 10_000,
+                remaining: None,
+                target,
+                folds: 1,
+            }),
+            FoldStep::Stop(FoldStop::NoUsage),
+            "after that one fold the target cannot be measured, so the event stops"
+        );
+        assert_eq!(
+            fold_step(FoldInput {
+                trigger: historian::Trigger::Speculative,
+                foldable: 10_000,
+                remaining: Some(73_400),
+                target,
+                folds: 0,
+            }),
+            FoldStep::Stop(FoldStop::TargetReached),
+            "an estimate at the low-water target is low enough"
+        );
+        assert_eq!(
+            fold_step(FoldInput {
+                trigger: historian::Trigger::Speculative,
+                foldable: 10_000,
+                remaining: Some(100_000),
+                target,
+                folds: MAX_FOLDS_PER_EVENT,
+            }),
+            FoldStep::Stop(FoldStop::Cap),
+            "the cap decides first: it bounds one event no matter what remains"
         );
     }
 }

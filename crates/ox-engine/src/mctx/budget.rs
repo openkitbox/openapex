@@ -1,14 +1,15 @@
-//! Model-window geometry and the three token budgets derived from it.
+//! Model-window geometry and the four token budgets derived from it.
 //!
 //! Everything that measures context pressure or decides how much history the
 //! head carries reads its numbers from one [`Budget`], derived once per drain
-//! from the model catalogue. Three budgets, not one, because they answer three
+//! from the model catalogue. Four budgets, not one, because they answer four
 //! different questions (upstream `derive-budgets.ts`):
 //!
 //! | field | question | anchor |
 //! |---|---|---|
 //! | [`Budget::trigger`] | how long may the unfolded tail grow | main model's usable window |
 //! | [`Budget::history`] | how much history may `m[0]` carry | main model's usable window |
+//! | [`Budget::target`] | how far down must a pressure event fold | main model's window |
 //! | [`Budget::historian_chunk`] | how much may one historian run read | the historian model's own window |
 //!
 //! Ported from the reference `boundary.rs` and its escalation bands, collapsed
@@ -23,6 +24,10 @@
 //! the fields.
 
 use crate::mctx::MctxConfig;
+use ox_core::config::{
+    default_execute_threshold_percentage, default_fold_target_percentage,
+    default_history_budget_percentage,
+};
 
 /// The window assumed for the **historian** model when the catalogue does not
 /// name it: the reference's own `BoundaryContext` default (§8.2). Erring small
@@ -42,11 +47,17 @@ const FALLBACK_HISTORY: u32 = 60_000;
 const SOFT_OFFSET_PCT: f64 = 2.0;
 /// Floor of the force band (`MIN_FORCE_MATERIALIZE_PERCENTAGE`).
 const HARD_FLOOR_PCT: f64 = 85.0;
+/// Margin between the low-water target and the proactive floor. A target at
+/// or above that floor is unreachable while pressure is active: the band stops
+/// the event first and immediately arms another one at the next step boundary.
+const TARGET_MARGIN_PCT: f64 = 5.0;
 
-/// The bounds of the two config values every number here derives from:
-/// `[magic_context] execute_threshold_percentage` and `history_budget_percentage`.
+/// The bounds of the three config values every number here derives from:
+/// `[magic_context] execute_threshold_percentage`, `history_budget_percentage`
+/// and `fold_target_percentage`.
 /// They live beside the config they constrain (`ox_core::config`).
-pub use ox_core::config::{MAX_EXECUTE_PCT, MAX_HISTORY_SHARE, MIN_EXECUTE_PCT, MIN_HISTORY_SHARE};
+pub use ox_core::config::{MAX_EXECUTE_PCT, MAX_FOLD_TARGET_PCT, MAX_HISTORY_SHARE};
+pub use ox_core::config::{MIN_EXECUTE_PCT, MIN_FOLD_TARGET_PCT, MIN_HISTORY_SHARE};
 
 /// `derive_trigger_budget`: a share of the usable window, clamped so a small
 /// window still folds something and a large one cannot let the tail grow
@@ -59,11 +70,6 @@ const TRIGGER_MAX: f64 = 50_000.0;
 const HISTORIAN_CHUNK_SHARE: f64 = 0.25;
 const HISTORIAN_CHUNK_MIN: f64 = 8_000.0;
 const HISTORIAN_CHUNK_MAX: f64 = 50_000.0;
-
-/// The defaults the config carries when a key is absent (mirrored by
-/// `MctxConfig::default`; duplicated here only so a NaN has somewhere to land).
-const DEFAULT_EXECUTE_PCT: f64 = 65.0;
-const DEFAULT_HISTORY_SHARE: f64 = 0.15;
 
 /// `deriveProtectedTailTokenTarget`: how many tokens at the end of the tail a
 /// run must leave alone.
@@ -92,6 +98,12 @@ pub struct Budget {
     pub history: u32,
     /// Tokens one historian run may read.
     pub historian_chunk: u32,
+    /// The low-water target in tokens (`window × fold_target_percentage`): a
+    /// pressure event keeps folding until its post-fold estimate reaches this.
+    /// `None` when the window is unknown — with no target there is nothing to
+    /// fold down to, not a single-fold limit. The bands and per-event cap still
+    /// bound the event; only a session with no reported usage folds just once.
+    pub target: Option<u32>,
     /// The usable working space (`window × execute_threshold`), kept because
     /// the protected tail is a fraction of it.
     usable: u32,
@@ -114,16 +126,28 @@ impl Budget {
         // clamp belongs to the only place that turns the numbers into budgets.
         let execute = percent(
             config.execute_threshold_percentage,
-            DEFAULT_EXECUTE_PCT,
+            default_execute_threshold_percentage(),
             MIN_EXECUTE_PCT,
             MAX_EXECUTE_PCT,
         );
+        let soft_pct = (execute - SOFT_OFFSET_PCT).max(0.0);
         let history_share = percent(
             config.history_budget_percentage,
-            DEFAULT_HISTORY_SHARE,
+            default_history_budget_percentage(),
             MIN_HISTORY_SHARE,
             MAX_HISTORY_SHARE,
         );
+        // The raw percentage is clamped during config validation, but the
+        // derived target must also stay below the soft band. Otherwise a
+        // reachable stop becomes unreachable: pressure clears before the
+        // target is reached, so every step boundary would fold again.
+        let fold_target = percent(
+            config.fold_target_percentage,
+            default_fold_target_percentage(),
+            MIN_FOLD_TARGET_PCT,
+            MAX_FOLD_TARGET_PCT,
+        )
+        .min(soft_pct - TARGET_MARGIN_PCT);
         let historian_chunk = clamp_u32(
             (f64::from(historian.unwrap_or(ASSUMED_HISTORIAN_WINDOW)) * HISTORIAN_CHUNK_SHARE)
                 .round(),
@@ -136,11 +160,12 @@ impl Budget {
                 // The bands are still derived (a reported usage percentage
                 // cannot exist without a window, so only `usage_percentage`
                 // returning `None` uses this).
-                soft_pct: (execute - SOFT_OFFSET_PCT).max(0.0),
+                soft_pct,
                 hard_pct: (execute + 2.0).max(HARD_FLOOR_PCT),
                 trigger: FALLBACK_TRIGGER,
                 history: FALLBACK_HISTORY,
                 historian_chunk,
+                target: None,
                 usable: 0,
             };
         };
@@ -149,7 +174,7 @@ impl Budget {
             window: Some(window),
             // Upstream derives both bands from the execute threshold, never
             // from each other: a misconfigured pair cannot invert them.
-            soft_pct: (execute - SOFT_OFFSET_PCT).max(0.0),
+            soft_pct,
             hard_pct: (execute + 2.0).max(HARD_FLOOR_PCT),
             trigger: clamp_u32(
                 (f64::from(usable) * TRIGGER_SHARE).round(),
@@ -162,6 +187,14 @@ impl Budget {
                 f64::from(usable),
             ),
             historian_chunk,
+            // A percentage of a real window, clamped into `1..=window`: a tiny
+            // window still gets a target of one token rather than zero, which
+            // would read as "already reached" and stop every event early.
+            target: Some(clamp_u32(
+                (f64::from(window) * fold_target / 100.0).round(),
+                1.0,
+                f64::from(window.max(1)),
+            )),
             usable,
         }
     }
@@ -258,4 +291,89 @@ fn percent(value: f64, default: f64, min: f64, max: f64) -> f64 {
 
 fn clamp_u32(value: f64, min: f64, max: f64) -> u32 {
     value.clamp(min, max) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_target_is_a_share_of_the_known_window() {
+        let budget = Budget::derive(&MctxConfig::default(), Some(262_144), None);
+        assert_eq!(
+            budget.target,
+            Some(73_400),
+            "262,144 × 28% must round to the low-water target, got {:?}",
+            budget.target
+        );
+    }
+
+    #[test]
+    fn an_unknown_window_has_no_target() {
+        let budget = Budget::derive(&MctxConfig::default(), None, None);
+        assert_eq!(
+            budget.target, None,
+            "with no window there is no low-water stop, not a single-fold event"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_target_percentage_is_clamped() {
+        let config = MctxConfig {
+            fold_target_percentage: 200.0,
+            ..MctxConfig::default()
+        };
+        let budget = Budget::derive(&config, Some(100_000), None);
+        assert_eq!(
+            budget.target,
+            Some(48_000),
+            "a 200% target must clamp to five points below the 53% soft band, got {:?}",
+            budget.target
+        );
+        let config = MctxConfig {
+            fold_target_percentage: f64::NAN,
+            ..MctxConfig::default()
+        };
+        let budget = Budget::derive(&config, Some(100_000), None);
+        assert_eq!(
+            budget.target,
+            Some(28_000),
+            "a NaN target must fall back to the default, got {:?}",
+            budget.target
+        );
+    }
+
+    #[test]
+    fn a_target_at_or_above_the_soft_band_is_pulled_below_it() {
+        let config = MctxConfig {
+            fold_target_percentage: 60.0,
+            ..MctxConfig::default()
+        };
+        let budget = Budget::derive(&config, Some(100_000), None);
+        assert_eq!(
+            budget.soft_pct, 53.0,
+            "the default 55% execute threshold puts the soft band at 53%, got {}",
+            budget.soft_pct
+        );
+        assert_eq!(
+            budget.target,
+            Some(48_000),
+            "a reachable target must sit five points below the soft band, got {:?}",
+            budget.target
+        );
+    }
+
+    #[test]
+    fn a_tiny_window_still_gets_a_nonzero_target() {
+        let config = MctxConfig {
+            fold_target_percentage: MIN_FOLD_TARGET_PCT,
+            ..MctxConfig::default()
+        };
+        let budget = Budget::derive(&config, Some(4), None);
+        assert_eq!(
+            budget.target,
+            Some(1),
+            "the target is clamped into 1..=window so zero cannot read as already reached"
+        );
+    }
 }

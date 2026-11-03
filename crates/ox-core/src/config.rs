@@ -532,6 +532,13 @@ impl Config {
 pub const MIN_EXECUTE_PCT: f64 = 20.0;
 pub const MAX_EXECUTE_PCT: f64 = 90.0;
 
+/// Bounds of the fold's low-water target, in percent of the model window. The
+/// lower floor prevents a zero target; the derived budget additionally caps the
+/// effective target below the proactive floor, so a high configured target
+/// cannot re-arm folding at every step boundary.
+pub const MIN_FOLD_TARGET_PCT: f64 = 5.0;
+pub const MAX_FOLD_TARGET_PCT: f64 = 80.0;
+
 /// Bounds of the `m[0]` history share.
 pub const MIN_HISTORY_SHARE: f64 = 0.05;
 pub const MAX_HISTORY_SHARE: f64 = 0.5;
@@ -554,9 +561,20 @@ pub struct MctxConfig {
     /// Context usage (percent of the model window) at which folding is due.
     /// Everything else — the proactive floor, the force band, the protected
     /// tail, the trigger and history budgets — is derived from it, so this is
-    /// the single knob the numbers hang off.
+    /// the knob the numbers hang off; `fold_target_percentage` below sets only
+    /// where a pressure event stops folding.
     #[serde(default = "default_execute_threshold_percentage")]
     pub execute_threshold_percentage: f64,
+    /// The fold's low-water target, as a percent of the model window: after a
+    /// fold the historian keeps folding (within the same pressure event) until
+    /// the estimated prompt is at or below it. One fold per event only removes
+    /// one chunk, so a tail that grew far above the target would otherwise sit
+    /// above it until the next event — which is what made folds fire back to
+    /// back in production. The derived target is additionally kept five points
+    /// below the proactive floor (`execute_threshold_percentage - 2`), so a
+    /// configured target at or above that floor cannot re-arm every step.
+    #[serde(default = "default_fold_target_percentage")]
+    pub fold_target_percentage: f64,
     /// Share of the usable window the `m[0]` history block may carry. Upstream
     /// default 0.15, range 0.05–0.5.
     #[serde(default = "default_history_budget_percentage")]
@@ -625,6 +643,16 @@ impl MctxConfig {
             );
             self.execute_threshold_percentage = default_execute_threshold_percentage();
         }
+        if !(MIN_FOLD_TARGET_PCT..=MAX_FOLD_TARGET_PCT).contains(&self.fold_target_percentage) {
+            tracing::warn!(
+                setting = "fold_target_percentage",
+                value = self.fold_target_percentage,
+                "invalid [magic_context] fold target (expected {}..={}); using the default",
+                MIN_FOLD_TARGET_PCT,
+                MAX_FOLD_TARGET_PCT
+            );
+            self.fold_target_percentage = default_fold_target_percentage();
+        }
         if !(MIN_HISTORY_SHARE..=MAX_HISTORY_SHARE).contains(&self.history_budget_percentage) {
             tracing::warn!(
                 setting = "history_budget_percentage",
@@ -685,7 +713,11 @@ impl MctxConfig {
 
 #[must_use]
 pub fn default_execute_threshold_percentage() -> f64 {
-    65.0
+    55.0
+}
+#[must_use]
+pub fn default_fold_target_percentage() -> f64 {
+    28.0
 }
 #[must_use]
 pub fn default_history_budget_percentage() -> f64 {
@@ -710,6 +742,7 @@ impl Default for MctxConfig {
             enabled: default_enabled(),
             historian_model: None,
             execute_threshold_percentage: default_execute_threshold_percentage(),
+            fold_target_percentage: default_fold_target_percentage(),
             history_budget_percentage: default_history_budget_percentage(),
             soft_threshold: default_soft_threshold(),
             hard_threshold: default_hard_threshold(),

@@ -1827,7 +1827,7 @@ impl RunState {
 
 /// What one run needs from its host: the store, the config the model comes
 /// from, and the mockable chat seam (the same one the runner drives).
-pub struct RunCtx<'a> {
+pub struct RunCtx<'a, 'historian> {
     pub db: &'a ox_db::Db,
     pub config: &'a Config,
     pub chat: &'a Arc<dyn Chat>,
@@ -1835,7 +1835,11 @@ pub struct RunCtx<'a> {
     pub catalog: &'a ox_llm::model_catalog::ModelCatalog,
     /// The session's policy captured at trigger time; detached runs never
     /// re-read a mutable session selection.
-    pub reasoning_effort: Option<String>,
+    ///
+    /// Borrowed, not owned: the host (the pressure event) lives for the whole
+    /// run it starts and lends the same policy to every fold it executes, so
+    /// a per-fold copy of the string would buy nothing.
+    pub reasoning_effort: Option<&'historian str>,
 }
 
 /// The live request a run's messages can begin with (plan A3): the bytes the
@@ -1958,7 +1962,7 @@ impl std::error::Error for ValidationFailure {}
 /// `None` means the session already has a run in flight and this one did not
 /// claim the slot: it has done nothing at all, and the winner's compartments are
 /// what the next pass picks up.
-pub async fn run(ctx: &RunCtx<'_>, plan: &RunPlan<'_>) -> Result<Option<RunOutcome>> {
+pub async fn run(ctx: &RunCtx<'_, '_>, plan: &RunPlan<'_>) -> Result<Option<RunOutcome>> {
     let model = historian_model(ctx.config, ctx.catalog)?;
     // The stored ranges are read before the run is claimed: a store failure must
     // leave no row behind for a run that never started.
@@ -2021,11 +2025,9 @@ pub async fn run(ctx: &RunCtx<'_>, plan: &RunPlan<'_>) -> Result<Option<RunOutco
                 prefix.tools,
                 HISTORIAN_SYSTEM_PROMPT,
                 &user_prompt,
-                ctx.reasoning_effort.as_deref(),
+                ctx.reasoning_effort,
             ),
-            None => {
-                historian_request_with_prompt(&model, &user_prompt, ctx.reasoning_effort.as_deref())
-            }
+            None => historian_request_with_prompt(&model, &user_prompt, ctx.reasoning_effort),
         };
 
         let text = match collect_completion(ctx.chat, &request, "historian").await {
