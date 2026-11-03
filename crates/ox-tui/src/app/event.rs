@@ -93,7 +93,7 @@ pub enum AppEvent {
     /// Answer to `AppCommand::ListSessions`; opens the `/sessions` dialog.
     Sessions(Vec<ox_client::rest::SessionSummary>),
     /// Answer to `AppCommand::ListFamily`: the family `session` belongs to;
-    /// opens the subagent picker.
+    /// the activity panel lists it.
     Family {
         session: String,
         members: Vec<ox_client::rest::FamilyMember>,

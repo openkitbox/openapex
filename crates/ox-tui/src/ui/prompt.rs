@@ -31,8 +31,10 @@ pub const PLACEHOLDERS: [&str; 3] = [
 
 /// Upstream `SplitBorder.vertical`: the panel's left edge is a heavy vertical
 /// rule. A half block (`▌`) is twice as wide and does not line up with the
-/// centred `╹` foot below it, which reads as a notch.
-const PANEL_BORDER_CHAR: char = '┃';
+/// centred `╹` foot below it, which reads as a notch. The activity panel
+/// (`super::activity_panel`), which takes the composer's place, draws the same
+/// rail.
+pub(crate) const PANEL_BORDER_CHAR: char = '┃';
 /// How long the first Esc keeps the interrupt armed (upstream: 5s).
 const INTERRUPT_WINDOW: Duration = Duration::from_secs(5);
 

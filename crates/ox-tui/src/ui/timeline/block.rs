@@ -106,7 +106,8 @@ pub enum Block {
     /// An agent / model / location change (upstream `SessionSwitchMessageV2`).
     Switch(Switch),
     /// A system notice or a loaded skill (upstream `SessionNoticeMessageV2`,
-    /// `SessionSkillMessage`).
+    /// `SessionSkillMessage`), or a described synthetic row such as a
+    /// historian fold (`◈ historian folded 59..59 · 1 compartment`).
     Notice(Notice),
     /// A run failure no step or compaction already shows: `Error: message`.
     Error(ErrorInfo),

@@ -305,8 +305,10 @@ fn thought_header_style(
 
 /// Upstream `ReasoningPart` / `ReasoningHeader` (`message-parts.tsx`). The
 /// header is `+ Thought` collapsed, `- Thought` open, and a spinner with
-/// `Thinking` while the reasoning streams. An open block shows its text on a
-/// `┃` rail one blank row below the header. Click or `r` toggles it.
+/// `Thinking` while the reasoning streams. A finished header appends
+/// ` · 2.5s` (gold: `+ Thought · 2.5s`); a summary title sits before it as
+/// `: title`. An open block shows its text on a `┃` rail one blank row below
+/// the header. Click or `r` toggles it.
 ///
 /// Observed in upstream 2.2.3 (`gold`): the open header is the plain warning
 /// colour and the collapsed one is warning tinted 60% over the background.
@@ -327,15 +329,12 @@ fn reasoning_block(
     let (title, body) = reasoning_summary(text);
     let style = thought_header_style(palette, expanded, done, view.hovered);
     let header = if done {
-        let duration = ms.map(|ms| format_duration(ms as i64));
         let mut header = format!("   {} Thought", if expanded { '-' } else { '+' });
-        match (title, duration) {
-            (Some(title), Some(duration)) => {
-                header.push_str(&format!(": {title} \u{b7} {duration}"))
-            }
-            (Some(title), None) => header.push_str(&format!(": {title}")),
-            (None, Some(duration)) => header.push_str(&format!(": {duration}")),
-            (None, None) => {}
+        if let Some(title) = title {
+            header.push_str(&format!(": {title}"));
+        }
+        if let Some(duration) = thought_duration(ms) {
+            header.push_str(&format!(" \u{b7} {duration}"));
         }
         header
     } else {
@@ -368,6 +367,17 @@ fn reasoning_block(
         }));
     }
     lines
+}
+
+/// The ` · 2.5s` suffix of a finished Thought header: tenths of a second, and
+/// no suffix until the reasoning reported a duration (`ms == 0` means none).
+///
+/// `format_duration` is upstream's `Locale.duration`, whose sub-second shape is
+/// `400ms`; the header always shows seconds (`0.4s`), so this is the smallest
+/// formatter that fits it instead of a mode inside the shared one.
+fn thought_duration(ms: Option<u64>) -> Option<String> {
+    let ms = ms.filter(|ms| *ms > 0)?;
+    Some(format!("{:.1}s", ms as f64 / 1_000.0))
 }
 
 /// The answer text, then the turn footer (own blank row above it).
@@ -546,9 +556,13 @@ fn notice_lines(notice: &Notice, width: u16) -> Vec<Line<'static>> {
 }
 
 /// Upstream `AssistantFooter` (`routes/session/index.tsx:2000`): the agent in
-/// its colour, then muted ` · model`, ` · duration`, ` · N.N tok/s`. The width
-/// gates are upstream's; `width` here is the timeline's, a few columns short
-/// of the terminal's, which only matters at the 28/36 boundaries.
+/// its colour, then muted ` · model`, ` · duration`, ` · N.N tok/s`. The model
+/// is the bare id (`General · k3-256k · 5m 3s · 32.1 tok/s` in the gold
+/// capture); `TurnFooter::model` carries upstream's `formatRef`
+/// (`providerID/id`), so the provider prefix is dropped here, as the composer's
+/// metadata row already draws it separately. The width gates are upstream's;
+/// `width` here is the timeline's, a few columns short of the terminal's, which
+/// only matters at the 28/36 boundaries.
 fn footer_line(footer: &TurnFooter, width: u16) -> Line<'static> {
     let palette = theme::palette();
     // A failed message's agent is muted (`AssistantFooter`).
@@ -565,7 +579,8 @@ fn footer_line(footer: &TurnFooter, width: u16) -> Line<'static> {
     if width >= 28
         && let Some(model) = &footer.model
     {
-        spans.push(Span::styled(format!(" \u{b7} {model}"), palette.dim));
+        let id = crate::ui::models::decode(model).map_or(model.as_str(), |(_, id)| id);
+        spans.push(Span::styled(format!(" \u{b7} {id}"), palette.dim));
     }
     if let Some(ms) = footer.duration_ms.filter(|ms| *ms > 0)
         && !(28..36).contains(&width)
@@ -596,4 +611,85 @@ fn user_block(text: &str, view: ViewState, width: u16) -> Vec<Line<'static>> {
         .map(|row| Line::from(Span::styled(row, palette.text)))
         .collect();
     block_tool::frame(rows, &rail, band, width)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::text::line_text;
+    use super::*;
+
+    /// The footer of a finished 5m 3s, 32.1 tok/s turn like the one the gold
+    /// capture shows.
+    fn footer(model: &str) -> TurnFooter {
+        TurnFooter {
+            agent: Some("general".to_owned()),
+            model: Some(model.to_owned()),
+            duration_ms: Some(303_000),
+            tokens_per_second: Some(32.1),
+            error: None,
+            retry: None,
+        }
+    }
+
+    /// A finished reasoning block over `text`.
+    fn reasoning(text: &str, ms: Option<u64>) -> Block {
+        Block::Reasoning {
+            id: "msg_1".to_owned(),
+            version: 1,
+            text: std::sync::Arc::new(text.to_owned()),
+            done: true,
+            ms,
+        }
+    }
+
+    /// The first drawn row after the block's leading margin row.
+    fn header(block: &Block) -> String {
+        let (rows, _, _) = render_entry(block, 100, ViewState::default());
+        line_text(&rows[1])
+    }
+
+    /// Gold: `General · k3-256k · 5m 3s · 32.1 tok/s` — the footer names the
+    /// model id alone, never the configured `provider/id` ref.
+    #[test]
+    fn footer_names_the_model_without_its_provider() {
+        let rows = footer_lines(&footer("cardinal/k3-256k"), None, 100);
+        let row = line_text(&rows[0]);
+        assert_eq!(
+            row,
+            "   General \u{b7} k3-256k \u{b7} 5m 3s \u{b7} 32.1 tok/s"
+        );
+        assert!(
+            !row.contains("cardinal"),
+            "the provider prefix must not reach the footer, got {row}"
+        );
+    }
+
+    /// Gold: `+ Thought · 2.5s` — tenths of a second once the reasoning ended.
+    #[test]
+    fn thought_header_shows_seconds_once_finished() {
+        assert_eq!(
+            header(&reasoning("a thought", Some(3_500))),
+            "   + Thought \u{b7} 3.5s"
+        );
+        assert_eq!(
+            header(&reasoning("a thought", Some(400))),
+            "   + Thought \u{b7} 0.4s"
+        );
+    }
+
+    /// No duration was reported: the header keeps upstream's bare shape.
+    #[test]
+    fn thought_header_omits_a_missing_duration() {
+        assert_eq!(header(&reasoning("a thought", Some(0))), "   + Thought");
+        assert_eq!(header(&reasoning("a thought", None)), "   + Thought");
+    }
+
+    /// A summary title stays ahead of the duration.
+    #[test]
+    fn thought_header_keeps_the_summary_title() {
+        assert_eq!(
+            header(&reasoning("**Inspecting**\n\nbody", Some(2_500))),
+            "   + Thought: Inspecting \u{b7} 2.5s"
+        );
+    }
 }

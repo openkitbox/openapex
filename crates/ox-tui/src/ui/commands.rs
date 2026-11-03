@@ -35,7 +35,8 @@ pub enum CommandAction {
     Rename,
     /// Open the message timeline and jump to the chosen message.
     Timeline,
-    /// Fetch the session family and open the subagent picker.
+    /// Fetch the session family and open the activity panel on its
+    /// `Subagents` tab (upstream's composer tabs).
     Subagents,
     /// Fetch the background shells and open the shell picker.
     Shells,
@@ -143,8 +144,8 @@ pub const COMMANDS: &[Command] = &[
     Command {
         name: "subagents",
         aliases: &[],
-        description: "Toggle subagent picker",
-        title: "Toggle subagent picker",
+        description: "Show subagents",
+        title: "Show subagents",
         group: "Session",
         action: CommandAction::Subagents,
     },

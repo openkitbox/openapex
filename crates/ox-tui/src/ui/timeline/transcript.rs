@@ -1,7 +1,8 @@
 use std::time::Instant;
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::theme;
@@ -19,6 +20,15 @@ use crate::ui::selection::{self, Behavior, ClickTracker, Outcome, Pos, Selection
 /// Blank rows kept under the last block (`routes/session/index.tsx` scrollbox
 /// content padding).
 const BOTTOM_PAD: usize = 1;
+
+/// The `Jump to latest ↓` affordance (upstream `routes/session/index.tsx`
+/// `session-jump-to-latest`): drawn over the last row of the scroll area while
+/// the view is scrolled away from the bottom.
+const JUMP_LABEL: &str = "Jump to latest ↓";
+
+/// Columns kept free between the label and the right edge: upstream pads the
+/// box on its left, and the label is right-aligned here instead.
+const JUMP_RIGHT_PAD: u16 = 1;
 
 pub struct Transcript {
     entries: Vec<Entry>,
@@ -119,11 +129,54 @@ impl Transcript {
         self.rebuild(index);
     }
 
+    /// The row the affordance is drawn on while it shows: the last row of the
+    /// transcript area. `None` at the bottom (nothing to jump to), before the
+    /// first draw, and when the area is too narrow for the label.
+    fn jump_row(&self) -> Option<u16> {
+        let area = self.last_area;
+        if self.scroll >= self.max_scroll()
+            || area.width < JUMP_LABEL.chars().count() as u16 + JUMP_RIGHT_PAD
+        {
+            return None;
+        }
+        Some(area.y + area.height.checked_sub(1)?)
+    }
+
+    /// Screen cells of the affordance: the label right-aligned on `jump_row`,
+    /// one column short of the right edge.
+    fn jump_rect(&self) -> Option<Rect> {
+        // `jump_row` proves the label fits before the subtraction below runs.
+        let y = self.jump_row()?;
+        let area = self.last_area;
+        let width = JUMP_LABEL.chars().count() as u16;
+        Some(Rect {
+            x: area.x + area.width - width - JUMP_RIGHT_PAD,
+            y,
+            width,
+            height: 1,
+        })
+    }
+
+    /// Whether screen cell (`x`, `y`) is on the affordance's label, i.e. the
+    /// button is drawn there. Only the label's own columns are the button; the
+    /// rest of its row is the content drawn underneath.
+    fn on_jump_label(&self, x: u16, y: u16) -> bool {
+        self.jump_rect().is_some_and(|rect| cell_in(rect, x, y))
+    }
+
     /// Map screen cell (`x`, `y`) to `(entry index, row within the block)`.
-    /// `None` outside the last drawn transcript area or below the content.
+    /// `None` outside the last drawn transcript area, below the content, and on
+    /// the columns of the `Jump to latest` label. The rest of that row maps to
+    /// its content as usual: a drag that ends there still selects it, since
+    /// `focus_at` does not consult the label.
     fn locate(&self, x: u16, y: u16) -> Option<(usize, usize)> {
         let area = self.last_area;
         if x < area.x || x >= area.x + area.width || y < area.y || y >= area.y + area.height {
+            return None;
+        }
+        // The label is a button over the row's last sixteen columns; whatever
+        // is drawn beside it keeps its click, hover and child-link behaviour.
+        if self.on_jump_label(x, y) {
             return None;
         }
         let mut line = self.scroll + usize::from(y - area.y);
@@ -260,11 +313,15 @@ impl Transcript {
     }
 
     /// The pointer moved to screen cell (`x`, `y`). Returns whether the
-    /// hovered entry changed.
+    /// hovered entry — or the affordance's highlight — changed.
     pub fn hover(&mut self, x: u16, y: u16) -> bool {
+        let was_jump = self.pointer.is_some_and(|(x, y)| self.on_jump_label(x, y));
         self.pointer = Some((x, y));
         let target = self.hover_target(x, y);
-        self.set_hover(target)
+        let moved = self.set_hover(target);
+        // The affordance highlights from the pointer (see `render_jump`), so a
+        // move onto or off its label is a repaint even when no entry changed.
+        moved || self.on_jump_label(x, y) != was_jump
     }
 
     /// Re-evaluate the hover at the last pointer cell: a wheel scroll moves
@@ -278,6 +335,10 @@ impl Transcript {
 
     /// The pointer left the transcript (or a modal took over).
     pub fn clear_hover(&mut self) -> bool {
+        // The affordance's highlight is derived from the pointer, so the
+        // pointer goes with the hover; `rehover` then has no stale cell to
+        // re-evaluate when a wheel arrives.
+        self.pointer = None;
         self.set_hover(None)
     }
 
@@ -297,8 +358,22 @@ impl Transcript {
     /// Left button down at (`x`, `y`) at time `now`: forget the old selection
     /// and, when the cell holds content, start a new one there. `clicks`
     /// counts the press: the second selects a word, the third a line. Returns
-    /// whether a visible selection was dropped (a repaint is due).
+    /// whether a repaint is due: a visible selection was dropped, or the
+    /// affordance sent the view back to the bottom.
     pub(crate) fn press(&mut self, x: u16, y: u16, now: Instant) -> bool {
+        // The affordance is a button on the label's own columns: a press there
+        // goes back to the bottom and re-engages the tail instead of starting a
+        // selection. Upstream fires it from `onMouseUp={toBottom}`; ox
+        // activates on press instead — a deliberate deviation — so a drag
+        // cannot carry the activation away from the label.
+        if self.on_jump_label(x, y) {
+            self.clear_selection();
+            // The row under the pointer now holds different content: forget the
+            // cell so a later `rehover` does not light a row it is not over.
+            self.pointer = None;
+            self.scroll_to_bottom();
+            return true;
+        }
         let dropped = self.has_selection();
         self.pointer = Some((x, y));
         let area = self.last_area;
@@ -602,13 +677,17 @@ impl Transcript {
         self.jump_to(line);
     }
 
-    /// Diff incoming blocks against current entries. `changed_from` comes from
-    /// `DataStore::claim_changed_from()`: everything before it is never even
-    /// compared. Changed blocks get a new generation; unchanged keep both cache
-    /// and generation.
-    pub fn sync(&mut self, blocks: &[Block], changed_from: usize) {
+    /// Diff incoming blocks against current entries. `first_changed_block` is a
+    /// BLOCK index — `pipeline::Projection::first_block`, derived from
+    /// `DataStore::claim_changed_from()` — not the store's item index: a turn
+    /// item draws no block, so the two only coincide by accident. Everything
+    /// before it is never even compared. Changed blocks get a new generation;
+    /// unchanged keep both cache and generation.
+    pub fn sync(&mut self, blocks: &[Block], first_changed_block: usize) {
         self.wall_ms = wall_ms_now();
-        let start = changed_from.min(self.entries.len()).min(blocks.len());
+        let start = first_changed_block
+            .min(self.entries.len())
+            .min(blocks.len());
 
         let end = self.entries.len().min(blocks.len());
         let views: Vec<ViewState> = blocks[start..end]
@@ -922,7 +1001,30 @@ impl Transcript {
                 break;
             }
         }
+
+        if let Some(rect) = self.jump_rect() {
+            self.render_jump(frame, rect);
+        }
     }
+
+    /// Draw the `Jump to latest ↓` label into `rect`, dim until the pointer
+    /// rests on the label and bright after (upstream `text.action.secondary`
+    /// base / hovered).
+    fn render_jump(&self, frame: &mut Frame, rect: Rect) {
+        let hovered = self.pointer.is_some_and(|(x, y)| cell_in(rect, x, y));
+        let style = if hovered {
+            theme::palette().text
+        } else {
+            theme::palette().dim
+        };
+        let line = Line::from(Span::styled(JUMP_LABEL, style));
+        frame.render_widget(Paragraph::new(line).alignment(Alignment::Right), rect);
+    }
+}
+
+/// Whether screen cell (`x`, `y`) falls inside `rect`.
+fn cell_in(rect: Rect, x: u16, y: u16) -> bool {
+    x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
 }
 
 /// The text of absolute transcript line `abs`; `None` past the end and on
@@ -963,4 +1065,260 @@ fn text_blocks(entries: &[Entry]) -> impl Iterator<Item = selection::Block<'_>> 
         *first += entry.lines.len();
         Some(block)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::pipeline;
+    use crate::shell_captures::ShellCaptures;
+    use ox_client::store;
+    use ox_client::store::DataStore;
+    use ox_schema::event::EventEnvelope;
+    use ox_schema::event::SessionEventData;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    const WIDTH: u16 = 40;
+    const HEIGHT: u16 = 8;
+    /// Narrower than the label plus its right padding.
+    const NARROW: u16 = 12;
+
+    /// One frame of `transcript` in a `width` × `height` terminal, returning the
+    /// cells it drew.
+    fn draw_at(transcript: &mut Transcript, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+        terminal
+            .draw(|frame| transcript.render(frame, frame.area()))
+            .expect("draw");
+        terminal.backend().buffer().clone()
+    }
+
+    /// `draw_at` in the standard fixture viewport.
+    fn draw(transcript: &mut Transcript) -> Buffer {
+        draw_at(transcript, WIDTH, HEIGHT)
+    }
+
+    /// The text of screen row `y`.
+    fn row_text(buffer: &Buffer, y: u16) -> String {
+        let mut text = String::new();
+        for x in 0..buffer.area.width {
+            text.push_str(buffer.cell((x, y)).map_or(" ", |cell| cell.symbol()));
+        }
+        text
+    }
+
+    /// Twelve one-line user blocks: taller than `HEIGHT`, so there is room to
+    /// scroll away from the bottom.
+    fn overflowing() -> Transcript {
+        let blocks: Vec<Block> = (0..12)
+            .map(|index| Block::user(&format!("message {index}")))
+            .collect();
+        let mut transcript = Transcript::new(WIDTH, HEIGHT);
+        transcript.sync(&blocks, 0);
+        transcript
+    }
+
+    /// The affordance shows exactly while the view is scrolled away from the
+    /// bottom, and activating it returns the scroll to the bottom.
+    #[test]
+    fn jump_to_latest_shows_away_from_bottom_and_returns_to_it() {
+        let bottom_row = HEIGHT - 1;
+        let mut transcript = overflowing();
+        let max = transcript.max_scroll();
+        assert!(
+            max > 1,
+            "the fixture must overflow the viewport, max was {max}"
+        );
+
+        // One row up from the bottom is enough to show it.
+        transcript.scroll_up(1);
+        assert_eq!(transcript.scroll, max - 1, "one row above the bottom");
+        let buffer = draw(&mut transcript);
+        assert!(
+            row_text(&buffer, bottom_row).contains(JUMP_LABEL),
+            "a view scrolled away from the bottom shows the label, bottom row was {:?}",
+            row_text(&buffer, bottom_row)
+        );
+        assert_eq!(
+            buffer
+                .cell((WIDTH - 1, bottom_row))
+                .map(|cell| cell.symbol()),
+            Some(" "),
+            "the label keeps one column of padding from the right edge"
+        );
+
+        // At the bottom there is nothing to jump to.
+        transcript.scroll_to_bottom();
+        let buffer = draw(&mut transcript);
+        assert!(
+            !row_text(&buffer, bottom_row).contains(JUMP_LABEL),
+            "the label is hidden at the bottom, bottom row was {:?}",
+            row_text(&buffer, bottom_row)
+        );
+
+        // The label is a button: a press on it returns to the bottom without
+        // starting a selection, and the moved view must repaint.
+        transcript.scroll_up(2);
+        draw(&mut transcript);
+        let label_x = WIDTH - JUMP_RIGHT_PAD - JUMP_LABEL.chars().count() as u16 / 2;
+        assert!(
+            transcript.press(label_x, bottom_row, Instant::now()),
+            "the press scrolls away from the label, so a repaint is due"
+        );
+        assert_eq!(
+            transcript.scroll,
+            transcript.max_scroll(),
+            "the press returns the view to the bottom"
+        );
+        assert!(
+            transcript.selection.is_none(),
+            "the press starts no text selection"
+        );
+    }
+
+    /// Only the label's own columns are the button: the rest of its row is the
+    /// content drawn underneath, which keeps its hover and click behaviour.
+    #[test]
+    fn jump_to_latest_surrenders_only_the_labels_columns() {
+        // Twelve one-line user blocks and a collapsed reasoning block whose
+        // header is the last line: one row above the bottom, the header sits on
+        // the row the label is drawn over.
+        let mut blocks: Vec<Block> = (0..12)
+            .map(|index| Block::user(&format!("message {index}")))
+            .collect();
+        blocks.push(Block::reasoning("r1", 0, "looking", true));
+        let mut transcript = Transcript::new(WIDTH, HEIGHT);
+        transcript.sync(&blocks, 0);
+        let max = transcript.max_scroll();
+        transcript.scroll_up(1);
+        assert_eq!(transcript.scroll, max - 1, "one row above the bottom");
+
+        let bottom_row = HEIGHT - 1;
+        let buffer = draw(&mut transcript);
+        assert!(
+            row_text(&buffer, bottom_row).contains(JUMP_LABEL),
+            "the label shows on the last row, bottom row was {:?}",
+            row_text(&buffer, bottom_row)
+        );
+        let label_x = WIDTH - JUMP_RIGHT_PAD - JUMP_LABEL.chars().count() as u16 / 2;
+        let content_x = 0;
+        let reasoning = Some(12);
+
+        // Left of the label the reasoning header is still the hover target.
+        assert!(
+            transcript.hover(content_x, bottom_row),
+            "the header under the label's row lights up"
+        );
+        assert_eq!(transcript.hovered, reasoning, "the header, not the label");
+        // And a click there still toggles the block.
+        assert!(
+            transcript.click(content_x, bottom_row),
+            "a click beside the label opens the reasoning block"
+        );
+        assert!(
+            transcript.expanded.contains("r1"),
+            "the reasoning body is expanded, expanded was {:?}",
+            transcript.expanded
+        );
+
+        // On the label's own cells neither goes through: it is a button.
+        assert!(
+            !transcript.click(label_x, bottom_row),
+            "the label is not block content"
+        );
+    }
+
+    /// A viewport too narrow for the label drops it instead of underflowing the
+    /// label's own arithmetic.
+    #[test]
+    fn jump_to_latest_is_dropped_when_the_viewport_is_too_narrow() {
+        let mut transcript = overflowing();
+        transcript.set_viewport(NARROW, HEIGHT);
+        transcript.scroll_up(1);
+        let buffer = draw_at(&mut transcript, NARROW, HEIGHT);
+        let last = row_text(&buffer, HEIGHT - 1);
+        assert!(
+            !last.contains("Jump"),
+            "no label fits in {NARROW} columns, bottom row was {last:?}"
+        );
+    }
+
+    /// One raw frame through the socket feed path.
+    fn event(frame: serde_json::Value) -> EventEnvelope<SessionEventData> {
+        let envelope: EventEnvelope<serde_json::Value> =
+            serde_json::from_value(frame).expect("a frame deserializes");
+        envelope.parse_typed()
+    }
+
+    /// The live answer of the assistant message a prompt opened must keep
+    /// streaming into its own block. The turn row renders nothing, so the item
+    /// index the store records (2) is one past the block index of the answer
+    /// (1): syncing from the item index would skip the answer and freeze it on
+    /// its first chunk.
+    #[test]
+    fn a_changed_answer_after_a_turn_row_reaches_its_block() {
+        let mut store = DataStore::default();
+        store.push_user("go");
+        store::reduce(
+            &mut store,
+            &event(serde_json::json!({
+                "id": "evt_started",
+                "created": 1_000,
+                "type": "session.execution.started",
+                "data": { "sessionID": "ses_1" },
+            })),
+        );
+        let delta = |id: &str, text: &str| {
+            event(serde_json::json!({
+                "id": id,
+                "created": 1_100,
+                "type": "session.text.delta",
+                "data": {
+                    "sessionID": "ses_1",
+                    "assistantMessageID": "msg_a",
+                    "ordinal": 0,
+                    "delta": text,
+                },
+            }))
+        };
+        store::reduce(&mut store, &delta("evt_d1", "hel"));
+
+        let mut transcript = Transcript::new(WIDTH, HEIGHT);
+        let changed_from = store.claim_changed_from();
+        let projection = project(&store, changed_from);
+        transcript.sync(&projection.blocks, projection.first_block);
+        assert_eq!(
+            answer_text(&transcript, 1),
+            "hel",
+            "the answer's block is index 1: the prompt row is 0 and the turn row draws nothing"
+        );
+
+        // The next delta touches only the assistant item (index 2).
+        store::reduce(&mut store, &delta("evt_d2", "lo"));
+        let changed_from = store.claim_changed_from();
+        assert_eq!(changed_from, 2, "the store records ITEM indices");
+        let projection = project(&store, changed_from);
+        transcript.sync(&projection.blocks, projection.first_block);
+        assert_eq!(
+            answer_text(&transcript, 1),
+            "hello",
+            "the delta reaches the answer's block, not past it"
+        );
+    }
+
+    /// The store's items projected through the real pipeline.
+    fn project(store: &DataStore, changed_from: usize) -> pipeline::Projection {
+        pipeline::blocks_from_store(store, &ShellCaptures::default(), changed_from)
+    }
+
+    /// The text of the assistant block at block index `index`.
+    fn answer_text(transcript: &Transcript, index: usize) -> String {
+        match &transcript.entries[index].block {
+            Block::Assistant { text, .. } => text.to_string(),
+            other => panic!("block {index} is not an answer: {other:?}"),
+        }
+    }
 }

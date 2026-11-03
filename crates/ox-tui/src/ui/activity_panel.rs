@@ -1,0 +1,1069 @@
+//! The composer's activity panel: the `Subagents` / `Shell` tabs that take the
+//! composer's place.
+//!
+//! Port of upstream `packages/tui/src/routes/session/composer/subagents-tab.tsx`
+//! and `shell-tab.tsx`, with the tab bar and the hint row from
+//! `composer/index.tsx` and the tab registry from `composer/context.ts`.
+//!
+//! What this file owns, as upstream defines it:
+//!
+//! - One filter at a time, never both lists: `entry.status === "running"` while
+//!   the filter is `active` (the default), `!== "running"` while it is not.
+//! - The empty state names the filter: `No active subagents` /
+//!   `No inactive subagents`, and `No shell commands` on the `Shell` tab.
+//! - A row reads `{prefix}{agent}: {title}`, with a right-aligned `Running`
+//!   while its subagent still works. `agent` is the session's own agent, else
+//!   the one in its `@xxx subagent` title marker, else `Subagent`; the marker is
+//!   stripped from the title. The row under the cursor takes the focused fill,
+//!   the row of the session on screen a quieter one, every other row the base.
+//! - `↑` from the first row closes the panel instead of clamping; `↓` wraps to
+//!   the first row.
+//! - `ctrl+a` flips the filter, puts the selection back on the first row and
+//!   with it the window back at its start.
+//! - The body is a five-row window (`scrollbox maxHeight={5}`, hidden
+//!   scrollbar) over *every* listed entry, so all of them are reachable.
+//! - Hints: `interrupt ctrl+d` only while the selected row runs, then
+//!   `show inactive ctrl+a` / `show active ctrl+a`; `tabs ←/→` belongs to the
+//!   tab bar, which ox draws in the same row set.
+//!
+//! The block sits on the composer's rail, in its place, and is not a modal over
+//! the transcript: [`rows`], [`lines`] and [`Cursor`] are pure (the family as
+//! the server reported it in, the block's rows out) and [`render`] paints them
+//! with the same rail as [`super::prompt`].
+//!
+//! Measured at 30x100 with no running child:
+//!
+//! ```text
+//! ┃  Subagents  Shell                                    esc
+//! ┃  No active subagents
+//! ┃
+//! ┃  open enter  show inactive ctrl+a  tabs ←/→
+//! ```
+//!
+//! Ledger — deliberate deviations from the upstream source:
+//!
+//! - Keys only: upstream selects a row on `onMouseMove` and navigates on
+//!   `onMouseUp`; ox's pointer gate belongs to the transcript, so the panel
+//!   takes keys and shows `open enter` (upstream's `composer.subagent.select`,
+//!   `config/keybind.ts:251`) as the hint for what a click does there.
+//! - The session on screen is filled with `raised.base`, not with
+//!   `background.action.primary.selected`: ox's palette carries no such token,
+//!   and `raised.base` is its one quieter raised surface. The focused row keeps
+//!   the picker's accent fill (`menu_selected`), so the two stay distinct.
+//!   Only truecolor separates `raised.base` from the `raised.high` panel it sits
+//!   on (`theme.rs` `from_tokens`); every 16-colour and `NO_COLOR` palette draws
+//!   both as the same surface, so the row of the session on screen goes unmarked
+//!   there.
+//! - The listed family is a snapshot: `App::family_state_changed` refetches it
+//!   whenever a child the store names starts or finishes its turn (upstream
+//!   reads a live memo over the session list), so a known child's `Running`
+//!   suffix and both filters follow it. A child no tool result names yet — one
+//!   spawned after the panel opened, before its tool row settles — appears only
+//!   after the panel is reopened.
+//! - The `Shell` tab lists nothing. `DataStore` answers whether a shell is
+//!   running by id (`is_shell_running`) but exposes no per-session list of
+//!   commands, so the tab shows upstream's `No shell commands` and has no
+//!   `output` / `kill` action; `/shells` (the background-shell picker) owns
+//!   both.
+//! - `tab` / `shift+tab` switch tabs as well as `←` / `→`: ox binds them to
+//!   agent cycling, and the panel owns the keyboard while it is open.
+//! - The window's offset is derived from the selection (centred, clamped so the
+//!   window stays full at the end of the list) instead of a scrollbox with its
+//!   own scroll state: nothing can drift, and `↑` / `↓` reach every entry.
+//! - Agent names go through the transcript's `titlecase`, which uppercases the
+//!   first character only, where upstream `Locale.titlecase` uppercases every
+//!   word boundary (`/\b\w/`); every built-in agent id is a single word.
+//! - One cursor for both tabs: upstream keeps a `selected` store per tab, but
+//!   the `Shell` tab lists nothing, so ox's single index simply restarts at the
+//!   first row after a visit there.
+//! - The block ends with its `╹` foot, and the prompt's footer row below it
+//!   (cwd, usage) is not drawn while the panel is open; the status dock under
+//!   it still carries the session status.
+
+use ox_client::rest::FamilyMember;
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::style::Modifier;
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+
+use crate::theme;
+
+use super::family;
+use super::prompt;
+use super::session_dialog::fallback_title;
+use super::timeline::titlecase;
+
+/// Body rows the panel shows at once; the rest scroll through the window
+/// (upstream `scrollbox maxHeight={5}`).
+const VIEWPORT: usize = 5;
+/// The key that closes the panel, drawn flush right on the header row.
+const CLOSE_KEY: &str = "esc";
+/// The right-aligned status of a row whose subagent is still working.
+const RUNNING: &str = "Running";
+/// The agent a row falls back to when neither its session nor its title names
+/// one (upstream `subagents-tab.tsx:55`).
+const UNNAMED_AGENT: &str = "Subagent";
+/// The tail of upstream's `/@(\w+) subagent/` title marker.
+const MARKER_SUFFIX: &str = " subagent";
+const SUBAGENTS_EMPTY_ACTIVE: &str = "No active subagents";
+const SUBAGENTS_EMPTY_INACTIVE: &str = "No inactive subagents";
+const SHELL_EMPTY: &str = "No shell commands";
+
+/// Which tab of the panel is shown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Tab {
+    #[default]
+    Subagents,
+    Shell,
+}
+
+impl Tab {
+    /// Every tab, in header order.
+    const ALL: [Tab; 2] = [Tab::Subagents, Tab::Shell];
+
+    /// The tab's own title in the header.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Tab::Subagents => "Subagents",
+            Tab::Shell => "Shell",
+        }
+    }
+
+    /// The tab to the right, wrapping (`→`).
+    #[must_use]
+    pub fn next(self) -> Self {
+        match self {
+            Tab::Subagents => Tab::Shell,
+            Tab::Shell => Tab::Subagents,
+        }
+    }
+
+    /// The tab to the left, wrapping (`←`).
+    #[must_use]
+    pub fn prev(self) -> Self {
+        match self {
+            Tab::Subagents => Tab::Shell,
+            Tab::Shell => Tab::Subagents,
+        }
+    }
+}
+
+/// The panel's cursor: which filter is listed and which row is selected
+/// (upstream's in-memory `subagents-filter` and the store's `selected`). Both
+/// outlive the panel, so reopening it keeps them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cursor {
+    /// List the running subagents (`true`, the default) or the finished ones.
+    /// Exactly one of the two is ever listed.
+    pub active: bool,
+    /// The selected row among the listed ones.
+    pub selected: usize,
+}
+
+impl Default for Cursor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Cursor {
+    /// The default filter: running subagents only, on the first row.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            active: true,
+            selected: 0,
+        }
+    }
+
+    /// Keep the selection on a row the list still has: the family, the filter
+    /// or the tab changed under it. A list with no rows has only row 0.
+    #[must_use]
+    pub fn clamp(self, len: usize) -> Self {
+        Self {
+            selected: self.selected.min(len.saturating_sub(1)),
+            ..self
+        }
+    }
+
+    /// `↑` (`config/keybind.ts:249`): the row above, or the panel closing from
+    /// the first row — upstream closes the composer there instead of clamping,
+    /// and a tab with no rows is always on its first one.
+    #[must_use]
+    pub fn up(self, len: usize) -> Up {
+        if self.selected == 0 || len == 0 {
+            Up::Close
+        } else {
+            Up::Row(self.selected - 1)
+        }
+    }
+
+    /// `↓` (`config/keybind.ts:250`): the row below, wrapping to the first. A
+    /// list with no rows stays on row 0.
+    #[must_use]
+    pub fn down(self, len: usize) -> Self {
+        let selected = if len == 0 {
+            0
+        } else {
+            (self.selected + 1) % len
+        };
+        Self { selected, ..self }
+    }
+
+    /// `ctrl+a` (`composer.subagent.toggle-activity`): the other filter, the
+    /// selection back on the first row and the window back at its start.
+    #[must_use]
+    pub fn toggle(self) -> Self {
+        Self {
+            active: !self.active,
+            selected: 0,
+        }
+    }
+}
+
+/// Where `↑` sent the cursor: upstream closes the composer from the first row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Up {
+    /// The panel closes and the composer comes back.
+    Close,
+    /// The selection moves to this row.
+    Row(usize),
+}
+
+/// One listed row: the subagent a row acts on and the tree prefix the session
+/// list draws before its title. The member travels with the row so an action
+/// never has to find it again by index.
+pub struct Row<'a> {
+    /// The session `enter` opens and `ctrl+d` interrupts.
+    pub member: &'a FamilyMember,
+    /// The tree prefix of the family walk (`"│  └─ "` and the like).
+    pub prefix: String,
+}
+
+/// The block [`render`] draws: its rows, and which of them are marked.
+#[derive(Debug, Default)]
+pub struct Block {
+    /// Header, body rows, one blank row, hints.
+    pub lines: Vec<Line<'static>>,
+    /// Index into `lines` of the selected row, when one is drawn. `None` when
+    /// no row is listed.
+    pub selected: Option<usize>,
+    /// Index into `lines` of the row for the session on screen, when it is
+    /// listed and inside the window (upstream `entry.current`).
+    pub current: Option<usize>,
+    /// Indices into `lines` of the rows that carry the right-aligned
+    /// [`RUNNING`] status.
+    pub running: Vec<usize>,
+}
+
+impl Block {
+    /// Rows the block takes: its own rows plus the `╹` foot under them.
+    #[must_use]
+    pub fn height(&self) -> u16 {
+        u16::try_from(self.lines.len())
+            .unwrap_or(u16::MAX)
+            .saturating_add(1)
+    }
+}
+
+/// The header row: every tab title, the selected one bold.
+#[must_use]
+pub fn header(tab: Tab) -> Line<'static> {
+    let pal = *theme::palette();
+    let selected = pal.text.add_modifier(Modifier::BOLD);
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(Tab::ALL.len() * 2);
+    for (index, each) in Tab::ALL.into_iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let style = if each == tab { selected } else { pal.dim };
+        spans.push(Span::styled(each.label(), style));
+    }
+    Line::from(spans)
+}
+
+/// The hint row: each action's title then its key, as the dialogs draw them.
+/// `active` is the filter, so the toggle offers the *other* list; `interruptible`
+/// adds `interrupt ctrl+d`, which upstream shows only while the selected row
+/// runs (and ox's `open enter` is the ledger's key stand-in for a click).
+#[must_use]
+pub fn hints(tab: Tab, active: bool, interruptible: bool) -> Line<'static> {
+    let pal = *theme::palette();
+    let toggle = if active {
+        "show inactive"
+    } else {
+        "show active"
+    };
+    let hints: &[(&str, &str)] = match tab {
+        Tab::Subagents if interruptible => &[
+            ("open", "enter"),
+            ("interrupt", "ctrl+d"),
+            (toggle, "ctrl+a"),
+            ("tabs", "←/→"),
+        ],
+        Tab::Subagents => &[("open", "enter"), (toggle, "ctrl+a"), ("tabs", "←/→")],
+        Tab::Shell => &[("tabs", "←/→")],
+    };
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(hints.len() * 3);
+    for (index, &(title, key)) in hints.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(title, pal.text));
+        spans.push(Span::styled(format!(" {key}"), pal.dim));
+    }
+    Line::from(spans)
+}
+
+/// The subagent rows of `current`'s family: the running ones while `active`,
+/// the finished ones while it is not — never both — in tree order. This is the
+/// one list the panel draws and acts on, so no index can outlive the rows.
+#[must_use]
+pub fn rows<'a>(members: &'a [FamilyMember], current: &str, active: bool) -> Vec<Row<'a>> {
+    family::family(members, current)
+        .into_iter()
+        .filter(|entry| entry.session.running == active)
+        .map(|entry| Row {
+            member: entry.session,
+            prefix: entry.prefix,
+        })
+        .collect()
+}
+
+/// The first listed row the window shows: the selection centred, clamped so the
+/// window stays full at the end of the list (upstream `scrollToIndex(index,
+/// true)` → `scrollTo(index - floor(viewport / 2))`, which its scrollbox then
+/// clamps to the last full window).
+#[must_use]
+pub fn window_offset(selected: usize, len: usize) -> usize {
+    selected
+        .saturating_sub(VIEWPORT / 2)
+        .min(len.saturating_sub(VIEWPORT))
+}
+
+/// The whole block interior: header, the window of rows, one blank row, hints.
+/// `cursor.selected` indexes [`rows`]; it is clamped, so a stale index draws the
+/// last row.
+#[must_use]
+pub fn lines(members: &[FamilyMember], current: &str, tab: Tab, cursor: Cursor) -> Block {
+    let listed = match tab {
+        Tab::Subagents => rows(members, current, cursor.active),
+        Tab::Shell => Vec::new(),
+    };
+    let mut block = Block {
+        lines: vec![header(tab)],
+        ..Block::default()
+    };
+    if listed.is_empty() {
+        let empty_state = match (tab, cursor.active) {
+            (Tab::Subagents, true) => SUBAGENTS_EMPTY_ACTIVE,
+            (Tab::Subagents, false) => SUBAGENTS_EMPTY_INACTIVE,
+            (Tab::Shell, _) => SHELL_EMPTY,
+        };
+        block.lines.push(empty(empty_state));
+        block.lines.push(Line::default());
+        block.lines.push(hints(tab, cursor.active, false));
+        return block;
+    }
+
+    let selected = cursor.selected.min(listed.len() - 1);
+    let offset = window_offset(selected, listed.len());
+    block.selected = Some(1 + selected - offset);
+    if let Some(position) = listed.iter().position(|row| row.member.id == current)
+        && (offset..offset + VIEWPORT).contains(&position)
+    {
+        block.current = Some(1 + position - offset);
+    }
+    for (index, row) in listed.iter().skip(offset).take(VIEWPORT).enumerate() {
+        let line = 1 + index;
+        block
+            .lines
+            .push(listed_row(row, Some(line) == block.selected));
+        if row.member.running {
+            block.running.push(line);
+        }
+    }
+    block.lines.push(Line::default());
+    block
+        .lines
+        .push(hints(tab, cursor.active, listed[selected].member.running));
+    block
+}
+
+/// One listed row line: `{prefix}{agent}: {title}`, the focused one filled and
+/// bold, every other one in body text (upstream draws one `<text>` either way).
+fn listed_row(row: &Row<'_>, focused: bool) -> Line<'static> {
+    let pal = *theme::palette();
+    let (agent, title) = agent_and_title(row.member);
+    let style = if focused {
+        pal.menu_selected.add_modifier(Modifier::BOLD)
+    } else {
+        pal.text
+    };
+    let label = format!("{}{agent}: {title}", row.prefix);
+    Line::from(Span::styled(label, style))
+}
+
+/// The row's agent and title. The agent is the session's own, else the one in
+/// its `@xxx subagent` title marker, else [`UNNAMED_AGENT`]; the marker is
+/// stripped from the title, which stays whole when nothing else is left.
+fn agent_and_title(member: &FamilyMember) -> (String, String) {
+    let title = fallback_title(member.title.as_deref(), member.time.created);
+    let found = marker(&title);
+    let agent = match member.agent.as_deref() {
+        Some(agent) => titlecase(agent),
+        None => found
+            .as_ref()
+            .map_or_else(|| UNNAMED_AGENT.to_owned(), |found| titlecase(found.agent)),
+    };
+    let Some(found) = found else {
+        return (agent, title);
+    };
+    let stripped = title.replacen(found.text, "", 1).trim().to_owned();
+    let title = if stripped.is_empty() { title } else { stripped };
+    (agent, title)
+}
+
+/// The `@xxx subagent` marker upstream matches in a title (`/@(\w+) subagent/`),
+/// `xxx` being one or more word characters.
+struct Marker<'a> {
+    /// The whole match, stripped from the title.
+    text: &'a str,
+    /// The agent name inside it.
+    agent: &'a str,
+}
+
+fn marker(title: &str) -> Option<Marker<'_>> {
+    for (at, _) in title.match_indices('@') {
+        let rest = title.get(at + 1..)?;
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len());
+        if end == 0 || !rest.get(end..)?.starts_with(MARKER_SUFFIX) {
+            continue;
+        }
+        let stop = at + 1 + end + MARKER_SUFFIX.len();
+        return Some(Marker {
+            text: title.get(at..stop)?,
+            agent: rest.get(..end)?,
+        });
+    }
+    None
+}
+
+/// Draw the block in the composer's place: the prompt's rail and panel fill
+/// around `lines`, the current and the selected row filled, `Running` flush
+/// right on the rows that carry one, `esc` flush right on the header row, then
+/// the `╹` foot.
+pub fn render(frame: &mut Frame, area: Rect, block: Block) {
+    let Block {
+        lines,
+        selected,
+        current,
+        running,
+    } = block;
+    if area.width < 2 || area.height == 0 || lines.is_empty() {
+        return;
+    }
+    let pal = *theme::palette();
+    let box_h = u16::try_from(lines.len())
+        .unwrap_or(u16::MAX)
+        .min(area.height);
+    {
+        let buf = frame.buffer_mut();
+        for y in area.y..area.y + box_h {
+            for x in area.x + 1..area.right() {
+                buf[(x, y)].set_style(pal.panel);
+            }
+            let cell = &mut buf[(area.x, y)];
+            cell.set_style(pal.panel_border);
+            cell.set_char(prompt::PANEL_BORDER_CHAR);
+        }
+    }
+    // The current row is the quieter fill, the selected row the focused one, so
+    // a row that is both reads as the selected one.
+    for (index, fill) in [(current, pal.raised_base), (selected, pal.menu_selected)] {
+        let Some(index) = index else {
+            continue;
+        };
+        let y = area.y + u16::try_from(index).unwrap_or(u16::MAX);
+        if y < area.y + box_h {
+            frame.buffer_mut().set_style(
+                Rect {
+                    x: area.x + 1,
+                    y,
+                    width: area.width.saturating_sub(1),
+                    height: 1,
+                },
+                fill,
+            );
+        }
+    }
+    let pad = if area.width < 44 { 1 } else { 2 };
+    let inner = Rect {
+        x: area.x + 1 + pad,
+        y: area.y,
+        width: area.width.saturating_sub(1 + pad * 2).max(1),
+        height: box_h,
+    };
+    // The header row keeps `esc` where upstream puts it: flush right, on the
+    // panel surface, outside the text column.
+    let used = lines[0].width();
+    let status_w = u16::try_from(RUNNING.len()).unwrap_or(u16::MAX);
+    for (index, line) in lines.into_iter().take(box_h as usize).enumerate() {
+        let y = area.y + u16::try_from(index).unwrap_or(u16::MAX);
+        // A row with a status gives it the right edge and clips its own text
+        // where the status starts (upstream `flexGrow={1} minWidth={0}`).
+        let has_status = running.contains(&index) && inner.width > status_w;
+        let width = if has_status {
+            inner.width - status_w
+        } else {
+            inner.width
+        };
+        frame.render_widget(
+            Paragraph::new(line),
+            Rect {
+                y,
+                width,
+                height: 1,
+                ..inner
+            },
+        );
+        if has_status {
+            let style = if Some(index) == selected {
+                pal.menu_selected
+            } else {
+                pal.dim
+            };
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(RUNNING, style))),
+                Rect {
+                    x: inner.right() - status_w,
+                    y,
+                    width: status_w,
+                    height: 1,
+                },
+            );
+        }
+    }
+    if used + CLOSE_KEY.len() + 1 < inner.width as usize {
+        let rect = Rect {
+            x: area.right() - u16::try_from(CLOSE_KEY.len()).unwrap_or(0),
+            y: area.y,
+            width: u16::try_from(CLOSE_KEY.len()).unwrap_or(0),
+            height: 1,
+        };
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(CLOSE_KEY, pal.dim))),
+            rect,
+        );
+    }
+    let edge_y = area.y + box_h;
+    if edge_y < area.bottom() {
+        let buf = frame.buffer_mut();
+        let corner = &mut buf[(area.x, edge_y)];
+        corner.set_char('╹');
+        if let Some(fg) = pal.panel_border.fg {
+            corner.set_fg(fg);
+        }
+        if let Some(bg) = pal.panel.bg {
+            for x in (area.x + 1)..area.right() {
+                let cell = &mut buf[(x, edge_y)];
+                cell.set_char('▀');
+                cell.set_fg(bg);
+            }
+        }
+    }
+}
+
+fn empty(text: &str) -> Line<'static> {
+    Line::from(Span::styled(text.to_owned(), theme::palette().dim))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+
+    const ROOT: &str = "ses_root";
+    const WORKING: &str = "ses_running";
+    const DONE: &str = "ses_finished";
+
+    fn member(id: &str, parent: Option<&str>, running: bool) -> FamilyMember {
+        FamilyMember {
+            id: id.to_owned(),
+            title: Some("Fix the parser".to_owned()),
+            agent: Some("general".to_owned()),
+            parent_id: parent.map(str::to_owned),
+            time: ox_client::rest::SessionTime::default(),
+            running,
+        }
+    }
+
+    fn text(line: &Line<'_>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn texts(lines: &[Line<'static>]) -> Vec<String> {
+        lines.iter().map(text).collect()
+    }
+
+    fn ids<'a>(rows: &'a [Row<'a>]) -> Vec<&'a str> {
+        rows.iter().map(|row| row.member.id.as_str()).collect()
+    }
+
+    /// One frame of `block` at `width`, as the cells it drew.
+    fn draw(width: u16, block: Block) -> Buffer {
+        let height = block.height();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, frame.area(), block))
+            .expect("draw");
+        terminal.backend().buffer().clone()
+    }
+
+    /// The text of screen row `y`.
+    fn row_text(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer.cell((x, y)).map_or(" ", |cell| cell.symbol()))
+            .collect()
+    }
+
+    #[test]
+    fn the_filter_lists_running_rows_or_finished_ones_but_never_both() {
+        let members = [
+            member(ROOT, None, false),
+            member(WORKING, Some(ROOT), true),
+            member(DONE, Some(ROOT), false),
+        ];
+        let active = rows(&members, ROOT, Cursor::new().active);
+        assert_eq!(
+            ids(&active),
+            [WORKING],
+            "the default filter lists the running subagents and nothing else",
+        );
+        let inactive = rows(&members, ROOT, false);
+        assert_eq!(
+            ids(&inactive),
+            [DONE],
+            "the other filter lists the finished subagents, not the running one",
+        );
+    }
+
+    #[test]
+    fn the_default_filter_is_the_active_one() {
+        assert_eq!(
+            Cursor::default(),
+            Cursor {
+                active: true,
+                selected: 0
+            },
+            "a panel opens on the running list, as upstream's `{{ active: true }}`",
+        );
+    }
+
+    #[test]
+    fn both_empty_states_name_the_filter_and_the_hint_offers_the_other_list() {
+        let running = [member(ROOT, None, false), member(WORKING, Some(ROOT), true)];
+        let nothing_finished = lines(
+            &running,
+            ROOT,
+            Tab::Subagents,
+            Cursor {
+                active: false,
+                selected: 0,
+            },
+        );
+        assert_eq!(
+            texts(&nothing_finished.lines),
+            [
+                "Subagents  Shell",
+                "No inactive subagents",
+                "",
+                "open enter  show active ctrl+a  tabs ←/→"
+            ],
+            "with nothing finished the finished list names itself and offers the running one",
+        );
+        assert_eq!(
+            nothing_finished.selected, None,
+            "an empty list has no selected row to act on",
+        );
+
+        let finished = [member(ROOT, None, false), member(DONE, Some(ROOT), false)];
+        let nothing_running = lines(&finished, ROOT, Tab::Subagents, Cursor::new());
+        assert_eq!(texts(&nothing_running.lines)[1], "No active subagents");
+        assert_eq!(
+            texts(&nothing_running.lines)[3],
+            "open enter  show inactive ctrl+a  tabs ←/→",
+            "the toggle hint reads as the opposite action while the running list is empty",
+        );
+    }
+
+    #[test]
+    fn a_row_reads_prefix_agent_title_and_marks_a_running_one() {
+        let members = [member(ROOT, None, false), member(WORKING, Some(ROOT), true)];
+        let block = lines(&members, ROOT, Tab::Subagents, Cursor::new());
+        assert_eq!(
+            texts(&block.lines),
+            [
+                "Subagents  Shell",
+                "General: Fix the parser",
+                "",
+                "open enter  interrupt ctrl+d  show inactive ctrl+a  tabs ←/→",
+            ],
+            "the running row carries the interrupt hint its status arms",
+        );
+        assert_eq!(
+            block.running,
+            [1],
+            "the row that runs carries the right-aligned status",
+        );
+        assert_eq!(block.selected, Some(1));
+        assert_eq!(
+            block.current, None,
+            "the root is not a listed row, so nothing is the session on screen there",
+        );
+    }
+
+    #[test]
+    fn the_running_status_is_an_index_of_the_row_that_runs() {
+        let members = [
+            member(ROOT, None, false),
+            member(WORKING, Some(ROOT), true),
+            member("ses_idle", Some(ROOT), false),
+            member("ses_busy", Some(ROOT), true),
+        ];
+        let inactive = Cursor {
+            active: false,
+            selected: 0,
+        };
+        let block = lines(&members, ROOT, Tab::Subagents, inactive);
+        assert_eq!(
+            texts(&block.lines)[1],
+            "General: Fix the parser",
+            "the finished row is the only one listed",
+        );
+        assert!(
+            block.running.is_empty(),
+            "no listed row runs, so none carries the status: {:?}",
+            block.running,
+        );
+        let block = lines(&members, ROOT, Tab::Subagents, Cursor::new());
+        assert_eq!(
+            block.running,
+            [1, 2],
+            "both running rows carry the status, on their own lines",
+        );
+    }
+
+    #[test]
+    fn the_running_status_sits_flush_right_on_its_row() {
+        let members = [member(ROOT, None, false), member(WORKING, Some(ROOT), true)];
+        let buffer = draw(40, lines(&members, ROOT, Tab::Subagents, Cursor::new()));
+        let row = row_text(&buffer, 1);
+        assert!(
+            row.trim_end().ends_with(super::RUNNING),
+            "the status ends the row: {row:?}",
+        );
+        let status = super::RUNNING;
+        let tail: String = row.chars().skip(40 - status.len() - 1).collect();
+        assert_eq!(
+            tail,
+            format!("{status} "),
+            "the status keeps the panel's one column of right padding: {row:?}",
+        );
+        assert!(
+            row.contains("General: Fix the parser"),
+            "the row's own text still starts the line: {row:?}",
+        );
+    }
+
+    #[test]
+    fn the_agent_falls_back_from_the_session_to_the_title_marker() {
+        let mut members = [
+            member(ROOT, None, false),
+            member("ses_titled", Some(ROOT), true),
+        ];
+
+        // A session agent wins and is titlecased; the marker still leaves the
+        // title, as upstream strips it either way.
+        members[1].agent = Some("explore".to_owned());
+        members[1].title = Some("@review subagent check it".to_owned());
+        assert_eq!(
+            texts(&lines(&members, ROOT, Tab::Subagents, Cursor::new()).lines)[1],
+            "Explore: check it",
+        );
+
+        // Without one, the title marker names the agent and leaves that title.
+        members[1].agent = None;
+        assert_eq!(
+            texts(&lines(&members, ROOT, Tab::Subagents, Cursor::new()).lines)[1],
+            "Review: check it",
+        );
+
+        // Without either, the row is an unnamed subagent.
+        members[1].title = Some("Fix the parser".to_owned());
+        assert_eq!(
+            texts(&lines(&members, ROOT, Tab::Subagents, Cursor::new()).lines)[1],
+            "Subagent: Fix the parser",
+        );
+
+        // A marker that is the whole title leaves the title alone.
+        members[1].title = Some("@review subagent".to_owned());
+        assert_eq!(
+            texts(&lines(&members, ROOT, Tab::Subagents, Cursor::new()).lines)[1],
+            "Review: @review subagent",
+            "an empty remainder keeps the whole title",
+        );
+    }
+
+    #[test]
+    fn up_on_the_first_row_closes_the_panel_instead_of_clamping() {
+        assert_eq!(
+            Cursor::new().up(3),
+            Up::Close,
+            "upstream closes the composer from row 0",
+        );
+        assert_eq!(
+            Cursor {
+                active: true,
+                selected: 2
+            }
+            .up(3),
+            Up::Row(1),
+        );
+        assert_eq!(
+            Cursor {
+                active: false,
+                selected: 2
+            }
+            .up(0),
+            Up::Close,
+            "a tab with no rows is always on its first one, so up closes it",
+        );
+    }
+
+    #[test]
+    fn down_wraps_to_the_first_row() {
+        assert_eq!(
+            Cursor {
+                active: true,
+                selected: 2
+            }
+            .down(3)
+            .selected,
+            0,
+            "down from the last row wraps, as `(i + 1) % len` does upstream",
+        );
+        assert_eq!(Cursor::new().down(3).selected, 1);
+        assert_eq!(
+            Cursor {
+                active: true,
+                selected: 1
+            }
+            .down(0)
+            .selected,
+            0,
+            "a list with no rows keeps its only position",
+        );
+    }
+
+    #[test]
+    fn ctrl_a_flips_the_filter_and_puts_the_selection_and_window_back_on_top() {
+        let cursor = Cursor {
+            active: true,
+            selected: 4,
+        }
+        .toggle();
+        assert_eq!(
+            cursor,
+            Cursor {
+                active: false,
+                selected: 0
+            },
+            "the toggle lists the other filter from the first row",
+        );
+        assert_eq!(
+            window_offset(cursor.selected, 9),
+            0,
+            "the window follows the selection back to the top",
+        );
+        assert!(cursor.toggle().active, "and back again");
+    }
+
+    #[test]
+    fn the_window_follows_the_selection_through_every_row() {
+        assert_eq!(window_offset(0, 3), 0, "a short list never scrolls");
+        assert_eq!(window_offset(0, 9), 0);
+        assert_eq!(
+            window_offset(6, 9),
+            4,
+            "the selected row is centred: 6 - floor(5 / 2)",
+        );
+        assert_eq!(
+            window_offset(8, 9),
+            4,
+            "the last row keeps the window full instead of running past the end",
+        );
+    }
+
+    #[test]
+    fn every_listed_entry_is_reachable_through_the_window() {
+        let listed = VIEWPORT + 3;
+        let mut members = vec![member(ROOT, None, false)];
+        for index in 0..listed {
+            let mut child = member(&format!("ses_{index}"), Some(ROOT), true);
+            child.title = Some(format!("Task {index}"));
+            members.push(child);
+        }
+        let mut seen: Vec<String> = Vec::new();
+        for selected in 0..listed {
+            let block = lines(
+                &members,
+                ROOT,
+                Tab::Subagents,
+                Cursor {
+                    active: true,
+                    selected,
+                },
+            );
+            let body = texts(&block.lines)[1..block.lines.len() - 2].to_vec();
+            assert!(
+                body.len() <= VIEWPORT,
+                "the body is the five-row window, got {} rows",
+                body.len(),
+            );
+            let line = block.selected.expect("a listed row is selected");
+            assert_eq!(
+                texts(&block.lines)[line],
+                format!("General: Task {selected}"),
+                "the selection always draws inside the window",
+            );
+            for row in body {
+                if !seen.contains(&row) {
+                    seen.push(row);
+                }
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            listed,
+            "every listed entry scrolls into the window: {seen:?}",
+        );
+    }
+
+    #[test]
+    fn the_row_of_the_session_on_screen_is_marked_apart_from_the_selection() {
+        let members = [
+            member(ROOT, None, false),
+            member(WORKING, Some(ROOT), true),
+            member(DONE, Some(ROOT), true),
+        ];
+        let block = lines(&members, DONE, Tab::Subagents, Cursor::new());
+        assert_eq!(
+            block.selected,
+            Some(1),
+            "the selection starts on the first row",
+        );
+        assert_eq!(
+            block.current,
+            Some(2),
+            "the session on screen is the second listed row",
+        );
+        let pal = *theme::palette();
+        let buffer = draw(40, block);
+        assert_eq!(
+            buffer.cell((1, 2)).map(|cell| cell.style().bg),
+            Some(pal.raised_base.bg),
+            "the current row takes the quieter fill",
+        );
+        assert_eq!(
+            buffer.cell((1, 1)).map(|cell| cell.style().bg),
+            Some(pal.menu_selected.bg),
+            "the selected row keeps the focused fill",
+        );
+    }
+
+    #[test]
+    fn the_selection_clamps_to_the_listed_rows() {
+        let members = [
+            member(ROOT, None, false),
+            member("ses_a", Some(ROOT), true),
+            member("ses_b", Some(ROOT), true),
+        ];
+        let head = lines(&members, ROOT, Tab::Subagents, Cursor::new());
+        assert_eq!(
+            head.selected,
+            Some(1),
+            "the header takes row 0, so the first listed row is row 1",
+        );
+        assert_eq!(
+            lines(
+                &members,
+                ROOT,
+                Tab::Subagents,
+                Cursor {
+                    active: true,
+                    selected: 1
+                }
+            )
+            .selected,
+            Some(2),
+        );
+        assert_eq!(
+            lines(
+                &members,
+                ROOT,
+                Tab::Subagents,
+                Cursor {
+                    active: true,
+                    selected: 9
+                }
+            )
+            .selected,
+            Some(2),
+            "an index past the list draws its last row",
+        );
+    }
+
+    #[test]
+    fn the_shell_tab_has_no_rows_and_upstreams_empty_state() {
+        let members = [member(ROOT, None, false), member(RUNNING, Some(ROOT), true)];
+        let block = lines(&members, ROOT, Tab::Shell, Cursor::new());
+        assert_eq!(
+            texts(&block.lines),
+            ["Subagents  Shell", "No shell commands", "", "tabs ←/→"],
+            "the shell tab shows upstream's empty state and no per-row hints",
+        );
+        assert_eq!(
+            block.selected, None,
+            "the shell tab is display only: nothing is selected there",
+        );
+        assert!(block.running.is_empty());
+    }
+
+    #[test]
+    fn tabs_wrap_both_ways() {
+        assert_eq!(Tab::Subagents.next(), Tab::Shell);
+        assert_eq!(Tab::Shell.next(), Tab::Subagents);
+        assert_eq!(Tab::Subagents.prev(), Tab::Shell);
+    }
+
+    #[test]
+    fn height_is_the_block_plus_its_foot() {
+        let block = lines(&[], ROOT, Tab::Shell, Cursor::new());
+        assert_eq!(
+            block.height(),
+            u16::try_from(block.lines.len()).expect("a short block fits u16") + 1,
+            "the foot row sits under the block's own rows",
+        );
+    }
+}

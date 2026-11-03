@@ -6,7 +6,7 @@ mod switching;
 
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use ox_client::rest::{FamilyMember, ShellInfo, ShellTail};
@@ -21,6 +21,7 @@ use crate::clipboard::Clip;
 use crate::pipeline;
 use crate::shell_captures::ShellCaptures;
 use crate::terminal::TerminalGuard;
+use crate::ui::activity_panel;
 use crate::ui::commands::CommandAction;
 use crate::ui::composer::{SearchAction, SearchBox, Submission};
 use crate::ui::dialog::{Dialog, DialogOutcome};
@@ -36,7 +37,6 @@ use crate::ui::queued_dialog;
 use crate::ui::selection::Outcome;
 use crate::ui::session_dialog;
 use crate::ui::shell_dialog;
-use crate::ui::subagent_dialog;
 use crate::ui::timeline::Transcript;
 use crate::ui::timeline_dialog;
 use crate::ui::toast::{self, Toast};
@@ -126,12 +126,20 @@ pub struct App {
     /// Whether the last copy produced an OSC 52 sequence, so the terminal was
     /// asked to set its clipboard even if the host write fails.
     osc52_attempted: bool,
-    /// The family behind the open subagent picker, fetched when it opened and
-    /// replaced on every fetch. Only `ctrl+a` reads it, to rebuild the rows.
+    /// The family the activity panel lists, fetched when the panel opened and
+    /// replaced on every fetch.
     family: Vec<FamilyMember>,
-    /// The picker's filter; it outlives the dialog like upstream's in-memory
-    /// `subagents-filter`.
-    subagents_active_only: bool,
+    /// The composer's activity panel while it is open (`ui::activity_panel`),
+    /// with the tab it shows; `None` leaves the composer in place.
+    panel: Option<activity_panel::Tab>,
+    /// The panel's cursor: which subagent filter is listed (one at a time) and
+    /// the selected row among the listed ones. It outlives the panel like
+    /// upstream's in-memory `subagents-filter`.
+    cursor: activity_panel::Cursor,
+    /// The panel has just opened and its family is still in flight: upstream
+    /// then puts the selection on the row of the session on screen, else on the
+    /// first row, as soon as the list has rows.
+    selection_pending: bool,
     /// The shell dialog the user just asked for and has not seen yet. A shell
     /// answer may open a dialog only for this; otherwise it may refresh a
     /// dialog that is still open. So a refresh that lands after `esc` is dropped.
@@ -206,7 +214,9 @@ impl App {
             pending_osc52: None,
             osc52_attempted: false,
             family: Vec::new(),
-            subagents_active_only: true,
+            panel: None,
+            cursor: activity_panel::Cursor::new(),
+            selection_pending: false,
             shell_wanted: None,
             shell_captures: ShellCaptures::default(),
             shell_syncs: 0,
@@ -233,7 +243,7 @@ impl App {
             AppEvent::History { request_id, items } => self.handle_history(request_id, items),
             AppEvent::ChildRunning { child, running } => {
                 if self.store.apply_probe(&child, running) {
-                    self.child_state_changed();
+                    self.family_state_changed();
                 }
             }
             AppEvent::SessionReady {
@@ -340,25 +350,14 @@ impl App {
         }
     }
 
-    /// Open the subagent picker for the family just fetched. A late answer
-    /// (the user moved to another session, a form needs answering) is dropped,
-    /// and so is one for a child session: upstream only closes the picker there.
+    /// Keep the family the panel lists. A late answer (the user moved to
+    /// another session) is dropped.
     fn on_family(&mut self, session: &str, members: Vec<FamilyMember>) {
-        if self.session.as_deref() != Some(session) || self.form_open() {
+        if self.session.as_deref() != Some(session) {
             return;
         }
-        let is_child = members
-            .iter()
-            .any(|member| member.id == session && member.parent_id.is_some());
-        if is_child {
-            return;
-        }
-        self.dialog = Some(subagent_dialog::dialog(
-            &members,
-            session,
-            self.subagents_active_only,
-        ));
         self.family = members;
+        self.settle_selection();
         self.dirty = true;
     }
 
@@ -407,19 +406,6 @@ impl App {
         }
     }
 
-    /// `ctrl+a` in the picker: flip running/finished and rebuild from the
-    /// members fetched when it opened.
-    fn toggle_subagents(&mut self) {
-        self.subagents_active_only = !self.subagents_active_only;
-        if let Some(session) = self.session.as_deref() {
-            self.dialog = Some(subagent_dialog::dialog(
-                &self.family,
-                session,
-                self.subagents_active_only,
-            ));
-        }
-    }
-
     /// A form dialog is open. It is the most urgent modal (the agent is
     /// blocked on it), so asynchronous dialog answers never replace it.
     fn form_open(&self) -> bool {
@@ -431,6 +417,10 @@ impl App {
     /// stale one would make the next stream replay from the wrong place).
     /// The new session's pending forms are fetched when there is one.
     fn session_changed(&mut self) {
+        self.panel = None;
+        self.family.clear();
+        self.cursor.selected = 0;
+        self.selection_pending = false;
         let purposeful = self.dialog_purpose.take().is_some();
         if purposeful || self.form_open() {
             self.dialog = None;
@@ -466,7 +456,7 @@ impl App {
             DialogOutcome::Selected(value) => {
                 self.dialog = None;
                 self.dirty = true;
-                if tag == Some(session_dialog::LIST_TAG) || tag == Some(subagent_dialog::TAG) {
+                if tag == Some(session_dialog::LIST_TAG) {
                     self.switch_session(value);
                 } else if tag == Some(queued_dialog::TAG) {
                     if let Some(session) = self.session.clone() {
@@ -493,15 +483,6 @@ impl App {
             }
             DialogOutcome::Action { key, value } => {
                 self.dirty = true;
-                if tag == Some(subagent_dialog::TAG) {
-                    if key == subagent_dialog::TOGGLE_KEY {
-                        self.toggle_subagents();
-                    } else if key == subagent_dialog::INTERRUPT_KEY {
-                        // The child's own session, not the one on screen.
-                        let _ = self.commands.send(AppCommand::Interrupt { session: value });
-                    }
-                    return;
-                }
                 if tag == Some(output_dialog::TAG) {
                     if key == output_dialog::REFRESH_KEY {
                         self.request_shell_output(value);
@@ -942,6 +923,20 @@ impl App {
             return;
         }
 
+        // The activity panel takes the composer's place, so it owns the
+        // keyboard: there is no visible text field to type into, and typing
+        // into a hidden composer would be invisible. `ctrl+c` still gets out.
+        if let Some(tab) = self.panel {
+            self.keymap.reset();
+            if keymap::is_cancel(&key) {
+                self.interrupt_or_quit();
+            } else {
+                self.on_activity_key(key, tab);
+            }
+            self.dirty = true;
+            return;
+        }
+
         // Global bindings. The slash menu keeps `ctrl+p`/`ctrl+n` for its own
         // navigation, so it owns the keyboard while it is open.
         let global = !self.prompt.autocomplete_visible();
@@ -1159,6 +1154,13 @@ impl App {
             }
             CommandAction::Subagents => {
                 if let Some(session) = self.session.clone() {
+                    // Upstream's tabs take the composer's place; the panel is
+                    // up at once and fills in when the family lands, with the
+                    // selection moving to the session on screen.
+                    self.panel = Some(activity_panel::Tab::Subagents);
+                    self.cursor.selected = 0;
+                    self.selection_pending = true;
+                    self.dirty = true;
                     let _ = self.commands.send(AppCommand::ListFamily { session });
                 }
             }
@@ -1217,6 +1219,128 @@ impl App {
                 let _ = self.commands.send(AppCommand::DetachSession);
             }
         }
+    }
+
+    /// A key while the activity panel is up: `esc` closes it, `←`/`→` and
+    /// `tab`/`shift+tab` switch tab, `↑` from the first row closes it and
+    /// otherwise moves up, `↓` moves down and wraps, `enter` opens that
+    /// subagent's session, `ctrl+d` interrupts it when it runs, `ctrl+a`
+    /// flips the subagent filter. Everything else is swallowed: the panel has
+    /// no text field, and the composer it replaced is not on screen. The keys
+    /// are upstream's (`config/keybind.ts:249-252` and the tab's own layer).
+    fn on_activity_key(&mut self, key: KeyEvent, tab: activity_panel::Tab) {
+        if key.kind == KeyEventKind::Release {
+            return;
+        }
+        let len = self.panel_rows(tab).len();
+        match key.code {
+            KeyCode::Esc => self.close_panel(),
+            KeyCode::Left | KeyCode::BackTab => {
+                self.panel = Some(tab.prev());
+                self.settle_selection();
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                self.panel = Some(tab.next());
+                self.settle_selection();
+            }
+            // Upstream's toggle lives in the subagents tab's own keymap layer.
+            KeyCode::Char('a')
+                if key.modifiers == KeyModifiers::CONTROL
+                    && tab == activity_panel::Tab::Subagents =>
+            {
+                self.cursor = self.cursor.toggle();
+            }
+            KeyCode::Up => match self.cursor.up(len) {
+                activity_panel::Up::Close => self.close_panel(),
+                activity_panel::Up::Row(selected) => self.cursor.selected = selected,
+            },
+            KeyCode::Down => self.cursor = self.cursor.down(len),
+            KeyCode::Enter => self.open_selected(tab),
+            KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
+                self.interrupt_selected(tab);
+            }
+            _ => {}
+        }
+    }
+
+    /// Close the panel (`esc`, or `↑` from the first row, where upstream closes
+    /// the composer). The selection goes back to the top the way upstream
+    /// resets it on close; the filter is remembered for the next open.
+    fn close_panel(&mut self) {
+        self.panel = None;
+        self.cursor.selected = 0;
+        self.selection_pending = false;
+        self.dirty = true;
+    }
+
+    /// The rows `tab` lists for the family it last fetched, in draw order.
+    fn panel_rows(&self, tab: activity_panel::Tab) -> Vec<activity_panel::Row<'_>> {
+        if tab != activity_panel::Tab::Subagents {
+            return Vec::new();
+        }
+        activity_panel::rows(
+            &self.family,
+            self.session.as_deref().unwrap_or_default(),
+            self.cursor.active,
+        )
+    }
+
+    /// The subagent under the selection, if one is listed. The index is clamped
+    /// the way the block clamps it, so a list that shrank under an open panel
+    /// (a child finishing) selects the row the panel actually draws.
+    fn panel_selected(&self, tab: activity_panel::Tab) -> Option<&FamilyMember> {
+        let rows = self.panel_rows(tab);
+        rows.get(self.cursor.clamp(rows.len()).selected)
+            .map(|row| row.member)
+    }
+
+    /// Keep the selection on a listed row, and put it on the session on screen
+    /// when the panel has just opened (upstream selects the current route
+    /// entry, else the first row, once the list has rows).
+    fn settle_selection(&mut self) {
+        let tab = self.panel.unwrap_or_default();
+        let (position, len) = {
+            let rows = self.panel_rows(tab);
+            let current = self.session.as_deref().unwrap_or_default();
+            (
+                rows.iter().position(|row| row.member.id == current),
+                rows.len(),
+            )
+        };
+        if self.selection_pending && len > 0 {
+            self.cursor.selected = position.unwrap_or(0);
+            self.selection_pending = false;
+        }
+        self.cursor = self.cursor.clamp(len);
+    }
+
+    /// `enter` (`composer.subagent.select`): open the selected subagent's
+    /// session. The old picker did it through `DialogOutcome::Selected` →
+    /// [`App::switch_session`], which also closes the panel (the session it
+    /// belongs to just changed).
+    fn open_selected(&mut self, tab: activity_panel::Tab) {
+        let Some(id) = self.panel_selected(tab).map(|member| member.id.clone()) else {
+            return;
+        };
+        self.switch_session(id);
+        self.dirty = true;
+    }
+
+    /// `ctrl+d` (`composer.subagent.interrupt`): interrupt the selected
+    /// subagent. The old picker sent the command for the child's own session,
+    /// not the one on screen; only a running child has a turn to stop, which is
+    /// also the only case upstream arms the key for.
+    fn interrupt_selected(&mut self, tab: activity_panel::Tab) {
+        let Some(member) = self.panel_selected(tab) else {
+            return;
+        };
+        if !member.running {
+            return;
+        }
+        let _ = self.commands.send(AppCommand::Interrupt {
+            session: member.id.clone(),
+        });
+        self.dirty = true;
     }
 
     /// Re-list the session's pending forms (after a reconnect or a failed reply).
@@ -1342,6 +1466,21 @@ impl App {
         self.store.changed_from = 0;
         self.store_dirty = true;
         self.dirty = true;
+    }
+
+    /// A child's own turn started or ended. Its `running` state lives on the
+    /// session row the family endpoint reports, so a panel that is open over it
+    /// must be re-listed: upstream's tab is a live memo over the session list,
+    /// while ox holds the family it last fetched. Only a child the store names
+    /// flips it (see `DataStore::observe_foreign`), which no shell or capture
+    /// update does, so this cannot turn a poll into a request loop.
+    fn family_state_changed(&mut self) {
+        self.child_state_changed();
+        if self.panel == Some(activity_panel::Tab::Subagents)
+            && let Some(session) = self.session.clone()
+        {
+            let _ = self.commands.send(AppCommand::ListFamily { session });
+        }
     }
 
     /// What the footer shows as going on: the focused session's own turn
@@ -1512,7 +1651,7 @@ impl App {
                 if !is_form && typed.data.session_id() != self.session.as_deref() {
                     // 其它会话不进 reducer；子会话的执行起止由 store 自己筛选。
                     if self.store.observe_foreign(&typed) {
-                        self.child_state_changed();
+                        self.family_state_changed();
                     }
                     return;
                 }
@@ -1558,8 +1697,10 @@ impl App {
     pub fn refresh(&mut self) {
         self.store_dirty = false;
         let changed_from = self.store.claim_changed_from();
-        let blocks = pipeline::blocks_from_store(&self.store, &self.shell_captures);
-        self.transcript.sync(&blocks, changed_from);
+        let projection =
+            pipeline::blocks_from_store(&self.store, &self.shell_captures, changed_from);
+        self.transcript
+            .sync(&projection.blocks, projection.first_block);
         self.refresh_context();
         let cost = self.store.total_cost();
         self.prompt
@@ -1605,8 +1746,8 @@ impl App {
         }
     }
 
-    /// One frame of the session route: transcript, docks, prompt, then the
-    /// dialog and toast on top.
+    /// One frame of the session route: transcript, docks, prompt (or the
+    /// activity panel in its place), then the dialog and toast on top.
     fn draw_session(&mut self, frame: &mut ratatui::Frame) {
         let full = frame.area();
         let searching = matches!(self.mode, Mode::SearchInput(_));
@@ -1614,13 +1755,29 @@ impl App {
             .prompt
             .height(full.height)
             .min(full.height.saturating_sub(1));
+        // The panel's rows are width independent, so they are built before the
+        // layout needs their height.
+        let panel = self.panel.map(|tab| {
+            activity_panel::lines(
+                &self.family,
+                self.session.as_deref().unwrap_or_default(),
+                tab,
+                self.cursor,
+            )
+        });
+        // A terminal shorter than the panel must not squeeze the transcript to
+        // no rows, so the panel gives way the same way the prompt does.
+        let bottom_h = match &panel {
+            Some(block) => block.height().min(full.height.saturating_sub(1)),
+            None => prompt_h,
+        };
         let queued_h = if self.queued_dock_shown() {
             dock::queued_dock_height(&self.store.queued)
         } else {
             0
         };
         let (timeline_area, queued_area, prompt_area, dock_area) =
-            layout::split_with_queue(full, if searching { 1 } else { prompt_h }, queued_h);
+            layout::split_with_queue(full, if searching { 1 } else { bottom_h }, queued_h);
         let queued_area = layout::padded(queued_area, full.width);
         let queued_area = Rect {
             height: queued_area.height.min(dock::QUEUED_DOCK_ROWS),
@@ -1643,8 +1800,13 @@ impl App {
             Mode::SearchInput(boxed) => boxed.render(frame, prompt_area, self.dialog.is_none()),
             _ => {
                 let prompt_area = layout::padded(prompt_area, full.width);
-                let activity = self.activity();
-                self.prompt.render(frame, prompt_area, full, activity);
+                match panel {
+                    Some(block) => activity_panel::render(frame, prompt_area, block),
+                    None => {
+                        let activity = self.activity();
+                        self.prompt.render(frame, prompt_area, full, activity);
+                    }
+                }
             }
         }
         let line = dock::status_line(&self.store, self.status_mode());
@@ -1701,7 +1863,8 @@ impl App {
                     if self.dirty {
                         self.flush_store();
                         self.dirty = false;
-                        self.prompt.yield_cursor(self.dialog.is_some());
+                        self.prompt
+                            .yield_cursor(self.dialog.is_some() || self.panel.is_some());
                         // The terminal applies the whole frame at once, so the
                         // cursor hopping around while cells are written is
                         // never seen (an IME anchors on it). Terminals that

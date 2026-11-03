@@ -1,3 +1,4 @@
+pub mod activity_panel;
 pub mod autocomplete;
 pub mod block_tool;
 pub mod commands;
@@ -29,7 +30,6 @@ pub mod shell_block;
 pub mod shell_collapse;
 pub mod shell_dialog;
 pub mod spinner;
-pub mod subagent_dialog;
 pub mod table;
 pub mod timeline;
 pub mod timeline_dialog;

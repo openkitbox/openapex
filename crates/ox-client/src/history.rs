@@ -1,11 +1,36 @@
 //! History parsing: a chronological `Vec<Message>` becomes the store's single
-//! ordered `Vec<Item>`. Pure function, no IO. Only shell / subagent
-//! completion notices are kept from synthetic messages; every other synthetic
-//! message stays skipped. Compaction messages become boundary items.
+//! ordered `Vec<Item>`. Pure function, no IO. Shell / subagent completion
+//! notices and every described synthetic message (a historian fold notice)
+//! become rows; a synthetic without a description stays skipped, and so does a
+//! compaction still `running` (its settled states become boundary items).
 //! `*-switched`, `system` and `skill` messages become row items, and an
 //! `idle` error becomes one only when it differs from the error the turn's
 //! last step or settled compaction already shows (upstream `rows.ts`
 //! `reduceSessionRows` `shownError`).
+//!
+//! A turn's start is an [`Item::Turn`], emitted at the input that begins the
+//! turn: a `synthetic` message, described or not, or a `user` message that
+//! begins one. A `user` message is its own row, and it begins a turn only when
+//! none is open — a prompt typed while a turn runs is persisted mid-turn, and
+//! taking it as a boundary would date the rest of the turn from the steer.
+//! Which input begins a turn follows upstream
+//! `packages/util/src/session-turn.ts` `inputIndex`: the first input after the
+//! previous `idle` marker, or — in a history that has no markers at all
+//! (`legacy`) — the nearest preceding input, so every input starts a turn. That
+//! file is outside the sparse `.ox/reference/opencode` checkout (only
+//! `packages/tui` is there); reach it with
+//! `git show HEAD:packages/util/src/session-turn.ts` in that repository.
+//!
+//! Markers are not always present in a marked history either: the projector
+//! writes `idle` on a turn that succeeded, failed or was interrupted, but not
+//! on a `Shutdown` interrupt (`crates/ox-core/src/projector/message_updater.rs`
+//! `ExecutionInterrupted` only clears the retry), so a hard kill mid-turn
+//! leaves the turn open in the persisted history. Every later prompt then reads
+//! as a steer, and the turn stays dated from the prompt that opened it, until
+//! the next `idle`. That is the upstream rule, not a parsing bug.
+//!
+//! `Item::from_synthetic` is the one classification point for synthetics,
+//! shared with the live reducer.
 
 use std::sync::Arc;
 
@@ -13,21 +38,40 @@ use ox_schema::message::{AssistantContent, Compaction, Message, ToolState as Wir
 use ox_schema::support::Content;
 
 use crate::store::{
-    AssistantItem, ChildRef, CompactionItem, CompactionStatus, CompletionItem, ErrorInfo, Item,
-    ModelChoice, Notice, RetryInfo, ShownError, Switch, ToolPart, ToolState,
+    AssistantItem, ChildRef, CompactionItem, CompactionStatus, ErrorInfo, Item, ModelChoice,
+    Notice, RetryInfo, ShownError, Switch, ToolPart, ToolState,
 };
 
 /// Turn a chronological message list into the store's ordered sequence.
 pub fn parse_messages(messages: &[Message]) -> Vec<Item> {
     let mut items = Vec::new();
     let mut shown = ShownError::default();
+    // A turn starts at its first input: upstream `session-turn.ts`
+    // `inputIndex` (reach it as the module doc says) returns the first
+    // `user`/`synthetic` after the previous `idle` marker. A history with no
+    // markers at all predates them, and there the nearest preceding input
+    // starts the turn instead, so every input does.
+    let marked = messages
+        .iter()
+        .any(|message| matches!(message, Message::Idle { .. }));
+    let mut turn_open = false;
 
     for message in messages {
         match message {
-            Message::User { prompt, time, .. } => items.push(Item::User {
-                text: Arc::from(prompt.text.as_str()),
-                created: Some(time.created),
-            }),
+            Message::User { prompt, time, .. } => {
+                // The row carries the prompt time the projector recorded, which
+                // is exact. It opens a turn when none is open — a prompt
+                // persisted mid-turn is a steer, and the wait for that turn is
+                // what upstream's `inputIndex` skips. An unmarked history has no
+                // marker to keep one open, so there it always opens one.
+                let starts_turn = !marked || !turn_open;
+                turn_open = true;
+                items.push(Item::User {
+                    text: Arc::from(prompt.text.as_str()),
+                    created: Some(time.created),
+                    starts_turn,
+                });
+            }
             Message::Assistant(assistant) => {
                 let mut text = String::new();
                 let mut reasoning = String::new();
@@ -62,6 +106,7 @@ pub fn parse_messages(messages: &[Message]) -> Vec<Item> {
                     id: assistant.id.clone(),
                     text: Arc::from(text),
                     reasoning: Arc::from(reasoning),
+                    reasoning_ms: reasoning_ms(&assistant.content),
                     done: true,
                     version: 0,
                     last_ordinal: None,
@@ -113,6 +158,8 @@ pub fn parse_messages(messages: &[Message]) -> Vec<Item> {
                 items.push(Item::Compaction(Box::new(compaction_item(message))));
             }
             Message::Idle { error, .. } => {
+                // The turn is over: the next input starts a new one.
+                turn_open = false;
                 if let Some(error) = shown.end_turn(error.as_ref().map(ErrorInfo::from)) {
                     items.push(Item::Error(error));
                 }
@@ -144,18 +191,49 @@ pub fn parse_messages(messages: &[Message]) -> Vec<Item> {
                 id,
                 metadata,
                 description,
+                time,
                 ..
             } => {
+                // A synthetic is a turn input even when it renders nothing (a
+                // repeat or todo reminder, an output-limit or incomplete-stream
+                // continuation), so the turn item goes in before the row.
+                if !marked || !turn_open {
+                    turn_open = true;
+                    items.push(Item::Turn {
+                        created: Some(time.created),
+                    });
+                }
                 if let Some(item) =
-                    CompletionItem::from_synthetic(id, metadata.as_ref(), description.as_deref())
+                    Item::from_synthetic(id, metadata.as_ref(), description.as_deref())
                 {
-                    items.push(Item::Completion(item));
+                    items.push(item);
                 }
             }
             _ => {}
         }
     }
     items
+}
+
+/// Milliseconds the provider spent thinking, summed over the message's
+/// `reasoning` parts. Each part records `time.created → time.completed`, the
+/// same window the live `reasoning.started → reasoning.ended` path times, and
+/// the live reducer adds those windows up the same way — so a history-loaded
+/// and a live row show the same duration. A part without a completion stamp
+/// contributes nothing; when no part is timed the result is `None`, and the row
+/// renders no suffix.
+fn reasoning_ms(content: &[AssistantContent]) -> Option<u64> {
+    content
+        .iter()
+        .filter_map(|content| {
+            let AssistantContent::Reasoning { time, .. } = content else {
+                return None;
+            };
+            let time = time.as_ref()?;
+            let completed = time.completed?;
+            Some((completed - time.created).max(0) as u64)
+        })
+        .reduce(|total, part| total + part)
 }
 
 fn compaction_item(message: &ox_schema::message::CompactionMessage) -> CompactionItem {
@@ -272,4 +350,218 @@ fn join_text(content: &[Content]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse one wire message list (what the history endpoint returns).
+    fn parse(messages: serde_json::Value) -> Vec<Item> {
+        let messages: Vec<Message> =
+            serde_json::from_value(messages).expect("history messages deserialize");
+        parse_messages(&messages)
+    }
+
+    /// The parsed items by kind, in order, with a turn start marked `turn`.
+    fn kinds(items: &[Item]) -> Vec<&'static str> {
+        items
+            .iter()
+            .map(|item| match item {
+                Item::User { .. } => "user",
+                Item::Turn { .. } => "turn",
+                Item::Assistant(_) => "assistant",
+                Item::Compaction(_) => "compaction",
+                Item::Completion(_) => "completion",
+                Item::Switch(_) => "switch",
+                Item::Notice(_) => "notice",
+                Item::Error(_) => "error",
+            })
+            .collect()
+    }
+
+    fn user(id: &str, created: i64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "user",
+            "id": id,
+            "time": { "created": created },
+            "text": "go",
+        })
+    }
+
+    fn synthetic(id: &str, created: i64, description: Option<&str>) -> serde_json::Value {
+        let mut message = serde_json::json!({
+            "type": "synthetic",
+            "id": id,
+            "time": { "created": created },
+            "text": "reminder",
+        });
+        if let Some(description) = description {
+            message["description"] = serde_json::json!(description);
+        }
+        message
+    }
+
+    fn idle(id: &str, created: i64) -> serde_json::Value {
+        serde_json::json!({
+            "type": "idle",
+            "id": id,
+            "time": { "created": created },
+            "outcome": "succeeded",
+        })
+    }
+
+    #[test]
+    fn a_turn_starts_at_its_first_input_after_the_previous_idle() {
+        // A synthetic without a description renders nothing and still starts
+        // the turn it prompts (a repeat / todo reminder, a continuation); a
+        // steer delivered inside the turn starts nothing.
+        let items = parse(serde_json::json!([
+            user("u1", 1_000),
+            idle("i1", 2_000),
+            synthetic("s1", 3_000, None),
+            synthetic("s1b", 4_000, Some("steer")),
+            idle("i2", 5_000),
+            user("u2", 6_000),
+        ]));
+        assert_eq!(
+            kinds(&items),
+            vec!["user", "turn", "notice", "user"],
+            "the description-less synthetic starts the turn after `i1`, the \
+             steered one does not start another, and a typed prompt is a row of its own"
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Turn { created } => *created,
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![3_000],
+            "the turn is dated from its first input, not from the steer"
+        );
+    }
+
+    #[test]
+    fn a_history_without_idle_markers_starts_a_turn_at_every_input() {
+        // Upstream `inputIndex` falls back to the nearest preceding input when
+        // a history has no markers at all, which splits a steered turn there:
+        // every input starts its own turn, typed prompts included, so a second
+        // prompt is never dated from the first.
+        let items = parse(serde_json::json!([
+            user("u1", 1_000),
+            synthetic("s1", 2_000, Some("steer")),
+            user("u2", 3_000),
+        ]));
+        assert_eq!(
+            kinds(&items),
+            vec!["user", "turn", "notice", "user"],
+            "without markers the synthetic is measured as its own turn (upstream legacy mode)"
+        );
+        assert_eq!(
+            user_turns(&items),
+            vec![true, true],
+            "with no markers at all every prompt opens a turn: the one after the \
+             synthetic is not a steer"
+        );
+    }
+
+    #[test]
+    fn a_user_message_inside_a_turn_is_a_steer_not_a_boundary() {
+        // A prompt typed while the turn runs is persisted mid-turn as a `user`
+        // message. Only the first input after an `idle` marker opens a turn
+        // (upstream `inputIndex`), so the steer must not date the rest of it.
+        let items = parse(serde_json::json!([
+            user("u1", 1_000),
+            assistant(
+                "a1",
+                1_500,
+                serde_json::json!([{ "type": "text", "text": "working" }])
+            ),
+            user("u2", 9_000),
+            idle("i1", 12_000),
+            user("u3", 20_000),
+        ]));
+        assert_eq!(
+            kinds(&items),
+            vec!["user", "assistant", "user", "user"],
+            "a steer is still a user row"
+        );
+        assert_eq!(
+            user_turns(&items),
+            vec![true, false, true],
+            "the prompt after the idle marker starts a turn; the one persisted \
+             mid-turn does not"
+        );
+    }
+
+    /// Whether each user row begins a turn, in transcript order.
+    fn user_turns(items: &[Item]) -> Vec<bool> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                Item::User { starts_turn, .. } => Some(*starts_turn),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assistant(id: &str, created: i64, content: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "type": "assistant",
+            "id": id,
+            // A whole-message window far larger than the reasoning windows, so
+            // the assertion catches a fallback to the message duration.
+            "time": { "created": created, "completed": created + 10_000 },
+            "agent": "apex",
+            "model": { "id": "deepseek-chat", "providerID": "cardinal" },
+            "content": content,
+        })
+    }
+
+    #[test]
+    fn a_history_row_carries_its_reasoning_duration() {
+        // The persisted reasoning parts carry the provider's thinking window,
+        // which is what upstream's `+ Thought · 3.0s` reports after reload.
+        let items = parse(serde_json::json!([
+            assistant(
+                "a1",
+                1_000,
+                serde_json::json!([
+                    {
+                        "type": "reasoning",
+                        "text": "first thought",
+                        "time": { "created": 1_000, "completed": 3_951 },
+                    },
+                    {
+                        "type": "reasoning",
+                        "text": "second thought",
+                        "time": { "created": 3_951, "completed": 4_351 },
+                    },
+                    { "type": "reasoning", "text": "untimed thought" },
+                    { "type": "text", "text": "done" },
+                ])
+            ),
+            assistant(
+                "a2",
+                5_000,
+                serde_json::json!([{ "type": "text", "text": "no thinking" }])
+            ),
+        ]));
+        let durations: Vec<Option<u64>> = items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Assistant(assistant) => Some(assistant.reasoning_ms),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            durations,
+            vec![Some(3_351), None],
+            "the two timed reasoning parts add up to 2951 + 400 ms, the untimed \
+             part and the message's own 10 s window contribute nothing, and a \
+             message with no reasoning renders no duration"
+        );
+    }
 }

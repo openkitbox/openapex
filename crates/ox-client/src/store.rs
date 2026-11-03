@@ -2,8 +2,12 @@
 //! part the TUI tests most heavily.
 //!
 //! Two invariants keep the UI cheap:
-//! 1. `items` is ONE ordered sequence (no parallel user/assistant vectors), so
-//!    the block list is a 1:1 projection with no positional pairing heuristics.
+//! 1. `items` is ONE ordered sequence (no parallel user/assistant vectors), and
+//!    the block list is a projection of it. An item index is NOT a block index:
+//!    one assistant item may draw several blocks (reasoning, answer, tool
+//!    rows), and [`Item::Turn`] draws none. The dirty watermark
+//!    ([`DataStore::changed_from`]) is an item index; the projection converts it
+//!    (`ox_tui::pipeline::blocks_from_store`) into the block to start re-wrapping.
 //! 2. Every mutation bumps `version` and lowers `changed_from`; the UI compares
 //!    `(id, version)` in O(1) and only re-wraps the changed tail. Text lives in
 //!    an `Arc` so an unchanged block shares the store's buffer (no deep copy).
@@ -38,6 +42,30 @@ pub enum Item {
         text: Arc<str>,
         /// Wire `time.created` (ms). `None` for the optimistic local echo.
         created: Option<i64>,
+        /// Whether this row is the input that begins a turn. Upstream
+        /// `packages/util/src/session-turn.ts` `inputIndex` dates a turn from
+        /// the first input after the previous `idle` marker, so a prompt typed
+        /// while a turn runs — persisted mid-turn as a `user` message, a steer —
+        /// is a row INSIDE the turn and must not restart its clock.
+        ///
+        /// Live: computed at echo time from the store's busy state
+        /// ([`DataStore::push_user`]); the turn row that follows a prompt typed
+        /// while idle carries the execution start, so `created` stays `None`.
+        /// History: true for a `user` message that opens a turn (no turn open
+        /// yet), false inside one.
+        starts_turn: bool,
+    },
+    /// A turn started here: the session opened one execution. Carries the
+    /// turn's first input `time.created` when the wire has it (a history input
+    /// row), and the execution's own `created` live.
+    ///
+    /// It renders nothing; it exists so the projector can date a turn from
+    /// where the turn started rather than from a rendered row (upstream
+    /// `packages/util/src/session-turn.ts` `inputIndex`), which is what keeps a
+    /// synthetic-started turn — described or not — measurable and a steered
+    /// turn whole.
+    Turn {
+        created: Option<i64>,
     },
     Assistant(Box<AssistantItem>),
     /// A context-compaction boundary (`session.compaction.*` live, or a
@@ -49,8 +77,9 @@ pub enum Item {
     /// An agent / model / location change (`*-switched` messages, or the
     /// `session.agent.selected` / `model.selected` / `moved` events).
     Switch(Switch),
-    /// A system notice (`system` message, `session.instructions.updated`) or
-    /// a loaded skill (`skill` message).
+    /// A system notice (`system` message, `session.instructions.updated`), a
+    /// described `synthetic` message (a historian fold: `◈ historian folded
+    /// 59..59 · 1 compartment`), or a loaded skill (`skill` message).
     Notice(Notice),
     /// A run failure the turn's last step or compaction did not already show
     /// (`idle.error`, `session.execution.failed`; upstream `reduceSessionRows`
@@ -210,6 +239,34 @@ impl CompletionItem {
             description,
             child_id,
         })
+    }
+}
+
+impl Item {
+    /// The single classification point for a `synthetic` session message:
+    /// history (`crate::history`), the live `session.synthetic` event and an
+    /// inbox-delivered synthetic all go through it.
+    ///
+    /// A shell / subagent completion keeps its [`Item::Completion`] row; every
+    /// other synthetic becomes a notice row (`◈ description`) — a historian
+    /// fold, a todo reminder. The message `text` is its model-facing body (a
+    /// repeat reminder, a continuation prompt) and never a row: a synthetic
+    /// describes itself, so one without a description makes no row at all
+    /// (upstream `rows.ts` drops `!description?.trim()`). That is the only
+    /// synthetic allowed to be dropped.
+    #[must_use]
+    pub fn from_synthetic(
+        id: &str,
+        metadata: Option<&Record>,
+        description: Option<&str>,
+    ) -> Option<Self> {
+        if let Some(completion) = CompletionItem::from_synthetic(id, metadata, description) {
+            return Some(Self::Completion(completion));
+        }
+        let description = description.filter(|text| !text.trim().is_empty())?;
+        Some(Self::Notice(Notice::System {
+            description: Some(Arc::from(description)),
+        }))
     }
 }
 
@@ -448,8 +505,10 @@ pub struct AssistantItem {
     /// Tool calls in first-seen order. Ordered after the message text — the
     /// wire gives tool parts no ordinal, so interleaving is not recoverable.
     pub tools: Vec<ToolPart>,
-    /// Seconds spent reasoning, when `reasoning.started` was seen live.
-    /// History-loaded reasoning has no duration on the wire.
+    /// Milliseconds the provider spent thinking, summed over the message's
+    /// thinking windows: the live `reasoning.started → reasoning.ended` spans, or
+    /// a history-loaded message's reasoning-part `time` blocks. `None` when
+    /// neither recorded a duration, in which case the row shows no suffix.
     pub reasoning_ms: Option<u64>,
     pub reasoning_started: Option<std::time::Instant>,
     /// Wall-clock start of the turn that produced this message (envelope ms).
@@ -515,15 +574,20 @@ pub struct DataStore {
     pub queued_compactions: Vec<String>,
     /// Prompts accepted but not yet delivered.
     pub queued: Vec<Queued>,
-    /// Completion notices enqueued but not yet delivered, by inbox id. Moved
-    /// into `items` on delivery; dropped on cancel and on history reload.
-    pending_completions: HashMap<String, CompletionItem>,
+    /// Rows classified at enqueue time by [`Item::from_synthetic`] for
+    /// inbox synthetics not yet delivered, by inbox id. Moved into `items` on
+    /// delivery; dropped on cancel and on history reload. Holding the `Item`
+    /// (not the narrower [`CompletionItem`]) is what keeps the delivered row
+    /// identical to the one history builds for the same message.
+    pending_synthetics: HashMap<String, Item>,
     /// Forms awaiting an answer (`form.created` not yet replied/cancelled),
     /// oldest first. The `question` tool is the only producer today.
     pub pending_forms: Vec<FormInfo>,
     /// Last durable seq **of the focused session only**.
     pub last_seq: Option<i64>,
-    /// First item index whose content changed since the last UI sync.
+    /// First **item** index whose content changed since the last UI sync. Item
+    /// indices are not block indices (see the module doc): a caller deriving
+    /// blocks must project this through the same walk that builds them.
     pub changed_from: usize,
     /// Dispatch timestamp of the step in flight; steps never overlap, so one
     /// slot (not per-item state) is enough to accumulate `active_ms`.
@@ -841,7 +905,7 @@ impl DataStore {
             .retain(|id| ChildRef::referenced_in(items, id));
         self.probing.retain(|id| ChildRef::referenced_in(items, id));
         self.assistant_index.clear();
-        self.pending_completions.clear();
+        self.pending_synthetics.clear();
         self.shown_error = ShownError::default();
         for (index, item) in self.items.iter().enumerate() {
             if let Item::Assistant(assistant) = item {
@@ -851,11 +915,15 @@ impl DataStore {
         self.changed_from = 0;
     }
 
-    /// Optimistic local echo of a submitted prompt.
+    /// Optimistic local echo of a submitted prompt. It is a steer when a turn is
+    /// already running: the row lands inside that turn (the server delivers it
+    /// at the next step boundary), so it must not open a new one. A prompt typed
+    /// while idle opens the turn the following [`Item::Turn`] dates.
     pub fn push_user(&mut self, text: &str) {
         self.items.push(Item::User {
             text: Arc::from(text),
             created: None,
+            starts_turn: self.running_since.is_none(),
         });
         let index = self.items.len() - 1;
         self.touch(index);
@@ -1005,10 +1073,13 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
             let index = store.ensure_assistant(assistant_message_id);
             if let Item::Assistant(item) = &mut store.items[index] {
                 item.reasoning = Arc::new(text.clone());
-                item.reasoning_ms = item
-                    .reasoning_started
-                    .take()
-                    .map(|started| started.elapsed().as_millis() as u64);
+                // A message may think more than once: the parts add up, the way
+                // history sums its persisted reasoning-part windows, so a
+                // reloaded row and a live one report the same duration.
+                if let Some(started) = item.reasoning_started.take() {
+                    let elapsed = started.elapsed().as_millis() as u64;
+                    item.reasoning_ms = Some(item.reasoning_ms.unwrap_or(0) + elapsed);
+                }
                 item.version += 1;
             }
             store.touch(index);
@@ -1146,6 +1217,22 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
             store.touch(index);
         }
         SessionEventData::ExecutionStarted { .. } => {
+            // One turn item per busy period: the actor publishes
+            // `execution.started` exactly once per it, and a steer or synthetic
+            // delivered mid-turn arrives as an inbox row and starts nothing
+            // here, so it cannot split the turn. The boundary is pushed even
+            // when `running_since` looks set, because that flag can be stale —
+            // a stream that dropped while a turn finished loses the terminal
+            // frame, so the next turn would otherwise get no boundary at all
+            // and its footer would span the previous turn's steps. Only a repeat
+            // of the frame that already opened the turn (a replay) adds nothing:
+            // a second boundary would draw no row, but it would cut the tok/s
+            // window of the later steps short.
+            if store.running_since != Some(event.created) {
+                store.push_row(Item::Turn {
+                    created: Some(event.created),
+                });
+            }
             store.running_since = Some(event.created);
         }
         SessionEventData::ExecutionSucceeded { .. }
@@ -1277,13 +1364,15 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
             item: ox_schema::inbox::Item::Synthetic { payload, .. },
             ..
         } => {
-            // No chip: a completion notice only appears once delivered.
-            if let Some(notice) = CompletionItem::from_synthetic(
+            // No chip: the row only appears once delivered, but it is
+            // classified here so an inbox synthetic and the same message
+            // reloaded from history agree on their row.
+            if let Some(row) = Item::from_synthetic(
                 inbox_id,
                 payload.metadata.as_ref(),
                 payload.description.as_deref(),
             ) {
-                store.pending_completions.insert(inbox_id.clone(), notice);
+                store.pending_synthetics.insert(inbox_id.clone(), row);
             }
         }
         SessionEventData::InboxEnqueued {
@@ -1300,8 +1389,8 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
             store.queued.retain(|queued| queued.inbox_id != *inbox_id);
             store.queued_compactions.retain(|id| id != inbox_id);
             // Timeline position = delivery time; a repeat finds nothing to move.
-            if let Some(notice) = store.pending_completions.remove(inbox_id) {
-                store.items.push(Item::Completion(notice));
+            if let Some(row) = store.pending_synthetics.remove(inbox_id) {
+                store.items.push(row);
             }
             store.changed_from = 0;
         }
@@ -1318,7 +1407,7 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
         SessionEventData::InboxCancelled { inbox_id, .. } => {
             store.queued.retain(|queued| queued.inbox_id != *inbox_id);
             store.queued_compactions.retain(|id| id != inbox_id);
-            store.pending_completions.remove(inbox_id);
+            store.pending_synthetics.remove(inbox_id);
             store.changed_from = 0;
         }
         SessionEventData::SessionModelSelected {
@@ -1368,6 +1457,20 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
                 store.push_row(Item::Notice(Notice::System {
                     description: Some(Arc::from(description)),
                 }));
+            }
+        }
+        SessionEventData::SessionSynthetic {
+            description,
+            metadata,
+            ..
+        } => {
+            // `text` is the model-facing body (a repeat reminder, a
+            // continuation prompt), never a row; a described synthetic gets
+            // its `◈` row here, the same one history builds.
+            if let Some(item) =
+                Item::from_synthetic(&event.id, metadata.as_ref(), description.as_deref())
+            {
+                store.push_row(item);
             }
         }
         SessionEventData::CompactionStarted { .. } => {
@@ -1548,4 +1651,397 @@ fn bound_summary(text: &str) -> String {
         cut.truncate(space);
     }
     format!("{cut}…")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One `session.synthetic` frame through the real path: wire JSON →
+    /// `parse_typed` → the reducer the socket feed uses.
+    fn reduced(data: serde_json::Value) -> Vec<Item> {
+        let frame = serde_json::json!({
+            "id": "evt_synthetic",
+            "created": 1,
+            "type": "session.synthetic",
+            "data": data,
+        });
+        let envelope: EventEnvelope<serde_json::Value> =
+            serde_json::from_value(frame).expect("a synthetic frame deserializes");
+        let mut store = DataStore::default();
+        reduce(&mut store, &envelope.parse_typed());
+        store.items
+    }
+
+    #[test]
+    fn a_synthetic_makes_one_row_or_none() {
+        // (a) A shell completion keeps its completion row.
+        let completion = reduced(serde_json::json!({
+            "sessionID": "ses_1",
+            "text": "Run echo done",
+            "description": "Done",
+            "metadata": { "source": "shell", "state": "completed" },
+        }));
+        assert!(
+            matches!(completion.as_slice(), [Item::Completion(_)]),
+            "a shell completion rides the completion row, got {completion:?}"
+        );
+
+        // (b) A described synthetic is a notice row (`◈ historian folded …`).
+        let folded = "historian folded 59..59 · 1 compartment";
+        let notice = reduced(serde_json::json!({
+            "sessionID": "ses_1",
+            "text": "",
+            "description": folded,
+        }));
+        match notice.as_slice() {
+            [
+                Item::Notice(Notice::System {
+                    description: Some(text),
+                }),
+            ] => assert_eq!(text.as_ref(), folded, "the row keeps the wire description"),
+            other => panic!("a described synthetic must be one notice row, got {other:?}"),
+        }
+
+        // (c) No description = no row: the body of such a synthetic is a
+        // model-facing prompt (a repeat reminder), and upstream drops it
+        // (`rows.ts` `!description?.trim()`).
+        for data in [
+            serde_json::json!({ "sessionID": "ses_1", "text": "" }),
+            serde_json::json!({ "sessionID": "ses_1", "text": "repeat reminder", "description": "  " }),
+        ] {
+            let items = reduced(data.clone());
+            assert!(
+                items.is_empty(),
+                "a synthetic with no description makes no row, got {items:?} for {data}"
+            );
+        }
+    }
+
+    /// One raw frame through `parse_typed` into `store` — the socket feed path.
+    fn apply(store: &mut DataStore, frame: serde_json::Value) {
+        let envelope: EventEnvelope<serde_json::Value> =
+            serde_json::from_value(frame).expect("a frame deserializes");
+        reduce(store, &envelope.parse_typed());
+    }
+
+    /// The `session.inbox.delivered` frame for one inbox id.
+    fn delivered(inbox_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "evt_delivered",
+            "created": 2,
+            "type": "session.inbox.delivered",
+            "data": { "sessionID": "ses_1", "inboxID": inbox_id },
+        })
+    }
+
+    /// The `session.inbox.enqueued` frame for one synthetic inbox item.
+    fn enqueued(inbox_id: &str, payload: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": "evt_enqueued",
+            "created": 1,
+            "type": "session.inbox.enqueued",
+            "data": {
+                "sessionID": "ses_1",
+                "inboxID": inbox_id,
+                "item": { "type": "synthetic", "delivery": "queue", "payload": payload },
+            },
+        })
+    }
+
+    #[test]
+    fn an_inbox_synthetic_delivers_the_row_the_classifier_built() {
+        // `POST /api/session/{id}/synthetic` reaches the timeline through the
+        // inbox, never through `session.synthetic`. Enqueue + delivery must
+        // therefore build the same row `Item::from_synthetic` classifies, or
+        // the live row and the reloaded one disagree.
+        let folded = "historian folded 59..59 · 1 compartment";
+        let mut store = DataStore::default();
+        apply(
+            &mut store,
+            enqueued(
+                "msg_notice",
+                serde_json::json!({ "text": "", "description": folded }),
+            ),
+        );
+        assert!(
+            store.items.is_empty(),
+            "an enqueued synthetic makes no row before delivery, got {:?}",
+            store.items
+        );
+        apply(&mut store, delivered("msg_notice"));
+        match store.items.as_slice() {
+            [
+                Item::Notice(Notice::System {
+                    description: Some(text),
+                }),
+            ] => assert_eq!(
+                text.as_ref(),
+                folded,
+                "a described inbox synthetic delivers its notice row"
+            ),
+            other => panic!("a described inbox synthetic must be one notice row, got {other:?}"),
+        }
+
+        // A shell-shaped inbox completion keeps the completion row it had
+        // before this path went through the classifier (text collapsed).
+        let mut store = DataStore::default();
+        apply(
+            &mut store,
+            enqueued(
+                "msg_completion",
+                serde_json::json!({
+                    "text": "Run echo done",
+                    "description": "Done   with  spaces",
+                    "metadata": { "source": "shell", "state": "completed" },
+                }),
+            ),
+        );
+        assert!(
+            store.items.is_empty(),
+            "an enqueued completion makes no row before delivery, got {:?}",
+            store.items
+        );
+        apply(&mut store, delivered("msg_completion"));
+        match store.items.as_slice() {
+            [Item::Completion(completion)] => {
+                assert_eq!(
+                    completion.id, "msg_completion",
+                    "the row is keyed by inbox id"
+                );
+                assert_eq!(
+                    completion.source,
+                    CompletionSource::Shell,
+                    "a shell-sourced inbox item stays a shell completion"
+                );
+                assert_eq!(
+                    completion.description.as_ref(),
+                    "Done with spaces",
+                    "a shell description is still collapsed"
+                );
+            }
+            other => panic!("a shell inbox item must be one completion row, got {other:?}"),
+        }
+    }
+
+    /// The `session.execution.started` frame.
+    fn execution_started(created: i64) -> serde_json::Value {
+        serde_json::json!({
+            "id": "evt_started",
+            "created": created,
+            "type": "session.execution.started",
+            "data": { "sessionID": "ses_1" },
+        })
+    }
+
+    /// A `session.step.started` frame for one assistant message.
+    fn step_started(created: i64, message_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": "evt_step",
+            "created": created,
+            "type": "session.step.started",
+            "data": {
+                "sessionID": "ses_1",
+                "assistantMessageID": message_id,
+                "agent": "apex",
+                "model": { "providerID": "cardinal", "id": "test" },
+                "started": created,
+            },
+        })
+    }
+
+    #[test]
+    fn an_execution_makes_exactly_one_turn_item() {
+        // A turn is one busy period: its second step is the same turn, and a
+        // synthetic delivered mid-turn is an input that starts nothing. Both
+        // would otherwise split the turn the footer measures.
+        let mut store = DataStore::default();
+        apply(&mut store, execution_started(1_000));
+        apply(&mut store, step_started(1_100, "msg_a"));
+        apply(&mut store, step_started(2_000, "msg_a"));
+        apply(
+            &mut store,
+            enqueued(
+                "msg_notice",
+                serde_json::json!({ "text": "", "description": "historian folded 1..1" }),
+            ),
+        );
+        apply(&mut store, delivered("msg_notice"));
+        apply(
+            &mut store,
+            serde_json::json!({
+                "id": "evt_succeeded",
+                "created": 3_000,
+                "type": "session.execution.succeeded",
+                "data": { "sessionID": "ses_1" },
+            }),
+        );
+        apply(&mut store, execution_started(4_000));
+        let turns: Vec<Option<i64>> = store
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Turn { created } => Some(*created),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            turns,
+            vec![Some(1_000), Some(4_000)],
+            "one turn item per execution: not one per step, and none for a synthetic delivered mid-turn"
+        );
+    }
+
+    #[test]
+    fn a_replayed_execution_start_adds_no_second_boundary() {
+        // The same frame can reach the reducer twice (a reconnect replays from
+        // the client's last seq). A second boundary draws no row, but it would
+        // restart the projection's tok/s window, dropping the turn's earlier
+        // steps from it.
+        let mut store = DataStore::default();
+        apply(&mut store, execution_started(1_000));
+        apply(&mut store, step_started(1_100, "msg_a"));
+        apply(&mut store, execution_started(1_000));
+        let turns: Vec<Option<i64>> = store
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Turn { created } => Some(*created),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            turns,
+            vec![Some(1_000)],
+            "the frame that already opened the turn adds no boundary"
+        );
+        assert_eq!(store.running_since, Some(1_000), "the flag is unchanged");
+    }
+
+    #[test]
+    fn a_lost_terminal_frame_still_opens_the_next_turn() {
+        // The stream can drop while a turn is finishing, so its
+        // `execution.succeeded` never arrives and `running_since` stays set;
+        // the reload that follows shows the turn closed. The store cannot tell,
+        // so the next `execution.started` must open a turn anyway: a duplicate
+        // boundary carries the same `created` and draws no row, while a missing
+        // one leaves the turn undated and its footer spanning the previous one.
+        let mut store = DataStore::default();
+        apply(&mut store, execution_started(1_000));
+        apply(&mut store, step_started(1_100, "msg_a"));
+        let history: Vec<ox_schema::message::Message> = serde_json::from_value(serde_json::json!([
+            { "type": "user", "id": "u1", "time": { "created": 900 }, "text": "go" },
+            {
+                "type": "assistant",
+                "id": "msg_a",
+                "time": { "created": 1_100, "completed": 2_000 },
+                "agent": "apex",
+                "model": { "id": "test", "providerID": "cardinal" },
+                "content": [{ "type": "text", "text": "done" }],
+            },
+            {
+                "type": "idle",
+                "id": "i1",
+                "time": { "created": 2_000 },
+                "outcome": "succeeded",
+            },
+        ]))
+        .expect("the reloaded history deserializes");
+        store.replace_items(crate::history::parse_messages(&history));
+        assert_eq!(
+            store.running_since,
+            Some(1_000),
+            "the lost terminal frame leaves the store thinking the turn runs"
+        );
+        store.push_user("next");
+        let echoed: Vec<bool> = store
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::User { starts_turn, .. } => Some(*starts_turn),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            echoed,
+            vec![true, false],
+            "the echo keeps reading as a steer: a prompt typed while a run is \
+             genuinely active must stay inside that turn"
+        );
+
+        apply(&mut store, execution_started(5_000));
+        let turns: Vec<Option<i64>> = store
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Turn { created } => Some(*created),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            turns,
+            vec![Some(5_000)],
+            "the new execution opens a turn where it started, so the projection \
+             dates the turn from 5000 and not from the stale 1000"
+        );
+        assert!(
+            matches!(
+                store.items.last(),
+                Some(Item::Turn {
+                    created: Some(5_000)
+                })
+            ),
+            "the boundary lands after the echoed prompt, got {:?}",
+            store.items.last()
+        );
+        assert_eq!(
+            store.running_since,
+            Some(5_000),
+            "the run flag follows the boundary it just opened"
+        );
+    }
+
+    #[test]
+    fn a_prompt_echoed_while_a_turn_runs_is_a_steer() {
+        // A typed prompt is echoed immediately. While a turn is in flight the
+        // server delivers it as a steer at the next step boundary, so the row
+        // belongs to the running turn and must not open another one; the next
+        // prompt typed while idle does.
+        fn echoed_turns(store: &DataStore) -> Vec<bool> {
+            store
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::User { starts_turn, .. } => Some(*starts_turn),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        let mut store = DataStore::default();
+        store.push_user("go");
+        apply(&mut store, execution_started(1_000));
+        store.push_user("use grep");
+        assert_eq!(
+            echoed_turns(&store),
+            vec![true, false],
+            "the prompt that opened the turn starts it, the steer typed while it ran does not"
+        );
+
+        apply(
+            &mut store,
+            serde_json::json!({
+                "id": "evt_succeeded",
+                "created": 3_000,
+                "type": "session.execution.succeeded",
+                "data": { "sessionID": "ses_1" },
+            }),
+        );
+        store.push_user("next");
+        assert_eq!(
+            echoed_turns(&store),
+            vec![true, false, true],
+            "typed while idle, the prompt starts the next turn"
+        );
+    }
 }
