@@ -45,8 +45,19 @@ def capture(cmd, rows, cols, settle, keys=None, env_extra=None):
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     env = dict(os.environ, TERM="xterm-256color", COLORTERM="truecolor")
     env.update(env_extra or {})
+    # start_new_session: without it the child keeps this process's controlling
+    # terminal, and crossterm's size query opens /dev/tty (the harness's own
+    # window) instead of the pty below -- ox then draws a screen of the wrong
+    # size and every capture looks broken. setsid makes /dev/tty unavailable so
+    # the child falls back to the pty it was given.
     proc = subprocess.Popen(
-        cmd, stdin=slave, stdout=slave, stderr=slave, env=env, close_fds=True
+        cmd,
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+        env=env,
+        close_fds=True,
+        start_new_session=True,
     )
     os.close(slave)
 

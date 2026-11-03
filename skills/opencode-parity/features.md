@@ -84,10 +84,10 @@
 | keybind | composer.shell.kill | config/keybind.ts:256 | crates/ox-tui/src/ui/shell_dialog.rs:20 | deviation | 偏差:对话框形态;ctrl+d 杀掉后重新拉取列表,光标回到顶部;无点击和页脚 M shells 提示 |
 | keybind | composer.shell.select | config/keybind.ts:255 | crates/ox-tui/src/ui/shell_dialog.rs:20 | deviation | 偏差:Enter 打开只读输出查看器(output_dialog.rs:45),不轮询,ctrl+r 手动刷新(上游每秒轮询) |
 | keybind | composer.shell.up | config/keybind.ts:253 | crates/ox-tui/src/ui/shell_dialog.rs:20 | deviation | 偏差:用 Select 对话框而非 composer 面板;入口 ctrl+x b 或 /shells(上游无独立键) |
-| keybind | composer.subagent.down | config/keybind.ts:250 | crates/ox-tui/src/ui/subagent_dialog.rs:45 | deviation | 偏差:用 Select 对话框而非底部 composer 面板;↑/↓ 在列表内移动 |
-| keybind | composer.subagent.interrupt | config/keybind.ts:252 | crates/ox-tui/src/ui/subagent_dialog.rs:45 | deviation | 偏差:用 Select 对话框而非底部 composer 面板;ctrl+d 只在运行中列表有效,对话框保持打开;ctrl+a 切换运行中/已结束;入口 ctrl+x ↓ 或 /subagents;无点击命中测试,页脚无 N subagents 提示 |
-| keybind | composer.subagent.select | config/keybind.ts:251 | crates/ox-tui/src/ui/subagent_dialog.rs:45 | deviation | 偏差:用 Select 对话框而非底部 composer 面板;Enter 跳到子会话;列表来自 GET /ox/session/{id}/family(ox 专用端点);只在根会话可开 |
-| keybind | composer.subagent.up | config/keybind.ts:249 | crates/ox-tui/src/ui/subagent_dialog.rs:45 | deviation | 偏差:用 Select 对话框而非底部 composer 面板;↑/↓ 在列表内移动,在第一行 ↑ 不关闭,Esc 关闭 |
+| keybind | composer.subagent.down | config/keybind.ts:250 | crates/ox-tui/src/ui/activity_panel.rs:227 | deviation | 偏差:底部 composer 面板(上游同形);↑/↓ 在列出的行内移动,列表变化后夹紧;入口 /subagents 或 ctrl+x ↓;无点击命中(上游 click 导航) |
+| keybind | composer.subagent.interrupt | config/keybind.ts:252 | crates/ox-tui/src/ui/activity_panel.rs:149 | deviation | 偏差:ctrl+d 只对运行中的行有效,面板保持打开;ctrl+a 切换显示已结束;无点击命中测试 |
+| keybind | composer.subagent.select | config/keybind.ts:251 | crates/ox-tui/src/ui/activity_panel.rs:227 | deviation | 偏差:Enter 跳到子会话(App::switch_session);列表来自 GET /ox/session/{id}/family(ox 专用端点);只在根会话可开;上游是 mouseUp 导航 |
+| keybind | composer.subagent.up | config/keybind.ts:249 | crates/ox-tui/src/ui/activity_panel.rs:227 | deviation | 偏差:底部 composer 面板;↑/↓ 在列出的行内移动,Esc 关闭 |
 | keybind | composer.terminal.down | config/keybind.ts:258 |  | todo |  |
 | keybind | composer.terminal.select | config/keybind.ts:259 |  | todo |  |
 | keybind | composer.terminal.up | config/keybind.ts:257 |  | todo |  |
