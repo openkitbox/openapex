@@ -477,7 +477,7 @@
 | theme_token | markdownCode | theme/assets/opencode.json:168 |  | todo |  |
 | theme_token | markdownCodeBlock | theme/assets/opencode.json:204 |  | todo |  |
 | theme_token | markdownEmph | theme/assets/opencode.json:176 |  | todo |  |
-| theme_token | markdownHeading | theme/assets/opencode.json:156 |  | todo |  |
+| theme_token | markdownHeading | theme/assets/opencode.json:156 | crates/ox-tui/src/ui/markdown.rs:69 | deviation | 偏差:只加粗不加下划线(与上游一致,采集核对 `b` 无 `u`);上游 heading 与正文同色,ox 用 palette.text |
 | theme_token | markdownHorizontalRule | theme/assets/opencode.json:184 |  | todo |  |
 | theme_token | markdownImage | theme/assets/opencode.json:196 |  | todo |  |
 | theme_token | markdownImageText | theme/assets/opencode.json:200 |  | todo |  |

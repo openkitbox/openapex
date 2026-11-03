@@ -1,8 +1,10 @@
 //! Minimal markdown rendering for assistant transcript text, shaped like
 //! upstream's `<markdown conceal>` element: markers are hidden, blocks are
-//! separated by one blank row, headings are bold + underlined without their
-//! `#`, list items are `- ` with the dash in the link colour, and fenced code
-//! is highlighted by [`super::highlight`] (no fence line, no gutter).
+//! separated by one blank row, headings are bold without their `#` (upstream
+//! bolds them and does not underline: theme `markdownHeading` is the body
+//! colour, and a capture of the same session shows `b` only), list items are
+//! `- ` with the dash in the link colour, and fenced code is highlighted by
+//! [`super::highlight`] (no fence line, no gutter).
 //!
 //! Homegrown on purpose (no tree-sitter): headings, lists, quotes, rules,
 //! fenced code, GFM pipe tables (drawn by [`super::table`]) and inline
@@ -66,7 +68,9 @@ pub fn render_toned(text: &str, width: u16, indent: usize, tone: Tone) -> Vec<Li
     let base = muted.unwrap_or(palette.text);
     let code = muted.unwrap_or(palette.success);
     let link = muted.unwrap_or(palette.link);
-    let heading = base.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    // Upstream bolds a heading and leaves the underline off (verified against
+    // `upstream-ses_19f7ed…-30x100`: `b` on the heading, no `u` anywhere).
+    let heading = base.add_modifier(Modifier::BOLD);
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut previous: Option<Kind> = None;
