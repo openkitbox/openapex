@@ -18,9 +18,10 @@ use serde::Deserialize;
 
 use super::EmbeddingConfig;
 
-/// Inputs per request. Providers cap batching (Zhipu allows 64); 32 keeps a
-/// large backfill inside one call while staying under every cap seen.
-const BATCH_SIZE: usize = 32;
+/// Inputs per request: a batch is exactly one endpoint call, and it is also the
+/// row count of one memory-embedding sweep batch. Providers cap batching (Zhipu
+/// allows 64); 32 stays under every cap seen.
+pub(super) const BATCH_SIZE: usize = 32;
 
 /// The embeddings client for one endpoint/model.
 pub struct Embedder {
@@ -166,8 +167,8 @@ fn truncate(text: &str, max: usize) -> String {
     text.chars().take(max).collect::<String>() + "…"
 }
 
-/// Cosine similarity. `0.0` for a zero or mismatched-length pair (a partial
-/// backfill can leave rows embedded under another model with another width).
+/// Cosine similarity. `0.0` for a zero or mismatched-length pair (a row swept
+/// under another model can carry another width).
 pub(crate) fn cosine(left: &[f32], right: &[f32]) -> f32 {
     if left.len() != right.len() || left.is_empty() {
         return 0.0;

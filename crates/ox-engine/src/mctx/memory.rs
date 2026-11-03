@@ -64,10 +64,12 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 
+use crate::mctx::embed::BATCH_SIZE;
 use crate::runner::{Tool, ToolContext, ToolOutput};
 use ox_db::{Db, WriteTx, optional};
 use ox_schema::id::now_millis;
@@ -619,49 +621,76 @@ pub(crate) async fn active_memories_with_watermark(
     result.with_context(|| context)
 }
 
-/// Store one memory's vector under `identity` (see [`crate::mctx::embed`]).
-pub(crate) async fn store_embedding(
+/// Store one memory's vector under `identity` (see [`crate::mctx::embed`]),
+/// conditional on the text the vector came from.
+///
+/// The write is a compare-and-set on `content`: an embedding call can take up to
+/// the endpoint's timeout, and an edit in that window rewrites the text and
+/// clears the vector. An unconditional write would then stamp the old text's
+/// vector onto the new text, and because the row would look covered nothing
+/// would ever correct it — the semantic lane would keep ranking that memory by
+/// text it no longer contains. Returns whether the row still carried `content`,
+/// so a caller can tell a write it made from one a concurrent edit made stale.
+///
+/// The affected-row count is the value this driver's `execute` returns.
+async fn store_embedding(
     db: &Db,
     id: &str,
+    content: &str,
     identity: &str,
     vector: &[f32],
-) -> Result<()> {
+) -> Result<bool> {
     let context = format!("store the embedding of memory #{id}");
     let blob = crate::mctx::embed::to_blob(vector);
-    let result: Result<()> = async {
+    let result: Result<bool> = async {
         let conn = db.acquire().await?;
-        conn.execute(
-            "UPDATE mc_memory SET embedding = ?2, embedding_model = ?3 WHERE id = ?1",
-            (id, blob, identity),
-        )
-        .await?;
-        Ok(())
+        let affected = conn
+            .execute(
+                "UPDATE mc_memory SET embedding = ?3, embedding_model = ?4
+                  WHERE id = ?1 AND content = ?2",
+                (id, content, blob, identity),
+            )
+            .await?;
+        Ok(affected > 0)
     }
     .await;
     result.with_context(|| context)
 }
 
-/// Active memories of `project` whose vector is missing or was produced under
-/// another identity, newest first, up to `limit`.
-pub(crate) async fn memories_needing_embedding(
+/// The rows that still need a vector for a given identity: none stored yet, or
+/// one produced under a different model/prefix.
+///
+/// One definition with two readers — [`memories_needing_embedding`]'s fetch and
+/// the pass-end count — because `remaining` is the only coverage signal an
+/// operator sees: a copy that drifted would report coverage the sweep never
+/// measured. The identity is bound as `?1` by both readers, so this fragment
+/// cannot be concatenated ahead of bind parameters in another order.
+const EMBEDDING_PENDING: &str =
+    "status = 'active' AND (embedding IS NULL OR embedding_model IS NOT ?1)";
+
+/// Active memories of every project whose vector is missing or was produced
+/// under another identity, newest first, up to `limit`.
+///
+/// Project-agnostic on purpose: this feeds [`embed_missing`], the background
+/// that owns embedding coverage, and coverage is a property of the whole store
+/// rather than of whichever project a search happened to touch. Newest first
+/// because the freshest facts are the ones a search is most likely to need.
+async fn memories_needing_embedding(
     db: &Db,
-    project: &str,
     identity: &str,
     limit: i64,
 ) -> Result<Vec<(String, String)>> {
-    let context = format!("find memories to embed for project {project}");
     let result: Result<Vec<(String, String)>> = async {
         let conn = db.acquire().await?;
         let mut stmt = conn
-            .prepare(
+            .prepare(&format!(
                 "SELECT id, content FROM mc_memory
-                  WHERE project = ?1 AND status = 'active'
-                    AND (embedding IS NULL OR embedding_model IS NOT ?2)
+                  WHERE {EMBEDDING_PENDING}
                   ORDER BY CAST(id AS INTEGER) DESC
-                  LIMIT ?3",
-            )
+                  LIMIT ?2"
+            ))
             .await?;
-        let mut rows = stmt.query((project, identity, limit)).await?;
+        let mut rows = stmt.query((identity, limit)).await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             out.push((row.get::<String>(0)?, row.get::<String>(1)?));
@@ -669,7 +698,256 @@ pub(crate) async fn memories_needing_embedding(
         Ok(out)
     }
     .await;
-    result.with_context(|| context)
+    result.with_context(|| "find memories to embed")
+}
+
+/// What one embedding sweep pass accomplished.
+#[derive(Debug, Default)]
+struct SweepReport {
+    /// Rows that received a vector under the sweep's identity during the pass.
+    embedded: usize,
+    /// Rows whose embedding or store call failed; they stay pending.
+    failed: usize,
+    /// Batches the pass actually attempted, whether or not they succeeded.
+    batches: usize,
+    /// Rows still without a vector for this identity when the pass ended.
+    remaining: i64,
+}
+
+/// Embed active memories that carry no vector for `embedder`'s identity, newest
+/// first, in batches, at most `batch_cap` batches per pass.
+///
+/// Invariants: idempotent (a row already carrying this identity's vector is
+/// never selected, so a repeated pass is a no-op), interruptible (each batch
+/// stores its own rows, so a dropped pass leaves completed work behind and the
+/// next pass resumes at the head), and bounded (at most `batch_cap` batches of
+/// [`BATCH_SIZE`] rows, whatever the store's size).
+///
+/// Forward progress is guaranteed: a failed batch degrades to per-row attempts,
+/// so one text the endpoint rejects no longer strands its batch-mates, and a
+/// row that fails alone is skipped for the rest of the pass rather than pinning
+/// the head. Every row the pass failed on is remembered, and the query window
+/// grows by that count, so a failed row cannot hide the older rows behind it —
+/// up to `batch_cap` x [`BATCH_SIZE`] rows, the most one pass can skip, which
+/// the window (`BATCH_SIZE + |skipped|`) always covers. `failed` therefore
+/// counts distinct rows, never attempts.
+///
+/// A batch of more than one row whose rows all fail their own single-input
+/// attempt is not a batch of poison texts but an endpoint that is down: the pass
+/// stops there and leaves the rest for the next one, so a dead endpoint costs
+/// one batch of timeouts per pass instead of `batch_cap` of them. A batch of one
+/// proves nothing about the endpoint, so it does not stop the pass.
+///
+/// `remaining` is measured after the pass rather than derived from it: the
+/// count is the only thing that says how far behind coverage is, and a caller
+/// that logs it can tell a caught-up store from one the cap held back.
+#[must_use = "the report says how much of the store the pass covered"]
+async fn embed_missing(
+    db: &Db,
+    embedder: &crate::mctx::embed::Embedder,
+    batch_cap: usize,
+) -> Result<SweepReport> {
+    let identity = embedder.identity();
+    let mut report = SweepReport::default();
+    // Rows this pass already failed on. They stay pending in the store, so the
+    // next query would hand them back as the newest rows and starve the rows
+    // behind them; widening the window by their count keeps the batch full of
+    // rows the pass has not tried yet.
+    let mut skipped: Vec<String> = Vec::new();
+    for _ in 0..batch_cap {
+        let window = (BATCH_SIZE + skipped.len()) as i64;
+        let pending: Vec<(String, String)> = memories_needing_embedding(db, identity, window)
+            .await?
+            .into_iter()
+            .filter(|(id, _)| !skipped.contains(id))
+            .take(BATCH_SIZE)
+            .collect();
+        if pending.is_empty() {
+            break;
+        }
+        report.batches += 1;
+        let texts: Vec<&str> = pending
+            .iter()
+            .map(|(_, content)| content.as_str())
+            .collect();
+        match embedder.embed_documents(&texts).await {
+            Ok(vectors) => {
+                for ((id, content), vector) in pending.iter().zip(vectors) {
+                    store_swept_row(
+                        db,
+                        id,
+                        content,
+                        identity,
+                        &vector,
+                        &mut report,
+                        &mut skipped,
+                    )
+                    .await;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    rows = pending.len(),
+                    error = %error,
+                    "embed memory batch failed; retrying its rows one at a time"
+                );
+                // One endpoint call rejects every text it was given, so the
+                // batch is retried row by row: a text that is bad on its own
+                // must not keep its batch-mates from getting their vectors.
+                let mut rejected = 0;
+                for (id, content) in &pending {
+                    let vectors = match embedder.embed_documents(&[content.as_str()]).await {
+                        Ok(vectors) => vectors,
+                        Err(error) => {
+                            tracing::debug!(memory = %id, error = %error, "embed memory row failed on its own");
+                            fail_swept_row(id, &mut report, &mut skipped);
+                            rejected += 1;
+                            continue;
+                        }
+                    };
+                    let Some(vector) = vectors.first() else {
+                        tracing::debug!(
+                            memory = %id,
+                            "embeddings endpoint returned no vector for one input"
+                        );
+                        fail_swept_row(id, &mut report, &mut skipped);
+                        rejected += 1;
+                        continue;
+                    };
+                    store_swept_row(db, id, content, identity, vector, &mut report, &mut skipped)
+                        .await;
+                }
+                if rejected == pending.len() && pending.len() > 1 {
+                    // Not one text of the batch passed on its own, so the texts
+                    // are not the problem: the endpoint is. Leave the rest of the
+                    // queue for the next pass rather than paying `batch_cap`
+                    // batches of timeouts against a dead endpoint. A batch of one
+                    // is not evidence of that: one poison row has already been
+                    // skipped for the pass and the cap still bounds the work.
+                    tracing::warn!(
+                        rows = pending.len(),
+                        "every row of the batch failed alone; treating the endpoint as down and ending this pass"
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    let remaining: i64 = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT count(*) FROM mc_memory WHERE {EMBEDDING_PENDING}"
+            ))
+            .await?;
+        let mut rows = stmt.query([identity]).await?;
+        let count: i64 = match rows.next().await? {
+            Some(row) => row.get(0)?,
+            None => 0,
+        };
+        Ok::<i64, anyhow::Error>(count)
+    }
+    .await
+    .context("count memories still needing an embedding")?;
+    Ok(SweepReport {
+        remaining,
+        ..report
+    })
+}
+
+/// Store one swept row's vector under `identity`. A store failure is logged,
+/// counted and skipped: the row stays pending for the next pass, and the rest
+/// of this pass moves on. A row whose text changed while the batch was being
+/// embedded is neither: the compare-and-set declined the write, so the row is
+/// already pending with its new text and a later pass picks it up.
+async fn store_swept_row(
+    db: &Db,
+    id: &str,
+    content: &str,
+    identity: &str,
+    vector: &[f32],
+    report: &mut SweepReport,
+    skipped: &mut Vec<String>,
+) {
+    match store_embedding(db, id, content, identity, vector).await {
+        Ok(true) => report.embedded += 1,
+        Ok(false) => {
+            tracing::debug!(memory = %id, "memory changed under the sweep; leaving it pending");
+        }
+        Err(error) => {
+            tracing::warn!(memory = %id, error = %error, "store swept embedding failed");
+            fail_swept_row(id, report, skipped);
+        }
+    }
+}
+
+/// Count a row this pass failed on and keep the rest of the pass from retrying
+/// it, so one bad row cannot pin the head of the queue.
+fn fail_swept_row(id: &str, report: &mut SweepReport, skipped: &mut Vec<String>) {
+    report.failed += 1;
+    skipped.push(id.to_owned());
+}
+
+/// Batches one sweep pass may run: `SWEEP_BATCH_CAP` x [`BATCH_SIZE`] rows (640
+/// at the sizes these constants carry), whatever the store's size.
+const SWEEP_BATCH_CAP: usize = 20;
+/// The gap between two sweep passes, measured from the end of the previous one
+/// rather than on a fixed clock (see [`spawn_embedding_sweep`]).
+const SWEEP_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Keep every active memory's embedding current for the configured embedder.
+///
+/// Coverage belongs to the store, not to query traffic: a search only reads
+/// vectors, and the write path embeds new rows inline, so what is left is
+/// whatever a failed inline embed or a model change left behind. This sweep is
+/// that owner — newest rows first, a bounded number per pass, idempotent, and
+/// moving past a failing row so one unreachable endpoint or one rejected text
+/// cannot stall coverage. One pass runs at startup, then one every
+/// [`SWEEP_INTERVAL`], counted from the end of the previous pass so a slow pass
+/// never stacks passes behind it.
+///
+/// Started from the server's composer rather than from state construction:
+/// tests must not acquire a background writer against their database (the same
+/// reason the dreamer, the pruners and the retention sweepers are started
+/// there).
+pub fn spawn_embedding_sweep(db: Db, embedder: Option<Arc<crate::mctx::embed::Embedder>>) {
+    let Some(embedder) = embedder else {
+        return;
+    };
+    tokio::spawn(async move {
+        loop {
+            match embed_missing(&db, &embedder, SWEEP_BATCH_CAP).await {
+                Ok(report) => log_sweep(report, SWEEP_BATCH_CAP),
+                Err(error) => tracing::warn!(error = %error, "memory embedding sweep failed"),
+            }
+            // Sleep after the pass rather than ticking a fixed schedule:
+            // `interval`'s default burst behaviour fires every missed tick back
+            // to back, so an endpoint that hangs one pass would be hit again
+            // immediately instead of once per interval.
+            tokio::time::sleep(SWEEP_INTERVAL).await;
+        }
+    });
+}
+
+/// Log one sweep pass: nothing when the pass found no work (the common case on a
+/// caught-up store), one `info` line when it did, plus a `warn` when the cap the
+/// pass was given held coverage back.
+fn log_sweep(report: SweepReport, batch_cap: usize) {
+    if report.embedded + report.failed == 0 {
+        return;
+    }
+    tracing::info!(
+        embedded = report.embedded,
+        failed = report.failed,
+        remaining = report.remaining,
+        "memory embedding sweep"
+    );
+    if report.batches == batch_cap && report.remaining > 0 {
+        tracing::warn!(
+            remaining = report.remaining,
+            "memory embedding sweep used its whole batch cap; coverage is still behind"
+        );
+    }
 }
 
 /// One active memory with its stored vector, as `ctx_search`'s semantic lane
@@ -690,7 +968,7 @@ pub(crate) struct EmbeddedMemory {
 
 /// The project's active memories with the vectors stored under `identity`.
 /// Rows embedded under another identity are omitted (they rank as a mismatch
-/// anyway, and the backfill re-embeds them).
+/// anyway, and the sweep re-embeds them).
 pub(crate) async fn embedded_memories(
     db: &Db,
     project: &str,
@@ -699,6 +977,8 @@ pub(crate) async fn embedded_memories(
     let context = format!("load embedded memories for project {project}");
     let result: Result<Vec<EmbeddedMemory>> = async {
         let conn = db.acquire().await?;
+        // The inverse of `EMBEDDING_PENDING`: a row is visible to the semantic
+        // lane exactly when the sweep would not pick it up.
         let mut stmt = conn
             .prepare(
                 "SELECT id, category, content, created_at, embedding FROM mc_memory
@@ -1418,8 +1698,8 @@ async fn run_memory(
 /// Embed a just-written fact and store its vector.
 ///
 /// Best effort: a failed call logs and leaves the row without a vector, which
-/// the next `ctx_search` backfills. A write must never fail because the
-/// embedding endpoint is down.
+/// the background embedding sweep ([`embed_missing`]) picks up. A write must
+/// never fail because the embedding endpoint is down.
 async fn embed_inline(
     db: &Db,
     embedder: Option<&crate::mctx::embed::Embedder>,
@@ -1432,13 +1712,14 @@ async fn embed_inline(
     match embedder.embed_documents(&[content]).await {
         Ok(mut vectors) => {
             if let Some(vector) = vectors.pop()
-                && let Err(error) = store_embedding(db, id, embedder.identity(), &vector).await
+                && let Err(error) =
+                    store_embedding(db, id, content, embedder.identity(), &vector).await
             {
                 tracing::warn!(memory = %id, error = %error, "store memory embedding failed");
             }
         }
         Err(error) => {
-            tracing::warn!(memory = %id, error = %error, "embed memory failed; the next search backfills it");
+            tracing::warn!(memory = %id, error = %error, "embed memory failed; the embedding sweep backfills it");
         }
     }
 }

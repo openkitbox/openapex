@@ -16,7 +16,7 @@ no dreamer).
 | Historian | At a step boundary, when the live tail passes a pressure band (or exceeds its trigger budget) and still has content outside the protected tail, ox folds the oldest part of the tail into compartments with a hidden completion through cardinal. |
 | Drops | A `ctx_reduce` stamp is applied by the next head rebuild *and* by the read path: the session API renders an applied drop's content as `[dropped §N§]`, the same placeholder the model sees. |
 | Dreamer | Every `dreamer_interval_minutes`, per project with memories: `verify` (do cited files still back the claims?) and `curate` (merge duplicates, archive redundancy). |
-| `ctx_search` | Memories and notes (turso FTS indexes), compartments (a scan of this session's rows, or with `scope: "project"` every session in the directory, ranked by BM25 over the scanned rows) and a transcript scan. With `[magic_context.embedding]` configured, the **memory lane** ranks by cosine similarity instead. |
+| `ctx_search` | Memories and notes (turso FTS indexes), compartments (a scan of this session's rows, or with `scope: "project"` every session in the directory, ranked by BM25 over the scanned rows) and a transcript scan. With `[magic_context.embedding]` configured, the **memory lane** also ranks semantically and fuses the two rankings by reciprocal rank (see below); without an embedder it is the FTS ranking alone. |
 
 ## Configuration
 
@@ -58,14 +58,28 @@ api_key = "…"
 
 Vectors live beside the text (`mc_memory.embedding`, `embedding_model`) and are
 written on the memory write itself; a failed embedding call never fails the
-write — the row simply has no vector and the next `ctx_search` backfills up to
-20 of them. Changing the model or the document prefix changes the identity, so
-every row is re-embedded by the same backfill instead of being compared across
-vector spaces. A search whose embedding call fails degrades to the index with a
+write — the row simply has no vector. Coverage belongs to the store rather than
+to query traffic: a background sweep runs at startup and then 600 s after each
+pass ends (the sleep follows the pass, so a slow pass never stacks a second one
+behind it), embeds up to 640 still-pending rows per pass newest first (up to 20
+batches of 32, one endpoint call each; a batch the endpoint rejects is retried
+row by row, so one batch can cost 33 calls), and retries whatever failed on the
+next pass. Changing the model or the document prefix changes the identity, so
+every row is re-embedded by the sweep instead of being compared across vector
+spaces. A search whose embedding call fails degrades to the index with a
 warning.
 
 Comparison is an in-memory cosine over the stored `f32` bytes (`crates/ox-engine/src/mctx/embed.rs`);
 ox does not use turso's built-in vector index — only the FTS indexes are turso's.
+With an embedder configured the memory lane ranks twice — BM25 over the FTS
+index and cosine over these vectors — and fuses the two lists by reciprocal
+rank, so neither score has to be normalised onto the other's scale; without one
+the lane is the FTS ranking alone. On a copy of the production store (181 active
+memories, all embedded; 10 hand-labelled queries drawn from 102 real ones) the
+fused order scored precision@5 0.28 against 0.20 for cosine alone and 0.16 for
+BM25 alone, so the fusion is the best of the three on that evidence — better on
+4 queries, worse on 1, tied on 5 against cosine; better on 5, never worse
+against BM25.
 
 Verified end to end against a running instance (2026-10-19): a memory written with
 `ctx_memory`, then queried as *"which storage engine keeps the durable rows and

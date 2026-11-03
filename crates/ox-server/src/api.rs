@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use ox_core::event_bus::EventBus;
 use ox_db::Db;
+use ox_engine::mctx::embed::Embedder;
 use ox_engine::runner::{Live, Runner, Services};
 use ox_llm::model_catalog::ModelCatalog;
 use ox_schema::id::now_millis;
@@ -50,6 +51,9 @@ pub struct AppState {
     pub config_path: PathBuf,
     /// Client leases; the server may exit only while none is held.
     pub lifecycle: Arc<crate::lifecycle::Lifecycle>,
+    /// Embedding client shared by the memory tools and the coverage sweep; read
+    /// only by the server's composer.
+    pub(crate) embedder: Option<Arc<Embedder>>,
 }
 
 impl AppState {

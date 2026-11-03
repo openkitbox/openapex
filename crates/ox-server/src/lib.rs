@@ -177,10 +177,15 @@ async fn build_state_with_mode(
     home: std::path::PathBuf,
     mcp_startup: McpStartup,
 ) -> Result<AppState> {
-    if config.magic_context.enabled {
+    // One embedder for both consumers: the memory tools embed writes inline, and
+    // the coverage sweep embeds whatever the write path missed.
+    let embedder = if config.magic_context.enabled {
         let embedder = mctx::embed::Embedder::from_config(&config.magic_context.embedding);
-        tools.register_mctx(db.clone(), embedder);
-    }
+        tools.register_mctx(db.clone(), embedder.clone());
+        embedder
+    } else {
+        None
+    };
     let cwd = std::env::current_dir()?;
     let directory = cwd.canonicalize().unwrap_or(cwd);
     // MCP servers connect before the runner exists: their tools must be in
@@ -226,6 +231,7 @@ async fn build_state_with_mode(
         runner,
         config_path: ox_core::config::Config::default_path(),
         lifecycle: lifecycle::Lifecycle::new(std::time::Instant::now()),
+        embedder,
     })
 }
 
@@ -369,6 +375,7 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
     )
     .await?;
     spawn_runner_memory_stats(state.runner.clone());
+    mctx::memory::spawn_embedding_sweep(state.db.clone(), state.embedder.clone());
     // Warm the catalogue without holding the listener: the first client that
     // asks (`/api/model` at TUI startup) gets models, and a client that beats
     // the warm-up gets the same refresh the request path already performs on
