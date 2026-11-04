@@ -1,7 +1,34 @@
 // event.rs — UI intent (keyboard/stream), never network actions.
 use crossterm::event::{Event, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use std::sync::Arc;
+
 use ox_client::store::Item;
 use ox_schema::support::FileInput;
+
+use crate::graphics::Prepared;
+use crate::graphics::cache::SizeClass;
+
+/// What a media fetch produced.
+pub enum Fetched {
+    /// Raw image bytes, for a kitty transmission the graphics cache makes on
+    /// the draw thread (one transmission serves every size). Shared: a composer
+    /// attachment is handed to the encoder without copying its payload.
+    Png(Arc<[u8]>),
+    /// A sixel image already encoded for the grid it was asked for: the encode
+    /// is expensive, so it happened on a blocking thread.
+    Sixel(Box<Prepared>),
+}
+
+/// The payload is opaque here: an encoded sixel is megabytes of protocol state
+/// that no log line should try to print.
+impl std::fmt::Debug for Fetched {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Png(_) => "Png(..)",
+            Self::Sixel(_) => "Sixel(..)",
+        })
+    }
+}
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -35,6 +62,15 @@ pub enum AppEvent {
     /// Mouse wheel: positive scrolls toward newer lines.
     Wheel(i8),
     Stream(ox_client::sse::StreamMsg),
+    /// One attachment's bytes, or why they could not be read, tagged with the
+    /// cache key that asked for them.
+    Media {
+        key: String,
+        /// Which part of the graphics cache asked, so the answer is filed where
+        /// the asker will look for it.
+        class: SizeClass,
+        result: Result<Fetched, String>,
+    },
     /// Authoritative history from a reload, tagged with the request that asked
     /// for it so stale responses can be dropped (they race live deltas).
     History {

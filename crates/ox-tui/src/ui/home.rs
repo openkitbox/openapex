@@ -10,7 +10,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::graphics::Graphics;
 use crate::theme::{self, terminal::Rgb};
+use crate::ui::media;
 use crate::ui::prompt::{Activity, Live, McpSummary, Prompt};
 
 /// Upstream `logo.left` / `logo.right` (`logo.ts:1-4`), verbatim. The mask
@@ -218,8 +220,17 @@ fn stack(content_h: u16, logo_h: u16, prompt_box_h: u16) -> Stack {
 /// 整屏渲染（上游 `routes/home.tsx`）：内容区里 logo + 空行 + Prompt 块整体垂直
 /// 居中，底部是独立的 footer 行（MCP 摘要 + 版本号）。会话创建失败走 toast
 /// （`ui::toast`），不再占用 Home 版面。
-pub fn render(frame: &mut ratatui::Frame, area: Rect, prompt: &mut Prompt) {
+pub fn render(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    prompt: &mut Prompt,
+    graphics: &mut Graphics,
+) -> Vec<media::Request> {
     let pal = theme::palette();
+    // The composer's strip is the only one this route draws, so the thumbnail
+    // class only has to hold what one band of the prompt can show.
+    graphics.reserve_thumbnails(media::capacity(area.height));
+    let mut requests = Vec::new();
     let footer_h = footer_height(area.width, area.height);
     let content = Rect {
         height: area.height - footer_h,
@@ -261,18 +272,22 @@ pub fn render(frame: &mut ratatui::Frame, area: Rect, prompt: &mut Prompt) {
             height: prompt_h.min(prompt_area.height),
             ..prompt_area
         };
-        prompt.render(
+        // The home route has no transcript, so its images are the composer's
+        // own attachments: they are already in hand, never fetched.
+        requests = prompt.render(
             frame,
             prompt_area,
             frame.area(),
             Activity::Idle,
             Live::default(),
+            graphics,
         );
     }
 
     if footer_h > 0 {
         render_footer(frame, area, footer_h, prompt.chrome().mcp, pal);
     }
+    requests
 }
 
 /// The footer row: MCP summary left at column 2, version right ending 2 columns

@@ -20,6 +20,7 @@ use ox_client::store::{
 };
 use ox_schema::support::Record;
 use ox_tui::app::keymap;
+use ox_tui::graphics::Graphics;
 use ox_tui::theme::{Deck, Palette};
 use ox_tui::ui::dialog;
 use ox_tui::ui::dock::{DockHover, StatusMode, queued_dock, status_line};
@@ -128,7 +129,7 @@ fn cases() -> Vec<Case> {
                     0,
                 );
                 t.toggle_last_reasoning();
-                t.render(frame, area);
+                t.render(frame, area, &mut Graphics::new());
             }),
         },
         transcript_case(
@@ -192,7 +193,7 @@ fn cases() -> Vec<Case> {
                     0,
                 );
                 t.toggle_tool_output();
-                t.render(frame, area);
+                t.render(frame, area, &mut Graphics::new());
             }),
         },
         transcript_case(
@@ -347,7 +348,7 @@ fn cases() -> Vec<Case> {
                     0,
                 );
                 t.focus_tool(true);
-                t.render(frame, area);
+                t.render(frame, area, &mut Graphics::new());
             }),
         },
         Case {
@@ -365,7 +366,7 @@ fn cases() -> Vec<Case> {
                     0,
                 );
                 t.toggle_tool_output();
-                t.render(frame, area);
+                t.render(frame, area, &mut Graphics::new());
             }),
         },
         // 各工具的单行文案（上游 InlineTool：Read/Grep/Glob/WebFetch/Skill/Generic）
@@ -726,11 +727,12 @@ fn cases() -> Vec<Case> {
             name: "sessions-rename",
             height: 20,
             draw: Box::new(|frame, area| {
-                dialog::render(
+                let _ = dialog::render(
                     frame,
                     area,
                     &session_dialog::rename("ses_a", "Fix the SSE reconnect"),
-                )
+                    &mut Graphics::new(),
+                );
             }),
         },
         form_case("form-select-30", 30, FormKind::Select),
@@ -774,7 +776,9 @@ fn session_case(
     Case {
         name,
         height,
-        draw: Box::new(move |frame, area| dialog::render(frame, area, &dialog)),
+        draw: Box::new(move |frame, area| {
+            let _ = dialog::render(frame, area, &dialog, &mut Graphics::new());
+        }),
     }
 }
 
@@ -825,7 +829,7 @@ fn transcript_case(name: &'static str, height: u16, blocks: Vec<Block>) -> Case 
         draw: Box::new(move |frame, area| {
             let mut t = Transcript::new(area.width, area.height);
             t.sync(&blocks, 0);
-            t.render(frame, area);
+            t.render(frame, area, &mut Graphics::new());
         }),
     }
 }
@@ -971,6 +975,7 @@ fn tool(tool: &str, summary: &str, state: ToolState, output: &str) -> Block {
         background: false,
         input: Arc::default(),
         metadata: None,
+        media: Arc::default(),
     }
 }
 
@@ -998,6 +1003,7 @@ fn tool_with(
         background: false,
         input: record(input),
         metadata: metadata.map(record),
+        media: Arc::default(),
     }
 }
 
@@ -1062,7 +1068,7 @@ fn dialog_case(name: &'static str) -> Case {
                     },
                 },
             ];
-            dialog::render(frame, area, &dialog::status(&servers));
+            let _ = dialog::render(frame, area, &dialog::status(&servers), &mut Graphics::new());
         }),
     }
 }
@@ -1073,7 +1079,9 @@ fn select_case(name: &'static str, height: u16, select: dialog::Select) -> Case 
     Case {
         name,
         height,
-        draw: Box::new(move |frame, area| dialog::render(frame, area, &dialog)),
+        draw: Box::new(move |frame, area| {
+            let _ = dialog::render(frame, area, &dialog, &mut Graphics::new());
+        }),
     }
 }
 
@@ -1158,12 +1166,13 @@ fn prompt_case(
                 Activity::Idle
             };
             // gallery 里另有同名的 mock 结构体 `Live`（shell 块标志），故用全路径。
-            prompt.render(
+            let _ = prompt.render(
                 frame,
                 panel_area,
                 area,
                 activity,
                 ox_tui::ui::prompt::Live::default(),
+                &mut Graphics::new(),
             );
         }),
     }
@@ -1200,12 +1209,13 @@ fn prompt_files_case() -> Case {
                 ..area
             };
             // 见上：`Live` 名在 gallery 已占用，用全路径。
-            prompt.render(
+            let _ = prompt.render(
                 frame,
                 panel_area,
                 area,
                 Activity::Idle,
                 ox_tui::ui::prompt::Live::default(),
+                &mut Graphics::new(),
             );
         }),
     }
@@ -1267,7 +1277,7 @@ fn home_case() -> Case {
                 },
                 Footer::Home,
             );
-            home::render(frame, area, &mut prompt);
+            let _ = home::render(frame, area, &mut prompt, &mut Graphics::new());
         }),
     }
 }

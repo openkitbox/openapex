@@ -347,12 +347,34 @@ pub struct ShellRead {
     pub skipped: bool,
 }
 
+/// One attachment's payload, exactly as the server stored it: raw bytes, never
+/// base64. Produced once per fetch and returned by value; not `Clone`, so the
+/// payload cannot be duplicated by accident.
+#[derive(Debug, PartialEq, Eq)]
+pub struct MediaBytes {
+    /// The response's `content-type`. The server sniffs it from the bytes
+    /// (`ox-server/src/api/media.rs`), so it can differ from the declaration the
+    /// row carries and is the one to trust when both are known.
+    pub mime: String,
+    /// The row's file name, absent when the wire carried none (display only).
+    pub name: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
 /// Bound for every REST call. Set per request, not on the shared client:
 /// the SSE stream uses the same client and must live indefinitely.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// `Number.MAX_SAFE_INTEGER`: a cursor no capture reaches, so the answer only
 /// carries the capture's `size` (upstream's probe).
 const MAX_SAFE_CURSOR: u64 = 9_007_199_254_740_991;
+/// The attachment's file name, when the row carries one
+/// (`ox-server/src/api/media.rs`): a header because it is display-only, so a
+/// multipart body would cost the response a second copy of the payload.
+const NAME_HEADER: &str = "x-ox-name";
+/// What the media endpoint answers when it recognises none of the bytes it
+/// sniffed, and what this client falls back to when the header is missing or
+/// unreadable on the wire.
+const DEFAULT_MEDIA_MIME: &str = "application/octet-stream";
 
 impl Client {
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -661,6 +683,54 @@ impl Client {
             return Err(Error::Status(resp.status()));
         }
         Ok(resp.json().await?)
+    }
+
+    /// One stored attachment's raw bytes, an ox-only endpoint
+    /// (`GET /ox/session/{id}/media/{message}?index=N[&part=…]`).
+    /// A message row carries its payloads inline as
+    /// base64, so [`crate::store::MediaMeta`] keeps only identity and the viewer
+    /// asks for the one image it is about to draw.
+    ///
+    /// `index` addresses a user prompt's `files[index]`; with `part` it
+    /// addresses `content[index]` of that assistant tool call instead. A bad
+    /// index or a non-`file` content answers 400, an unknown message or part
+    /// 404, both as [`Error::Status`].
+    pub async fn media(
+        &self,
+        session: &str,
+        message: &str,
+        part: Option<&str>,
+        index: u32,
+    ) -> Result<MediaBytes> {
+        let mut req = self
+            .request(
+                reqwest::Method::GET,
+                &format!("/ox/session/{session}/media/{message}"),
+            )
+            .query(&[("index", index)]);
+        if let Some(part) = part {
+            req = req.query(&[("part", part)]);
+        }
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            return Err(Error::Status(resp.status()));
+        }
+        let mime = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or(DEFAULT_MEDIA_MIME)
+            .to_owned();
+        let name = resp
+            .headers()
+            .get(NAME_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        Ok(MediaBytes {
+            mime,
+            name,
+            bytes: resp.bytes().await?.into(),
+        })
     }
 
     /// `files` are serialized by reference; with none the body is exactly the

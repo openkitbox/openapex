@@ -18,7 +18,7 @@ pub(crate) fn session_not_found(res: &mut Response, session_id: &str) {
 }
 
 /// 404 `MessageNotFoundError`.
-pub(super) fn message_not_found(res: &mut Response, session_id: &str, message_id: &str) {
+pub(crate) fn message_not_found(res: &mut Response, session_id: &str, message_id: &str) {
     res.status_code(StatusCode::NOT_FOUND);
     res.render(Json(json!({
         "_tag": "MessageNotFoundError",
@@ -77,7 +77,7 @@ pub(super) fn invalid_cursor(res: &mut Response, message: &str) {
 }
 
 /// 500 `UnknownError` — never leaks internal detail on the wire.
-pub(super) fn unknown_error(res: &mut Response, error: &anyhow::Error) {
+pub(crate) fn unknown_error(res: &mut Response, error: &anyhow::Error) {
     tracing::error!(error = %error, "session handler failed");
     res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
     res.render(Json(json!({

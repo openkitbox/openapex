@@ -8,20 +8,31 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
+use ratatui::layout::Position;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Widget};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
 use crate::attachment::Loaded;
+use crate::graphics::Graphics;
+use crate::graphics::Prepared;
+use crate::graphics::Slot;
 use crate::theme;
 use crate::ui::autocomplete::{self, Autocomplete, FileRow, Trigger};
 use crate::ui::commands::{self, CommandAction, Row};
 use crate::ui::composer::{Composer, Submission};
 use crate::ui::history::History;
+use crate::ui::media;
 use crate::ui::spinner;
+
+/// Whether screen cell (`x`, `y`) falls inside `rect`.
+fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
+    rect.contains(Position::new(x, y))
+}
 
 pub const PLACEHOLDERS: [&str; 3] = [
     "Fix a TODO in the codebase",
@@ -279,6 +290,23 @@ pub struct Prompt {
     cursor_yielded: bool,
     /// The cols the live chip occupied on the last draw, for the pointer.
     live_area: Rect,
+    /// The attachment strip as the last draw left it, for the pointer.
+    strip: Option<StripState>,
+}
+
+/// The image strip above the textarea, as drawn: where its band went and what
+/// each cell showed, so a click can open the image under the pointer.
+struct StripState {
+    strip: media::Strip,
+    /// What the band showed: the cells drawn whole and the `+N more` label,
+    /// laid out by the draw so hit-testing reads the same answer instead of
+    /// recomputing it.
+    layout: media::Layout,
+    /// The composer generation `images` was derived from: the strip is redrawn
+    /// every frame, and rebuilding the list would allocate a key and a name per
+    /// image per frame on the draw path.
+    revision: u64,
+    images: Vec<media::Image>,
 }
 
 impl Prompt {
@@ -298,6 +326,7 @@ impl Prompt {
             spin_started: None,
             spin_frame: 0,
             interrupt_armed: None,
+            strip: None,
             cursor_yielded: false,
             live_area: Rect::default(),
         }
@@ -441,8 +470,52 @@ impl Prompt {
     }
 
     fn panel_height(&self, terminal_height: u16) -> u16 {
-        // paddingTop + textarea + paddingTop + metadata row
-        1 + self.composer.height(terminal_height) + 1 + 1
+        // paddingTop + image strip + textarea + paddingTop + metadata row
+        1 + self.strip_rows(terminal_height) + self.composer.height(terminal_height) + 1 + 1
+    }
+
+    /// Rows the attachment strip takes above the textarea: the thumbnails plus
+    /// the blank under them (upstream
+    /// `height={imagePreviewHeight() + 1} ... paddingBottom={1}`,
+    /// `component/prompt/index.tsx:1701-1710`). Zero when nothing is attached
+    /// or the terminal cannot draw pictures, so no empty band is reserved.
+    fn strip_rows(&self, terminal_height: u16) -> u16 {
+        if self.composer.image_count() == 0 || !media::supported() {
+            return 0;
+        }
+        media::height(terminal_height) + 1
+    }
+
+    /// The images attached to the draft, for the enlarged preview
+    /// (`prompt.images.view`). Empty when there are none.
+    #[must_use]
+    pub fn images(&self) -> Vec<media::Image> {
+        self.composer.images().collect()
+    }
+
+    /// The image under the pointer and the whole strip it belongs to, for the
+    /// preview: `+N more` opens at the first image the strip does not draw.
+    #[must_use]
+    pub fn image_at(&self, x: u16, y: u16) -> Option<(&[media::Image], usize)> {
+        let state = self.strip.as_ref()?;
+        let drawn = usize::from(state.strip.images).min(state.images.len());
+        let visible = usize::from(state.layout.cells).min(drawn);
+        for index in 0..visible {
+            let Ok(position) = u16::try_from(index) else {
+                continue;
+            };
+            if rect_contains(state.layout.cell(&state.strip, position), x, y) {
+                return Some((state.images.as_slice(), index));
+            }
+        }
+        // `+N more` opens at the first image no cell draws, which is the first
+        // one past the cells that fit — not past the strip's image count, or a
+        // narrow band would skip the images it could not draw.
+        (state
+            .layout
+            .more
+            .is_some_and(|more| rect_contains(more, x, y)))
+        .then_some((state.images.as_slice(), visible))
     }
 
     /// The cols the live chip occupied on the last draw, for the pointer.
@@ -456,6 +529,7 @@ impl Prompt {
     /// the bottom of the screen), so the pointer must not hit a stale one.
     pub fn reset_live_area(&mut self) {
         self.live_area = Rect::default();
+        self.strip = None;
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> PromptAction {
@@ -682,21 +756,24 @@ impl Prompt {
         full: Rect,
         activity: Activity,
         live: Live,
-    ) {
-        // The chip is only hit-testable on a frame that drew it.
+        graphics: &mut Graphics,
+    ) -> Vec<media::Request> {
+        // The chip and the strip are only hit-testable on a frame that drew them.
         self.live_area = Rect::default();
+        self.strip = None;
         let running = activity != Activity::Idle;
         let pal = *theme::palette();
         if area.width == 0 || area.height == 0 {
-            return;
+            return Vec::new();
         }
         let rail = self.rail_style(&pal);
         let pad = if full.width < 44 { 1 } else { 2 };
+        let strip_rows = self.strip_rows(full.height);
         let composer_h = self
             .composer
             .height(full.height)
-            .min(area.height.saturating_sub(3).max(1));
-        let panel_h = 1 + composer_h + 1 + 1;
+            .min(area.height.saturating_sub(3 + strip_rows).max(1));
+        let panel_h = 1 + strip_rows + composer_h + 1 + 1;
         let panel = Rect {
             x: area.x,
             y: area.y,
@@ -726,18 +803,29 @@ impl Prompt {
 
         let inner_x = panel.x + 1 + pad;
         let inner_w = panel.width.saturating_sub(1 + pad * 2).max(1);
+        // The strip sits between the panel's top padding and the textarea.
+        let mut requests = Vec::new();
+        if strip_rows > 0 {
+            let band = Rect {
+                x: inner_x,
+                y: panel.y + 1,
+                width: inner_w,
+                height: strip_rows.saturating_sub(1),
+            };
+            requests = self.draw_strip(frame, band, graphics, &pal);
+        }
         let text_area = Rect {
             x: inner_x,
-            y: panel.y + 1,
+            y: panel.y + 1 + strip_rows,
             width: inner_w,
-            height: composer_h.min(panel.height.saturating_sub(1)),
+            height: composer_h.min(panel.height.saturating_sub(1 + strip_rows)),
         };
         if text_area.height > 0 {
             self.composer.render(frame, text_area, !self.cursor_yielded);
         }
 
         // Metadata row, one blank row under the textarea.
-        let meta_y = panel.y + 1 + composer_h + 1;
+        let meta_y = panel.y + 1 + strip_rows + composer_h + 1;
         if meta_y < panel.bottom() {
             // 上游宽度预算：终端宽度减 13（窄终端减 9）。
             let budget = full
@@ -910,6 +998,88 @@ impl Prompt {
                 }
             }
         }
+        requests
+    }
+
+    /// Draw the attachment strip in `band` and report the images whose bytes are
+    /// not cached yet.
+    ///
+    /// Upstream shows at most three thumbnails plus `+N more`
+    /// (`component/prompt/index.tsx:1701-1766`); the strip is drawn as pixels by
+    /// the graphics layer, so the panel rows it covers stay blank here. What
+    /// fits is [`media::Strip::layout`]'s answer, which the hit-test reads back
+    /// from the state this draw stores.
+    fn draw_strip(
+        &mut self,
+        frame: &mut Frame,
+        band: Rect,
+        graphics: &mut Graphics,
+        pal: &theme::Palette,
+    ) -> Vec<media::Request> {
+        // Reuse the list the last draw derived when the attachments have not
+        // moved since; only a paste, a removal or a submit rebuilds it.
+        let revision = self.composer.attachments_revision();
+        let images = match self.strip.take() {
+            Some(state) if state.revision == revision => state.images,
+            _ => self.composer.images().collect(),
+        };
+        let Some(strip) = media::Strip::new(0, images.len(), band.height) else {
+            return Vec::new();
+        };
+        let (x, y, width) = (band.x, band.y, band.width);
+        let layout = strip.layout(x, y, width);
+        let mut requests = Vec::new();
+        let mut painted: Vec<Arc<Prepared>> = Vec::new();
+        let mut areas = Vec::new();
+        for (index, image) in images.iter().enumerate().take(usize::from(layout.cells)) {
+            let Ok(position) = u16::try_from(index) else {
+                continue;
+            };
+            let cell = layout.cell(&strip, position);
+            match graphics.cached_for(&image.key, strip.cells()) {
+                Some(prepared) => {
+                    painted.push(prepared);
+                    areas.push(cell);
+                }
+                None => requests.push(media::Request {
+                    key: image.key.clone(),
+                    bytes: image.bytes.clone(),
+                    cells: strip.cells(),
+                    class: media::THUMBNAIL,
+                }),
+            }
+        }
+        let slots: Vec<Slot<'_>> = painted
+            .iter()
+            .zip(&areas)
+            .map(|(image, area)| Slot { area: *area, image })
+            .collect();
+        graphics.paint(frame.buffer_mut(), &slots);
+        if let Err(err) = graphics.flush() {
+            tracing::warn!(%err, "queued graphics escapes not written");
+        }
+        if let Some(more) = layout.more {
+            let label = format!("+{} more", strip.more);
+            let label_w = u16::try_from(label.width())
+                .unwrap_or(more.width)
+                .min(more.width);
+            frame.render_widget(
+                Paragraph::new(Span::styled(label, pal.dim)),
+                Rect {
+                    x: more.x + (more.width - label_w) / 2,
+                    y,
+                    width: label_w,
+                    height: 1,
+                },
+            );
+        }
+        self.strip = Some(StripState {
+            strip,
+            layout,
+            revision,
+            images,
+        });
+        requests
     }
 
     /// The rail and its `╹` foot, in the agent colour: upstream takes it from
@@ -1185,6 +1355,84 @@ mod tests {
     const WIDTH: u16 = 100;
     const HEIGHT: u16 = 24;
 
+    fn inline_image(index: usize) -> media::Image {
+        media::Image {
+            key: format!("c{index}"),
+            bytes: media::Bytes::Inline(Arc::from(Vec::new())),
+            name: None,
+        }
+    }
+
+    /// Seed the strip the way a draw with five attachments would, at column 10
+    /// row 5 with 4-row thumbnails: 8 columns each plus a 1-column gap.
+    fn seeded_strip() -> Prompt {
+        seeded_strip_in(60)
+    }
+
+    /// [`seeded_strip`] in a band `width` columns wide, so the cells and the
+    /// `+N more` label can be made to overrun it.
+    fn seeded_strip_in(width: u16) -> Prompt {
+        let mut prompt = Prompt::new("", Chrome::default(), Footer::Session);
+        let images: Vec<media::Image> = (0..5).map(inline_image).collect();
+        let strip = media::Strip::new(0, images.len(), 4).expect("five images make a strip");
+        prompt.strip = Some(StripState {
+            images,
+            layout: strip.layout(10, 5, width),
+            revision: 0,
+            strip,
+        });
+        prompt
+    }
+
+    #[test]
+    fn the_strip_opens_the_clicked_image() {
+        let prompt = seeded_strip();
+        assert_eq!(
+            prompt.image_at(10, 5).map(|(_, index)| index),
+            Some(0),
+            "the first thumbnail is under the strip's first column"
+        );
+        assert_eq!(
+            prompt.image_at(19, 7).map(|(_, index)| index),
+            Some(1),
+            "the second cell starts one gap after eight columns of thumbnail"
+        );
+        assert_eq!(
+            prompt.image_at(37, 5).map(|(_, index)| index),
+            Some(3),
+            "`+N more` opens the first image the strip does not draw"
+        );
+        assert!(
+            prompt.image_at(10, 9).is_none(),
+            "only the thumbnail rows are clickable, not the row under them"
+        );
+        assert!(
+            prompt.image_at(60, 5).is_none(),
+            "past the last cell there is nothing to open"
+        );
+    }
+
+    #[test]
+    fn a_cell_the_band_cannot_show_is_not_clickable() {
+        // 20 columns hold two 8-wide thumbnails and their gap; the third ends at
+        // column 26 and would overrun the band, so the draw leaves it blank and
+        // the pointer must not open what is not on screen.
+        let prompt = seeded_strip_in(20);
+        assert_eq!(
+            prompt.image_at(19, 5).map(|(_, index)| index),
+            Some(1),
+            "the second thumbnail still fits its band"
+        );
+        assert!(
+            prompt.image_at(28, 5).is_none(),
+            "the third thumbnail overruns a 20-column band and is not drawn"
+        );
+        assert!(
+            prompt.image_at(32, 5).is_none(),
+            "`+N more` does not fit that band either"
+        );
+    }
+
     fn full() -> Rect {
         Rect::new(0, 0, WIDTH, HEIGHT)
     }
@@ -1212,7 +1460,9 @@ mod tests {
         let mut terminal =
             Terminal::new(TestBackend::new(full.width, full.height)).expect("test terminal");
         terminal
-            .draw(|frame| prompt.render(frame, area, full, activity, live))
+            .draw(|frame| {
+                let _ = prompt.render(frame, area, full, activity, live, &mut Graphics::new());
+            })
             .expect("draw");
         (terminal.backend().buffer().clone(), footer_y)
     }

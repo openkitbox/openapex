@@ -1,4 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use std::sync::Arc;
+
 use ox_schema::support::FileInput;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -9,6 +11,7 @@ use tui_textarea::{CursorRenderMode, TextArea};
 
 use crate::attachment::Loaded;
 use crate::theme;
+use crate::ui::media;
 use crate::ui::paste::{self, Pasted};
 
 /// What one submit hands to the app: the prompt text and the files that ride
@@ -45,12 +48,27 @@ pub struct Composer {
     /// Pasted images and PDFs standing in the textarea as labels. Like
     /// `pasted`: the text decides which of them are sent.
     attached: Vec<Attached>,
+    /// Serial behind the cache key of each new attachment, so two pastes of the
+    /// same image stay apart and a removed attachment's key is never reused.
+    next_key: u64,
+    /// Bumped on every change to `attached`. The prompt's strip caches what it
+    /// derives from the attachments and rebuilds it when this moves, so the
+    /// draw path does not allocate the same image list every frame.
+    attachments: u64,
 }
 
 /// An attachment waiting for submit; `label` is its stand-in in the text.
+///
+/// `key` names the picture in the graphics cache for as long as the attachment
+/// is held, and `bytes` is its decoded payload — PNG, JPEG, GIF or WebP as it
+/// was pasted, and whichever of those it is, it still has to be decoded once
+/// here: the preview strip redraws every frame the app is dirty, so it must not
+/// decode the 20 MiB of base64 the `data:` URI carries more than once.
 struct Attached {
+    key: String,
     label: String,
     input: FileInput,
+    bytes: Option<Arc<[u8]>>,
 }
 
 impl Composer {
@@ -66,6 +84,8 @@ impl Composer {
             placeholder: placeholder.to_owned(),
             pasted: Vec::new(),
             attached: Vec::new(),
+            next_key: 0,
+            attachments: 0,
         }
     }
 
@@ -85,6 +105,7 @@ impl Composer {
         self.textarea = empty_textarea();
         self.pasted.clear();
         self.attached.clear();
+        self.attachments += 1;
     }
 
     /// Returns `Some(submission)` when the user submits.
@@ -150,7 +171,50 @@ impl Composer {
         let base = paste::attachment_label(&input.uri, name, images);
         let label = self.unique_label(&base);
         self.insert_label(&label);
-        self.attached.push(Attached { label, input });
+        let key = format!("c{}", self.next_key);
+        self.next_key += 1;
+        self.attachments += 1;
+        let bytes = crate::attachment::image_uri_bytes(&input.uri).map(Arc::from);
+        self.attached.push(Attached {
+            key,
+            label,
+            input,
+            bytes,
+        });
+    }
+
+    /// The image attachments and their bytes, in the order they were pasted:
+    /// what the preview strip draws and the enlarged dialog pages through. An
+    /// attachment whose bytes did not decode is left out — there is nothing to
+    /// show, and its label still names it.
+    fn image_attachments(&self) -> impl Iterator<Item = (&Attached, &Arc<[u8]>)> + '_ {
+        self.attached
+            .iter()
+            .filter_map(|attached| attached.bytes.as_ref().map(|bytes| (attached, bytes)))
+    }
+
+    /// How many previewable images are attached, for the strip's height.
+    #[must_use]
+    pub fn image_count(&self) -> usize {
+        self.image_attachments().count()
+    }
+
+    /// Which generation of attachments [`Self::images`] describes: a caller
+    /// that stores what it derived from them compares this to know when to
+    /// rebuild.
+    #[must_use]
+    pub fn attachments_revision(&self) -> u64 {
+        self.attachments
+    }
+
+    /// The previewable attachments as the graphics layer wants them.
+    pub fn images(&self) -> impl Iterator<Item = media::Image> + '_ {
+        self.image_attachments()
+            .map(|(attached, bytes)| media::Image {
+                key: attached.key.clone(),
+                bytes: media::Bytes::Inline(Arc::clone(bytes)),
+                name: attached.input.name.as_deref().map(Arc::from),
+            })
     }
 
     /// Insert a pasted SVG as a `[SVG: name]` label followed by a space; the
@@ -188,6 +252,7 @@ impl Composer {
     /// Move out the attachments whose label is still in `text`, in the order
     /// the labels appear; the others are dropped. The files move, never copy.
     fn take_attached(&mut self, text: &str) -> Vec<FileInput> {
+        self.attachments += 1;
         let attached = std::mem::take(&mut self.attached);
         let labels: Vec<&str> = attached.iter().map(|a| a.label.as_str()).collect();
         let order = paste::labels_in_order(text, &labels);

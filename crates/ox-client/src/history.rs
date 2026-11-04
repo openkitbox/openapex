@@ -35,11 +35,12 @@
 use std::sync::Arc;
 
 use ox_schema::message::{AssistantContent, Compaction, Message, ToolState as WireToolState};
-use ox_schema::support::Content;
+use ox_schema::support::{Content, FileAttachment};
 
 use crate::store::{
-    AssistantItem, ChildRef, CompactionItem, CompactionStatus, ErrorInfo, Item, ModelChoice,
-    Notice, RetryInfo, ShownError, Switch, ToolPart, ToolState,
+    AssistantItem, ChildRef, CompactionItem, CompactionStatus, ErrorInfo, Item, MediaMeta,
+    MediaSource, ModelChoice, Notice, RetryInfo, ShownError, Switch, ToolPart, ToolState,
+    tool_media,
 };
 
 /// Turn a chronological message list into the store's ordered sequence.
@@ -58,7 +59,9 @@ pub fn parse_messages(messages: &[Message]) -> Vec<Item> {
 
     for message in messages {
         match message {
-            Message::User { prompt, time, .. } => {
+            Message::User {
+                id, prompt, time, ..
+            } => {
                 // The row carries the prompt time the projector recorded, which
                 // is exact. It opens a turn when none is open — a prompt
                 // persisted mid-turn is a steer, and the wait for that turn is
@@ -66,8 +69,10 @@ pub fn parse_messages(messages: &[Message]) -> Vec<Item> {
                 // marker to keep one open, so there it always opens one.
                 let starts_turn = !marked || !turn_open;
                 turn_open = true;
+                let message: Arc<str> = Arc::from(id.as_str());
                 items.push(Item::User {
                     text: Arc::from(prompt.text.as_str()),
+                    files: prompt_media(prompt.files.as_deref(), &message),
                     created: Some(time.created),
                     starts_turn,
                 });
@@ -83,7 +88,7 @@ pub fn parse_messages(messages: &[Message]) -> Vec<Item> {
                         AssistantContent::Tool {
                             id, name, state, ..
                         } => {
-                            tools.push(tool_part(id, name, state));
+                            tools.push(tool_part(id, name, state, &assistant.id));
                         }
                     }
                 }
@@ -264,11 +269,40 @@ fn compaction_item(message: &ox_schema::message::CompactionMessage) -> Compactio
     }
 }
 
+/// The prompt's attachments, as metadata only (`Item::User.files`): every
+/// entry, images and non-images alike, because the UI labels the latter
+/// `file`/`dir` without fetching anything. `index` is the entry's own position
+/// in `files` — that is what the media endpoint reads — and the base64
+/// payload is never touched.
+#[must_use]
+fn prompt_media(files: Option<&[FileAttachment]>, message: &Arc<str>) -> Arc<[MediaMeta]> {
+    let Some(files) = files else {
+        return Arc::default();
+    };
+    let media: Vec<MediaMeta> = files
+        .iter()
+        .enumerate()
+        .filter_map(|(index, file)| {
+            let index = u32::try_from(index).ok()?;
+            Some(MediaMeta::new(
+                file.name.as_deref(),
+                &file.mime,
+                MediaSource::Prompt {
+                    message: Arc::clone(message),
+                    index,
+                },
+            ))
+        })
+        .collect();
+    media.into()
+}
+
 /// Rebuild a live `ToolPart` from the recorded wire state. `Streaming` only
 /// carries the raw input text (the summary derives from it as a fallback);
 /// the resolved states carry the parsed input record.
-fn tool_part(id: &str, name: &str, state: &WireToolState) -> ToolPart {
+fn tool_part(id: &str, name: &str, state: &WireToolState, message: &str) -> ToolPart {
     let mut child = None;
+    let mut media = None;
     let (state, record, output, input_text, metadata): (
         ToolState,
         Option<&_>,
@@ -292,6 +326,7 @@ fn tool_part(id: &str, name: &str, state: &WireToolState) -> ToolPart {
             metadata,
         } => {
             child = ChildRef::from_metadata(name, metadata.as_ref());
+            media = Some(tool_media(content, message, id));
             (
                 ToolState::Success,
                 Some(input),
@@ -303,15 +338,20 @@ fn tool_part(id: &str, name: &str, state: &WireToolState) -> ToolPart {
         WireToolState::Error {
             input,
             error,
+            content,
             metadata,
-            ..
-        } => (
-            ToolState::Failed,
-            Some(input),
-            error.message.clone(),
-            String::new(),
-            metadata.as_ref(),
-        ),
+        } => {
+            media = content
+                .as_deref()
+                .map(|content| tool_media(content, message, id));
+            (
+                ToolState::Failed,
+                Some(input),
+                error.message.clone(),
+                String::new(),
+                metadata.as_ref(),
+            )
+        }
     };
     let mut part = ToolPart {
         id: id.to_owned(),
@@ -331,6 +371,7 @@ fn tool_part(id: &str, name: &str, state: &WireToolState) -> ToolPart {
             .map(|record| Arc::new(record.clone()))
             .unwrap_or_default(),
         metadata: metadata.map(|metadata| Arc::new(metadata.clone())),
+        media: media.unwrap_or_default(),
     };
     if part.todos.is_empty() {
         part.todos = crate::store::todos_from_input_text(name, &part.input_text);

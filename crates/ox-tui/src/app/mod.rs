@@ -4,6 +4,7 @@ pub mod keymap;
 pub mod state;
 mod switching;
 
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -18,6 +19,8 @@ use tokio::sync::{mpsc, watch};
 
 use crate::attachment::Loaded;
 use crate::clipboard::Clip;
+use crate::graphics::Graphics;
+use crate::graphics::SizeClass;
 use crate::pipeline;
 use crate::shell_captures::ShellCaptures;
 use crate::terminal::TerminalGuard;
@@ -26,7 +29,9 @@ use crate::ui::commands::CommandAction;
 use crate::ui::composer::{SearchAction, SearchBox, Submission};
 use crate::ui::dialog::{Dialog, DialogOutcome};
 use crate::ui::dock::{self, DockHover, StatusMode};
+use crate::ui::image_preview;
 use crate::ui::layout;
+use crate::ui::media;
 use crate::ui::output_dialog::{self, Output};
 use crate::ui::palette;
 use crate::ui::paste;
@@ -42,6 +47,7 @@ use crate::ui::timeline_dialog;
 use crate::ui::toast::{self, Toast};
 use command::{AppCommand, CancelReason};
 use event::AppEvent;
+use event::Fetched;
 use keymap::{Action, Feed, Keymap};
 use state::{Route, ViewState};
 
@@ -140,6 +146,18 @@ pub struct App {
     /// then puts the selection on the row of the session on screen, else on the
     /// first row, as soon as the list has rows.
     selection_pending: bool,
+    /// Terminal graphics: the probe's answer, the prepared-image cache and the
+    /// escapes queued for the next frame.
+    pub graphics: Graphics,
+    /// Attachment keys a fetch is already out for. A frame whose cells are
+    /// still blank asks again, so the key is only held while the answer is in
+    /// flight; a resident image is skipped by the cache, not by this set.
+    media_pending: HashSet<(String, SizeClass)>,
+    /// Attachment keys given up on, either because the fetch failed or because
+    /// the cache refused the payload. Retrying every frame would hammer a 404
+    /// (or repeat a refusal) and still draw nothing, so they are dropped until
+    /// the session changes.
+    media_failed: HashSet<(String, SizeClass)>,
     /// The shell dialog the user just asked for and has not seen yet. A shell
     /// answer may open a dialog only for this; otherwise it may refresh a
     /// dialog that is still open. So a refresh that lands after `esc` is dropped.
@@ -225,6 +243,9 @@ impl App {
             queued_dock_area: Rect::default(),
             dock_hover: DockHover::Off,
             live_hover: false,
+            graphics: Graphics::new(),
+            media_pending: HashSet::new(),
+            media_failed: HashSet::new(),
         }
     }
 
@@ -273,6 +294,7 @@ impl App {
                 self.settled_forms.clear();
                 self.request_forms();
             }
+            AppEvent::Media { key, class, result } => self.on_media(key, class, result),
             AppEvent::Files { query, entries } => {
                 self.prompt.set_files(&query, &entries);
                 self.dirty = true;
@@ -607,6 +629,12 @@ impl App {
         self.store = store;
         self.session = Some(id.clone());
         self.transcript = Transcript::new(80, 20);
+        // The cells naming the old session's images are gone with its
+        // transcript, so the terminal's copies go too, and a new session cannot
+        // inherit a fetch already in flight for the old one.
+        self.graphics.clear();
+        self.media_pending.clear();
+        self.media_failed.clear();
         self.shell_captures = ShellCaptures::default();
         // `next_reload_id` keeps counting, so an answer for the old session
         // can never match the new request.
@@ -1178,6 +1206,17 @@ impl App {
                     let _ = self.commands.send(AppCommand::ListFamily { session });
                 }
             }
+            CommandAction::Images => {
+                // Upstream's `prompt.images.view` is enabled only with an image
+                // attached (`component/prompt/index.tsx:496-499`); with none
+                // there is nothing to open, and no empty dialog either.
+                let images = self.prompt.images();
+                if !images.is_empty() {
+                    self.dialog = Some(Dialog::Preview(preview_of(&images, 0)));
+                    self.dialog_purpose = None;
+                    self.dirty = true;
+                }
+            }
             CommandAction::QueuedPrompts => {
                 // Disabled with nothing queued, as upstream (`index.tsx:1400`).
                 if self.queued_dialog_available() {
@@ -1222,6 +1261,9 @@ impl App {
                 self.session = None;
                 self.store = DataStore::default();
                 self.transcript = Transcript::new(80, 20);
+                self.graphics.clear();
+                self.media_pending.clear();
+                self.media_failed.clear();
                 self.shell_captures = ShellCaptures::default();
                 self.pending_reload = None;
                 self.pending_home_prompt = None;
@@ -1594,6 +1636,9 @@ impl App {
                 if let Some(child) = self.transcript.child_at(x, y).map(str::to_owned) {
                     self.switch_session(child);
                     self.dirty = true;
+                } else if let Some(preview) = self.preview_at(x, y) {
+                    self.dialog = Some(crate::ui::dialog::Dialog::Preview(preview));
+                    self.dirty = true;
                 } else if self.transcript.click(x, y) {
                     self.dirty = true;
                 }
@@ -1773,10 +1818,106 @@ impl App {
         }
     }
 
+    /// Adopt one attachment's bytes: a kitty transmission is cheap enough for
+    /// the draw thread, a sixel arrived already encoded for its grid.
+    ///
+    /// The key leaves `media_pending` either way, so a resident image that is
+    /// later evicted is asked for again, and a fetch the cache then refuses —
+    /// a payload too large for the whole budget — is given up on like a failed
+    /// one: asking again would repeat the same refusal on every frame.
+    fn on_media(&mut self, key: String, class: SizeClass, result: Result<Fetched, String>) {
+        self.media_pending.remove(&(key.clone(), class));
+        let kept = match result {
+            Ok(Fetched::Png(png)) => self.graphics.image(&key, class, &png),
+            Ok(Fetched::Sixel(prepared)) => self.graphics.adopt(&key, class, *prepared),
+            Err(err) => {
+                tracing::warn!(key, %err, "attachment bytes not served");
+                None
+            }
+        };
+        if kept.is_none() {
+            // A preview of this image would otherwise wait on a fetch that never
+            // repeats: let it say `No preview`.
+            if let Some(Dialog::Preview(preview)) = &mut self.dialog {
+                preview.mark_failed(&key);
+            }
+            self.media_failed.insert((key, class));
+        }
+        self.dirty = true;
+    }
+
+    /// The enlarged preview of the thumbnail under `(x, y)`, when the pointer is
+    /// on one: every image of that strip, opening at the clicked one. The
+    /// composer's strip is checked first because it sits over nothing the
+    /// transcript draws.
+    fn preview_at(&self, x: u16, y: u16) -> Option<image_preview::Preview> {
+        let (images, initial) = self
+            .prompt
+            .image_at(x, y)
+            .or_else(|| self.transcript.image_at(x, y))?;
+        Some(preview_of(images, initial))
+    }
+
+    /// Ask for the images the frame could not paint, transcript or dialog.
+    ///
+    /// The cache is the authority on what is resident, so a miss means the
+    /// bytes are not here and the ask is legitimate: what must not repeat is
+    /// the ask itself, and `media_pending` holds a key exactly while its answer
+    /// is in flight (`media_failed` holds the ones given up on). A stored
+    /// attachment belongs to the session on screen, which the home route does
+    /// not have: there is nothing to fetch.
+    fn request_media(&mut self, requests: Vec<media::Request>) {
+        let App {
+            commands,
+            media_pending,
+            media_failed,
+            session,
+            graphics,
+            ..
+        } = self;
+        for request in requests {
+            let cells = graphics.encodes_sixel().then_some(request.cells);
+            let key = (request.key.clone(), request.class);
+            if media_pending.contains(&key) || media_failed.contains(&key) {
+                continue;
+            }
+            let command = match request.bytes {
+                media::Bytes::Stored(source) => {
+                    let Some(session) = session.as_ref() else {
+                        continue;
+                    };
+                    AppCommand::FetchMedia {
+                        session: session.clone(),
+                        key: request.key,
+                        source,
+                        cells,
+                        class: request.class,
+                    }
+                }
+                media::Bytes::Inline(bytes) => AppCommand::MediaInline {
+                    key: request.key,
+                    bytes,
+                    cells,
+                    class: request.class,
+                },
+            };
+            // A closed channel never answers, so the key must not stay in the
+            // pending set: it would be asked for exactly once and then drop out
+            // of the cache's reach for the life of the process.
+            if commands.send(command).is_ok() {
+                media_pending.insert(key);
+            }
+        }
+    }
+
     /// One frame of the session route: transcript, docks, prompt (or the
     /// activity panel in its place), then the dialog and toast on top.
     fn draw_session(&mut self, frame: &mut ratatui::Frame) {
         let full = frame.area();
+        // The transcript's strips are what the cache has to hold, so the window's
+        // own height is what sizes the thumbnail class this frame.
+        self.graphics
+            .reserve_thumbnails(media::capacity(full.height));
         let searching = matches!(self.mode, Mode::SearchInput(_));
         let prompt_h = self
             .prompt
@@ -1817,8 +1958,12 @@ impl App {
         };
         // The transcript goes first: the slash menu pops up over it and must
         // end up on top (upstream draws the menu at `zIndex={100}`).
-        self.transcript
-            .render(frame, layout::padded(timeline_area, full.width));
+        let queued = self.transcript.render(
+            frame,
+            layout::padded(timeline_area, full.width),
+            &mut self.graphics,
+        );
+        self.request_media(queued);
         if queued_h > 0 {
             let lines = dock::queued_dock(&self.store.queued, queued_area.width, self.dock_hover);
             frame.render_widget(ratatui::widgets::Paragraph::new(lines), queued_area);
@@ -1852,16 +1997,26 @@ impl App {
                     Some(block) => activity_panel::render(frame, prompt_area, block),
                     None => {
                         let activity = self.activity();
-                        self.prompt.render(frame, prompt_area, full, activity, live);
+                        let from_prompt = self.prompt.render(
+                            frame,
+                            prompt_area,
+                            full,
+                            activity,
+                            live,
+                            &mut self.graphics,
+                        );
+                        self.request_media(from_prompt);
                     }
                 }
             }
         }
         let line = dock::status_line(&self.store, self.status_mode());
         frame.render_widget(ratatui::widgets::Paragraph::new(line), dock_area);
-        if let Some(dialog) = &self.dialog {
-            crate::ui::dialog::render(frame, full, dialog);
-        }
+        let from_dialog = match &self.dialog {
+            Some(dialog) => crate::ui::dialog::render(frame, full, dialog, &mut self.graphics),
+            None => Vec::new(),
+        };
+        self.request_media(from_dialog);
         if let Some(toast) = &self.toast {
             toast::render(frame.buffer_mut(), full, toast, crate::theme::palette());
         }
@@ -1919,16 +2074,27 @@ impl App {
                         // do not know the sequence ignore it.
                         flush_osc52(&mut self.pending_osc52, terminal.terminal.backend_mut())?;
                         execute!(terminal.terminal.backend_mut(), BeginSynchronizedUpdate)?;
+                        let mut from_home = Vec::new();
                         let drawn = match self.route {
                             Route::Home => {
                                 terminal.terminal.draw(|frame| {
-                                    crate::ui::home::render(
+                                    from_home = crate::ui::home::render(
                                         frame,
                                         frame.area(),
                                         &mut self.prompt,
+                                        &mut self.graphics,
                                     );
+                                    // Home has no transcript to fetch for; the
+                                    // dialog's own images still are, and a
+                                    // composer attachment carries its bytes.
                                     if let Some(dialog) = &self.dialog {
-                                        crate::ui::dialog::render(frame, frame.area(), dialog);
+                                        let from_dialog = crate::ui::dialog::render(
+                                            frame,
+                                            frame.area(),
+                                            dialog,
+                                            &mut self.graphics,
+                                        );
+                                        from_home.extend(from_dialog);
                                     }
                                     if let Some(toast) = &self.toast {
                                         let area = frame.area();
@@ -1940,6 +2106,7 @@ impl App {
                                 terminal.terminal.draw(|frame| self.draw_session(frame)).map(|_| ())
                             }
                         };
+                        self.request_media(from_home);
                         execute!(terminal.terminal.backend_mut(), EndSynchronizedUpdate)?;
                         drawn?;
                     }
@@ -1947,12 +2114,29 @@ impl App {
                 Some(event) = events.recv() => {
                     self.handle(event);
                     if self.view.should_quit {
+                        // The terminal keeps every image it was handed; nothing
+                        // else will ever delete them.
+                        self.graphics.release()?;
                         return Ok(());
                     }
                 }
             }
         }
     }
+}
+
+/// The enlarged preview of `images` starting at `initial`, as the dialog wants
+/// it: the sources are shared, so nothing but the small names is copied.
+fn preview_of(images: &[media::Image], initial: usize) -> image_preview::Preview {
+    let images = images
+        .iter()
+        .map(|image| image_preview::Image {
+            key: image.key.clone(),
+            bytes: image.bytes.clone(),
+            name: image.name.clone(),
+        })
+        .collect();
+    image_preview::Preview::new(images, initial)
 }
 
 /// Whether the cell `(x, y)` lies in `area`.

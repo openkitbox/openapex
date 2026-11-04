@@ -1,6 +1,11 @@
 // command.rs — App -> server (executed by tokio tasks via ox-client).
-use ox_schema::support::FileInput;
+use std::sync::Arc;
 
+use ox_client::store::MediaSource;
+use ox_schema::support::FileInput;
+use ratatui::layout::Size;
+
+use crate::graphics::cache::SizeClass;
 use crate::ui::composer::Submission;
 
 #[derive(Debug, Clone)]
@@ -26,6 +31,27 @@ pub enum AppCommand {
     /// after another; every answer is an `AppEvent::ChildRunning`.
     ProbeChildren {
         children: Vec<String>,
+    },
+    /// Fetch one attachment's bytes for a thumbnail; answered with
+    /// `AppEvent::Media`. `cells` is the grid the image will be drawn on, which
+    /// only a sixel terminal needs: its encode is made for that exact grid.
+    FetchMedia {
+        session: String,
+        key: String,
+        source: MediaSource,
+        cells: Option<Size>,
+        class: SizeClass,
+    },
+    /// Prepare one attachment the composer already holds: its bytes were
+    /// decoded from the pasted `data:` URI, so nothing is fetched; a kitty
+    /// terminal still has to be handed PNG, and a sixel one an encode for the
+    /// grid the image will be drawn on. Answered with `AppEvent::Media`, like a
+    /// stored attachment.
+    MediaInline {
+        key: String,
+        bytes: Arc<[u8]>,
+        cells: Option<Size>,
+        class: SizeClass,
     },
     /// Fetch the session's stored agent/model for the prompt's metadata row;
     /// answered with `AppEvent::SessionChrome`.

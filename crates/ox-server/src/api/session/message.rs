@@ -235,6 +235,39 @@ fn render_message_page(res: &mut Response, messages: Vec<Message>, order: &Optio
 }
 
 // ---------------------------------------------------------------------------
+// One stored row, shared with the media endpoint
+// ---------------------------------------------------------------------------
+
+/// One `session_message` row: the `type` column plus the raw `data` JSON. The
+/// id lives in the key column, so a caller merges it back in
+/// ([`Message::merge_row_columns`]) before decoding.
+pub(crate) struct MessageRow {
+    pub kind: String,
+    pub data: String,
+}
+
+/// Read one message row by the session-scoped key. `None` means no row carries
+/// both ids (an unknown session and an unknown message are the same answer);
+/// the caller decides which error that is.
+pub(crate) async fn load_message_row(
+    db: &Db,
+    session_id: &str,
+    message_id: &str,
+) -> Result<Option<MessageRow>> {
+    let conn = db.acquire().await?;
+    let mut stmt = conn
+        .prepare("SELECT type, data FROM session_message WHERE session_id = ?1 AND id = ?2")
+        .await?;
+    let Some(row) = ox_db::optional(&mut stmt, (session_id, message_id)).await? else {
+        return Ok(None);
+    };
+    Ok(Some(MessageRow {
+        kind: row.get::<String>(0)?,
+        data: row.get::<String>(1)?,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // session.message.get — GET /api/session/{sessionID}/message/{messageID}
 // ---------------------------------------------------------------------------
 
@@ -264,20 +297,7 @@ pub(crate) async fn message_get(req: &mut Request, depot: &mut Depot, res: &mut 
         }
     }
 
-    let row: Result<Option<(String, String)>> = async {
-        let conn = app.db.acquire().await?;
-        let mut stmt = conn
-            .prepare("SELECT type, data FROM session_message WHERE session_id = ?1 AND id = ?2")
-            .await?;
-        let Some(row) =
-            ox_db::optional(&mut stmt, (session_id.as_str(), message_id.as_str())).await?
-        else {
-            return Ok(None);
-        };
-        Ok(Some((row.get::<String>(0)?, row.get::<String>(1)?)))
-    }
-    .await;
-    let row = match row {
+    let row = match load_message_row(&app.db, &session_id, &message_id).await {
         Ok(row) => row,
         Err(error) => {
             unknown_error(res, &anyhow!("message lookup failed: {error}"));
@@ -285,7 +305,7 @@ pub(crate) async fn message_get(req: &mut Request, depot: &mut Depot, res: &mut 
         }
     };
 
-    let Some((kind, data)) = row else {
+    let Some(MessageRow { kind, data }) = row else {
         message_not_found(res, &session_id, &message_id);
         return;
     };

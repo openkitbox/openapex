@@ -251,6 +251,15 @@ pub struct Palette {
     pub menu_selected: Style,
     /// The raised surface behind a user message (upstream `raised.base`).
     pub raised_base: Style,
+    /// The fill of an attachment badge (`file` / `dir`) and of the `skill`
+    /// badge: upstream `hue.accent` behind `background.raised.base` in bold
+    /// (`routes/session/index.tsx:2447-2464`). The palette has no hue scale, so
+    /// this is the accent the theme already gives images
+    /// (`theme/tokens.rs` `markdown.image`).
+    pub image: Style,
+    /// An attachment's name on its chip: upstream `text.muted` on
+    /// `decrease(raised.base)` (`theme/tokens.rs` `markdown.image_text`).
+    pub image_text: Style,
     /// Markdown links and list markers (upstream `markdown.link` /
     /// `markdown.listItem`).
     pub link: Style,
@@ -293,6 +302,11 @@ impl Palette {
                 menu_border: Style::default().fg(Color::Gray),
                 menu_selected: Style::default().fg(Color::Black).bg(Color::Cyan),
                 raised_base: Style::default().bg(Color::DarkGray),
+                image: Style::default()
+                    .bg(Color::Cyan)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+                image_text: Style::default().fg(Color::Cyan).bg(Color::DarkGray),
                 link: Style::default().fg(Color::Blue),
                 syntax: SyntaxStyles::ansi16(),
                 thought: Style::default().fg(Color::Yellow),
@@ -316,6 +330,8 @@ impl Palette {
                 menu_border: Style::default().add_modifier(Modifier::DIM),
                 menu_selected: Style::default().add_modifier(Modifier::REVERSED),
                 raised_base: Style::default(),
+                image: Style::default().add_modifier(Modifier::BOLD),
+                image_text: Style::default().add_modifier(Modifier::DIM),
                 link: Style::default(),
                 syntax: SyntaxStyles::no_color(),
                 thought: Style::default(),
@@ -364,6 +380,13 @@ impl Palette {
             menu_border: Style::default().fg(rgb(t.border)),
             menu_selected: selected,
             raised_base: Style::default().bg(rgb(t.raised_base)),
+            image: Style::default()
+                .bg(rgb(t.markdown.image))
+                .fg(rgb(t.raised_base))
+                .add_modifier(Modifier::BOLD),
+            image_text: Style::default()
+                .fg(rgb(t.markdown.image_text))
+                .bg(rgb(t.raised_high)),
             link: Style::default().fg(rgb(t.markdown.link)),
             syntax: SyntaxStyles::from_tokens(&t.syntax),
             thought: thought(t.background, t.warning),
@@ -417,6 +440,11 @@ impl Palette {
             menu_border: Style::default().fg(Color::DarkGray),
             menu_selected: Style::default().fg(Color::Black).bg(Color::Cyan),
             raised_base: Style::default(),
+            image: Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+            image_text: Style::default().fg(Color::Cyan),
             link: Style::default().fg(Color::Blue),
             syntax: SyntaxStyles::ansi16(),
             thought: Style::default().fg(Color::Yellow),

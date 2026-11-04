@@ -89,9 +89,10 @@ pub fn blocks_from_store(
             turn = start;
         }
         match item {
-            Item::User { text, .. } => {
+            Item::User { text, files, .. } => {
                 blocks.push(Block::User {
                     text: Arc::clone(text),
+                    files: Arc::clone(files),
                 });
             }
             // Nothing to draw: the turn item only moved the boundary above.
@@ -280,6 +281,7 @@ fn push_tools(
                 .is_some_and(|child| store.is_child_running(&child.session_id)),
             input: Arc::clone(&tool.input),
             metadata: tool.metadata.clone(),
+            media: Arc::clone(&tool.media),
         });
     }
     if let Some(explored) = group {
@@ -369,16 +371,19 @@ mod tests {
     fn prompt(created: i64, text: &str) -> Item {
         Item::User {
             text: Arc::from(text),
+            files: Arc::default(),
             created: Some(created),
             starts_turn: true,
         }
     }
 
     /// The optimistic echo of a prompt typed while idle: no wire time, and the
-    /// turn row that follows carries the execution start.
+    /// turn row that follows carries the execution start. It has no message id
+    /// yet, so it carries no attachment either.
     fn echo(text: &str) -> Item {
         Item::User {
             text: Arc::from(text),
+            files: Arc::default(),
             created: None,
             starts_turn: true,
         }
@@ -398,6 +403,7 @@ mod tests {
     fn steer(created: Option<i64>, text: &str) -> Item {
         Item::User {
             text: Arc::from(text),
+            files: Arc::default(),
             created,
             starts_turn: false,
         }

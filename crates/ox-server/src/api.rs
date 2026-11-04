@@ -28,6 +28,7 @@ pub mod form;
 mod integration;
 pub mod lease;
 mod mcp;
+mod media;
 pub mod session;
 pub mod shell;
 pub mod skill;
@@ -760,7 +761,8 @@ pub fn build_router(state: AppState) -> Router {
         .push(
             Router::with_path("ox")
                 .push(Router::with_path("lease").get(lease::lease))
-                .push(Router::with_path("session/{id}/family").get(family::family)),
+                .push(Router::with_path("session/{id}/family").get(family::family))
+                .push(Router::with_path("session/{sessionID}/media/{messageID}").get(media::media)),
         )
         .push(
             Router::with_path("api")

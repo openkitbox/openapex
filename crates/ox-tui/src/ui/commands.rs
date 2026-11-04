@@ -42,6 +42,9 @@ pub enum CommandAction {
     Shells,
     /// Open the queued-prompts dialog (upstream `session.queued_prompts`).
     QueuedPrompts,
+    /// Show the draft's image attachments at full size (upstream
+    /// `prompt.images.view`, `<leader>i`).
+    Images,
 }
 
 /// One registered command. `aliases` are rendered as their own menu rows,
@@ -140,6 +143,14 @@ pub const COMMANDS: &[Command] = &[
         title: "View background shells",
         group: "Session",
         action: CommandAction::Shells,
+    },
+    Command {
+        name: "images",
+        aliases: &[],
+        description: "View image attachments",
+        title: "View image attachments",
+        group: "Prompt",
+        action: CommandAction::Images,
     },
     Command {
         name: "subagents",

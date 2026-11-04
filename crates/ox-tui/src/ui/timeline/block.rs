@@ -1,5 +1,5 @@
 use ox_client::store::{
-    CompactionStatus, CompletionSource, ErrorInfo, Notice, RetryInfo, Switch, ToolState,
+    CompactionStatus, CompletionSource, ErrorInfo, MediaMeta, Notice, RetryInfo, Switch, ToolState,
 };
 use ox_client::todo::Todo;
 use ox_schema::support::{Record, TokenUsage};
@@ -81,6 +81,10 @@ impl Eq for Explored {}
 pub enum Block {
     User {
         text: std::sync::Arc<str>,
+        /// Every attachment on the prompt as metadata: images are drawn as
+        /// thumbnails, anything else as a `file`/`dir` label row. Empty for the
+        /// optimistic local echo, which has no message to fetch bytes by.
+        files: std::sync::Arc<[ox_client::store::MediaMeta]>,
     },
     /// The reasoning header of one assistant message, collapsed by default.
     Reasoning {
@@ -133,6 +137,10 @@ pub enum Block {
         input: std::sync::Arc<Record>,
         /// The result metadata, shared with the `ToolPart`.
         metadata: Option<std::sync::Arc<Record>>,
+        /// The images in this call's result, shared with the `ToolPart`: drawn
+        /// as a strip below the block, the bytes fetched by
+        /// [`ox_client::store::MediaSource::Tool`]. Empty for every other call.
+        media: std::sync::Arc<[MediaMeta]>,
     },
     /// A `shell` call, drawn as a block (`super::shell_block`, upstream
     /// `Shell`). `input`/`output` are shared with the `ToolPart`.
@@ -197,6 +205,7 @@ impl Block {
     pub fn user(text: &str) -> Self {
         Block::User {
             text: std::sync::Arc::from(text),
+            files: std::sync::Arc::from(Vec::new()),
         }
     }
     #[must_use]
@@ -226,7 +235,9 @@ impl Block {
 impl PartialEq for Block {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Block::User { text: a }, Block::User { text: b }) => std::sync::Arc::ptr_eq(a, b),
+            (Block::User { text: a, files: af }, Block::User { text: b, files: bf }) => {
+                std::sync::Arc::ptr_eq(a, b) && std::sync::Arc::ptr_eq(af, bf)
+            }
             (
                 Block::Reasoning {
                     id: aid,
@@ -268,15 +279,24 @@ impl PartialEq for Block {
                     id: aid,
                     version: aversion,
                     background: abackground,
+                    media: amedia,
                     ..
                 },
                 Block::Tool {
                     id: bid,
                     version: bversion,
                     background: bbackground,
+                    media: bmedia,
                     ..
                 },
-            ) => aid == bid && aversion == bversion && abackground == bbackground,
+            ) => {
+                // The strip is laid out from the pointer, so a new attachment
+                // list (a new `Arc`) is a new block even at the same version.
+                aid == bid
+                    && aversion == bversion
+                    && abackground == bbackground
+                    && std::sync::Arc::ptr_eq(amedia, bmedia)
+            }
             (
                 Block::Shell {
                     id: aid,

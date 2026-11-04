@@ -3,6 +3,7 @@ pub mod attachment;
 pub mod bootstrap;
 pub mod clipboard;
 pub mod executor;
+pub mod graphics;
 pub mod lifecycle;
 pub mod pipeline;
 pub mod run;

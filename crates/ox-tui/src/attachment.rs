@@ -85,6 +85,16 @@ fn read_bounded(path: &Path, max: u64) -> Option<Vec<u8>> {
     (bytes.len() as u64 <= max).then_some(bytes)
 }
 
+/// The bytes of a `data:image/...;base64,<payload>` URI, decoded once so the
+/// composer can show the attachment it is holding. `None` for anything else:
+/// a path, another scheme, or a payload that does not decode.
+#[must_use]
+pub(crate) fn image_uri_bytes(uri: &str) -> Option<Vec<u8>> {
+    let payload = uri.strip_prefix("data:image/")?;
+    let (_, encoded) = payload.split_once(";base64,")?;
+    STANDARD.decode(encoded).ok()
+}
+
 /// `data:<mime>;base64,<payload>`, built in one allocation.
 pub(crate) fn data_uri(mime: &str, bytes: &[u8]) -> String {
     let prefix = format!("data:{mime};base64,");

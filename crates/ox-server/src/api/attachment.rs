@@ -166,8 +166,10 @@ fn too_large(label: &str) -> AttachmentError {
 }
 
 /// Split `data:<metadata>,<payload>` into the declared mime (possibly empty)
-/// and the payload. Only base64 data URLs are accepted.
-fn parse_data_url(uri: &str) -> Option<(&str, &str)> {
+/// and the payload, borrowing both. Only base64 data URLs are accepted. The
+/// write path and the media read endpoint ([`super::media`]) share this so both
+/// sides accept exactly the same URLs.
+pub(crate) fn parse_data_url(uri: &str) -> Option<(&str, &str)> {
     let rest = uri.strip_prefix("data:")?;
     let (metadata, payload) = rest.split_once(',')?;
     let mut parts = metadata.split(';');

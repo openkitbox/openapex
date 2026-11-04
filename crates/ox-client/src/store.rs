@@ -37,10 +37,64 @@ use ox_schema::support::{FinishReason, Record, TokenUsage};
 use crate::form::{self, FormInfo};
 use crate::todo::{Todo, parse_todos};
 
+/// Where one attachment's bytes can be fetched from, on demand.
+///
+/// The store keeps no attachment bytes — a 20 MiB image is ~27 MB of base64 —
+/// so a row carries only [`MediaMeta`], and the UI asks the ox-only media
+/// endpoint for the bytes of the one image it is about to draw.
+#[derive(Debug, Clone)]
+pub enum MediaSource {
+    /// A user message's `files[index]`.
+    Prompt { message: Arc<str>, index: u32 },
+    /// A tool part's `state.content[index]`.
+    Tool {
+        message: Arc<str>,
+        part: Arc<str>,
+        index: u32,
+    },
+}
+
+/// One attachment as the UI needs it: no bytes, only what identifies it.
+#[derive(Debug, Clone)]
+pub struct MediaMeta {
+    /// The attachment's file name, when the wire carried one.
+    pub name: Option<Arc<str>>,
+    pub mime: Arc<str>,
+    pub source: MediaSource,
+}
+
+impl MediaMeta {
+    /// One attachment's identity.
+    pub(crate) fn new(name: Option<&str>, mime: &str, source: MediaSource) -> Self {
+        Self {
+            name: name.map(Arc::from),
+            mime: Arc::from(mime),
+            source,
+        }
+    }
+
+    /// Whether this attachment is a directory listing. A directory has no field
+    /// of its own on the wire: the server materializes one as a listing with
+    /// the [`DIRECTORY_MIME`] type (`ox-server/src/api/attachment.rs`), so this
+    /// is derived from `mime` rather than carried beside it.
+    #[must_use]
+    pub fn is_dir(&self) -> bool {
+        &*self.mime == DIRECTORY_MIME
+    }
+}
+
+/// The mime type a directory attachment is materialized as.
+const DIRECTORY_MIME: &str = "application/x-directory";
+
 #[derive(Debug, Clone)]
 pub enum Item {
     User {
         text: Arc<str>,
+        /// Metadata for every attachment on the prompt, images and non-images
+        /// alike — the UI labels the latter `file`/`dir`. Empty for the local
+        /// echo ([`DataStore::push_user`]), which carries no attachment and no
+        /// message id to fetch one by.
+        files: Arc<[MediaMeta]>,
         /// Wire `time.created` (ms). `None` for the optimistic local echo.
         created: Option<i64>,
         /// Whether this row is the input that begins a turn. Upstream
@@ -470,6 +524,10 @@ pub struct ToolPart {
     /// live, `completed`/`error` in history), e.g. glob `count` or shell
     /// `shellID`. `None` while running or when the result carried none.
     pub metadata: Option<Arc<Record>>,
+    /// The images in this call's result the UI can draw: `image/*` entries with
+    /// inline `data:` bytes, as metadata only — [`MediaSource::Tool`] fetches
+    /// the bytes on demand. Empty for every other result, which is most of them.
+    pub media: Arc<[MediaMeta]>,
 }
 
 impl ToolPart {
@@ -996,6 +1054,7 @@ impl DataStore {
     pub fn push_user(&mut self, text: &str) {
         self.items.push(Item::User {
             text: Arc::from(text),
+            files: Arc::default(),
             created: None,
             starts_turn: self.running_since.is_none(),
         });
@@ -1178,6 +1237,7 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
                     child: None,
                     input: Arc::default(),
                     metadata: None,
+                    media: Arc::default(),
                 });
             }
             store.touch(index);
@@ -1263,6 +1323,7 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
                     part.todos = todos_from_input_text(&part.tool, &part.input_text);
                 }
                 part.output = Arc::new(join_text(content));
+                part.media = tool_media(content, assistant_message_id, id);
                 part.child = ChildRef::from_metadata(&part.tool, metadata.as_ref());
                 part.metadata = metadata.clone().map(Arc::new);
                 part.version += 1;
@@ -1273,6 +1334,7 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
             assistant_message_id,
             id,
             error,
+            content,
             metadata,
             ..
         } => {
@@ -1285,6 +1347,9 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
                     part.summary = summary_from_input_text(&part.tool, &part.input_text);
                 }
                 part.output = Arc::new(error.message.clone());
+                if let Some(content) = content {
+                    part.media = tool_media(content, assistant_message_id, id);
+                }
                 part.metadata = metadata.clone().map(Arc::new);
                 part.version += 1;
             }
@@ -1657,6 +1722,49 @@ fn join_text(content: &[ox_schema::support::Content]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// The images of one tool result, as metadata only ([`ToolPart::media`]).
+///
+/// Only `image/*` bytes can be drawn, and only an inline `data:` URI can be
+/// fetched from the media endpoint, so everything else is dropped here rather
+/// than at draw time. `index` is the entry's own position in `content` — that
+/// is what the endpoint reads — so filtering never renumbers it. The base64
+/// payload is never touched.
+#[must_use]
+pub(crate) fn tool_media(
+    content: &[ox_schema::support::Content],
+    message_id: &str,
+    part_id: &str,
+) -> Arc<[MediaMeta]> {
+    let mut media = Vec::new();
+    // The source ids are allocated only when the result actually carries an
+    // image: most tool results draw nothing, and a shell call can finish
+    // hundreds of times in one turn.
+    let mut source_ids: Option<(Arc<str>, Arc<str>)> = None;
+    for (index, entry) in content.iter().enumerate() {
+        let ox_schema::support::Content::File { uri, mime, name } = entry else {
+            continue;
+        };
+        if !mime.starts_with("image/") || !uri.starts_with("data:") {
+            continue;
+        }
+        let Ok(index) = u32::try_from(index) else {
+            continue;
+        };
+        let (message, part) =
+            source_ids.get_or_insert_with(|| (Arc::from(message_id), Arc::from(part_id)));
+        media.push(MediaMeta::new(
+            name.as_deref(),
+            mime,
+            MediaSource::Tool {
+                message: Arc::clone(message),
+                part: Arc::clone(part),
+                index,
+            },
+        ));
+    }
+    media.into()
 }
 
 /// One-line summary from the parsed `tool.called` input. Recognizes the input

@@ -1,15 +1,21 @@
+use std::sync::Arc;
 use std::time::Instant;
 
 use ratatui::Frame;
-use ratatui::layout::{Alignment, Rect};
+use ratatui::layout::{Alignment, Position, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_width::UnicodeWidthStr;
 
+use crate::graphics::Graphics;
+use crate::graphics::Prepared;
+use crate::graphics::Slot;
 use crate::theme;
+use crate::ui::media;
 
 use super::block::Block;
 use super::entry::{Entry, entry_expandable};
-use super::render::{retry_secs, wall_ms_now};
+use super::render::{self, retry_secs, wall_ms_now};
 use super::text::{highlight, line_text, text_rows};
 use super::view::{
     SPINNER_FRAMES, SPINNER_INTERVAL_MS, ViewState, clickable, entry_tool_id, spins,
@@ -36,6 +42,10 @@ pub struct Transcript {
     pub sticky_bottom: bool,
     width: u16,
     height: u16,
+    /// Rows one attachment thumbnail is tall, derived from `height`
+    /// (`media::height`); part of the layout key, so a change re-lays blocks
+    /// out like a width change.
+    thumb_height: u16,
     search: SearchState,
     /// Done messages whose reasoning body is expanded (`r`).
     expanded: std::collections::HashSet<String>,
@@ -88,6 +98,7 @@ impl Transcript {
             sticky_bottom: true,
             width,
             height,
+            thumb_height: media::height(height),
             search: SearchState::default(),
             expanded: std::collections::HashSet::new(),
             tool_expanded: std::collections::HashSet::new(),
@@ -658,7 +669,8 @@ impl Transcript {
         }
         let block = self.entries[index].block.clone();
         let rows = self.entries[index].lines.len();
-        self.entries[index] = Entry::new(block, generation, self.width, view);
+        let metrics = self.metrics();
+        self.entries[index] = Entry::new(block, generation, metrics, view);
         if let Some(sel) = self.selection
             && self.entries[index].lines.len() != rows
             && self.first_line_of(index) <= sel.ordered().1.line
@@ -704,6 +716,7 @@ impl Transcript {
             0
         };
         let mut stale = false;
+        let metrics = self.metrics();
         for ((entry, block), view) in self.entries[start..end]
             .iter_mut()
             .zip(&blocks[start..end])
@@ -712,7 +725,7 @@ impl Transcript {
             let rows = entry.lines.len();
             if entry.block != *block || entry.view != view {
                 let generation = entry.generation + 1;
-                *entry = Entry::new(block.clone(), generation, self.width, view);
+                *entry = Entry::new(block.clone(), generation, metrics, view);
             }
             if let Some(last) = selected_to {
                 stale |= entry.lines.len() != rows && base <= last;
@@ -729,7 +742,7 @@ impl Transcript {
                 .collect();
             for (block, view) in blocks[appended..].iter().zip(views) {
                 self.entries
-                    .push(Entry::new(block.clone(), 0, self.width, view));
+                    .push(Entry::new(block.clone(), 0, metrics, view));
             }
         }
 
@@ -838,7 +851,7 @@ impl Transcript {
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| match &entry.block {
-                Block::User { text } => Some((index, &**text)),
+                Block::User { text, .. } => Some((index, &**text)),
                 _ => None,
             })
             .collect()
@@ -866,24 +879,41 @@ impl Transcript {
 
     pub fn set_viewport(&mut self, width: u16, height: u16) {
         self.height = height;
-        if self.width != width {
-            self.width = width;
-            // Re-wrapping renumbers lines, so a selection no longer points at
-            // what it selected.
-            self.selection = None;
-            // Re-wrap eagerly: `search.matches` holds absolute wrapped-line
-            // numbers, and a width change renumbers every line after the first
-            // one that now wraps differently. Costs nothing on the frames that
-            // keep the width (the guard above), and makes `render`'s own
-            // `lines_for` calls no-ops for this pass.
-            for entry in &mut self.entries {
-                entry.lines_for(width);
-            }
-            if !self.search.query.is_empty() {
-                self.recompute_search();
-            }
+        let thumb_height = media::height(height);
+        if self.width == width && self.thumb_height == thumb_height {
+            self.clamp();
+            return;
+        }
+        // A thumbnail-height change renumbers lines too: a block's strip rows
+        // are part of its line list, so a taller band pushes every later match
+        // down even at an unchanged width.
+        self.width = width;
+        self.thumb_height = thumb_height;
+        // Re-wrapping renumbers lines, so a selection no longer points at
+        // what it selected.
+        self.selection = None;
+        // Re-wrap eagerly: `search.matches` holds absolute wrapped-line
+        // numbers, and a width change renumbers every line after the first
+        // one that now wraps differently. Costs nothing on the frames that
+        // keep the width (the guard above), and makes `render`'s own
+        // `lines_for` calls no-ops for this pass.
+        let metrics = self.metrics();
+        for entry in &mut self.entries {
+            entry.lines_for(metrics);
+        }
+        if !self.search.query.is_empty() {
+            self.recompute_search();
         }
         self.clamp();
+    }
+
+    /// The frame every block is laid out for: the columns it may use and the
+    /// rows one attachment thumbnail is tall.
+    fn metrics(&self) -> render::Metrics {
+        render::Metrics {
+            width: self.width,
+            thumb_height: self.thumb_height,
+        }
     }
 
     pub fn scroll_up(&mut self, lines: usize) {
@@ -921,20 +951,40 @@ impl Transcript {
         }
     }
 
-    pub fn render(&mut self, frame: &mut Frame, area: Rect) {
+    /// Draw the transcript into `area`, painting the attachment thumbnails the
+    /// graphics layer already holds.
+    ///
+    /// The escape sequences a kitty transmission needs are written from here,
+    /// before the frame's cells: a placeholder cell can only show an image the
+    /// terminal has, and the frame that first names one is the frame this
+    /// queues. Returns the thumbnails still to fetch, which the caller asks for
+    /// once the frame is done.
+    pub fn render(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        graphics: &mut Graphics,
+    ) -> Vec<media::Request> {
         self.last_area = area;
         self.set_viewport(area.width, area.height);
         self.clamp();
 
+        let metrics = self.metrics();
         let mut remaining_skip = self.scroll;
         let mut y = area.y;
         let mut base = 0usize;
         let current_match = self.current_line();
+        // Where each visible thumbnail strip starts, by entry index: its rows
+        // are drawn with the text, the pixels after it.
+        let mut strips: Vec<(usize, i32)> = Vec::new();
 
         let selection = self.selection.filter(|s| !s.is_empty());
-        for entry in &mut self.entries {
+        for (index, entry) in self.entries.iter_mut().enumerate() {
             let (head, tail) = text_rows(&entry.block);
-            let lines = entry.lines_for(area.width);
+            // The strip's geometry is a value; the images stay behind the
+            // borrow `lines_for` needs.
+            let strip = entry.thumbs.as_ref().map(|thumbs| thumbs.strip);
+            let lines = entry.lines_for(metrics);
             let count = lines.len();
 
             if remaining_skip >= count {
@@ -952,6 +1002,12 @@ impl Transcript {
             }
 
             let height = visible.len() as u16;
+            if let Some(strip) = strip {
+                // The screen row the strip's first image row lands on; it may
+                // be above the viewport when the entry is scrolled partly off.
+                let top = i32::from(y) + strip.at as i32 - skip as i32;
+                strips.push((index, top));
+            }
             let rect = Rect {
                 x: area.x,
                 y,
@@ -1005,6 +1061,110 @@ impl Transcript {
         if let Some(rect) = self.jump_rect() {
             self.render_jump(frame, rect);
         }
+        self.paint_thumbs(frame, area, &strips, graphics)
+    }
+
+    /// The thumbnail a click at screen cell (`x`, `y`) landed on: the strip it
+    /// belongs to (every image it draws, in strip order) and which of them was
+    /// hit.
+    ///
+    /// Geometry mirrors [`Self::paint_thumbs`] rather than re-rendering: an
+    /// entry's rows only move when `sync`, `rebuild` or a resize re-lays them
+    /// out, and a click follows the frame that was just drawn.
+    #[must_use]
+    pub fn image_at(&self, x: u16, y: u16) -> Option<(&[media::Image], usize)> {
+        let area = self.last_area;
+        if !cell_in(area, x, y) {
+            return None;
+        }
+        let mut base = 0usize;
+        for entry in &self.entries {
+            let count = entry.lines.len();
+            let Some(thumbs) = &entry.thumbs else {
+                base += count;
+                continue;
+            };
+            let top = i32::from(area.y) + (base + thumbs.strip.at) as i32 - self.scroll as i32;
+            let Some(layout) = strip_layout(area, thumbs.strip, top) else {
+                base += count;
+                continue;
+            };
+            for position in 0..usize::from(layout.cells) {
+                let Ok(position) = u16::try_from(position) else {
+                    break;
+                };
+                if cell_in(layout.cell(&thumbs.strip, position), x, y) {
+                    return Some((&thumbs.images, usize::from(position)));
+                }
+            }
+            // `+N more` opens at the first image the band does not draw.
+            if layout.more.is_some_and(|more| cell_in(more, x, y)) {
+                return Some((&thumbs.images, layout.cells.into()));
+            }
+            base += count;
+        }
+        None
+    }
+
+    /// Paint the cached thumbnails of `strips` into the frame and report the
+    /// ones whose bytes are still missing.
+    ///
+    /// Only a thumbnail whose cells are all inside `area` is drawn: a kitty
+    /// placeholder names its row and column inside the image, so a clipped
+    /// corner would have to be drawn with offsets the encoder does not carry.
+    /// Half-visible images stay blank until the scroll brings them in.
+    fn paint_thumbs(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        strips: &[(usize, i32)],
+        graphics: &mut Graphics,
+    ) -> Vec<media::Request> {
+        let mut prepared: Vec<Arc<Prepared>> = Vec::new();
+        let mut areas: Vec<Rect> = Vec::new();
+        let mut requests: Vec<media::Request> = Vec::new();
+        for (index, top) in strips {
+            let Some(thumbs) = &self.entries[*index].thumbs else {
+                continue;
+            };
+            let Some(layout) = strip_layout(area, thumbs.strip, *top) else {
+                continue;
+            };
+            for position in 0..usize::from(layout.cells) {
+                let Ok(position) = u16::try_from(position) else {
+                    break;
+                };
+                let Some(image) = thumbs.images.get(usize::from(position)) else {
+                    break;
+                };
+                let cell = layout.cell(&thumbs.strip, position);
+                match graphics.cached_for(&image.key, thumbs.strip.cells()) {
+                    Some(image) => {
+                        prepared.push(image);
+                        areas.push(cell);
+                    }
+                    None => requests.push(media::Request {
+                        key: image.key.clone(),
+                        bytes: image.bytes.clone(),
+                        cells: thumbs.strip.cells(),
+                        class: media::THUMBNAIL,
+                    }),
+                }
+            }
+            if let Some(more) = layout.more {
+                draw_more(frame, more, thumbs.strip.more);
+            }
+        }
+        let slots: Vec<Slot<'_>> = prepared
+            .iter()
+            .zip(&areas)
+            .map(|(image, area)| Slot { area: *area, image })
+            .collect();
+        graphics.paint(frame.buffer_mut(), &slots);
+        if let Err(err) = graphics.flush() {
+            tracing::warn!(%err, "queued graphics escapes not written");
+        }
+        requests
     }
 
     /// Draw the `Jump to latest ↓` label into `rect`, dim until the pointer
@@ -1022,9 +1182,39 @@ impl Transcript {
     }
 }
 
+/// What a strip whose first image row lands on screen row `top` shows, or
+/// `None` when the band is not wholly inside `area` (scrolled partly out of
+/// view): a kitty placeholder names its row and column inside the image, so a
+/// clipped corner cannot be drawn with the offsets the encoder carries.
+fn strip_layout(area: Rect, strip: media::Strip, top: i32) -> Option<media::Layout> {
+    if top < i32::from(area.y) {
+        return None;
+    }
+    let y = u16::try_from(top).ok()?;
+    (y.saturating_add(strip.height) <= area.bottom()).then(|| strip.layout_in(area, y))
+}
+
+/// Upstream's `+N more` label, dim and centred in its box
+/// (`routes/session/index.tsx:2676`).
+fn draw_more(frame: &mut Frame, more: Rect, remaining: usize) {
+    let label = format!("+{remaining} more");
+    let width = u16::try_from(label.width())
+        .unwrap_or(more.width)
+        .min(more.width);
+    frame.render_widget(
+        Paragraph::new(Span::styled(label, theme::palette().dim)),
+        Rect {
+            x: more.x + (more.width - width) / 2,
+            y: more.y,
+            width,
+            height: 1,
+        },
+    );
+}
+
 /// Whether screen cell (`x`, `y`) falls inside `rect`.
 fn cell_in(rect: Rect, x: u16, y: u16) -> bool {
-    x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+    rect.contains(Position::new(x, y))
 }
 
 /// The text of absolute transcript line `abs`; `None` past the end and on
@@ -1091,7 +1281,9 @@ mod tests {
     fn draw_at(transcript: &mut Transcript, width: u16, height: u16) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
         terminal
-            .draw(|frame| transcript.render(frame, frame.area()))
+            .draw(|frame| {
+                transcript.render(frame, frame.area(), &mut Graphics::new());
+            })
             .expect("draw");
         terminal.backend().buffer().clone()
     }

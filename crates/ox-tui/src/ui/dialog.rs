@@ -21,8 +21,11 @@ use unicode_width::UnicodeWidthStr;
 
 use super::form::{self, FormOutcome, FormState};
 use super::fuzzy;
+use super::image_preview::{self, Preview};
+use super::media;
 use super::output_dialog::{self, Output};
 use super::paste;
+use crate::graphics::Graphics;
 use crate::theme::{self, Palette};
 
 /// What a key did to the open dialog. The app only needs to know whether to
@@ -57,6 +60,8 @@ pub enum Dialog {
     Form(Box<FormState>),
     /// A shell's recent output (`ui/output_dialog.rs`).
     Output(Output),
+    /// An image at full panel size (`ui/image_preview.rs`).
+    Preview(Preview),
 }
 
 impl Dialog {
@@ -67,6 +72,7 @@ impl Dialog {
             Self::Input(input) => &input.title,
             Self::Form(form) => form.title(),
             Self::Output(_) => "Shell output",
+            Self::Preview(_) => "Image",
         }
     }
 
@@ -79,6 +85,7 @@ impl Dialog {
             Self::Input(input) => input.tag,
             Self::Form(_) => None,
             Self::Output(_) => Some(output_dialog::TAG),
+            Self::Preview(_) => Some(image_preview::TAG),
         }
     }
 
@@ -99,6 +106,7 @@ impl Dialog {
                 FormOutcome::Cancel => DialogOutcome::Cancelled,
             },
             Self::Output(output) => output.on_key(key),
+            Self::Preview(preview) => preview.on_key(key),
         }
     }
 }
@@ -109,7 +117,7 @@ impl Dialog {
     /// so it never reaches the composer).
     pub fn on_paste(&mut self, text: &str) -> DialogOutcome {
         match self {
-            Self::Info(_) | Self::Output(_) => DialogOutcome::Idle,
+            Self::Info(_) | Self::Output(_) | Self::Preview(_) => DialogOutcome::Idle,
             Self::Select(select) => select.on_paste(text),
             Self::Input(input) => input.on_paste(text),
             Self::Form(form) => match form.on_paste(text) {
@@ -185,25 +193,48 @@ pub fn status(servers: &[McpRef]) -> Dialog {
 }
 
 /// Draw `dialog` over `area`, clearing what is underneath.
-pub fn render(frame: &mut Frame, area: Rect, dialog: &Dialog) {
+///
+/// Returns the images the dialog wants fetched; a dialog that shows pictures
+/// paints the ones already in the cache through `graphics` and asks the app for
+/// the rest, exactly as the transcript does.
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    dialog: &Dialog,
+    graphics: &mut Graphics,
+) -> Vec<media::Request> {
     match dialog {
-        Dialog::Info(info) => render_info(frame, area, info),
+        Dialog::Info(info) => {
+            render_info(frame, area, info);
+            Vec::new()
+        }
         Dialog::Select(select) => {
             let cursor = draw_select(frame.buffer_mut(), area, select, theme::palette());
             frame.set_cursor_position(cursor);
+            Vec::new()
         }
         Dialog::Input(input) => {
             let cursor = draw_input(frame.buffer_mut(), area, input, theme::palette());
             frame.set_cursor_position(cursor);
+            Vec::new()
         }
         Dialog::Form(form) => {
             if let Some(cursor) = form::draw(frame.buffer_mut(), area, form, theme::palette()) {
                 frame.set_cursor_position(cursor);
             }
+            Vec::new()
         }
         Dialog::Output(output) => {
             output_dialog::draw(frame.buffer_mut(), area, output, theme::palette());
+            Vec::new()
         }
+        Dialog::Preview(preview) => image_preview::draw(
+            frame.buffer_mut(),
+            area,
+            preview,
+            theme::palette(),
+            graphics,
+        ),
     }
 }
 

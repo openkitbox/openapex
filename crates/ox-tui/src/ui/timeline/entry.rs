@@ -1,14 +1,18 @@
 use ratatui::text::Line;
 
 use super::block::Block;
+use super::render::Metrics;
+use super::render::Rendered;
 use super::render::render_entry;
 use super::view::{SPINNER_FRAMES, ViewState, tool_expandable};
+use crate::ui::media;
 
 pub(super) struct Entry {
     pub(super) block: Block,
     pub(super) generation: u64,
     pub(super) lines: Vec<Line<'static>>,
-    pub(super) width: u16,
+    /// The frame the rows were laid out for; a change re-lays them out.
+    pub(super) metrics: Metrics,
     pub(super) view: ViewState,
     /// A click or `o` toggles the block (see `entry_expandable`). Computed
     /// with `lines`, because a shell block's answer depends on the width its
@@ -17,27 +21,43 @@ pub(super) struct Entry {
     /// The row of `lines` holding a shell block's spinner lead (see
     /// `shell_block::Rendered::spinner_row`), rendered with `lines`.
     spinner_row: Option<usize>,
+    /// The rows this block leaves for attachment thumbnails.
+    pub(super) thumbs: Option<media::Thumbs>,
 }
 
 impl Entry {
-    pub(super) fn new(block: Block, generation: u64, width: u16, view: ViewState) -> Self {
-        let (lines, expandable, spinner_row) = render_entry(&block, width, view);
+    pub(super) fn new(block: Block, generation: u64, metrics: Metrics, view: ViewState) -> Self {
+        let Rendered {
+            lines,
+            expandable,
+            spinner_row,
+            thumbs,
+        } = render_entry(&block, metrics, view);
         Self {
             block,
             generation,
             lines,
-            width,
+            metrics,
             view,
             expandable,
             spinner_row,
+            thumbs,
         }
     }
 
-    pub(super) fn lines_for(&mut self, width: u16) -> &[Line<'static>] {
-        if self.width != width {
-            (self.lines, self.expandable, self.spinner_row) =
-                render_entry(&self.block, width, self.view);
-            self.width = width;
+    pub(super) fn lines_for(&mut self, metrics: Metrics) -> &[Line<'static>] {
+        if self.metrics != metrics {
+            let Rendered {
+                lines,
+                expandable,
+                spinner_row,
+                thumbs,
+            } = render_entry(&self.block, metrics, self.view);
+            self.lines = lines;
+            self.expandable = expandable;
+            self.spinner_row = spinner_row;
+            self.thumbs = thumbs;
+            self.metrics = metrics;
         }
         &self.lines
     }

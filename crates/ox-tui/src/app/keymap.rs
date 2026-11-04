@@ -46,6 +46,7 @@ const LEADER_KEYS: &[(KeyCode, CommandAction)] = &[
     (KeyCode::Char('s'), CommandAction::Status),
     (KeyCode::Char('q'), CommandAction::QueuedPrompts),
     (KeyCode::Char('b'), CommandAction::Shells),
+    (KeyCode::Char('i'), CommandAction::Images),
 ];
 
 /// What a global binding asks the app to do.

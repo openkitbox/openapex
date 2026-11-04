@@ -7,13 +7,19 @@
 //! `AttachSession`, `DetachSession`, `Quit`) stay on `main`'s serial loop and
 //! are no-ops here.
 
+use std::sync::Arc;
+
 use ox_client::Client;
+use ox_client::store::MediaSource;
 use ox_client::store::RunningShell;
 use ox_schema::support::FileInput;
+use ratatui::layout::Size;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::command::{AgentIntent, AppCommand, CancelReason, Switch};
 use crate::app::event::AppEvent;
+use crate::app::event::Fetched;
+use crate::graphics::cache::SizeClass;
 
 type Events = UnboundedSender<AppEvent>;
 
@@ -81,6 +87,19 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
         AppCommand::ReadClipboard => read_clipboard(&tx).await,
         AppCommand::WriteClipboard(text) => write_clipboard(&tx, text).await,
         AppCommand::ProbeChildren { children } => probe_children(&client, &tx, children).await,
+        AppCommand::FetchMedia {
+            session,
+            key,
+            source,
+            cells,
+            class,
+        } => fetch_media(&client, &tx, &session, key, source, cells, class).await,
+        AppCommand::MediaInline {
+            key,
+            bytes,
+            cells,
+            class,
+        } => media_inline(&tx, key, bytes, cells, class).await,
         AppCommand::LoadSessionChrome { session } => session_chrome(&client, &tx, session).await,
         AppCommand::McpList => mcp_list(&client, &tx).await,
         AppCommand::ModelList => model_list(&client, &tx).await,
@@ -330,6 +349,78 @@ async fn probe_children(client: &Client, tx: &Events, children: Vec<String>) {
             }
             Err(err) => tracing::warn!(%err, child, "child session probe failed"),
         }
+    }
+}
+
+/// One attachment's bytes, and on a sixel terminal the encode for the grid it
+/// will be drawn on.
+///
+/// The encode decodes the image and resamples it, so it runs on a blocking
+/// thread: a 4000px photo would otherwise stall the runtime that also carries
+/// the session's event stream. Kitty needs none of that — the terminal scales the
+/// transmission itself — but the payload still has to be PNG for it.
+async fn fetch_media(
+    client: &Client,
+    tx: &Events,
+    session: &str,
+    key: String,
+    source: MediaSource,
+    cells: Option<Size>,
+    class: SizeClass,
+) {
+    let (message, part, index) = match &source {
+        MediaSource::Prompt { message, index } => (message.as_ref(), None, *index),
+        MediaSource::Tool {
+            message,
+            part,
+            index,
+        } => (message.as_ref(), Some(part.as_ref()), *index),
+    };
+    let result = match client.media(session, message, part, index).await {
+        Ok(media) => prepared(Arc::from(media.bytes), cells).await,
+        Err(err) => Err(err.to_string()),
+    };
+    let _ = tx.send(AppEvent::Media { key, class, result });
+}
+
+/// One attachment the composer already holds: no request, but a terminal that
+/// encodes per grid still needs the encode its grid demands.
+async fn media_inline(
+    tx: &Events,
+    key: String,
+    bytes: Arc<[u8]>,
+    cells: Option<Size>,
+    class: SizeClass,
+) {
+    let result = prepared(bytes, cells).await;
+    let _ = tx.send(AppEvent::Media { key, class, result });
+}
+
+/// The bytes a drawing terminal can cache: the payload as PNG for kitty, an
+/// encode for the grid for sixel, which cannot reuse one encode at another size.
+///
+/// Kitty is handed `f=100`, which is PNG data, so a stored JPEG or WebP is
+/// re-encoded once here rather than drawn as nothing.
+async fn prepared(bytes: Arc<[u8]>, cells: Option<Size>) -> Result<Fetched, String> {
+    let Some(cells) = cells else {
+        let png = tokio::task::spawn_blocking(move || crate::graphics::png::ensure(bytes))
+            .await
+            .map_err(|err| err.to_string())?;
+        return png
+            .map(Fetched::Png)
+            .ok_or_else(|| "these bytes are not an image this build can decode".to_string());
+    };
+    let Some(picker) = crate::graphics::probe::capabilities().picker.clone() else {
+        return Err("this terminal cannot encode images".to_string());
+    };
+    match tokio::task::spawn_blocking(move || {
+        crate::graphics::sixel::prepare(&picker, &bytes, cells)
+    })
+    .await
+    {
+        Ok(Ok(prepared)) => Ok(Fetched::Sixel(Box::new(prepared))),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(err) => Err(err.to_string()),
     }
 }
 

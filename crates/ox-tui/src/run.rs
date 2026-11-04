@@ -51,6 +51,12 @@ pub async fn run() -> anyhow::Result<()> {
     // OSC replies arrive on the same stream as the keystrokes.
     crate::theme::init(crate::theme::terminal::query());
 
+    // Graphics support is one more stdio query in the same pre-TUI window, and
+    // for the same reason it has to happen before the event thread below: the
+    // replies to the kitty/sixel and cell-size queries arrive on stdin. The
+    // query enters and restores raw mode itself, so the two run in sequence.
+    crate::graphics::probe::init();
+
     // 事件线程：阻塞 read 放独立线程。
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let terminal_tx = event_tx.clone();

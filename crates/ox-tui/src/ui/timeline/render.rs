@@ -2,7 +2,12 @@ use std::borrow::Cow;
 
 use ratatui::text::{Line, Span};
 
-use ox_client::store::{CompletionSource, ModelChoice, Notice, Switch, ToolState};
+use ox_client::store::CompletionSource;
+use ox_client::store::MediaMeta;
+use ox_client::store::ModelChoice;
+use ox_client::store::Notice;
+use ox_client::store::Switch;
+use ox_client::store::ToolState;
 
 use crate::theme;
 
@@ -11,9 +16,32 @@ use super::text::{format_duration, indent_wrapped, titlecase};
 use super::tool::{explored_block, text_tool_block, todo_block, tool_block};
 use super::view::{SPINNER_FRAMES, ViewState, draws_block, tool_expandable};
 use crate::ui::block_tool;
+use crate::ui::media;
 use crate::ui::patch_block::PatchCall;
 use crate::ui::tool_row::{self, InlineSpec, RowView};
 use crate::ui::tool_text;
+
+/// The frame a block is laid out for: the columns it may use, and the rows one
+/// attachment thumbnail is tall (which follows the terminal, not the block).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Metrics {
+    pub(super) width: u16,
+    pub(super) thumb_height: u16,
+}
+
+/// What one block draws: its rows, whether a click or `o` toggles it (a shell
+/// block learns that from the same collapse its rows came from), the row of a
+/// shell block's spinner lead, and the row band it reserves for attachment
+/// thumbnails.
+pub(super) struct Rendered {
+    pub(super) lines: Vec<Line<'static>>,
+    pub(super) expandable: bool,
+    pub(super) spinner_row: Option<usize>,
+    /// Where the thumbnail strip's rows are, when the block has images and this
+    /// terminal can draw them: the rows themselves are blank, since an image is
+    /// pixels the graphics layer paints into the cells they leave.
+    pub(super) thumbs: Option<media::Thumbs>,
+}
 
 /// Every block is one upstream row: `marginTop={1}` puts a blank line above it
 /// (`routes/session/index.tsx:1670`). A block with nothing to show draws
@@ -21,14 +49,12 @@ use crate::ui::tool_text;
 /// A block's rows, and whether a click or `o` toggles it: a shell block
 /// learns that from the same collapse its rows came from.
 /// A shell block also reports the row of its spinner lead.
-pub(super) fn render_entry(
-    block: &Block,
-    width: u16,
-    view: ViewState,
-) -> (Vec<Line<'static>>, bool, Option<usize>) {
+pub(super) fn render_entry(block: &Block, metrics: Metrics, view: ViewState) -> Rendered {
+    let width = metrics.width;
     let palette = theme::palette();
     let mut expandable = tool_expandable(block);
     let mut spinner_row = None;
+    let mut thumbs = None;
     let body = match block {
         Block::Shell {
             state,
@@ -66,7 +92,11 @@ pub(super) fn render_entry(
             spinner_row = rendered.spinner_row;
             rendered.lines
         }
-        Block::User { text } => user_block(text, view, width),
+        Block::User { text, files } => {
+            let (lines, strip) = user_block(text, files, view, metrics);
+            thumbs = strip;
+            lines
+        }
         Block::Reasoning { text, done, ms, .. } => reasoning_block(text, *done, *ms, view, width),
         Block::Assistant { text, footer, .. } => {
             assistant_block(text, footer.as_ref(), view.retry_secs, width)
@@ -83,27 +113,49 @@ pub(super) fn render_entry(
             output,
             input,
             metadata,
+            media: files,
             ..
-        } => match own_block(
-            tool,
-            &PatchCall {
-                state: *state,
-                input,
-                metadata: metadata.as_deref(),
-                output,
-            },
-            width,
-            palette,
-        ) {
-            Some(lines) => lines,
-            None => {
-                match tool_text::text(tool, input, metadata.as_deref(), *state, tool_text::paths())
-                {
-                    Some(text) => text_tool_block(block, &text, input, output, view, width),
-                    None => tool_block(block, tool, *state, summary, output, view, width),
+        } => {
+            let mut body = match own_block(
+                tool,
+                &PatchCall {
+                    state: *state,
+                    input,
+                    metadata: metadata.as_deref(),
+                    output,
+                },
+                width,
+                palette,
+            ) {
+                Some(lines) => lines,
+                None => {
+                    match tool_text::text(
+                        tool,
+                        input,
+                        metadata.as_deref(),
+                        *state,
+                        tool_text::paths(),
+                    ) {
+                        Some(text) => text_tool_block(block, &text, input, output, view, width),
+                        None => tool_block(block, tool, *state, summary, output, view, width),
+                    }
                 }
+            };
+            // A result that carries images draws them under the block, as
+            // upstream's `ToolImages` does (`routes/session/index.tsx:2645`):
+            // one padding row, the image rows, one padding row.
+            if !body.is_empty()
+                && let Some(drawn) = thumbs_of(files, metrics, body.len() + 1)
+            {
+                body.push(Line::default());
+                body.extend(
+                    std::iter::repeat_with(Line::default).take(usize::from(drawn.strip.height)),
+                );
+                body.push(Line::default());
+                thumbs = Some(drawn);
             }
-        },
+            body
+        }
         Block::Todo {
             state,
             todos,
@@ -141,13 +193,29 @@ pub(super) fn render_entry(
         )],
     };
     if body.is_empty() {
-        return (body, expandable, None);
+        return Rendered {
+            lines: body,
+            expandable,
+            spinner_row: None,
+            thumbs: None,
+        };
     }
     let mut lines = Vec::with_capacity(body.len() + 1);
     lines.push(Line::default());
     lines.extend(body);
     // The margin row above shifts the block's own rows down by one.
-    (lines, expandable, spinner_row.map(|row| row + 1))
+    Rendered {
+        lines,
+        expandable,
+        spinner_row: spinner_row.map(|row| row + 1),
+        thumbs: thumbs.map(|thumbs| media::Thumbs {
+            strip: media::Strip {
+                at: thumbs.strip.at + 1,
+                ..thumbs.strip
+            },
+            ..thumbs
+        }),
+    }
 }
 
 /// Columns every session-level row is indented (`paddingLeft={3}`).
@@ -599,24 +667,111 @@ fn footer_line(footer: &TurnFooter, width: u16) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The strip a block with `files` reserves rows for, when this terminal draws
+/// pixels and the attachment list has images: `at` is the row the first image
+/// starts on, so drawing and hit-testing read one number.
+///
+/// A surface then adds its own padding rows around it: the user block has the
+/// frame's margin above and a `gap` plus the text box's padding below, a tool
+/// block has upstream's `paddingTop`/`paddingBottom` of one row each
+/// (`SessionImages`, `routes/session/index.tsx:2670-2712`).
+fn thumbs_of(files: &[MediaMeta], metrics: Metrics, at: usize) -> Option<media::Thumbs> {
+    if !media::supported() {
+        return None;
+    }
+    let thumbs = media::Thumbs::new(at, files, metrics.thumb_height)?;
+    // A band too narrow for a cell and for `+N more` would reserve rows nothing
+    // draws into, so the block keeps its text and shows no strip.
+    let band = u16::try_from(block_tool::content_width(metrics.width)).unwrap_or(u16::MAX);
+    thumbs.strip.draws_in(band).then_some(thumbs)
+}
+
 /// Upstream user message (`routes/session/index.tsx` ~2370): the block-tool
 /// frame with an agent-coloured rail, on `raised.base` (`raised.high` under
 /// the pointer, `block_tool::surface`).
-fn user_block(text: &str, view: ViewState, width: u16) -> Vec<Line<'static>> {
+///
+/// Above the text the block reserves a strip of thumbnail rows when the prompt
+/// carried images and this terminal draws them (`SessionImages`, `:2656-2712`);
+/// under it a `file`/`dir` badge row names every attachment (`:2447-2480`).
+fn user_block(
+    text: &str,
+    files: &[MediaMeta],
+    view: ViewState,
+    metrics: Metrics,
+) -> (Vec<Line<'static>>, Option<media::Thumbs>) {
     let palette = theme::palette();
     let band = block_tool::surface(palette, view.hovered);
     let rail = Span::styled(block_tool::RAIL, palette.agent.patch(band));
-    let rows: Vec<Line<'static>> = block_tool::wrap(text, block_tool::content_width(width))
-        .into_iter()
-        .map(|row| Line::from(Span::styled(row, palette.text)))
-        .collect();
-    block_tool::frame(rows, &rail, band, width)
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut thumbs = None;
+    if let Some(drawn) = thumbs_of(files, metrics, 1) {
+        // The frame's leading blank row is the strip's `paddingTop`, so the
+        // rows added here are the image rows, their `paddingBottom` and the
+        // text box's `paddingTop` (`gap={1}` between the two boxes).
+        rows.extend(std::iter::repeat_with(Line::default).take(usize::from(drawn.strip.height)));
+        rows.push(Line::default());
+        rows.push(Line::default());
+        thumbs = Some(drawn);
+    }
+    rows.extend(
+        block_tool::wrap(text, block_tool::content_width(metrics.width))
+            .into_iter()
+            .map(|row| Line::from(Span::styled(row, palette.text))),
+    );
+    if !files.is_empty() {
+        rows.push(Line::default());
+        rows.extend(attachment_labels(
+            files,
+            block_tool::content_width(metrics.width),
+        ));
+    }
+    (block_tool::frame(rows, &rail, band, metrics.width), thumbs)
+}
+
+/// One row per attachment chip, wrapped at `width`: ` file name` on the badge
+/// fill, the name on the receded chip behind it (`:2447-2480`). A directory is
+/// labelled `dir`, every other type `file`.
+fn attachment_labels(files: &[MediaMeta], width: usize) -> Vec<Line<'static>> {
+    let palette = theme::palette();
+    let width = width.max(1);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for file in files {
+        let badge = if file.is_dir() { " dir " } else { " file " };
+        let name = format!(" {} ", file.name.as_deref().unwrap_or("attachment"));
+        let chip = Span::styled(badge, palette.image)
+            .width()
+            .saturating_add(Span::styled(name.clone(), palette.image_text).width());
+        // One column between chips, then wrap like upstream's `flexWrap`.
+        if used > 0 && used.saturating_add(1).saturating_add(chip) > width {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            used = 0;
+        }
+        if used > 0 {
+            spans.push(Span::raw(" "));
+            used += 1;
+        }
+        spans.push(Span::styled(badge, palette.image));
+        spans.push(Span::styled(name, palette.image_text));
+        used = used.saturating_add(chip);
+    }
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::text::line_text;
     use super::*;
+
+    /// The standard fixture frame: 100 columns, four thumbnail rows.
+    const METRICS: Metrics = Metrics {
+        width: 100,
+        thumb_height: 4,
+    };
 
     /// The footer of a finished 5m 3s, 32.1 tok/s turn like the one the gold
     /// capture shows.
@@ -644,8 +799,8 @@ mod tests {
 
     /// The first drawn row after the block's leading margin row.
     fn header(block: &Block) -> String {
-        let (rows, _, _) = render_entry(block, 100, ViewState::default());
-        line_text(&rows[1])
+        let rendered = render_entry(block, METRICS, ViewState::default());
+        line_text(&rendered.lines[1])
     }
 
     /// Gold: `General · k3-256k · 5m 3s · 32.1 tok/s` — the footer names the
