@@ -7,12 +7,19 @@
 //! Upstream defaults (`packages/tui/src/config/keybind.ts`):
 //! `command.palette.show = ctrl+p`, `leader = ctrl+x` with a 2000ms timeout
 //! (`context/keymap.tsx:143`), `session.new = <leader>n`,
-//! `session.list = <leader>l`, `session.child.first = <leader>down`, `model.list = <leader>m`, `agent.list = <leader>a`,
+//! `session.list = <leader>l`, `model.list = <leader>m`, `agent.list = <leader>a`,
 //! `opencode.status = <leader>s`,
 //! `session.queued_prompts = <leader>q`
 //! (upstream's `app.exit` also lists `<leader>q`: the queue command takes
 //! the key while prompts are queued, otherwise it declines and the app
 //! exits; `App::run_command` makes that choice).
+//! `session.child.first` is a bare `↓` (`config/keybind.ts:138`), not a leader
+//! sequence: the same key runs `prompt.history.next`, which returns `false`
+//! once the history is exhausted (`component/prompt/index.tsx:1086`), so
+//! the picker takes the key after the prompt declines it
+//! (`App::declined_key`). It stays out of [`LEADER_KEYS`] for that reason and
+//! still reports a hint here, because the palette lists it beside the
+//! leader-bound commands.
 //! ox has no sidebar, so `<leader>b` (upstream `session.sidebar.toggle`)
 //! opens the Shells list instead.
 //! A key that does not continue a pending leader sequence cancels it and is
@@ -38,7 +45,6 @@ const LEADER_KEYS: &[(KeyCode, CommandAction)] = &[
     (KeyCode::Char('a'), CommandAction::Agents),
     (KeyCode::Char('s'), CommandAction::Status),
     (KeyCode::Char('q'), CommandAction::QueuedPrompts),
-    (KeyCode::Down, CommandAction::Subagents),
     (KeyCode::Char('b'), CommandAction::Shells),
 ];
 
@@ -109,11 +115,15 @@ impl Keymap {
 /// The key hint of `action` (`ctrl+x l`), if it has a binding.
 #[must_use]
 pub fn hint(action: CommandAction) -> Option<String> {
+    // `session.child.first` is a bare `↓`: no leader label, because the key
+    // needs none upstream either (the palette lists it the same way).
+    if action == CommandAction::Subagents {
+        return Some(crate::ui::prompt::SUBAGENT_SHORTCUT.to_owned());
+    }
     LEADER_KEYS
         .iter()
         .find(|(_, bound)| *bound == action)
         .map(|(code, _)| match code {
-            KeyCode::Down => format!("{LEADER_LABEL} ↓"),
             KeyCode::Char(ch) => format!("{LEADER_LABEL} {ch}"),
             other => format!("{LEADER_LABEL} {other}"),
         })
@@ -157,4 +167,36 @@ fn is_ctrl(key: &KeyEvent, ch: char) -> bool {
 /// `ctrl+c` and `ctrl+f`, kept so their behaviour does not change.
 fn has_ctrl(key: &KeyEvent, ch: char) -> bool {
     key.code == KeyCode::Char(ch) && key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_picker_hint_is_the_bare_down_arrow() {
+        assert_eq!(
+            hint(CommandAction::Subagents).as_deref(),
+            Some(crate::ui::prompt::SUBAGENT_SHORTCUT),
+            "upstream binds `session.child.first` to a bare `down` (`config/keybind.ts:138`), \
+             and its palette prints that key alone"
+        );
+    }
+
+    #[test]
+    fn the_leader_no_longer_binds_the_down_arrow() {
+        let mut keymap = Keymap::default();
+        let now = Instant::now();
+        let leader = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert_eq!(
+            keymap.feed(&leader, now, true),
+            Feed::Consumed,
+            "ctrl+x arms the leader"
+        );
+        assert_eq!(
+            keymap.feed(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), now, true),
+            Feed::Consumed,
+            "`<leader>↓` is not a binding: the pending sequence is cancelled and the key swallowed"
+        );
+    }
 }

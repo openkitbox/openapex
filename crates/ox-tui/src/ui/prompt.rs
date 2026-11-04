@@ -155,11 +155,68 @@ fn session_hint(pal: &theme::Palette) -> Vec<Span<'static>> {
     ]
 }
 
+/// How the subagent picker's shortcut reads in the footer and the palette:
+/// upstream `session.child.first = down`, formatted as `↓`
+/// (`config/keybind.ts:138`, `context/keymap.tsx:501`).
+pub const SUBAGENT_SHORTCUT: &str = "↓";
+
+/// The running-subagent / running-shell counts the footer's live chip shows.
+/// Zero counts draw nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Live {
+    pub subagents: usize,
+    pub shells: usize,
+    /// The pointer is over the chip: the counts light up.
+    pub hovered: bool,
+}
+
+/// `1 subagent` / `2 shells`: upstream's `count === 1 ? "" : "s"`.
+fn count_label(count: usize, noun: &str) -> String {
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} {noun}{plural}")
+}
+
+/// The live chip: `↓ 1 subagent · 2 shells`
+/// (`feature-plugins/prompt/footer.tsx:73-92`).
+///
+/// The shortcut always draws in `text.base`; the counts and their ` · `
+/// separator sit in the outer `<text>`, which is `text.muted` until the
+/// pointer is over the chip and `text.base` after. A zero count omits its
+/// segment, and ` · ` needs both segments; with no counts the chip is empty
+/// and draws nothing.
+fn live_spans(live: Live, pal: &theme::Palette) -> Vec<Span<'static>> {
+    if live.subagents == 0 && live.shells == 0 {
+        return Vec::new();
+    }
+    let counts = if live.hovered { pal.text } else { pal.dim };
+    let mut spans = vec![Span::styled(format!("{SUBAGENT_SHORTCUT} "), pal.text)];
+    if live.subagents > 0 {
+        spans.push(Span::styled(
+            count_label(live.subagents, "subagent"),
+            counts,
+        ));
+    }
+    if live.subagents > 0 && live.shells > 0 {
+        spans.push(Span::styled(" · ", counts));
+    }
+    if live.shells > 0 {
+        spans.push(Span::styled(count_label(live.shells, "shell"), counts));
+    }
+    spans
+}
+
 /// What a key meant to the app.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PromptAction {
     /// The widget handled it (typed text, menu navigation, cleared draft).
     Ignored,
+    /// The key is not the prompt's: a bare `↓` at the end of the history,
+    /// which upstream's `prompt.history.next` hands back with `false`
+    /// (`component/prompt/index.tsx:1086`) so `session.child.first` reaches
+    /// the subagent picker. A bare `↑` at the start of the history declines
+    /// the same way (upstream `prompt.history.previous`); ox binds nothing to
+    /// it. `App` decides who takes the key.
+    Declined,
     /// The user submitted a non-empty prompt.
     Submit(Submission),
     /// A slash command was chosen; the token was removed from the draft.
@@ -178,6 +235,21 @@ pub enum PromptAction {
 pub enum Activity {
     Idle,
     Turn,
+}
+
+/// What Up/Down did to the draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryWalk {
+    /// Not a history key (or the caret has rows to travel inside the draft).
+    NotMine,
+    /// Consumed: moved the caret or replaced the draft from history.
+    Consumed,
+    /// At the text edge with no further entry: the key belongs to the next
+    /// handler, exactly upstream's `prompt.history.next` returning `false`
+    /// (`component/prompt/index.tsx:1086`), which lets bare `↓` reach
+    /// `session.child.first`. `↑` declines the same way at the start of the
+    /// history.
+    Declined,
 }
 
 pub struct Prompt {
@@ -205,6 +277,8 @@ pub struct Prompt {
     /// A modal owns the terminal cursor: the panel still draws, but leaves the
     /// cursor to the modal (or hidden, for one without a text field).
     cursor_yielded: bool,
+    /// The cols the live chip occupied on the last draw, for the pointer.
+    live_area: Rect,
 }
 
 impl Prompt {
@@ -225,6 +299,7 @@ impl Prompt {
             spin_frame: 0,
             interrupt_armed: None,
             cursor_yielded: false,
+            live_area: Rect::default(),
         }
     }
 
@@ -370,6 +445,19 @@ impl Prompt {
         1 + self.composer.height(terminal_height) + 1 + 1
     }
 
+    /// The cols the live chip occupied on the last draw, for the pointer.
+    /// Empty when nothing drew (no counts, home footer, narrow terminal).
+    #[must_use]
+    pub fn live_area(&self) -> Rect {
+        self.live_area
+    }
+
+    /// Forget the last chip rect: the prompt is not being drawn (a panel holds
+    /// the bottom of the screen), so the pointer must not hit a stale one.
+    pub fn reset_live_area(&mut self) {
+        self.live_area = Rect::default();
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> PromptAction {
         if self.auto.visible() {
             return self.handle_menu_key(key);
@@ -384,8 +472,15 @@ impl Prompt {
             self.composer.clear();
             return PromptAction::Ignored;
         }
-        if key.modifiers.is_empty() && self.walk_history(key.code) {
-            return PromptAction::Ignored;
+        if key.modifiers.is_empty() {
+            // Upstream's history bindings answer `false` at the end of their
+            // list, which lets the same key fall through to `session.child.first`
+            // (`component/prompt/index.tsx:1060-1094`).
+            match self.walk_history(key.code) {
+                HistoryWalk::Consumed => return PromptAction::Ignored,
+                HistoryWalk::Declined => return PromptAction::Declined,
+                HistoryWalk::NotMine => {}
+            }
         }
         let Some(submission) = self.composer.handle_key(key) else {
             self.sync_menu();
@@ -419,8 +514,7 @@ impl Prompt {
 
     /// Upstream `prompt.history.previous/next`: Up/Down first travel to the
     /// start/end of the text, and only a press there walks the history.
-    /// Returns `true` when the key was consumed.
-    fn walk_history(&mut self, code: KeyCode) -> bool {
+    fn walk_history(&mut self, code: KeyCode) -> HistoryWalk {
         let (direction, text_edge, boundary_row) = match code {
             KeyCode::Up => (
                 -1,
@@ -432,7 +526,7 @@ impl Prompt {
                 self.composer.cursor_at_end(),
                 self.composer.on_last_row(),
             ),
-            _ => return false,
+            _ => return HistoryWalk::NotMine,
         };
         if !text_edge {
             if boundary_row {
@@ -441,16 +535,17 @@ impl Prompt {
                 } else {
                     self.composer.move_to_end();
                 }
-                return true;
+                return HistoryWalk::Consumed;
             }
-            return false;
+            return HistoryWalk::NotMine;
         }
-        if let Some(text) = self.history.step(direction, &self.composer.text()) {
-            self.composer.set_text(&text, direction > 0);
-            self.auto.hide();
-            self.sync_files();
-        }
-        true
+        let Some(text) = self.history.step(direction, &self.composer.text()) else {
+            return HistoryWalk::Declined;
+        };
+        self.composer.set_text(&text, direction > 0);
+        self.auto.hide();
+        self.sync_files();
+        HistoryWalk::Consumed
     }
 
     fn handle_menu_key(&mut self, key: KeyEvent) -> PromptAction {
@@ -578,7 +673,18 @@ impl Prompt {
         }
     }
 
-    pub fn render(&mut self, frame: &mut Frame, area: Rect, full: Rect, activity: Activity) {
+    /// Draw the block. `live` is the chip's data; `App` derives it from the
+    /// store on every frame instead of caching counts here.
+    pub fn render(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        full: Rect,
+        activity: Activity,
+        live: Live,
+    ) {
+        // The chip is only hit-testable on a frame that drew it.
+        self.live_area = Rect::default();
         let running = activity != Activity::Idle;
         let pal = *theme::palette();
         if area.width == 0 || area.height == 0 {
@@ -692,10 +798,27 @@ impl Prompt {
             };
             // Upstream `showDetails`: usage and hints stay up during a turn and
             // only yield to an armed interrupt on a narrow terminal
-            // (`component/prompt/index.tsx:1614`).
+            // (`component/prompt/index.tsx:1614`). The live chip is a sibling of
+            // that block and never takes part in the gate
+            // (`feature-plugins/prompt/footer.tsx:71-92`).
             let details = self.interrupt_armed.is_none() || full.width >= 80;
-            let right: Option<Vec<Span<'static>>> = if !details {
-                None
+            // The chip leads the right segment and is not charged against the
+            // layout budget: upstream's `promptFooterLayout` reserves columns
+            // for the usage and the hint only (`footer.tsx:156-166`). It
+            // describes a session, so the home route has none to show
+            // (`footer.tsx:24,31` read zero without a session id).
+            let chip = if self.footer == Footer::Session {
+                live_spans(live, &pal)
+            } else {
+                Vec::new()
+            };
+            let chip_w = spans_width(&chip).min(area.width as usize) as u16;
+            // The usage group and the shortcut hint are separate children of
+            // the row: upstream's status `<text>` owns the ` · ` before the
+            // usage and the footer container's `gap={2}` spaces the hint off it
+            // (`component/prompt/index.tsx:1900`).
+            let (usage_part, hint_part): (Vec<Span<'static>>, Vec<Span<'static>>) = if !details {
+                (Vec::new(), Vec::new())
             } else {
                 match self.footer {
                     Footer::Session => {
@@ -707,21 +830,45 @@ impl Prompt {
                         let hint = session_hint(&pal);
                         let usage_w = spans_width(&usage);
                         let hint_w = spans_width(&hint);
-                        let mut spans: Vec<Span<'static>> = Vec::new();
                         if usage_w > 0 && usage_w <= available {
-                            spans.extend(usage);
-                            if full.width >= 44 && usage_w + 2 + hint_w <= available {
-                                spans.push(Span::raw("  "));
-                                spans.extend(hint);
-                            }
+                            let with_hint = full.width >= 44 && usage_w + 2 + hint_w <= available;
+                            let hint = if with_hint { hint } else { Vec::new() };
+                            (usage, hint)
                         } else if usage_w == 0 && full.width >= 44 && hint_w <= available {
-                            spans.extend(hint);
+                            (Vec::new(), hint)
+                        } else {
+                            (Vec::new(), Vec::new())
                         }
-                        (!spans.is_empty()).then_some(spans)
                     }
-                    Footer::Home => (full.width >= 44).then(|| home_hints(&pal)),
+                    Footer::Home => {
+                        let hint = if full.width >= 44 {
+                            home_hints(&pal)
+                        } else {
+                            Vec::new()
+                        };
+                        (Vec::new(), hint)
+                    }
                 }
             };
+            let mut spans = chip;
+            if !usage_part.is_empty() {
+                // Upstream writes this separator inside the usage block, so it
+                // appears only between the chip and the usage, and it carries
+                // the usage's `text.muted` (`footer.tsx:102-105`).
+                if !spans.is_empty() {
+                    spans.push(Span::styled(" · ", pal.dim));
+                }
+                spans.extend(usage_part);
+            }
+            if !hint_part.is_empty() {
+                // The container's two-column gap; it needs a column before it
+                // only when something already sits to its left.
+                if !spans.is_empty() {
+                    spans.push(Span::raw("  "));
+                }
+                spans.extend(hint_part);
+            }
+            let right: Option<Vec<Span<'static>>> = (!spans.is_empty()).then_some(spans);
             let left_w = left
                 .iter()
                 .map(|span| span.width())
@@ -737,11 +884,7 @@ impl Prompt {
                 },
             );
             if let Some(spans) = right {
-                let right_w = spans
-                    .iter()
-                    .map(|span| span.width())
-                    .sum::<usize>()
-                    .min(area.width as usize) as u16;
+                let right_w = spans_width(&spans).min(area.width as usize) as u16;
                 let x = area.right().saturating_sub(right_w);
                 if x >= area.x + left_w {
                     frame.render_widget(
@@ -753,6 +896,17 @@ impl Prompt {
                             height: 1,
                         },
                     );
+                    // The chip is the right segment's first element, so the
+                    // segment's left edge is the chip's. Only with nothing after
+                    // the chip does its right edge land on `area.right()`.
+                    if chip_w > 0 {
+                        self.live_area = Rect {
+                            x,
+                            y: footer_y,
+                            width: chip_w,
+                            height: 1,
+                        };
+                    }
                 }
             }
         }
@@ -1014,4 +1168,466 @@ fn truncate_end(text: &str, width: usize) -> String {
     }
     out.push('…');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::Color;
+    use ratatui::style::Style;
+
+    use crate::theme;
+
+    const WIDTH: u16 = 100;
+    const HEIGHT: u16 = 24;
+
+    fn full() -> Rect {
+        Rect::new(0, 0, WIDTH, HEIGHT)
+    }
+
+    fn session_prompt() -> Prompt {
+        // No placeholder and no chrome: the left segment of the footer is
+        // empty, so the right one can be asserted without a location in front.
+        Prompt::new("", Chrome::default(), Footer::Session)
+    }
+
+    /// The prompt area the session route gives the block, bottom-aligned.
+    fn prompt_area(prompt: &Prompt, full: Rect) -> Rect {
+        let height = prompt.height(full.height).min(full.height);
+        Rect {
+            y: full.height - height,
+            height,
+            ..full
+        }
+    }
+
+    /// Draw one frame; hand back the buffer and the footer row's index.
+    fn draw(prompt: &mut Prompt, full: Rect, activity: Activity, live: Live) -> (Buffer, u16) {
+        let area = prompt_area(prompt, full);
+        let footer_y = area.bottom() - 1;
+        let mut terminal =
+            Terminal::new(TestBackend::new(full.width, full.height)).expect("test terminal");
+        terminal
+            .draw(|frame| prompt.render(frame, area, full, activity, live))
+            .expect("draw");
+        (terminal.backend().buffer().clone(), footer_y)
+    }
+
+    fn row_text(buffer: &Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer.cell((x, y)).map_or(" ", |cell| cell.symbol()))
+            .collect()
+    }
+
+    /// The glyphs the last drawn chip covers, taken from its own rect.
+    fn chip_text(buffer: &Buffer, y: u16, live_area: Rect) -> String {
+        let start = live_area.x as usize;
+        let end = start + live_area.width as usize;
+        row_text(buffer, y)
+            .chars()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .collect()
+    }
+
+    /// `(fg, modifier)` — the two parts of a style the buffer keeps apart.
+    fn painted(cell: &ratatui::buffer::Cell) -> (Color, Modifier) {
+        (cell.fg, cell.modifier)
+    }
+
+    /// What a style paints onto a blank cell: the buffer has no `Option` for
+    /// either part, so an unset fg reads as `Reset` and the style's
+    /// subtractions are already applied.
+    fn paint(style: Style) -> (Color, Modifier) {
+        (
+            style.fg.unwrap_or(Color::Reset),
+            style.add_modifier - style.sub_modifier,
+        )
+    }
+
+    fn cell(buffer: &Buffer, x: u16, y: u16) -> &ratatui::buffer::Cell {
+        buffer.cell((x, y)).expect("cell inside the buffer")
+    }
+
+    #[test]
+    fn nothing_running_draws_no_chip() {
+        let mut prompt = session_prompt();
+        let (buffer, y) = draw(&mut prompt, full(), Activity::Idle, Live::default());
+        let row = row_text(&buffer, y);
+        assert!(
+            !row.contains(SUBAGENT_SHORTCUT),
+            "0 subagents and 0 shells must draw no chip, row: {row:?}"
+        );
+        assert_eq!(
+            prompt.live_area(),
+            Rect::default(),
+            "an undrawn chip must not be hit-testable"
+        );
+    }
+
+    #[test]
+    fn the_chip_counts_what_runs_and_pluralises() {
+        let cases = [
+            (
+                Live {
+                    subagents: 1,
+                    shells: 0,
+                    hovered: false,
+                },
+                "↓ 1 subagent",
+            ),
+            (
+                Live {
+                    subagents: 0,
+                    shells: 1,
+                    hovered: false,
+                },
+                "↓ 1 shell",
+            ),
+            (
+                Live {
+                    subagents: 1,
+                    shells: 1,
+                    hovered: false,
+                },
+                "↓ 1 subagent · 1 shell",
+            ),
+            (
+                Live {
+                    subagents: 2,
+                    shells: 0,
+                    hovered: false,
+                },
+                "↓ 2 subagents",
+            ),
+            (
+                Live {
+                    subagents: 0,
+                    shells: 2,
+                    hovered: false,
+                },
+                "↓ 2 shells",
+            ),
+        ];
+        for (live, expected) in cases {
+            let mut prompt = session_prompt();
+            let (buffer, y) = draw(&mut prompt, full(), Activity::Idle, live);
+            let area = prompt.live_area();
+            assert_eq!(
+                chip_text(&buffer, y, area),
+                expected,
+                "chip for {live:?} must read {expected:?}, row: {:?}",
+                row_text(&buffer, y)
+            );
+            assert_eq!(
+                usize::from(area.width),
+                expected.chars().count(),
+                "the chip rect must be exactly as wide as {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_shortcut_is_text_base_and_the_counts_are_muted_until_hovered() {
+        let pal = *theme::palette();
+        let text = paint(pal.text);
+        let muted = paint(pal.dim);
+        assert_ne!(
+            text, muted,
+            "the two footer roles must differ, or these colour checks prove nothing"
+        );
+        let live = Live {
+            subagents: 1,
+            shells: 1,
+            hovered: false,
+        };
+        let mut prompt = session_prompt();
+        let (buffer, y) = draw(&mut prompt, full(), Activity::Idle, live);
+        let area = prompt.live_area();
+        assert_eq!(
+            painted(cell(&buffer, area.x, y)),
+            text,
+            "the `↓ ` shortcut always draws in text.base"
+        );
+        // `↓ ` is two columns, so the first count glyph sits at `x + 2`.
+        assert_eq!(
+            painted(cell(&buffer, area.x + 2, y)),
+            muted,
+            "the counts are text.muted until the pointer is over the chip"
+        );
+
+        let hovered = Live {
+            hovered: true,
+            ..live
+        };
+        let (buffer, y) = draw(&mut prompt, full(), Activity::Idle, hovered);
+        let area = prompt.live_area();
+        assert_eq!(
+            painted(cell(&buffer, area.x, y)),
+            text,
+            "hovering must not change the shortcut's colour"
+        );
+        assert_eq!(
+            painted(cell(&buffer, area.x + 2, y)),
+            text,
+            "hovering lifts the counts to text.base"
+        );
+    }
+
+    #[test]
+    fn the_chip_leads_the_usage_and_the_hint() {
+        let live = Live {
+            subagents: 0,
+            shells: 1,
+            hovered: false,
+        };
+        let mut prompt = session_prompt();
+        prompt.set_ctx(Some("16.3K".to_owned()));
+        let (buffer, y) = draw(&mut prompt, full(), Activity::Idle, live);
+        assert_eq!(
+            row_text(&buffer, y).trim(),
+            "↓ 1 shell · 16.3K  ctrl+p commands",
+            "the usage takes upstream's ` · ` and the hint keeps the footer's two-column gap"
+        );
+
+        let mut prompt = session_prompt();
+        let (buffer, y) = draw(&mut prompt, full(), Activity::Idle, live);
+        assert_eq!(
+            row_text(&buffer, y).trim(),
+            "↓ 1 shell  ctrl+p commands",
+            "without usage the chip and the hint are separated by the gap alone"
+        );
+    }
+
+    #[test]
+    fn the_chip_leads_a_two_part_usage() {
+        // Both usage figures join with ` · ` upstream (`footer.tsx:104`), and
+        // the separator the chip adds in front of them carries the usage's
+        // `text.muted`, not the buffer's default foreground.
+        let live = Live {
+            subagents: 0,
+            shells: 1,
+            hovered: false,
+        };
+        let mut prompt = session_prompt();
+        prompt.set_ctx(Some("16.3K".to_owned()));
+        prompt.set_cost(Some("$0.42".to_owned()));
+        let (buffer, y) = draw(&mut prompt, full(), Activity::Idle, live);
+        assert_eq!(
+            row_text(&buffer, y).trim(),
+            "↓ 1 shell · 16.3K · $0.42  ctrl+p commands",
+            "both usage figures follow the chip, each separator drawn once"
+        );
+        let muted = paint(theme::palette().dim);
+        let chip = prompt.live_area();
+        assert_eq!(
+            painted(cell(&buffer, chip.right(), y)),
+            muted,
+            "the ` · ` the usage block owns is text.muted, not the default foreground"
+        );
+        assert_ne!(
+            muted,
+            paint(theme::palette().text),
+            "the separator assertion is vacuous if text.muted paints like text.base"
+        );
+    }
+
+    #[test]
+    fn the_home_footer_never_shows_the_chip() {
+        // The home route has no session, so there are no counts to belong to
+        // it: upstream reads `sessionID` and reports zero without one
+        // (`footer.tsx:20-21`).
+        let mut prompt = Prompt::new("", Chrome::default(), Footer::Home);
+        let live = Live {
+            subagents: 2,
+            shells: 3,
+            hovered: false,
+        };
+        let (buffer, y) = draw(&mut prompt, full(), Activity::Idle, live);
+        let row = row_text(&buffer, y);
+        assert!(
+            !row.contains(SUBAGENT_SHORTCUT),
+            "the home footer must not draw a session's counts, row: {row:?}"
+        );
+        assert_eq!(
+            prompt.live_area(),
+            Rect::default(),
+            "and nothing on the home route is clickable"
+        );
+    }
+
+    #[test]
+    fn the_chip_survives_a_narrow_armed_interrupt() {
+        let mut prompt = session_prompt();
+        prompt.set_ctx(Some("16.3K".to_owned()));
+        assert!(
+            !prompt.press_interrupt(Instant::now()),
+            "the first Esc only arms the hint"
+        );
+        // `showDetails` is false below 80 columns once an interrupt is armed.
+        let narrow = Rect::new(0, 0, 70, HEIGHT);
+        let live = Live {
+            subagents: 0,
+            shells: 1,
+            hovered: false,
+        };
+        let (buffer, y) = draw(&mut prompt, narrow, Activity::Turn, live);
+        let row = row_text(&buffer, y);
+        assert_eq!(
+            chip_text(&buffer, y, prompt.live_area()),
+            "↓ 1 shell",
+            "the chip is not part of `showDetails` and always draws, row: {row:?}"
+        );
+        assert!(
+            !row.contains("16.3K") && !row.contains("ctrl+p"),
+            "usage and hint yield to an armed interrupt on a narrow terminal, row: {row:?}"
+        );
+        assert_eq!(
+            prompt.live_area().right(),
+            narrow.width,
+            "with nothing after the chip its right edge lands on the area's"
+        );
+    }
+
+    #[test]
+    fn the_chip_rect_covers_the_drawn_columns() {
+        let live = Live {
+            subagents: 1,
+            shells: 1,
+            hovered: false,
+        };
+        let mut prompt = session_prompt();
+        let (buffer, y) = draw(&mut prompt, full(), Activity::Idle, live);
+        let area = prompt.live_area();
+        let row = row_text(&buffer, y);
+        let arrow = row
+            .chars()
+            .position(|ch| ch == '↓')
+            .expect("the chip must have been drawn");
+        assert_eq!(
+            arrow, area.x as usize,
+            "the chip rect must start on the drawn `↓`, row: {row:?}"
+        );
+        assert_eq!(
+            chip_text(&buffer, y, area),
+            "↓ 1 subagent · 1 shell",
+            "the rect must cover the whole chip"
+        );
+        assert!(
+            area.right() < WIDTH,
+            "with the hint after it the chip is not flush with the area's right edge"
+        );
+    }
+
+    #[test]
+    fn a_bare_down_at_the_end_of_the_history_is_declined() {
+        let mut prompt = session_prompt();
+        assert_eq!(
+            prompt.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+            PromptAction::Declined,
+            "an empty history has nothing newer to show, so `↓` must fall through"
+        );
+    }
+
+    #[test]
+    fn walking_back_then_forward_stays_in_the_prompt() {
+        let mut prompt = session_prompt();
+        for ch in "hello".chars() {
+            let _ = prompt.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert!(
+            matches!(
+                prompt.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                PromptAction::Submit(_)
+            ),
+            "typing then Enter submits and records one history entry"
+        );
+        assert!(
+            matches!(
+                prompt.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+                PromptAction::Ignored
+            ),
+            "`↑` in the empty draft walks back into the entry just submitted"
+        );
+        assert_eq!(
+            prompt.text(),
+            "hello",
+            "the walk must have restored the entry"
+        );
+        assert!(
+            matches!(
+                prompt.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+                PromptAction::Ignored
+            ),
+            "`↓` inside a restored entry moves the caret, it does not decline"
+        );
+        assert!(
+            matches!(
+                prompt.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+                PromptAction::Ignored
+            ),
+            "`↓` at the end of the restored entry walks forward instead of declining"
+        );
+        assert!(
+            prompt.text().is_empty(),
+            "walking forward past the newest entry clears the draft, got {:?}",
+            prompt.text()
+        );
+    }
+
+    #[test]
+    fn a_down_inside_a_multi_row_draft_stays_in_the_prompt() {
+        let mut prompt = session_prompt();
+        prompt.restore("aa\nbb\ncc");
+        assert!(
+            matches!(
+                prompt.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+                PromptAction::Ignored
+            ),
+            "`↑` on the last row has a row to travel inside the draft"
+        );
+        assert!(
+            matches!(
+                prompt.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+                PromptAction::Ignored
+            ),
+            "`↓` from a middle row is the editor's move, not a decline"
+        );
+    }
+
+    #[test]
+    fn an_up_at_the_start_of_the_history_is_declined() {
+        let mut prompt = session_prompt();
+        assert_eq!(
+            prompt.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            PromptAction::Declined,
+            "nothing older to show: `↑` declines as well, and ox binds nothing to it"
+        );
+    }
+
+    #[test]
+    fn reset_live_area_forgets_the_chip() {
+        let mut prompt = session_prompt();
+        let live = Live {
+            subagents: 0,
+            shells: 1,
+            hovered: false,
+        };
+        let _ = draw(&mut prompt, full(), Activity::Idle, live);
+        assert_ne!(
+            prompt.live_area(),
+            Rect::default(),
+            "the chip drew, so the pointer must be able to reach it"
+        );
+        prompt.reset_live_area();
+        assert_eq!(
+            prompt.live_area(),
+            Rect::default(),
+            "a panel holding the bottom of the screen must not leave a stale rect"
+        );
+    }
 }

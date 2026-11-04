@@ -1157,7 +1157,14 @@ fn prompt_case(
             } else {
                 Activity::Idle
             };
-            prompt.render(frame, panel_area, area, activity);
+            // gallery 里另有同名的 mock 结构体 `Live`（shell 块标志），故用全路径。
+            prompt.render(
+                frame,
+                panel_area,
+                area,
+                activity,
+                ox_tui::ui::prompt::Live::default(),
+            );
         }),
     }
 }
@@ -1192,7 +1199,14 @@ fn prompt_files_case() -> Case {
                 height: h,
                 ..area
             };
-            prompt.render(frame, panel_area, area, Activity::Idle);
+            // 见上：`Live` 名在 gallery 已占用，用全路径。
+            prompt.render(
+                frame,
+                panel_area,
+                area,
+                Activity::Idle,
+                ox_tui::ui::prompt::Live::default(),
+            );
         }),
     }
 }

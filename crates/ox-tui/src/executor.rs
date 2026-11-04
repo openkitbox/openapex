@@ -8,6 +8,7 @@
 //! are no-ops here.
 
 use ox_client::Client;
+use ox_client::store::RunningShell;
 use ox_schema::support::FileInput;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -135,19 +136,25 @@ async fn list_shells(client: &Client, tx: &Events, session: String) {
     let _ = tx.send(event);
 }
 
-/// The same `GET /api/shell` the picker uses, reduced to the running ids.
-/// A failure is logged only: the `shell.*` frames still drive the set.
+/// The same `GET /api/shell` the picker uses, reduced to the running shells
+/// and the session that owns each (the prompt footer's shell count). The
+/// status filter is defensive: the server's list already holds only unsettled
+/// sessions. A failure is logged only: the `shell.*` frames still drive the
+/// map.
 async fn sync_shells(client: &Client, generation: u64, tx: &Events) {
     match client.shells().await {
         Ok(shells) => {
-            let running: Vec<String> = shells
+            let running: Vec<RunningShell> = shells
                 .into_iter()
                 .filter(|shell| shell.status == "running")
-                .map(|shell| shell.id)
+                .map(|shell| RunningShell {
+                    session: shell.session_id().map(str::to_owned),
+                    id: shell.id,
+                })
                 .collect();
             let _ = tx.send(AppEvent::RunningShells {
                 generation,
-                ids: running,
+                shells: running,
             });
         }
         Err(err) => tracing::warn!(%err, "shell sync failed"),

@@ -61,10 +61,11 @@
 //!   spawned after the panel opened, before its tool row settles — appears only
 //!   after the panel is reopened.
 //! - The `Shell` tab lists nothing. `DataStore` answers whether a shell is
-//!   running by id (`is_shell_running`) but exposes no per-session list of
-//!   commands, so the tab shows upstream's `No shell commands` and has no
-//!   `output` / `kill` action; `/shells` (the background-shell picker) owns
-//!   both.
+//!   running by id (`is_shell_running`) and how many the session owns
+//!   (`running_shells_of`, the prompt footer's count), but exposes no
+//!   per-session list of commands, so the tab shows upstream's
+//!   `No shell commands` and has no `output` / `kill` action; `/shells` (the
+//!   background-shell picker) owns both.
 //! - `tab` / `shift+tab` switch tabs as well as `←` / `→`: ox binds them to
 //!   agent cycling, and the panel owns the keyboard while it is open.
 //! - The window's offset is derived from the selection (centred, clamped so the

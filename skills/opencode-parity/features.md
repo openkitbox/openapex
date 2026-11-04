@@ -20,6 +20,7 @@
 | behavior | paste-fold | component/prompt/index.tsx:1447 | crates/ox-tui/src/ui/paste.rs:88 | deviation | 3 行以上或超 150 字符折叠为 [Pasted ~N lines];占位符是普通文本(tui-textarea 无 extmark),无点击展开 |
 | behavior | patch-block | routes/session/index.tsx:3503 | crates/ox-tui/src/ui/patch_block.rs:44 | partial | 每文件一个 diff 块,patch/apply_patch 两名都认,失败态也画块。偏差:无 metadata.applied、无 move 源路径、失败无 metadata(服务端缺口) |
 | behavior | prompt-surface | component/prompt/index.tsx:1610 | crates/ox-tui/src/ui/prompt.rs:765 | partial | 左边框轨与 `╹` 脚用 agent 色(2.2.5 实测 #b294bb,home 与根会话一致;无 agent 色时退 border.base),底色透明、`▀` 影线与上游同形。偏差:ox 只有一个 agent 色,不做上游按 agent 序号轮转的分类色 |
+| behavior | prompt-footer-live | feature-plugins/prompt/footer.tsx:24 | crates/ox-tui/src/ui/prompt.rs:187 | deviation | 会话 footer 的活胶囊 `↓ N subagent · N shell`:位置(右段首位)、顺序、配色(`↓` 与 `ctrl+p` 用 text.base,计数与 ` · ` 用 muted)、` · ` 分隔、与 hint 间两空格都与上游 footer.tsx:73-92 同形;不受 showDetails 约束、不计入 promptFooterLayout 预算(footer.tsx:156-166,实现 crates/ox-tui/src/ui/prompt.rs:812-818);计数为 0 时整段消失(无 shell 会话实测只剩 `ctrl+p commands`);hover 时计数转 text.base(prompt.rs:191,live_spans 在 187),点击派发 session.child.first。2.2.5 30×100 端到端实测:footer 行与上游逐格一致(0 格差异,两侧 `↓` 73 列、`1 shell` 75-81 列 muted、`ctrl+p` 84-89 列 text、`commands` 91-98 列 muted)。偏差:(a) subagent 只数被 transcript tool part 命名的子会话(crates/ox-client/src/store.rs:752 running_subagents),上游数常驻 family 中 status 为 running 的成员(footer.tsx:24-29);(b) shell 只数 running(crates/ox-client/src/store.rs:737 running_shells_of,该结构只含 running),等价上游 Shell 标签页的计数而非 footer 的计数(footer.tsx:30-36 数 list() 里全部) |
 | behavior | activity-panel | routes/session/composer/index.tsx:91 | crates/ox-tui/src/ui/activity_panel.rs:460 | partial | Subagents/Shell 标签面板占据输入框位置,标签头、行、`Running`、`esc`、footer 提示对齐。偏差:面板底色用 raised_high(上游 `background.raised.base`,实测 2.2.5 为 #25364d、ox 为 #2a3d58);当前行底色用 raised_base(上游 `background.action.primary.base/selected/focused`);仅按键打开,上游对 `session.parentID` 且无表单的会话自动打开(2.2.5 实测三个子会话均自动显示、根会话显示输入框) |
 | behavior | queued-dock | routes/session/index.tsx:225 | crates/ox-tui/src/ui/dock.rs:98 | partial | 输入框上方逐条列出排队提示词,<leader>q 有排队时开对话框、无则退出(keymap.tsx:231)。偏差见 dock.rs/queued_dialog.rs 模块文档 |
 | behavior | question-block | routes/session/index.tsx:3651 | crates/ox-tui/src/ui/question_block.rs:1 | partial | `# Questions` BlockTool + 问答列表;服务端在 metadata.answers 回传答案(ox-tools/src/question.rs)。偏差见 question_block.rs 模块文档 |
@@ -86,7 +87,7 @@
 | keybind | composer.shell.kill | config/keybind.ts:256 | crates/ox-tui/src/ui/shell_dialog.rs:20 | deviation | 偏差:对话框形态;ctrl+d 杀掉后重新拉取列表,光标回到顶部;无点击和页脚 M shells 提示 |
 | keybind | composer.shell.select | config/keybind.ts:255 | crates/ox-tui/src/ui/shell_dialog.rs:20 | deviation | 偏差:Enter 打开只读输出查看器(output_dialog.rs:45),不轮询,ctrl+r 手动刷新(上游每秒轮询) |
 | keybind | composer.shell.up | config/keybind.ts:253 | crates/ox-tui/src/ui/shell_dialog.rs:20 | deviation | 偏差:用 Select 对话框而非 composer 面板;入口 ctrl+x b 或 /shells(上游无独立键) |
-| keybind | composer.subagent.down | config/keybind.ts:250 | crates/ox-tui/src/ui/activity_panel.rs:227 | deviation | 偏差:底部 composer 面板(上游同形);↑/↓ 在列出的行内移动,列表变化后夹紧;入口 /subagents 或 ctrl+x ↓;无点击命中(上游 click 导航) |
+| keybind | composer.subagent.down | config/keybind.ts:250 | crates/ox-tui/src/ui/activity_panel.rs:227 | deviation | 偏差:底部 composer 面板(上游同形);↑/↓ 在列出的行内移动,列表变化后夹紧;入口 /subagents 或裸 ↓(历史走完后 fallthrough,见 session.child.first 行);无点击命中(上游 click 导航) |
 | keybind | composer.subagent.interrupt | config/keybind.ts:252 | crates/ox-tui/src/ui/activity_panel.rs:149 | deviation | 偏差:ctrl+d 只对运行中的行有效,面板保持打开;ctrl+a 切换显示已结束;无点击命中测试 |
 | keybind | composer.subagent.select | config/keybind.ts:251 | crates/ox-tui/src/ui/activity_panel.rs:227 | deviation | 偏差:Enter 跳到子会话(App::switch_session);列表来自 GET /ox/session/{id}/family(ox 专用端点);只在根会话可开;上游是 mouseUp 导航 |
 | keybind | composer.subagent.up | config/keybind.ts:249 | crates/ox-tui/src/ui/activity_panel.rs:227 | deviation | 偏差:底部 composer 面板;↑/↓ 在列出的行内移动,Esc 关闭 |
@@ -205,8 +206,8 @@
 | keybind | prompt.clear | config/keybind.ts:208 |  | todo |  |
 | keybind | prompt.editor | config/keybind.ts:92 |  | todo |  |
 | keybind | prompt.editor_context.clear | config/keybind.ts:201 |  | todo |  |
-| keybind | prompt.history.next | config/keybind.ts:247 |  | todo |  |
-| keybind | prompt.history.previous | config/keybind.ts:246 |  | todo |  |
+| keybind | prompt.history.next | config/keybind.ts:247 | crates/ox-tui/src/ui/prompt.rs:517 | aligned | 裸 ↓:先按可视行下移/移到文末,到文末再走历史;历史走完返回 Declined 让给 session.child.first(上游同样 return false,component/prompt/index.tsx:1086) |
+| keybind | prompt.history.previous | config/keybind.ts:246 | crates/ox-tui/src/ui/prompt.rs:517 | aligned | 裸 ↑:先按可视行上移/移到文首,上文首再走历史;走完返回 Declined(ox 无 session.parent 绑定) |
 | keybind | prompt.images.view | config/keybind.ts:202 |  | todo |  |
 | keybind | prompt.paste | config/keybind.ts:209 | crates/ox-tui/src/app/keymap.rs:120 | aligned | ctrl+v 读取剪贴板图片 |
 | keybind | prompt.queue | config/keybind.ts:200 |  | todo |  |
@@ -223,7 +224,7 @@
 | keybind | session.aside | config/keybind.ts:131 |  | todo |  |
 | keybind | session.background | config/keybind.ts:129 |  | missing | 服务端路由已有(crates/ox-server/src/api/session/control.rs:47);ox-tui 尚未绑定 ctrl+b |
 | keybind | session.cd | config/keybind.ts:132 |  | todo |  |
-| keybind | session.child.first | config/keybind.ts:138 | crates/ox-tui/src/ui/subagent_dialog.rs:45 | partial | 只做了 Subagents 选择器(ctrl+x ↓),没有 first/next/previous 的会话间直接切换键 |
+| keybind | session.child.first | config/keybind.ts:138 | crates/ox-tui/src/app/keymap.rs:117 | deviation | 裸 `↓` 已绑定,靠与上游相同的 fallthrough 到达选择器:历史走完时 prompt 返回 Declined(prompt.rs:213-219,上游 `component/prompt/index.tsx:1086`),`App::declined_key`(crates/ox-tui/src/app/mod.rs:1113)派发 Subagents 面板;footer 提示与 palette 同显示 `↓`(keymap.rs:117-122)。偏差:ox 无父会话信息(上游 `session.parentID`),所以子会话里按 `↓` 打开的是活动面板(空列表),上游此时关闭 composer(`routes/session/index.tsx:1404`);面板已打开时 `↓` 归面板所有(crates/ox-tui/src/app/mod.rs:933-944),不做上游那种关闭切换。`session.child.next/previous` 仍未绑 |
 | keybind | session.child.next | config/keybind.ts:139 |  | todo |  |
 | keybind | session.child.previous | config/keybind.ts:140 |  | todo |  |
 | keybind | session.compact | config/keybind.ts:130 |  | missing | 服务端路由已有(crates/ox-server/src/api/session/compaction.rs,60cdfa5);ox-tui 尚未绑定 |

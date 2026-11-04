@@ -31,7 +31,7 @@ use crate::ui::output_dialog::{self, Output};
 use crate::ui::palette;
 use crate::ui::paste;
 use crate::ui::prompt::{
-    Activity, Chrome, Footer, Prompt, PromptAction, pick_placeholder, placeholder_line,
+    Activity, Chrome, Footer, Live, Prompt, PromptAction, pick_placeholder, placeholder_line,
 };
 use crate::ui::queued_dialog;
 use crate::ui::selection::Outcome;
@@ -155,6 +155,8 @@ pub struct App {
     queued_dock_area: Rect,
     /// Whether the pointer is over the queued-prompt dock.
     dock_hover: DockHover,
+    /// Whether the pointer is over the prompt footer's live chip.
+    live_hover: bool,
 }
 
 /// Which shell dialog an in-flight request will open.
@@ -222,6 +224,7 @@ impl App {
             shell_syncs: 0,
             queued_dock_area: Rect::default(),
             dock_hover: DockHover::Off,
+            live_hover: false,
         }
     }
 
@@ -319,8 +322,8 @@ impl App {
             }
             AppEvent::Family { session, members } => self.on_family(&session, members),
             AppEvent::Shells { session, shells } => self.on_shells(&session, &shells),
-            AppEvent::RunningShells { generation, ids } => {
-                if self.store.set_running_shells(generation, ids) {
+            AppEvent::RunningShells { generation, shells } => {
+                if self.store.set_running_shells(generation, shells) {
                     self.child_state_changed();
                 }
             }
@@ -1093,6 +1096,7 @@ impl App {
         }
         match self.prompt.handle_key(key) {
             PromptAction::Ignored => {}
+            PromptAction::Declined => self.declined_key(key.code),
             PromptAction::CtrlC => self.interrupt_or_quit(),
             PromptAction::Esc => self.press_esc(Instant::now()),
             PromptAction::Submit(submission) => self.submit(submission),
@@ -1100,6 +1104,16 @@ impl App {
         }
         self.flush_file_request();
         self.dirty = true;
+    }
+
+    /// Upstream's fallthrough for a key the prompt declined: `↓` at the end of
+    /// the history opens the subagent picker (`session.child.first`,
+    /// `config/keybind.ts:138`). `↑` declines too, but ox has no parent session
+    /// for it to reach (upstream `session.parent`), so it stays unbound.
+    fn declined_key(&mut self, code: KeyCode) {
+        if code == KeyCode::Down {
+            self.run_command(CommandAction::Subagents);
+        }
     }
 
     fn submit(&mut self, submission: Submission) {
@@ -1565,6 +1579,14 @@ impl App {
             self.run_command(CommandAction::QueuedPrompts);
             return;
         }
+        if contains(self.prompt.live_area(), x, y) {
+            // Upstream's chip is an `onMouseUp` on the footer box
+            // (`feature-plugins/prompt/footer.tsx:78`) dispatching
+            // `session.child.first`, so a click opens the subagent picker.
+            self.transcript.release();
+            self.run_command(CommandAction::Subagents);
+            return;
+        }
         match self.transcript.release() {
             Outcome::Click => {
                 // A subagent notice opens its child session; the owned id
@@ -1603,7 +1625,12 @@ impl App {
         };
         let dock_changed = hover != self.dock_hover;
         self.dock_hover = hover;
-        if changed || dock_changed {
+        // The footer chip lights its counts up while the pointer is over it
+        // (`footer.tsx:76-81`); the rect is empty while it does not draw.
+        let live = enabled && contains(self.prompt.live_area(), x, y);
+        let live_changed = live != self.live_hover;
+        self.live_hover = live;
+        if changed || dock_changed || live_changed {
             self.dirty = true;
         }
     }
@@ -1796,6 +1823,27 @@ impl App {
             let lines = dock::queued_dock(&self.store.queued, queued_area.width, self.dock_hover);
             frame.render_widget(ratatui::widgets::Paragraph::new(lines), queued_area);
         }
+        // Only the prompt draws the live chip, so a panel or the search box in
+        // its place must not leave the pointer a rect from an earlier frame.
+        self.prompt.reset_live_area();
+        if panel.is_some() || searching {
+            // Nothing on the replaced prompt can be hovered, and the pointer may
+            // never move again to say so: drop the highlight here or the chip
+            // comes back lit when the panel closes.
+            self.live_hover = false;
+        }
+        // The chip describes the session on screen. `App::session` and
+        // `DataStore::session` hold that same id (`switch_session`,
+        // `handle_session_ready` and New/Clear all set both), so the screen's
+        // own field is the one to read. Derived per frame, never cached.
+        let live = Live {
+            subagents: self.store.running_subagents(),
+            shells: self
+                .session
+                .as_deref()
+                .map_or(0, |session| self.store.running_shells_of(session)),
+            hovered: self.live_hover,
+        };
         match &mut self.mode {
             Mode::SearchInput(boxed) => boxed.render(frame, prompt_area, self.dialog.is_none()),
             _ => {
@@ -1804,7 +1852,7 @@ impl App {
                     Some(block) => activity_panel::render(frame, prompt_area, block),
                     None => {
                         let activity = self.activity();
-                        self.prompt.render(frame, prompt_area, full, activity);
+                        self.prompt.render(frame, prompt_area, full, activity, live);
                     }
                 }
             }

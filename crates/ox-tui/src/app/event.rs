@@ -104,11 +104,12 @@ pub enum AppEvent {
         session: String,
         shells: Vec<ox_client::rest::ShellInfo>,
     },
-    /// Answer to `AppCommand::SyncShells`: the ids of the server's running
-    /// shells. Replaces `DataStore`'s running set; a failed list sends nothing.
+    /// Answer to `AppCommand::SyncShells`: the server's running shells and the
+    /// session that owns each. Replaces `DataStore`'s running map; a failed
+    /// list sends nothing.
     RunningShells {
         generation: u64,
-        ids: Vec<String>,
+        shells: Vec<ox_client::store::RunningShell>,
     },
     /// Answer to `AppCommand::ShellOutput`: the shell as the server lists it
     /// now, plus the newest part of its output.

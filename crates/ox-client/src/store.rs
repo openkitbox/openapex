@@ -27,6 +27,7 @@
 //! - A history `system` message has no description, so it reads as a bare
 //!   `Instructions updated` notice.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -366,9 +367,11 @@ pub struct ShellRef {
 #[derive(Debug, Default)]
 struct ShellSync {
     generation: u64,
-    /// Last running state each frame since the request left the shell in.
-    /// Bounded by the shells that changed while one request was in flight.
-    seen: HashMap<String, bool>,
+    /// Ids some frame touched since the request left. Only the ids: their
+    /// state (and owner) is read back from `running_shells`, which the frame
+    /// already updated. Bounded by the shells that changed while one request
+    /// was in flight.
+    seen: HashSet<String>,
 }
 
 impl ShellRef {
@@ -421,6 +424,17 @@ impl<'a> ShellView<'a> {
             background: self.background,
         }
     }
+}
+
+/// One running shell with the session that owns it, as the `GET /api/shell`
+/// rebuild reports them (the running subset of that list). The owner is
+/// `metadata.sessionID` (`ox-tools/src/shell/sessions.rs`: `info()`), the same
+/// field the `shell.created` frame's `info` carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningShell {
+    pub id: String,
+    /// `None` when the server recorded no owner for the shell.
+    pub session: Option<String>,
 }
 
 /// One tool call inside an assistant message. Events are keyed by the tool
@@ -560,10 +574,15 @@ pub struct DataStore {
     /// removes it from here, so the (older) probe result is then discarded:
     /// the event stream is newer than the answer to a request sent before it.
     probing: HashSet<String>,
-    /// Ids of the server's running shells (upstream `data.shell`), from the
-    /// `shell.*` frames and the `GET /api/shell` rebuild. Ids only: the cap
-    /// is the number of live shells on the server.
-    running_shells: HashSet<String>,
+    /// Running shells by id, each with the session that owns it (`None` when
+    /// the server recorded no `metadata.sessionID`). From the `shell.*` frames
+    /// and the `GET /api/shell` rebuild; the cap is the number of live shells
+    /// on the server.
+    ///
+    /// [`DataStore::apply_shell_frame`] is the only writer, and a rebuild
+    /// replays through its result: clearing this map outside a frame would let
+    /// an in-flight answer restore the sessions it just dropped.
+    running_shells: HashMap<String, Option<String>>,
     /// The `GET /api/shell` request in flight, if any; see
     /// [`DataStore::begin_shell_sync`].
     shell_sync: Option<ShellSync>,
@@ -704,20 +723,54 @@ impl DataStore {
     /// Whether shell `id` is running (upstream: present in `data.shell`).
     #[must_use]
     pub fn is_shell_running(&self, id: &str) -> bool {
-        self.running_shells.contains(id)
+        self.running_shells.contains_key(id)
+    }
+
+    /// Running shells owned by `session`: the prompt footer's shell count.
+    /// Shells the server recorded no owner for, and other sessions' shells,
+    /// are not counted.
+    ///
+    /// Deviation: upstream's footer counts every shell its store holds for the
+    /// session, settled ones included (its `Shell` tab has to filter
+    /// `status === "running"` again). `running_shells` holds only running
+    /// shells: a frame inserts one while it runs and removes it on exit, and
+    /// the rebuild lists only unsettled sessions
+    /// (`ox-tools/src/shell/sessions.rs`, `ShellSessions::list`). So this is
+    /// upstream's Shell-tab count, not its footer count.
+    #[must_use]
+    pub fn running_shells_of(&self, session: &str) -> usize {
+        self.running_shells
+            .values()
+            .filter(|owner| owner.as_deref() == Some(session))
+            .count()
+    }
+
+    /// Children named by a tool part that are running right now: the prompt
+    /// footer's subagent count. Derived, so it cannot drift from the rows.
+    ///
+    /// Deviation: upstream walks the session's family and keeps the members
+    /// whose status is `running` (`feature-plugins/prompt/footer.tsx:24-29`),
+    /// so a child the transcript has not named yet still counts. ox's family
+    /// is only fetched while the panel is open, so `running_children` (same
+    /// source as the subagent rows) is the resident count: a still-unnamed
+    /// child is the one case it misses.
+    #[must_use]
+    pub fn running_subagents(&self) -> usize {
+        self.running_children.len()
     }
 
     /// Feed one `shell.*` frame (`ox-tools/src/shell/events.rs:frame`):
-    /// `created` with status `running` adds `info.id`; `exited` / `deleted`
-    /// remove `id`. Shell frames carry no session id, so the caller routes
-    /// them here before any session filter. Returns whether the set changed.
-    /// While a rebuild is outstanding the frame is also recorded, so its
-    /// older answer cannot undo it.
+    /// `created` with status `running` adds `info.id` with the owner from
+    /// `info.metadata.sessionID`; `exited` / `deleted` remove `id`. Frames
+    /// carry no top-level session id (only a `created` frame's `info` names
+    /// one), so the caller routes them here before any session filter.
+    /// Returns whether the map changed. While a rebuild is outstanding the
+    /// frame's id is also recorded, so the older answer cannot undo it.
     pub fn apply_shell_frame(&mut self, kind: &str, data: &serde_json::Value) -> bool {
         fn id_of(value: &serde_json::Value) -> Option<&str> {
             value.get("id").and_then(serde_json::Value::as_str)
         }
-        let (id, running) = match kind {
+        let (id, running, owner) = match kind {
             "shell.created" => {
                 let Some(info) = data.get("info") else {
                     return false;
@@ -727,28 +780,41 @@ impl DataStore {
                 };
                 let running =
                     info.get("status").and_then(serde_json::Value::as_str) == Some("running");
-                (id, running)
+                let owner = info
+                    .get("metadata")
+                    .and_then(|metadata| metadata.get("sessionID"))
+                    .and_then(serde_json::Value::as_str);
+                (id, running, owner)
             }
             "shell.exited" | "shell.deleted" => {
                 let Some(id) = id_of(data) else {
                     return false;
                 };
-                (id, false)
+                (id, false, None)
             }
             _ => return false,
         };
         if let Some(sync) = &mut self.shell_sync {
-            match sync.seen.get_mut(id) {
-                Some(state) => *state = running,
-                None => {
-                    sync.seen.insert(id.to_owned(), running);
-                }
-            }
+            sync.seen.insert(id.to_owned());
         }
         if running {
-            !self.running_shells.contains(id) && self.running_shells.insert(id.to_owned())
+            match self.running_shells.entry(id.to_owned()) {
+                Entry::Occupied(mut slot) => {
+                    let owner = owner.map(str::to_owned);
+                    if *slot.get() == owner {
+                        false
+                    } else {
+                        slot.insert(owner);
+                        true
+                    }
+                }
+                Entry::Vacant(slot) => {
+                    slot.insert(owner.map(str::to_owned));
+                    true
+                }
+            }
         } else {
-            self.running_shells.remove(id)
+            self.running_shells.remove(id).is_some()
         }
     }
 
@@ -757,27 +823,35 @@ impl DataStore {
     pub fn begin_shell_sync(&mut self, generation: u64) {
         self.shell_sync = Some(ShellSync {
             generation,
-            seen: HashMap::new(),
+            seen: HashSet::new(),
         });
     }
 
-    /// Answer to rebuild `generation` (the ids whose status is `running`):
-    /// replaces the set, then replays the frames seen since the request was
-    /// issued, which are newer. An answer to any other request (superseded,
-    /// or already applied) is dropped. Returns whether the set changed.
-    pub fn set_running_shells(&mut self, generation: u64, ids: Vec<String>) -> bool {
+    /// Answer to rebuild `generation` (the shells whose status is `running`,
+    /// each with its owner): replaces the map, then replays the frames seen
+    /// since the request was issued, which are newer — for those ids the
+    /// frame's state and owner win. An answer to any other request
+    /// (superseded, or already applied) is dropped. Returns whether the map
+    /// changed.
+    pub fn set_running_shells(&mut self, generation: u64, shells: Vec<RunningShell>) -> bool {
         let Some(sync) = self
             .shell_sync
             .take_if(|sync| sync.generation == generation)
         else {
             return false;
         };
-        let mut next: HashSet<String> = ids.into_iter().collect();
-        for (id, running) in sync.seen {
-            if running {
-                next.insert(id);
-            } else {
-                next.remove(&id);
+        let mut next: HashMap<String, Option<String>> = shells
+            .into_iter()
+            .map(|shell| (shell.id, shell.session))
+            .collect();
+        for id in sync.seen {
+            match self.running_shells.get(&id) {
+                Some(owner) => {
+                    next.insert(id, owner.clone());
+                }
+                None => {
+                    next.remove(&id);
+                }
             }
         }
         if next == self.running_shells {
@@ -2042,6 +2116,275 @@ mod tests {
             echoed_turns(&store),
             vec![true, false, true],
             "typed while idle, the prompt starts the next turn"
+        );
+    }
+
+    /// The `shell.created` frame for one shell (`ox-tools/src/shell/events.rs`:
+    /// `{ info }`), carrying the owner the server puts in `metadata.sessionID`.
+    fn shell_created(id: &str, session: Option<&str>) -> serde_json::Value {
+        let metadata = match session {
+            Some(session) => serde_json::json!({ "sessionID": session }),
+            None => serde_json::json!({}),
+        };
+        serde_json::json!({
+            "info": { "id": id, "status": "running", "metadata": metadata },
+        })
+    }
+
+    /// The `shell.exited` frame: its id sits at the top level, not under `info`.
+    fn shell_exited(id: &str) -> serde_json::Value {
+        serde_json::json!({ "id": id, "status": "completed" })
+    }
+
+    #[test]
+    fn the_shell_count_is_per_session() {
+        // The footer counts the focused session's own shells, so another
+        // session's shell and one the server recorded no owner for must not
+        // inflate it.
+        let mut store = DataStore::default();
+        store.begin_shell_sync(1);
+        assert!(
+            store.set_running_shells(
+                1,
+                vec![
+                    RunningShell {
+                        id: "sh_a".to_owned(),
+                        session: Some("ses_1".to_owned()),
+                    },
+                    RunningShell {
+                        id: "sh_b".to_owned(),
+                        session: Some("ses_1".to_owned()),
+                    },
+                    RunningShell {
+                        id: "sh_c".to_owned(),
+                        session: Some("ses_2".to_owned()),
+                    },
+                    RunningShell {
+                        id: "sh_d".to_owned(),
+                        session: None,
+                    },
+                ],
+            ),
+            "the first answer fills a map that was empty, got {:?}",
+            store.running_shells
+        );
+        assert_eq!(
+            store.running_shells_of("ses_1"),
+            2,
+            "only the focused session's shells count; another session's and the \
+             ownerless one are not its, map: {:?}",
+            store.running_shells
+        );
+        assert_eq!(
+            store.running_shells_of("ses_2"),
+            1,
+            "another session's shell belongs to that session, map: {:?}",
+            store.running_shells
+        );
+        assert_eq!(
+            store.running_shells_of("ses_3"),
+            0,
+            "a session that owns no shell counts none, map: {:?}",
+            store.running_shells
+        );
+    }
+
+    #[test]
+    fn a_created_shell_frame_records_its_owner() {
+        let mut store = DataStore::default();
+        assert!(
+            store.apply_shell_frame("shell.created", &shell_created("sh_a", Some("ses_1"))),
+            "a created frame adds a shell the map did not have"
+        );
+        assert!(
+            store.is_shell_running("sh_a"),
+            "a created running shell reads as running, map: {:?}",
+            store.running_shells
+        );
+        assert_eq!(
+            store.running_shells_of("ses_1"),
+            1,
+            "the frame's metadata names the owner, map: {:?}",
+            store.running_shells
+        );
+        assert!(
+            store.apply_shell_frame("shell.exited", &shell_exited("sh_a")),
+            "an exited frame removes a shell the map had"
+        );
+        assert!(
+            !store.is_shell_running("sh_a"),
+            "an exited shell no longer reads as running, map: {:?}",
+            store.running_shells
+        );
+        assert_eq!(
+            store.running_shells_of("ses_1"),
+            0,
+            "an exited shell leaves its owner's count, map: {:?}",
+            store.running_shells
+        );
+    }
+
+    #[test]
+    fn a_frame_seen_during_a_rebuild_beats_the_answer() {
+        // The answer was built before the exit, so it still lists the shell;
+        // the frame is newer and must win, or the footer keeps a dead shell.
+        let mut store = DataStore::default();
+        assert!(
+            store.apply_shell_frame("shell.created", &shell_created("sh_a", Some("ses_1"))),
+            "the shell starts out running"
+        );
+        store.begin_shell_sync(7);
+        assert!(
+            store.apply_shell_frame("shell.exited", &shell_exited("sh_a")),
+            "the exit changes the map"
+        );
+        store.set_running_shells(
+            7,
+            vec![RunningShell {
+                id: "sh_a".to_owned(),
+                session: Some("ses_1".to_owned()),
+            }],
+        );
+        assert!(
+            !store.is_shell_running("sh_a"),
+            "the newer exit frame outlives the older answer, map: {:?}",
+            store.running_shells
+        );
+        assert_eq!(
+            store.running_shells_of("ses_1"),
+            0,
+            "and the dead shell leaves the footer's count, map: {:?}",
+            store.running_shells
+        );
+    }
+
+    #[test]
+    fn only_the_latest_rebuild_is_applied() {
+        // A superseded answer describes a moment the newer request has already
+        // moved past; applying it would resurrect shells the newer answer is
+        // about to correct. An answer that changes nothing must also report so,
+        // or the caller repaints the footer on every sync.
+        let mut store = DataStore::default();
+        store.begin_shell_sync(1);
+        store.begin_shell_sync(2);
+        let stale = vec![RunningShell {
+            id: "sh_a".to_owned(),
+            session: Some("ses_1".to_owned()),
+        }];
+        assert!(
+            !store.set_running_shells(1, stale),
+            "an answer to a superseded request is dropped, map: {:?}",
+            store.running_shells
+        );
+        assert!(
+            !store.is_shell_running("sh_a"),
+            "the dropped answer left no shell behind, map: {:?}",
+            store.running_shells
+        );
+        let same = vec![RunningShell {
+            id: "sh_a".to_owned(),
+            session: Some("ses_1".to_owned()),
+        }];
+        assert!(
+            store.set_running_shells(2, same.clone()),
+            "the first applied answer changes the map, map: {:?}",
+            store.running_shells
+        );
+        store.begin_shell_sync(3);
+        assert!(
+            !store.set_running_shells(3, same),
+            "an answer matching the current map changes nothing, map: {:?}",
+            store.running_shells
+        );
+    }
+
+    #[test]
+    fn a_rebuild_keeps_the_owner_a_frame_supplied() {
+        // The answer predates the frame, so it carries no owner for that id;
+        // replaying the frame must keep the owner it did supply.
+        let mut store = DataStore::default();
+        store.begin_shell_sync(8);
+        assert!(
+            store.apply_shell_frame("shell.created", &shell_created("sh_a", Some("ses_1"))),
+            "the frame adds the shell"
+        );
+        store.set_running_shells(
+            8,
+            vec![RunningShell {
+                id: "sh_a".to_owned(),
+                session: None,
+            }],
+        );
+        assert_eq!(
+            store.running_shells_of("ses_1"),
+            1,
+            "the frame's owner survives a rebuild that could not know it, map: {:?}",
+            store.running_shells
+        );
+    }
+
+    /// A store whose transcript names `child` in one subagent tool part — the
+    /// precondition both child paths check (`is_foreign_child`).
+    fn store_naming_child(child: &str) -> DataStore {
+        let mut store = DataStore {
+            session: Some("ses_1".to_owned()),
+            ..Default::default()
+        };
+        store.replace_items(vec![Item::Assistant(Box::new(AssistantItem {
+            id: "msg_a".to_owned(),
+            tools: vec![ToolPart {
+                id: "prt_a".to_owned(),
+                tool: ChildRef::SUBAGENT_TOOL.to_owned(),
+                child: Some(ChildRef {
+                    session_id: child.to_owned(),
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }))]);
+        store
+    }
+
+    #[test]
+    fn the_subagent_count_follows_the_children_that_run() {
+        let child = "ses_child";
+        let mut store = store_naming_child(child);
+        assert_eq!(
+            store.running_subagents(),
+            0,
+            "a named child that has not started does not count, children: {:?}",
+            store.running_children
+        );
+        assert!(
+            !store.set_child_running("ses_unknown", true),
+            "a session no tool part names is not this session's child"
+        );
+        assert_eq!(
+            store.running_subagents(),
+            0,
+            "so an unnamed session cannot enter the count, children: {:?}",
+            store.running_children
+        );
+        store.mark_probing(&[child.to_owned()]);
+        assert!(
+            store.apply_probe(child, true),
+            "the probe applies while the child is named"
+        );
+        assert_eq!(
+            store.running_subagents(),
+            1,
+            "a running child counts, children: {:?}",
+            store.running_children
+        );
+        assert!(
+            store.set_child_running(child, false),
+            "the stop applies while the child is still named"
+        );
+        assert_eq!(
+            store.running_subagents(),
+            0,
+            "a settled child leaves the count, children: {:?}",
+            store.running_children
         );
     }
 }
