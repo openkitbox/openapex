@@ -1,0 +1,85 @@
+# Release builds for ox, published as GitHub Release assets on a `v*` tag.
+#
+# Every target is built on its own native runner, so no cross toolchain and no
+# emulation is involved: the C dependencies (aws-lc-sys, libgit2-sys, zstd-sys)
+# compile with the runner's own compiler.
+#
+# Windows (x64/arm64) is deliberately absent: ox is unix-only today. The server
+# binds a unix domain socket (crates/ox-server/src/instance.rs), the shell tool
+# owns process groups and signals (crates/ox-tools/src/shell/process.rs), and
+# the TUI spawns the server into its own process group
+# (crates/ox-tui/src/lifecycle.rs). Add `windows-*` targets here only after
+# that layer is ported.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+# One release per tag: a re-run of the same tag must not race itself.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-15
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --bin ox --target ${{ matrix.target }}
+      - name: Package
+        id: package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive="ox-${version}-${{ matrix.target }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "$GITHUB_WORKSPACE/$archive" ox
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.package.outputs.archive }}
+          path: ${{ steps.package.outputs.archive }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
