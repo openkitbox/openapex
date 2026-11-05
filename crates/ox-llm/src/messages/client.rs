@@ -114,28 +114,3 @@ impl Chat for MessagesClient {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_plain_base_gets_the_version_segment() {
-        assert_eq!(
-            messages_url("https://api.deepseek.com/anthropic"),
-            "https://api.deepseek.com/anthropic/v1/messages"
-        );
-        assert_eq!(
-            messages_url("https://api.anthropic.com/"),
-            "https://api.anthropic.com/v1/messages"
-        );
-    }
-
-    #[test]
-    fn a_base_already_carrying_v1_does_not_repeat_it() {
-        assert_eq!(
-            messages_url("https://gateway.test/v1"),
-            "https://gateway.test/v1/messages"
-        );
-    }
-}

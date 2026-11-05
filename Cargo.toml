@@ -23,7 +23,6 @@ edition = "2024"
 # bump touches exactly one file.
 [workspace.dependencies]
 anyhow = "1.0"
-agent-client-protocol = { version = "3.5" }
 base64 = "0.23"
 bytes = "1.12"
 crossterm = "0.29"

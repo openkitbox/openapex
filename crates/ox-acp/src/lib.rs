@@ -27,7 +27,7 @@ mod translate;
 use std::time::Duration;
 
 use agent_client_protocol as acp;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
     NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SetSessionModeRequest,
     SetSessionModeResponse,
@@ -88,14 +88,14 @@ async fn serve_stdio(base: String) -> anyhow::Result<()> {
     let bridge = bridge::Bridge::new(base);
 
     acp::Agent
-        .builder()
+        .v1()
         .name("ox")
         .on_receive_request(
             {
                 let bridge = bridge.clone();
                 async move |request: InitializeRequest,
-                            responder: acp::Responder<InitializeResponse>,
-                            _connection: acp::ConnectionTo<acp::Client>| {
+                            responder: acp::v1::Responder<InitializeResponse>,
+                            _connection: acp::v1::ConnectionTo<acp::Client>| {
                     responder.respond(bridge.initialize(request))
                 }
             },
@@ -105,8 +105,8 @@ async fn serve_stdio(base: String) -> anyhow::Result<()> {
             {
                 let bridge = bridge.clone();
                 async move |request: NewSessionRequest,
-                            responder: acp::Responder<NewSessionResponse>,
-                            connection: acp::ConnectionTo<acp::Client>| {
+                            responder: acp::v1::Responder<NewSessionResponse>,
+                            connection: acp::v1::ConnectionTo<acp::Client>| {
                     match bridge.new_session(request).await {
                         Ok(response) => {
                             let session = response.session_id.clone();
@@ -126,8 +126,8 @@ async fn serve_stdio(base: String) -> anyhow::Result<()> {
             {
                 let bridge = bridge.clone();
                 async move |request: PromptRequest,
-                            responder: acp::Responder<PromptResponse>,
-                            connection: acp::ConnectionTo<acp::Client>| {
+                            responder: acp::v1::Responder<PromptResponse>,
+                            connection: acp::v1::ConnectionTo<acp::Client>| {
                     // The turn outlives the dispatch loop: stream updates from
                     // the spawned task and answer `session/prompt` on settle.
                     connection.spawn({
@@ -135,9 +135,7 @@ async fn serve_stdio(base: String) -> anyhow::Result<()> {
                         let bridge = bridge.clone();
                         async move {
                             match bridge.run_prompt(&request, &connection).await {
-                                Ok(stop) => {
-                                    responder.respond(acp::schema::v1::PromptResponse::new(stop))
-                                }
+                                Ok(stop) => responder.respond(PromptResponse::new(stop)),
                                 Err(error) => responder.respond_with_error(error),
                             }
                         }
@@ -150,8 +148,8 @@ async fn serve_stdio(base: String) -> anyhow::Result<()> {
             {
                 let bridge = bridge.clone();
                 async move |request: LoadSessionRequest,
-                            responder: acp::Responder<LoadSessionResponse>,
-                            connection: acp::ConnectionTo<acp::Client>| {
+                            responder: acp::v1::Responder<LoadSessionResponse>,
+                            connection: acp::v1::ConnectionTo<acp::Client>| {
                     match bridge.load_session(request, &connection).await {
                         Ok(response) => responder.respond(response),
                         Err(error) => responder.respond_with_error(error),
@@ -164,8 +162,8 @@ async fn serve_stdio(base: String) -> anyhow::Result<()> {
             {
                 let bridge = bridge.clone();
                 async move |request: SetSessionModeRequest,
-                            responder: acp::Responder<SetSessionModeResponse>,
-                            _connection: acp::ConnectionTo<acp::Client>| {
+                            responder: acp::v1::Responder<SetSessionModeResponse>,
+                            _connection: acp::v1::ConnectionTo<acp::Client>| {
                     match bridge.set_session_mode(request).await {
                         Ok(response) => responder.respond(response),
                         Err(error) => responder.respond_with_error(error),
@@ -177,8 +175,8 @@ async fn serve_stdio(base: String) -> anyhow::Result<()> {
         .on_receive_notification(
             {
                 let bridge = bridge.clone();
-                async move |notification: acp::schema::v1::CancelNotification,
-                            _connection: acp::ConnectionTo<acp::Client>| {
+                async move |notification: acp::v1::schema::CancelNotification,
+                            _connection: acp::v1::ConnectionTo<acp::Client>| {
                     bridge.cancel(&notification.session_id).await;
                     Ok(())
                 }

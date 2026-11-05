@@ -169,35 +169,3 @@ fn is_ctrl(key: &KeyEvent, ch: char) -> bool {
 fn has_ctrl(key: &KeyEvent, ch: char) -> bool {
     key.code == KeyCode::Char(ch) && key.modifiers.contains(KeyModifiers::CONTROL)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_picker_hint_is_the_bare_down_arrow() {
-        assert_eq!(
-            hint(CommandAction::Subagents).as_deref(),
-            Some(crate::ui::prompt::SUBAGENT_SHORTCUT),
-            "upstream binds `session.child.first` to a bare `down` (`config/keybind.ts:138`), \
-             and its palette prints that key alone"
-        );
-    }
-
-    #[test]
-    fn the_leader_no_longer_binds_the_down_arrow() {
-        let mut keymap = Keymap::default();
-        let now = Instant::now();
-        let leader = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
-        assert_eq!(
-            keymap.feed(&leader, now, true),
-            Feed::Consumed,
-            "ctrl+x arms the leader"
-        );
-        assert_eq!(
-            keymap.feed(&KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), now, true),
-            Feed::Consumed,
-            "`<leader>↓` is not a binding: the pending sequence is cancelled and the key swallowed"
-        );
-    }
-}

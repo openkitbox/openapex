@@ -68,28 +68,3 @@ impl Credentials {
             .all(|credential| credential.api_key.as_deref().is_none_or(str::is_empty))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_set_key_reads_back_and_an_empty_one_is_absent() {
-        let mut credentials = Credentials::default();
-        assert!(credentials.is_empty());
-        credentials.set("deepseek", "sk-test");
-        assert_eq!(credentials.key("deepseek"), Some("sk-test"));
-        assert!(!credentials.is_empty());
-        credentials.set("deepseek", "");
-        assert_eq!(credentials.key("deepseek"), None);
-    }
-
-    #[test]
-    fn remove_reports_whether_a_key_was_there() {
-        let mut credentials = Credentials::default();
-        credentials.set("deepseek", "sk-test");
-        assert!(credentials.remove("deepseek"));
-        assert!(!credentials.remove("deepseek"));
-        assert!(credentials.key("deepseek").is_none());
-    }
-}

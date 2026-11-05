@@ -15,7 +15,7 @@
 //! - `session.execution.succeeded/.failed/.interrupted` are the turn-level
 //!   terminators (`session.step.ended` fires once per step, many per turn).
 
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     Content, ContentBlock, ContentChunk, SessionUpdate, TextContent, ToolCall, ToolCallContent,
     ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };

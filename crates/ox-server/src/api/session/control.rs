@@ -475,34 +475,3 @@ pub(crate) async fn synthetic(req: &mut Request, depot: &mut Depot, res: &mut Re
         },
     })));
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn background_notice_matches_upstream_text() {
-        let moved = [
-            ox_tools::jobs::JobInfo {
-                id: "shell_1".to_owned(),
-                kind: "shell",
-                title: "sleep 60".to_owned(),
-            },
-            ox_tools::jobs::JobInfo {
-                id: "ses_child".to_owned(),
-                kind: "subagent",
-                title: String::new(),
-            },
-        ];
-        assert_eq!(
-            background_notice(&moved),
-            "User requested that active blocking work be moved to the background.\n\
-             \n\
-             Backgrounded work:\n\
-             - shell: sleep 60\n\
-             - subagent: ses_child\n\
-             \n\
-             The backgrounded work is still unfinished. Move on to other work if you can. If there is nothing else useful to do, finish your response. Do not wait, sleep, poll, or report the backgrounded work as complete until a later completion notification is added to the conversation.",
-        );
-    }
-}

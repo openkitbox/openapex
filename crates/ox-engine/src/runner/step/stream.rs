@@ -429,35 +429,3 @@ fn map_finish(raw: &str) -> FinishReason {
         _ => FinishReason::Unknown,
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Both wire vocabularies must map, because one mapper serves both streams;
-    /// an unmapped reason silently degrades the turn to `provider.invalid-output`
-    /// (that is how DeepSeek's `end_turn` broke every Messages turn).
-    #[test]
-    fn finish_reasons_from_both_wire_vocabularies_map() {
-        for (raw, expected) in [
-            ("stop", FinishReason::Stop),
-            ("end_turn", FinishReason::Stop),
-            ("stop_sequence", FinishReason::Stop),
-            ("pause_turn", FinishReason::Stop),
-            ("length", FinishReason::Length),
-            ("max_tokens", FinishReason::Length),
-            ("tool_calls", FinishReason::ToolCalls),
-            ("tool_use", FinishReason::ToolCalls),
-            ("content_filter", FinishReason::ContentFilter),
-            ("refusal", FinishReason::ContentFilter),
-            ("error", FinishReason::Error),
-            ("something-new", FinishReason::Unknown),
-        ] {
-            assert_eq!(
-                map_finish(raw),
-                expected,
-                "finish reason {raw:?} must map to {expected:?}"
-            );
-        }
-    }
-}

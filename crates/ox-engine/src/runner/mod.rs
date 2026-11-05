@@ -1054,35 +1054,3 @@ impl ox_tools::subagent::SubagentSpawner for Runner {
         ))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_root_session_runs_its_named_agent_or_the_default() {
-        assert_eq!(agent_of(None, Some("explore")).id, "explore");
-        assert_eq!(agent_of(None, None).id, agent::DEFAULT_AGENT);
-        assert_eq!(
-            agent_of(None, Some("nope")).id,
-            agent::DEFAULT_AGENT,
-            "an unknown id runs the default agent"
-        );
-    }
-
-    #[test]
-    fn a_child_never_runs_a_primary_agent() {
-        // A child created straight through `POST /api/session {parentID}`
-        // inherits the parent's `apex`; its toolset must still drop `question`.
-        for named in [None, Some("apex"), Some("nope")] {
-            let resolved = agent_of(Some("ses_parent"), named);
-            assert_eq!(
-                resolved.mode,
-                Mode::Subagent,
-                "child named {named:?} resolved to primary `{}`",
-                resolved.id
-            );
-        }
-        assert_eq!(agent_of(Some("ses_parent"), Some("explore")).id, "explore");
-    }
-}

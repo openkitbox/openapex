@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use agent_client_protocol as acp;
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v1::{
+use agent_client_protocol::v1::schema::{
     AgentCapabilities, AvailableCommand, AvailableCommandsUpdate, ContentBlock,
     EmbeddedResourceResource, Implementation, InitializeRequest, InitializeResponse,
     LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
@@ -144,7 +144,7 @@ impl Bridge {
     pub async fn load_session(
         &self,
         request: LoadSessionRequest,
-        connection: &acp::ConnectionTo<acp::Client>,
+        connection: &acp::v1::ConnectionTo<acp::Client>,
     ) -> Result<LoadSessionResponse, acp::Error> {
         let session = request.session_id.to_string();
         let directory = request.cwd.to_string_lossy().to_string();
@@ -243,7 +243,7 @@ impl Bridge {
     pub(crate) async fn send_available_commands(
         &self,
         session: &SessionId,
-        connection: &acp::ConnectionTo<acp::Client>,
+        connection: &acp::v1::ConnectionTo<acp::Client>,
     ) {
         let mut commands = Vec::new();
         match self
@@ -330,7 +330,7 @@ impl Bridge {
     pub(crate) async fn run_prompt(
         &self,
         request: &PromptRequest,
-        connection: &acp::ConnectionTo<acp::Client>,
+        connection: &acp::v1::ConnectionTo<acp::Client>,
     ) -> Result<StopReason, acp::Error> {
         let session = request.session_id.to_string();
         let directory = self.directory(&session)?;
@@ -357,7 +357,7 @@ impl Bridge {
         session: &str,
         directory: &str,
         request: &PromptRequest,
-        connection: &acp::ConnectionTo<acp::Client>,
+        connection: &acp::v1::ConnectionTo<acp::Client>,
         cancel: &Arc<tokio::sync::Notify>,
     ) -> Result<StopReason, acp::Error> {
         let mut stream = stream::open(&self.http, &self.base, Some(session), None).await?;
@@ -418,7 +418,7 @@ impl Bridge {
         frame: &Frame,
         tool_names: &mut translate::ToolNames,
         request: &PromptRequest,
-        connection: &acp::ConnectionTo<acp::Client>,
+        connection: &acp::v1::ConnectionTo<acp::Client>,
     ) -> Option<TurnEnd> {
         if frame.kind == "session.tool.input.started" {
             translate::learn_tool_name(tool_names, &frame.data);
