@@ -127,7 +127,14 @@ pub enum AppEvent {
     FormFailed(String),
     Quit,
     /// Answer to `AppCommand::ListSessions`; opens the `/sessions` dialog.
-    Sessions(Vec<ox_client::rest::SessionSummary>),
+    /// `running` holds the root sessions with a turn in flight in their tree.
+    Sessions {
+        sessions: Vec<ox_client::rest::SessionSummary>,
+        running: std::collections::HashSet<String>,
+    },
+    /// Answer to `AppCommand::ListRunningRoots`: the root sessions with a turn
+    /// in flight in their tree, to refresh the open `/sessions` dialog.
+    RunningRoots(std::collections::HashSet<String>),
     /// Answer to `AppCommand::ListFamily`: the family `session` belongs to;
     /// the activity panel lists it.
     Family {

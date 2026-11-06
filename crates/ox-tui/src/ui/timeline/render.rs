@@ -437,15 +437,12 @@ fn reasoning_block(
     lines
 }
 
-/// The ` · 2.5s` suffix of a finished Thought header: tenths of a second, and
-/// no suffix until the reasoning reported a duration (`ms == 0` means none).
-///
-/// `format_duration` is upstream's `Locale.duration`, whose sub-second shape is
-/// `400ms`; the header always shows seconds (`0.4s`), so this is the smallest
-/// formatter that fits it instead of a mode inside the shared one.
+/// The ` · 2.5s` suffix of a finished Thought header (upstream
+/// `Locale.duration`, so under a second it reads `400ms`); no suffix until
+/// the reasoning reported a duration (`ms == 0` means none).
 fn thought_duration(ms: Option<u64>) -> Option<String> {
     let ms = ms.filter(|ms| *ms > 0)?;
-    Some(format!("{:.1}s", ms as f64 / 1_000.0))
+    Some(format_duration(i64::try_from(ms).unwrap_or(i64::MAX)))
 }
 
 /// The answer text, then the turn footer (own blank row above it).

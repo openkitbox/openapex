@@ -442,6 +442,20 @@ impl Client {
         Ok(resp.json::<Page<SessionSummary>>().await?.data)
     }
 
+    /// Ids of every session with work scheduled or in flight, children
+    /// included (`GET /api/session/active`).
+    pub async fn active_sessions(&self) -> Result<Vec<String>> {
+        let resp = self
+            .request(reqwest::Method::GET, "/api/session/active")
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Error::Status(resp.status()));
+        }
+        let active = resp.json::<Envelope<HashMap<String, Value>>>().await?.data;
+        Ok(active.into_keys().collect())
+    }
+
     /// The whole session tree `current` belongs to, root first and then its
     /// descendants breadth-first (`GET /ox/session/{id}/family`, an ox-only
     /// endpoint: upstream's `parentID` filter reaches direct children only).

@@ -91,6 +91,9 @@ pub enum AppCommand {
     Quit,
     /// Fetch `GET /api/session` for the `/sessions` dialog.
     ListSessions,
+    /// Re-resolve which root sessions are running; answered with
+    /// `AppEvent::RunningRoots`.
+    ListRunningRoots,
     /// Fetch the session family of `session`; answered with `AppEvent::Family`.
     ListFamily {
         session: String,

@@ -346,15 +346,24 @@ impl App {
             AppEvent::SwitchFailed { title, err } => {
                 self.show_toast(Toast::error(title, err, Instant::now()))
             }
-            AppEvent::Sessions(sessions) => {
+            AppEvent::Sessions { sessions, running } => {
                 if !self.form_open() {
                     self.dialog = Some(session_dialog::list(
                         &sessions,
                         self.session.as_deref(),
+                        &running,
                         jiff::Timestamp::now(),
                         &jiff::tz::TimeZone::system(),
                     ));
                     self.dialog_purpose = None;
+                    self.dirty = true;
+                }
+            }
+            AppEvent::RunningRoots(running) => {
+                if self.dialog.as_ref().and_then(Dialog::tag) == Some(session_dialog::LIST_TAG)
+                    && let Some(Dialog::Select(select)) = self.dialog.as_mut()
+                    && session_dialog::set_running(select, &running)
+                {
                     self.dirty = true;
                 }
             }
@@ -951,7 +960,7 @@ impl App {
             self.keymap.reset();
             // `ctrl+c` stays a way out of anything, including a modal.
             if keymap::is_cancel(&key) {
-                self.interrupt_or_quit();
+                self.quit();
                 self.dirty = true;
                 return;
             }
@@ -994,7 +1003,7 @@ impl App {
         if let Some(tab) = self.panel {
             self.keymap.reset();
             if keymap::is_cancel(&key) {
-                self.interrupt_or_quit();
+                self.quit();
             } else {
                 self.on_activity_key(key, tab);
             }
@@ -1041,7 +1050,7 @@ impl App {
         // prompt is not receiving keys.
         if matches!(self.mode, Mode::Browse) {
             if keymap::is_cancel(&key) {
-                self.interrupt_or_quit();
+                self.quit();
                 self.dirty = true;
                 return;
             }
@@ -1159,7 +1168,7 @@ impl App {
         match self.prompt.handle_key(key) {
             PromptAction::Ignored => {}
             PromptAction::Declined => self.declined_key(key.code),
-            PromptAction::CtrlC => self.interrupt_or_quit(),
+            PromptAction::CtrlC => self.quit(),
             PromptAction::Esc => self.press_esc(Instant::now()),
             PromptAction::Submit(submission) => self.submit(submission),
             PromptAction::Run(action) => self.run_command(action),
@@ -1595,15 +1604,10 @@ impl App {
         }
     }
 
-    /// ctrl+c with an empty draft: interrupt a running turn, otherwise quit.
-    fn interrupt_or_quit(&mut self) {
-        if self.store.running_since.is_some() {
-            if let Some(session) = self.session.clone() {
-                let _ = self.commands.send(AppCommand::Interrupt { session });
-            }
-        } else {
-            self.view.should_quit = true;
-        }
+    /// ctrl+c with an empty draft: quit (upstream `app.exit`). Stopping a
+    /// running turn is Esc's job alone (`press_esc`).
+    fn quit(&mut self) {
+        self.view.should_quit = true;
     }
 
     /// The pointer reaches the transcript only when nothing modal is on top.
@@ -1753,6 +1757,13 @@ impl App {
                     return;
                 }
                 let typed = envelope.parse_typed();
+                // A turn started or ended somewhere: the open session list
+                // re-reads which trees are running.
+                if self.dialog.as_ref().and_then(Dialog::tag) == Some(session_dialog::LIST_TAG)
+                    && execution_edge(&typed.data)
+                {
+                    let _ = self.commands.send(AppCommand::ListRunningRoots);
+                }
                 // `form.*` frames parse as `Unknown` (no session id); the
                 // store filters them by `form.sessionID` itself.
                 let is_form = envelope.kind.starts_with("form.");
@@ -2113,6 +2124,11 @@ impl App {
                     if self.route == Route::Session && self.transcript.tick(Instant::now()) {
                         self.dirty = true;
                     }
+                    if let Some(Dialog::Select(select)) = self.dialog.as_mut()
+                        && select.tick_spinner(Instant::now())
+                    {
+                        self.dirty = true;
+                    }
                     if self.route == Route::Session {
                         self.poll_shells(Instant::now());
                     }
@@ -2197,6 +2213,18 @@ fn preview_of(images: &[media::Image], initial: usize) -> image_preview::Preview
 /// Whether the cell `(x, y)` lies in `area`.
 fn contains(area: Rect, x: u16, y: u16) -> bool {
     area.contains(ratatui::layout::Position { x, y })
+}
+
+/// A session's turn started or ended (`session.execution.*`).
+fn execution_edge(data: &ox_schema::event::SessionEventData) -> bool {
+    use ox_schema::event::SessionEventData;
+    matches!(
+        data,
+        SessionEventData::ExecutionStarted { .. }
+            | SessionEventData::ExecutionSucceeded { .. }
+            | SessionEventData::ExecutionFailed { .. }
+            | SessionEventData::ExecutionInterrupted { .. }
+    )
 }
 
 /// Send the pending OSC 52 copy sequence, if any, through the writer ratatui

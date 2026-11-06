@@ -30,6 +30,15 @@ pub const FRAMES: usize = WIDTH + HOLD_END + (WIDTH - 1) + HOLD_START;
 /// Upstream's `interval={40}`.
 pub const INTERVAL_MS: u128 = 40;
 
+/// Upstream `braille` spinner (`component/spinner-frames.ts`), the glyph
+/// `<Spinner>` draws for running rows.
+pub const BRAILLE_FRAMES: [char; 10] = [
+    '\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}', '\u{2834}', '\u{2826}', '\u{2827}',
+    '\u{2807}', '\u{280f}',
+];
+/// `<spinner interval={80}>` (`component/spinner.tsx`).
+pub const BRAILLE_INTERVAL_MS: u128 = 80;
+
 /// Where the scanner head is and how far the current phase has run.
 struct State {
     position: usize,

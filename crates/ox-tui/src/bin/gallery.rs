@@ -766,9 +766,11 @@ fn session_case(
         summary("ses_c", Some("帮我写一个 Rust 解析器"), 2 * 86_400_000),
         summary("ses_d", Some("Parity gold for dialogs"), 9 * 86_400_000),
     ];
+    let running: std::collections::HashSet<String> = ["ses_c".to_owned()].into();
     let mut dialog = session_dialog::list(
         &sessions,
         Some("ses_a"),
+        &running,
         jiff::Timestamp::from_millisecond(NOW).expect("fixed instant"),
         &jiff::tz::TimeZone::UTC,
     );

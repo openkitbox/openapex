@@ -130,7 +130,7 @@ pub fn hint(action: CommandAction) -> Option<String> {
         })
 }
 
-/// `ctrl+c`: interrupt a running turn, otherwise quit. Works in every mode.
+/// `ctrl+c`: quit (upstream `app.exit`). Works in every mode.
 #[must_use]
 pub fn is_cancel(key: &KeyEvent) -> bool {
     has_ctrl(key, 'c')

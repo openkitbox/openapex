@@ -7,6 +7,8 @@
 //! `AttachSession`, `DetachSession`, `Quit`) stay on `main`'s serial loop and
 //! are no-ops here.
 
+use std::collections::{HashMap, HashSet};
+use std::mem;
 use std::sync::Arc;
 
 use ox_client::Client;
@@ -42,6 +44,7 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
         } => prompt(&client, &tx, &session, &text, &files).await,
         AppCommand::Interrupt { session } => interrupt(&client, &tx, &session).await,
         AppCommand::ListSessions => list_sessions(&client, &tx).await,
+        AppCommand::ListRunningRoots => list_running_roots(&client, &tx).await,
         AppCommand::ListFamily { session } => list_family(&client, &tx, session).await,
         AppCommand::ListShells { session } => list_shells(&client, &tx, session).await,
         AppCommand::SyncShells { generation } => sync_shells(&client, generation, &tx).await,
@@ -133,11 +136,69 @@ async fn interrupt(client: &Client, tx: &Events, session: &str) {
 
 async fn list_sessions(client: &Client, tx: &Events) {
     let event = match client.sessions().await {
-        Ok(sessions) => AppEvent::Sessions(sessions),
+        Ok(sessions) => AppEvent::Sessions {
+            sessions,
+            running: running_roots(client).await,
+        },
         Err(err) => session_failed("Failed to list sessions", err),
     };
     let _ = tx.send(event);
 }
+
+async fn list_running_roots(client: &Client, tx: &Events) {
+    let _ = tx.send(AppEvent::RunningRoots(running_roots(client).await));
+}
+
+/// Root sessions with work in flight in their tree: the session itself or any
+/// descendant (upstream marks a row whose `family` has a running member).
+/// Each active id climbs `parentID` to its root; the active set is a handful
+/// of sessions, and a shared visited map stops repeated climbs. A failed
+/// lookup drops that chain only: no spinner is the safe reading.
+async fn running_roots(client: &Client) -> HashSet<String> {
+    let active = match client.active_sessions().await {
+        Ok(active) => active,
+        Err(err) => {
+            tracing::warn!(%err, "active sessions lookup failed");
+            return HashSet::new();
+        }
+    };
+    // Session → its root, for every id seen while climbing.
+    let mut root_of: HashMap<String, String> = HashMap::new();
+    let mut roots = HashSet::new();
+    for start in active {
+        let mut chain = Vec::new();
+        let mut id = start;
+        let root = loop {
+            if let Some(root) = root_of.get(&id) {
+                break Some(root.clone());
+            }
+            // A cycle would be a corrupt store; give up on this chain.
+            if chain.contains(&id) || chain.len() > MAX_CLIMB {
+                break None;
+            }
+            match client.session_info(&id).await {
+                Ok(info) => match info.parent_id {
+                    Some(parent) => chain.push(mem::replace(&mut id, parent)),
+                    None => break Some(id.clone()),
+                },
+                Err(err) => {
+                    tracing::warn!(%err, id, "session lookup failed");
+                    break None;
+                }
+            }
+        };
+        let Some(root) = root else { continue };
+        chain.push(id);
+        for member in chain {
+            root_of.insert(member, root.clone());
+        }
+        roots.insert(root);
+    }
+    roots
+}
+
+/// Deepest subagent nesting `running_roots` climbs before giving up.
+const MAX_CLIMB: usize = 32;
 
 async fn list_family(client: &Client, tx: &Events, session: String) {
     let event = match client.session_family(&session).await {

@@ -232,7 +232,7 @@ pub enum PromptAction {
     Submit(Submission),
     /// A slash command was chosen; the token was removed from the draft.
     Run(CommandAction),
-    /// ctrl+c with an empty draft: the app decides interrupt vs quit.
+    /// ctrl+c with an empty draft: the app quits.
     CtrlC,
     /// Esc with no menu open: the app decides whether it interrupts a turn.
     Esc,

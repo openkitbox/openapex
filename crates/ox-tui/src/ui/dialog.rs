@@ -8,6 +8,8 @@
 
 use std::cell::Cell;
 use std::cmp::Reverse;
+use std::mem;
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ox_client::rest::{McpRef, McpStatus};
@@ -25,6 +27,7 @@ use super::image_preview::{self, Preview};
 use super::media;
 use super::output_dialog::{self, Output};
 use super::paste;
+use super::spinner;
 use crate::graphics::Graphics;
 use crate::theme::{self, Palette};
 
@@ -325,6 +328,9 @@ pub struct Item {
     /// Shown only while the filter is empty (the palette's `Suggested` copies,
     /// which upstream drops once the user types).
     pub unfiltered_only: bool,
+    /// The row's work is in flight: a spinner takes the marker cell
+    /// (upstream's `gutter` with `<Spinner>`, `dialog-session-list.tsx`).
+    pub running: bool,
 }
 
 impl Item {
@@ -336,7 +342,14 @@ impl Item {
             footer: None,
             category: None,
             unfiltered_only: false,
+            running: false,
         }
+    }
+
+    #[must_use]
+    pub fn running(mut self, running: bool) -> Self {
+        self.running = running;
+        self
     }
 
     #[must_use]
@@ -401,6 +414,9 @@ pub struct Select {
     actions: Vec<Action>,
     /// A row that pressed a confirming action once and awaits the second.
     armed: Option<Armed>,
+    /// Spinner frame of running rows, and when it started counting.
+    spin: usize,
+    spin_started: Option<Instant>,
 }
 
 /// A `ctrl+<key>` shortcut on the selected row (upstream `actions`). With
@@ -436,6 +452,8 @@ impl Select {
             empty_text: None,
             actions: Vec::new(),
             armed: None,
+            spin: 0,
+            spin_started: None,
         }
     }
 
@@ -490,6 +508,30 @@ impl Select {
     /// The row whose value is `value`.
     pub fn item(&self, value: &str) -> Option<&Item> {
         self.items.iter().find(|item| item.value == value)
+    }
+
+    /// Mark each row running when `running(value)` says so; `true` when a row
+    /// changed.
+    pub fn mark_running(&mut self, running: impl Fn(&str) -> bool) -> bool {
+        let mut changed = false;
+        for item in &mut self.items {
+            let now = running(&item.value);
+            changed |= mem::replace(&mut item.running, now) != now;
+        }
+        changed
+    }
+
+    /// Advance the running rows' spinner by the clock; `true` when the drawn
+    /// frame changed. Nothing running stops the clock.
+    pub fn tick_spinner(&mut self, now: Instant) -> bool {
+        if !self.items.iter().any(|item| item.running) {
+            self.spin_started = None;
+            return false;
+        }
+        let started = *self.spin_started.get_or_insert(now);
+        let elapsed = now.saturating_duration_since(started).as_millis();
+        let frame = (elapsed / spinner::BRAILLE_INTERVAL_MS) as usize;
+        mem::replace(&mut self.spin, frame) != frame
     }
 
     /// Drop the row `value` (it was deleted elsewhere); the cursor stays in range.
@@ -1061,6 +1103,7 @@ fn draw_select(buf: &mut Buffer, area: Rect, select: &Select, pal: &Palette) -> 
                         confirm,
                         *position == cursor,
                         current,
+                        select.spin,
                         pal,
                     );
                 }
@@ -1099,7 +1142,9 @@ fn draw_select(buf: &mut Buffer, area: Rect, select: &Select, pal: &Palette) -> 
 }
 
 /// One list row (`DialogSelectRow`, old-design branch: the gold capture
-/// shows bold + fill for the active row, `●` for the current value).
+/// shows bold + fill for the active row, `●` for the current value). A
+/// running row's spinner is its gutter and replaces the `●`
+/// (`<Show when={props.current && !props.gutter}>`).
 #[allow(clippy::too_many_arguments)]
 fn draw_item(
     buf: &mut Buffer,
@@ -1109,6 +1154,7 @@ fn draw_item(
     confirm: Option<&str>,
     active: bool,
     current: bool,
+    spin: usize,
     pal: &Palette,
 ) {
     let text_x = panel.x + TEXT_INSET;
@@ -1159,7 +1205,19 @@ fn draw_item(
     } else {
         (pal.text, pal.dim)
     };
-    if current {
+    if item.running {
+        let glyph = spinner::BRAILLE_FRAMES[spin % spinner::BRAILLE_FRAMES.len()];
+        let mut cell = [0; 4];
+        put(
+            buf,
+            panel,
+            panel.x + 2,
+            y,
+            1,
+            glyph.encode_utf8(&mut cell),
+            title_style,
+        );
+    } else if current {
         put(buf, panel, panel.x + 2, y, 1, "\u{25cf}", title_style);
     }
     // The footer takes its own width from the right; title and description

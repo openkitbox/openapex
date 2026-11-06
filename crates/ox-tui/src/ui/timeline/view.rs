@@ -1,6 +1,7 @@
 use ox_client::store::ToolState;
 
 use super::block::Block;
+use crate::ui::spinner;
 use crate::ui::tool_text;
 
 /// Everything the renderer needs beyond the `Block` itself. `Copy`, so `sync`
@@ -37,12 +38,9 @@ pub(super) fn draws_block(tool: &str, state: ToolState) -> bool {
     }
 }
 
-/// Upstream `braille` spinner (`component/spinner-frames.ts`), 80ms a frame.
-pub(super) const SPINNER_FRAMES: [char; 10] = [
-    '\u{280b}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283c}', '\u{2834}', '\u{2826}', '\u{2827}',
-    '\u{2807}', '\u{280f}',
-];
-pub(super) const SPINNER_INTERVAL_MS: u128 = 80;
+/// Upstream `braille` spinner, 80ms a frame (`ui/spinner.rs` owns them).
+pub(super) const SPINNER_FRAMES: [char; 10] = spinner::BRAILLE_FRAMES;
+pub(super) const SPINNER_INTERVAL_MS: u128 = spinner::BRAILLE_INTERVAL_MS;
 
 /// Blocks whose spinner moves with the clock: streaming reasoning, running
 /// tool and todo rows, and background subagent rows.

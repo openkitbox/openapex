@@ -5,6 +5,8 @@
 //! arguments, so grouping and relative times are testable without a machine
 //! clock. Network calls and navigation live in `app` and `main`.
 
+use std::collections::HashSet;
+
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, Zoned};
 use ox_client::rest::SessionSummary;
@@ -65,11 +67,13 @@ fn relative(now: &Zoned, then: &Zoned) -> String {
 }
 
 /// The session list, newest first as the server sent it. `current` is the
-/// session being viewed (marked `●`, cursor starts on it).
+/// session being viewed (marked `●`, cursor starts on it). Rows in `running`
+/// show a spinner instead (upstream `sessionStatusGutter`).
 #[must_use]
 pub fn list(
     sessions: &[SessionSummary],
     current: Option<&str>,
+    running: &HashSet<String>,
     now: Timestamp,
     tz: &TimeZone,
 ) -> Dialog {
@@ -83,6 +87,7 @@ pub fn list(
             Item::new(session.id.as_str(), title_of(session))
                 .category(category(&updated, &now))
                 .footer(relative(&now, &updated))
+                .running(running.contains(&session.id))
         })
         .collect();
     let mut select = Select::new("Sessions", items)
@@ -98,6 +103,12 @@ pub fn list(
         select = select.current(current);
     }
     Dialog::Select(select)
+}
+
+/// Refresh the running marks of an open list from `running`; `true` when a
+/// row changed.
+pub fn set_running(select: &mut Select, running: &HashSet<String>) -> bool {
+    select.mark_running(|value| running.contains(value))
 }
 
 /// `DialogSessionRename`: a prompt prefilled with the row's title.
