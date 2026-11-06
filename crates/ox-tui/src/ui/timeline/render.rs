@@ -355,16 +355,18 @@ fn reasoning_summary(text: &str) -> (Option<&str>, &str) {
     }
 }
 
-/// Header colour: full `warning` when open, or when a finished header is
-/// hovered (upstream `group-view.tsx:166-177`); the 60% `thought` tint
-/// otherwise.
+/// Header colour (upstream `group-view.tsx:166-177`): the plain text colour
+/// while the reasoning streams (`Thinking`); once finished (`Thought`), full
+/// `warning` when open or hovered, the 60% `thought` tint otherwise.
 fn thought_header_style(
     palette: &theme::Palette,
     expanded: bool,
     done: bool,
     hovered: bool,
 ) -> ratatui::style::Style {
-    if expanded || (done && hovered) {
+    if !done {
+        palette.text
+    } else if expanded || hovered {
         palette.warning
     } else {
         palette.thought
@@ -378,8 +380,9 @@ fn thought_header_style(
 /// `: title`. An open block shows its text on a `┃` rail one blank row below
 /// the header. Click or `r` toggles it.
 ///
-/// Observed in upstream 2.2.3 (`gold`): the open header is the plain warning
-/// colour and the collapsed one is warning tinted 60% over the background.
+/// Observed in upstream 2.2.3 (`gold`): a streaming `Thinking` header is the
+/// plain text colour; a finished open header is the plain warning colour and
+/// a collapsed one is warning tinted 60% over the background.
 /// The body is markdown in the muted tone (upstream `ReasoningPart` with
 /// `generateThinkingSyntax`, `message-parts.tsx:43`).
 fn reasoning_block(
