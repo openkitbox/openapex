@@ -41,9 +41,10 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
     match command {
         AppCommand::Prompt {
             session,
+            id,
             text,
             files,
-        } => prompt(&client, &tx, &session, &text, &files).await,
+        } => prompt(&client, &tx, &session, &id, &text, &files).await,
         AppCommand::Interrupt { session } => interrupt(&client, &tx, &session).await,
         AppCommand::Background { session } => background(&client, &tx, &session).await,
         AppCommand::ListSessions => list_sessions(&client, &tx).await,
@@ -128,10 +129,20 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
     }
 }
 
-async fn prompt(client: &Client, tx: &Events, session: &str, text: &str, files: &[FileInput]) {
-    if let Err(err) = client.prompt(session, text, files).await {
+async fn prompt(
+    client: &Client,
+    tx: &Events,
+    session: &str,
+    id: &str,
+    text: &str,
+    files: &[FileInput],
+) {
+    if let Err(err) = client.prompt(session, id, text, files).await {
         tracing::warn!(%err, "prompt failed");
-        let _ = tx.send(AppEvent::PromptFailed(err.to_string()));
+        let _ = tx.send(AppEvent::PromptFailed {
+            id: id.to_owned(),
+            error: err.to_string(),
+        });
     }
 }
 

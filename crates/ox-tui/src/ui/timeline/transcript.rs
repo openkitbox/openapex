@@ -248,6 +248,7 @@ impl Transcript {
             | Block::Notice(_)
             | Block::Error(_)
             | Block::CompactionQueued
+            | Block::BackgroundHint
             | Block::Compaction { .. }
             | Block::Completion { .. }
             | Block::Shell { .. } => return false,
@@ -302,6 +303,7 @@ impl Transcript {
             | Block::Notice(_)
             | Block::Error(_)
             | Block::CompactionQueued
+            | Block::BackgroundHint
             | Block::Tool { .. }
             | Block::Todo { .. }
             | Block::Compaction { .. } => None,
@@ -654,9 +656,11 @@ impl Transcript {
                 spin: if spins(block) { self.spin_frame } else { 0 },
                 ..Default::default()
             },
-            Block::Switch(_) | Block::Notice(_) | Block::Error(_) | Block::CompactionQueued => {
-                ViewState::default()
-            }
+            Block::Switch(_)
+            | Block::Notice(_)
+            | Block::Error(_)
+            | Block::CompactionQueued
+            | Block::BackgroundHint => ViewState::default(),
         }
     }
 

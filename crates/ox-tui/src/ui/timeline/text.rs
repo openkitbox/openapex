@@ -16,6 +16,7 @@ pub(super) fn text_rows(block: &Block) -> (usize, usize) {
         | Block::Notice(_)
         | Block::Error(_)
         | Block::CompactionQueued
+        | Block::BackgroundHint
         | Block::Explored(_)
         | Block::Tool { .. }
         | Block::Todo { .. }

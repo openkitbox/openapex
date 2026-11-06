@@ -77,14 +77,25 @@ impl PartialEq for Explored {
 }
 impl Eq for Explored {}
 
+/// Whether a user prompt has reached the agent yet (upstream
+/// `pendingDeliveries`, `routes/session/index.tsx:221-224`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Still in the server inbox.
+    Pending,
+    /// Delivered to the agent, or loaded from history.
+    Delivered,
+}
+
 #[derive(Debug, Clone)]
 pub enum Block {
     User {
         text: std::sync::Arc<str>,
         /// Every attachment on the prompt as metadata: images are drawn as
         /// thumbnails, anything else as a `file`/`dir` label row. Empty for the
-        /// optimistic local echo, which has no message to fetch bytes by.
+        /// optimistic local echo, which carries no attachment.
         files: std::sync::Arc<[ox_client::store::MediaMeta]>,
+        delivery: Delivery,
     },
     /// The reasoning header of one assistant message, collapsed by default.
     Reasoning {
@@ -117,6 +128,9 @@ pub enum Block {
     Error(ErrorInfo),
     /// A compaction waiting in the inbox (upstream `CompactionQueued`).
     CompactionQueued,
+    /// Upstream `BackgroundToolHint`: the transcript's last row while a
+    /// running shell/subagent call can be moved to the background.
+    BackgroundHint,
     /// Consecutive read/search/fetch tool calls, folded into one row.
     Explored(Explored),
     /// One inline tool call row (and its collapsed output).
@@ -206,6 +220,7 @@ impl Block {
         Block::User {
             text: std::sync::Arc::from(text),
             files: std::sync::Arc::from(Vec::new()),
+            delivery: Delivery::Delivered,
         }
     }
     #[must_use]
@@ -235,9 +250,18 @@ impl Block {
 impl PartialEq for Block {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Block::User { text: a, files: af }, Block::User { text: b, files: bf }) => {
-                std::sync::Arc::ptr_eq(a, b) && std::sync::Arc::ptr_eq(af, bf)
-            }
+            (
+                Block::User {
+                    text: a,
+                    files: af,
+                    delivery: ad,
+                },
+                Block::User {
+                    text: b,
+                    files: bf,
+                    delivery: bd,
+                },
+            ) => std::sync::Arc::ptr_eq(a, b) && std::sync::Arc::ptr_eq(af, bf) && ad == bd,
             (
                 Block::Reasoning {
                     id: aid,
@@ -273,6 +297,7 @@ impl PartialEq for Block {
                 std::sync::Arc::ptr_eq(&a.message, &b.message) || a == b
             }
             (Block::CompactionQueued, Block::CompactionQueued) => true,
+            (Block::BackgroundHint, Block::BackgroundHint) => true,
             (Block::Explored(a), Block::Explored(b)) => a == b,
             (
                 Block::Tool {

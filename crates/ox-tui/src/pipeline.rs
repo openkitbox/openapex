@@ -28,7 +28,9 @@
 //! payloads across, the step error and retry ride on the assistant footer,
 //! and each compaction waiting in the inbox appends a trailing
 //! `CompactionQueued` row (upstream `rows.ts:70-79` splices them in at the
-//! end, ahead of pending prompts, which ox shows in the dock instead).
+//! end, ahead of pending prompts, which ox shows in the dock instead). The
+//! `BackgroundHint` row comes last while it is shown (upstream
+//! `BackgroundToolHint` follows the rows, `routes/session/index.tsx:1561`).
 //!
 //! Session-row deviations:
 //! - The footer shows for a terminal finish only once the message is `done`
@@ -47,7 +49,7 @@ use ox_client::store::{AssistantItem, DataStore, Item, ShellRef, ToolPart};
 use ox_schema::support::FinishReason;
 
 use crate::shell_captures::ShellCaptures;
-use crate::ui::timeline::{Block, Explored, ExploredCall, ExploredCount, TurnFooter};
+use crate::ui::timeline::{Block, Delivery, Explored, ExploredCall, ExploredCount, TurnFooter};
 
 /// Projection of the store's ordered items into display blocks. Ordering is
 /// owned by `DataStore::items`; text is shared via `Arc` so an unchanged block
@@ -61,8 +63,9 @@ pub struct Projection {
     pub blocks: Vec<Block>,
     /// The block index of the store item the dirty watermark
     /// (`DataStore::changed_from`) points at; every block before it is
-    /// untouched. `blocks.len()` when the watermark is past the last item, so a
-    /// caller can diff `blocks[first_block..]`.
+    /// untouched. When the watermark is past the last item it is the first
+    /// block after the items (the session rows), so a caller diffs those rows
+    /// every time.
     ///
     /// It is the item's index only when every earlier item drew exactly one
     /// block: a turn item draws none, and one assistant item may draw several,
@@ -70,10 +73,20 @@ pub struct Projection {
     pub first_block: usize,
 }
 
+/// Whether the transcript ends with the `ctrl+b` background hint row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundHint {
+    /// No backgroundable call has run long enough.
+    Hidden,
+    /// A `shell`/`subagent` call has run past the hint delay.
+    Shown,
+}
+
 pub fn blocks_from_store(
     store: &DataStore,
     captures: &ShellCaptures,
     changed_from: usize,
+    hint: BackgroundHint,
 ) -> Projection {
     let mut blocks = Vec::new();
     // Where the turn being projected started; see [`turn_start`].
@@ -89,10 +102,19 @@ pub fn blocks_from_store(
             turn = start;
         }
         match item {
-            Item::User { text, files, .. } => {
+            Item::User {
+                text,
+                files,
+                pending,
+                ..
+            } => {
                 blocks.push(Block::User {
                     text: Arc::clone(text),
                     files: Arc::clone(files),
+                    delivery: match pending {
+                        Some(_) => Delivery::Pending,
+                        None => Delivery::Delivered,
+                    },
                 });
             }
             // Nothing to draw: the turn item only moved the boundary above.
@@ -139,17 +161,21 @@ pub fn blocks_from_store(
             Item::Error(error) => blocks.push(Block::Error(error.clone())),
         }
     }
+    // Session rows after the items are few and always compared: a watermark
+    // past the last item (nothing dirty, or the last item removed) still
+    // re-checks them, so a dropped item never leaves a stale row behind.
+    let first_block = first_block.unwrap_or(blocks.len());
     blocks.extend(
         store
             .queued_compactions
             .iter()
             .map(|_| Block::CompactionQueued),
     );
-    let first_block = first_block.unwrap_or(blocks.len());
+    if hint == BackgroundHint::Shown {
+        blocks.push(Block::BackgroundHint);
+    }
     Projection {
         blocks,
-        // A watermark past the last item (nothing dirty) compares nothing, but
-        // still lets the caller pick up appended and dropped trailing blocks.
         first_block,
     }
 }

@@ -15,6 +15,8 @@ pub enum AppCommand {
     CreateSessionAndPrompt(Submission),
     Prompt {
         session: String,
+        /// Inbox/message id the local echo is pending under.
+        id: String,
         text: String,
         files: Vec<FileInput>,
     },

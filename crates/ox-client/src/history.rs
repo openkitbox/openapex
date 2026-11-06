@@ -86,6 +86,7 @@ pub fn parse_messages(messages: &[Message]) -> Vec<Item> {
                     files: prompt_media(prompt.files.as_deref(), &message),
                     created: Some(time.created),
                     starts_turn,
+                    pending: None,
                 });
             }
             Message::Assistant(assistant) => {

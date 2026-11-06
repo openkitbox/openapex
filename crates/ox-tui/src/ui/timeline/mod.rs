@@ -6,7 +6,7 @@ mod tool;
 mod transcript;
 mod view;
 
-pub use block::{Block, Explored, ExploredCall, ExploredCount, TurnFooter};
+pub use block::{Block, Delivery, Explored, ExploredCall, ExploredCount, TurnFooter};
 pub(crate) use render::wall_ms_now;
 pub(crate) use text::titlecase;
 pub use transcript::{SearchState, Transcript};

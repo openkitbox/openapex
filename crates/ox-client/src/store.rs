@@ -92,8 +92,7 @@ pub enum Item {
         text: Arc<str>,
         /// Metadata for every attachment on the prompt, images and non-images
         /// alike — the UI labels the latter `file`/`dir`. Empty for the local
-        /// echo ([`DataStore::push_user`]), which carries no attachment and no
-        /// message id to fetch one by.
+        /// echo ([`DataStore::push_user`]), which carries no attachment.
         files: Arc<[MediaMeta]>,
         /// Wire `time.created` (ms). `None` for the optimistic local echo.
         created: Option<i64>,
@@ -109,6 +108,11 @@ pub enum Item {
         /// History: true for a `user` message that opens a turn (no turn open
         /// yet), false inside one.
         starts_turn: bool,
+        /// The inbox id while the prompt still sits in the server inbox, `None`
+        /// once `session.inbox.delivered` names it and for every history row.
+        /// Upstream keys its `pendingDeliveries` map by the same id
+        /// (`routes/session/index.tsx:221-224`) to draw the row as pending.
+        pending: Option<Arc<str>>,
     },
     /// A turn started here: the session opened one execution. Carries the
     /// turn's first input `time.created` when the wire has it (a history input
@@ -1205,14 +1209,43 @@ impl DataStore {
     /// already running: the row lands inside that turn (the server delivers it
     /// at the next step boundary), so it must not open a new one. A prompt typed
     /// while idle opens the turn the following [`Item::Turn`] dates.
-    pub fn push_user(&mut self, text: &str) {
+    ///
+    /// `id` is the inbox id the prompt is submitted under, so the row stays
+    /// pending until the server delivers (or retracts on cancel) that id.
+    pub fn push_user(&mut self, id: &str, text: &str) {
         self.items.push(Item::User {
             text: Arc::from(text),
             files: Arc::default(),
             created: None,
             starts_turn: self.running_since.is_none(),
+            pending: Some(Arc::from(id)),
         });
         let index = self.items.len() - 1;
+        self.touch(index);
+    }
+
+    /// Index of the local echo still pending under `inbox_id`. It sits near
+    /// the tail, so the search runs from the end.
+    fn pending_user(&self, inbox_id: &str) -> Option<usize> {
+        self.items.iter().rposition(
+            |item| matches!(item, Item::User { pending: Some(id), .. } if **id == *inbox_id),
+        )
+    }
+
+    /// Drop the local echo of a cancelled or rejected prompt (upstream
+    /// `retractLocal`, `packages/client/src/solid/data.ts:473-484`). Later rows
+    /// shift down by one, so every `assistant_index` entry past the removed
+    /// row moves with them.
+    pub fn retract_user(&mut self, inbox_id: &str) {
+        let Some(index) = self.pending_user(inbox_id) else {
+            return;
+        };
+        self.items.remove(index);
+        for slot in self.assistant_index.values_mut() {
+            if *slot > index {
+                *slot -= 1;
+            }
+        }
         self.touch(index);
     }
 
@@ -1697,6 +1730,12 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
             if let Some(row) = store.pending_synthetics.remove(inbox_id) {
                 store.items.push(row);
             }
+            if let Some(index) = store.pending_user(inbox_id) {
+                if let Item::User { pending, .. } = &mut store.items[index] {
+                    *pending = None;
+                }
+                store.touch(index);
+            }
             store.changed_from = 0;
         }
         // Steered: it is no longer waiting for the turn. A change back to
@@ -1713,6 +1752,7 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
             store.queued.retain(|queued| queued.inbox_id != *inbox_id);
             store.queued_compactions.retain(|id| id != inbox_id);
             store.pending_synthetics.remove(inbox_id);
+            store.retract_user(inbox_id);
             store.changed_from = 0;
         }
         SessionEventData::SessionModelSelected {

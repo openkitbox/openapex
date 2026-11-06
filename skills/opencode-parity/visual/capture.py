@@ -44,6 +44,11 @@ def capture(cmd, rows, cols, settle, keys=None, env_extra=None):
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
     env = dict(os.environ, TERM="xterm-256color", COLORTERM="truecolor")
+    # Drop herdr's pane identity: the captured TUI would otherwise report
+    # itself as an agent of the pane this harness runs in, and the SIGKILL
+    # below never lets it send pane.release_agent, leaving a stale row.
+    for key in [k for k in env if k.startswith("HERDR_")]:
+        del env[key]
     env.update(env_extra or {})
     # start_new_session: without it the child keeps this process's controlling
     # terminal, and crossterm's size query opens /dev/tty (the harness's own
@@ -96,6 +101,12 @@ def capture(cmd, rows, cols, settle, keys=None, env_extra=None):
             os.write(master, b"\x1b[?62;c")
         if b"\x1b[6n" in data:
             os.write(master, b"\x1b[1;1R")
+        # DSR status: ratatui-image's graphics probe reads stdin until this
+        # answer arrives. Unanswered, its thread outlives the probe, eats the
+        # first keystroke and then restores the cooked termios it saved, so
+        # every later key is echoed instead of reaching the TUI.
+        if b"\x1b[5n" in data:
+            os.write(master, b"\x1b[0n")
 
     pump(settle)
     for chunk in keys or []:

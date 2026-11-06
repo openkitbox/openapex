@@ -118,6 +118,9 @@ pub struct App {
     /// Stream events were reduced into the store but not yet turned into
     /// transcript blocks; `flush_store` does that once per frame.
     store_dirty: bool,
+    /// The background hint state the transcript blocks were last built with;
+    /// the tick compares it to the wall clock to rebuild on a change.
+    background_hint: pipeline::BackgroundHint,
     /// Forms this client already answered or cancelled. A `ListForms` answer
     /// fetched before the server saw the reply must not bring them back.
     settled_forms: Vec<String>,
@@ -246,6 +249,7 @@ impl App {
             session_title: None,
             dirty: true,
             store_dirty: false,
+            background_hint: pipeline::BackgroundHint::Hidden,
             settled_forms: Vec::new(),
             mode: Mode::Compose,
             show_help: false,
@@ -307,8 +311,11 @@ impl App {
                 files,
             } => self.handle_session_ready(session, prompt, files),
             AppEvent::SessionFailed(err) => self.handle_session_failed(err),
-            AppEvent::PromptFailed(err) => {
-                self.show_toast(Toast::error("Failed to send prompt", err, Instant::now()))
+            AppEvent::PromptFailed { id, error } => {
+                // The server never admitted it, so no delivery will come.
+                self.store.retract_user(&id);
+                self.refresh();
+                self.show_toast(Toast::error("Failed to send prompt", error, Instant::now()))
             }
             AppEvent::Forms(forms) => {
                 self.store.pending_forms = forms
@@ -797,9 +804,11 @@ impl App {
         self.route = Route::Session;
         self.prompt.set_footer(footer_of(self.route));
         self.prompt.set_placeholder("");
-        self.store.push_user(&prompt);
+        let id = ox_schema::id::id("msg");
+        self.store.push_user(&id, &prompt);
         let _ = self.commands.send(AppCommand::Prompt {
             session,
+            id,
             text: prompt,
             files,
         });
@@ -1337,12 +1346,14 @@ impl App {
             return;
         }
         let Submission { text, files } = submission;
-        // 本地乐观显示：随后一帧就有用户消息；服务端确认后由历史重拉覆盖。
-        self.store.push_user(&text);
+        // 本地乐观显示：随后一帧就有用户消息；`session.inbox.delivered` 按 id 把它标为已送达。
+        let id = ox_schema::id::id("msg");
+        self.store.push_user(&id, &text);
         self.refresh();
         if let Some(session) = self.session.clone() {
             let _ = self.commands.send(AppCommand::Prompt {
                 session,
+                id,
                 text,
                 files,
             });
@@ -2024,8 +2035,13 @@ impl App {
     pub fn refresh(&mut self) {
         self.store_dirty = false;
         let changed_from = self.store.claim_changed_from();
-        let projection =
-            pipeline::blocks_from_store(&self.store, &self.shell_captures, changed_from);
+        self.background_hint = self.background_hint_now();
+        let projection = pipeline::blocks_from_store(
+            &self.store,
+            &self.shell_captures,
+            changed_from,
+            self.background_hint,
+        );
         self.transcript
             .sync(&projection.blocks, projection.first_block);
         self.refresh_context();
@@ -2033,6 +2049,19 @@ impl App {
         self.prompt
             .set_cost((cost > 0.0).then(|| format!("${cost:.2}")));
         self.dirty = true;
+    }
+
+    /// Whether the background hint is due now (wall clock; the store owns
+    /// the running-call and delay rules).
+    fn background_hint_now(&self) -> pipeline::BackgroundHint {
+        if self
+            .store
+            .background_hint_due(crate::ui::timeline::wall_ms_now())
+        {
+            pipeline::BackgroundHint::Shown
+        } else {
+            pipeline::BackgroundHint::Hidden
+        }
     }
 
     /// Footer context figure: tokens, plus `(N%)` once the producing model's
@@ -2279,14 +2308,7 @@ impl App {
                 }
             }
         }
-        // Wall clock for the background hint's 3s delay; the spinner tick
-        // repaints every frame while a turn runs, so the hint appears on time.
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| {
-                i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
-            });
-        let line = dock::status_line(&self.store, self.status_mode(), now_ms);
+        let line = dock::status_line(self.status_mode());
         frame.render_widget(ratatui::widgets::Paragraph::new(line), dock_area);
         let from_dialog = match &self.dialog {
             Some(dialog) => crate::ui::dialog::render(frame, full, dialog, &mut self.graphics),
@@ -2344,6 +2366,14 @@ impl App {
                         self.poll_shells(Instant::now());
                     }
                     self.expire_toast(Instant::now());
+                    // The hint row appears after a delay with no store event;
+                    // a per-tick compare rebuilds the blocks only on a change.
+                    if self.route == Route::Session
+                        && self.background_hint_now() != self.background_hint
+                    {
+                        self.store_dirty = true;
+                        self.dirty = true;
+                    }
                     if self.dirty {
                         self.flush_store();
                         self.dirty = false;

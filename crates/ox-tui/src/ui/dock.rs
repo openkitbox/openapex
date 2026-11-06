@@ -16,16 +16,10 @@
 //!   prompt, and the dialog closes on enter at once rather than after the
 //!   steer succeeds (a failure still toasts).
 //!
-//! The status line's background hint is upstream `BackgroundToolHint`
-//! (`routes/session/index.tsx:1897-1929`). Deviation: upstream draws it at the
-//! transcript's end; ox draws it on the status line under the prompt, because
-//! transcript rows are cached blocks and a row that appears with time would
-//! need its own invalidation. It repaints with the prompt's spinner, which
-//! ticks every frame while a turn runs (the hint needs a running turn).
-//! Like upstream, the hint follows the first running `shell`/`subagent` call
-//! ([`DataStore::backgroundable_tool`]) and `ctrl+b` only acts while one runs.
+//! The `ctrl+b` background hint is the transcript's last row
+//! (`Block::BackgroundHint`), as upstream draws it.
 
-use ox_client::store::{DataStore, Queued};
+use ox_client::store::Queued;
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -46,14 +40,10 @@ pub enum StatusMode<'a> {
 
 const HELP: &str = "↑↓ j/k 滚动 · g/G 顶部/底部 · / 搜索 · n/N 下一个/上一个 · r 推理展开 · o 工具输出 · [ ] 切换工具行 · ⏎ 发送 · ⇧⏎ 换行 · ctrl-c 中断/退出";
 
-/// The key the background hint names (`keymap::is_background`).
-const BACKGROUND_KEY: &str = "ctrl+b";
-
-/// The row under the prompt footer: search/help text, else the background
-/// hint while it is due at `now_ms` (wall-clock ms), else blank (the
+/// The row under the prompt footer: search/help text, else blank (the
 /// queued-prompt count lives in the dock above the prompt).
 #[must_use]
-pub fn status_line(store: &DataStore, mode: StatusMode<'_>, now_ms: i64) -> Line<'static> {
+pub fn status_line(mode: StatusMode<'_>) -> Line<'static> {
     let p = theme::palette();
     match mode {
         StatusMode::Help => Line::from(Span::styled(HELP, p.dim)),
@@ -77,13 +67,7 @@ pub fn status_line(store: &DataStore, mode: StatusMode<'_>, now_ms: i64) -> Line
         }
         // Upstream's session view has no status line and no elapsed timer
         // (the running state is the prompt footer's `esc interrupt`; the
-        // queue is `queued_dock`). The only thing drawn here is upstream's
-        // `BackgroundToolHint` (`routes/session/index.tsx:1897-1929`).
-        StatusMode::Normal if store.background_hint_due(now_ms) => Line::from(vec![
-            Span::styled("Press ", p.dim),
-            Span::styled(BACKGROUND_KEY, p.text),
-            Span::styled(" to move running work to the background", p.dim),
-        ]),
+        // queue is `queued_dock`; the background hint is a transcript row).
         StatusMode::Normal => Line::default(),
     }
 }

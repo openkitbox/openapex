@@ -11,7 +11,7 @@ use ox_client::store::ToolState;
 
 use crate::theme;
 
-use super::block::{Block, TurnFooter};
+use super::block::{Block, Delivery, TurnFooter};
 use super::text::{format_duration, indent_wrapped, titlecase};
 use super::tool::{explored_block, text_tool_block, todo_block, tool_block};
 use super::view::{SPINNER_FRAMES, ViewState, draws_block, tool_expandable};
@@ -92,8 +92,12 @@ pub(super) fn render_entry(block: &Block, metrics: Metrics, view: ViewState) -> 
             spinner_row = rendered.spinner_row;
             rendered.lines
         }
-        Block::User { text, files } => {
-            let (lines, strip) = user_block(text, files, view, metrics);
+        Block::User {
+            text,
+            files,
+            delivery,
+        } => {
+            let (lines, strip) = user_block(text, files, *delivery, view, metrics);
             thumbs = strip;
             lines
         }
@@ -105,6 +109,7 @@ pub(super) fn render_entry(block: &Block, metrics: Metrics, view: ViewState) -> 
         Block::Notice(notice) => notice_lines(notice, width),
         Block::Error(error) => error_lines(&error.message, width),
         Block::CompactionQueued => vec![crate::ui::compaction::queued_line(width)],
+        Block::BackgroundHint => vec![background_hint_line()],
         Block::Explored(explored) => explored_block(explored, view, width),
         Block::Tool {
             tool,
@@ -545,6 +550,21 @@ pub(crate) fn wall_ms_now() -> i64 {
         })
 }
 
+/// The key the background hint names (`keymap::is_background`).
+const BACKGROUND_KEY: &str = "ctrl+b";
+
+/// Upstream `BackgroundToolHint` (`routes/session/index.tsx:1897-1929`):
+/// `paddingLeft={3}`, the key in `text.base` and the rest `text.muted`.
+fn background_hint_line() -> Line<'static> {
+    let palette = theme::palette();
+    Line::from(vec![
+        Span::raw("   "),
+        Span::styled("Press ", palette.dim),
+        Span::styled(BACKGROUND_KEY, palette.text),
+        Span::styled(" to move running work to the background", palette.dim),
+    ])
+}
+
 /// Upstream `SessionSwitchMessageV2` (`routes/session/index.tsx:2060-2088`).
 fn switch_line(switch: &Switch, width: u16) -> Line<'static> {
     let palette = theme::palette();
@@ -687,8 +707,9 @@ fn thumbs_of(files: &[MediaMeta], metrics: Metrics, at: usize) -> Option<media::
 }
 
 /// Upstream user message (`routes/session/index.tsx` ~2370): the block-tool
-/// frame with an agent-coloured rail, on `raised.base` (`raised.high` under
-/// the pointer, `block_tool::surface`).
+/// frame on `raised.base` (`raised.high` under the pointer,
+/// `block_tool::surface`). The rail is agent-coloured once the prompt is
+/// delivered and `border.base` while it waits in the inbox (`:2372-2373`).
 ///
 /// Above the text the block reserves a strip of thumbnail rows when the prompt
 /// carried images and this terminal draws them (`SessionImages`, `:2656-2712`);
@@ -696,12 +717,17 @@ fn thumbs_of(files: &[MediaMeta], metrics: Metrics, at: usize) -> Option<media::
 fn user_block(
     text: &str,
     files: &[MediaMeta],
+    delivery: Delivery,
     view: ViewState,
     metrics: Metrics,
 ) -> (Vec<Line<'static>>, Option<media::Thumbs>) {
     let palette = theme::palette();
     let band = block_tool::surface(palette, view.hovered);
-    let rail = Span::styled(block_tool::RAIL, palette.agent.patch(band));
+    let rail_style = match delivery {
+        Delivery::Pending => palette.menu_border,
+        Delivery::Delivered => palette.agent,
+    };
+    let rail = Span::styled(block_tool::RAIL, rail_style.patch(band));
     let mut rows: Vec<Line<'static>> = Vec::new();
     let mut thumbs = None;
     if let Some(drawn) = thumbs_of(files, metrics, 1) {

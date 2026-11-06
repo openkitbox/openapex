@@ -12,6 +12,7 @@ use crate::{Client, Error, Result};
 /// base64 image can be tens of MB, so nothing here is cloned).
 #[derive(Serialize)]
 struct PromptBody<'a> {
+    id: &'a str,
     text: &'a str,
     #[serde(skip_serializing_if = "<[FileInput]>::is_empty")]
     files: &'a [FileInput],
@@ -774,15 +775,23 @@ impl Client {
         })
     }
 
-    /// `files` are serialized by reference; with none the body is exactly the
-    /// text-only `{"text":..}` the server always accepted.
-    pub async fn prompt(&self, session: &str, text: &str, files: &[FileInput]) -> Result<Value> {
+    /// `files` are serialized by reference and omitted when empty.
+    ///
+    /// `id` becomes the inbox and message id, so the caller's optimistic echo
+    /// can be matched to the `session.inbox.delivered` that names it.
+    pub async fn prompt(
+        &self,
+        session: &str,
+        id: &str,
+        text: &str,
+        files: &[FileInput],
+    ) -> Result<Value> {
         let resp = self
             .request(
                 reqwest::Method::POST,
                 &format!("/api/session/{session}/prompt"),
             )
-            .json(&PromptBody { text, files })
+            .json(&PromptBody { id, text, files })
             .send()
             .await?;
         if !resp.status().is_success() {

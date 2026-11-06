@@ -15,9 +15,7 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, Terminal};
 
 use ox_client::rest::{McpRef, McpStatus};
-use ox_client::store::{
-    CompletionSource, DataStore, ErrorInfo, Notice, Queued, RetryInfo, Switch, ToolState,
-};
+use ox_client::store::{CompletionSource, ErrorInfo, Notice, Queued, RetryInfo, Switch, ToolState};
 use ox_schema::support::Record;
 use ox_tui::app::keymap;
 use ox_tui::graphics::Graphics;
@@ -29,7 +27,7 @@ use ox_tui::ui::markdown;
 use ox_tui::ui::palette;
 use ox_tui::ui::prompt::{Activity, Chrome, Footer, McpSummary, Prompt, placeholder_line};
 use ox_tui::ui::session_dialog;
-use ox_tui::ui::timeline::{Block, Explored, ExploredCount, Transcript, TurnFooter};
+use ox_tui::ui::timeline::{Block, Delivery, Explored, ExploredCount, Transcript, TurnFooter};
 use ox_tui::ui::toast::{self, Toast, Variant};
 
 /// 一个用例：独立 TestBackend 终端画一帧，然后把 Buffer 打成 ANSI。
@@ -82,6 +80,16 @@ fn cases() -> Vec<Case> {
             "user-box-short",
             3,
             vec![Block::user("帮我把这个函数改成迭代实现")],
+        ),
+        // 用户消息盒：尚未送达 agent，左侧竖线为 border.base 灰色
+        transcript_case(
+            "user-pending",
+            3,
+            vec![Block::User {
+                text: Arc::from("运行中插话，等待送达"),
+                files: Arc::from(Vec::new()),
+                delivery: Delivery::Pending,
+            }],
         ),
         // 用户消息盒：长文本换行
         transcript_case(
@@ -462,6 +470,8 @@ fn cases() -> Vec<Case> {
                 Block::CompactionQueued,
             ],
         ),
+        // 转入后台提示：转录末行（上游 BackgroundToolHint）
+        transcript_case("background-hint", 2, vec![Block::BackgroundHint]),
         // 重试行挂在助手消息页脚上方（上游 index.tsx:2022-2035）
         transcript_case("session-retry", 7, {
             let mut blocks = assistant("Working on it.", "", true);
@@ -568,19 +578,18 @@ fn cases() -> Vec<Case> {
         ),
         prompt_files_case(),
         // dock
-        dock_case("dock-idle", DataStore::default(), StatusMode::Normal),
+        dock_case("dock-idle", StatusMode::Normal),
         queued_dock_case("dock-queued", DockHover::Off),
         queued_dock_case("dock-queued-hover", DockHover::On),
         dock_case(
             "dock-search",
-            DataStore::default(),
             StatusMode::Search {
                 query: "cache",
                 matches: 12,
                 current: Some(2),
             },
         ),
-        dock_case("dock-help", DataStore::default(), StatusMode::Help),
+        dock_case("dock-help", StatusMode::Help),
         dialog_case("dialog-status"),
         home_case(),
         markdown_case(),
@@ -1223,10 +1232,10 @@ fn prompt_files_case() -> Case {
     }
 }
 
-fn dock_case(name: &'static str, store: DataStore, mode: StatusMode<'static>) -> Case {
+fn dock_case(name: &'static str, mode: StatusMode<'static>) -> Case {
     // StatusMode 不 impl Copy/Clone 且不能改库：构建期先把 Line 算好（status_line
-    // 只读 store/mode），闭包里只剩渲染。
-    let line = status_line(&store, mode, 0);
+    // 只读 mode），闭包里只剩渲染。
+    let line = status_line(mode);
     Case {
         name,
         height: 1,

@@ -99,8 +99,12 @@ pub enum AppEvent {
     },
     /// Lazy session creation failed; the draft must be restored.
     SessionFailed(String),
-    /// A prompt could not be delivered; shown as a toast.
-    PromptFailed(String),
+    /// A prompt request failed: its optimistic echo (`id`) is retracted and
+    /// the error shown as a toast.
+    PromptFailed {
+        id: String,
+        error: String,
+    },
     /// Answer to `AppCommand::LoadSessionChrome`.
     SessionChrome {
         session: String,

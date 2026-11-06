@@ -245,7 +245,8 @@ pub struct Palette {
     pub agent: Style,
     /// The slash-command menu surface (upstream `background.raised.high`).
     pub menu: Style,
-    /// The menu's four-sided border (upstream `border.base`).
+    /// Upstream `border.base`: the menu's four-sided border, and the rail of a
+    /// user prompt still pending delivery.
     pub menu_border: Style,
     /// The selected menu row: accent background, dark foreground.
     pub menu_selected: Style,
