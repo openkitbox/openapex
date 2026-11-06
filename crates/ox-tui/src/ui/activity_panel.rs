@@ -14,12 +14,14 @@
 //! - A subagent row reads `{prefix}{agent}: {title}`, with a right-aligned `Running`
 //!   while its subagent still works. `agent` is the session's own agent, else
 //!   the one in its `@xxx subagent` title marker, else `Subagent`; the marker is
-//!   stripped from the title. The row under the cursor takes the focused fill,
-//!   the row of the session on screen a quieter one, every other row the base.
+//!   stripped from the title. The row under the cursor takes the focused fill
+//!   and bold text, the row of the session on screen primary text, every other
+//!   row body text; only the focused row is filled (upstream's
+//!   `background.action.primary` is transparent for `base` and `$selected`).
 //! - A shell row reads the first line of the command (`shell.command.split("\n",
 //!   1)[0]`), the row under the cursor likewise filled and bold. The rows are
 //!   the running shells of the session on screen, sorted by id; that session is
-//!   every row here, so no row carries the quieter "current" fill.
+//!   every row here, so no row carries the "current" marking.
 //! - `↑` from the first row closes the panel instead of clamping; `↓` wraps to
 //!   the first row.
 //! - `ctrl+a` flips the filter, puts the selection back on the first row and
@@ -36,13 +38,23 @@
 //! the server reported it in, the block's rows out) and [`render`] paints them
 //! with the same rail as [`super::prompt`].
 //!
-//! Measured at 30x100 with no running child:
+//! The block is always eleven rows, whatever it lists (upstream
+//! `composer/index.tsx:92-97`: padding 1 above and below, `gap={1}` between
+//! header, window and hints, `scrollbox maxHeight={5}`). Measured on upstream
+//! at 30x100 with one running shell:
 //!
 //! ```text
-//! ┃  Subagents  Shell                                    esc
-//! ┃  No active subagents
 //! ┃
-//! ┃  open enter  show inactive ctrl+a  tabs ←/→
+//! ┃  Subagents  Shell                                    esc
+//! ┃
+//! ┃  cd ~/Developer/openkitbox/ox && cargo test
+//! ┃
+//! ┃
+//! ┃
+//! ┃
+//! ┃
+//! ┃  output enter  kill ctrl+d  tabs ←/→
+//! ┃
 //! ```
 //!
 //! Ledger — deliberate deviations from the upstream source:
@@ -51,14 +63,8 @@
 //!   `onMouseUp`; ox's pointer gate belongs to the transcript, so the panel
 //!   takes keys and shows `open enter` (upstream's `composer.subagent.select`,
 //!   `config/keybind.ts:251`) as the hint for what a click does there.
-//! - The session on screen is filled with `raised.base`, not with
-//!   `background.action.primary.selected`: ox's palette carries no such token,
-//!   and `raised.base` is its one quieter raised surface. The focused row keeps
-//!   the picker's accent fill (`menu_selected`), so the two stay distinct.
-//!   Only truecolor separates `raised.base` from the `raised.high` panel it sits
-//!   on (`theme.rs` `from_tokens`); every 16-colour and `NO_COLOR` palette draws
-//!   both as the same surface, so the row of the session on screen goes unmarked
-//!   there.
+//! - The session on screen is drawn in `accent` without bold, ox's role for the
+//!   primary colour (upstream `text.action.primary.$selected` = `primary`).
 //! - The listed family is a snapshot: `App::family_state_changed` refetches it
 //!   whenever a child the store names starts or finishes its turn (upstream
 //!   reads a live memo over the session list), so a known child's `Running`
@@ -83,9 +89,6 @@
 //!   clamps it to the new tab's rows (`App::settle_selection`), so the same
 //!   row number is selected on the other tab, or its last row when the list is
 //!   shorter, and switching back does not restore the earlier row.
-//! - The block ends with its `╹` foot, and the prompt's footer row below it
-//!   (cwd, usage) is not drawn while the panel is open; the status dock under
-//!   it still carries the session status.
 
 use ox_client::rest::FamilyMember;
 use ratatui::Frame;
@@ -104,6 +107,11 @@ use super::timeline::titlecase;
 /// Body rows the panel shows at once; the rest scroll through the window
 /// (upstream `scrollbox maxHeight={5}`).
 const VIEWPORT: usize = 5;
+/// Rows from the top of the block to the window's first row: padding, header,
+/// gap.
+const BODY_TOP: u16 = 3;
+/// Every row of the block: [`BODY_TOP`], the window, gap, hints, padding.
+const BLOCK_ROWS: u16 = BODY_TOP + VIEWPORT as u16 + 3;
 /// The key that closes the panel, drawn flush right on the header row.
 const CLOSE_KEY: &str = "esc";
 /// The right-aligned status of a row whose subagent is still working.
@@ -249,29 +257,31 @@ pub struct Row<'a> {
     pub prefix: String,
 }
 
-/// The block [`render`] draws: its rows, and which of them are marked.
+/// The block [`render`] draws: the header, the window of body rows and the
+/// hints, with the body rows that are marked.
 #[derive(Debug, Default)]
 pub struct Block {
-    /// Header, body rows, one blank row, hints.
-    pub lines: Vec<Line<'static>>,
-    /// Index into `lines` of the selected row, when one is drawn. `None` when
+    /// The tab bar (`esc` is added flush right when drawn).
+    pub header: Line<'static>,
+    /// At most [`VIEWPORT`] rows: the listed window, or the empty state.
+    pub body: Vec<Line<'static>>,
+    /// The hint row.
+    pub hints: Line<'static>,
+    /// Index into `body` of the selected row, when one is drawn. `None` when
     /// no row is listed.
     pub selected: Option<usize>,
-    /// Index into `lines` of the row for the session on screen, when it is
-    /// listed and inside the window (upstream `entry.current`).
-    pub current: Option<usize>,
-    /// Indices into `lines` of the rows that carry the right-aligned
+    /// Indices into `body` of the rows that carry the right-aligned
     /// [`RUNNING`] status.
     pub running: Vec<usize>,
 }
 
 impl Block {
-    /// Rows the block takes: its own rows plus the `╹` foot under them.
+    /// Rows the block takes. Upstream's box is the same height whatever it
+    /// lists: one padding row, the header, a gap, the five-row window, a gap,
+    /// the hints, one padding row (`composer/index.tsx:92-97`, `gap={1}`).
     #[must_use]
     pub fn height(&self) -> u16 {
-        u16::try_from(self.lines.len())
-            .unwrap_or(u16::MAX)
-            .saturating_add(1)
+        BLOCK_ROWS
     }
 }
 
@@ -316,13 +326,14 @@ pub fn hints(tab: Tab, active: bool, armed: bool) -> Line<'static> {
         Tab::Shell if armed => &[("output", "enter"), ("kill", "ctrl+d"), ("tabs", "←/→")],
         Tab::Shell => &[("tabs", "←/→")],
     };
-    let mut spans: Vec<Span<'static>> = Vec::with_capacity(hints.len() * 3);
+    let mut spans: Vec<Span<'static>> = Vec::with_capacity(hints.len() * 4);
     for (index, &(title, key)) in hints.iter().enumerate() {
         if index > 0 {
             spans.push(Span::raw("  "));
         }
-        spans.push(Span::styled(title, pal.text));
-        spans.push(Span::styled(format!(" {key}"), pal.dim));
+        spans.push(Span::styled(title, pal.text.add_modifier(Modifier::BOLD)));
+        spans.push(Span::styled(" ", pal.text));
+        spans.push(Span::styled(key, pal.dim));
     }
     Line::from(spans)
 }
@@ -353,8 +364,8 @@ pub fn window_offset(selected: usize, len: usize) -> usize {
         .min(len.saturating_sub(VIEWPORT))
 }
 
-/// The whole block interior: header, the window of rows, one blank row, hints.
-/// `shells` is the `Shell` tab's `(id, command)` list (`DataStore::shells_of`).
+/// The whole block: header, the window of rows, hints. `shells` is the
+/// `Shell` tab's `(id, command)` list (`DataStore::shells_of`).
 /// `cursor.selected` indexes the shown tab's rows ([`rows`] or `shells`); it is
 /// clamped, so a stale index draws the last row.
 #[must_use]
@@ -369,43 +380,41 @@ pub fn lines(
         return shell_lines(shells, cursor);
     }
     let listed = rows(members, current, cursor.active);
-    let mut block = Block {
-        lines: vec![header(tab)],
-        ..Block::default()
-    };
     if listed.is_empty() {
         let empty_state = if cursor.active {
             SUBAGENTS_EMPTY_ACTIVE
         } else {
             SUBAGENTS_EMPTY_INACTIVE
         };
-        block.lines.push(empty(empty_state));
-        block.lines.push(Line::default());
-        block.lines.push(hints(tab, cursor.active, false));
-        return block;
+        return Block {
+            header: header(tab),
+            body: vec![empty(empty_state)],
+            hints: hints(tab, cursor.active, false),
+            ..Block::default()
+        };
     }
 
     let selected = cursor.selected.min(listed.len() - 1);
     let offset = window_offset(selected, listed.len());
-    block.selected = Some(1 + selected - offset);
-    if let Some(position) = listed.iter().position(|row| row.member.id == current)
-        && (offset..offset + VIEWPORT).contains(&position)
-    {
-        block.current = Some(1 + position - offset);
-    }
+    let mut block = Block {
+        header: header(tab),
+        hints: hints(tab, cursor.active, listed[selected].member.running),
+        selected: Some(selected - offset),
+        ..Block::default()
+    };
     for (index, row) in listed.iter().skip(offset).take(VIEWPORT).enumerate() {
-        let line = 1 + index;
-        block
-            .lines
-            .push(listed_row(row, Some(line) == block.selected));
+        let focus = if Some(index) == block.selected {
+            Focus::Selected
+        } else if row.member.id == current {
+            Focus::Current
+        } else {
+            Focus::None
+        };
+        block.body.push(listed_row(row, focus));
         if row.member.running {
-            block.running.push(line);
+            block.running.push(index);
         }
     }
-    block.lines.push(Line::default());
-    block
-        .lines
-        .push(hints(tab, cursor.active, listed[selected].member.running));
     block
 }
 
@@ -414,45 +423,57 @@ pub fn lines(
 /// rows.
 fn shell_lines(shells: &[(&str, &str)], cursor: Cursor) -> Block {
     let pal = *theme::palette();
-    let mut block = Block {
-        lines: vec![header(Tab::Shell)],
-        ..Block::default()
-    };
     if shells.is_empty() {
-        block.lines.push(empty(SHELL_EMPTY));
-        block.lines.push(Line::default());
-        block.lines.push(hints(Tab::Shell, cursor.active, false));
-        return block;
+        return Block {
+            header: header(Tab::Shell),
+            body: vec![empty(SHELL_EMPTY)],
+            hints: hints(Tab::Shell, cursor.active, false),
+            ..Block::default()
+        };
     }
     let selected = cursor.selected.min(shells.len() - 1);
     let offset = window_offset(selected, shells.len());
-    block.selected = Some(1 + selected - offset);
+    let mut block = Block {
+        header: header(Tab::Shell),
+        hints: hints(Tab::Shell, cursor.active, true),
+        selected: Some(selected - offset),
+        ..Block::default()
+    };
     let focused = pal.menu_selected.add_modifier(Modifier::BOLD);
     for (index, &(_, command)) in shells.iter().skip(offset).take(VIEWPORT).enumerate() {
-        let style = if Some(1 + index) == block.selected {
+        let style = if Some(index) == block.selected {
             focused
         } else {
             pal.text
         };
         let first = command.split('\n').next().unwrap_or_default();
         block
-            .lines
+            .body
             .push(Line::from(Span::styled(first.to_owned(), style)));
     }
-    block.lines.push(Line::default());
-    block.lines.push(hints(Tab::Shell, cursor.active, true));
     block
 }
 
-/// One listed row line: `{prefix}{agent}: {title}`, the focused one filled and
-/// bold, every other one in body text (upstream draws one `<text>` either way).
-fn listed_row(row: &Row<'_>, focused: bool) -> Line<'static> {
+/// How a listed row is marked (upstream's `active()` / `entry.current`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    /// The row under the cursor: filled, bold.
+    Selected,
+    /// The session on screen: primary text on the panel surface.
+    Current,
+    None,
+}
+
+/// One listed row line: `{prefix}{agent}: {title}`. The focused row is filled
+/// and bold, the session on screen in primary text (`text.action.primary`
+/// `$selected`), every other one in body text (upstream draws one `<text>`).
+fn listed_row(row: &Row<'_>, focus: Focus) -> Line<'static> {
     let pal = *theme::palette();
     let (agent, title) = agent_and_title(row.member);
-    let style = if focused {
-        pal.menu_selected.add_modifier(Modifier::BOLD)
-    } else {
-        pal.text
+    let style = match focus {
+        Focus::Selected => pal.menu_selected.add_modifier(Modifier::BOLD),
+        Focus::Current => pal.accent.remove_modifier(Modifier::BOLD),
+        Focus::None => pal.text,
     };
     let label = format!("{}{agent}: {title}", row.prefix);
     Line::from(Span::styled(label, style))
@@ -505,86 +526,92 @@ fn marker(title: &str) -> Option<Marker<'_>> {
     None
 }
 
-/// Draw the block in the composer's place: the prompt's rail and panel fill
-/// around `lines`, the current and the selected row filled, `Running` flush
-/// right on the rows that carry one, `esc` flush right on the header row, then
-/// the `╹` foot.
+/// Draw the block in the composer's place: the prompt's rail on the
+/// `raised.base` surface upstream's bordered box fills (rail cell included), the header with `esc` flush right, the window of rows with
+/// the selected one filled and `Running` flush right where a row carries one,
+/// and the hints. The rail runs to the bottom of the block with no foot, as
+/// upstream's left border does.
 pub fn render(frame: &mut Frame, area: Rect, block: Block) {
     let Block {
-        lines,
+        header,
+        body,
+        hints,
         selected,
-        current,
         running,
     } = block;
-    if area.width < 2 || area.height == 0 || lines.is_empty() {
+    if area.width < 6 || area.height == 0 {
         return;
     }
     let pal = *theme::palette();
-    let box_h = u16::try_from(lines.len())
-        .unwrap_or(u16::MAX)
-        .min(area.height);
     {
         let buf = frame.buffer_mut();
-        for y in area.y..area.y + box_h {
+        for y in area.y..area.bottom() {
             for x in area.x + 1..area.right() {
-                buf[(x, y)].set_style(pal.panel);
+                buf[(x, y)].set_style(pal.raised_base);
             }
             let cell = &mut buf[(area.x, y)];
-            cell.set_style(pal.panel_border);
+            cell.set_style(pal.raised_base.patch(pal.panel_border));
             cell.set_char(prompt::PANEL_BORDER_CHAR);
         }
     }
-    // The current row is the quieter fill, the selected row the focused one, so
-    // a row that is both reads as the selected one.
-    for (index, fill) in [(current, pal.raised_base), (selected, pal.menu_selected)] {
-        let Some(index) = index else {
-            continue;
-        };
-        let y = area.y + u16::try_from(index).unwrap_or(u16::MAX);
-        if y < area.y + box_h {
-            frame.buffer_mut().set_style(
+    // Upstream's content box: one column after the rail, `paddingLeft={1}`,
+    // `paddingRight={2}`. Rows fill the whole box; their text sits one column
+    // in (`paddingLeft={1}` on the header, the rows and the hints).
+    let content = Rect {
+        x: area.x + 2,
+        width: area.width - 4,
+        height: 1,
+        y: area.y,
+    };
+    let text = Rect {
+        x: content.x + 1,
+        width: content.width - 2,
+        ..content
+    };
+    let row_at = |offset: u16| -> Option<u16> {
+        let y = area.y.checked_add(offset)?;
+        (y < area.bottom()).then_some(y)
+    };
+
+    if let Some(y) = row_at(1) {
+        let used = header.width();
+        frame.render_widget(Paragraph::new(header), Rect { y, ..text });
+        let close_w = u16::try_from(CLOSE_KEY.len()).unwrap_or(u16::MAX);
+        if used + CLOSE_KEY.len() + 1 < content.width as usize {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(CLOSE_KEY, pal.dim))),
                 Rect {
-                    x: area.x + 1,
+                    x: content.right() - close_w,
                     y,
-                    width: area.width.saturating_sub(1),
+                    width: close_w,
                     height: 1,
                 },
-                fill,
             );
         }
     }
-    let pad = if area.width < 44 { 1 } else { 2 };
-    let inner = Rect {
-        x: area.x + 1 + pad,
-        y: area.y,
-        width: area.width.saturating_sub(1 + pad * 2).max(1),
-        height: box_h,
-    };
-    // The header row keeps `esc` where upstream puts it: flush right, on the
-    // panel surface, outside the text column.
-    let used = lines[0].width();
+
     let status_w = u16::try_from(RUNNING.len()).unwrap_or(u16::MAX);
-    for (index, line) in lines.into_iter().take(box_h as usize).enumerate() {
-        let y = area.y + u16::try_from(index).unwrap_or(u16::MAX);
+    for (index, line) in body.into_iter().take(VIEWPORT).enumerate() {
+        let Some(y) = row_at(BODY_TOP + u16::try_from(index).unwrap_or(u16::MAX)) else {
+            break;
+        };
+        let is_selected = Some(index) == selected;
+        if is_selected {
+            frame
+                .buffer_mut()
+                .set_style(Rect { y, ..content }, pal.menu_selected);
+        }
         // A row with a status gives it the right edge and clips its own text
         // where the status starts (upstream `flexGrow={1} minWidth={0}`).
-        let has_status = running.contains(&index) && inner.width > status_w;
+        let has_status = running.contains(&index) && text.width > status_w;
         let width = if has_status {
-            inner.width - status_w
+            text.width - status_w
         } else {
-            inner.width
+            text.width
         };
-        frame.render_widget(
-            Paragraph::new(line),
-            Rect {
-                y,
-                width,
-                height: 1,
-                ..inner
-            },
-        );
+        frame.render_widget(Paragraph::new(line), Rect { y, width, ..text });
         if has_status {
-            let style = if Some(index) == selected {
+            let style = if is_selected {
                 pal.menu_selected
             } else {
                 pal.dim
@@ -592,7 +619,7 @@ pub fn render(frame: &mut Frame, area: Rect, block: Block) {
             frame.render_widget(
                 Paragraph::new(Line::from(Span::styled(RUNNING, style))),
                 Rect {
-                    x: inner.right() - status_w,
+                    x: text.right() - status_w,
                     y,
                     width: status_w,
                     height: 1,
@@ -600,33 +627,9 @@ pub fn render(frame: &mut Frame, area: Rect, block: Block) {
             );
         }
     }
-    if used + CLOSE_KEY.len() + 1 < inner.width as usize {
-        let rect = Rect {
-            x: area.right() - u16::try_from(CLOSE_KEY.len()).unwrap_or(0),
-            y: area.y,
-            width: u16::try_from(CLOSE_KEY.len()).unwrap_or(0),
-            height: 1,
-        };
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(CLOSE_KEY, pal.dim))),
-            rect,
-        );
-    }
-    let edge_y = area.y + box_h;
-    if edge_y < area.bottom() {
-        let buf = frame.buffer_mut();
-        let corner = &mut buf[(area.x, edge_y)];
-        corner.set_char('╹');
-        if let Some(fg) = pal.panel_border.fg {
-            corner.set_fg(fg);
-        }
-        if let Some(bg) = pal.panel.bg {
-            for x in (area.x + 1)..area.right() {
-                let cell = &mut buf[(x, edge_y)];
-                cell.set_char('▀');
-                cell.set_fg(bg);
-            }
-        }
+
+    if let Some(y) = row_at(BLOCK_ROWS - 2) {
+        frame.render_widget(Paragraph::new(hints), Rect { y, ..text });
     }
 }
 
