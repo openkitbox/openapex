@@ -93,6 +93,16 @@ pub(super) fn select_shell() -> PathBuf {
     )
 }
 
+/// Names of the terminal-multiplexer variables that identify the pane the
+/// server was started in (herdr's `HERDR_*`). Commands run in no pane of
+/// their own, so a TUI started by one must not report itself as that pane's
+/// agent. Pure: the environment is an input.
+fn pane_identity_vars(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<OsString> {
+    vars.map(|(key, _)| key)
+        .filter(|key| key.as_encoded_bytes().starts_with(b"HERDR_"))
+        .collect()
+}
+
 /// Spawn `shell -c command` in `cwd` as the leader of a new process group,
 /// with stdin at `/dev/null` and stdout+stderr on one pipe. Must be called
 /// inside a tokio runtime (the read end is registered with its reactor).
@@ -108,6 +118,9 @@ pub(super) fn spawn(shell: &Path, command: &str, cwd: &Path) -> io::Result<Spawn
         .stderr(write_err)
         .process_group(0)
         .kill_on_drop(true);
+    for key in pane_identity_vars(std::env::vars_os()) {
+        cmd.env_remove(key);
+    }
     let child = cmd.spawn()?;
     // `cmd` owns the parent's copies of the write ends; release them so EOF
     // is reachable.
