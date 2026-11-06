@@ -39,6 +39,7 @@ use anyhow::{Context as _, Result};
 
 use crate::mctx::historian_validate::FactCandidate;
 use crate::mctx::memory;
+use crate::mctx::redact;
 use ox_db::WriteTx;
 
 /// One stored memory as the dedup comparison reads it.
@@ -99,6 +100,9 @@ pub(crate) fn normalize_fact(content: &str) -> String {
 /// that memory; otherwise it is inserted. Facts that normalize to the same key
 /// within one batch produce one action: the first decides, the rest are
 /// dropped. Blank facts are skipped, as in the reference.
+///
+/// Stored rows hold redacted text, so each fact is keyed on its redacted
+/// form; facts that differ only in a secret share one key.
 #[must_use]
 pub(crate) fn plan_promotion<'a>(
     facts: &'a [FactCandidate],
@@ -111,7 +115,7 @@ pub(crate) fn plan_promotion<'a>(
     let mut seen: HashSet<(&'a str, String)> = HashSet::new();
     let mut actions = Vec::new();
     for fact in facts {
-        let key = normalize_fact(&fact.content);
+        let key = normalize_fact(&redact::redact_secrets(&fact.content));
         if key.is_empty() {
             continue;
         }
@@ -129,6 +133,7 @@ pub(crate) fn plan_promotion<'a>(
             Some(id) => PromotionAction::Bump { id },
             None => PromotionAction::Insert {
                 category,
+                // Raw text is fine here: `insert_promoted` redacts on store.
                 content: &fact.content,
             },
         });

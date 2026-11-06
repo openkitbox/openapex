@@ -146,10 +146,12 @@ use serde_json::{Value, json};
 use crate::runner::{Tool, ToolContext, ToolOutput};
 use ox_db::Db;
 use ox_llm::cardinal::wire::ToolDef;
+use ox_schema::id::now_millis;
 use ox_tools::{object_param, ok_text};
 
 use super::compartments::Tiers;
 use super::memory::internal_error;
+use super::memory::record_use;
 use super::tagger::taggable_items;
 
 /// Default `limit` when the model omits it (the reference's default).
@@ -1632,7 +1634,18 @@ async fn run_search(
         to_ms,
     };
     match search(db, embedder, &request).await {
-        Ok(hits) => ok_text(render_hits(query, &hits, &ctx.session_id)),
+        Ok(hits) => {
+            // Usage is a by-product: a failed write must not fail the search.
+            let used: Vec<&str> = hits
+                .iter()
+                .filter(|hit| hit.source == Source::Memory)
+                .map(|hit| hit.id.as_str())
+                .collect();
+            if let Err(error) = record_use(db, &project, &used, now_millis()).await {
+                tracing::warn!(error = %error, "search: record memory use failed");
+            }
+            ok_text(render_hits(query, &hits, &ctx.session_id))
+        }
         Err(error) => internal_error("search", &error),
     }
 }

@@ -6,6 +6,7 @@ use anyhow::Result;
 
 use crate::mctx::historian::{collect_completion, historian_model};
 use crate::mctx::memory::{self, CATEGORIES};
+use crate::mctx::redact;
 use ox_core::config::Config;
 use ox_db::Db;
 use ox_llm::cardinal::chat::Chat;
@@ -572,7 +573,10 @@ impl Dreamer {
                 cursor: None,
             };
         }
-        match fact_recorded(&self.db, project, &lesson.content).await {
+        // The store keeps the redacted text, so the exact-match dedup must
+        // compare the redacted form too; the write re-redacts it as a no-op.
+        let content = redact::redact_secrets(&lesson.content);
+        match fact_recorded(&self.db, project, &content).await {
             Ok(false) => {}
             Ok(true) => {
                 return TaskOutcome::Completed {
@@ -584,7 +588,7 @@ impl Dreamer {
                 return TaskOutcome::Failed(TaskFailure::host("check recorded facts", &error));
             }
         }
-        match memory::write_memory(&self.db, project, &lesson.content, lesson.category).await {
+        match memory::write_memory(&self.db, project, &content, lesson.category).await {
             Ok(id) => TaskOutcome::Completed {
                 detail: format!("recorded memory #{id}"),
                 cursor: None,

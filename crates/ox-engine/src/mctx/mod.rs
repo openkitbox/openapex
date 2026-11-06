@@ -37,7 +37,7 @@ pub(crate) fn budget_for(
 /// policy is cross-tool (which member to reach for), so it is written once
 /// here and every member answers with the same line; `prompt::system_static`
 /// renders identical contributions once.
-pub(crate) const CTX_GUIDANCE: &str = "ctx_note parks follow-ups, ctx_reduce drops stale items, ctx_expand recovers them, ctx_search finds the archive, ctx_memory stores facts.";
+pub(crate) const CTX_GUIDANCE: &str = "ctx_note parks follow-ups, ctx_reduce drops stale items, ctx_expand recovers them, ctx_search finds the archive, ctx_memory stores facts. A memory records what was true when it was written, not what the code does now: verify a claim against the source when it is drift-prone (paths, line numbers, config, status) and say so when you rely on unverified memory.";
 
 /// The embedding client and its vector helpers.
 pub mod embed;
@@ -96,6 +96,9 @@ pub mod historian_validate;
 
 /// Promotion of the historian's `<facts>` into project memory, with dedup.
 mod promotion;
+
+/// Secret redaction applied to every memory write.
+mod redact;
 
 /// `ctx_search`: unified retrieval over memories, notes and compartments.
 pub mod search;

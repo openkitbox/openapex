@@ -60,7 +60,13 @@
 //! - Model-facing text is ox-authored where the reference string was not
 //!   recoverable; the tool *interfaces* (actions, fields, handle shapes) are
 //!   the reference's.
+//! - **Memory text is redacted before it is stored.** Every store write
+//!   ([`write_memory`], [`update_memory`], [`merge_memories`],
+//!   [`insert_promoted`]) passes the content through
+//!   [`crate::mctx::redact::redact_secrets`]; rows stored earlier are not
+//!   backfilled.
 
+use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -70,6 +76,7 @@ use anyhow::{Context as _, Result};
 use serde_json::{Value, json};
 
 use crate::mctx::embed::BATCH_SIZE;
+use crate::mctx::redact;
 use crate::runner::{Tool, ToolContext, ToolOutput};
 use ox_db::{Db, WriteTx, optional};
 use ox_schema::id::now_millis;
@@ -136,6 +143,10 @@ pub struct MemoryRow {
     /// Last verification against the cited files, in epoch milliseconds; `0`
     /// means never verified.
     pub verified_at: i64,
+    /// Last retrieval by a model through `ctx_search` or `ctx_memory get`, in
+    /// epoch milliseconds; `0` means never retrieved. A selection tiebreak
+    /// only: recording a use is neither a write nor a verification.
+    pub last_used_at: i64,
 }
 
 /// One memory as `get` reads it (every status).
@@ -159,6 +170,8 @@ pub(crate) async fn write_memory(
     category: &str,
 ) -> Result<String> {
     let context = format!("write memory for project {project}");
+    let content = redact::redact_secrets(content);
+    let content = content.as_ref();
     let now = now_millis();
     let result: Result<String> = async {
         let tx = db.begin().await?;
@@ -241,11 +254,12 @@ pub(crate) async fn insert_promoted(
     content: &str,
     now: i64,
 ) -> Result<()> {
+    let content = redact::redact_secrets(content);
     tx.execute(
         "INSERT INTO mc_memory
              (id, project, content, category, created_at, updated_at, status, source)
          VALUES (?1, ?2, ?3, ?4, ?5, ?5, 'active', 'historian')",
-        (id, project, content, category, now),
+        (id, project, content.as_ref(), category, now),
     )
     .await?;
     Ok(())
@@ -264,6 +278,8 @@ pub(crate) async fn update_memory(
     category: Option<&str>,
 ) -> Result<bool> {
     let context = format!("update memory #{id} for project {project}");
+    let content = redact::redact_secrets(content);
+    let content = content.as_ref();
     let now = now_millis();
     let result: Result<bool> = async {
         let conn = db.acquire().await?;
@@ -358,6 +374,8 @@ pub(crate) async fn merge_memories(
     category: Option<&str>,
 ) -> Result<Option<Merged>> {
     let context = format!("merge memories for project {project}");
+    let content = redact::redact_secrets(content);
+    let content = content.as_ref();
     let now = now_millis();
     let result: Result<Option<Merged>> = async {
         let tx = db.begin().await?;
@@ -482,7 +500,8 @@ pub(crate) async fn active_memories(db: &Db, project: &str) -> Result<Vec<Memory
         let conn = db.acquire().await?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, category, content, importance, updated_at, verified_at
+                "SELECT id, category, content, importance, updated_at, verified_at,
+                        last_used_at
                    FROM mc_memory
                   WHERE project = ?1 AND status = 'active'
                   ORDER BY CAST(id AS INTEGER)",
@@ -498,6 +517,7 @@ pub(crate) async fn active_memories(db: &Db, project: &str) -> Result<Vec<Memory
                 importance: row.get(3)?,
                 updated_at: row.get(4)?,
                 verified_at: row.get(5)?,
+                last_used_at: row.get(6)?,
             });
         }
         Ok(out)
@@ -509,9 +529,16 @@ pub(crate) async fn active_memories(db: &Db, project: &str) -> Result<Vec<Memory
 /// Choose which memories the pinboard carries under `budget_tokens`.
 ///
 /// Order: [`MemoryRow::importance`] descending (the classify task's weight,
-/// `0` until it runs), then the last touch (`max(verified_at, updated_at)`)
-/// descending, then the numeric id ascending. The id tie-break is numeric, not
-/// lexicographic — handles are numbers (`#9` before `#10`).
+/// `0` until it runs), then the last touch
+/// (`max(verified_at, updated_at, last_used_at)`) descending, then the numeric
+/// id ascending. The id tie-break is numeric, not lexicographic — handles are
+/// numbers (`#9` before `#10`).
+///
+/// A retrieval through `ctx_search` or `ctx_memory get` refreshes the touch
+/// ([`record_use`]), so a memory the model keeps finding stays on the
+/// pinboard. The rendered block orders by category and id, so the change is
+/// invisible until the selected *set* differs at the budget edge; when it
+/// does, only the m[1] bytes change — a `Soft` bust, never a rebuild of m[0].
 ///
 /// A memory that does not fit is **skipped, not truncated**, and the walk
 /// continues: a short fact behind a long one still makes it in. The budget
@@ -554,10 +581,13 @@ fn selection_order(left: &MemoryRow, right: &MemoryRow) -> std::cmp::Ordering {
         .then_with(|| left.id.cmp(&right.id))
 }
 
-/// The most recent of the two watermarks: a row is "fresh" when either it was
-/// rewritten or its citations were re-verified.
+/// The most recent of the three watermarks: a row is "fresh" when it was
+/// rewritten, its citations were re-verified, or a model retrieved it.
 fn last_touch(memory: &MemoryRow) -> i64 {
-    memory.verified_at.max(memory.updated_at)
+    memory
+        .verified_at
+        .max(memory.updated_at)
+        .max(memory.last_used_at)
 }
 
 /// Sort key for a handle id: numeric ids order numerically, anything else
@@ -1076,6 +1106,36 @@ pub(crate) async fn touch_memories(
     result.with_context(|| context)
 }
 
+/// Stamp `last_used_at = at` on the active memories a model just retrieved
+/// (`ctx_search` hits, `ctx_memory get` rows). Archived and unknown ids are
+/// ignored. `updated_at` and `verified_at` are untouched: a retrieval is
+/// neither a write nor a verification, and must not move the verify
+/// watermark. No DB access when `ids` is empty.
+pub(crate) async fn record_use(db: &Db, project: &str, ids: &[&str], at: i64) -> Result<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let context = format!("record memory use for project {project}");
+    let result: Result<()> = async {
+        let tx = db.begin().await?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "UPDATE mc_memory SET last_used_at = ?3
+                      WHERE project = ?1 AND id = ?2 AND status = 'active'",
+                )
+                .await?;
+            for &id in ids {
+                stmt.execute((project, id, at)).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+    result.with_context(|| context)
+}
+
 // ---------------------------------------------------------------------------
 // Store: notes
 // ---------------------------------------------------------------------------
@@ -1580,10 +1640,14 @@ async fn run_memory(
                 Ok(category) => category,
                 Err(message) => return ok_text(message),
             };
+            let content = redact::redact_secrets(&content);
             match write_memory(db, &project, &content, &category).await {
                 Ok(id) => {
                     embed_inline(db, embedder, &id, &content).await;
-                    ok_text(format!("Wrote memory #{id}."))
+                    ok_text(format!(
+                        "Wrote memory #{id}{}.",
+                        redaction_note(matches!(content, Cow::Owned(_)))
+                    ))
                 }
                 Err(error) => internal_error("memory write", &error),
             }
@@ -1604,10 +1668,14 @@ async fn run_memory(
                 Ok(category) => category,
                 Err(message) => return ok_text(message),
             };
+            let content = redact::redact_secrets(&content);
             match update_memory(db, &project, id, &content, category.as_deref()).await {
                 Ok(true) => {
                     embed_inline(db, embedder, id, &content).await;
-                    ok_text(format!("Updated memory #{id}."))
+                    ok_text(format!(
+                        "Updated memory #{id}{}.",
+                        redaction_note(matches!(content, Cow::Owned(_)))
+                    ))
                 }
                 Ok(false) => ok_text(format!("Error: no memory #{id}.")),
                 Err(error) => internal_error("memory update", &error),
@@ -1654,13 +1722,15 @@ async fn run_memory(
                 Ok(category) => category,
                 Err(message) => return ok_text(message),
             };
+            let content = redact::redact_secrets(&content);
             match merge_memories(db, &project, &ids, &content, category.as_deref()).await {
                 Ok(Some(merged)) => {
                     embed_inline(db, embedder, &merged.survivor, &content).await;
                     ok_text(format!(
-                        "Merged {} into #{}.",
+                        "Merged {} into #{}{}.",
                         handles(&merged.sources),
-                        merged.survivor
+                        merged.survivor,
+                        redaction_note(matches!(content, Cow::Owned(_)))
                     ))
                 }
                 Ok(None) => ok_text("Error: merge needs at least two active memories among 'ids'."),
@@ -1675,6 +1745,11 @@ async fn run_memory(
             match get_memories(db, &project, &ids).await {
                 Ok(rows) if rows.is_empty() => ok_text("Error: no such memory."),
                 Ok(rows) => {
+                    // Usage is a by-product: a failed write must not fail the read.
+                    let used: Vec<&str> = rows.iter().map(|row| row.id.as_str()).collect();
+                    if let Err(error) = record_use(db, &project, &used, now_millis()).await {
+                        tracing::warn!(error = %error, "memory get: record use failed");
+                    }
                     let lines: Vec<String> = rows
                         .iter()
                         .map(|row| {
@@ -1693,6 +1768,13 @@ async fn run_memory(
             "Error: unknown action '{other}' (write, update, archive, merge, get)."
         )),
     }
+}
+
+/// The success-message suffix telling the model its text was redacted, so it
+/// does not retry a write whose secret came back as `[REDACTED_SECRET]`.
+/// `redacted` is whether [`redact::redact_secrets`] returned `Cow::Owned`.
+fn redaction_note(redacted: bool) -> &'static str {
+    if redacted { " (secrets redacted)" } else { "" }
 }
 
 /// Embed a just-written fact and store its vector.

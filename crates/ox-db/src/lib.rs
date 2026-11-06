@@ -503,6 +503,18 @@ CREATE TABLE IF NOT EXISTS credential (
 );
 "#;
 
+/// V20: `mc_memory.last_used_at`, the last time a model retrieved the memory
+/// through `ctx_search` or `ctx_memory get` (epoch ms, `0` = never; see
+/// `.ox/plans/2026-11-06-mctx-usage-and-redaction.md`, D1/D2).
+///
+/// It is a selection tiebreak for the pinboard
+/// (`ox-engine::mctx::memory::select_memories`), not a write and not a
+/// verification: recording a use leaves `updated_at` and `verified_at`
+/// untouched. Purely additive, so it applies onto any V19-stamped database.
+const MIGRATION_V20: &str = r#"
+ALTER TABLE mc_memory ADD COLUMN last_used_at integer NOT NULL DEFAULT 0;
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
@@ -526,6 +538,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (17, MIGRATION_V17),
     (18, MIGRATION_V18),
     (19, MIGRATION_V19),
+    (20, MIGRATION_V20),
 ];
 
 /// Async handle to the database.
