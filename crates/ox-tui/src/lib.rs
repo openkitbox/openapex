@@ -4,6 +4,7 @@ pub mod bootstrap;
 pub mod clipboard;
 pub mod executor;
 pub mod graphics;
+pub mod herdr;
 pub mod lifecycle;
 pub mod pipeline;
 pub mod run;

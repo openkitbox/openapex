@@ -21,6 +21,7 @@ use crate::attachment::Loaded;
 use crate::clipboard::Clip;
 use crate::graphics::Graphics;
 use crate::graphics::SizeClass;
+use crate::herdr;
 use crate::pipeline;
 use crate::shell_captures::ShellCaptures;
 use crate::terminal::TerminalGuard;
@@ -175,6 +176,9 @@ pub struct App {
     dock_hover: DockHover,
     /// Whether the pointer is over the prompt footer's live chip.
     live_hover: bool,
+    /// Reports the focused session's state to the herdr pane this TUI runs
+    /// in; `None` outside herdr.
+    herdr: Option<herdr::Reporter>,
 }
 
 /// Which shell dialog an in-flight request will open.
@@ -188,6 +192,17 @@ impl App {
     /// Back the prompt history with a file (startup only; tests stay in memory).
     pub fn attach_history(&mut self, history: crate::ui::history::History) {
         self.prompt.set_history(history);
+    }
+
+    /// Report agent state to herdr (startup only, inside a herdr pane).
+    pub fn attach_herdr(&mut self, reporter: herdr::Reporter) {
+        self.herdr = Some(reporter);
+    }
+
+    /// Hand the herdr reporter back so the caller can release the pane after
+    /// `run` returns.
+    pub fn take_herdr(&mut self) -> Option<herdr::Reporter> {
+        self.herdr.take()
     }
 
     #[must_use]
@@ -246,6 +261,7 @@ impl App {
             graphics: Graphics::new(),
             media_pending: HashSet::new(),
             media_failed: HashSet::new(),
+            herdr: None,
         }
     }
 
@@ -910,6 +926,24 @@ impl App {
             self.dirty = true;
             if key.code == KeyCode::Esc {
                 return;
+            }
+        }
+        // A question form takes the composer's place rather than covering
+        // the session (upstream `routes/session/index.tsx:1625-1631`), so the
+        // transcript keeps its page keys (`session.page.up/down`).
+        if self.form_open() && key.kind != crossterm::event::KeyEventKind::Release {
+            match key.code {
+                KeyCode::PageUp => {
+                    self.transcript.scroll_up(SCROLL_PAGE);
+                    self.dirty = true;
+                    return;
+                }
+                KeyCode::PageDown => {
+                    self.transcript.scroll_down(SCROLL_PAGE);
+                    self.dirty = true;
+                    return;
+                }
+                _ => {}
             }
         }
         // A dialog is modal: it eats every key, and only dismissal leaves it.
@@ -1681,7 +1715,9 @@ impl App {
     }
 
     fn handle_wheel(&mut self, direction: i8) {
-        if self.route != Route::Session || self.dialog.is_some() {
+        // A question form leaves the transcript scrollable (see the page
+        // keys in `handle_key_at`); every other dialog is modal.
+        if self.route != Route::Session || (self.dialog.is_some() && !self.form_open()) {
             return;
         }
         if direction < 0 {
@@ -1728,9 +1764,14 @@ impl App {
                     return;
                 }
                 ox_client::store::reduce(&mut self.store, &typed);
-                // A tool result that names a child session may have missed
+                // A tool event that names a child session may have missed
                 // that child's `execution.started`: probe it once.
                 if let ox_schema::event::SessionEventData::ToolSuccess {
+                    assistant_message_id,
+                    id,
+                    ..
+                }
+                | ox_schema::event::SessionEventData::ToolProgress {
                     assistant_message_id,
                     id,
                     ..
@@ -1798,6 +1839,19 @@ impl App {
     pub(crate) fn flush_store(&mut self) {
         if self.store_dirty {
             self.refresh();
+        }
+    }
+
+    /// Publish the focused session's state to herdr. Called every tick: not
+    /// every form or execution change marks the frame dirty, and the
+    /// reporter only wakes its task when the value differs.
+    fn report_herdr(&self) {
+        if let Some(reporter) = &self.herdr {
+            let state = herdr::state_of(
+                self.store.running_since.is_some(),
+                !self.store.pending_forms.is_empty(),
+            );
+            reporter.update(state, self.session.as_deref());
         }
     }
 
@@ -2110,6 +2164,7 @@ impl App {
                         execute!(terminal.terminal.backend_mut(), EndSynchronizedUpdate)?;
                         drawn?;
                     }
+                    self.report_herdr();
                 }
                 Some(event) = events.recv() => {
                     self.handle(event);

@@ -590,6 +590,26 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         }
     };
 
+    // Name the child on the running part before it can start (upstream
+    // `ctx.metadata({ sessionId })`): the same bus orders this ahead of the
+    // child's `execution.started`, so a client can count and open a
+    // foreground child while it runs. Ephemeral, so a failure only costs the
+    // live view; the result's metadata still names the child.
+    let progress = SessionEventData::ToolProgress {
+        session_id: ctx.session_id.clone(),
+        assistant_message_id: ctx.assistant_message_id.clone(),
+        id: ctx.call_id.clone(),
+        metadata: [
+            ("sessionID".to_owned(), json!(child_id)),
+            ("description".to_owned(), json!(description)),
+        ]
+        .into_iter()
+        .collect(),
+    };
+    if let Err(error) = tool.handle.bus.publish(progress).await {
+        tracing::warn!(%error, child = %child_id, "subagent progress failed to publish");
+    }
+
     // Enqueue the prompt, then wake the child through the same dispatch path
     // an HTTP prompt uses.
     let message_id = ox_schema::id::id("msg");

@@ -1293,6 +1293,7 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
         SessionEventData::ToolProgress {
             assistant_message_id,
             id,
+            metadata,
             ..
         } => {
             let index = store.ensure_assistant(assistant_message_id);
@@ -1300,6 +1301,12 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
                 && let Some(part) = live_part(item, id)
             {
                 part.state = ToolState::Progress;
+                // A running `subagent` names its child here, before the
+                // child starts, so the footer can count it and the block can
+                // open it while it runs.
+                if let Some(child) = ChildRef::from_metadata(&part.tool, Some(metadata)) {
+                    part.child = Some(child);
+                }
                 part.version += 1;
             }
             store.touch(index);

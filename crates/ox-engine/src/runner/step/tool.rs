@@ -217,6 +217,7 @@ fn spawn_tool_task(
                 ToolContext {
                     session_id: session_id.clone(),
                     directory,
+                    assistant_message_id: message_id.clone(),
                     call_id: call_id.clone(),
                     cancellation,
                     registry,

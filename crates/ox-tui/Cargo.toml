@@ -29,7 +29,7 @@ crossterm = { workspace = true, features = ["bracketed-paste"] }
 # bundled syntaxes; colours come from the theme tokens, not syntect themes.
 syntect = { version = "5.3", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }
 tui-textarea-2 = { version = "0.13", default-features = false, features = ["crossterm"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 serde_json.workspace = true
 textwrap.workspace = true
 unicode-width.workspace = true

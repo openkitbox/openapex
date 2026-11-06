@@ -1,7 +1,7 @@
 //! The `ox` TUI entry point: argument handling, terminal setup, wiring.
 
 use crate::lifecycle::{self, Transport};
-use crate::{app, bootstrap, executor, terminal, ui};
+use crate::{app, bootstrap, executor, herdr, terminal, ui};
 
 use tokio::sync::{mpsc, watch};
 
@@ -28,6 +28,16 @@ fn arg_in(args: impl IntoIterator<Item = String>, name: &str) -> Option<String> 
 /// keeps its native text selection.
 fn mouse_enabled(args: impl IntoIterator<Item = String>) -> bool {
     !args.into_iter().any(|arg| arg == "--no-mouse")
+}
+
+/// TUI options a herdr resume replays before `--session <id>`: only the
+/// server the session lives on. `--no-mouse` is not replayed because the `ox`
+/// command line does not accept it (`TUI_OPTIONS` in `src/main.rs`).
+fn resume_flags(transport: &Transport) -> Vec<String> {
+    match transport {
+        Transport::Explicit(url) => vec!["--server".to_string(), url.clone()],
+        Transport::Unix => Vec::new(),
+    }
 }
 
 pub async fn run() -> anyhow::Result<()> {
@@ -75,6 +85,8 @@ pub async fn run() -> anyhow::Result<()> {
     terminal::install_panic_hook();
 
     let demo = std::env::var("OX_TUI_DEMO").ok();
+    // Demo mode replays a script with no real session: nothing to report.
+    let herdr_flags = demo.is_none().then(|| resume_flags(&transport));
 
     // The client every online route uses: `--server` is plain HTTP; otherwise
     // the unix socket, with the server spawned on demand and a lease held.
@@ -191,7 +203,19 @@ pub async fn run() -> anyhow::Result<()> {
     if let Some(path) = ui::history::default_path() {
         app.attach_history(ui::history::History::load(path));
     }
-    app.run(&mut guard, event_rx).await
+    if let Some(reporter) = herdr_flags.and_then(herdr::Reporter::from_env) {
+        app.attach_herdr(reporter);
+    }
+    let result = app.run(&mut guard, event_rx).await;
+    let reporter = app.take_herdr();
+    // Same drop order as without herdr (app, then the guard restoring the
+    // screen); the release waits last so a slow herdr cannot freeze the frame.
+    drop(app);
+    drop(guard);
+    if let Some(reporter) = reporter {
+        reporter.finish().await;
+    }
+    result
 }
 
 /// Connect over the unix socket, starting the server if needed, and keep a

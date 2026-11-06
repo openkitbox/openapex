@@ -29,6 +29,9 @@ pub struct ToolContext {
     pub session_id: String,
     /// Canonical project directory the server runs in.
     pub directory: PathBuf,
+    /// The assistant message that holds the tool call; a tool that reports
+    /// `session.tool.progress` addresses its part with it and `call_id`.
+    pub assistant_message_id: String,
     /// The assistant tool-call id this execution answers.
     pub call_id: String,
     /// Fires when the turn is interrupted; long tools should poll it.

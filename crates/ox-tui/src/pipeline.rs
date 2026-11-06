@@ -275,10 +275,14 @@ fn push_tools(
             state: tool.state,
             summary: tool.summary.clone(),
             output: Arc::clone(&tool.output),
-            background: tool
-                .child
-                .as_ref()
-                .is_some_and(|child| store.is_child_running(&child.session_id)),
+            // Upstream `isBackgroundSubagent`: the badge is a finished
+            // call whose child still runs. A foreground call holds its child
+            // too now, so the outcome is what tells the two apart.
+            background: tool.state == ox_client::store::ToolState::Success
+                && tool
+                    .child
+                    .as_ref()
+                    .is_some_and(|child| store.is_child_running(&child.session_id)),
             input: Arc::clone(&tool.input),
             metadata: tool.metadata.clone(),
             media: Arc::clone(&tool.media),
