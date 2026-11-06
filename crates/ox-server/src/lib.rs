@@ -320,11 +320,18 @@ pub async fn run_with(config: Config, opts: ServeOptions) -> Result<()> {
     let outcome = async {
         if opts.exit_when_idle {
             let (state, router) = compose(config).await?;
-            serve_with(uds, state, router, Some(opts.grace)).await
+            serve_with(uds, state, router, Some(opts.grace), Signals::Handle).await
         } else {
             let tcp = TcpListener::new(config.listen.clone()).try_bind().await?;
             let (state, router) = compose(config).await?;
-            serve_with(JoinedAcceptor::new(tcp, uds), state, router, None).await
+            serve_with(
+                JoinedAcceptor::new(tcp, uds),
+                state,
+                router,
+                None,
+                Signals::Handle,
+            )
+            .await
         }
     }
     .await;
@@ -552,23 +559,40 @@ fn log_cache_stats(runner: &Runner) {
 
 /// Serve the composed router on an already-bound listener — the `ox acp`
 /// own-mode seam (the ephemeral acceptor is bound by the caller so the real
-/// port is known before the loop starts).
+/// port is known before the loop starts). Installs no signal handler: the
+/// embedding process keeps its own SIGINT/SIGTERM behaviour, and stops the
+/// shells itself (`ShellSessions::shutdown`) when it ends.
 pub async fn serve_on(
     acceptor: impl salvo::conn::Acceptor,
     state: AppState,
     router: Router,
 ) -> Result<()> {
-    serve_with(acceptor, state, router, None).await
+    serve_with(acceptor, state, router, None, Signals::Ignore).await
+}
+
+/// Whether [`serve_with`] stops gracefully on SIGINT/SIGTERM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Signals {
+    /// `ox serve`: the server owns the process, so a signal stops it.
+    Handle,
+    /// Embedded (`ox acp`): the host process owns its signals.
+    Ignore,
 }
 
 /// Serve on `acceptor`. With `idle = Some(grace)` the server stops itself
 /// once [`lifecycle::Lifecycle::try_close`] says no lease, no turn and a full
-/// `grace` of quiet. Never composes state or reads the real home.
+/// `grace` of quiet. With [`Signals::Handle`], SIGINT and SIGTERM stop it
+/// gracefully too. However serving ends (idle exit or a signal), every
+/// background shell
+/// process group is stopped before this returns, so none outlives the server
+/// (upstream shell finalizer); a SIGKILL of ox cannot be handled. Never
+/// composes state or reads the real home.
 pub async fn serve_with(
     acceptor: impl salvo::conn::Acceptor,
     state: AppState,
     router: Router,
     idle: Option<Duration>,
+    signals: Signals,
 ) -> Result<()> {
     let server = Server::new(acceptor);
     let watcher = idle.map(|grace| {
@@ -588,9 +612,47 @@ pub async fn serve_with(
             }
         })
     });
+    let signal_task = (signals == Signals::Handle).then(|| {
+        let handle = server.handle();
+        tokio::spawn(async move {
+            let signal = shutdown_signal().await;
+            tracing::info!(signal, "shutdown signal received; stopping");
+            handle.stop_graceful(Duration::from_secs(2));
+        })
+    });
     server.serve(router).await;
-    if let Some(watcher) = watcher {
-        watcher.abort();
+    for task in [watcher, signal_task].into_iter().flatten() {
+        task.abort();
     }
+    ox_tools::shell::sessions::shared().shutdown().await;
     Ok(())
+}
+
+/// Resolve with the name of the first shutdown signal: SIGINT (ctrl+c) or
+/// SIGTERM. A signal whose handler cannot be registered is logged and never
+/// resolves, so a registration failure cannot stop the server.
+async fn shutdown_signal() -> &'static str {
+    use tokio::signal::unix;
+
+    let interrupt = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %error, "unable to listen for SIGINT");
+            std::future::pending::<()>().await;
+        }
+    };
+    let terminate = async {
+        match unix::signal(unix::SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                terminate.recv().await;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "unable to listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    tokio::select! {
+        () = interrupt => "SIGINT",
+        () = terminate => "SIGTERM",
+    }
 }

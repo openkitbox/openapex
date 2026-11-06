@@ -21,6 +21,11 @@ pub enum AppCommand {
     Interrupt {
         session: String,
     },
+    /// Move the session's blocking `shell`/`subagent` calls to the
+    /// background (upstream `session.background`, `ctrl+b`).
+    Background {
+        session: String,
+    },
     /// `request_id` lets the App drop responses that lost the race against
     /// newer deltas or a newer reload.
     ReloadHistory {
@@ -110,19 +115,14 @@ pub enum AppCommand {
     ListFamily {
         session: String,
     },
-    /// Fetch the background shells; answered with `AppEvent::Shells`.
-    ListShells {
-        session: String,
-    },
     /// Fetch the background shells to rebuild the running set; answered with
     /// `AppEvent::RunningShells`, which never opens a dialog. `generation`
     /// numbers the request; the answer carries it back.
     SyncShells {
         generation: u64,
     },
-    /// Kill shell `id`, then re-fetch the list for `session`.
+    /// Kill shell `id`; its `shell.*` frames then drop it from the store.
     KillShell {
-        session: String,
         id: String,
     },
     /// Deliver queued prompt `inbox` of `session` at the next step boundary.

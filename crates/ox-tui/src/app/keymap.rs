@@ -21,7 +21,7 @@
 //! still reports a hint here, because the palette lists it beside the
 //! leader-bound commands.
 //! ox has no sidebar, so `<leader>b` (upstream `session.sidebar.toggle`)
-//! opens the Shells list instead.
+//! opens the activity panel on its `Shell` tab instead.
 //! A key that does not continue a pending leader sequence cancels it and is
 //! swallowed (upstream `registerEscapeClearsPendingSequence` plus the
 //! timed-leader's `clearPendingSequence`).
@@ -147,6 +147,17 @@ pub fn is_search(key: &KeyEvent) -> bool {
 #[must_use]
 pub fn is_paste(key: &KeyEvent) -> bool {
     key.kind != KeyEventKind::Release && is_ctrl(key, 'v')
+}
+
+/// `ctrl+b`: move the session's running `shell`/`subagent` calls to the
+/// background (upstream `session.background`, `config/keybind.ts:129`).
+/// Upstream also binds `ctrl+b` to `input.move.left` (`:212`), as the prompt's
+/// textarea does; the app takes the key only while a `shell` or `subagent`
+/// call runs, so it still moves the cursor when there is nothing to
+/// background.
+#[must_use]
+pub fn is_background(key: &KeyEvent) -> bool {
+    key.kind != KeyEventKind::Release && is_ctrl(key, 'b')
 }
 
 fn follow_up(key: &KeyEvent) -> Option<CommandAction> {

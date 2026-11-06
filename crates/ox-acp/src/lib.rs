@@ -44,7 +44,8 @@ use ox_core::config::Config;
 pub async fn run(explicit_base: Option<String>, config: Config) -> anyhow::Result<()> {
     let base = explicit_base.unwrap_or_else(|| format!("http://{}", config.listen));
 
-    let base = if probe(&base).await {
+    let owned = !probe(&base).await;
+    let base = if !owned {
         base
     } else {
         // No server answered: own the runtime in-process on an ephemeral
@@ -65,7 +66,13 @@ pub async fn run(explicit_base: Option<String>, config: Config) -> anyhow::Resul
         format!("http://{addr}")
     };
 
-    serve_stdio(base).await
+    let outcome = serve_stdio(base).await;
+    // The in-process server dies with this process without returning, so
+    // its shells are stopped here (an attached server keeps its own).
+    if owned {
+        ox_tools::shell::sessions::shared().shutdown().await;
+    }
+    outcome
 }
 
 /// `GET {base}/api/info` with a short timeout decides attach vs own.

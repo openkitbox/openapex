@@ -43,7 +43,9 @@
 
 use std::sync::Arc;
 
-use ox_schema::message::{AssistantContent, Compaction, Message, ToolState as WireToolState};
+use ox_schema::message::{
+    AssistantContent, Compaction, Message, ToolState as WireToolState, ToolTime,
+};
 use ox_schema::support::{Content, FileAttachment};
 
 use crate::store::{
@@ -95,9 +97,13 @@ pub fn parse_messages(messages: &[Message]) -> Vec<Item> {
                         AssistantContent::Text { text: t, .. } => text.push_str(t),
                         AssistantContent::Reasoning { text: t, .. } => reasoning.push_str(t),
                         AssistantContent::Tool {
-                            id, name, state, ..
+                            id,
+                            name,
+                            state,
+                            time,
+                            ..
                         } => {
-                            tools.push(tool_part(id, name, state, &assistant.id));
+                            tools.push(tool_part(id, name, state, time, &assistant.id));
                         }
                     }
                 }
@@ -313,8 +319,19 @@ fn prompt_media(files: Option<&[FileAttachment]>, message: &Arc<str>) -> Arc<[Me
 
 /// Rebuild a live `ToolPart` from the recorded wire state. `Streaming` only
 /// carries the raw input text (the summary derives from it as a fallback);
-/// the resolved states carry the parsed input record.
-fn tool_part(id: &str, name: &str, state: &WireToolState, message: &str) -> ToolPart {
+/// the resolved states carry the parsed input record. `time` dates the call
+/// (`ran`, else `created`) once it is past streaming.
+fn tool_part(
+    id: &str,
+    name: &str,
+    state: &WireToolState,
+    time: &ToolTime,
+    message: &str,
+) -> ToolPart {
+    let started_ms = match state {
+        WireToolState::Streaming { .. } => None,
+        _ => Some(time.ran.unwrap_or(time.created)),
+    };
     let mut child = None;
     let mut media = None;
     let (state, record, output, input_text, metadata): (
@@ -386,6 +403,7 @@ fn tool_part(id: &str, name: &str, state: &WireToolState, message: &str) -> Tool
             .unwrap_or_default(),
         metadata: metadata.map(|metadata| Arc::new(metadata.clone())),
         media: media.unwrap_or_default(),
+        started_ms,
     };
     if part.todos.is_empty() {
         part.todos = crate::store::todos_from_input_text(name, &part.input_text);

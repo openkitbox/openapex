@@ -805,6 +805,23 @@ impl Client {
         Ok(())
     }
 
+    /// `POST /api/session/{session}/background`: move the session's blocking
+    /// `shell`/`subagent` calls to the background (upstream
+    /// `session.background`).
+    pub async fn background(&self, session: &str) -> Result<()> {
+        let resp = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/api/session/{session}/background"),
+            )
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Error::Status(resp.status()));
+        }
+        Ok(())
+    }
+
     /// `PATCH /api/session/{session}/inbox/{inbox}` with `{"delivery":"steer"}`
     /// (204): deliver a queued prompt at the next step boundary instead of
     /// after the turn.

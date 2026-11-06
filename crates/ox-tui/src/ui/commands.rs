@@ -41,7 +41,7 @@ pub enum CommandAction {
     /// Fetch the session family and open the activity panel on its
     /// `Subagents` tab (upstream's composer tabs).
     Subagents,
-    /// Fetch the background shells and open the shell picker.
+    /// Open the activity panel on its Shell tab.
     Shells,
     /// Open the queued-prompts dialog (upstream `session.queued_prompts`).
     QueuedPrompts,
@@ -147,11 +147,13 @@ pub const COMMANDS: &[Command] = &[
         group: "Session",
         action: CommandAction::Sessions,
     },
+    // ox-only: upstream has no `/shells`; it opens the activity panel's Shell
+    // tab, like `<leader>b` (`app::keymap`).
     Command {
         name: "shells",
         aliases: &[],
-        description: "View background shells",
-        title: "View background shells",
+        description: "Show background shells",
+        title: "Show background shells",
         group: "Session",
         action: CommandAction::Shells,
     },

@@ -17,7 +17,9 @@
 //! Background children (`cmd &`) are ordinary processes of that group: they
 //! outlive the call, stay visible to `ps`, and keep writing into the bounded
 //! capture until they close the pipe. `stop` is the one explicit owner of
-//! their teardown, and signals only ever go to the group this session spawned.
+//! their teardown (session deletion and shutdown go through it), and a
+//! settled session whose group still lives is never evicted, so that handle
+//! is not lost. Signals only ever go to the group this session spawned.
 
 use std::collections::HashMap;
 use std::mem;
@@ -59,6 +61,9 @@ const DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 /// How long a non-forced `stop` waits for SIGTERM to take effect before it
 /// escalates to SIGKILL.
 const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+/// How often a settled `stop` re-probes its process group while waiting for
+/// SIGTERM to take effect.
+const GROUP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Upstream `Shell.Status`, re-exported from the shared wire schema.
 pub use ox_schema::support::ShellStatus as Status;
@@ -197,6 +202,10 @@ struct SettledCapture {
     completed: i64,
     /// [`OutputBuffer::retained`] at snapshot time.
     retained: usize,
+    /// The session's process group was alive at snapshot time. A pinned
+    /// session is never removed (it holds the only handle to its `cmd &`
+    /// children), but its output still counts toward the budget.
+    pinned: bool,
 }
 
 /// Indices into the [`SettledCapture`] slice the plan was made from.
@@ -210,7 +219,9 @@ struct EvictionPlan {
 
 /// Decide which settled sessions to drop (past the TTL, then beyond
 /// [`EXITED_LIMIT`], oldest first) and which survivors release their output
-/// to fit [`SETTLED_OUTPUT_BUDGET`], oldest first.
+/// to fit [`SETTLED_OUTPUT_BUDGET`], oldest first. Pinned sessions are never
+/// dropped and do not occupy an [`EXITED_LIMIT`] slot, but their output is
+/// budgeted and released like any other.
 fn eviction_plan(settled: &[SettledCapture], now_ms: i64) -> EvictionPlan {
     plan_with(
         settled,
@@ -222,6 +233,8 @@ fn eviction_plan(settled: &[SettledCapture], now_ms: i64) -> EvictionPlan {
 }
 
 /// [`eviction_plan`] with explicit limits, so tests can use small numbers.
+/// Pinned captures never enter `remove` and are exempt from `ttl_ms` and
+/// `limit`; they only take part in the `budget` pass.
 fn plan_with(
     settled: &[SettledCapture],
     now_ms: i64,
@@ -230,9 +243,12 @@ fn plan_with(
     budget: usize,
 ) -> EvictionPlan {
     let mut plan = EvictionPlan::default();
+    let mut pinned: Vec<usize> = Vec::new();
     let mut survivors: Vec<usize> = Vec::with_capacity(settled.len());
     for (index, capture) in settled.iter().enumerate() {
-        if now_ms.saturating_sub(capture.completed) > ttl_ms {
+        if capture.pinned {
+            pinned.push(index);
+        } else if now_ms.saturating_sub(capture.completed) > ttl_ms {
             plan.remove.push(index);
         } else {
             survivors.push(index);
@@ -243,6 +259,9 @@ fn plan_with(
     let excess = survivors.len().saturating_sub(limit);
     plan.remove.extend(survivors.drain(..excess));
 
+    // Pinned sessions stay, so their output joins the budget pass.
+    survivors.extend(pinned);
+    survivors.sort_by_key(|&index| (settled[index].completed, index));
     let mut total: usize = survivors.iter().map(|&index| settled[index].retained).sum();
     for &index in &survivors {
         if total <= budget {
@@ -284,8 +303,10 @@ pub struct ShellSession {
     /// fresh group. Every signal this session sends targets this group only.
     pgid: u32,
     /// Whether the group still had members when the session settled. Only
-    /// then may a settled `stop` signal `pgid`; `stop` clears it the first
-    /// time it sees the group gone, so a reused pid is never signalled.
+    /// then may a settled `stop` signal `pgid`. Every liveness probe through
+    /// [`ShellSession::group_alive`] (`stop`, eviction, shutdown) clears it
+    /// the first time it sees the group gone, so a reused pid is never
+    /// signalled.
     group_may_live: AtomicBool,
     /// Basename of the shell the command runs under (`ShellInfo.shell`).
     shell_name: Arc<str>,
@@ -351,8 +372,9 @@ pub enum HandBack {
     /// The run is now a background job: exactly one completion follows its
     /// settle (or already went out, if it settled an instant ago).
     Background,
-    /// The run settled first and is being returned inline; no completion
-    /// will ever be delivered for it.
+    /// The run settled first and is being returned inline, or it was
+    /// silenced (its owner is being deleted or ox is exiting, and the turn is
+    /// cancelled); no completion will ever be delivered for it.
     Settled,
 }
 
@@ -575,6 +597,21 @@ impl ShellSession {
         }
     }
 
+    /// Never deliver a completion for this run: an `Armed` or `Held` gate
+    /// becomes `Quiet`. Used before stopping the shells of a session that is
+    /// being deleted, or every shell when ox exits, whose completion would
+    /// otherwise wake a turn. A later `hand_back` reports `Settled`; only a
+    /// cancelled turn can reach it, and that turn stops the run itself.
+    fn silence(&self) {
+        let mut gate = self
+            .gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if matches!(*gate, Gate::Armed | Gate::Held) {
+            *gate = Gate::Quiet;
+        }
+    }
+
     /// Whether this session reports its completion through a sink. Such a
     /// session needs no polling: the model is notified when it settles.
     pub fn notifies_on_completion(&self) -> bool {
@@ -644,26 +681,22 @@ impl ShellSession {
     ///   once the shell is gone.
     /// - On an already settled session the leader is gone but background
     ///   children may live on (`npm run dev &`); they are killed if the group
-    ///   is still alive.
+    ///   is still alive: SIGTERM first, SIGKILL if the group outlives
+    ///   [`STOP_GRACE`] (`force` skips the grace).
     ///
     /// Residual risk: the group id is a pid, and the kernel may reuse it once
     /// every process of the group has exited. While any member lives the id
     /// cannot be reused, so a settled session signals its group only if
     /// `drive` saw the group alive at settle (`group_may_live`) and it is
-    /// still alive now. The first settled `stop` that finds the group gone
-    /// clears the flag and the session never signals again. This relies on
-    /// someone calling `stop` while the group is gone but its id is not yet
-    /// reused: a group that dies and is reassigned before any `stop` runs is
-    /// indistinguishable from ours, so that narrow window remains.
+    /// still alive now. The first liveness probe that finds the group gone
+    /// (from `stop`, eviction or shutdown) clears the flag and the session
+    /// never signals again. This relies on some probe running while the
+    /// group is gone but its id is not yet reused: a group that dies and is
+    /// reassigned before any probe runs is indistinguishable from ours, so
+    /// that narrow window remains.
     pub async fn stop(&self, force: bool) {
         if self.settled() {
-            if self.group_may_live.load(Ordering::Acquire) {
-                if process::group_alive(self.pgid) {
-                    self.signal_group(Signal::Kill);
-                } else {
-                    self.group_may_live.store(false, Ordering::Release);
-                }
-            }
+            self.stop_settled_group(force).await;
             self.wait_announced().await;
             return;
         }
@@ -683,6 +716,35 @@ impl ShellSession {
         self.wait_announced().await;
     }
 
+    /// Tear down a settled session's surviving group: SIGTERM, then SIGKILL
+    /// once [`STOP_GRACE`] passes with the group still alive. Every signal is
+    /// preceded by [`Self::group_alive`], so a group that exited (and whose id
+    /// may be reused) is never signalled.
+    async fn stop_settled_group(&self, force: bool) {
+        if !self.group_alive() {
+            return;
+        }
+        if force {
+            self.signal_group(Signal::Kill);
+            return;
+        }
+        self.signal_group(Signal::Term);
+        let deadline = tokio::time::Instant::now() + STOP_GRACE;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            tokio::time::sleep(left.min(GROUP_POLL)).await;
+            if !self.group_alive() {
+                return;
+            }
+        }
+        if self.group_alive() {
+            self.signal_group(Signal::Kill);
+        }
+    }
+
     /// Wait until the terminal notice went out (see [`Self::announced`]).
     async fn wait_announced(&self) {
         loop {
@@ -692,6 +754,21 @@ impl ShellSession {
             }
             notified.await;
         }
+    }
+
+    /// Whether a settled session's process group may still be signalled:
+    /// `drive` saw it alive at settle and it is alive now. The first call
+    /// that finds it gone clears `group_may_live`, so a reused pid is never
+    /// treated as ours (see [`Self::stop`]).
+    fn group_alive(&self) -> bool {
+        if !self.group_may_live.load(Ordering::Acquire) {
+            return false;
+        }
+        if process::group_alive(self.pgid) {
+            return true;
+        }
+        self.group_may_live.store(false, Ordering::Release);
+        false
     }
 
     /// The `Shell.Info` a client reads.
@@ -882,9 +959,10 @@ impl ShellSessions {
     /// stops it first.
     pub fn remove(&self, id: &str) -> bool {
         let removed = {
-            let Ok(mut table) = self.sessions.lock() else {
-                return false;
-            };
+            let mut table = self
+                .sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             match table.get(id) {
                 Some(session) if !session.settled() => return false,
                 Some(_) => table.remove(id),
@@ -901,12 +979,73 @@ impl ShellSessions {
         })
     }
 
+    /// Stop every session owned by one of `session_ids`, then remove them
+    /// (each removal announces `deleted`). Used when a session tree is
+    /// deleted, as upstream `Session.remove` → `jobs.cancelSession` →
+    /// `shell.remove`.
+    /// Their completions are silenced first: the owner still exists while
+    /// they settle, and a delivered completion would wake a turn on a session
+    /// that is being deleted.
+    /// The stops run concurrently, so the whole call is bounded by one
+    /// [`STOP_GRACE`] rather than growing with the number of shells.
+    pub async fn stop_owned(&self, session_ids: &[String]) {
+        let owned: Vec<Arc<ShellSession>> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .filter(|session| {
+                session
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| session_ids.contains(&owner.session_id))
+            })
+            .cloned()
+            .collect();
+        for session in &owned {
+            session.silence();
+        }
+        stop_concurrently(&owned).await;
+        for session in &owned {
+            self.remove(&session.id);
+        }
+    }
+
+    /// Stop every session that may still have processes: the running ones
+    /// and the settled ones whose process group is still alive (`cmd &`
+    /// children). Called once by the server when serving ends, so no process
+    /// group outlives ox (upstream finalizer, `core/src/shell.ts:149-159`).
+    /// Their completions are silenced first: a turn woken while ox exits is
+    /// paid for and cut off. Sessions stay in the table. The stops run
+    /// concurrently, so the whole call is bounded by one [`STOP_GRACE`].
+    pub async fn shutdown(&self) {
+        let live: Vec<Arc<ShellSession>> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .filter(|session| !session.settled() || session.group_alive())
+            .cloned()
+            .collect();
+        for session in &live {
+            session.silence();
+        }
+        stop_concurrently(&live).await;
+    }
+
     /// Bound the settled history: drop sessions settled longer than
     /// [`SHELL_SESSION_TTL_MS`] ago or beyond the newest [`EXITED_LIMIT`], then
     /// release the output of the oldest survivors until all settled captures
     /// fit [`SETTLED_OUTPUT_BUDGET`]. Running sessions are never touched:
-    /// `Exit.completed` only exists once a session settles. Removal is silent
-    /// (no `deleted` notice, plan D2). Runs after every settle and on spawn.
+    /// `Exit.completed` only exists once a session settles. Each removal
+    /// announces `deleted`, as upstream eviction goes through
+    /// `removeCommand`. Runs after every settle and on spawn.
+    ///
+    /// A settled session whose process group is still alive is pinned: it is
+    /// never removed and takes no [`EXITED_LIMIT`] slot, so it keeps the one
+    /// handle that lets `DELETE`, session deletion and shutdown kill its
+    /// `cmd &` children (plan D1). Its output still counts toward the budget
+    /// and is released like any other.
     ///
     /// Lock order: table, then each session's `exit`/`output`; the plan is a
     /// pure decision over a snapshot of completion times and retained bytes.
@@ -929,6 +1068,7 @@ impl ShellSessions {
                 .map(|session| SettledCapture {
                     completed: session.exit().completed.unwrap_or_default(),
                     retained: session.retained(),
+                    pinned: session.group_alive(),
                 })
                 .collect();
             let plan = eviction_plan(&captures, now_ms);
@@ -937,13 +1077,17 @@ impl ShellSessions {
             for &index in &plan.release {
                 settled[index].release_output();
             }
+            // Pinned (live-group) sessions are never in `remove` (plan D1).
             plan.remove
                 .iter()
                 .filter_map(|&index| table.remove(&settled[index].id))
                 .collect()
         };
-        // A removed session may drop its last reference here, off the lock.
-        drop(removed);
+        for session in removed {
+            session.notify(Notice::Deleted {
+                id: session.id.clone(),
+            });
+        }
     }
 
     /// Subscribe to lifecycle changes instead of polling.
@@ -958,6 +1102,26 @@ impl ShellSessions {
 pub fn shared() -> Arc<ShellSessions> {
     static TABLE: std::sync::OnceLock<Arc<ShellSessions>> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| Arc::new(ShellSessions::new())).clone()
+}
+
+/// Run `stop(false)` on every session at once and wait for all of them, so
+/// the total wait is one [`STOP_GRACE`] however many there are. Each stop is
+/// a detached task: if the caller is dropped mid-grace (a client hangs up on
+/// `DELETE`), the stops still escalate to SIGKILL. Each task owns one `Arc`
+/// clone; no session data is copied.
+async fn stop_concurrently(sessions: &[Arc<ShellSession>]) {
+    let stops: Vec<tokio::task::JoinHandle<()>> = sessions
+        .iter()
+        .map(|session| {
+            let session = Arc::clone(session);
+            tokio::spawn(async move { session.stop(false).await })
+        })
+        .collect();
+    for stop in stops {
+        if let Err(error) = stop.await {
+            tracing::error!(%error, "shell stop task failed");
+        }
+    }
 }
 
 /// Kill the session's process group when its deadline passes. Holds only a

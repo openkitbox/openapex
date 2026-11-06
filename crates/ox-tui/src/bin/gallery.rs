@@ -1226,7 +1226,7 @@ fn prompt_files_case() -> Case {
 fn dock_case(name: &'static str, store: DataStore, mode: StatusMode<'static>) -> Case {
     // StatusMode 不 impl Copy/Clone 且不能改库：构建期先把 Line 算好（status_line
     // 只读 store/mode），闭包里只剩渲染。
-    let line = status_line(&store, mode);
+    let line = status_line(&store, mode, 0);
     Case {
         name,
         height: 1,

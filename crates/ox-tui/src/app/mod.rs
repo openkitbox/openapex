@@ -43,7 +43,6 @@ use crate::ui::prompt::{
 use crate::ui::queued_dialog;
 use crate::ui::selection::Outcome;
 use crate::ui::session_dialog;
-use crate::ui::shell_dialog;
 use crate::ui::timeline::Transcript;
 use crate::ui::timeline_dialog;
 use crate::ui::toast::{self, Toast};
@@ -175,10 +174,11 @@ pub struct App {
     /// (or repeat a refusal) and still draw nothing, so they are dropped until
     /// the session changes.
     media_failed: HashSet<(String, SizeClass)>,
-    /// The shell dialog the user just asked for and has not seen yet. A shell
-    /// answer may open a dialog only for this; otherwise it may refresh a
-    /// dialog that is still open. So a refresh that lands after `esc` is dropped.
-    shell_wanted: Option<ShellWanted>,
+    /// The user just asked for a shell's output viewer and has not seen it
+    /// yet. A shell answer may open the viewer only for this; otherwise it may
+    /// refresh a viewer that is still open. So a refresh that lands after
+    /// `esc` is dropped.
+    shell_wanted: bool,
     /// Output fetched for expanded shell blocks of the open session.
     shell_captures: ShellCaptures,
     /// Number of the last `SyncShells` sent. Kept here, not in the store, so
@@ -195,13 +195,6 @@ pub struct App {
     /// Reports the focused session's state to the herdr pane this TUI runs
     /// in; `None` outside herdr.
     herdr: Option<herdr::Reporter>,
-}
-
-/// Which shell dialog an in-flight request will open.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ShellWanted {
-    Picker,
-    Viewer,
 }
 
 impl App {
@@ -270,7 +263,7 @@ impl App {
             panel: None,
             cursor: activity_panel::Cursor::new(),
             selection_pending: false,
-            shell_wanted: None,
+            shell_wanted: false,
             shell_captures: ShellCaptures::default(),
             shell_syncs: 0,
             queued_dock_area: Rect::default(),
@@ -393,7 +386,6 @@ impl App {
                 }
             }
             AppEvent::Family { session, members } => self.on_family(&session, members),
-            AppEvent::Shells { session, shells } => self.on_shells(&session, &shells),
             AppEvent::RunningShells { generation, shells } => {
                 if self.store.set_running_shells(generation, shells) {
                     self.child_state_changed();
@@ -551,33 +543,18 @@ impl App {
         }
     }
 
-    /// Open (or refresh) the shell picker. A late answer for another session
-    /// or one that would cover a form is dropped.
-    fn on_shells(&mut self, session: &str, shells: &[ShellInfo]) {
-        let opens = self.shell_wanted == Some(ShellWanted::Picker) && self.dialog.is_none();
-        let refreshes = self.dialog.as_ref().and_then(Dialog::tag) == Some(shell_dialog::TAG);
-        if self.session.as_deref() != Some(session) || !(opens || refreshes) {
-            return;
-        }
-        if opens {
-            self.shell_wanted = None;
-        }
-        self.dialog = Some(shell_dialog::dialog(shells, session));
-        self.dirty = true;
-    }
-
     /// Open (or refresh) the output viewer. A refresh of the same shell keeps
     /// the reader where they were. A late answer for another session or one
     /// that would cover a form is dropped.
     fn on_shell_output(&mut self, session: &str, shell: &ShellInfo, tail: ShellTail) {
-        let opens = self.shell_wanted == Some(ShellWanted::Viewer) && self.dialog.is_none();
+        let opens = self.shell_wanted && self.dialog.is_none();
         let refreshes =
             matches!(&self.dialog, Some(Dialog::Output(open)) if open.shell_id() == shell.id);
         if self.session.as_deref() != Some(session) || !(opens || refreshes) {
             return;
         }
         if opens {
-            self.shell_wanted = None;
+            self.shell_wanted = false;
         }
         let mut output = Output::new(shell, tail);
         if let Some(Dialog::Output(open)) = &self.dialog
@@ -655,9 +632,6 @@ impl App {
                             inbox: value,
                         });
                     }
-                } else if tag == Some(shell_dialog::TAG) {
-                    self.shell_wanted = Some(ShellWanted::Viewer);
-                    self.request_shell_output(value);
                 } else if tag == Some(timeline_dialog::TAG) {
                     if let Ok(index) = value.parse::<usize>() {
                         self.transcript.jump_to_entry(index);
@@ -685,16 +659,6 @@ impl App {
                 }
                 if tag == Some(queued_dialog::TAG) {
                     self.on_queued_action(key, value);
-                    return;
-                }
-                if tag == Some(shell_dialog::TAG) {
-                    if key == shell_dialog::KILL_KEY
-                        && let Some(session) = self.session.clone()
-                    {
-                        let _ = self
-                            .commands
-                            .send(AppCommand::KillShell { session, id: value });
-                    }
                     return;
                 }
                 if tag != Some(session_dialog::LIST_TAG) {
@@ -1203,6 +1167,19 @@ impl App {
             return;
         }
 
+        // `ctrl+b` backgrounds the running tools (upstream
+        // `session.background`). After the keymap feed, so `ctrl+x b` still
+        // opens the Shell tab; only while a shell or subagent call runs, so
+        // the prompt keeps `ctrl+b` as cursor-left otherwise
+        // (`keymap::is_background`).
+        if keymap::is_background(&key)
+            && self.store.backgroundable_tool().is_some()
+            && let Some(session) = self.session.clone()
+        {
+            let _ = self.commands.send(AppCommand::Background { session });
+            return;
+        }
+
         // Browse mode: single-letter navigation is safe here because the
         // prompt is not receiving keys.
         if matches!(self.mode, Mode::Browse) {
@@ -1429,9 +1406,13 @@ impl App {
                 }
             }
             CommandAction::Shells => {
-                if let Some(session) = self.session.clone() {
-                    self.shell_wanted = Some(ShellWanted::Picker);
-                    let _ = self.commands.send(AppCommand::ListShells { session });
+                // The rows come from the store's running shells, so the tab is
+                // complete at once and needs no fetch.
+                if self.session.is_some() {
+                    self.panel = Some(activity_panel::Tab::Shell);
+                    self.cursor.selected = 0;
+                    self.selection_pending = false;
+                    self.dirty = true;
                 }
             }
             CommandAction::Rename => {
@@ -1482,16 +1463,21 @@ impl App {
 
     /// A key while the activity panel is up: `esc` closes it, `←`/`→` and
     /// `tab`/`shift+tab` switch tab, `↑` from the first row closes it and
-    /// otherwise moves up, `↓` moves down and wraps, `enter` opens that
-    /// subagent's session, `ctrl+d` interrupts it when it runs, `ctrl+a`
-    /// flips the subagent filter. Everything else is swallowed: the panel has
+    /// otherwise moves up, `↓` moves down and wraps. On `Subagents` `enter`
+    /// opens that subagent's session, `ctrl+d` interrupts it when it runs and
+    /// `ctrl+a` flips the filter; on `Shell` `enter` opens the selected
+    /// shell's output and `ctrl+d` kills it. Everything else is swallowed: the panel has
     /// no text field, and the composer it replaced is not on screen. The keys
-    /// are upstream's (`config/keybind.ts:249-252` and the tab's own layer).
+    /// are upstream's (`config/keybind.ts:249-256` and the tab's own layer).
     fn on_activity_key(&mut self, key: KeyEvent, tab: activity_panel::Tab) {
         if key.kind == KeyEventKind::Release {
             return;
         }
-        let len = self.panel_rows(tab).len();
+        let len = self.panel_len(tab);
+        // Rows can vanish under the open panel (a shell exits): bring the
+        // stored index back in range first, as upstream's clamp effect does
+        // (`shell-tab.tsx:34-36`), so `↑` moves from the row that is drawn.
+        self.cursor = self.cursor.clamp(len);
         match key.code {
             KeyCode::Esc => self.close_panel(),
             KeyCode::Left | KeyCode::BackTab => {
@@ -1514,10 +1500,14 @@ impl App {
                 activity_panel::Up::Row(selected) => self.cursor.selected = selected,
             },
             KeyCode::Down => self.cursor = self.cursor.down(len),
-            KeyCode::Enter => self.open_selected(tab),
-            KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
-                self.interrupt_selected(tab);
-            }
+            KeyCode::Enter => match tab {
+                activity_panel::Tab::Subagents => self.open_selected(tab),
+                activity_panel::Tab::Shell => self.view_selected_shell(),
+            },
+            KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => match tab {
+                activity_panel::Tab::Subagents => self.interrupt_selected(tab),
+                activity_panel::Tab::Shell => self.kill_selected_shell(),
+            },
             _ => {}
         }
     }
@@ -1532,7 +1522,8 @@ impl App {
         self.dirty = true;
     }
 
-    /// The rows `tab` lists for the family it last fetched, in draw order.
+    /// The subagent rows `tab` lists for the family it last fetched, in draw
+    /// order; none on the `Shell` tab, whose rows are [`App::panel_shells`].
     fn panel_rows(&self, tab: activity_panel::Tab) -> Vec<activity_panel::Row<'_>> {
         if tab != activity_panel::Tab::Subagents {
             return Vec::new();
@@ -1542,6 +1533,46 @@ impl App {
             self.session.as_deref().unwrap_or_default(),
             self.cursor.active,
         )
+    }
+
+    /// The `Shell` tab's rows: `(id, command)` of the session's running shells.
+    fn panel_shells(&self) -> Vec<(&str, &str)> {
+        self.session
+            .as_deref()
+            .map_or_else(Vec::new, |session| self.store.shells_of(session))
+    }
+
+    /// How many rows `tab` lists.
+    fn panel_len(&self, tab: activity_panel::Tab) -> usize {
+        match tab {
+            activity_panel::Tab::Subagents => self.panel_rows(tab).len(),
+            activity_panel::Tab::Shell => self.panel_shells().len(),
+        }
+    }
+
+    /// The id of the shell under the selection, clamped like the block.
+    fn selected_shell(&self) -> Option<String> {
+        let shells = self.panel_shells();
+        shells
+            .get(self.cursor.clamp(shells.len()).selected)
+            .map(|&(id, _)| id.to_owned())
+    }
+
+    /// `enter` on the `Shell` tab (`composer.shell.select`): open the output
+    /// viewer for the selected shell once its output lands.
+    fn view_selected_shell(&mut self) {
+        if let Some(id) = self.selected_shell() {
+            self.shell_wanted = true;
+            self.request_shell_output(id);
+        }
+    }
+
+    /// `ctrl+d` on the `Shell` tab (`composer.shell.kill`): kill the selected
+    /// shell; its `shell.*` frames then drop the row.
+    fn kill_selected_shell(&mut self) {
+        if let Some(id) = self.selected_shell() {
+            let _ = self.commands.send(AppCommand::KillShell { id });
+        }
     }
 
     /// The subagent under the selection, if one is listed. The index is clamped
@@ -1558,15 +1589,18 @@ impl App {
     /// entry, else the first row, once the list has rows).
     fn settle_selection(&mut self) {
         let tab = self.panel.unwrap_or_default();
-        let (position, len) = {
-            let rows = self.panel_rows(tab);
-            let current = self.session.as_deref().unwrap_or_default();
-            (
-                rows.iter().position(|row| row.member.id == current),
-                rows.len(),
-            )
+        let (position, len) = match tab {
+            activity_panel::Tab::Subagents => {
+                let rows = self.panel_rows(tab);
+                let current = self.session.as_deref().unwrap_or_default();
+                (
+                    rows.iter().position(|row| row.member.id == current),
+                    rows.len(),
+                )
+            }
+            activity_panel::Tab::Shell => (None, self.panel_shells().len()),
         };
-        if self.selection_pending && len > 0 {
+        if self.selection_pending && len > 0 && tab == activity_panel::Tab::Subagents {
             self.cursor.selected = position.unwrap_or(0);
             self.selection_pending = false;
         }
@@ -1642,7 +1676,7 @@ impl App {
 
     /// Rebuild the running-shell set from `GET /api/shell` (session open and
     /// reconnect: `shell.*` frames are ephemeral, so missed ones are gone).
-    /// Its answer takes its own path, never the picker's `shell_wanted` one.
+    /// Its answer takes its own path, never the viewer's `shell_wanted` one.
     fn request_running_shells(&mut self) {
         if self.session.is_some() {
             self.shell_syncs += 1;
@@ -2162,6 +2196,7 @@ impl App {
         let panel = self.panel.map(|tab| {
             activity_panel::lines(
                 &self.family,
+                &self.panel_shells(),
                 self.session.as_deref().unwrap_or_default(),
                 tab,
                 self.cursor,
@@ -2244,7 +2279,14 @@ impl App {
                 }
             }
         }
-        let line = dock::status_line(&self.store, self.status_mode());
+        // Wall clock for the background hint's 3s delay; the spinner tick
+        // repaints every frame while a turn runs, so the hint appears on time.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX)
+            });
+        let line = dock::status_line(&self.store, self.status_mode(), now_ms);
         frame.render_widget(ratatui::widgets::Paragraph::new(line), dock_area);
         let from_dialog = match &self.dialog {
             Some(dialog) => crate::ui::dialog::render(frame, full, dialog, &mut self.graphics),

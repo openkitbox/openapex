@@ -11,20 +11,25 @@
 //!   the filter is `active` (the default), `!== "running"` while it is not.
 //! - The empty state names the filter: `No active subagents` /
 //!   `No inactive subagents`, and `No shell commands` on the `Shell` tab.
-//! - A row reads `{prefix}{agent}: {title}`, with a right-aligned `Running`
+//! - A subagent row reads `{prefix}{agent}: {title}`, with a right-aligned `Running`
 //!   while its subagent still works. `agent` is the session's own agent, else
 //!   the one in its `@xxx subagent` title marker, else `Subagent`; the marker is
 //!   stripped from the title. The row under the cursor takes the focused fill,
 //!   the row of the session on screen a quieter one, every other row the base.
+//! - A shell row reads the first line of the command (`shell.command.split("\n",
+//!   1)[0]`), the row under the cursor likewise filled and bold. The rows are
+//!   the running shells of the session on screen, sorted by id; that session is
+//!   every row here, so no row carries the quieter "current" fill.
 //! - `↑` from the first row closes the panel instead of clamping; `↓` wraps to
 //!   the first row.
 //! - `ctrl+a` flips the filter, puts the selection back on the first row and
 //!   with it the window back at its start.
 //! - The body is a five-row window (`scrollbox maxHeight={5}`, hidden
 //!   scrollbar) over *every* listed entry, so all of them are reachable.
-//! - Hints: `interrupt ctrl+d` only while the selected row runs, then
-//!   `show inactive ctrl+a` / `show active ctrl+a`; `tabs ←/→` belongs to the
-//!   tab bar, which ox draws in the same row set.
+//! - Hints: `interrupt ctrl+d` only while the selected subagent row runs, then
+//!   `show inactive ctrl+a` / `show active ctrl+a`; on the `Shell` tab
+//!   `output enter` / `kill ctrl+d` only while a row is selected; `tabs ←/→`
+//!   belongs to the tab bar, which ox draws in the same row set.
 //!
 //! The block sits on the composer's rail, in its place, and is not a modal over
 //! the transcript: [`rows`], [`lines`] and [`Cursor`] are pure (the family as
@@ -60,12 +65,10 @@
 //!   suffix and both filters follow it. A child no tool result names yet — one
 //!   spawned after the panel opened, before its tool row settles — appears only
 //!   after the panel is reopened.
-//! - The `Shell` tab lists nothing. `DataStore` answers whether a shell is
-//!   running by id (`is_shell_running`) and how many the session owns
-//!   (`running_shells_of`, the prompt footer's count), but exposes no
-//!   per-session list of commands, so the tab shows upstream's
-//!   `No shell commands` and has no `output` / `kill` action; `/shells` (the
-//!   background-shell picker) owns both.
+//! - The `Shell` tab's rows are derived from `DataStore` every frame
+//!   (`shells_of`: id and command of the session's running shells), never held
+//!   here: a frame that starts or exits a shell changes the map, and the rows
+//!   follow. Upstream reads a live memo over `data.shell` the same way.
 //! - `tab` / `shift+tab` switch tabs as well as `←` / `→`: ox binds them to
 //!   agent cycling, and the panel owns the keyboard while it is open.
 //! - The window's offset is derived from the selection (centred, clamped so the
@@ -74,9 +77,12 @@
 //! - Agent names go through the transcript's `titlecase`, which uppercases the
 //!   first character only, where upstream `Locale.titlecase` uppercases every
 //!   word boundary (`/\b\w/`); every built-in agent id is a single word.
-//! - One cursor for both tabs: upstream keeps a `selected` store per tab, but
-//!   the `Shell` tab lists nothing, so ox's single index simply restarts at the
-//!   first row after a visit there.
+//! - One cursor for both tabs: upstream keeps a separate `selected` store per
+//!   tab, so a visit to the other tab leaves the first tab's selection where it
+//!   was. ox keeps a single index for both: a tab switch keeps it and only
+//!   clamps it to the new tab's rows (`App::settle_selection`), so the same
+//!   row number is selected on the other tab, or its last row when the list is
+//!   shorter, and switching back does not restore the earlier row.
 //! - The block ends with its `╹` foot, and the prompt's footer row below it
 //!   (cwd, usage) is not drawn while the panel is open; the status dock under
 //!   it still carries the session status.
@@ -286,11 +292,13 @@ pub fn header(tab: Tab) -> Line<'static> {
 }
 
 /// The hint row: each action's title then its key, as the dialogs draw them.
-/// `active` is the filter, so the toggle offers the *other* list; `interruptible`
-/// adds `interrupt ctrl+d`, which upstream shows only while the selected row
-/// runs (and ox's `open enter` is the ledger's key stand-in for a click).
+/// `active` is the filter, so the toggle offers the *other* list. `armed` adds
+/// the row actions upstream shows conditionally: on `Subagents`
+/// `interrupt ctrl+d` while the selected row runs (ox's `open enter` is the
+/// ledger's key stand-in for a click), on `Shell` `output enter` and
+/// `kill ctrl+d` while a row is selected (`config/keybind.ts:253-256`).
 #[must_use]
-pub fn hints(tab: Tab, active: bool, interruptible: bool) -> Line<'static> {
+pub fn hints(tab: Tab, active: bool, armed: bool) -> Line<'static> {
     let pal = *theme::palette();
     let toggle = if active {
         "show inactive"
@@ -298,13 +306,14 @@ pub fn hints(tab: Tab, active: bool, interruptible: bool) -> Line<'static> {
         "show active"
     };
     let hints: &[(&str, &str)] = match tab {
-        Tab::Subagents if interruptible => &[
+        Tab::Subagents if armed => &[
             ("open", "enter"),
             ("interrupt", "ctrl+d"),
             (toggle, "ctrl+a"),
             ("tabs", "←/→"),
         ],
         Tab::Subagents => &[("open", "enter"), (toggle, "ctrl+a"), ("tabs", "←/→")],
+        Tab::Shell if armed => &[("output", "enter"), ("kill", "ctrl+d"), ("tabs", "←/→")],
         Tab::Shell => &[("tabs", "←/→")],
     };
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(hints.len() * 3);
@@ -345,23 +354,30 @@ pub fn window_offset(selected: usize, len: usize) -> usize {
 }
 
 /// The whole block interior: header, the window of rows, one blank row, hints.
-/// `cursor.selected` indexes [`rows`]; it is clamped, so a stale index draws the
-/// last row.
+/// `shells` is the `Shell` tab's `(id, command)` list (`DataStore::shells_of`).
+/// `cursor.selected` indexes the shown tab's rows ([`rows`] or `shells`); it is
+/// clamped, so a stale index draws the last row.
 #[must_use]
-pub fn lines(members: &[FamilyMember], current: &str, tab: Tab, cursor: Cursor) -> Block {
-    let listed = match tab {
-        Tab::Subagents => rows(members, current, cursor.active),
-        Tab::Shell => Vec::new(),
-    };
+pub fn lines(
+    members: &[FamilyMember],
+    shells: &[(&str, &str)],
+    current: &str,
+    tab: Tab,
+    cursor: Cursor,
+) -> Block {
+    if tab == Tab::Shell {
+        return shell_lines(shells, cursor);
+    }
+    let listed = rows(members, current, cursor.active);
     let mut block = Block {
         lines: vec![header(tab)],
         ..Block::default()
     };
     if listed.is_empty() {
-        let empty_state = match (tab, cursor.active) {
-            (Tab::Subagents, true) => SUBAGENTS_EMPTY_ACTIVE,
-            (Tab::Subagents, false) => SUBAGENTS_EMPTY_INACTIVE,
-            (Tab::Shell, _) => SHELL_EMPTY,
+        let empty_state = if cursor.active {
+            SUBAGENTS_EMPTY_ACTIVE
+        } else {
+            SUBAGENTS_EMPTY_INACTIVE
         };
         block.lines.push(empty(empty_state));
         block.lines.push(Line::default());
@@ -390,6 +406,41 @@ pub fn lines(members: &[FamilyMember], current: &str, tab: Tab, cursor: Cursor) 
     block
         .lines
         .push(hints(tab, cursor.active, listed[selected].member.running));
+    block
+}
+
+/// The `Shell` tab's block: one row per running shell, the first line of its
+/// command (upstream `shell-tab.tsx:139`), in the same window as the subagent
+/// rows.
+fn shell_lines(shells: &[(&str, &str)], cursor: Cursor) -> Block {
+    let pal = *theme::palette();
+    let mut block = Block {
+        lines: vec![header(Tab::Shell)],
+        ..Block::default()
+    };
+    if shells.is_empty() {
+        block.lines.push(empty(SHELL_EMPTY));
+        block.lines.push(Line::default());
+        block.lines.push(hints(Tab::Shell, cursor.active, false));
+        return block;
+    }
+    let selected = cursor.selected.min(shells.len() - 1);
+    let offset = window_offset(selected, shells.len());
+    block.selected = Some(1 + selected - offset);
+    let focused = pal.menu_selected.add_modifier(Modifier::BOLD);
+    for (index, &(_, command)) in shells.iter().skip(offset).take(VIEWPORT).enumerate() {
+        let style = if Some(1 + index) == block.selected {
+            focused
+        } else {
+            pal.text
+        };
+        let first = command.split('\n').next().unwrap_or_default();
+        block
+            .lines
+            .push(Line::from(Span::styled(first.to_owned(), style)));
+    }
+    block.lines.push(Line::default());
+    block.lines.push(hints(Tab::Shell, cursor.active, true));
     block
 }
 

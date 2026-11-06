@@ -45,16 +45,16 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
             files,
         } => prompt(&client, &tx, &session, &text, &files).await,
         AppCommand::Interrupt { session } => interrupt(&client, &tx, &session).await,
+        AppCommand::Background { session } => background(&client, &tx, &session).await,
         AppCommand::ListSessions => list_sessions(&client, &tx).await,
         AppCommand::ListRunningRoots => list_running_roots(&client, &tx).await,
         AppCommand::ListFamily { session } => list_family(&client, &tx, session).await,
-        AppCommand::ListShells { session } => list_shells(&client, &tx, session).await,
         AppCommand::SyncShells { generation } => sync_shells(&client, generation, &tx).await,
         AppCommand::ShellOutput { session, id } => shell_output(&client, &tx, session, &id).await,
         AppCommand::ShellPoll { id, cursor, mode } => {
             shell_poll(&client, &tx, id, cursor, mode).await
         }
-        AppCommand::KillShell { session, id } => kill_shell(&client, &tx, session, &id).await,
+        AppCommand::KillShell { id } => kill_shell(&client, &tx, &id).await,
         AppCommand::SteerQueued { session, inbox } => {
             if let Err(err) = client.steer_queued(&session, &inbox).await {
                 let _ = tx.send(session_failed("Failed to steer pending prompt", err));
@@ -141,6 +141,12 @@ async fn interrupt(client: &Client, tx: &Events, session: &str) {
     }
 }
 
+async fn background(client: &Client, tx: &Events, session: &str) {
+    if let Err(err) = client.background(session).await {
+        let _ = tx.send(session_failed("Failed to background tools", err));
+    }
+}
+
 async fn list_sessions(client: &Client, tx: &Events) {
     let event = match client.sessions().await {
         Ok(sessions) => AppEvent::Sessions {
@@ -215,19 +221,11 @@ async fn list_family(client: &Client, tx: &Events, session: String) {
     let _ = tx.send(event);
 }
 
-async fn list_shells(client: &Client, tx: &Events, session: String) {
-    let event = match client.shells().await {
-        Ok(shells) => AppEvent::Shells { session, shells },
-        Err(err) => session_failed("Failed to list shells", err),
-    };
-    let _ = tx.send(event);
-}
-
-/// The same `GET /api/shell` the picker uses, reduced to the running shells
-/// and the session that owns each (the prompt footer's shell count). The
-/// status filter is defensive: the server's list already holds only unsettled
-/// sessions. A failure is logged only: the `shell.*` frames still drive the
-/// map.
+/// `GET /api/shell`, reduced to the running shells with the session that owns
+/// each and its command (the prompt footer's shell count and the Shell tab's
+/// rows). The status filter is defensive: the server's list already holds
+/// only unsettled sessions. A failure is logged only: the `shell.*` frames
+/// still drive the map.
 async fn sync_shells(client: &Client, generation: u64, tx: &Events) {
     match client.shells().await {
         Ok(shells) => {
@@ -237,6 +235,7 @@ async fn sync_shells(client: &Client, generation: u64, tx: &Events) {
                 .map(|shell| RunningShell {
                     session: shell.session_id().map(str::to_owned),
                     id: shell.id,
+                    command: shell.command,
                 })
                 .collect();
             let _ = tx.send(AppEvent::RunningShells {
@@ -306,13 +305,12 @@ async fn read_shell(
     Ok((shell, tail))
 }
 
-/// Kill, then answer with the fresh list so the open picker drops the row.
-async fn kill_shell(client: &Client, tx: &Events, session: String, id: &str) {
+/// Kill shell `id`. The Shell tab drops the row when the `shell.*` frame for
+/// it arrives, so success sends nothing.
+async fn kill_shell(client: &Client, tx: &Events, id: &str) {
     if let Err(err) = client.kill_shell(id).await {
         let _ = tx.send(session_failed("Failed to kill shell", err));
-        return;
     }
-    list_shells(client, tx, session).await;
 }
 
 async fn rename_session(client: &Client, tx: &Events, session: &str, title: &str) {

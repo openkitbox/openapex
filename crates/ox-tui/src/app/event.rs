@@ -159,12 +159,6 @@ pub enum AppEvent {
         session: String,
         members: Vec<ox_client::rest::FamilyMember>,
     },
-    /// Answer to `AppCommand::ListShells`: every shell the server knows;
-    /// `session` is the one that asked, and the picker filters by it.
-    Shells {
-        session: String,
-        shells: Vec<ox_client::rest::ShellInfo>,
-    },
     /// Answer to `AppCommand::SyncShells`: the server's running shells and the
     /// session that owns each. Replaces `DataStore`'s running map; a failed
     /// list sends nothing.

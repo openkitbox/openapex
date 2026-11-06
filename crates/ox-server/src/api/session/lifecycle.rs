@@ -8,6 +8,7 @@ use ox_db::Db;
 use ox_schema::event::SessionEventData;
 use ox_schema::id;
 use ox_schema::support::{ForkBoundary, LocationRef, ModelRef, Rule, SessionMetadata};
+use ox_tools::shell::sessions;
 
 use super::response::{
     invalid_request, invalid_request_kind, message_not_found, no_content, parse_body,
@@ -361,7 +362,11 @@ pub(crate) async fn remove(req: &mut Request, depot: &mut Depot, res: &mut Respo
 }
 
 /// Delete `root` and every descendant: descendants first (deepest last-found
-/// first), then the root. Each session goes through a `SessionDeleted` event
+/// first), then the root. Every session's running turn is interrupted, then
+/// the background shells the tree owns are stopped together (SIGTERM, SIGKILL
+/// after one grace) and removed, as upstream `Session.remove` →
+/// `jobs.cancelSession` (`packages/core/src/session.ts:395`).
+/// Each session then goes through a `SessionDeleted` event
 /// (so the projection, the event log and SSE subscribers all agree), then its
 /// durable event log is purged and the runner forgets it. Spilled subagent
 /// reports are removed with their owning session; cleanup is best-effort so a
@@ -374,6 +379,12 @@ pub(crate) async fn delete_session_tree(app: &crate::api::AppState, root: &str) 
     order.reverse();
     order.push(root.to_owned());
 
+    // Interrupt first so no turn can start a shell after the snapshot
+    // `stop_owned` takes.
+    for target in &order {
+        let _ = app.runner.interrupt(target);
+    }
+    sessions::shared().stop_owned(&order).await;
     for target in order {
         app.bus
             .publish(SessionEventData::SessionDeleted {

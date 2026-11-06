@@ -32,7 +32,6 @@ pub(crate) mod selection;
 pub mod session_dialog;
 pub mod shell_block;
 pub mod shell_collapse;
-pub mod shell_dialog;
 pub mod spinner;
 pub mod table;
 pub mod timeline;

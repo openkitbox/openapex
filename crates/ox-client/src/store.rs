@@ -422,9 +422,9 @@ pub struct ShellRef {
 struct ShellSync {
     generation: u64,
     /// Ids some frame touched since the request left. Only the ids: their
-    /// state (and owner) is read back from `running_shells`, which the frame
-    /// already updated. Bounded by the shells that changed while one request
-    /// was in flight.
+    /// state (owner and command) is read back from `running_shells`, which
+    /// the frame already updated. Bounded by the shells that changed while one
+    /// request was in flight.
     seen: HashSet<String>,
 }
 
@@ -480,16 +480,32 @@ impl<'a> ShellView<'a> {
     }
 }
 
-/// One running shell with the session that owns it, as the `GET /api/shell`
-/// rebuild reports them (the running subset of that list). The owner is
-/// `metadata.sessionID` (`ox-tools/src/shell/sessions.rs`: `info()`), the same
-/// field the `shell.created` frame's `info` carries.
+/// One running shell with the session that owns it and its command, as the
+/// `GET /api/shell` rebuild reports them (the running subset of that list).
+/// The owner is `metadata.sessionID` (`ox-tools/src/shell/sessions.rs`:
+/// `info()`), the same field the `shell.created` frame's `info` carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunningShell {
     pub id: String,
     /// `None` when the server recorded no owner for the shell.
     pub session: Option<String>,
+    /// The command line the shell runs (`info.command`).
+    pub command: String,
 }
+
+/// What the store keeps per running shell: its owner and its command, the
+/// Shell tab's row text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunningShellEntry {
+    /// `None` when the server recorded no `metadata.sessionID`.
+    pub owner: Option<String>,
+    /// `info.command`, possibly several lines.
+    pub command: String,
+}
+
+/// How long a `shell`/`subagent` call runs before the background hint shows
+/// (upstream `BACKGROUND_TOOL_HINT_DELAY`).
+pub const BACKGROUND_HINT_DELAY_MS: i64 = 3000;
 
 /// One tool call inside an assistant message. Events are keyed by the tool
 /// part `id`, so out-of-order arrival is tolerated and finished parts ignore
@@ -528,6 +544,11 @@ pub struct ToolPart {
     /// inline `data:` bytes, as metadata only — [`MediaSource::Tool`] fetches
     /// the bytes on demand. Empty for every other result, which is most of them.
     pub media: Arc<[MediaMeta]>,
+    /// Wall-clock start of the call (ms): the `tool.called` envelope's
+    /// `created` live, the wire `time.ran` (else `time.created`) in history.
+    /// `None` while only input has streamed. Dates the background hint
+    /// ([`DataStore::background_hint_due`]).
+    pub started_ms: Option<i64>,
 }
 
 impl ToolPart {
@@ -651,14 +672,15 @@ pub struct DataStore {
     /// the event stream is newer than the answer to a request sent before it.
     probing: HashSet<String>,
     /// Running shells by id, each with the session that owns it (`None` when
-    /// the server recorded no `metadata.sessionID`). From the `shell.*` frames
-    /// and the `GET /api/shell` rebuild; the cap is the number of live shells
-    /// on the server.
+    /// the server recorded no `metadata.sessionID`) and its command. From the
+    /// `shell.*` frames and the `GET /api/shell` rebuild; the cap is the number
+    /// of live shells on the server. The Shell tab derives its rows from here,
+    /// so it holds no list of its own.
     ///
     /// [`DataStore::apply_shell_frame`] is the only writer, and a rebuild
     /// replays through its result: clearing this map outside a frame would let
     /// an in-flight answer restore the sessions it just dropped.
-    running_shells: HashMap<String, Option<String>>,
+    running_shells: HashMap<String, RunningShellEntry>,
     /// The `GET /api/shell` request in flight, if any; see
     /// [`DataStore::begin_shell_sync`].
     shell_sync: Option<ShellSync>,
@@ -764,6 +786,35 @@ impl DataStore {
         self.pending_forms.first()
     }
 
+    /// The running call `ctrl+b` would move to the background (upstream
+    /// `BackgroundToolHint`, `routes/session/index.tsx:1897-1929`): during a
+    /// running turn, the first `shell` or `subagent` call of the last
+    /// assistant message that is still running. Upstream's "not completed
+    /// message" is the running turn here: history marks every loaded message
+    /// done, so a mid-turn reload has only `running_since` to go by.
+    #[must_use]
+    pub fn backgroundable_tool(&self) -> Option<&ToolPart> {
+        self.running_since?;
+        let Some(Item::Assistant(item)) = last_assistant(self).map(|index| &self.items[index])
+        else {
+            return None;
+        };
+        item.tools.iter().find(|part| {
+            matches!(part.state, ToolState::Running | ToolState::Progress)
+                && (part.tool == ShellRef::SHELL_TOOL || part.tool == ChildRef::SUBAGENT_TOOL)
+        })
+    }
+
+    /// Whether the background hint is due at `now_ms`: the
+    /// [`Self::backgroundable_tool`] started at least
+    /// [`BACKGROUND_HINT_DELAY_MS`] ago.
+    #[must_use]
+    pub fn background_hint_due(&self, now_ms: i64) -> bool {
+        self.backgroundable_tool()
+            .and_then(|part| part.started_ms)
+            .is_some_and(|started| now_ms - started >= BACKGROUND_HINT_DELAY_MS)
+    }
+
     /// The session's current todo list (upstream `util/todo.ts`
     /// `sessionTodos`): the list of the last `todowrite` call that
     /// succeeded, across every assistant message. Running and failed calls
@@ -812,13 +863,30 @@ impl DataStore {
     /// shells: a frame inserts one while it runs and removes it on exit, and
     /// the rebuild lists only unsettled sessions
     /// (`ox-tools/src/shell/sessions.rs`, `ShellSessions::list`). So this is
-    /// upstream's Shell-tab count, not its footer count.
+    /// upstream's Shell-tab count (the length of [`DataStore::shells_of`]),
+    /// not its footer count.
     #[must_use]
     pub fn running_shells_of(&self, session: &str) -> usize {
         self.running_shells
             .values()
-            .filter(|owner| owner.as_deref() == Some(session))
+            .filter(|entry| entry.owner.as_deref() == Some(session))
             .count()
+    }
+
+    /// The Shell tab's rows: `(id, command)` of every running shell `session`
+    /// owns, sorted by id, which ascends with creation, so rows keep their
+    /// order as shells come and go. Upstream lists `data.shell.listBySession`
+    /// filtered to `status === "running"` (`composer/shell-tab.tsx:20-22`).
+    #[must_use]
+    pub fn shells_of(&self, session: &str) -> Vec<(&str, &str)> {
+        let mut shells: Vec<(&str, &str)> = self
+            .running_shells
+            .iter()
+            .filter(|(_, entry)| entry.owner.as_deref() == Some(session))
+            .map(|(id, entry)| (id.as_str(), entry.command.as_str()))
+            .collect();
+        shells.sort_unstable_by_key(|&(id, _)| id);
+        shells
     }
 
     /// Children named by a tool part that are running right now: the prompt
@@ -837,7 +905,8 @@ impl DataStore {
 
     /// Feed one `shell.*` frame (`ox-tools/src/shell/events.rs:frame`):
     /// `created` with status `running` adds `info.id` with the owner from
-    /// `info.metadata.sessionID`; `exited` / `deleted` remove `id`. Frames
+    /// `info.metadata.sessionID` and the command from `info.command`;
+    /// `exited` / `deleted` remove `id`. Frames
     /// carry no top-level session id (only a `created` frame's `info` names
     /// one), so the caller routes them here before any session filter.
     /// Returns whether the map changed. While a rebuild is outstanding the
@@ -846,7 +915,7 @@ impl DataStore {
         fn id_of(value: &serde_json::Value) -> Option<&str> {
             value.get("id").and_then(serde_json::Value::as_str)
         }
-        let (id, running, owner) = match kind {
+        let (id, running, owner, command) = match kind {
             "shell.created" => {
                 let Some(info) = data.get("info") else {
                     return false;
@@ -860,13 +929,17 @@ impl DataStore {
                     .get("metadata")
                     .and_then(|metadata| metadata.get("sessionID"))
                     .and_then(serde_json::Value::as_str);
-                (id, running, owner)
+                let command = info
+                    .get("command")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default();
+                (id, running, owner, command)
             }
             "shell.exited" | "shell.deleted" => {
                 let Some(id) = id_of(data) else {
                     return false;
                 };
-                (id, false, None)
+                (id, false, None, "")
             }
             _ => return false,
         };
@@ -876,16 +949,22 @@ impl DataStore {
         if running {
             match self.running_shells.entry(id.to_owned()) {
                 Entry::Occupied(mut slot) => {
-                    let owner = owner.map(str::to_owned);
-                    if *slot.get() == owner {
+                    let entry = slot.get();
+                    if entry.owner.as_deref() == owner && entry.command == command {
                         false
                     } else {
-                        slot.insert(owner);
+                        slot.insert(RunningShellEntry {
+                            owner: owner.map(str::to_owned),
+                            command: command.to_owned(),
+                        });
                         true
                     }
                 }
                 Entry::Vacant(slot) => {
-                    slot.insert(owner.map(str::to_owned));
+                    slot.insert(RunningShellEntry {
+                        owner: owner.map(str::to_owned),
+                        command: command.to_owned(),
+                    });
                     true
                 }
             }
@@ -904,9 +983,9 @@ impl DataStore {
     }
 
     /// Answer to rebuild `generation` (the shells whose status is `running`,
-    /// each with its owner): replaces the map, then replays the frames seen
-    /// since the request was issued, which are newer — for those ids the
-    /// frame's state and owner win. An answer to any other request
+    /// each with its owner and command): replaces the map, then replays the
+    /// frames seen since the request was issued, which are newer — for those
+    /// ids the frame's state, owner and command win. An answer to any other request
     /// (superseded, or already applied) is dropped. Returns whether the map
     /// changed.
     pub fn set_running_shells(&mut self, generation: u64, shells: Vec<RunningShell>) -> bool {
@@ -916,14 +995,20 @@ impl DataStore {
         else {
             return false;
         };
-        let mut next: HashMap<String, Option<String>> = shells
+        let mut next: HashMap<String, RunningShellEntry> = shells
             .into_iter()
-            .map(|shell| (shell.id, shell.session))
+            .map(|shell| {
+                let entry = RunningShellEntry {
+                    owner: shell.session,
+                    command: shell.command,
+                };
+                (shell.id, entry)
+            })
             .collect();
         for id in sync.seen {
             match self.running_shells.get(&id) {
-                Some(owner) => {
-                    next.insert(id, owner.clone());
+                Some(entry) => {
+                    next.insert(id, entry.clone());
                 }
                 None => {
                     next.remove(&id);
@@ -1307,6 +1392,7 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
                     input: Arc::default(),
                     metadata: None,
                     media: Arc::default(),
+                    started_ms: None,
                 });
             }
             store.touch(index);
@@ -1355,6 +1441,7 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
                 part.summary = tool_summary(&part.tool, input);
                 part.todos = todos_of(&part.tool, input);
                 part.input = Arc::new(input.clone());
+                part.started_ms.get_or_insert(event.created);
                 part.version += 1;
             }
             store.touch(index);
