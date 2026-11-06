@@ -7,7 +7,7 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
-use tui_textarea::{CursorRenderMode, TextArea};
+use tui_textarea::{CursorMove, CursorRenderMode, TextArea, WrapMode};
 
 use crate::attachment::Loaded;
 use crate::theme;
@@ -80,7 +80,7 @@ impl Composer {
     #[must_use]
     pub fn new_with_placeholder(placeholder: &str) -> Self {
         Self {
-            textarea: empty_textarea(),
+            textarea: wrapping_textarea(),
             placeholder: placeholder.to_owned(),
             pasted: Vec::new(),
             attached: Vec::new(),
@@ -102,7 +102,7 @@ impl Composer {
     /// Empty textarea and paste registry together: the registry never
     /// outlives the text it belongs to.
     fn reset_text(&mut self) {
-        self.textarea = empty_textarea();
+        self.textarea = wrapping_textarea();
         self.pasted.clear();
         self.attached.clear();
         self.attachments += 1;
@@ -296,10 +296,12 @@ impl Composer {
         self.textarea.cursor()
     }
 
-    /// Visible rows: `1..=max(6, terminal_height / 3)` (upstream `maxHeight`).
-    pub fn height(&self, terminal_height: u16) -> u16 {
+    /// Visible rows when drawn `width` columns wide: the soft-wrapped row
+    /// count, clamped to `1..=max(6, terminal_height / 3)` (upstream
+    /// `minHeight`/`maxHeight`). Measuring caches per width, hence `&mut`.
+    pub fn height(&mut self, terminal_height: u16, width: u16) -> u16 {
         let max = max_height(terminal_height);
-        (self.textarea.lines().len() as u16).clamp(1, max)
+        self.textarea.measure(width).content_rows.clamp(1, max)
     }
 
     /// Replace the first `chars` characters with `with` (menu completion).
@@ -335,12 +337,24 @@ impl Composer {
         row + 1 == lines.len() && col == lines[row].chars().count()
     }
 
-    pub fn on_first_row(&self) -> bool {
-        self.textarea.cursor().0 == 0
+    /// Move one screen (wrapped) row up; on the first screen row, jump to the
+    /// start instead (upstream `prompt.history.previous` with text before the
+    /// cursor).
+    pub fn move_up_or_start(&mut self) {
+        let before = self.textarea.cursor();
+        self.textarea.move_cursor(CursorMove::Up);
+        if self.textarea.cursor() == before {
+            self.move_to_start();
+        }
     }
 
-    pub fn on_last_row(&self) -> bool {
-        self.textarea.cursor().0 + 1 == self.textarea.lines().len()
+    /// Move one screen row down; on the last screen row, jump to the end.
+    pub fn move_down_or_end(&mut self) {
+        let before = self.textarea.cursor();
+        self.textarea.move_cursor(CursorMove::Down);
+        if self.textarea.cursor() == before {
+            self.move_to_end();
+        }
     }
 
     pub fn move_to_start(&mut self) {
@@ -441,6 +455,14 @@ fn empty_textarea() -> TextArea<'static> {
     // tui-textarea underlines the cursor's whole line by default. Upstream's
     // input has no cursor-line decoration, so typed text stays plain.
     textarea.set_cursor_line_style(Style::default());
+    textarea
+}
+
+/// The prompt's editor soft-wraps at word boundaries like upstream's
+/// textarea; the single-line search box keeps horizontal scrolling.
+fn wrapping_textarea() -> TextArea<'static> {
+    let mut textarea = empty_textarea();
+    textarea.set_wrap_mode(WrapMode::Word);
     textarea
 }
 

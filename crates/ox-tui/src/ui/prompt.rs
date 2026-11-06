@@ -34,6 +34,20 @@ fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
     rect.contains(Position::new(x, y))
 }
 
+/// The panel's inner padding on each side: one column on a narrow screen.
+fn side_pad(screen_width: u16) -> u16 {
+    if screen_width < 44 { 1 } else { 2 }
+}
+
+/// Columns the textarea gets inside a `panel_width`-wide panel: the border
+/// column and the padding on both sides come off. Shared by measuring and
+/// drawing so the wrapped row count matches what is drawn.
+fn text_width(panel_width: u16, screen_width: u16) -> u16 {
+    panel_width
+        .saturating_sub(1 + side_pad(screen_width) * 2)
+        .max(1)
+}
+
 pub const PLACEHOLDERS: [&str; 3] = [
     "Fix a TODO in the codebase",
     "What is the tech stack of this project?",
@@ -464,14 +478,17 @@ impl Prompt {
         self.footer = footer;
     }
 
-    /// Rows the whole block needs: panel, `╹`/`▀` edge and footer row.
-    pub fn height(&self, terminal_height: u16) -> u16 {
-        self.panel_height(terminal_height) + 2
+    /// Rows the whole block needs when drawn `width` columns wide on a
+    /// `screen`-sized terminal (the same pair [`Self::render`] gets as
+    /// `area.width` and `full`): panel, `╹`/`▀` edge and footer row.
+    pub fn height(&mut self, width: u16, screen: Rect) -> u16 {
+        self.panel_height(width, screen) + 2
     }
 
-    fn panel_height(&self, terminal_height: u16) -> u16 {
+    fn panel_height(&mut self, width: u16, screen: Rect) -> u16 {
         // paddingTop + image strip + textarea + paddingTop + metadata row
-        1 + self.strip_rows(terminal_height) + self.composer.height(terminal_height) + 1 + 1
+        let text_w = text_width(width, screen.width);
+        1 + self.strip_rows(screen.height) + self.composer.height(screen.height, text_w) + 1 + 1
     }
 
     /// Rows the attachment strip takes above the textarea: the thumbnails plus
@@ -589,29 +606,24 @@ impl Prompt {
     /// Upstream `prompt.history.previous/next`: Up/Down first travel to the
     /// start/end of the text, and only a press there walks the history.
     fn walk_history(&mut self, code: KeyCode) -> HistoryWalk {
-        let (direction, text_edge, boundary_row) = match code {
-            KeyCode::Up => (
-                -1,
-                self.composer.cursor_at_start(),
-                self.composer.on_first_row(),
-            ),
-            KeyCode::Down => (
-                1,
-                self.composer.cursor_at_end(),
-                self.composer.on_last_row(),
-            ),
+        // Rows here are screen rows of the wrapped text, as upstream's
+        // `visualRow` (`component/prompt/index.tsx:1036-1090`): off the edge,
+        // Up/Down move one screen row, and from the first/last screen row
+        // they jump to the start/end of the text.
+        let (direction, text_edge) = match code {
+            KeyCode::Up => (-1, self.composer.cursor_at_start()),
+            KeyCode::Down => (1, self.composer.cursor_at_end()),
             _ => return HistoryWalk::NotMine,
         };
         if !text_edge {
-            if boundary_row {
-                if direction < 0 {
-                    self.composer.move_to_start();
-                } else {
-                    self.composer.move_to_end();
-                }
-                return HistoryWalk::Consumed;
+            if direction < 0 {
+                self.composer.move_up_or_start();
+            } else {
+                self.composer.move_down_or_end();
             }
-            return HistoryWalk::NotMine;
+            // The cursor moved, so the menu follows it as after any other key.
+            self.sync_menu();
+            return HistoryWalk::Consumed;
         }
         let Some(text) = self.history.step(direction, &self.composer.text()) else {
             return HistoryWalk::Declined;
@@ -767,11 +779,12 @@ impl Prompt {
             return Vec::new();
         }
         let rail = self.rail_style(&pal);
-        let pad = if full.width < 44 { 1 } else { 2 };
+        let pad = side_pad(full.width);
         let strip_rows = self.strip_rows(full.height);
+        let inner_w = text_width(area.width, full.width);
         let composer_h = self
             .composer
-            .height(full.height)
+            .height(full.height, inner_w)
             .min(area.height.saturating_sub(3 + strip_rows).max(1));
         let panel_h = 1 + strip_rows + composer_h + 1 + 1;
         let panel = Rect {
@@ -802,7 +815,6 @@ impl Prompt {
         }
 
         let inner_x = panel.x + 1 + pad;
-        let inner_w = panel.width.saturating_sub(1 + pad * 2).max(1);
         // The strip sits between the panel's top padding and the textarea.
         let mut requests = Vec::new();
         if strip_rows > 0 {

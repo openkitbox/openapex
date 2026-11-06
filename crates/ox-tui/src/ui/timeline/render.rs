@@ -534,7 +534,7 @@ pub(super) fn retry_secs(at: i64, now_ms: i64) -> i64 {
 }
 
 /// Milliseconds since the Unix epoch; 0 if the clock is before it.
-pub(super) fn wall_ms_now() -> i64 {
+pub(crate) fn wall_ms_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| {

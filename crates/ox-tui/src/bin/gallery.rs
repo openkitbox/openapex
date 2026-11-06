@@ -1156,7 +1156,7 @@ fn prompt_case(
             if slash {
                 let _ = prompt.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
             }
-            let h = prompt.height(area.height);
+            let h = prompt.height(area.width, area);
             let panel_area = Rect {
                 y: area.height - h,
                 height: h,
@@ -1204,7 +1204,7 @@ fn prompt_files_case() -> Case {
                     entry("README.md", "file"),
                 ],
             );
-            let h = prompt.height(area.height);
+            let h = prompt.height(area.width, area);
             let panel_area = Rect {
                 y: area.height - h,
                 height: h,

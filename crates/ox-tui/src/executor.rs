@@ -567,18 +567,56 @@ async fn switch_to(client: &Client, tx: &Events, session: &str, switch: Switch) 
     }
 }
 
+/// Fetch the session's history together with its run state.
+///
+/// The stream attaches at the live tail, so a turn already in flight never
+/// sends its `execution.started` again: without a snapshot the footer spinner,
+/// the reasoning block and the interrupt key all read idle. The runner's active
+/// set (`GET /api/session/active`) is the authority for whether a turn is
+/// running — the stored `time.busy`/`time.idle` pair can be stale after a crash
+/// — and the session's `time.busy` dates the turn it reports. A failed active
+/// query counts as not running (fail closed: no spinner for a turn nobody would
+/// ever end here); a missing stamp dates the turn from now.
 async fn reload_history(client: &Client, tx: &Events, session: &str, request_id: u64) {
-    match client.messages(session, None).await {
-        Ok(page) => {
-            let mut messages = page.data;
-            messages.reverse(); // desc → chronological
-            let items = ox_client::history::parse_messages(&messages);
-            let _ = tx.send(AppEvent::History { request_id, items });
-        }
+    let (history, active, info) = tokio::join!(
+        client.messages(session, None),
+        client.active_sessions(),
+        client.session_info(session),
+    );
+    let page = match history {
+        Ok(page) => page,
         Err(err) => {
             let _ = tx.send(session_failed("Failed to load history", err));
+            return;
         }
-    }
+    };
+    let info = match info {
+        Ok(info) => Some(info),
+        Err(err) => {
+            tracing::warn!(%err, session, "session info failed");
+            None
+        }
+    };
+    let running_since = match active {
+        Ok(active) if active.iter().any(|id| id == session) => Some(
+            info.as_ref()
+                .and_then(|info| info.time.busy)
+                .unwrap_or_else(crate::ui::timeline::wall_ms_now),
+        ),
+        Ok(_) => None,
+        Err(err) => {
+            tracing::warn!(%err, session, "active session list failed; assuming idle");
+            None
+        }
+    };
+    let mut messages = page.data;
+    messages.reverse(); // desc → chronological
+    let items = ox_client::history::parse_messages(&messages);
+    let _ = tx.send(AppEvent::History {
+        request_id,
+        items,
+        running_since,
+    });
 }
 
 /// 409 (already settled) and 404 (gone) mean the form is done either way; any

@@ -12,7 +12,7 @@ use crossterm::execute;
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use ox_client::rest::{FamilyMember, ShellInfo, ShellTail};
 use ox_client::sse::StreamMsg;
-use ox_client::store::{DataStore, Item, ShellRef};
+use ox_client::store::{DataStore, Hydration, Item, ShellRef};
 use ox_schema::support::FileInput;
 use ratatui::layout::Rect;
 use tokio::sync::{mpsc, watch};
@@ -90,6 +90,15 @@ struct PendingHome {
     dropped_files: usize,
 }
 
+/// The history reload in flight: its request id, and the store's
+/// [`DataStore::lifecycle_epoch`] when it was sent, so an `execution.*` event
+/// that lands before the answer keeps the run state it set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingReload {
+    request_id: u64,
+    lifecycle_epoch: u64,
+}
+
 pub struct App {
     pub route: Route,
     pub session: Option<String>,
@@ -100,7 +109,7 @@ pub struct App {
     pub commands: mpsc::UnboundedSender<AppCommand>,
     seq_tx: watch::Sender<Option<i64>>,
     next_reload_id: u64,
-    pending_reload: Option<u64>,
+    pending_reload: Option<PendingReload>,
     /// Home 提交后等待会话创建：失败时把这段文本放回 composer。
     pending_home_prompt: Option<PendingHome>,
     /// Title of the open session, for the `/rename` prefill.
@@ -280,7 +289,11 @@ impl App {
             AppEvent::Hover { x, y } => self.handle_hover(x, y),
             AppEvent::Wheel(direction) => self.handle_wheel(direction),
             AppEvent::Stream(msg) => self.handle_stream(msg),
-            AppEvent::History { request_id, items } => self.handle_history(request_id, items),
+            AppEvent::History {
+                request_id,
+                items,
+                running_since,
+            } => self.handle_history(request_id, items, running_since),
             AppEvent::ChildRunning { child, running } => {
                 if self.store.apply_probe(&child, running) {
                     self.family_state_changed();
@@ -752,12 +765,22 @@ impl App {
 
     /// Authoritative history, accepted only if it answers the newest request.
     /// Otherwise it lost the race against newer deltas (or a newer reload).
-    fn handle_history(&mut self, request_id: u64, items: Vec<Item>) {
-        if self.pending_reload != Some(request_id) {
+    /// Its run-state snapshot applies unless an `execution.*` event arrived
+    /// since the request went out: that event is newer, so the store keeps it.
+    fn handle_history(&mut self, request_id: u64, items: Vec<Item>, running_since: Option<i64>) {
+        let Some(pending) = self.pending_reload else {
+            return;
+        };
+        if pending.request_id != request_id {
             return;
         }
         self.pending_reload = None;
-        self.store.replace_items(items);
+        let hydration = if pending.lifecycle_epoch == self.store.lifecycle_epoch() {
+            Hydration::Snapshot(running_since)
+        } else {
+            Hydration::KeepLive
+        };
+        self.store.replace_items(items, hydration);
         self.refresh();
         // Starts missed while the history was loading, or while the stream
         // was down, are not replayed: ask the server about every child.
@@ -782,7 +805,10 @@ impl App {
         };
         let request_id = self.next_reload_id;
         self.next_reload_id += 1;
-        self.pending_reload = Some(request_id);
+        self.pending_reload = Some(PendingReload {
+            request_id,
+            lifecycle_epoch: self.store.lifecycle_epoch(),
+        });
         let _ = self.commands.send(AppCommand::ReloadHistory {
             session,
             request_id,
@@ -1986,7 +2012,7 @@ impl App {
         let searching = matches!(self.mode, Mode::SearchInput(_));
         let prompt_h = self
             .prompt
-            .height(full.height)
+            .height(layout::padded(full, full.width).width, full)
             .min(full.height.saturating_sub(1));
         // The panel's rows are width independent, so they are built before the
         // layout needs their height.

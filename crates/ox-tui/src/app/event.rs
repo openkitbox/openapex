@@ -76,6 +76,12 @@ pub enum AppEvent {
     History {
         request_id: u64,
         items: Vec<Item>,
+        /// The session's run state when the history was read: the epoch-ms
+        /// start of the turn in flight, or `None` when the server's runner has
+        /// no work for it (or that could not be asked, which fails closed).
+        /// The SSE stream attaches at the live tail and never replays a
+        /// missed `execution.started`, so this is the only source on a switch.
+        running_since: Option<i64>,
     },
     /// Answer to `AppCommand::ProbeChildren` for one child session. Applies
     /// only if no execution event for the child arrived since the probe went

@@ -29,6 +29,15 @@
 //! as a steer, and the turn stays dated from the prompt that opened it, until
 //! the next `idle`. That is the upstream rule, not a parsing bug.
 //!
+//! An assistant row is `done` once its message has `time.completed`. A history
+//! read mid-turn therefore leaves the streaming message open; whether a turn is
+//! running at all is not in the messages. [`DataStore::replace_items`] closes
+//! every open row except, while a turn runs, the newest assistant row of the
+//! latest turn; an earlier open row (one a `Shutdown` interrupt left behind) is
+//! closed even mid-turn.
+//!
+//! [`DataStore::replace_items`]: crate::store::DataStore::replace_items
+//!
 //! `Item::from_synthetic` is the one classification point for synthetics,
 //! shared with the live reducer.
 
@@ -112,7 +121,12 @@ pub fn parse_messages(messages: &[Message]) -> Vec<Item> {
                     text: Arc::from(text),
                     reasoning: Arc::from(reasoning),
                     reasoning_ms: reasoning_ms(&assistant.content),
-                    done: true,
+                    // The projector stamps `time.completed` only when the
+                    // message ends (step ended or failed, or a stale attempt
+                    // closed), so a message still streaming loads open and
+                    // keeps taking live deltas. Upstream reads the same stamp
+                    // (`message-parts.tsx` `message.time.completed`).
+                    done: assistant.time.completed.is_some(),
                     version: 0,
                     last_ordinal: None,
                     tools,

@@ -618,12 +618,30 @@ pub struct Queued {
     pub text: Arc<str>,
 }
 
+/// The run state a history reload applies with its items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hydration {
+    /// Apply the snapshot fetched with the history: `Some(start)` puts the
+    /// session in a turn that began at that epoch-ms stamp, `None` marks it
+    /// idle.
+    Snapshot(Option<i64>),
+    /// A lifecycle event arrived while the history was loading, so the store's
+    /// live run state is newer than the snapshot and stays (upstream
+    /// `data.ts` `activeUpdates`); only the items are replaced.
+    KeepLive,
+}
+
 #[derive(Debug, Default)]
 pub struct DataStore {
     pub session: Option<String>,
     pub items: Vec<Item>,
     assistant_index: HashMap<String, usize>,
     pub running_since: Option<i64>,
+    /// Count of `execution.*` lifecycle events reduced for the focused
+    /// session. A history reload records it when it is sent: a different value
+    /// when the answer lands means the live run state is newer than the
+    /// answer's snapshot (see [`Hydration::KeepLive`]).
+    lifecycle_epoch: u64,
     /// Known child sessions (see [`ChildRef`]) whose turn is in flight.
     /// Derived from `session.execution.*` events alone; see
     /// [`DataStore::observe_foreign`].
@@ -1030,8 +1048,59 @@ impl DataStore {
         self.probing.remove(session_id) && self.set_child_running(session_id, running)
     }
 
-    pub fn replace_items(&mut self, items: Vec<Item>) {
+    /// See the `lifecycle_epoch` field: how many `execution.*` events the
+    /// focused session has reduced so far.
+    #[must_use]
+    pub fn lifecycle_epoch(&self) -> u64 {
+        self.lifecycle_epoch
+    }
+
+    /// Replace the transcript with a hydrated one and apply the run-state
+    /// snapshot that came with it (or keep the live one).
+    ///
+    /// `done` follows the message's own stamp in history, so an open row loads
+    /// as streaming. Only the newest assistant message of the latest turn can
+    /// be streaming, so every other one is closed: a server `Shutdown`
+    /// interrupt leaves a turn open in the persisted history (see
+    /// `history.rs`), and one that a later turn overtook would spin forever.
+    /// That includes a reload landing after the new turn started but before
+    /// its first step: the newest assistant row then belongs to the killed
+    /// turn, and a turn boundary ([`Item::Turn`] or a turn-starting
+    /// [`Item::User`]) after it closes it. When no turn is in flight at all,
+    /// every row closes.
+    pub fn replace_items(&mut self, items: Vec<Item>, hydration: Hydration) {
         self.items = items;
+        if let Hydration::Snapshot(running_since) = hydration {
+            self.running_since = running_since;
+        }
+        // The newest assistant row, when history left it open, a turn is in
+        // flight, and no turn boundary follows it: the only one that may keep
+        // streaming.
+        let streaming = self.running_since.and_then(|_| {
+            let index = self
+                .items
+                .iter()
+                .rposition(|item| matches!(item, Item::Assistant(_)))?;
+            let open = matches!(&self.items[index], Item::Assistant(assistant) if !assistant.done);
+            let later_turn = self.items[index + 1..].iter().any(|item| {
+                matches!(
+                    item,
+                    Item::Turn { .. }
+                        | Item::User {
+                            starts_turn: true,
+                            ..
+                        }
+                )
+            });
+            (open && !later_turn).then_some(index)
+        });
+        for (index, item) in self.items.iter_mut().enumerate() {
+            if let Item::Assistant(assistant) = item
+                && Some(index) != streaming
+            {
+                assistant.done = true;
+            }
+        }
         let items = &self.items;
         self.running_children
             .retain(|id| ChildRef::referenced_in(items, id));
@@ -1380,15 +1449,18 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
                 });
             }
             store.running_since = Some(event.created);
+            store.lifecycle_epoch += 1;
         }
         SessionEventData::ExecutionSucceeded { .. }
         | SessionEventData::ExecutionInterrupted { .. } => {
             store.running_since = None;
+            store.lifecycle_epoch += 1;
             finish_last_assistant(store, event.created);
             store.end_turn(None);
         }
         SessionEventData::ExecutionFailed { error, .. } => {
             store.running_since = None;
+            store.lifecycle_epoch += 1;
             finish_last_assistant(store, event.created);
             store.end_turn(Some(ErrorInfo::from(error)));
         }

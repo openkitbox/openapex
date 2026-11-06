@@ -240,7 +240,7 @@ pub fn render(
     let logo = logo_lines(area.width, area.height, *pal);
     let logo_h = logo.len() as u16;
     // paddingTop(1) + the prompt block itself.
-    let prompt_h = prompt.height(area.height).min(content.height);
+    let prompt_h = prompt.height(col.width, frame.area()).min(content.height);
     let layout = stack(content.height, logo_h, 1 + prompt_h);
 
     for (y, line) in (content.y + layout.logo_y..).zip(logo) {
