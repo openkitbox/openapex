@@ -18,7 +18,9 @@ use ox_schema::support::FileInput;
 use ratatui::layout::Size;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::app::command::{AgentIntent, AppCommand, CancelReason, Switch};
+use crate::app::command::{
+    AgentIntent, AppCommand, CancelReason, McpAction, McpIntent, McpStamp, Switch,
+};
 use crate::app::event::AppEvent;
 use crate::app::event::Fetched;
 use crate::graphics::cache::SizeClass;
@@ -104,7 +106,12 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
             class,
         } => media_inline(&tx, key, bytes, cells, class).await,
         AppCommand::LoadSessionChrome { session } => session_chrome(&client, &tx, session).await,
-        AppCommand::McpList => mcp_list(&client, &tx).await,
+        AppCommand::McpList { intent, stamp } => mcp_list(&client, &tx, intent, stamp).await,
+        AppCommand::McpToggle {
+            server,
+            action,
+            stamp,
+        } => mcp_toggle(&client, &tx, server, action, stamp).await,
         AppCommand::ModelList => model_list(&client, &tx).await,
         AppCommand::LoadContextLimits => context_limits(&client, &tx).await,
         AppCommand::AgentList(intent) => agent_list(&client, &tx, intent).await,
@@ -485,13 +492,50 @@ async fn prepared(bytes: Arc<[u8]>, cells: Option<Size>) -> Result<Fetched, Stri
     }
 }
 
-async fn mcp_list(client: &Client, tx: &Events) {
+/// Only the `/mcps` dialog the user asked for reports a failed fetch; a
+/// refresh or the `/status` dialog leaves it in the log.
+async fn mcp_list(client: &Client, tx: &Events, intent: McpIntent, stamp: McpStamp) {
     match client.mcp().await {
         Ok(servers) => {
-            let _ = tx.send(AppEvent::McpServers(servers));
+            let _ = tx.send(AppEvent::McpServers {
+                servers,
+                intent,
+                stamp,
+            });
+        }
+        Err(err) if intent == McpIntent::Dialog => {
+            let _ = tx.send(session_failed("Failed to load MCP servers", err));
         }
         Err(err) => tracing::warn!(%err, "mcp list failed"),
     }
+}
+
+/// Connect or disconnect, re-list whatever happened (the server's status has
+/// settled once the request returns), then report it: the dialog settles the
+/// row after the fresh list is in. A list stamped later but read before the
+/// change can still win briefly; the server's final `mcp.status.changed`
+/// re-list corrects it.
+async fn mcp_toggle(
+    client: &Client,
+    tx: &Events,
+    server: String,
+    action: McpAction,
+    stamp: McpStamp,
+) {
+    let result = match action {
+        McpAction::Connect => client.mcp_connect(&server).await,
+        McpAction::Disconnect => client.mcp_disconnect(&server).await,
+    };
+    let error = result.err().map(|err| {
+        tracing::warn!(%err, %server, ?action, "mcp toggle failed");
+        err.to_string()
+    });
+    mcp_list(client, tx, McpIntent::Refresh, stamp).await;
+    let _ = tx.send(AppEvent::McpToggled {
+        server,
+        action,
+        error,
+    });
 }
 
 async fn context_limits(client: &Client, tx: &Events) {

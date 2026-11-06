@@ -51,7 +51,7 @@
 | dialog | dialog-highlights | component/dialog-highlights.tsx:1 |  | todo |  |
 | dialog | dialog-image-preview | component/dialog-image-preview.tsx:13 | crates/ox-tui/src/ui/image_preview.rs:58 | partial | 放大对话框:`Image N of M` 标题、`← previous` / `next →`(仅多于一张)、Esc 关闭、页脚文件名,等比缩放(高 = 终端高 − 8,最少 3),面板 116 列宽、8 行 chrome 居中。偏差:对话框打开期间 ox 只认键盘(pointer_enabled 为假),页脚箭头是标签不是可点按钮;`No preview` 要等该图的取字节失败才出现;不做半格 blocks 兜底与 iTerm2 协议(用户 2026-11-04 决定只做真像素) |
 | dialog | dialog-integration | component/dialog-integration.tsx:1 |  | todo |  |
-| dialog | dialog-mcp | component/dialog-mcp.tsx:1 |  | todo |  |
+| dialog | dialog-mcp | component/dialog-mcp.tsx:1 | crates/ox-tui/src/ui/mcp_dialog.rs:49 | deviation | /mcps 对话框:按名排序、状态标签、space 连接/断开、失败行 enter 看错误详情(c 复制、i 新会话起草排查);接线 crates/ox-tui/src/app/mod.rs:409-485(feat/tui-mcps)。偏差:D1 无 needs_auth/OAuth(ox 无 MCP OAuth);D2 无会话的 Home 收不到 mcp.status.changed;D3 搜索占位符用 Search;D4 ✓ copied 在发起复制时显示;D5 错误详情无 source/diagnosticRef;D8 mcp.status.changed 每帧一次 GET /api/mcp 不合并 |
 | dialog | dialog-message | routes/session/dialog-message.tsx:1 |  | todo |  |
 | dialog | dialog-model | component/dialog-model.tsx:1 | crates/ox-tui/src/ui/models.rs:99 | todo | ox 有对应对话框,字段与交互未逐项核对 |
 | dialog | dialog-model-free | component/dialog-model-free.tsx:1 |  | todo |  |
@@ -98,7 +98,7 @@
 | keybind | composer.terminal.up | config/keybind.ts:257 |  | todo |  |
 | keybind | dialog.integration.delete | config/keybind.ts:270 |  | todo |  |
 | keybind | dialog.integration.rename | config/keybind.ts:269 |  | todo |  |
-| keybind | dialog.mcp.toggle | config/keybind.ts:283 |  | todo |  |
+| keybind | dialog.mcp.toggle | config/keybind.ts:283 | crates/ox-tui/src/ui/mcp_dialog.rs:135 | deviation | 默认 space 同上游。偏差 D7:ox 无 keybind 配置,不可改键 |
 | keybind | dialog.move_session.delete | config/keybind.ts:274 |  | todo |  |
 | keybind | dialog.move_session.move | config/keybind.ts:273 |  | todo |  |
 | keybind | dialog.move_session.new | config/keybind.ts:272 |  | todo |  |
@@ -181,7 +181,7 @@
 | keybind | input.word.forward | config/keybind.ts:239 |  | todo |  |
 | keybind | leader | config/keybind.ts:46 |  | todo |  |
 | keybind | location.reload | config/keybind.ts:63 |  | todo |  |
-| keybind | mcp.list | config/keybind.ts:172 |  | todo |  |
+| keybind | mcp.list | config/keybind.ts:172 |  | deviation | 上游默认 none(无键);ox 只能经 /mcps 或命令面板打开。偏差 D7:ox 无 keybind 配置 |
 | keybind | messages.copy | config/keybind.ts:194 |  | todo |  |
 | keybind | model.cycle_favorite | config/keybind.ts:170 |  | todo |  |
 | keybind | model.cycle_favorite_reverse | config/keybind.ts:171 |  | todo |  |
@@ -317,8 +317,8 @@
 | keybind | which-key.scroll.up | config/keybind.ts:297 |  | todo |  |
 | keybind | which-key.toggle | config/keybind.ts:292 |  | todo |  |
 | sdk_call | credential.activate | component/dialog-integration.tsx:231 |  | todo |  |
-| sdk_call | experimental.mcp.connect | component/dialog-mcp.tsx:124 |  | partial | 服务端已对齐(crates/ox-server/src/api/mcp.rs,60cdfa5);偏差 D4-D6;ox-tui 未调用 |
-| sdk_call | experimental.mcp.disconnect | component/dialog-mcp.tsx:124 |  | partial | 服务端已对齐(crates/ox-server/src/api/mcp.rs,60cdfa5);ox-tui 未调用 |
+| sdk_call | experimental.mcp.connect | component/dialog-mcp.tsx:124 | crates/ox-client/src/rest.rs:924 | aligned | 服务端 crates/ox-server/src/api/mcp.rs(60cdfa5);客户端 POST /api/experimental/mcp/{server}/connect,server 名按单段百分号编码,2xx 成功(实测 204,未知名 404);/mcps 的 space 调用,失败 toast `Failed to connect MCP server`,之后重新列表 |
+| sdk_call | experimental.mcp.disconnect | component/dialog-mcp.tsx:124 | crates/ox-client/src/rest.rs:930 | aligned | 服务端 crates/ox-server/src/api/mcp.rs(60cdfa5);客户端 POST …/disconnect,同上;失败 toast `Failed to disconnect MCP server` |
 | sdk_call | experimental.usage.limits | component/usage.tsx:37 |  | partial | 服务端返回 data:null(无 Console 账号,即上游未登录答案;crates/ox-server/src/api/compat.rs,60cdfa5);ox-tui 未调用 |
 | sdk_call | file.find | component/prompt/autocomplete.tsx:378 |  | todo |  |
 | sdk_call | file.list | app.tsx:227 |  | todo |  |
@@ -360,7 +360,7 @@
 | slash | fork | routes/session/index.tsx:1069 | crates/ox-tui/src/ui/commands.rs:90 | todo | ox 有同名命令,行为未逐项核对 |
 | slash | help | app.tsx:1162 |  | todo |  |
 | slash | highlights | app.tsx:1037 |  | todo |  |
-| slash | mcps | app.tsx:970 |  | todo |  |
+| slash | mcps | app.tsx:970 | crates/ox-tui/src/ui/commands.rs:95 | aligned | /mcps 打开 MCP 对话框(AppCommand::McpList(Dialog),crates/ox-tui/src/app/mod.rs:1306) |
 | slash | models | app.tsx:907 | crates/ox-tui/src/ui/commands.rs:82 | todo | ox 有同名命令,行为未逐项核对 |
 | slash | new | app.tsx:778 | crates/ox-tui/src/ui/commands.rs:98 | todo | ox 有同名命令,行为未逐项核对 |
 | slash | open | app.tsx:831 |  | todo |  |
@@ -406,7 +406,7 @@
 | sse_event | provider.go-limit | component/usage.tsx:267 |  | todo |  |
 | sse_event | provider.model-budget-limit | component/usage.tsx:274 |  | todo |  |
 | sse_event | queued.prompts | mini/footer.ts:506 |  | n/a | mini 精简 TUI 的内部发射器名,不是服务端 SSE 事件 |
-| sse_event | server.connected | context/client-mcp.tsx:108 |  | todo |  |
+| sse_event | server.connected | context/client-mcp.tsx:108 |  | n/a | 偏差 D6:上游 client-mcp 实验功能(TUI 自己充当 MCP server),ox 不做 |
 | sse_event | session.agent.selected | context/local.tsx:71 |  | todo |  |
 | sse_event | session.compaction.delta | mini/stream-v2.transport.ts:1113 |  | partial | 服务端已发射(crates/ox-schema/src/event.rs:622-655),ox-client 消费(crates/ox-client/src/store.rs:43);字段未逐项核对 |
 | sse_event | session.compaction.ended | mini/stream-v2.transport.ts:1120 |  | partial | 服务端已发射(crates/ox-schema/src/event.rs:622-655),ox-client 消费(crates/ox-client/src/store.rs:43);字段未逐项核对 |

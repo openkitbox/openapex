@@ -364,6 +364,11 @@ pub struct MediaBytes {
 /// Bound for every REST call. Set per request, not on the shared client:
 /// the SSE stream uses the same client and must live indefinitely.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Bound for an MCP connect/disconnect. The server holds the request until
+/// the server's startup settles, so this must exceed any reasonable
+/// `[mcp.timeout] startup` budget (30 s by default); with
+/// [`REQUEST_TIMEOUT`] a slow but successful start would read as a failure.
+const MCP_TOGGLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// `Number.MAX_SAFE_INTEGER`: a cursor no capture reaches, so the answer only
 /// carries the capture's `size` (upstream's probe).
 const MAX_SAFE_CURSOR: u64 = 9_007_199_254_740_991;
@@ -375,6 +380,28 @@ const NAME_HEADER: &str = "x-ox-name";
 /// sniffed, and what this client falls back to when the header is missing or
 /// unreadable on the wire.
 const DEFAULT_MEDIA_MIME: &str = "application/octet-stream";
+
+/// Percent-encode `value` as one URL path segment: every byte outside the
+/// unreserved set is escaped, so a `/` or `?` in an MCP server name cannot
+/// reach another route. URL parsing still resolves a `.` / `..` segment
+/// (escaped or not) as a relative step; such a name lands on an unknown path
+/// and fails as a 404, never on another real route.
+fn encode_path_segment(value: &str) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(char::from(byte));
+            }
+            other => {
+                write!(out, "%{other:02X}").expect("writing to a String cannot fail");
+            }
+        }
+    }
+    out
+}
 
 impl Client {
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -909,6 +936,41 @@ impl Client {
             return Err(Error::Status(resp.status()));
         }
         Ok(resp.json::<Envelope<Vec<McpRef>>>().await?.data)
+    }
+
+    /// `POST /api/experimental/mcp/{server}/connect` (204, upstream
+    /// `mcp.connect`): start `server`, even one disabled in the config. The
+    /// server's status has settled when this returns; a failed start is not
+    /// an error here, it shows up as `failed` in [`Client::mcp`].
+    pub async fn mcp_connect(&self, server: &str) -> Result<()> {
+        let path = format!(
+            "/api/experimental/mcp/{}/connect",
+            encode_path_segment(server)
+        );
+        self.mcp_toggle(&path).await
+    }
+
+    /// `POST /api/experimental/mcp/{server}/disconnect` (204, upstream
+    /// `mcp.disconnect`): stop `server` and mark it `disabled`.
+    pub async fn mcp_disconnect(&self, server: &str) -> Result<()> {
+        let path = format!(
+            "/api/experimental/mcp/{}/disconnect",
+            encode_path_segment(server)
+        );
+        self.mcp_toggle(&path).await
+    }
+
+    /// POST a connect/disconnect `path`, waiting out the server's startup.
+    async fn mcp_toggle(&self, path: &str) -> Result<()> {
+        let resp = self
+            .request(reqwest::Method::POST, path)
+            .timeout(MCP_TOGGLE_TIMEOUT)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Error::Status(resp.status()));
+        }
+        Ok(())
     }
 
     /// Paths under the working directory matching `query` (`GET /api/fs/find`,

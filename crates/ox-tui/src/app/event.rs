@@ -106,8 +106,20 @@ pub enum AppEvent {
         session: String,
         selection: crate::bootstrap::Selection,
     },
-    /// Answer to `AppCommand::McpList`; opens the `/status` dialog.
-    McpServers(Vec<ox_client::rest::McpRef>),
+    /// Answer to `AppCommand::McpList` (or the list after a toggle), for the
+    /// intent and with the stamp it was requested with.
+    McpServers {
+        servers: Vec<ox_client::rest::McpRef>,
+        intent: super::command::McpIntent,
+        stamp: super::command::McpStamp,
+    },
+    /// Answer to `AppCommand::McpToggle`: the request finished, with the
+    /// error when it failed.
+    McpToggled {
+        server: String,
+        action: super::command::McpAction,
+        error: Option<String>,
+    },
     /// Answer to `AppCommand::ModelList`; opens the `/models` dialog.
     Models {
         models: Vec<ox_client::rest::ModelInfo>,

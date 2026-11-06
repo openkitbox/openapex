@@ -26,6 +26,9 @@ pub enum CommandAction {
     Models,
     /// Fetch the agents and open the agent picker.
     Agents,
+    /// Fetch the MCP servers and open the connect/disconnect dialog
+    /// (upstream `mcp.list`, `dialog-mcp.tsx`).
+    Mcps,
     /// Ask the server for the session list and open the switcher
     /// (upstream `dialog-session-list.tsx`).
     Sessions,
@@ -87,6 +90,14 @@ pub const COMMANDS: &[Command] = &[
         title: "Exit the app",
         group: "System",
         action: CommandAction::Exit,
+    },
+    Command {
+        name: "mcps",
+        aliases: &[],
+        description: "MCP servers",
+        title: "MCP servers",
+        group: "Agent",
+        action: CommandAction::Mcps,
     },
     Command {
         name: "models",

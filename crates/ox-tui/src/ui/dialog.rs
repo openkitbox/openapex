@@ -24,6 +24,7 @@ use unicode_width::UnicodeWidthStr;
 use super::form::{self, FormOutcome, FormState};
 use super::fuzzy;
 use super::image_preview::{self, Preview};
+use super::mcp_dialog::{self, McpDialog};
 use super::media;
 use super::output_dialog::{self, Output};
 use super::paste;
@@ -65,6 +66,8 @@ pub enum Dialog {
     Output(Output),
     /// An image at full panel size (`ui/image_preview.rs`).
     Preview(Preview),
+    /// The MCP server list and its error details (`ui/mcp_dialog.rs`).
+    Mcp(Box<McpDialog>),
 }
 
 impl Dialog {
@@ -76,6 +79,7 @@ impl Dialog {
             Self::Form(form) => form.title(),
             Self::Output(_) => "Shell output",
             Self::Preview(_) => "Image",
+            Self::Mcp(mcp) => mcp.title(),
         }
     }
 
@@ -89,6 +93,7 @@ impl Dialog {
             Self::Form(_) => None,
             Self::Output(_) => Some(output_dialog::TAG),
             Self::Preview(_) => Some(image_preview::TAG),
+            Self::Mcp(_) => Some(mcp_dialog::TAG),
         }
     }
 
@@ -110,6 +115,7 @@ impl Dialog {
             },
             Self::Output(output) => output.on_key(key),
             Self::Preview(preview) => preview.on_key(key),
+            Self::Mcp(mcp) => mcp.on_key(key),
         }
     }
 }
@@ -123,6 +129,7 @@ impl Dialog {
             Self::Info(_) | Self::Output(_) | Self::Preview(_) => DialogOutcome::Idle,
             Self::Select(select) => select.on_paste(text),
             Self::Input(input) => input.on_paste(text),
+            Self::Mcp(mcp) => mcp.on_paste(text),
             Self::Form(form) => match form.on_paste(text) {
                 FormOutcome::Changed => DialogOutcome::Changed,
                 _ => DialogOutcome::Idle,
@@ -140,6 +147,8 @@ pub enum Tone {
     Warn,
     /// Neutral information.
     Dim,
+    /// Healthy, in the feedback colour (`text.feedback.success`).
+    Success,
 }
 
 /// One content line: a bullet, a name, and a muted detail.
@@ -238,6 +247,13 @@ pub fn render(
             theme::palette(),
             graphics,
         ),
+        Dialog::Mcp(mcp) => {
+            if let Some(cursor) = mcp_dialog::draw(frame.buffer_mut(), area, mcp, theme::palette())
+            {
+                frame.set_cursor_position(cursor);
+            }
+            Vec::new()
+        }
     }
 }
 
@@ -278,6 +294,7 @@ fn render_info(frame: &mut Frame, area: Rect, dialog: &Info) {
             Tone::Accent => pal.accent,
             Tone::Warn => pal.warn,
             Tone::Dim => pal.dim,
+            Tone::Success => pal.success,
         };
         let mut spans = vec![
             Span::styled("\u{2022} ", dot),
@@ -323,6 +340,9 @@ pub struct Item {
     pub description: Option<String>,
     /// Right-aligned text (a keybinding, a price, a date…).
     pub footer: Option<String>,
+    /// Colour of `footer` on an unselected row (upstream `footerColor`);
+    /// `None` keeps it muted.
+    pub footer_tone: Option<Tone>,
     /// Group header this row lives under (provider, date…).
     pub category: Option<String>,
     /// Shown only while the filter is empty (the palette's `Suggested` copies,
@@ -340,6 +360,7 @@ impl Item {
             title: title.into(),
             description: None,
             footer: None,
+            footer_tone: None,
             category: None,
             unfiltered_only: false,
             running: false,
@@ -365,6 +386,14 @@ impl Item {
 
     pub fn footer(mut self, text: impl Into<String>) -> Self {
         self.footer = Some(text.into());
+        self
+    }
+
+    /// Colour the footer by `tone` while the row is not selected; `Success`
+    /// is also bold (`Connected ✓`, `dialog-mcp.tsx:25`).
+    #[must_use]
+    pub fn footer_tone(mut self, tone: Tone) -> Self {
+        self.footer_tone = Some(tone);
         self
     }
 
@@ -544,6 +573,25 @@ impl Select {
     pub fn hints(mut self, hints: Vec<Hint>) -> Self {
         self.hints = hints;
         self
+    }
+
+    /// Replace the footer hints of an open dialog.
+    pub fn set_hints(&mut self, hints: Vec<Hint>) {
+        self.hints = hints;
+    }
+
+    /// Swap in a fresh list (`preserveSelection`): the cursor stays on the
+    /// same value, or is clamped into range when that value is gone.
+    pub fn replace_items(&mut self, items: Vec<Item>) {
+        let kept = self.selected_value().map(str::to_owned);
+        self.items = items;
+        self.armed = None;
+        let view = self.view();
+        let position = kept.and_then(|value| {
+            view.iter()
+                .position(|&index| self.items[index].value == value)
+        });
+        self.selected = position.unwrap_or_else(|| self.selected.min(view.len().saturating_sub(1)));
     }
 
     /// Mark `value` as the current choice and start on it.
@@ -1000,7 +1048,12 @@ pub(super) fn put(
 }
 
 /// Draw a select dialog over `area` and return where the input cursor goes.
-fn draw_select(buf: &mut Buffer, area: Rect, select: &Select, pal: &Palette) -> Position {
+pub(super) fn draw_select(
+    buf: &mut Buffer,
+    area: Rect,
+    select: &Select,
+    pal: &Palette,
+) -> Position {
     dim_backdrop(buf, area, pal);
 
     let width = select.width.min(area.width.saturating_sub(2));
@@ -1226,7 +1279,19 @@ fn draw_item(
     if let Some(footer) = &item.footer {
         let wanted = footer.width() as u16;
         let x = right.saturating_sub(wanted).max(text_x);
-        put(buf, panel, x, y, right - x, footer, secondary);
+        // The selected (or armed) row keeps its own colour (`dialog-select.tsx:966`);
+        // `Connected ✓` is bold either way (`dialog-mcp.tsx:25`).
+        let style = match item.footer_tone {
+            Some(tone) if !active && confirm.is_none() => match tone {
+                Tone::Accent => pal.accent,
+                Tone::Warn => pal.warn,
+                Tone::Dim => pal.dim,
+                Tone::Success => pal.success.add_modifier(Modifier::BOLD),
+            },
+            Some(Tone::Success) => secondary.add_modifier(Modifier::BOLD),
+            _ => secondary,
+        };
+        put(buf, panel, x, y, right - x, footer, style);
         limit = x.saturating_sub(1);
     }
     let mut x = put(

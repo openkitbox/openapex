@@ -478,6 +478,12 @@ impl Prompt {
         self.footer = footer;
     }
 
+    /// Show a freshly fetched MCP summary in the home footer (`None` hides
+    /// the segment).
+    pub fn set_mcp(&mut self, mcp: Option<McpSummary>) {
+        self.chrome.mcp = mcp;
+    }
+
     /// Rows the whole block needs when drawn `width` columns wide on a
     /// `screen`-sized terminal (the same pair [`Self::render`] gets as
     /// `area.width` and `full`): panel, `╹`/`▀` edge and footer row.

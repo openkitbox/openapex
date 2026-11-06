@@ -58,8 +58,20 @@ pub enum AppCommand {
     LoadSessionChrome {
         session: String,
     },
-    /// Fetch `GET /api/mcp` for the `/status` dialog.
-    McpList,
+    /// Fetch `GET /api/mcp`; the intent says what the answer is for, the
+    /// stamp orders it against the other MCP lists.
+    McpList {
+        intent: McpIntent,
+        stamp: McpStamp,
+    },
+    /// Connect or disconnect one MCP server, answered with a
+    /// `McpIntent::Refresh` list carrying `stamp` and then
+    /// `AppEvent::McpToggled`.
+    McpToggle {
+        server: String,
+        action: McpAction,
+        stamp: McpStamp,
+    },
     /// Fetch the model catalogue for the `/models` dialog.
     ModelList,
     /// Fetch the catalogue only for its context windows (the footer's
@@ -167,6 +179,32 @@ pub enum AppCommand {
     /// A finished drag selection: copy the text to the host clipboard off the
     /// UI thread; the answer is `AppEvent::ClipboardWritten`.
     WriteClipboard(String),
+}
+
+/// Why the MCP server list is being fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpIntent {
+    /// Open the `/status` dialog.
+    Status,
+    /// Open the `/mcps` dialog.
+    Dialog,
+    /// Refresh the open `/mcps` dialog (after a toggle or a
+    /// `mcp.status.changed` frame); the home footer follows either way.
+    Refresh,
+}
+
+/// Issue order of an MCP list request. Every fetch runs in its own task and
+/// `mcp.status.changed` fires twice per connect (pending, then final), so
+/// answers can land out of order; the app drops one older than the list it
+/// already shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct McpStamp(pub u64);
+
+/// What toggling an MCP server asks the server to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpAction {
+    Connect,
+    Disconnect,
 }
 
 /// Why the agent list is being fetched.

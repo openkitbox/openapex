@@ -40,6 +40,7 @@ const ORDER: &[CommandAction] = &[
     CommandAction::Shells,
     CommandAction::Models,
     CommandAction::Agents,
+    CommandAction::Mcps,
     CommandAction::Status,
     CommandAction::Exit,
 ];

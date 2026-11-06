@@ -32,6 +32,7 @@ use crate::ui::dialog::{Dialog, DialogOutcome};
 use crate::ui::dock::{self, DockHover, StatusMode};
 use crate::ui::image_preview;
 use crate::ui::layout;
+use crate::ui::mcp_dialog::{self, McpDialog};
 use crate::ui::media;
 use crate::ui::output_dialog::{self, Output};
 use crate::ui::palette;
@@ -46,7 +47,7 @@ use crate::ui::shell_dialog;
 use crate::ui::timeline::Transcript;
 use crate::ui::timeline_dialog;
 use crate::ui::toast::{self, Toast};
-use command::{AppCommand, CancelReason};
+use command::{AppCommand, CancelReason, McpAction, McpIntent, McpStamp};
 use event::AppEvent;
 use event::Fetched;
 use keymap::{Action, Feed, Keymap};
@@ -142,6 +143,12 @@ pub struct App {
     /// Whether the last copy produced an OSC 52 sequence, so the terminal was
     /// asked to set its clipboard even if the host write fails.
     osc52_attempted: bool,
+    /// Stamp of the last MCP list request issued, and of the last one
+    /// applied. Each list runs in its own task and the server announces every
+    /// status change twice, so answers can land out of order; a list older
+    /// than the one shown is dropped instead of resurrecting `Connecting …`.
+    mcp_issued: u64,
+    mcp_applied: McpStamp,
     /// The family the activity panel lists, fetched when the panel opened and
     /// replaced on every fetch.
     family: Vec<FamilyMember>,
@@ -257,6 +264,8 @@ impl App {
             limits_requested: false,
             pending_osc52: None,
             osc52_attempted: false,
+            mcp_issued: 0,
+            mcp_applied: McpStamp::default(),
             family: Vec::new(),
             panel: None,
             cursor: activity_panel::Cursor::new(),
@@ -328,13 +337,16 @@ impl App {
                 self.prompt.set_files(&query, &entries);
                 self.dirty = true;
             }
-            AppEvent::McpServers(servers) => {
-                if !self.form_open() {
-                    self.dialog = Some(crate::ui::dialog::status(&servers));
-                    self.dialog_purpose = None;
-                    self.dirty = true;
-                }
-            }
+            AppEvent::McpServers {
+                servers,
+                intent,
+                stamp,
+            } => self.on_mcp_servers(servers, intent, stamp),
+            AppEvent::McpToggled {
+                server,
+                action,
+                error,
+            } => self.on_mcp_toggled(&server, action, error),
             AppEvent::Models { models, providers } => self.on_models(models, providers),
             AppEvent::ContextLimits(limits) => {
                 self.context_limits = limits;
@@ -422,6 +434,121 @@ impl App {
         self.family = members;
         self.settle_selection();
         self.dirty = true;
+    }
+
+    /// A fresh MCP server list. The home footer's summary follows every
+    /// answer; the intent says which dialog it is for. `/status` and `/mcps`
+    /// never cover a form, and `/mcps` opens over nothing else either; a
+    /// refresh only reaches an open `/mcps` dialog. A refresh older than the
+    /// list already applied is dropped; an older `/status` or `/mcps` answer
+    /// still opens its dialog but leaves the footer alone.
+    fn on_mcp_servers(
+        &mut self,
+        servers: Vec<ox_client::rest::McpRef>,
+        intent: McpIntent,
+        stamp: McpStamp,
+    ) {
+        // A stale answer must not overwrite newer status, but an explicit
+        // `/status` or `/mcps` still opens: the user asked for it.
+        let stale = stamp < self.mcp_applied;
+        if stale && intent == McpIntent::Refresh {
+            return;
+        }
+        if !stale {
+            self.mcp_applied = stamp;
+            self.prompt.set_mcp(crate::bootstrap::mcp_summary(&servers));
+        }
+        self.dirty = true;
+        match intent {
+            McpIntent::Status => {
+                if !self.form_open() {
+                    self.dialog = Some(crate::ui::dialog::status(&servers));
+                    self.dialog_purpose = None;
+                }
+            }
+            McpIntent::Dialog => {
+                if self.dialog.is_none() {
+                    self.dialog = Some(Dialog::Mcp(Box::new(McpDialog::new(servers))));
+                    self.dialog_purpose = None;
+                    if stale {
+                        self.request_mcp_list(McpIntent::Refresh);
+                    }
+                }
+            }
+            McpIntent::Refresh => {
+                if let Some(Dialog::Mcp(open)) = &mut self.dialog {
+                    open.update(servers);
+                }
+            }
+        }
+    }
+
+    /// The stamp for the next MCP list request; later requests get larger
+    /// stamps.
+    fn next_mcp_stamp(&mut self) -> McpStamp {
+        self.mcp_issued += 1;
+        McpStamp(self.mcp_issued)
+    }
+
+    /// Fetch the MCP server list for `intent`.
+    fn request_mcp_list(&mut self, intent: McpIntent) {
+        let stamp = self.next_mcp_stamp();
+        let _ = self.commands.send(AppCommand::McpList { intent, stamp });
+    }
+
+    /// A connect/disconnect finished: its row stops showing `Connecting …`
+    /// (the refreshed list was sent first), and a failure is a toast
+    /// (`dialog-mcp.tsx:118-127`).
+    fn on_mcp_toggled(&mut self, server: &str, action: McpAction, error: Option<String>) {
+        if let Some(Dialog::Mcp(open)) = &mut self.dialog {
+            open.settle(server);
+            self.dirty = true;
+        }
+        if let Some(error) = error {
+            let title = match action {
+                McpAction::Connect => "Failed to connect MCP server",
+                McpAction::Disconnect => "Failed to disconnect MCP server",
+            };
+            self.show_toast(Toast::error(title, error, Instant::now()));
+        }
+    }
+
+    /// A key action of the `/mcps` dialog: toggle a server, copy the error
+    /// details, or investigate them in a new session drafted with `value`.
+    fn on_mcp_action(&mut self, key: char, value: String) {
+        match key {
+            mcp_dialog::TOGGLE_KEY => {
+                let Some(Dialog::Mcp(open)) = &self.dialog else {
+                    return;
+                };
+                let action = if open.wants_connect(&value) {
+                    McpAction::Connect
+                } else {
+                    McpAction::Disconnect
+                };
+                let stamp = self.next_mcp_stamp();
+                let _ = self.commands.send(AppCommand::McpToggle {
+                    server: value,
+                    action,
+                    stamp,
+                });
+            }
+            mcp_dialog::COPY_KEY => {
+                if let Some(Dialog::Mcp(open)) = &mut self.dialog {
+                    open.set_copied();
+                }
+                self.pending_osc52 = crate::clipboard::osc52(&value);
+                self.osc52_attempted = self.pending_osc52.is_some();
+                let _ = self.commands.send(AppCommand::WriteClipboard(value));
+            }
+            mcp_dialog::INVESTIGATE_KEY => {
+                self.dialog = None;
+                self.dialog_purpose = None;
+                self.run_command(CommandAction::New);
+                self.prompt.restore(&value);
+            }
+            _ => {}
+        }
     }
 
     /// Open (or refresh) the shell picker. A late answer for another session
@@ -546,6 +673,10 @@ impl App {
             }
             DialogOutcome::Action { key, value } => {
                 self.dirty = true;
+                if tag == Some(mcp_dialog::TAG) {
+                    self.on_mcp_action(key, value);
+                    return;
+                }
                 if tag == Some(output_dialog::TAG) {
                     if key == output_dialog::REFRESH_KEY {
                         self.request_shell_output(value);
@@ -1250,7 +1381,10 @@ impl App {
         match action {
             CommandAction::Exit => self.view.should_quit = true,
             CommandAction::Status => {
-                let _ = self.commands.send(AppCommand::McpList);
+                self.request_mcp_list(McpIntent::Status);
+            }
+            CommandAction::Mcps => {
+                self.request_mcp_list(McpIntent::Dialog);
             }
             CommandAction::Models => {
                 let _ = self.commands.send(AppCommand::ModelList);
@@ -1772,6 +1906,8 @@ impl App {
                 self.request_forms();
                 // shell.* frames missed while down: rebuild the running set.
                 self.request_running_shells();
+                // mcp.status.changed frames missed while down: re-list.
+                self.request_mcp_list(McpIntent::Refresh);
             }
             StreamMsg::Event(envelope) => {
                 // `shell.*` frames carry no session id: they would fail the
@@ -1780,6 +1916,13 @@ impl App {
                     if self.store.apply_shell_frame(&envelope.kind, &envelope.data) {
                         self.child_state_changed();
                     }
+                    return;
+                }
+                // `mcp.status.changed` names a server, not a session: re-list
+                // so an open `/mcps` dialog and the footer follow changes made
+                // elsewhere (a config reload, another client).
+                if envelope.kind == "mcp.status.changed" {
+                    self.request_mcp_list(McpIntent::Refresh);
                     return;
                 }
                 let typed = envelope.parse_typed();
