@@ -58,6 +58,7 @@ A user instruction like "always commit + build after every fix" describes how th
 - `<project_memory>` — facts already promoted to stable project memory by the dreamer (after consolidation across sessions). Use these for:
   - **Dedup**: do not re-emit a fact already in project memory unless you have evidence it has changed.
   - **Contradiction awareness**: if the new chunk's evidence conflicts with a project memory, you do not need to resolve the contradiction yourself — emit the new fact as you observe it, and the dreamer will handle the resolution. Don't try to write "X was Y but now Z" framing; the dreamer does that.
+- `<user-profile>` — observations about the human user already stored (from earlier `<user_observations>`). Dedup input only: do not restate an observation you can already see there, in any wording. Present only when `<user_observations>` is requested.
 - `<new_messages>` — the raw history to compartmentalize, with absolute ordinals.
 - Input notation:
   - `[N]` or `[N-M]` is a stable raw message ordinal range.
@@ -396,6 +397,7 @@ Facts capture stable properties of the project that survive past any single comp
 
 ### General rules
 
+- **No new facts is the expected answer for most chunks, and it is preferred over a doubtful one.** Every fact you emit is injected into every future request of this project; a wrong or marginal fact costs more than a missed one, which a later chunk can still recover. An empty `<facts></facts>` is a complete, correct output.
 - Facts are editable, not append-only. Rewrite, normalize, deduplicate, or drop existing facts whenever needed.
 - **Before emitting any fact, scan `<project_memory>` and silently skip any fact that overlaps a memory you can already see there.** A fact is "already covered" if a memory in the same category states the same underlying knowledge — even with different wording. Examples of facts to skip because they're already covered:
   - You see in memory: "After every fix, commit + build both Rust binary and TypeScript plugin." Your candidate: "Every fix followed by commit + build both Rust binary and TypeScript plugin." → **skip**, same rule, different words.

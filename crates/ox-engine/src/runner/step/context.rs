@@ -393,12 +393,15 @@ pub(crate) fn tool_input(state: &ToolState) -> Cow<'_, Record> {
     }
 }
 
-/// The `{role: "tool"}` result for a settled tool part (upstream
-/// `toolResult`): joined text content for completed calls, `{error: …}` for
-/// failed ones. A `streaming`/`running` part yields `None` — its own row's
-/// result lands in the next request. Completed text is bounded for the wire
-/// ([`bound_tool_output`]): the stored row keeps the full text, only this
-/// request's view is head + marker + tail.
+/// The `{role: "tool"}` result for a tool part (upstream `toolResult`):
+/// joined text content for completed calls, `{error: …}` for failed ones.
+/// A `streaming`/`running` part is one that never settled — the process died
+/// or the row was cut off before `tool.failed` could land — and it renders
+/// as the fixed [`UNSETTLED_TOOL_RESULT`]: a call with no result is a request
+/// strict providers reject outright, and the deterministic text keeps the
+/// rendered bytes (and so the provider cache) stable across requests.
+/// Completed text is bounded for the wire ([`bound_tool_output`]): the stored
+/// row keeps the full text, only this request's view is head + marker + tail.
 ///
 /// Attachments cannot ride inside a `tool` message: providers accept an image
 /// only as user content. They are returned separately so the caller can append
@@ -439,7 +442,7 @@ fn tool_result_message(id: &str, state: &ToolState) -> Option<(ChatMessage, Vec<
             .ok()?
         }
         ToolState::Error { error, .. } => serde_json::to_string(&ToolError { error }).ok()?,
-        ToolState::Streaming { .. } | ToolState::Running { .. } => return None,
+        ToolState::Streaming { .. } | ToolState::Running { .. } => UNSETTLED_TOOL_RESULT.to_owned(),
     };
     Some((
         ChatMessage::Tool {
@@ -449,6 +452,12 @@ fn tool_result_message(id: &str, state: &ToolState) -> Option<(ChatMessage, Vec<
         media,
     ))
 }
+
+/// The result a never-settled tool part renders as: the `{"error": …}`
+/// envelope of an `aborted` error, fixed text so it is the same bytes on
+/// every request (codex renders the same synthetic `aborted` output).
+const UNSETTLED_TOOL_RESULT: &str =
+    r#"{"error":{"type":"aborted","message":"Tool call did not settle before the turn ended"}}"#;
 
 /// The `{"output": …}` envelope of a completed tool result. Serialized from a
 /// borrowed view so the result text is escaped exactly once.

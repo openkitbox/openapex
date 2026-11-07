@@ -34,7 +34,7 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
     // The magic-context head replaces everything it covers: the pass mints
     // the frozen bytes and reports the ordinal floor, so the transcript
     // starts after the covered range.
-    let budget = crate::mctx::budget_for(&ctx.config, &ctx.model_catalog, &params.model.id);
+    let budget = ctx.budget_for(&params.model.id);
     let (head_m0, head_m1, floor) = mctx_head(ctx, budget).await;
     let rows = if ctx.config.magic_context.enabled {
         // The §N§ overlay (tag prefixes + drop placeholders) is part of the
@@ -151,6 +151,14 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
         && let Some(query) = recall_query(&rows)
     {
         let project = ctx.directory.to_string_lossy();
+        // A session with memory switched off recalls no memories; a failed
+        // read of the switch is treated as "on" (the hint is best-effort).
+        let sources = match crate::mctx::memory_mode::mode_of(&ctx.db, &ctx.session_id).await {
+            Ok(mode) if !mode.is_on() => {
+                search::SourceFilter::RECALL.without(search::Source::Memory)
+            }
+            _ => search::SourceFilter::RECALL,
+        };
         let request = search::SearchRequest {
             project: project.as_ref(),
             session_id: &ctx.session_id,
@@ -158,7 +166,7 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
             // puts a project-wide scan on every turn.
             compartment_scope: search::CompartmentScope::Session,
             query: &query,
-            sources: search::SourceFilter::RECALL,
+            sources,
             limit: RECALL_LIMIT,
             from_ms: None,
             to_ms: None,

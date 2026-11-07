@@ -107,6 +107,11 @@ pub struct Budget {
     /// The usable working space (`window × execute_threshold`), kept because
     /// the protected tail is a fraction of it.
     usable: u32,
+    /// Tokens the request carries before any conversation: the static system
+    /// layer and the tools array. Subtracted from both sides of the usage
+    /// reading ([`Self::usage_percentage`]) so the percentage measures the
+    /// conversation's share of what the conversation can actually use.
+    baseline: u32,
 }
 
 impl Budget {
@@ -167,6 +172,7 @@ impl Budget {
                 historian_chunk,
                 target: None,
                 usable: 0,
+                baseline: 0,
             };
         };
         let usable = usable_tokens(window, execute);
@@ -196,7 +202,18 @@ impl Budget {
                 f64::from(window.max(1)),
             )),
             usable,
+            baseline: 0,
         }
+    }
+
+    /// The budget with its fixed-layer baseline set (see [`Self::baseline`]).
+    /// Builder-style so [`Self::derive`] stays the one place the numbers come
+    /// from and the caller that knows the request's static layers adds the one
+    /// it measured.
+    #[must_use]
+    pub fn with_baseline(mut self, baseline_tokens: u32) -> Self {
+        self.baseline = baseline_tokens;
+        self
     }
 
     /// The share of the main model's window the newest assistant turn filled,
@@ -206,10 +223,23 @@ impl Budget {
     /// `prompt_tokens` is what the provider reported for that turn —
     /// `tokens.input + tokens.cache.read`, the same sum the client's footer
     /// divides by this same window.
+    ///
+    /// The fixed baseline ([`Self::with_baseline`]) is taken off both sides:
+    /// a 20k system layer in a 128k window is 16% "used" before the first
+    /// word, and on a small window it can sit above the fold target, so a
+    /// reading that counted it would fold early and never reach its stop.
+    /// Measured against the room the conversation has, the empty session
+    /// reads 0% and the thresholds mean what they say. A baseline at or over
+    /// the window leaves no room; the reading then degrades to the raw share.
     #[must_use]
     pub fn usage_percentage(&self, prompt_tokens: i64) -> Option<f64> {
-        let window = self.window?;
-        Some(prompt_tokens as f64 / f64::from(window) * 100.0)
+        let window = f64::from(self.window?);
+        let baseline = f64::from(self.baseline);
+        if baseline <= 0.0 || baseline >= window {
+            return Some(prompt_tokens as f64 / window * 100.0);
+        }
+        let used = (prompt_tokens as f64 - baseline).max(0.0);
+        Some(used / (window - baseline) * 100.0)
     }
 
     /// How many tokens at the end of the tail a run must leave verbatim
@@ -265,11 +295,45 @@ pub const MEMORY_BUDGET_MAX: usize = 8_000;
 /// on spend, and a zero budget would silently drop every memory.
 #[must_use]
 pub fn memory_budget(history_tokens: f64) -> usize {
+    share_of_history(
+        history_tokens,
+        MEMORY_BUDGET_SHARE,
+        MEMORY_BUDGET_MIN..=MEMORY_BUDGET_MAX,
+    )
+}
+
+/// Share of the history budget the `<user-profile>` tier may take: a fifth of
+/// the pinboard's. A profile is a handful of universal observations, not a
+/// project's accumulated knowledge, and it is paid in *every* project.
+pub const USER_PROFILE_BUDGET_SHARE: f64 = 0.05;
+/// Floor of [`user_profile_budget`]: room for a few observations always.
+pub const USER_PROFILE_BUDGET_MIN: usize = 300;
+/// Ceiling of [`user_profile_budget`].
+pub const USER_PROFILE_BUDGET_MAX: usize = 1_500;
+
+/// The token budget for the `<user-profile>` block, derived like
+/// [`memory_budget`] with its own, smaller share and clamp.
+#[must_use]
+pub fn user_profile_budget(history_tokens: f64) -> usize {
+    share_of_history(
+        history_tokens,
+        USER_PROFILE_BUDGET_SHARE,
+        USER_PROFILE_BUDGET_MIN..=USER_PROFILE_BUDGET_MAX,
+    )
+}
+
+/// `share` of the history budget, clamped to `bounds`. A non-finite history
+/// budget takes the floor: the selection is conservative on spend, and a zero
+/// budget would silently drop every memory.
+fn share_of_history(
+    history_tokens: f64,
+    share: f64,
+    bounds: std::ops::RangeInclusive<usize>,
+) -> usize {
     if !history_tokens.is_finite() {
-        return MEMORY_BUDGET_MIN;
+        return *bounds.start();
     }
-    ((history_tokens.max(0.0) * MEMORY_BUDGET_SHARE).round() as usize)
-        .clamp(MEMORY_BUDGET_MIN, MEMORY_BUDGET_MAX)
+    ((history_tokens.max(0.0) * share).round() as usize).clamp(*bounds.start(), *bounds.end())
 }
 
 /// `usable = window × execute%`, at least one token and never more than the

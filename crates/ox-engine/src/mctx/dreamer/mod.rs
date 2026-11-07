@@ -211,6 +211,16 @@
 //!   note projects as well would put every task's cheap gate into projects the
 //!   dreamer has never seen — a scheduling change this task does not make, so
 //!   the limitation is recorded instead.
+//! - **The user tier is an owner like any project.** `mc_memory.project` holds
+//!   [`memory::USER_SCOPE`] for the user's own observations, so the tick
+//!   enumerates it with the projects; [`DreamTask::applies_to`] limits it to
+//!   pool hygiene (`expire`, `curate`, `classify`) because nothing in that
+//!   tier cites a file, and no transcript or session belongs to it.
+//! - **`expire` is ox's own, model-free task** (`expire.rs`): historian facts
+//!   nobody confirmed within 30 days, or nobody touched within 180, are
+//!   archived under a named reason. The reference prunes by a citation-fed
+//!   usage count; ox feeds the same `last_used_at` from retrievals and
+//!   citations, and leaves manual rows alone.
 //! - **Not ported at all:** the reference's remaining tasks (doc proposals,
 //!   primers, the mural, user-memory review), `scope`/`shareable` on classify
 //!   (single project model, no consumer), token budgets, model fallback chains,
@@ -220,6 +230,7 @@
 
 mod classify;
 mod curate;
+mod expire;
 mod manifest;
 mod retrospective;
 mod schedule;

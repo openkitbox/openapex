@@ -149,6 +149,8 @@ pub struct ToolRegistry {
     /// tools, and a request is assembled on every model step, so rebuilding
     /// them per step only re-copies identical schemas.
     definitions_cache: std::sync::OnceLock<Arc<Vec<ToolDef>>>,
+    /// The serialized size of the cached array, measured once with it.
+    definitions_bytes_cache: std::sync::OnceLock<usize>,
     /// The handle the registered `subagent` tool shares with the runner, so
     /// the runner can attach itself the moment it exists.
     pub subagent_handle: SubagentSlot,
@@ -176,6 +178,7 @@ impl ToolRegistry {
     pub fn register(&mut self, tool: Arc<dyn Tool>) -> Result<()> {
         let name = tool.name().to_owned();
         self.definitions_cache = std::sync::OnceLock::new();
+        self.definitions_bytes_cache = std::sync::OnceLock::new();
         if self.tools.insert(name.clone(), tool).is_some() {
             bail!("tool `{name}` is already registered");
         }
@@ -192,6 +195,7 @@ impl ToolRegistry {
     /// ones (`subagent`).
     pub fn remove(&mut self, name: &str) -> bool {
         self.definitions_cache = std::sync::OnceLock::new();
+        self.definitions_bytes_cache = std::sync::OnceLock::new();
         self.tools.remove(name).is_some()
     }
 
@@ -208,6 +212,7 @@ impl ToolRegistry {
         Self {
             tools,
             definitions_cache: std::sync::OnceLock::new(),
+            definitions_bytes_cache: std::sync::OnceLock::new(),
             subagent_handle: self.subagent_handle.clone(),
             shell_completion: self.shell_completion.clone(),
             jobs: Arc::clone(&self.jobs),
@@ -229,6 +234,7 @@ impl ToolRegistry {
         Self {
             tools,
             definitions_cache: std::sync::OnceLock::new(),
+            definitions_bytes_cache: std::sync::OnceLock::new(),
             subagent_handle: self.subagent_handle.clone(),
             shell_completion: self.shell_completion.clone(),
             jobs: Arc::clone(&self.jobs),
@@ -240,6 +246,7 @@ impl ToolRegistry {
     /// programming error caught by debug builds (built-ins have fixed names).
     pub fn register_all(&mut self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) {
         self.definitions_cache = std::sync::OnceLock::new();
+        self.definitions_bytes_cache = std::sync::OnceLock::new();
         for tool in tools {
             let name = tool.name().to_owned();
             if self.tools.insert(name, tool.clone()).is_some() {
@@ -266,6 +273,17 @@ impl ToolRegistry {
             self.definitions_cache
                 .get_or_init(|| Arc::new(self.definitions())),
         )
+    }
+
+    /// The serialized size of [`Self::definitions_shared`] in bytes: what the
+    /// tools array costs on every request, measured once. The size signal the
+    /// context budget's baseline is built from.
+    pub fn definitions_bytes(&self) -> usize {
+        *self.definitions_bytes_cache.get_or_init(|| {
+            serde_json::to_vec(&*self.definitions_shared())
+                .map(|body| body.len())
+                .unwrap_or(0)
+        })
     }
 
     /// Each registered tool's name with the guidance it contributes, in name

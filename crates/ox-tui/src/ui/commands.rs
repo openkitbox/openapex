@@ -48,6 +48,10 @@ pub enum CommandAction {
     /// Show the draft's image attachments at full size (upstream
     /// `prompt.images.view`, `<leader>i`).
     Images,
+    /// Flip the session's memory switch (ox-only: `mctx::memory_mode`).
+    Memory,
+    /// Archive the project's active memories (ox-only).
+    Forget,
 }
 
 /// One registered command. `aliases` are rendered as their own menu rows,
@@ -114,6 +118,23 @@ pub const COMMANDS: &[Command] = &[
         title: "Fork session",
         group: "Session",
         action: CommandAction::Fork,
+    },
+    // ox-only: the session's long-term memory switch (read + extract).
+    Command {
+        name: "forget",
+        aliases: &[],
+        description: "Archive this project's memories",
+        title: "Archive this project's memories",
+        group: "Memory",
+        action: CommandAction::Forget,
+    },
+    Command {
+        name: "memory",
+        aliases: &[],
+        description: "Toggle memory for this session",
+        title: "Toggle memory for this session",
+        group: "Memory",
+        action: CommandAction::Memory,
     },
     Command {
         name: "new",

@@ -50,12 +50,15 @@
 use super::cache_core::{CoreState, DurabilityClass, FrozenUnit};
 use anyhow::{Context as _, Result};
 
-use crate::mctx::budget::{Budget, memory_budget};
+use crate::mctx::budget::{Budget, memory_budget, user_profile_budget};
 use crate::mctx::cache::{HeadRenderer, McCache, PassOutcome, RenderedPass, Signals, run_pass};
 use crate::mctx::compartments::{self, Compartment};
-use crate::mctx::memory::{MemoryRow, ReadyNote, active_memories, ready_notes, select_memories};
+use crate::mctx::memory::{
+    MemoryRow, ReadyNote, active_memories, ready_notes, select_memories, user_profile,
+};
 use crate::mctx::render::{
-    M0Inputs, assemble_m1, render_m0, render_memory_block, render_ready_notes_block,
+    M0Inputs, M1Parts, MemoryIndex, Shown, assemble_m1, render_m0, render_memory_block,
+    render_memory_index, render_ready_notes_block, render_user_profile_block,
 };
 use crate::mctx::tagger::{mark_drops_applied, peek_queued_drops};
 use ox_db::{Db, optional};
@@ -119,7 +122,23 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
     let count_tokens = crate::mctx::tokens::counter_fn(calibration);
 
     let compartments = compartments::load(db, session_id).await?;
-    let memories = active_memories(db, project).await?;
+    // A session with memory switched off reads none: both tiers stay empty
+    // (and are not even loaded), so the head carries no memory at all.
+    let memory_on = crate::mctx::memory_mode::mode_of(db, session_id)
+        .await?
+        .is_on();
+    let memories = if memory_on {
+        active_memories(db, project).await?
+    } else {
+        Vec::new()
+    };
+    // The user's own tier rides beside the pinboard: same half, same bust
+    // class, its own (smaller) budget.
+    let profile = if memory_on {
+        user_profile(db).await?
+    } else {
+        Vec::new()
+    };
     // Surfaced smart notes ride the same volatile half as the pinboard: a
     // note that becomes `ready` is a `Soft` bust, never a rebuild of m[0].
     let notes = ready_notes(db, session_id).await?;
@@ -147,8 +166,11 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
 
     let plan = plan_units(
         &compartments,
-        &memories,
-        &notes,
+        M1Sources {
+            memories: &memories,
+            profile: &profile,
+            notes: &notes,
+        },
         coverage,
         budget.history,
         &count_tokens,
@@ -298,12 +320,22 @@ struct Plan {
     boundary_id: String,
 }
 
+/// The loaded rows m[1] is rendered from, borrowed for one pass.
+#[derive(Clone, Copy)]
+struct M1Sources<'a> {
+    /// The project's active memories.
+    memories: &'a [MemoryRow],
+    /// The user's active profile memories.
+    profile: &'a [MemoryRow],
+    /// The session's surfaced notes.
+    notes: &'a [ReadyNote],
+}
+
 /// Render the two head halves: m[0] over every compartment the head covers,
-/// m[1] over the pinboard and the session's surfaced notes.
+/// m[1] over the pinboard, the user profile and the session's surfaced notes.
 fn plan_units(
     compartments: &[Compartment],
-    memories: &[MemoryRow],
-    notes: &[ReadyNote],
+    sources: M1Sources<'_>,
     coverage: i64,
     history_budget_tokens: u32,
     count_tokens: &dyn Fn(&str) -> usize,
@@ -323,15 +355,31 @@ fn plan_units(
     // provider's cache anchor. It is also the one section that grows with the
     // project's lifetime, so it is selected under its own budget first — a
     // memory that does not fit is skipped, the rest of the list still renders.
-    let selected = select_memories(
-        memories,
-        memory_budget(f64::from(history_budget_tokens)),
-        count_tokens,
-    );
-    let m1_body = assemble_m1(
-        &render_memory_block(&selected),
-        &render_ready_notes_block(notes),
-    );
+    let history = f64::from(history_budget_tokens);
+    let selected = select_memories(sources.memories, memory_budget(history), count_tokens);
+    let profile = select_memories(sources.profile, user_profile_budget(history), count_tokens);
+    // The index counts what the model cannot see from the blocks alone: the
+    // memories the budget (or the confirmation rule) left out, and the folded
+    // history `ctx_search` can reach.
+    let index = MemoryIndex {
+        project: Shown {
+            active: sources.memories.len(),
+            shown: selected.len(),
+        },
+        profile: Shown {
+            active: sources.profile.len(),
+            shown: profile.len(),
+        },
+        compartments: compartments.len(),
+        compartment_span: compartment_span(compartments),
+        notes: sources.notes.len(),
+    };
+    let m1_body = assemble_m1(M1Parts {
+        memories: &render_memory_block(&selected),
+        user_profile: &render_user_profile_block(&profile),
+        index: &render_memory_index(&index),
+        notes: &render_ready_notes_block(sources.notes),
+    });
     Plan {
         m0,
         // The unit payload carries the blank line that separates it from m[0]:
@@ -339,6 +387,14 @@ fn plan_units(
         m1: format!("\n\n{m1_body}"),
         boundary_id: anchor_id(coverage),
     }
+}
+
+/// `created_at` of the oldest and newest compartment, `None` when there are
+/// none.
+fn compartment_span(compartments: &[Compartment]) -> Option<(i64, i64)> {
+    let oldest = compartments.iter().map(|c| c.created_at).min()?;
+    let newest = compartments.iter().map(|c| c.created_at).max()?;
+    Some((oldest, newest))
 }
 
 /// The boundary id for a given m[0] coverage ordinal.
@@ -451,9 +507,15 @@ async fn write_kv_int(db: &Db, key: &str, value: i64, what: &str) -> Result<()> 
 /// line that separated the halves when they were concatenated is consumed at
 /// the seam (the halves travel as their own messages now).
 fn split_prefix(prefix: &str) -> (&str, &str) {
-    // m[1] opens with the pinboard when there are memories and with the
-    // since-marker otherwise; the separator (a blank line) belongs to neither.
-    const M1_OPENERS: [&str; 2] = ["\n\n<project-memory>", "\n\n<session-history-since>"];
+    // m[1] opens with a memory tier when there is one (the pinboard, else the
+    // user profile) and with the since-marker otherwise; the separator (a
+    // blank line) belongs to neither.
+    const M1_OPENERS: [&str; 4] = [
+        "\n\n<project-memory>",
+        "\n\n<user-profile>",
+        "\n\n<memory-index>",
+        "\n\n<session-history-since>",
+    ];
     let start = M1_OPENERS
         .iter()
         .filter_map(|opener| prefix.find(opener))

@@ -1045,15 +1045,18 @@ impl Firing<'_> {
             historian::build_reference_blocks(session_id, chunk.start_ordinal, &references);
         let memories = memory::active_memories(db, project).await?;
         let memory_block = historian::render_historian_memory_block(&memories);
+        let profile = memory::user_profile(db).await?;
+        let profile_block = historian::render_historian_user_profile_block(&profile);
         let prompt = historian::CompartmentPromptInputs {
             seed_examples: &blocks.seed_examples,
             session_references: &blocks.session_references,
             project_memory: &memory_block,
+            user_profile: &profile_block,
             input_source: &chunk.text,
             memory_enabled: true,
-            // The dreamer writes `<user_observations>` into the pinboard, so they
-            // are only worth asking for when it can run.
-            user_observations_requested: config.magic_context.dreamer_enabled,
+            // The publish promotes `<user_observations>` into the user tier
+            // alongside the project facts, so they ride with memory itself.
+            user_observations_requested: true,
             extraction_free: false,
         };
         let run_ctx = historian::RunCtx {
@@ -1065,6 +1068,7 @@ impl Firing<'_> {
             // event and lends the same string to every run it executes, so
             // the field never outlives the event it came from.
             reasoning_effort: self.reasoning_effort.as_deref(),
+            session_model: live.map(|live| live.model_id.as_str()),
         };
         // The request shape, decided before the region is loaded because only a
         // prefix-shaped run pays for it. `same_model` reads the same resolver the

@@ -15,14 +15,27 @@
 //!   `surface_condition` is surfaced into the session's pinboard by the
 //!   dreamer once the condition holds (see the deviation below).
 //!
+//! # Owners: project and user
+//!
+//! `mc_memory.project` is the row's **owner key**, not only a directory. A
+//! project memory's owner is the canonical working directory; a memory about
+//! the user themself — how they like to work, what they know, what they keep
+//! correcting — is owned by [`USER_SCOPE`] and rendered into every session of
+//! every project (`<user-profile>`, see [`crate::mctx::render`]). The owner is
+//! decided by the category ([`owner_for`]): [`USER_PROFILE`] rows are user
+//! memories, every category in [`CATEGORIES`] is a project memory. Handles are
+//! global, so an id-addressed operation from a project may reach that
+//! project's rows *and* the user's ([`owner_match`]) — never another
+//! project's.
+//!
 //! # Handles and lifecycles
 //!
 //! Ids are small ascending integers (`#17`) from a single sequence per table,
 //! minted by `MAX(id) + 1` inside the writing transaction (the reference
 //! addresses memories and notes as `#N`). A handle is a unique address; the
-//! owning scope (project for memories, session for notes) is an ordinary
-//! column, not part of the handle. The column is `text`; ordering casts to
-//! `INTEGER`.
+//! owning scope (project or user for memories, session for notes) is an
+//! ordinary column, not part of the handle. The column is `text`; ordering
+//! casts to `INTEGER`.
 //!
 //! Memories: `active` → `archived` (retirable, still `get`-able; the
 //! optional archive reason is kept). Notes: `active`, `pending` (a smart
@@ -83,7 +96,7 @@ use ox_schema::id::now_millis;
 use ox_schema::wire::ToolDef;
 use ox_tools::{object_param, ok_text};
 
-/// The closed category set, in pinboard render order.
+/// The closed project category set, in pinboard render order.
 pub(crate) const CATEGORIES: [&str; 5] = [
     "PROJECT_RULES",
     "ARCHITECTURE",
@@ -91,6 +104,77 @@ pub(crate) const CATEGORIES: [&str; 5] = [
     "CONFIG_VALUES",
     "NAMING",
 ];
+
+/// The owner key of memories about the user (see the module docs). Not a path
+/// — `@` cannot open a canonical directory — so it can never collide with a
+/// project.
+pub const USER_SCOPE: &str = "@user";
+/// The one user-owned category: universal observations about how the user
+/// works, independent of any project (the historian's `<user_observations>`).
+pub(crate) const USER_PROFILE: &str = "USER_PROFILE";
+/// The user-owned category set.
+pub(crate) const USER_CATEGORIES: [&str; 1] = [USER_PROFILE];
+
+/// Whether `owner` is the user namespace rather than a project directory.
+#[must_use]
+pub(crate) fn is_user_scope(owner: &str) -> bool {
+    owner == USER_SCOPE
+}
+
+/// Whether `category` is one a memory may carry, in either owner.
+#[must_use]
+pub(crate) fn is_known_category(category: &str) -> bool {
+    CATEGORIES.contains(&category) || USER_CATEGORIES.contains(&category)
+}
+
+/// The owner a memory of `category` written from `project` belongs to: the
+/// user namespace for [`USER_CATEGORIES`], the project otherwise.
+#[must_use]
+pub(crate) fn owner_for<'a>(project: &'a str, category: &str) -> &'a str {
+    if USER_CATEGORIES.contains(&category) {
+        USER_SCOPE
+    } else {
+        project
+    }
+}
+
+/// The categories `owner` admits.
+#[must_use]
+pub(crate) fn categories_of(owner: &str) -> &'static [&'static str] {
+    if is_user_scope(owner) {
+        &USER_CATEGORIES
+    } else {
+        &CATEGORIES
+    }
+}
+
+/// The id-addressed reach of a caller working in `project`: its own rows and
+/// the user's. Bound as two parameters, never interpolated.
+fn owner_match(project: &str) -> (&str, &'static str) {
+    (project, USER_SCOPE)
+}
+
+/// Where a memory row came from (the `source` column).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemorySource {
+    /// Written on purpose: `ctx_memory`, the dreamer's retrospective, a merge.
+    Manual,
+    /// Promoted from a historian fold's side channel, unconfirmed by a human.
+    Historian,
+}
+
+impl MemorySource {
+    /// The column spelling, as the historian's promotion writes it.
+    pub(crate) const HISTORIAN: &'static str = "historian";
+
+    fn parse(value: &str) -> Self {
+        if value == Self::HISTORIAN {
+            Self::Historian
+        } else {
+            Self::Manual
+        }
+    }
+}
 
 /// A note whose age reaches this many days is flagged stale in `read`
 /// (reference: "rows untouched 30+ days are marked stale").
@@ -147,7 +231,27 @@ pub struct MemoryRow {
     /// epoch milliseconds; `0` means never retrieved. A selection tiebreak
     /// only: recording a use is neither a write nor a verification.
     pub last_used_at: i64,
+    /// How many historian folds have stated this fact (`1` for a row written
+    /// on purpose). With [`MemorySource::Historian`] it is the row's
+    /// confirmation: see [`select_memories`].
+    pub seen_count: i64,
+    /// Where the row came from.
+    pub source: MemorySource,
 }
+
+impl MemoryRow {
+    /// Whether the pinboard may carry this row. A historian-promoted fact is a
+    /// one-model reading of one fold until a second fold states it again (or
+    /// a human writes it); until then it is kept for the historian's own
+    /// dedup and for `ctx_search`, but it does not ride every request.
+    #[must_use]
+    pub fn is_confirmed(&self) -> bool {
+        self.source == MemorySource::Manual || self.seen_count >= PROMOTED_CONFIRMATION_SIGHTINGS
+    }
+}
+
+/// Historian sightings before a promoted fact counts as confirmed.
+pub(crate) const PROMOTED_CONFIRMATION_SIGHTINGS: i64 = 2;
 
 /// One memory as `get` reads it (every status).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,7 +266,9 @@ pub(crate) struct MemoryDetail {
     pub status: String,
 }
 
-/// Write a new memory; returns its `#N` handle body.
+/// Write a new memory; returns its `#N` handle body. The row's owner follows
+/// the category ([`owner_for`]): a [`USER_PROFILE`] memory written from any
+/// project lands in the user namespace.
 pub(crate) async fn write_memory(
     db: &Db,
     project: &str,
@@ -173,6 +279,7 @@ pub(crate) async fn write_memory(
     let content = redact::redact_secrets(content);
     let content = content.as_ref();
     let now = now_millis();
+    let owner = owner_for(project, category);
     let result: Result<String> = async {
         let tx = db.begin().await?;
         let id = next_memory_id(&tx).await?.to_string();
@@ -180,7 +287,7 @@ pub(crate) async fn write_memory(
             "INSERT INTO mc_memory
                  (id, project, content, category, created_at, updated_at, status)
              VALUES (?1, ?2, ?3, ?4, ?5, ?5, 'active')",
-            (id.as_str(), project, content, category, now),
+            (id.as_str(), owner, content, category, now),
         )
         .await?;
         tx.commit().await?;
@@ -270,6 +377,10 @@ pub(crate) async fn insert_promoted(
 ///
 /// A rewrite clears `verified_at`: the claims are new text, so the old
 /// verification says nothing about them.
+///
+/// A recategorization is confined to the row's owner: a new category whose
+/// owner ([`owner_for`]) differs from the row's matches nothing, so a project
+/// fact cannot be turned into a user observation (or back) by rewording.
 pub(crate) async fn update_memory(
     db: &Db,
     project: &str,
@@ -281,6 +392,7 @@ pub(crate) async fn update_memory(
     let content = redact::redact_secrets(content);
     let content = content.as_ref();
     let now = now_millis();
+    let (own, user) = owner_match(project);
     let result: Result<bool> = async {
         let conn = db.acquire().await?;
         let changed = match category {
@@ -288,8 +400,16 @@ pub(crate) async fn update_memory(
                 conn.execute(
                     "UPDATE mc_memory SET content = ?3, category = ?4, updated_at = ?5,
                          verified_at = 0, embedding = NULL, embedding_model = NULL
-                         WHERE project = ?1 AND id = ?2",
-                    (project, id, content, category, now),
+                         WHERE id = ?2 AND project IN (?1, ?6) AND project = ?7",
+                    (
+                        own,
+                        id,
+                        content,
+                        category,
+                        now,
+                        user,
+                        owner_for(project, category),
+                    ),
                 )
                 .await?
             }
@@ -297,8 +417,8 @@ pub(crate) async fn update_memory(
                 conn.execute(
                     "UPDATE mc_memory SET content = ?3, updated_at = ?4, verified_at = 0,
                          embedding = NULL, embedding_model = NULL
-                         WHERE project = ?1 AND id = ?2",
-                    (project, id, content, now),
+                         WHERE id = ?2 AND project IN (?1, ?5)",
+                    (own, id, content, now, user),
                 )
                 .await?
             }
@@ -308,6 +428,11 @@ pub(crate) async fn update_memory(
     .await;
     result.with_context(|| context)
 }
+
+/// A row's status and owner when it is inside the caller's reach
+/// ([`owner_match`]): `(project, id, user)`.
+const STATUS_IN_REACH_SQL: &str =
+    "SELECT status, project FROM mc_memory WHERE id = ?2 AND project IN (?1, ?3)";
 
 /// Archive the given memories (any status may be given; already-archived
 /// rows are left alone). Returns the ids that were actually archived.
@@ -319,16 +444,15 @@ pub(crate) async fn archive_memories(
 ) -> Result<Vec<String>> {
     let context = format!("archive memories for project {project}");
     let now = now_millis();
+    let (own, user) = owner_match(project);
     let result: Result<Vec<String>> = async {
         let tx = db.begin().await?;
         let mut archived = Vec::new();
         {
-            let mut stmt = tx
-                .prepare("SELECT status FROM mc_memory WHERE project = ?1 AND id = ?2")
-                .await?;
+            let mut stmt = tx.prepare(STATUS_IN_REACH_SQL).await?;
             for id in ids {
                 let status: Option<String> =
-                    match optional(&mut stmt, (project, id.as_str())).await? {
+                    match optional(&mut stmt, (own, id.as_str(), user)).await? {
                         Some(row) => Some(row.get(0)?),
                         None => None,
                     };
@@ -340,8 +464,8 @@ pub(crate) async fn archive_memories(
         for id in &archived {
             tx.execute(
                 "UPDATE mc_memory SET status = 'archived', archive_reason = ?3, updated_at = ?4
-                 WHERE project = ?1 AND id = ?2",
-                (project, id.as_str(), reason, now),
+                 WHERE id = ?2 AND project IN (?1, ?5)",
+                (own, id.as_str(), reason, now, user),
             )
             .await?;
         }
@@ -350,6 +474,24 @@ pub(crate) async fn archive_memories(
     }
     .await;
     result.with_context(|| context)
+}
+
+/// Archive every active memory of one owner — a project directory or
+/// [`USER_SCOPE`] — with `reason`. The user's one-shot reset: rows are
+/// archived, not deleted, so `ctx_memory get` can still read them and a
+/// mistake is recoverable. Returns how many rows changed.
+pub async fn clear_owner(db: &Db, owner: &str, reason: &str) -> Result<usize> {
+    let now = now_millis();
+    let conn = db.acquire().await?;
+    let changed = conn
+        .execute(
+            "UPDATE mc_memory SET status = 'archived', archive_reason = ?2, updated_at = ?3
+             WHERE project = ?1 AND status = 'active'",
+            (owner, reason, now),
+        )
+        .await
+        .with_context(|| format!("clear memories of {owner}"))?;
+    Ok(usize::try_from(changed).unwrap_or(usize::MAX))
 }
 
 /// The result of a merge: the surviving handle and every handle the merge
@@ -377,31 +519,23 @@ pub(crate) async fn merge_memories(
     let content = redact::redact_secrets(content);
     let content = content.as_ref();
     let now = now_millis();
+    let (own, user) = owner_match(project);
     let result: Result<Option<Merged>> = async {
         let tx = db.begin().await?;
         // Only ACTIVE rows are merge candidates: an archived row must
         // neither survive (its content would be stranded outside the
         // pinboard) nor lose (its own archive reason would be
         // overwritten).
-        let mut live: Vec<String> = Vec::new();
-        {
-            let mut stmt = tx
-                .prepare("SELECT status FROM mc_memory WHERE project = ?1 AND id = ?2")
-                .await?;
-            for id in ids {
-                let status: Option<String> =
-                    match optional(&mut stmt, (project, id.as_str())).await? {
-                        Some(row) => Some(row.get(0)?),
-                        None => None,
-                    };
-                if status.as_deref() == Some("active") && !live.contains(id) {
-                    live.push(id.clone());
-                }
-            }
-        }
-        // A merge needs at least two live rows; fewer is reported as
-        // "nothing merged" rather than silently rewriting one row.
-        if live.len() < 2 {
+        // A merge needs at least two live rows of one owner; anything else
+        // is reported as "nothing merged" rather than silently rewriting one
+        // row or fusing a project fact with a user observation.
+        let Some((owner, mut live)) = live_rows_of_one_owner(&tx, (own, user), ids).await? else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let project = owner.as_str();
+        // The survivor keeps its owner's category set.
+        if category.is_some_and(|category| owner_for(project, category) != project) {
             tx.rollback().await?;
             return Ok(None);
         }
@@ -450,6 +584,39 @@ pub(crate) async fn merge_memories(
     result.with_context(|| context)
 }
 
+/// The active rows among `ids` inside `reach` (`(project, user)`), deduped,
+/// with the owner they all share: `None` when fewer than two are live or
+/// they span two owners.
+async fn live_rows_of_one_owner(
+    tx: &WriteTx<'_>,
+    reach: (&str, &str),
+    ids: &[String],
+) -> Result<Option<(String, Vec<String>)>> {
+    let (own, user) = reach;
+    let mut stmt = tx.prepare(STATUS_IN_REACH_SQL).await?;
+    let mut live: Vec<String> = Vec::new();
+    let mut owner: Option<String> = None;
+    for id in ids {
+        let Some(row) = optional(&mut stmt, (own, id.as_str(), user)).await? else {
+            continue;
+        };
+        let status: String = row.get(0)?;
+        let row_owner: String = row.get(1)?;
+        if status != "active" || live.contains(id) {
+            continue;
+        }
+        if owner.as_deref().is_some_and(|known| known != row_owner) {
+            return Ok(None);
+        }
+        owner.get_or_insert(row_owner);
+        live.push(id.clone());
+    }
+    if live.len() < 2 {
+        return Ok(None);
+    }
+    Ok(owner.map(|owner| (owner, live)))
+}
+
 /// Fetch memories by id in every status, in the requested order (unknown
 /// ids are skipped).
 pub(crate) async fn get_memories(
@@ -458,17 +625,18 @@ pub(crate) async fn get_memories(
     ids: &[String],
 ) -> Result<Vec<MemoryDetail>> {
     let context = format!("get memories for project {project}");
+    let (own, user) = owner_match(project);
     let result: Result<Vec<MemoryDetail>> = async {
         let conn = db.acquire().await?;
         let mut out = Vec::new();
         let mut stmt = conn
             .prepare(
                 "SELECT id, category, content, status FROM mc_memory
-                 WHERE project = ?1 AND id = ?2",
+                 WHERE id = ?2 AND project IN (?1, ?3)",
             )
             .await?;
         for id in ids {
-            let Some(row) = optional(&mut stmt, (project, id.as_str())).await? else {
+            let Some(row) = optional(&mut stmt, (own, id.as_str(), user)).await? else {
                 continue;
             };
             let id: String = row.get(0)?;
@@ -492,24 +660,25 @@ pub(crate) async fn get_memories(
     result.with_context(|| context)
 }
 
-/// Every active memory of the project, ids ascending (the renderer applies
-/// category order).
-pub(crate) async fn active_memories(db: &Db, project: &str) -> Result<Vec<MemoryRow>> {
-    let context = format!("read active memories for project {project}");
+/// Every active memory of `owner` (a project, or [`USER_SCOPE`]), ids
+/// ascending (the renderer applies category order).
+pub(crate) async fn active_memories(db: &Db, owner: &str) -> Result<Vec<MemoryRow>> {
+    let context = format!("read active memories for {owner}");
     let result: Result<Vec<MemoryRow>> = async {
         let conn = db.acquire().await?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, category, content, importance, updated_at, verified_at,
-                        last_used_at
+                        last_used_at, seen_count, source
                    FROM mc_memory
                   WHERE project = ?1 AND status = 'active'
                   ORDER BY CAST(id AS INTEGER)",
             )
             .await?;
-        let mut rows = stmt.query([project]).await?;
+        let mut rows = stmt.query([owner]).await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
+            let source: String = row.get(8)?;
             out.push(MemoryRow {
                 id: row.get(0)?,
                 category: row.get(1)?,
@@ -518,12 +687,20 @@ pub(crate) async fn active_memories(db: &Db, project: &str) -> Result<Vec<Memory
                 updated_at: row.get(4)?,
                 verified_at: row.get(5)?,
                 last_used_at: row.get(6)?,
+                seen_count: row.get(7)?,
+                source: MemorySource::parse(&source),
             });
         }
         Ok(out)
     }
     .await;
     result.with_context(|| context)
+}
+
+/// The user's active profile memories: what [`active_memories`] reads for
+/// [`USER_SCOPE`], named so a caller cannot pass a directory by mistake.
+pub(crate) async fn user_profile(db: &Db) -> Result<Vec<MemoryRow>> {
+    active_memories(db, USER_SCOPE).await
 }
 
 /// Choose which memories the pinboard carries under `budget_tokens`.
@@ -545,6 +722,10 @@ pub(crate) async fn active_memories(db: &Db, project: &str) -> Result<Vec<Memory
 /// accounts for the fact text only; the framing (`#id: `, category tags) is a
 /// constant per included row and not what the budget exists to bound.
 ///
+/// Unconfirmed rows ([`MemoryRow::is_confirmed`]) are not candidates at all:
+/// a fact one fold stated once waits for a second sighting before it costs
+/// every request of the project.
+///
 /// Pure: no IO, no DB, and no content copy — the selection is a list of
 /// borrows.
 pub(crate) fn select_memories<'a>(
@@ -552,7 +733,7 @@ pub(crate) fn select_memories<'a>(
     budget_tokens: usize,
     count_tokens: &dyn Fn(&str) -> usize,
 ) -> Vec<&'a MemoryRow> {
-    let mut ordered: Vec<&MemoryRow> = memories.iter().collect();
+    let mut ordered: Vec<&MemoryRow> = memories.iter().filter(|m| m.is_confirmed()).collect();
     ordered.sort_by(|left, right| selection_order(left, right));
 
     let mut used = 0usize;
@@ -1116,21 +1297,77 @@ pub(crate) async fn record_use(db: &Db, project: &str, ids: &[&str], at: i64) ->
         return Ok(());
     }
     let context = format!("record memory use for project {project}");
+    let (own, user) = owner_match(project);
     let result: Result<()> = async {
         let tx = db.begin().await?;
         {
             let mut stmt = tx
                 .prepare(
                     "UPDATE mc_memory SET last_used_at = ?3
-                      WHERE project = ?1 AND id = ?2 AND status = 'active'",
+                      WHERE id = ?2 AND project IN (?1, ?4) AND status = 'active'",
                 )
                 .await?;
             for &id in ids {
-                stmt.execute((project, id, at)).await?;
+                stmt.execute((own, id, at, user)).await?;
             }
         }
         tx.commit().await?;
         Ok(())
+    }
+    .await;
+    result.with_context(|| context)
+}
+
+/// The cut-offs of one expiry pass (see `dreamer::expire`). Instants, not
+/// ages: the policy is decided once at the task's `now`, and the store only
+/// compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExpirePolicy<'a> {
+    /// An unconfirmed historian row whose every timestamp is older than this
+    /// is archived.
+    pub unconfirmed_before: i64,
+    /// A confirmed historian row whose every timestamp is older than this is
+    /// archived.
+    pub unused_before: i64,
+    /// The `archive_reason` to stamp.
+    pub reason: &'a str,
+}
+
+/// Archive `owner`'s historian-sourced rows that have aged past `policy`.
+/// Returns how many rows were archived. Rows with
+/// [`MemorySource::Manual`] are never touched.
+///
+/// "Touched" is the latest of `updated_at` (a write or a sighting bump),
+/// `verified_at` and `last_used_at` (a retrieval or a citation); a row is
+/// expired only when all three are older than its cut-off.
+pub(crate) async fn expire_memories(
+    db: &Db,
+    owner: &str,
+    policy: &ExpirePolicy<'_>,
+    now: i64,
+) -> Result<usize> {
+    let context = format!("expire memories for {owner}");
+    let result: Result<usize> = async {
+        let conn = db.acquire().await?;
+        let affected = conn
+            .execute(
+                "UPDATE mc_memory
+                    SET status = 'archived', archive_reason = ?2, updated_at = ?3
+                  WHERE project = ?1 AND status = 'active' AND source = ?4
+                    AND MAX(updated_at, verified_at, last_used_at)
+                        < CASE WHEN seen_count >= ?5 THEN ?6 ELSE ?7 END",
+                (
+                    owner,
+                    policy.reason,
+                    now,
+                    MemorySource::HISTORIAN,
+                    PROMOTED_CONFIRMATION_SIGHTINGS,
+                    policy.unused_before,
+                    policy.unconfirmed_before,
+                ),
+            )
+            .await?;
+        Ok(affected as usize)
     }
     .await;
     result.with_context(|| context)
@@ -1549,7 +1786,10 @@ impl Tool for CtxMemoryTool {
              fact, a hard-won constraint, a config value, a naming convention — and \
              especially when it cost you turns to find. One standalone fact per memory, \
              phrased to make sense on its own. A pending intention with its evidence \
-             (\"do X later, here is what we know\") is ctx_note, not memory.",
+             (\"do X later, here is what we know\") is ctx_note, not memory. A fact about \
+             the user rather than the project — how they like to work, what they keep \
+             correcting — is category USER_PROFILE: it follows them into every project \
+             (<user-profile>), so never put project specifics there.",
             object_param(
                 vec![
                     (
@@ -1580,9 +1820,11 @@ impl Tool for CtxMemoryTool {
                         "category",
                         json!({
                             "type": "string",
-                            "enum": CATEGORIES,
+                            "enum": tool_categories(),
                             "description": "Kind of fact (required for write; optional on \
-                                            update/merge to recategorize).",
+                                            update/merge to recategorize within the same \
+                                            owner: a project fact stays a project fact, \
+                                            a USER_PROFILE memory stays one).",
                         }),
                     ),
                     (
@@ -1591,7 +1833,7 @@ impl Tool for CtxMemoryTool {
                             "type": "array",
                             "items": { "type": "integer" },
                             "description": "Memory ids from a `#id: fact` line or a \
-                                            `<project-memory>` entry.",
+                                            `<project-memory>` / `<user-profile>` entry.",
                         }),
                     ),
                     (
@@ -1806,15 +2048,20 @@ async fn embed_inline(
     }
 }
 
-/// One category check for every arm: the closed set lives in [`CATEGORIES`],
-/// and its rejection message is written once.
+/// Every category the tool accepts: the project set, then the user set.
+fn tool_categories() -> Vec<&'static str> {
+    CATEGORIES.iter().chain(&USER_CATEGORIES).copied().collect()
+}
+
+/// One category check for every arm: the closed sets live in [`CATEGORIES`]
+/// and [`USER_CATEGORIES`], and the rejection message is written once.
 fn check_category(category: &str) -> Result<(), String> {
-    if CATEGORIES.contains(&category) {
+    if is_known_category(category) {
         Ok(())
     } else {
         Err(format!(
             "Error: 'category' must be one of {}.",
-            CATEGORIES.join(", ")
+            tool_categories().join(", ")
         ))
     }
 }

@@ -21,6 +21,7 @@ mod cursor;
 mod inbox;
 mod lifecycle;
 mod listing;
+mod memory;
 mod message;
 mod prompting;
 mod response;
@@ -36,6 +37,7 @@ pub(crate) use control::{
 pub(crate) use inbox::{inbox_cancel, inbox_list, inbox_update};
 pub(crate) use lifecycle::{create, delete_session_tree, fork, get, remove, update};
 pub(crate) use listing::list;
+pub(crate) use memory::{memory_clear, memory_get, memory_set};
 pub(crate) use message::{load_message_row, message_get, message_list};
 pub(crate) use prompting::prompt;
 pub(crate) use response::{invalid_request, message_not_found, session_not_found, unknown_error};

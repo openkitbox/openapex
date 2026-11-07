@@ -839,6 +839,14 @@ pub fn build_router(state: AppState) -> Router {
                                 .push(Router::with_path("agent").post(session::switch_agent))
                                 .push(Router::with_path("model").post(session::switch_model))
                                 .push(
+                                    Router::with_path("memory")
+                                        .get(session::memory_get)
+                                        .post(session::memory_set)
+                                        .push(
+                                            Router::with_path("clear").post(session::memory_clear),
+                                        ),
+                                )
+                                .push(
                                     Router::with_path("message")
                                         .get(session::message_list)
                                         .push(

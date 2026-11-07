@@ -35,6 +35,7 @@ use ox_schema::support::{ModelRef, SessionError};
 use tokio_util::sync::CancellationToken;
 
 use super::drain::DrainCtx;
+use super::fold_input;
 use super::historian_trigger::prompt_tokens;
 use super::resolve_selection;
 use super::unknown_error;
@@ -249,6 +250,7 @@ async fn stream_summary(
     let mut stream = match ctx.chat.stream_chat(request).await {
         Ok(stream) => stream,
         Err(error) => {
+            crate::mctx::quota::observe(&error, ox_schema::id::now_millis());
             let kind = if super::provider_error::is_overflow_error(&error) {
                 "compaction.overflow"
             } else {
@@ -356,54 +358,15 @@ async fn summarized_reply(
         status: None,
         response: None,
     };
-    let base_max_tokens = request.max_tokens;
-    let mut shrink_step = 0;
-    let mut summary = loop {
-        match stream_summary(ctx, &request, emit_deltas).await {
-            Ok(summary) => break summary,
-            Err(error)
-                if error.kind == "compaction.overflow"
-                    && shrink_step < 4
-                    && request.max_tokens.is_some() =>
-            {
-                shrink_step += 1;
-                request.max_tokens = Some(compaction_max_tokens(
-                    base_max_tokens,
-                    base_max_tokens.unwrap_or(1),
-                    None,
-                    None,
-                    shrink_step,
-                ));
-            }
-            Err(error) => return Err(error),
-        }
-    };
+    let mut ladder = OverflowLadder::new(request.max_tokens);
+    let mut summary = stream_until_fits(ctx, &mut request, &mut ladder, emit_deltas).await?;
     // Upstream `send` (compaction.ts): a reply that ignores the summary
     // template gets one nudge before it counts as a failure. The nudge is a
     // content-only re-ask: preserve the already-derived positive `max_tokens`
     // instead of recalculating the budget for the extra user turn.
     if !filled(&summary) {
         append_nudge(&mut request);
-        summary = loop {
-            match stream_summary(ctx, &request, emit_deltas).await {
-                Ok(summary) => break summary,
-                Err(error)
-                    if error.kind == "compaction.overflow"
-                        && shrink_step < 4
-                        && request.max_tokens.is_some() =>
-                {
-                    shrink_step += 1;
-                    request.max_tokens = Some(compaction_max_tokens(
-                        base_max_tokens,
-                        base_max_tokens.unwrap_or(1),
-                        None,
-                        None,
-                        shrink_step,
-                    ));
-                }
-                Err(error) => return Err(error),
-            }
-        };
+        summary = stream_until_fits(ctx, &mut request, &mut ladder, emit_deltas).await?;
         if !filled(&summary) {
             return Err(failure(
                 "compaction.failed",
@@ -419,18 +382,92 @@ async fn summarized_reply(
     Ok(summary)
 }
 
+/// Stream `request` until it fits: on `compaction.overflow` give up the next
+/// rung of `ladder` and retry; any other error, or a ladder with nothing
+/// left, is returned as is.
+async fn stream_until_fits(
+    ctx: &DrainCtx,
+    request: &mut ChatRequest,
+    ladder: &mut OverflowLadder,
+    emit_deltas: bool,
+) -> std::result::Result<String, SessionError> {
+    loop {
+        match stream_summary(ctx, request, emit_deltas).await {
+            Ok(summary) => return Ok(summary),
+            Err(error) if error.kind == "compaction.overflow" && ladder.descend(request) => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// What an overflowing summary request gives up, rung by rung: first the
+/// reply budget (two shrinks of `max_tokens`), then the tool outputs in the
+/// prompt ([`fold_input::elide_tool_outputs`] — the transcript's bulk, never
+/// its narrative), then the remaining shrinks. One ladder spans the first
+/// ask and the nudge, so the nudge never climbs back up.
+struct OverflowLadder {
+    base_max_tokens: Option<u64>,
+    shrink_step: usize,
+    elided: bool,
+}
+
+impl OverflowLadder {
+    const SHRINKS_BEFORE_ELISION: usize = 2;
+    const MAX_SHRINKS: usize = 4;
+
+    fn new(base_max_tokens: Option<u64>) -> Self {
+        Self {
+            base_max_tokens,
+            shrink_step: 0,
+            elided: false,
+        }
+    }
+
+    /// Apply the next rung to `request`; `false` when none is left.
+    fn descend(&mut self, request: &mut ChatRequest) -> bool {
+        let can_shrink = |step: usize| request.max_tokens.is_some() && step < Self::MAX_SHRINKS;
+        if self.shrink_step < Self::SHRINKS_BEFORE_ELISION && can_shrink(self.shrink_step) {
+            return self.shrink(request);
+        }
+        if !self.elided {
+            self.elided = true;
+            if fold_input::elide_tool_outputs(&mut request.messages) > 0 {
+                return true;
+            }
+        }
+        can_shrink(self.shrink_step) && self.shrink(request)
+    }
+
+    fn shrink(&mut self, request: &mut ChatRequest) -> bool {
+        self.shrink_step += 1;
+        request.max_tokens = Some(compaction_max_tokens(
+            self.base_max_tokens,
+            self.base_max_tokens.unwrap_or(1),
+            None,
+            None,
+            self.shrink_step,
+        ));
+        true
+    }
+}
+
 /// The summarization proper over a given transcript: build the request,
 /// stream it, re-ask once when the reply skipped the template. Split from
 /// [`summarize`] so the background fold can feed its snapshot (plan D4).
 /// `emit_deltas` is the blocking path's wire contract (`started → delta →
 /// ended`); the fold passes `false` — its deltas must not broadcast.
+///
+/// The transcript is the live renderer's output, tiered for a summary
+/// ([`fold_input::tighten_tool_outputs`]): a result's body is the request's
+/// bulk and the summary's least useful input.
 async fn summarize_transcript(
     ctx: &DrainCtx,
     model: &ModelRef,
     rows: &[ox_schema::message::Message],
     emit_deltas: bool,
 ) -> std::result::Result<String, SessionError> {
-    let messages = super::step::build_chat_messages("", "", &[], rows);
+    let mut messages = super::step::build_chat_messages("", "", &[], rows);
+    fold_input::tighten_tool_outputs(&mut messages);
     let measured_prompt = measured_prompt_tokens(rows);
     let mut request = summarization_request(model, &messages);
     apply_compaction_budget(ctx, model, &mut request, measured_prompt);
@@ -793,24 +830,47 @@ fn truncate_chars(value: &str, max: usize) -> String {
 /// rows from the oldest end (upstream `oldestToDrop`). The budget is
 /// counted with the injected token counter — one over per row's trailing
 /// newline.
+///
+/// Two tiers (codex's evidence ordering, human first): once a row no longer
+/// fits, the walk goes on over the older rows admitting only the user's own
+/// turns. What the user said is the cheapest text in the tail and the one a
+/// summary paraphrases least faithfully, so it is kept verbatim as far back
+/// as the budget reaches; the assistant's and the tools' text stops at the
+/// first row that overflowed. Rows come out in transcript order.
 fn recent_text(tail: &[(i64, serde_json::Value)], count_tokens: &dyn Fn(&str) -> usize) -> String {
     let budget_tokens = RECENT_KEEP_TOKENS as usize;
-    let mut kept: Vec<String> = Vec::new();
+    let mut kept: Vec<(i64, String)> = Vec::new();
     let mut spent = 0usize;
-    for (_, row) in tail.iter().rev() {
+    let mut users_only = false;
+    for (seq, row) in tail.iter().rev() {
+        if users_only && !is_user_row(row) {
+            continue;
+        }
         let text = recent_row_text(row);
         if text.is_empty() {
             continue;
         }
         let cost = count_tokens(&text) + 1;
         if spent + cost > budget_tokens {
-            break;
+            if users_only {
+                break;
+            }
+            users_only = true;
+            continue;
         }
         spent += cost;
-        kept.push(text);
+        kept.push((*seq, text));
     }
-    kept.reverse();
-    kept.join("\n")
+    kept.sort_unstable_by_key(|(seq, _)| *seq);
+    kept.into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether a stored row is an authored user turn.
+fn is_user_row(row: &serde_json::Value) -> bool {
+    row.get("type").and_then(serde_json::Value::as_str) == Some("user")
 }
 
 /// Whether the recent budget carries the whole tail row-by-row (plan D6):
@@ -1024,7 +1084,7 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
     // assistant turn past the checkpoint, measured exactly like the
     // historian trigger measures it. Both mctx modes need it, so the budget
     // is derived unconditionally; the floor stays mctx-only.
-    let budget = crate::mctx::budget_for(&ctx.config, &ctx.model_catalog, &model.id);
+    let budget = ctx.budget_for(&model.id);
     let usage_pct = {
         let tail = super::step::rows_after_with_seq(&ctx.db, &ctx.session_id, checkpoint).await?;
         let usage = tail.iter().rev().find_map(|(_, row)| prompt_tokens(row));

@@ -28,6 +28,7 @@ pub use step::usage::SessionCache;
 
 pub mod compaction;
 pub mod drain;
+mod fold_input;
 pub(crate) mod generate;
 mod historian_trigger;
 pub(crate) mod instructions;

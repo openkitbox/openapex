@@ -188,6 +188,10 @@ pub enum AppEvent {
     SessionDeleted(String),
     /// A fork finished; the app switches to the new session.
     SessionForked(String),
+    /// The session's memory switch after a toggle (`"on"` / `"off"`).
+    MemoryMode(String),
+    /// A memory clear finished: how many memories were archived.
+    MemoryCleared(u64),
     /// A session request failed: toast title and the error text.
     SessionOpFailed {
         title: &'static str,

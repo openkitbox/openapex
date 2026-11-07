@@ -38,6 +38,8 @@ const ORDER: &[CommandAction] = &[
     CommandAction::Subagents,
     CommandAction::QueuedPrompts,
     CommandAction::Shells,
+    CommandAction::Memory,
+    CommandAction::Forget,
     CommandAction::Models,
     CommandAction::Agents,
     CommandAction::Mcps,
@@ -53,6 +55,8 @@ const SESSION_ONLY: &[CommandAction] = &[
     CommandAction::Subagents,
     CommandAction::QueuedPrompts,
     CommandAction::Shells,
+    CommandAction::Memory,
+    CommandAction::Forget,
 ];
 
 /// What the palette needs to know about the app.

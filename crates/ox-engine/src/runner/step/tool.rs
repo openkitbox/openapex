@@ -217,6 +217,13 @@ fn spawn_tool_task(
         db: ctx.db.clone(),
         grants: Arc::clone(&ctx.grants),
     };
+    // Decided here, on the name alone, so the task needs no config handle:
+    // a successful run of an external-content tool taints the session.
+    let external_content = ctx
+        .config
+        .magic_context
+        .is_external_content_tool(tool.name());
+    let db = ctx.db.clone();
     tokio::spawn(async move {
         // The permission gate runs inside the task so an `ask` that waits on
         // the user neither stalls the stream nor the sibling calls.
@@ -257,6 +264,13 @@ fn spawn_tool_task(
                 input,
             )
             .await;
+        if external_content && output.error.is_none() {
+            // Marked before the success is published, so a fold triggered by
+            // this very step already sees the session as tainted.
+            if let Err(error) = crate::mctx::taint::mark(&db, &session_id, tool.name()).await {
+                tracing::warn!(error = %error, tool = tool.name(), "could not mark session taint");
+            }
+        }
         let event = match output.error {
             None => SessionEventData::ToolSuccess {
                 session_id,

@@ -160,6 +160,9 @@ pub struct ParsedCompartmentOutput {
     pub dropped_fact_blocks: usize,
     pub dropped_facts: usize,
     pub events: Vec<ParsedEvent>,
+    /// The `<user_observations>` bullets: universal statements about the user,
+    /// not the project. Promoted into the user tier, never into the pinboard.
+    pub user_observations: Vec<String>,
     pub unprocessed_from: Option<i64>,
 }
 
@@ -188,6 +191,8 @@ pub struct ValidatedChunk {
     pub dropped_fact_blocks: usize,
     pub dropped_facts: usize,
     pub events: Vec<ParsedEvent>,
+    /// See [`ParsedCompartmentOutput::user_observations`].
+    pub user_observations: Vec<String>,
     /// The next ordinal safe to read after the compartments that persist.
     pub unprocessed_from: i64,
     /// True when the provisional last compartment was withheld so the next run
@@ -360,6 +365,7 @@ pub fn parse_compartment_output(
     }
 
     let unprocessed_from = capture_i64(&unprocessed_regex(), &outside);
+    let user_observations = parse_user_observations(&outside);
 
     let mut events = parse_events(&outside);
 
@@ -397,8 +403,25 @@ pub fn parse_compartment_output(
         dropped_fact_blocks,
         dropped_facts,
         events,
+        user_observations,
         unprocessed_from,
     })
+}
+
+/// The `* ` bullets of the `<user_observations>` side channel, unescaped and
+/// trimmed; an absent or empty block yields none. Read from the text outside
+/// the compartment elements like every other side channel.
+fn parse_user_observations(outside: &str) -> Vec<String> {
+    let Some(caps) = user_observations_block_regex().captures(outside) else {
+        return Vec::new();
+    };
+    let block = caps.get(1).map_or("", |m| m.as_str());
+    fact_item_regex()
+        .captures_iter(block)
+        .filter_map(|caps| caps.get(1))
+        .map(|m| unescape_xml(m.as_str().trim()))
+        .filter(|observation| !observation.is_empty())
+        .collect()
 }
 
 /// Parse, heal safe gaps, map endpoint ordinals, enforce coverage, apply
@@ -559,12 +582,22 @@ pub fn validate_historian_output(
         })
         .collect();
 
+    // Observations are not anchored to a compartment: they describe the user,
+    // not a stretch of transcript, so a discarded lookahead does not touch
+    // them. The forced-keep repair path drops them like every side channel.
+    let user_observations = if options.force_keep_last_compartment {
+        Vec::new()
+    } else {
+        parsed.user_observations
+    };
+
     Ok(ValidatedChunk {
         compartments,
         facts,
         dropped_fact_blocks: parsed.dropped_fact_blocks,
         dropped_facts: parsed.dropped_facts,
         events,
+        user_observations,
         // A publication floor, not a promise that the next integer exists.
         unprocessed_from: last_new_end.saturating_add(1),
         discarded_last,
@@ -1423,6 +1456,15 @@ fn events_block_regex() -> Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?s)<events>(.*?)</events>").expect("events block regex"))
         .clone()
+}
+
+fn user_observations_block_regex() -> Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?s)<user_observations>(.*?)</user_observations>")
+            .expect("user observations block regex")
+    })
+    .clone()
 }
 
 /// Opening tag of a fact category block; group 1 is the category name.

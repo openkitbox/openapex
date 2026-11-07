@@ -2,7 +2,9 @@
 //! ordered `Vec<Item>`. Pure function, no IO. Shell / subagent completion
 //! notices and every described synthetic message (a historian fold notice)
 //! become rows; a synthetic without a description stays skipped, and so does a
-//! compaction still `running` (its settled states become boundary items).
+//! compaction still `running` (its settled states become boundary items) and
+//! every background-fold checkpoint (`reason: idle`, silent live, so silent
+//! on reload too).
 //! `*-switched`, `system` and `skill` messages become row items, and an
 //! `idle` error becomes one only when it differs from the error the turn's
 //! last step or settled compaction already shows (upstream `rows.ts`
@@ -44,7 +46,7 @@
 use std::sync::Arc;
 
 use ox_schema::message::{
-    AssistantContent, Compaction, Message, ToolState as WireToolState, ToolTime,
+    AssistantContent, Compaction, CompactionReason, Message, ToolState as WireToolState, ToolTime,
 };
 use ox_schema::support::{Content, FileAttachment};
 
@@ -176,6 +178,14 @@ pub fn parse_messages(messages: &[Message]) -> Vec<Item> {
                 })));
             }
             Message::Compaction(message) => {
+                // A background fold's checkpoint (`reason: idle`) is silent on
+                // the live stream — `publish_quiet` never broadcasts it — so
+                // a reload must not surface it either, or a reconnect would
+                // show summaries the user never saw while connected. It also
+                // leaves `shown` alone: the live reducer never ran for it.
+                if compaction_reason(&message.compaction) == CompactionReason::Idle {
+                    continue;
+                }
                 match &message.compaction {
                     Compaction::Running { .. } => {}
                     Compaction::Failed { error, .. } => shown.show(Some(ErrorInfo::from(error))),
@@ -260,6 +270,14 @@ fn reasoning_ms(content: &[AssistantContent]) -> Option<u64> {
             Some((completed - time.created).max(0) as u64)
         })
         .reduce(|total, part| total + part)
+}
+
+/// The `reason` every compaction status carries.
+fn compaction_reason(compaction: &Compaction) -> CompactionReason {
+    match compaction {
+        Compaction::Running { reason, .. } | Compaction::Failed { reason, .. } => *reason,
+        Compaction::Completed(done) => done.reason,
+    }
 }
 
 fn compaction_item(message: &ox_schema::message::CompactionMessage) -> CompactionItem {

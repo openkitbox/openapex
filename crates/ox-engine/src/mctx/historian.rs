@@ -131,6 +131,7 @@
 //!   have no consumer yet.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -139,7 +140,7 @@ use serde::Deserialize;
 use crate::mctx::budget::Budget;
 use crate::mctx::compartments::{self, NewCompartment, Tiers};
 use crate::mctx::historian_validate::{self, ValidateOptions};
-use crate::mctx::memory::MemoryRow;
+use crate::mctx::memory::{self, MemoryRow};
 use crate::mctx::promotion;
 use ox_core::config::Config;
 use ox_llm::cardinal::chat::Chat;
@@ -1133,10 +1134,14 @@ pub struct CompartmentPromptInputs<'a> {
     pub seed_examples: &'a str,
     pub session_references: &'a str,
     pub project_memory: &'a str,
+    /// `<user-profile>` — the user observations already promoted
+    /// ([`render_historian_user_profile_block`]), so the historian restates
+    /// none of them. Empty when none exist or they are not requested.
+    pub user_profile: &'a str,
     pub input_source: &'a str,
     pub memory_enabled: bool,
-    /// False when the dreamer is not runnable: the prompt then tells the
-    /// historian to skip `<user_observations>`.
+    /// False when nothing consumes `<user_observations>` (memory disabled):
+    /// the prompt then tells the historian to skip the block.
     pub user_observations_requested: bool,
     pub extraction_free: bool,
 }
@@ -1471,11 +1476,30 @@ pub fn build_reference_blocks(
 /// id.
 #[must_use]
 pub fn render_historian_memory_block(memories: &[MemoryRow]) -> String {
+    render_historian_tier(
+        "project-memory",
+        &HISTORIAN_MEMORY_CATEGORY_PRIORITY,
+        memories,
+    )
+}
+
+/// The user observations already stored, in the same id-free shape as
+/// [`render_historian_memory_block`] under `<user-profile>`: the historian's
+/// dedup input for `<user_observations>`, so a trait it already recorded is
+/// not restated every fold.
+#[must_use]
+pub fn render_historian_user_profile_block(memories: &[MemoryRow]) -> String {
+    render_historian_tier("user-profile", &memory::USER_CATEGORIES, memories)
+}
+
+/// One memory tier as `<tag><CATEGORY>- fact…</CATEGORY></tag>`, categories in
+/// the given order, or an empty string when nothing is stored.
+fn render_historian_tier(tag: &str, categories: &[&str], memories: &[MemoryRow]) -> String {
     let mut sections = Vec::new();
-    for category in HISTORIAN_MEMORY_CATEGORY_PRIORITY {
+    for category in categories {
         let category_memories: Vec<&MemoryRow> = memories
             .iter()
-            .filter(|memory| memory.category == category)
+            .filter(|memory| memory.category == *category)
             .collect();
         if category_memories.is_empty() {
             continue;
@@ -1490,10 +1514,7 @@ pub fn render_historian_memory_block(memories: &[MemoryRow]) -> String {
     if sections.is_empty() {
         String::new()
     } else {
-        format!(
-            "<project-memory>\n{}\n</project-memory>",
-            sections.join("\n")
-        )
+        format!("<{tag}>\n{}\n</{tag}>", sections.join("\n"))
     }
 }
 
@@ -1529,6 +1550,15 @@ fn push_historian_context_blocks(inputs: &CompartmentPromptInputs<'_>, parts: &m
     }
     if inputs.memory_enabled && !inputs.project_memory.is_empty() {
         parts.push(inputs.project_memory.to_string());
+    }
+    // The known profile is only a dedup input for `<user_observations>`, so
+    // it rides only when the block is asked for.
+    if inputs.memory_enabled
+        && inputs.user_observations_requested
+        && !inputs.extraction_free
+        && !inputs.user_profile.is_empty()
+    {
+        parts.push(inputs.user_profile.to_string());
     }
 }
 
@@ -1840,6 +1870,67 @@ pub struct RunCtx<'a, 'historian> {
     /// run it starts and lends the same policy to every fold it executes, so
     /// a per-fold copy of the string would buy nothing.
     pub reasoning_effort: Option<&'historian str>,
+    /// The session's live model, the one the user is actually talking to.
+    /// A run whose historian model fails before producing output retries
+    /// once through it ([`ModelChain`]); `None` falls back to the default.
+    pub session_model: Option<&'historian str>,
+}
+
+/// The models a hidden completion may try, in order: the historian's own
+/// ([`historian_model`]) and, when it is a different one, the model the
+/// session actually runs with (the catalogue default when no session is
+/// involved). The fallback exists because the two are usually different
+/// deployments: a cheap summarizer behind one gateway going down must not
+/// stall every fold while the main model is answering fine.
+///
+/// Only a failure *before any output* moves down the chain — a transport
+/// error, a timeout, an endpoint the router could not reach. A completion that
+/// arrived but did not validate is a model answer and is repaired on the same
+/// model; switching would mix two models' readings of one chunk.
+///
+/// Reference: codex `compact_model_fallback.rs` — compaction that failed on
+/// the previous model is retried once on the current one when they differ.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ModelChain<'a> {
+    primary: String,
+    fallback: Option<std::borrow::Cow<'a, str>>,
+}
+
+impl<'a> ModelChain<'a> {
+    /// Resolve the chain. `session_model` is the live model when the caller
+    /// has a session; otherwise the catalogue default stands in. A fallback
+    /// equal to the primary is dropped: the router already tried its
+    /// candidates, so the same id again would repeat the same failure.
+    pub(crate) fn resolve(
+        config: &Config,
+        catalog: &ox_llm::model_catalog::ModelCatalog,
+        session_model: Option<&'a str>,
+    ) -> Result<Self> {
+        let primary = historian_model(config, catalog)?;
+        let fallback = match session_model {
+            Some(model) => Some(std::borrow::Cow::Borrowed(model)),
+            None => catalog
+                .default_entry(&config.llm)
+                .map(|entry| std::borrow::Cow::Owned(entry.id)),
+        }
+        .filter(|model| **model != primary);
+        Ok(Self { primary, fallback })
+    }
+
+    /// The model a completion starts with.
+    pub(crate) fn primary(&self) -> &str {
+        &self.primary
+    }
+
+    /// The model to try after `current` failed before producing output:
+    /// the fallback when `current` is the primary, nothing further after
+    /// that (one step down, never a loop).
+    pub(crate) fn next_after(&self, current: &str) -> Option<&str> {
+        if current != self.primary {
+            return None;
+        }
+        self.fallback.as_deref()
+    }
 }
 
 /// The live request a run's messages can begin with (plan A3): the bytes the
@@ -1914,9 +2005,41 @@ pub struct RunOutcome {
 /// chain's length; ox drives a single model, so it re-prompts the same one a
 /// fixed number of times. Three is one original plus two repairs — enough for the
 /// common truncation and mismatched-close failures to self-correct. A validation
-/// failure is a *model* failure, so the same chunk is retried; a transport
-/// failure is not retried here at all.
+/// failure is a *model* failure, so the same chunk is retried on the same
+/// model; a transport failure is retried only as one step down the
+/// [`ModelChain`], and counts against the same bound.
 pub const HISTORIAN_MAX_ATTEMPTS: i64 = 3;
+
+/// The longest one historian completion may take before it counts as a
+/// transport failure: five minutes. A stream that stalls without closing
+/// would otherwise hold the session's run slot for the life of the process.
+pub const HISTORIAN_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// How long a `running` row stays authoritative without a heartbeat:
+/// [`HISTORIAN_COMPLETION_TIMEOUT`] with a full attempt's margin, so a live
+/// run — whose every attempt stamps `updated_at` — is never pre-empted, and
+/// one orphaned by a process that lost its connection (not its life, which
+/// [`settle_running_runs`] handles) is reclaimed by the next pressure event
+/// instead of blocking the session until restart.
+pub const HISTORIAN_LEASE: Duration = Duration::from_secs(2 * 5 * 60 + 60);
+
+/// [`collect_completion`] under [`HISTORIAN_COMPLETION_TIMEOUT`]. The
+/// timeout is an error like any transport failure: the run settles `failed`
+/// and the caller decides whether to retry.
+async fn collect_completion_bounded(chat: &Arc<dyn Chat>, request: &ChatRequest) -> Result<String> {
+    match tokio::time::timeout(
+        HISTORIAN_COMPLETION_TIMEOUT,
+        collect_completion(chat, request, "historian"),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(anyhow::anyhow!(
+            "historian completion timed out after {}s",
+            HISTORIAN_COMPLETION_TIMEOUT.as_secs()
+        )),
+    }
+}
 
 /// Importance a validated compartment gets when the model omitted the attribute.
 const DEFAULT_COMPARTMENT_IMPORTANCE: i64 = 50;
@@ -1949,8 +2072,9 @@ impl std::error::Error for ValidationFailure {}
 /// model failure: the same chunk is re-prompted through
 /// [`build_historian_repair_prompt`] until [`HISTORIAN_MAX_ATTEMPTS`] attempts
 /// have been made, then the row settles `failed` and the error is returned. A
-/// transport failure settles the row `failed` at once — retrying it is the
-/// caller's decision, not this run's.
+/// transport failure moves once down the [`ModelChain`] (the session's own
+/// model) when there is a step left to take; otherwise it settles the row
+/// `failed` at once — retrying it is the caller's decision, not this run's.
 ///
 /// The request shape follows [`RunPlan::prefix`]: with a live prefix the
 /// completion continues the conversation the provider already holds and states
@@ -1963,7 +2087,8 @@ impl std::error::Error for ValidationFailure {}
 /// claim the slot: it has done nothing at all, and the winner's compartments are
 /// what the next pass picks up.
 pub async fn run(ctx: &RunCtx<'_, '_>, plan: &RunPlan<'_>) -> Result<Option<RunOutcome>> {
-    let model = historian_model(ctx.config, ctx.catalog)?;
+    let chain = ModelChain::resolve(ctx.config, ctx.catalog, ctx.session_model)?;
+    let mut model = chain.primary();
     // The stored ranges are read before the run is claimed: a store failure must
     // leave no row behind for a run that never started.
     let prior = stored_ranges(ctx.db, plan.session_id).await?;
@@ -2017,7 +2142,7 @@ pub async fn run(ctx: &RunCtx<'_, '_>, plan: &RunPlan<'_>) -> Result<Option<RunO
         // cache hit on everything before the instruction.
         let request = match &plan.prefix {
             Some(prefix) => prefixed_request(
-                &model,
+                model,
                 prefix.system_static,
                 prefix.instructions,
                 &prefix.head,
@@ -2027,14 +2152,29 @@ pub async fn run(ctx: &RunCtx<'_, '_>, plan: &RunPlan<'_>) -> Result<Option<RunO
                 &user_prompt,
                 ctx.reasoning_effort,
             ),
-            None => historian_request_with_prompt(&model, &user_prompt, ctx.reasoning_effort),
+            None => historian_request_with_prompt(model, &user_prompt, ctx.reasoning_effort),
         };
 
-        let text = match collect_completion(ctx.chat, &request, "historian").await {
+        let text = match collect_completion_bounded(ctx.chat, &request).await {
             Ok(text) => text,
             Err(error) => {
-                settle_failed(ctx.db, &run_id, &error).await;
-                return Err(error);
+                // Nothing came back: one step down the chain, as one more
+                // attempt of this run, while the attempt budget allows it.
+                let Some(next) = chain.next_after(model).filter(|_| attempt < last_attempt) else {
+                    settle_failed(ctx.db, &run_id, &error).await;
+                    return Err(error);
+                };
+                tracing::warn!(
+                    session = %plan.session_id,
+                    failed_model = model,
+                    fallback_model = next,
+                    error = %error,
+                    "historian completion failed before output; retrying on the fallback model"
+                );
+                model = next;
+                attempt += 1;
+                update_run_attempt(ctx.db, &run_id, attempt).await?;
+                continue;
             }
         };
 
@@ -2047,10 +2187,16 @@ pub async fn run(ctx: &RunCtx<'_, '_>, plan: &RunPlan<'_>) -> Result<Option<RunO
                     mut compartments,
                     facts,
                     events,
+                    user_observations,
                     ..
                 } = validated;
+                let user_facts = promotion::user_candidates(user_observations);
+                let promotable = Promotable {
+                    facts: &facts,
+                    user_facts: &user_facts,
+                };
                 let compartment_ids =
-                    match publish_compartments(ctx.db, plan, &mut compartments, &facts).await {
+                    match publish_compartments(ctx.db, plan, &mut compartments, promotable).await {
                         Ok(ids) => ids,
                         Err(error) => {
                             settle_failed(ctx.db, &run_id, &error).await;
@@ -2149,13 +2295,28 @@ async fn stored_ranges(
 /// compartments that produced them. Promotion runs only when the prompt asked
 /// for facts (`memory_enabled`) and the model returned some.
 ///
+/// The side channels one publish may promote, borrowed from the validated
+/// plan. Project facts go to the project's pinboard; user facts (the
+/// historian's `<user_observations>`) go to the user tier.
+#[derive(Clone, Copy)]
+struct Promotable<'a> {
+    facts: &'a [historian_validate::FactCandidate],
+    user_facts: &'a [historian_validate::FactCandidate],
+}
+
+impl Promotable<'_> {
+    fn is_empty(&self) -> bool {
+        self.facts.is_empty() && self.user_facts.is_empty()
+    }
+}
+
 /// Consumes the compartments' strings (`&mut` is ownership transfer here):
 /// validation already produced them and the publish plan is not read again.
 async fn publish_compartments(
     db: &ox_db::Db,
     plan: &RunPlan<'_>,
     compartments: &mut [historian_validate::ValidatedCompartment],
-    facts: &[historian_validate::FactCandidate],
+    promotable: Promotable<'_>,
 ) -> Result<Vec<String>> {
     let session_id = plan.session_id;
     let mut pending: Vec<(String, Tiers, f64)> = Vec::with_capacity(compartments.len());
@@ -2191,7 +2352,26 @@ async fn publish_compartments(
     // Serialized before the transaction opens (see `compartments::insert_all`).
     let tiers = compartments::serialize_tiers(&rows)?;
     let now = now_millis();
-    let promote = plan.prompt.memory_enabled && !facts.is_empty();
+    // Promotion is withheld for a session with memory switched off or one
+    // carrying external content (see `mctx::memory_mode`): the side channels
+    // are still stored on the run row, but nothing becomes project memory.
+    // Read before the write transaction opens so the check never extends it.
+    let wanted = plan.prompt.memory_enabled && !promotable.is_empty();
+    let withheld = if wanted {
+        crate::mctx::memory_mode::promotion_withheld(db, session_id).await?
+    } else {
+        None
+    };
+    if let Some(reason) = withheld {
+        tracing::info!(
+            session = %session_id,
+            facts = promotable.facts.len(),
+            user_facts = promotable.user_facts.len(),
+            reason = reason.as_str(),
+            "historian side channels not promoted"
+        );
+    }
+    let promote = wanted && withheld.is_none();
     let tx = db.begin().await?;
     compartments::insert_all_in(&tx, &rows, &tiers, now)
         .await
@@ -2201,25 +2381,44 @@ async fn publish_compartments(
                 rows.len()
             )
         })?;
-    let promoted = if promote {
-        Some(promotion::apply(&tx, plan.project, facts, now).await?)
-    } else {
-        None
-    };
+    if promote {
+        promote_side_channels(&tx, plan, promotable, now).await?;
+    }
     tx.commit()
         .await
         .with_context(|| format!("commit historian publish for session {session_id}"))?;
-    if let Some(summary) = promoted {
+    Ok(pending.into_iter().map(|(id, _, _)| id).collect())
+}
+
+/// Promote the project facts into the project and the user observations into
+/// the user tier, inside the publish transaction. Each tier is one promotion
+/// pass over its own owner; the ids they mint are sequential because the
+/// passes run back to back on one write transaction.
+async fn promote_side_channels(
+    tx: &ox_db::WriteTx<'_>,
+    plan: &RunPlan<'_>,
+    promotable: Promotable<'_>,
+    now: i64,
+) -> Result<()> {
+    let tiers = [
+        (plan.project, promotable.facts),
+        (crate::mctx::memory::USER_SCOPE, promotable.user_facts),
+    ];
+    for (owner, facts) in tiers {
+        if facts.is_empty() {
+            continue;
+        }
+        let summary = promotion::apply(tx, owner, facts, now).await?;
         tracing::info!(
-            session = %session_id,
-            project = %plan.project,
+            session = %plan.session_id,
+            owner,
             facts = facts.len(),
             inserted = summary.inserted,
             bumped = summary.bumped,
-            "historian facts promoted"
+            "historian side channel promoted"
         );
     }
-    Ok(pending.into_iter().map(|(id, _, _)| id).collect())
+    Ok(())
 }
 
 /// A validated importance clamped into the store's 1..100 decay band.
@@ -2296,18 +2495,28 @@ pub async fn settle_running_runs(db: &ox_db::Db) -> Result<usize> {
     Ok(settled as usize)
 }
 
-/// The one predicate saying a session's run slot is taken. Shared by the
-/// pre-check and the claim so the two cannot drift apart.
-const RUNNING_RUN_SQL: &str =
-    "SELECT count(*) FROM mc_historian_run WHERE session_id = ?1 AND state = 'running'";
+/// The one predicate saying a session's run slot is taken: a `running` row
+/// whose lease (`updated_at`, stamped at claim and on every attempt) is
+/// younger than `?2`. Shared by the pre-check and the claim so the two cannot
+/// drift apart.
+const RUNNING_RUN_SQL: &str = "SELECT count(*) FROM mc_historian_run
+     WHERE session_id = ?1 AND state = 'running' AND updated_at >= ?2";
+
+/// The oldest `updated_at` a `running` row may carry at `now` and still hold
+/// its slot.
+fn lease_floor(now: i64) -> i64 {
+    now.saturating_sub(HISTORIAN_LEASE.as_millis() as i64)
+}
 
 /// Whether `session_id` already has a run in flight, without touching the store
 /// otherwise: the trigger's cheap early exit before it loads the tail. A row is
-/// `running` from before its completion starts until it settles.
+/// `running` from before its completion starts until it settles — or until
+/// its lease lapses, after which it no longer counts (and the next claim
+/// settles it).
 pub async fn has_running_run(db: &ox_db::Db, session_id: &str) -> Result<bool> {
     let conn = db.acquire().await?;
     let mut stmt = conn.prepare(RUNNING_RUN_SQL).await?;
-    let mut rows = stmt.query([session_id]).await?;
+    let mut rows = stmt.query((session_id, lease_floor(now_millis()))).await?;
     Ok(match rows.next().await? {
         Some(row) => row.get::<i64>(0)? > 0,
         None => false,
@@ -2317,10 +2526,13 @@ pub async fn has_running_run(db: &ox_db::Db, session_id: &str) -> Result<bool> {
 /// Claim the session's run slot: write the `running` row and hand back its id,
 /// or `None` when another run already holds it.
 ///
-/// One statement, because the rule lives in the schema: `mc_historian_run_running_idx`
-/// is unique over the running rows, so the losing insert matches that conflict,
-/// inserts nothing and returns no row. There is no read-then-write window to
-/// lose, in this process or in another one over the same file.
+/// The claim is one insert, because the rule lives in the schema:
+/// `mc_historian_run_running_idx` is unique over the running rows, so the
+/// losing insert matches that conflict, inserts nothing and returns no row.
+/// Before it, inside the same write transaction, a `running` row whose lease
+/// has lapsed is settled `aborted` so the slot can be taken: with the write
+/// gate held there is no window in which two claimants both see the slot
+/// free, in this process or in another one over the same file.
 async fn claim_run(
     db: &ox_db::Db,
     session_id: &str,
@@ -2329,23 +2541,39 @@ async fn claim_run(
 ) -> Result<Option<String>> {
     let run_id = id("hrun");
     let now = now_millis();
-    let conn = db.acquire().await?;
-    let mut stmt = conn
-        .prepare(
-            "INSERT INTO mc_historian_run
-                 (id, session_id, state, chunk_ref, attempt, created_at, updated_at)
-             VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?5)
-             ON CONFLICT (session_id) WHERE state = 'running' DO NOTHING
-             RETURNING id",
+    let tx = db.begin().await?;
+    let reclaimed = tx
+        .execute(
+            "UPDATE mc_historian_run
+                SET state = 'aborted', updated_at = ?3,
+                    error = 'lease expired: no heartbeat within the historian lease'
+              WHERE session_id = ?1 AND state = 'running' AND updated_at < ?2",
+            (session_id, lease_floor(now), now),
         )
         .await?;
-    let mut rows = stmt
-        .query((run_id.as_str(), session_id, chunk_ref, attempt, now))
-        .await?;
-    Ok(match rows.next().await? {
-        Some(row) => Some(row.get::<String>(0)?),
-        None => None,
-    })
+    if reclaimed > 0 {
+        tracing::warn!(session = %session_id, "historian run slot reclaimed from an expired lease");
+    }
+    let claimed = {
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO mc_historian_run
+                     (id, session_id, state, chunk_ref, attempt, created_at, updated_at)
+                 VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?5)
+                 ON CONFLICT (session_id) WHERE state = 'running' DO NOTHING
+                 RETURNING id",
+            )
+            .await?;
+        let mut rows = stmt
+            .query((run_id.as_str(), session_id, chunk_ref, attempt, now))
+            .await?;
+        match rows.next().await? {
+            Some(row) => Some(row.get::<String>(0)?),
+            None => None,
+        }
+    };
+    tx.commit().await?;
+    Ok(claimed)
 }
 
 /// Move a run row to its terminal state.
@@ -2451,10 +2679,13 @@ pub(crate) async fn collect_completion(
     request: &ChatRequest,
     purpose: &'static str,
 ) -> Result<String> {
-    let mut stream = chat
-        .stream_chat(request)
-        .await
-        .context("historian completion request failed")?;
+    let mut stream = match chat.stream_chat(request).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            crate::mctx::quota::observe(&error, now_millis());
+            return Err(anyhow::Error::new(error).context("historian completion request failed"));
+        }
+    };
     let mut text = String::new();
     let mut usage: Option<Usage> = None;
     loop {
@@ -2464,6 +2695,7 @@ pub(crate) async fn collect_completion(
             Some(Ok(StreamEvent::Usage(reported))) => usage = Some(reported),
             Some(Ok(_)) => {}
             Some(Err(error)) => {
+                crate::mctx::quota::observe(&error, now_millis());
                 return Err(anyhow::Error::new(error).context("historian completion stream failed"));
             }
             None => break,

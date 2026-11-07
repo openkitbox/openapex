@@ -241,6 +241,14 @@ impl SourceFilter {
     /// and one the model asks about explicitly).
     pub(crate) const RECALL: Self = Self([true, true, true, false, false]);
 
+    /// This filter with `source` excluded (recall for a session whose memory
+    /// switch is off drops the memory lane, keeps the rest).
+    #[must_use]
+    pub(crate) fn without(mut self, source: Source) -> Self {
+        self.0[source as usize] = false;
+        self
+    }
+
     fn contains(self, source: Source) -> bool {
         self.0[source as usize]
     }

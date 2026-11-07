@@ -169,6 +169,15 @@ pub enum AppCommand {
     ForkSession {
         session: String,
     },
+    /// Flip the session's memory switch; the answer is `AppEvent::MemoryMode`.
+    ToggleMemory {
+        session: String,
+    },
+    /// Archive the project's active memories; the answer is
+    /// `AppEvent::MemoryCleared`.
+    ClearMemory {
+        session: String,
+    },
     /// `GET /api/fs/find` for the `@` file menu; the answer is `AppEvent::Files`.
     FindFiles(String),
     /// A paste that looks like image/PDF paths: read the files off the UI

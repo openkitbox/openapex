@@ -79,6 +79,8 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
         }
         AppCommand::DeleteSession { session } => delete_session(&client, &tx, session).await,
         AppCommand::ForkSession { session } => fork_session(&client, &tx, &session).await,
+        AppCommand::ToggleMemory { session } => toggle_memory(&client, &tx, &session).await,
+        AppCommand::ClearMemory { session } => clear_memory(&client, &tx, &session).await,
         AppCommand::ReplyForm {
             session,
             form,
@@ -342,6 +344,30 @@ async fn fork_session(client: &Client, tx: &Events, session: &str) {
     let event = match client.fork_session(session).await {
         Ok(forked) => AppEvent::SessionForked(forked),
         Err(err) => session_failed("Failed to fork session", err),
+    };
+    let _ = tx.send(event);
+}
+
+/// Read the switch, flip it, report the new state.
+async fn toggle_memory(client: &Client, tx: &Events, session: &str) {
+    let flipped = async {
+        let current = client.memory_mode(session).await?;
+        let next = if current == "off" { "on" } else { "off" };
+        client.set_memory_mode(session, next).await?;
+        Ok::<_, ox_client::Error>(next.to_owned())
+    }
+    .await;
+    let event = match flipped {
+        Ok(mode) => AppEvent::MemoryMode(mode),
+        Err(err) => session_failed("Failed to toggle memory", err),
+    };
+    let _ = tx.send(event);
+}
+
+async fn clear_memory(client: &Client, tx: &Events, session: &str) {
+    let event = match client.clear_memory(session).await {
+        Ok(archived) => AppEvent::MemoryCleared(archived),
+        Err(err) => session_failed("Failed to clear memories", err),
     };
     let _ = tx.send(event);
 }

@@ -32,6 +32,12 @@
 //!   `PROMOTABLE_CATEGORIES` also admits legacy categories. ox accepts
 //!   [`crate::mctx::memory::CATEGORIES`] only, and the historian parser has
 //!   already dropped every other category, so this pass does not re-check.
+//!
+//! The historian's `<user_observations>` take the same path into the user
+//! tier: [`user_candidates`] shapes them as [`FactCandidate`]s of
+//! [`crate::mctx::memory::USER_PROFILE`], and [`apply`] runs against
+//! [`crate::mctx::memory::USER_SCOPE`] instead of the project. One dedup, one
+//! `seen_count`, one confirmation rule for both tiers.
 
 use std::collections::HashSet;
 
@@ -141,9 +147,26 @@ pub(crate) fn plan_promotion<'a>(
     actions
 }
 
-/// Promote `facts` into `project`'s memories inside the caller's transaction.
+/// The historian's user observations as promotion candidates for the user
+/// tier. Observations carry no compartment anchor (they are about the user,
+/// not a stretch of transcript). Consumes the strings: the observations are
+/// not read again after promotion.
+#[must_use]
+pub(crate) fn user_candidates(observations: Vec<String>) -> Vec<FactCandidate> {
+    observations
+        .into_iter()
+        .map(|content| FactCandidate {
+            category: memory::USER_PROFILE.to_owned(),
+            content,
+            origin_compartment_index: None,
+        })
+        .collect()
+}
+
+/// Promote `facts` into `owner`'s memories inside the caller's transaction,
+/// where `owner` is a project or [`memory::USER_SCOPE`].
 ///
-/// Reads the project's active and archived memories, plans the writes with
+/// Reads the owner's active and archived memories, plans the writes with
 /// [`plan_promotion`] and executes them. A storage failure is returned so the
 /// caller's publish rolls back as a whole.
 pub(crate) async fn apply(

@@ -1035,7 +1035,7 @@ fn env_block(directory: &Path, home: &Path) -> String {
 /// (UTC calendar day → local calendar day), so the first post-deploy request
 /// per session emits a one-time `core/date` delta — a documented re-baseline,
 /// not a bug.
-fn local_date(timestamp_ms: i64, zone: &jiff::tz::TimeZone) -> String {
+pub(crate) fn local_date(timestamp_ms: i64, zone: &jiff::tz::TimeZone) -> String {
     jiff::Timestamp::from_millisecond(timestamp_ms)
         .expect("timestamp out of range")
         .to_zoned(zone.clone())

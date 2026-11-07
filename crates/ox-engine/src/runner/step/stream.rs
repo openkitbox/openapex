@@ -22,6 +22,7 @@ use super::attempt::{
 use super::error::{aborted_error, invalid_output_error, to_session_error};
 use super::tool::{fail_unsettled_tools, join_tool_tasks, settle_tool_calls};
 use super::usage::{attempt_tokens, observe_request_cost};
+use crate::mctx::citation::{self, CitationGate};
 /// One accumulating tool call from `ToolCallDelta` fragments.
 #[derive(Debug, Default)]
 pub(super) struct ToolAccum {
@@ -53,6 +54,9 @@ pub(super) async fn consume(
     mut stream: BoxChatStream,
 ) -> Result<Attempt> {
     let mut text = String::new();
+    // Keeps a `<mem-used>` mark out of the deltas; `text` stays raw and is
+    // cleaned once, at the end (`flush_blocks`).
+    let mut gate = CitationGate::default();
     let mut reasoning = String::new();
     let mut text_ordinal: Option<i64> = None;
     let mut reasoning_ordinal: Option<i64> = None;
@@ -89,7 +93,7 @@ pub(super) async fn consume(
                     params,
                     &mut text_ordinal,
                     &mut reasoning_ordinal,
-                    &text,
+                    (&text, &mut gate),
                     &reasoning,
                 )
                 .await?;
@@ -118,7 +122,7 @@ pub(super) async fn consume(
                     params,
                     &mut text_ordinal,
                     &mut reasoning_ordinal,
-                    &text,
+                    (&text, &mut gate),
                     &reasoning,
                 )
                 .await?;
@@ -160,15 +164,10 @@ pub(super) async fn consume(
                         text_ordinal = Some(ordinal);
                     }
                     text.push_str(&delta);
-                    let ordinal = text_ordinal.unwrap_or_default();
-                    ctx.bus
-                        .publish(SessionEventData::TextDelta {
-                            session_id: ctx.session_id.clone(),
-                            assistant_message_id: params.assistant_message_id.clone(),
-                            ordinal,
-                            delta,
-                        })
-                        .await?;
+                    if let Some(delta) = gate.admit(delta) {
+                        publish_text_delta(ctx, params, text_ordinal.unwrap_or_default(), delta)
+                            .await?;
+                    }
                 }
                 StreamEvent::ReasoningDelta(delta) => {
                     note_output(ctx, params, dispatch, started, &mut produced).await?;
@@ -278,7 +277,7 @@ pub(super) async fn consume(
         params,
         &mut text_ordinal,
         &mut reasoning_ordinal,
-        &text,
+        (&text, &mut gate),
         &reasoning,
     )
     .await?;
@@ -370,17 +369,44 @@ pub(super) async fn consume(
     }))
 }
 
+/// Publish one text delta of the open text block.
+async fn publish_text_delta(
+    ctx: &DrainCtx,
+    params: &StepParams<'_>,
+    ordinal: i64,
+    delta: String,
+) -> Result<()> {
+    ctx.bus
+        .publish(SessionEventData::TextDelta {
+            session_id: ctx.session_id.clone(),
+            assistant_message_id: params.assistant_message_id.clone(),
+            ordinal,
+            delta,
+        })
+        .await
+}
+
 /// Publish `text.ended`/`reasoning.ended` for any open blocks. Idempotent:
 /// ordinals are taken (set to `None`) as they close.
+///
+/// `text` is the raw accumulated text with its citation gate: whatever the
+/// gate still holds goes out as a last delta, the `<mem-used>` marks are
+/// stripped from the ended payload, and the memories they cite are stamped
+/// as used (a by-product; its failure is logged, never raised).
 async fn flush_blocks(
     ctx: &DrainCtx,
     params: &StepParams<'_>,
     text_ordinal: &mut Option<i64>,
     reasoning_ordinal: &mut Option<i64>,
-    text: &str,
+    text: (&str, &mut CitationGate),
     reasoning: &str,
 ) -> Result<()> {
+    let (text, gate) = text;
     if let Some(ordinal) = text_ordinal.take() {
+        if let Some(rest) = gate.finish() {
+            publish_text_delta(ctx, params, ordinal, rest).await?;
+        }
+        let (cleaned, cited) = citation::strip(text);
         ctx.bus
             .publish(SessionEventData::TextEnded {
                 session_id: ctx.session_id.clone(),
@@ -389,10 +415,12 @@ async fn flush_blocks(
                 // Same strip as the persistence boundary: the ended payload is
                 // what live clients render as the part's final text, so a
                 // copied tag run must not survive here either.
-                text: strip_copied_tag_notation(text).into_owned(),
+                text: strip_copied_tag_notation(&cleaned).into_owned(),
                 state: None,
             })
             .await?;
+        let project = ctx.directory.to_string_lossy();
+        citation::record(&ctx.db, &project, &cited, ox_schema::id::now_millis()).await;
     }
     if let Some(ordinal) = reasoning_ordinal.take() {
         ctx.bus

@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::mctx::historian::{collect_completion, historian_model};
-use crate::mctx::memory::{self, CATEGORIES};
+use crate::mctx::historian::{ModelChain, collect_completion};
+use crate::mctx::memory;
 use crate::mctx::redact;
 use ox_core::config::Config;
 use ox_db::Db;
@@ -21,6 +21,7 @@ use super::curate::{
     CURATE_SYSTEM_PROMPT, apply_curate_manifest, curate_scope, parse_curate_manifest,
     render_curate_prompt,
 };
+use super::expire::run_expire;
 use super::retrospective::{
     RETROSPECTIVE_SYSTEM_PROMPT, fact_recorded, parse_retrospective, render_retrospective_prompt,
     validate_retrospective_lesson,
@@ -164,9 +165,24 @@ impl Dreamer {
             return Ok(report);
         }
         let interval = self.interval_millis();
+        // A provider that just throttled gets no background completions for
+        // the cool-down: the model-free tasks still run, the rest wait for
+        // the next tick (their due slot is unchanged, so nothing is lost).
+        let cooling = crate::mctx::quota::cooling_until(now);
+        if let Some(until) = cooling {
+            tracing::debug!(
+                until,
+                "dreamer: provider throttled recently; model-backed tasks deferred"
+            );
+        }
+        // Owners, not only projects: the user tier is listed like any other
+        // when it holds memories, and each task decides whether it applies.
         let projects = memory::projects_with_active_memories(&self.db).await?;
         for project in projects {
             for task in DreamTask::ALL {
+                if !task.applies_to(&project) || (cooling.is_some() && task.needs_model()) {
+                    continue;
+                }
                 // A host failure on one task is that task's failure: it must not
                 // cancel the rest of the tick (the other tasks, the other
                 // projects, and the results already gathered).
@@ -210,7 +226,7 @@ impl Dreamer {
                     continue;
                 };
                 let outcome = self.run_task(&project, task, &state, now).await;
-                let status = match self.settle(&project, task, now, outcome).await {
+                let status = match self.settle(&project, task, &state, now, outcome).await {
                     Ok(status) => status,
                     Err(error) => {
                         // The task's own work is done; only recording it failed.
@@ -253,17 +269,24 @@ impl Dreamer {
         })
     }
 
-    /// Record a settled task and render its report entry.
+    /// Record a settled task and render its report entry. `state` is the row
+    /// the run loaded; a recorded fingerprint is merged into its map.
     async fn settle(
         &self,
         project: &str,
         task: DreamTask,
+        state: &DreamState,
         now: i64,
         outcome: TaskOutcome,
     ) -> Result<TickStatus> {
         match outcome {
-            TaskOutcome::Completed { detail, cursor } => {
-                settle_success(&self.db, project, task, now, cursor).await?;
+            TaskOutcome::Completed {
+                detail,
+                cursor,
+                fingerprint,
+            } => {
+                let fingerprint = fingerprint.as_ref().map(|fingerprint| (state, fingerprint));
+                settle_success(&self.db, project, task, now, cursor, fingerprint).await?;
                 tracing::info!(
                     project = %project,
                     task = task.as_str(),
@@ -272,8 +295,8 @@ impl Dreamer {
                 );
                 Ok(TickStatus::Completed { detail })
             }
-            TaskOutcome::Skipped { detail } => {
-                settle_skip(&self.db, project, task, now).await?;
+            TaskOutcome::Skipped { detail, cursor } => {
+                settle_skip(&self.db, project, task, now, cursor).await?;
                 tracing::debug!(
                     project = %project,
                     task = task.as_str(),
@@ -312,6 +335,7 @@ impl Dreamer {
         started_at: i64,
     ) -> TaskOutcome {
         match task {
+            DreamTask::Expire => self.run_expire(project, started_at).await,
             DreamTask::Verify => self.run_verify(project, started_at).await,
             DreamTask::Curate => self.run_curate(project, state).await,
             DreamTask::Classify => self.run_classify(project).await,
@@ -321,21 +345,40 @@ impl Dreamer {
     }
 
     /// One hidden, tool-free completion through the historian's resolved model
-    /// and transport (one route to the model, not two).
+    /// and transport (one route to the model, not two). A failure before any
+    /// output steps once down the [`ModelChain`] (the catalogue default, since
+    /// a dream has no session).
     async fn complete(&self, system: &str, user_prompt: &str) -> Result<String, TaskFailure> {
-        let model = historian_model(&self.config, &self.catalog).map_err(|error| TaskFailure {
-            class: FailureClass::NoModels,
-            message: error.root_cause().to_string(),
-        })?;
-        let request = dreamer_request(&model, system, user_prompt);
-        // Dreamer has no parent session policy; the request carries no
-        // reasoning effort deliberately, leaving the provider's default.
-        let text = collect_completion(&self.chat, &request, "dreamer")
-            .await
-            .map_err(|error| TaskFailure {
-                class: FailureClass::ProviderError,
+        let chain = ModelChain::resolve(&self.config, &self.catalog, None).map_err(|error| {
+            TaskFailure {
+                class: FailureClass::NoModels,
                 message: error.root_cause().to_string(),
-            })?;
+            }
+        })?;
+        let mut model = chain.primary();
+        let text = loop {
+            let request = dreamer_request(model, system, user_prompt);
+            // Dreamer has no parent session policy; the request carries no
+            // reasoning effort deliberately, leaving the provider's default.
+            match collect_completion(&self.chat, &request, "dreamer").await {
+                Ok(text) => break text,
+                Err(error) => {
+                    let Some(next) = chain.next_after(model) else {
+                        return Err(TaskFailure {
+                            class: FailureClass::ProviderError,
+                            message: error.root_cause().to_string(),
+                        });
+                    };
+                    tracing::warn!(
+                        failed_model = model,
+                        fallback_model = next,
+                        error = %error,
+                        "dreamer completion failed before output; retrying on the fallback model"
+                    );
+                    model = next;
+                }
+            }
+        };
         // A stop with no text is an outage shape, not an answer: classify it
         // apart from a parse failure so a retry can be reasoned about
         // (`provider-output-failure.ts`).
@@ -346,6 +389,21 @@ impl Dreamer {
             });
         }
         Ok(text)
+    }
+
+    // -- expire -------------------------------------------------------------
+
+    /// `expire`: archive the owner's historian facts that aged out unconfirmed
+    /// or unused. No gate and no model: the policy is one `UPDATE`, and a
+    /// pass that archives nothing is a skip.
+    async fn run_expire(&self, owner: &str, started_at: i64) -> TaskOutcome {
+        match run_expire(&self.db, owner, started_at).await {
+            Ok(report) if report.archived == 0 => {
+                TaskOutcome::skipped("no memory aged past its expiry".to_owned())
+            }
+            Ok(report) => TaskOutcome::completed(report.describe()),
+            Err(error) => TaskOutcome::Failed(TaskFailure::host("expire memories", &error)),
+        }
     }
 
     // -- verify -------------------------------------------------------------
@@ -364,9 +422,9 @@ impl Dreamer {
             .collect();
         let batch: Vec<Candidate> = candidates.into_iter().take(VERIFY_MEMORY_LIMIT).collect();
         if batch.is_empty() {
-            return TaskOutcome::Skipped {
-                detail: "no memory cites a file that is missing or newer than it".to_owned(),
-            };
+            return TaskOutcome::skipped(
+                "no memory cites a file that is missing or newer than it".to_owned(),
+            );
         }
         let prompt = render_verify_prompt(project, &batch);
         let text = match self.complete(VERIFY_SYSTEM_PROMPT, &prompt).await {
@@ -383,10 +441,7 @@ impl Dreamer {
             }
         };
         match apply_verify_manifest(&self.db, project, &batch, &manifest, started_at).await {
-            Ok(report) => TaskOutcome::Completed {
-                detail: report.describe(),
-                cursor: None,
-            },
+            Ok(report) => TaskOutcome::completed(report.describe()),
             Err(error) => TaskOutcome::Failed(TaskFailure::host("apply verify manifest", &error)),
         }
     }
@@ -396,18 +451,36 @@ impl Dreamer {
     /// `curate`: one category per run, scanning from the persisted cursor for
     /// the first category with at least two memories. A category with a single
     /// memory is passed over (it cannot contain a duplicate pair), so the scan
-    /// never wedges, and the cursor advances only past a category that
-    /// actually ran (the reference's `curateTaskStateAfterSuccess`).
+    /// never wedges, and the cursor advances past a category that actually
+    /// ran (the reference's `curateTaskStateAfterSuccess`) — or that the
+    /// dirty check found unchanged since its last run, so an idle pool costs
+    /// no completion and the rotation still moves on.
     async fn run_curate(&self, project: &str, state: &DreamState) -> TaskOutcome {
         let memories = match memory::active_memories_with_watermark(&self.db, project).await {
             Ok(memories) => memories,
             Err(error) => return TaskOutcome::Failed(TaskFailure::host("read memories", &error)),
         };
-        let Some(scope) = curate_scope(state.rotation_cursor, &memories) else {
-            return TaskOutcome::Skipped {
-                detail: "no category holds two or more memories".to_owned(),
-            };
+        let categories = memory::categories_of(project);
+        let Some(scope) = curate_scope(state.rotation_cursor, categories, &memories) else {
+            return TaskOutcome::skipped("no category holds two or more memories");
         };
+        // The modulo keeps the cursor inside the owner's list however the
+        // list grows.
+        let next_cursor = {
+            let len = categories.len() as u32;
+            let used = categories
+                .iter()
+                .position(|category| *category == scope.category)
+                .unwrap_or(0) as u32;
+            Some((used + 1) % len)
+        };
+        let fingerprint = scope.fingerprint();
+        if state.is_unchanged(&fingerprint) {
+            return TaskOutcome::Skipped {
+                detail: format!("{} unchanged since its last curate run", scope.category),
+                cursor: next_cursor,
+            };
+        }
         let prompt = render_curate_prompt(project, scope.category, &scope.memories);
         let text = match self.complete(CURATE_SYSTEM_PROMPT, &prompt).await {
             Ok(text) => text,
@@ -423,21 +496,14 @@ impl Dreamer {
             }
         };
         match apply_curate_manifest(&self.db, project, &scope, &manifest).await {
-            Ok(report) => {
-                // Advance the cursor past the category that ran, so the next
-                // run covers the next one (the reference's
-                // `curateTaskStateAfterSuccess`). The modulo keeps it inside
-                // the canonical five however the list grows.
-                let len = CATEGORIES.len() as u32;
-                let used = CATEGORIES
-                    .iter()
-                    .position(|category| *category == scope.category)
-                    .unwrap_or(0) as u32;
-                TaskOutcome::Completed {
-                    detail: report.describe(),
-                    cursor: Some((used + 1) % len),
-                }
-            }
+            // The fingerprint recorded is the input this run saw: a manifest
+            // that changed rows moves their watermarks, so the next rotation
+            // re-reads the consolidated text once and then settles.
+            Ok(report) => TaskOutcome::Completed {
+                detail: report.describe(),
+                cursor: next_cursor,
+                fingerprint: Some(fingerprint),
+            },
             Err(error) => TaskOutcome::Failed(TaskFailure::host("apply curate manifest", &error)),
         }
     }
@@ -461,9 +527,7 @@ impl Dreamer {
             }
         };
         if pending == 0 {
-            return TaskOutcome::Skipped {
-                detail: "no unclassified memories".to_owned(),
-            };
+            return TaskOutcome::skipped("no unclassified memories".to_owned());
         }
         let batch = match unclassified_batch(&self.db, project).await {
             Ok(batch) => batch,
@@ -477,9 +541,7 @@ impl Dreamer {
         // A row written between the count and the read can leave the batch
         // empty; the gate's answer is still "nothing to do".
         if batch.is_empty() {
-            return TaskOutcome::Skipped {
-                detail: "no unclassified memories".to_owned(),
-            };
+            return TaskOutcome::skipped("no unclassified memories".to_owned());
         }
         let prompt = render_classify_prompt(project, &batch);
         let text = match self.complete(CLASSIFY_SYSTEM_PROMPT, &prompt).await {
@@ -496,10 +558,7 @@ impl Dreamer {
             }
         };
         match apply_classify_manifest(&self.db, project, &manifest).await {
-            Ok(applied) => TaskOutcome::Completed {
-                detail: format!("classified {applied} memories"),
-                cursor: None,
-            },
+            Ok(applied) => TaskOutcome::completed(format!("classified {applied} memories")),
             Err(error) => TaskOutcome::Failed(TaskFailure::host("apply classify manifest", &error)),
         }
     }
@@ -531,9 +590,7 @@ impl Dreamer {
             }
         };
         if turns.is_empty() {
-            return TaskOutcome::Skipped {
-                detail: "no recent user messages".to_owned(),
-            };
+            return TaskOutcome::skipped("no recent user messages".to_owned());
         }
         let prompt = render_retrospective_prompt(project, &turns);
         let text = match self.complete(RETROSPECTIVE_SYSTEM_PROMPT, &prompt).await {
@@ -543,10 +600,7 @@ impl Dreamer {
         let lesson = match parse_retrospective(&text) {
             Ok(Some(lesson)) => lesson,
             Ok(None) => {
-                return TaskOutcome::Completed {
-                    detail: "nothing durable".to_owned(),
-                    cursor: None,
-                };
+                return TaskOutcome::completed("nothing durable".to_owned());
             }
             Err(message) => {
                 return TaskOutcome::Failed(TaskFailure {
@@ -568,10 +622,7 @@ impl Dreamer {
                 project = %project,
                 "retrospective rejected: {reason:?}"
             );
-            return TaskOutcome::Completed {
-                detail: format!("rejected: {reason:?}"),
-                cursor: None,
-            };
+            return TaskOutcome::completed(format!("rejected: {reason:?}"));
         }
         // The store keeps the redacted text, so the exact-match dedup must
         // compare the redacted form too; the write re-redacts it as a no-op.
@@ -579,20 +630,14 @@ impl Dreamer {
         match fact_recorded(&self.db, project, &content).await {
             Ok(false) => {}
             Ok(true) => {
-                return TaskOutcome::Completed {
-                    detail: "already recorded".to_owned(),
-                    cursor: None,
-                };
+                return TaskOutcome::completed("already recorded".to_owned());
             }
             Err(error) => {
                 return TaskOutcome::Failed(TaskFailure::host("check recorded facts", &error));
             }
         }
         match memory::write_memory(&self.db, project, &content, lesson.category).await {
-            Ok(id) => TaskOutcome::Completed {
-                detail: format!("recorded memory #{id}"),
-                cursor: None,
-            },
+            Ok(id) => TaskOutcome::completed(format!("recorded memory #{id}")),
             Err(error) => TaskOutcome::Failed(TaskFailure::host("write memory", &error)),
         }
     }
@@ -624,9 +669,7 @@ impl Dreamer {
             }
         };
         if parked == 0 {
-            return TaskOutcome::Skipped {
-                detail: "no parked notes with a condition".to_owned(),
-            };
+            return TaskOutcome::skipped("no parked notes with a condition".to_owned());
         }
         let batch = match parked_notes(&self.db, project).await {
             Ok(batch) => batch,
@@ -637,9 +680,7 @@ impl Dreamer {
         // A note dismissed between the count and the read can leave the batch
         // empty; the gate's answer is still "nothing to do".
         if batch.is_empty() {
-            return TaskOutcome::Skipped {
-                detail: "no parked notes with a condition".to_owned(),
-            };
+            return TaskOutcome::skipped("no parked notes with a condition".to_owned());
         }
         let turns = match recent_user_turns(&self.db, project, state.last_run_at.unwrap_or(0)).await
         {
@@ -649,9 +690,9 @@ impl Dreamer {
             }
         };
         if turns.is_empty() {
-            return TaskOutcome::Skipped {
-                detail: "no recent activity to check conditions against".to_owned(),
-            };
+            return TaskOutcome::skipped(
+                "no recent activity to check conditions against".to_owned(),
+            );
         }
         let prompt = render_surface_prompt(project, &batch, &turns);
         let text = match self.complete(SURFACE_SYSTEM_PROMPT, &prompt).await {
@@ -676,14 +717,8 @@ impl Dreamer {
             }
         };
         match apply_surfaced(&self.db, &ids, at).await {
-            Ok(0) => TaskOutcome::Completed {
-                detail: "no conditions satisfied".to_owned(),
-                cursor: None,
-            },
-            Ok(applied) => TaskOutcome::Completed {
-                detail: format!("surfaced {applied} notes"),
-                cursor: None,
-            },
+            Ok(0) => TaskOutcome::completed("no conditions satisfied".to_owned()),
+            Ok(applied) => TaskOutcome::completed(format!("surfaced {applied} notes")),
             Err(error) => TaskOutcome::Failed(TaskFailure::host("apply surfaced notes", &error)),
         }
     }

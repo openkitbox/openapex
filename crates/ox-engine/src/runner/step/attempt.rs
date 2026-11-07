@@ -91,6 +91,14 @@ pub(super) enum AttemptFailure {
 }
 
 impl AttemptFailure {
+    /// Tell the provider quota guard about a transport failure, so a
+    /// throttle seen by a live turn also holds the dreamer back.
+    fn observe_quota(&self) {
+        if let AttemptFailure::Transport(error) = self {
+            crate::mctx::quota::observe(error, id::now_millis());
+        }
+    }
+
     /// How this failure is retried; an incomplete stream is bounded.
     fn retry_kind(&self) -> RetryKind {
         match self {
@@ -178,6 +186,7 @@ pub(crate) async fn run(
         let stream = match opened {
             Ok(stream) => stream,
             Err(error) => {
+                crate::mctx::quota::observe(&error, id::now_millis());
                 // The flight recorder for the pairing-400 class
                 // (docs/tool-call-pairing-400.md): what ox put on the wire
                 // (post pairing-guard) beside what the upstream named as
@@ -233,6 +242,7 @@ pub(crate) async fn run(
                 published,
                 tokens,
             } => {
+                failure.observe_quota();
                 // Overflow recovery is a pre-output concern (upstream gates
                 // Outcome.Compacted on `!outputStarted`).
                 if !published && failure.is_overflow() {

@@ -217,6 +217,26 @@ struct CreateEnvelope {
 }
 
 #[derive(Deserialize)]
+struct MemoryModeEnvelope {
+    data: MemoryModeData,
+}
+
+#[derive(Deserialize)]
+struct MemoryModeData {
+    mode: String,
+}
+
+#[derive(Deserialize)]
+struct MemoryClearedEnvelope {
+    data: MemoryClearedData,
+}
+
+#[derive(Deserialize)]
+struct MemoryClearedData {
+    archived: u64,
+}
+
+#[derive(Deserialize)]
 struct SessionEnvelope {
     data: StoredSession,
 }
@@ -660,6 +680,55 @@ impl Client {
             return Err(Error::Status(resp.status()));
         }
         Ok(())
+    }
+
+    /// `GET /api/session/{id}/memory`: the session's memory switch, `"on"`
+    /// or `"off"`.
+    pub async fn memory_mode(&self, session: &str) -> Result<String> {
+        let resp = self
+            .request(
+                reqwest::Method::GET,
+                &format!("/api/session/{session}/memory"),
+            )
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Error::Status(resp.status()));
+        }
+        Ok(resp.json::<MemoryModeEnvelope>().await?.data.mode)
+    }
+
+    /// `POST /api/session/{id}/memory` with `{mode}` (204).
+    pub async fn set_memory_mode(&self, session: &str, mode: &str) -> Result<()> {
+        let resp = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/api/session/{session}/memory"),
+            )
+            .json(&serde_json::json!({ "mode": mode }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Error::Status(resp.status()));
+        }
+        Ok(())
+    }
+
+    /// `POST /api/session/{id}/memory/clear` for the session's project:
+    /// archives its active memories and returns how many.
+    pub async fn clear_memory(&self, session: &str) -> Result<u64> {
+        let resp = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/api/session/{session}/memory/clear"),
+            )
+            .json(&serde_json::json!({ "scope": "project" }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Error::Status(resp.status()));
+        }
+        Ok(resp.json::<MemoryClearedEnvelope>().await?.data.archived)
     }
 
     /// `DELETE /api/session/{id}` (204); the server cascades to descendants.

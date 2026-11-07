@@ -515,6 +515,16 @@ const MIGRATION_V20: &str = r#"
 ALTER TABLE mc_memory ADD COLUMN last_used_at integer NOT NULL DEFAULT 0;
 "#;
 
+/// V21: `mc_dream_state.fingerprints`, a JSON object of `key → fingerprint`
+/// describing the input a task's last successful run saw (the dreamer's
+/// dirty check; `curate` keys it by category). A task whose current input
+/// fingerprints the same as the stored one skips its completion. `NULL` is
+/// "nothing recorded" and reads as an empty object. Purely additive, so it
+/// applies onto any V20-stamped database.
+const MIGRATION_V21: &str = r#"
+ALTER TABLE mc_dream_state ADD COLUMN fingerprints text;
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
@@ -539,6 +549,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (18, MIGRATION_V18),
     (19, MIGRATION_V19),
     (20, MIGRATION_V20),
+    (21, MIGRATION_V21),
 ];
 
 /// Async handle to the database.

@@ -421,6 +421,25 @@ impl App {
             AppEvent::SessionOpFailed { title, error } => {
                 self.show_toast(Toast::error(title, error, Instant::now()))
             }
+            AppEvent::MemoryMode(mode) => {
+                let message = if mode == "off" {
+                    "Memory off for this session: nothing injected, nothing extracted"
+                } else {
+                    "Memory on for this session"
+                };
+                self.show_toast(Toast::new(
+                    toast::Variant::Info,
+                    None,
+                    message,
+                    Instant::now(),
+                ));
+            }
+            AppEvent::MemoryCleared(archived) => self.show_toast(Toast::new(
+                toast::Variant::Info,
+                None,
+                format!("Archived {archived} project memories"),
+                Instant::now(),
+            )),
         }
     }
 
@@ -1450,6 +1469,16 @@ impl App {
             CommandAction::Fork => {
                 if let Some(session) = self.session.clone() {
                     let _ = self.commands.send(AppCommand::ForkSession { session });
+                }
+            }
+            CommandAction::Memory => {
+                if let Some(session) = self.session.clone() {
+                    let _ = self.commands.send(AppCommand::ToggleMemory { session });
+                }
+            }
+            CommandAction::Forget => {
+                if let Some(session) = self.session.clone() {
+                    let _ = self.commands.send(AppCommand::ClearMemory { session });
                 }
             }
             CommandAction::New | CommandAction::Clear => {

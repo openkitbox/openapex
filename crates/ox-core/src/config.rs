@@ -664,7 +664,7 @@ pub const MIN_HISTORY_SHARE: f64 = 0.05;
 pub const MAX_HISTORY_SHARE: f64 = 0.5;
 
 /// The `[magic_context]` section of `ox.toml`. Every field tolerates a
-/// missing key; the section itself is optional and defaults to disabled.
+/// missing key; the section itself is optional and defaults to enabled.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct MctxConfig {
     /// Master switch. On by default: the integration is what ox is for, and a
@@ -736,9 +736,29 @@ pub struct MctxConfig {
     /// (see [`crate::mctx::dreamer`]), so this one interval drives every task.
     #[serde(default = "default_dreamer_interval_minutes")]
     pub dreamer_interval_minutes: u64,
+    /// Tools whose output is content from outside the project — web pages,
+    /// remote documents — rather than the repository or the user. Once one of
+    /// them has run in a session, the session's historian folds still
+    /// summarize but no longer promote facts into project memory: a fact
+    /// stated by a fetched page is not knowledge about this project. Names
+    /// match exactly; a trailing `*` matches a prefix (MCP tools are named
+    /// `server_tool`, so `docs_*` covers one server). Default: `webfetch`.
+    #[serde(default = "default_external_content_tools")]
+    pub external_content_tools: Vec<String>,
 }
 
 impl MctxConfig {
+    /// Whether `tool` is one of [`Self::external_content_tools`].
+    #[must_use]
+    pub fn is_external_content_tool(&self, tool: &str) -> bool {
+        self.external_content_tools
+            .iter()
+            .any(|pattern| match pattern.strip_suffix('*') {
+                Some(prefix) => tool.starts_with(prefix),
+                None => pattern == tool,
+            })
+    }
+
     /// The config with its invariants enforced: the new budget numbers are
     /// clamped into their documented ranges, the deprecated threshold pair is
     /// warned about and dropped, and a dreamer requested while the module is
@@ -843,6 +863,9 @@ pub fn default_fold_target_percentage() -> f64 {
 pub fn default_history_budget_percentage() -> f64 {
     0.15
 }
+fn default_external_content_tools() -> Vec<String> {
+    vec!["webfetch".to_owned()]
+}
 
 fn default_soft_threshold() -> f32 {
     0.70
@@ -870,6 +893,7 @@ impl Default for MctxConfig {
             historian_prefix_cache: false,
             embedding: EmbeddingConfig::default(),
             dreamer_interval_minutes: default_dreamer_interval_minutes(),
+            external_content_tools: default_external_content_tools(),
         }
     }
 }

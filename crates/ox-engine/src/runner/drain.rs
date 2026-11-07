@@ -156,6 +156,24 @@ impl DrainCtx {
         self.generation = svc.generation;
     }
 
+    /// The session's budgets for a step running `model_id`, with the fixed
+    /// layers this context sends on every request — the static system layer
+    /// and the tools array — measured as the usage baseline. The static layer
+    /// is assembled here only to be measured (string work over the registry's
+    /// guidance); the tools array's size is cached by the registry.
+    pub(crate) fn budget_for(&self, model_id: &str) -> crate::mctx::budget::Budget {
+        let guidance: Vec<(&str, Option<&'static str>)> = self.tools.guidances().collect();
+        let system_bytes = crate::prompt::system_static(&guidance, self.agent).len();
+        let baseline =
+            crate::mctx::tokens::heuristic_bytes(system_bytes + self.tools.definitions_bytes());
+        crate::mctx::budget_for(
+            &self.config,
+            &self.model_catalog,
+            model_id,
+            u32::try_from(baseline).unwrap_or(u32::MAX),
+        )
+    }
+
     /// Observe this step's instruction sources (`prompt::gather`) off the
     /// async executor. The observation is filesystem work — the repository
     /// anchor (libgit2 discovery + canonicalize, cached per directory), the

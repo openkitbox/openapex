@@ -2,13 +2,18 @@
 // Task, failure and report types
 // ---------------------------------------------------------------------------
 
+use super::schedule::Fingerprint;
+
 /// The tasks the MVP schedules, in the order a tick runs them. The order is
 /// the reference's: `task-registry.ts::CANONICAL_DREAM_TASKS` lists `verify`
 /// before `curate`, and `compareTaskOrder` orders due tasks that way; the tasks
-/// added for context management follow them, cheapest first. It is fixed so a
-/// tick is deterministic.
+/// added for context management follow them, cheapest first — except
+/// `expire`, which leads because it calls no model and shrinks the pool the
+/// model-backed tasks then read. It is fixed so a tick is deterministic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DreamTask {
+    /// Archive historian facts nobody confirmed or used (no model call).
+    Expire,
     /// Re-check memories whose referenced files are newer (or missing, if never verified).
     Verify,
     /// Duplicate/stale consolidation of one memory category.
@@ -23,7 +28,8 @@ pub enum DreamTask {
 
 impl DreamTask {
     /// Every task, in tick order.
-    pub const ALL: [DreamTask; 5] = [
+    pub const ALL: [DreamTask; 6] = [
+        DreamTask::Expire,
         DreamTask::Verify,
         DreamTask::Curate,
         DreamTask::Classify,
@@ -31,10 +37,33 @@ impl DreamTask {
         DreamTask::SurfaceNotes,
     ];
 
+    /// Whether the task has anything to do for `owner`. The user tier
+    /// ([`crate::mctx::memory::USER_SCOPE`]) is a handful of observations
+    /// about a person: nothing cites a file to verify, there is no project
+    /// transcript to learn a retrospective from, and no session to surface
+    /// notes into. Only its pool hygiene — expire, curate and classify —
+    /// applies.
+    #[must_use]
+    pub fn applies_to(self, owner: &str) -> bool {
+        !crate::mctx::memory::is_user_scope(owner)
+            || matches!(
+                self,
+                DreamTask::Expire | DreamTask::Curate | DreamTask::Classify
+            )
+    }
+
+    /// Whether the task pays for a completion. Everything but `expire`, whose
+    /// policy is one `UPDATE`; the provider quota guard gates only these.
+    #[must_use]
+    pub fn needs_model(self) -> bool {
+        !matches!(self, DreamTask::Expire)
+    }
+
     /// The `task` column spelling.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            DreamTask::Expire => "expire",
             DreamTask::Verify => "verify",
             DreamTask::Curate => "curate",
             DreamTask::Classify => "classify",
@@ -102,13 +131,38 @@ impl TaskFailure {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum TaskOutcome {
     /// The task ran to completion. `cursor` patches the rotation cursor when
-    /// the task owns one.
-    Completed { detail: String, cursor: Option<u32> },
+    /// the task owns one; `fingerprint` records the input it ran over, for
+    /// the next run's dirty check.
+    Completed {
+        detail: String,
+        cursor: Option<u32>,
+        fingerprint: Option<Fingerprint>,
+    },
     /// The moment was due, but the cheap gate found no work. Not a failure:
     /// the reference advances a skipped slot without touching `last_run_at`.
-    Skipped { detail: String },
+    /// `cursor` lets a rotating task step past the slot it skipped.
+    Skipped { detail: String, cursor: Option<u32> },
     /// The run failed; see [`TaskFailure`].
     Failed(TaskFailure),
+}
+
+impl TaskOutcome {
+    /// A completion with no rotation and no fingerprint.
+    pub(super) fn completed(detail: String) -> Self {
+        Self::Completed {
+            detail,
+            cursor: None,
+            fingerprint: None,
+        }
+    }
+
+    /// A skip with no rotation.
+    pub(super) fn skipped(detail: impl Into<String>) -> Self {
+        Self::Skipped {
+            detail: detail.into(),
+            cursor: None,
+        }
+    }
 }
 
 /// What one `(project, task)` did in this tick.

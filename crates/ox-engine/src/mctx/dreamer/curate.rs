@@ -1,12 +1,13 @@
 use anyhow::Result;
 
-use crate::mctx::memory::{self, CATEGORIES};
+use crate::mctx::memory;
 use ox_db::Db;
 
 use super::manifest::{
     ApplyReport, archive_regex, attr_of, complete_manifest_body, directive_shaped_project_rule,
     keep_batch_id, merge_regex,
 };
+use super::schedule::Fingerprint;
 
 /// The curate task's prefixed completion prompt, adapting
 /// `dreamer/task-prompts.ts::CURATE_SYSTEM_PROMPT` to a manifest instead of
@@ -36,26 +37,33 @@ Rules:
 // curate
 // ---------------------------------------------------------------------------
 
-/// The category one curate run covers, with the memories in it.
+/// The category one curate run covers, with the memories in it — borrowed
+/// from the owner's loaded pool, never copied.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct CurateScope {
+pub(super) struct CurateScope<'a> {
     pub(super) category: &'static str,
-    pub(super) memories: Vec<memory::StoredMemory>,
+    pub(super) memories: Vec<&'a memory::StoredMemory>,
 }
 
-/// Pick the category for this run: scan the five canonical categories from the
+/// Pick the category for this run: scan the owner's `categories` from the
 /// persisted cursor, wrapping, and take the first one holding at least two
 /// memories. Returns `None` when no category has a pair to work with — the
-/// cheap gate that keeps an idle project free of model calls.
-pub(super) fn curate_scope(cursor: u32, memories: &[memory::StoredMemory]) -> Option<CurateScope> {
-    let len = CATEGORIES.len() as u32;
+/// cheap gate that keeps an idle owner free of model calls.
+pub(super) fn curate_scope<'a>(
+    cursor: u32,
+    categories: &[&'static str],
+    memories: &'a [memory::StoredMemory],
+) -> Option<CurateScope<'a>> {
+    let len = categories.len() as u32;
+    if len == 0 {
+        return None;
+    }
     let start = cursor % len;
     for offset in 0..len {
-        let category = CATEGORIES[((start + offset) % len) as usize];
-        let scoped: Vec<memory::StoredMemory> = memories
+        let category = categories[((start + offset) % len) as usize];
+        let scoped: Vec<&memory::StoredMemory> = memories
             .iter()
             .filter(|memory| memory.category == category)
-            .cloned()
             .collect();
         if scoped.len() >= 2 {
             return Some(CurateScope {
@@ -67,12 +75,39 @@ pub(super) fn curate_scope(cursor: u32, memories: &[memory::StoredMemory]) -> Op
     None
 }
 
+impl CurateScope<'_> {
+    /// The scope's input fingerprint: the ids and write watermarks of the
+    /// memories it would send, so an unchanged category skips its completion
+    /// (the dreamer's dirty check). Content is not hashed — every content
+    /// write moves `updated_at` — and the hash is FNV-1a so the stored value
+    /// means the same thing across processes and toolchains.
+    pub(super) fn fingerprint(&self) -> Fingerprint {
+        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+        let mut hash = OFFSET;
+        let mut absorb = |bytes: &[u8]| {
+            for byte in bytes {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(PRIME);
+            }
+        };
+        for memory in &self.memories {
+            absorb(memory.id.as_bytes());
+            absorb(&memory.updated_at.to_le_bytes());
+        }
+        Fingerprint {
+            key: self.category,
+            value: format!("{hash:016x}"),
+        }
+    }
+}
+
 /// The `curate` user prompt: the scoped category's snapshot. The model mutates
 /// nothing directly; it answers with a manifest the host applies.
 pub(super) fn render_curate_prompt(
     project: &str,
     category: &str,
-    memories: &[memory::StoredMemory],
+    memories: &[&memory::StoredMemory],
 ) -> String {
     let mut parts = vec![format!(
         "## Project: {project}\n\nThis run covers the `{category}` category only. The other categories run in later windows.\n\nThe memories below are assumed ACCURATE (a separate verify task keeps them true). Remove duplicates, tighten wording, consolidate redundancy, and archive only what another memory in this category already restates. The memories:\n"
@@ -109,7 +144,7 @@ struct CurateArchive {
 /// Parse a `<curate>` manifest with the same fail-closed rules as `verify`.
 pub(super) fn parse_curate_manifest(
     text: &str,
-    scope: &[memory::StoredMemory],
+    scope: &[&memory::StoredMemory],
 ) -> Result<CurateManifest, String> {
     let body = complete_manifest_body(text, "curate")?;
     let mut manifest = CurateManifest::default();
@@ -204,7 +239,7 @@ pub(super) fn parse_curate_manifest(
 pub(super) async fn apply_curate_manifest(
     db: &Db,
     project: &str,
-    scope: &CurateScope,
+    scope: &CurateScope<'_>,
     manifest: &CurateManifest,
 ) -> Result<ApplyReport> {
     let mut report = ApplyReport::default();
