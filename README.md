@@ -55,7 +55,8 @@ at all, opens the TUI.
 
 Top-level keys such as `listen`, `db_path` and `default_model` sit next to the
 sections `[providers]`, `[models]`, `[context_caps]`, `[magic_context]`,
-`[mcp]`, `[subagent]`, `[events]`, `[sessions]`, `[tmp]` and `[turn]`.
+`[mcp]`, `[permissions]`, `[subagent]`, `[events]`, `[sessions]`, `[tmp]` and
+`[turn]`.
 
 ### Provider
 
@@ -95,6 +96,28 @@ default endpoint, which routes may reference by its provider name.
 `[mcp.servers.<name>]` connects an MCP server at startup and exposes its tools
 under the server name as a prefix. Connections are process-wide, so the tool
 registry is the same for every session.
+
+### Permissions
+
+Every tool call passes a policy check before it runs. The default is
+`allow`; `[permissions]` tightens it per tool:
+
+```toml
+[permissions]
+default = "allow"                 # allow | ask | deny
+
+[permissions.tools]
+shell = { ask_if = ["rm -rf", "git push", "sudo"] }   # ask only on a match
+webfetch = "ask"                  # ask every time
+write = "deny"                    # refuse outright
+```
+
+`ask_if` holds regexes matched against the call's arguments (the `command`
+for `shell`, compact JSON otherwise). An `ask` opens a question on the
+user's root session — subagent calls surface there too — with the answers
+*once*, *for this session* and *deny*; no answer within five minutes, or an
+interrupt, counts as a denial. Session grants live in process memory and
+reset on restart. MCP tools are addressed by their prefixed name.
 
 ## Editor integration
 

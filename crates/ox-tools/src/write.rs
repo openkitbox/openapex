@@ -41,7 +41,7 @@ impl Tool for WriteTool {
         ctx: ToolContext,
         input: Value,
     ) -> std::pin::Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
-        Box::pin(async move { run(&ctx, &input) })
+        crate::contract::blocking(ctx, input, run)
     }
 }
 

@@ -8,8 +8,11 @@
 //! the Bun implementation.
 //!
 //! Scope notes (MVP, aligned with the plan):
-//! - Upstream's permission system is **not** ported: every tool is
-//!   allow-all, no approval prompts, no `tools.allow` config.
+//! - Tools themselves carry no permission logic. The engine gates every
+//!   call before `execute` from the `[permissions]` config section
+//!   (`allow` / `ask` / `deny` per tool, `ask_if` argument patterns); an
+//!   `ask` is a question form on the user's root session. The default
+//!   policy is allow-all.
 //! - File diffs are computed upstream for permission prompts and UI
 //!   metadata (`FileDiff`); ox has no such channel yet, so they are not
 //!   produced. The model-facing content strings are identical.

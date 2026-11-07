@@ -52,6 +52,7 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
         instruction_baselines: Arc::clone(&inner.instruction_baselines),
         calibrations: Arc::clone(&inner.calibrations),
         cache_ledger: Arc::clone(&inner.cache_ledger),
+        grants: Arc::clone(&inner.grants),
         // The session handle's cached git-toplevel anchor (the same slot the
         // busy period's steps use); no live registry entry keeps a fresh,
         // unused cache.
@@ -73,16 +74,7 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
         super::step::load_history_after(&ctx.db, &ctx.session_id, floor).await?
     };
 
-    // Directory and root must share one namespace: the chain's
-    // component-wise prefix check degenerates to leaf-only when the
-    // directory still carries symlink components the canonical root lost.
-    let (directory, project_root) = ctx.instruction_root.get_or_compute(&ctx.directory);
-    let observed = crate::prompt::gather(
-        &directory,
-        &ctx.home,
-        project_root.as_deref(),
-        ctx.mcp.instructions_block().as_deref(),
-    );
+    let observed = ctx.observe_sources().await?;
     let guidance: Vec<(&str, Option<&'static str>)> = ctx.tools.guidances().collect();
     let system_static = crate::prompt::system_static(&guidance, ctx.agent);
     let instructions = super::instructions::baseline(&observed).initial_render;

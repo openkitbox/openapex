@@ -105,6 +105,17 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt"] }
 
+# One binary shipped to users: spend compile time on it once. Thin LTO plus a
+# single codegen unit lets the optimizer see across the eleven crates (the
+# step loop, the projector and the TUI renderer all cross crate boundaries on
+# their hot paths), and stripping symbols keeps the release artefact small.
+# Panics still unwind: the server recovers poisoned locks and tool tasks are
+# isolated by `tokio::spawn`, both of which `panic = "abort"` would defeat.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
 [workspace.lints.clippy]
 result_large_err = "allow"
 wildcard_imports = "warn"

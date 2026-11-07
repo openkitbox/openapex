@@ -33,6 +33,7 @@ mod historian_trigger;
 pub(crate) mod instructions;
 mod loop_guard;
 mod output_budget;
+pub(crate) mod permissions;
 pub(crate) mod provider_error;
 mod retry;
 mod services;
@@ -116,6 +117,9 @@ struct Inner {
     /// Per-session prompt-cache accounting, reported per attempt and read only
     /// by diagnostics ([`Runner::diagnostic_cache_ledger`]).
     cache_ledger: Arc<CacheLedger>,
+    /// Per-session "allow for this session" permission grants (process
+    /// memory; a restart asks again).
+    grants: Arc<permissions::Grants>,
     sessions: DashMap<String, SessionHandle>,
 }
 
@@ -143,6 +147,10 @@ struct SessionHandle {
     /// sweep's clock: an entry with no work in flight or scheduled that has
     /// been silent past [`RUNNER_IDLE_TTL_MS`] is reaped.
     last_used: Arc<std::sync::atomic::AtomicU64>,
+    /// Woken every time the session stops being active: a busy period
+    /// settles, or the entry is forgotten. [`Runner::wait_idle`] parks on it
+    /// instead of polling `is_active`.
+    settled: Arc<tokio::sync::Notify>,
 }
 
 /// The working-tree root of the repository containing `directory`, or `None`
@@ -236,6 +244,7 @@ fn new_session_handle() -> SessionHandle {
         last_used: Arc::new(std::sync::atomic::AtomicU64::new(
             ox_schema::id::now_millis() as u64,
         )),
+        settled: Arc::new(tokio::sync::Notify::new()),
     }
 }
 
@@ -257,10 +266,15 @@ impl Inner {
     /// the database's, and a later dispatch of an evicted session rebuilds the
     /// entry and re-baselines exactly as the existing shutdown path does.
     fn forget(&self, session_id: &str) {
-        self.sessions.remove(session_id);
+        if let Some((_, handle)) = self.sessions.remove(session_id) {
+            // A waiter parked on this entry would otherwise never wake: the
+            // registry no longer answers for the session, so it is idle.
+            handle.settled.notify_waiters();
+        }
         lock(&self.instruction_baselines).remove(session_id);
         crate::mctx::calibration::forget(&self.calibrations, session_id);
         self.cache_ledger.forget(session_id);
+        self.grants.forget(session_id);
     }
 }
 
@@ -348,6 +362,7 @@ impl Runner {
             instruction_baselines: Default::default(),
             calibrations: Default::default(),
             cache_ledger: Default::default(),
+            grants: Default::default(),
             sessions: DashMap::new(),
         });
         let tools = inner.live.current().tools.clone();
@@ -387,6 +402,33 @@ impl Runner {
             .sessions
             .get(session_id)
             .is_some_and(|handle| handle_is_active(&handle))
+    }
+
+    /// Resolve once the session has no work scheduled or in flight. Returns
+    /// at once for an idle or unknown session; otherwise parks on the entry's
+    /// settle notification and re-checks on every wake-up. The notification
+    /// is armed *before* the activity check, so a busy period that settles
+    /// between the check and the await is not missed.
+    pub async fn wait_idle(&self, session_id: &str) {
+        loop {
+            // Clone out of the shard guard: parking while holding a DashMap
+            // read guard would block the actor's own `entry` call.
+            let Some(handle) = self
+                .inner
+                .sessions
+                .get(session_id)
+                .map(|entry| entry.clone())
+            else {
+                return;
+            };
+            let settled = handle.settled.notified();
+            tokio::pin!(settled);
+            settled.as_mut().enable();
+            if !handle_is_active(&handle) {
+                return;
+            }
+            settled.await;
+        }
     }
 
     /// Whether any session has work scheduled or in flight.
@@ -615,6 +657,11 @@ impl ActorTask {
                                 "execution.started failed; releasing busy period"
                             );
                             *lock(&self.handle.cancel) = None;
+                            // Nothing will run for this enqueue: the entry
+                            // is idle again, and a waiter must not hang on
+                            // a `scheduled` flag no busy period will clear.
+                            *lock(&self.handle.scheduled) = false;
+                            self.handle.settled.notify_waiters();
                             break;
                         }
                         token = Some(period);
@@ -674,6 +721,7 @@ impl ActorTask {
                 instruction_baselines: self.inner.instruction_baselines.clone(),
                 calibrations: self.inner.calibrations.clone(),
                 cache_ledger: Arc::clone(&self.inner.cache_ledger),
+                grants: Arc::clone(&self.inner.grants),
                 instruction_root: self.handle.instruction_root.clone(),
                 fold_in_flight: Arc::clone(&self.handle.fold_in_flight),
             };
@@ -765,6 +813,9 @@ impl ActorTask {
             }
             *lock(&self.handle.cancel) = None;
             *lock(&self.handle.scheduled) = false;
+            // The terminal is published and the flags are down: every
+            // `wait_idle` re-checks `is_active` on this wake-up.
+            self.handle.settled.notify_waiters();
             // Loop: absorb anything that arrived while the terminal settled.
         }
     }
@@ -1041,6 +1092,10 @@ impl ox_tools::subagent::SubagentSpawner for Runner {
 
     fn is_active(&self, session_id: &str) -> bool {
         Runner::is_active(self, session_id)
+    }
+
+    fn wait_idle<'a>(&'a self, session_id: &'a str) -> ox_tools::subagent::WaitIdle<'a> {
+        Box::pin(Runner::wait_idle(self, session_id))
     }
 
     fn interrupt(&self, session_id: &str) -> bool {

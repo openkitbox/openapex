@@ -59,16 +59,9 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
     if usage_pct.is_some_and(|pct| pct >= super::super::compaction::FOLD_USAGE_THRESHOLD * 100.0) {
         super::super::compaction::spawn_background_fold(ctx);
     }
-    // Directory and root must share one namespace: the chain's
-    // component-wise prefix check degenerates to leaf-only when the
-    // directory still carries symlink components the canonical root lost.
-    let (directory, project_root) = ctx.instruction_root.get_or_compute(&ctx.directory);
-    let observed = prompt::gather(
-        &directory,
-        &ctx.home,
-        project_root.as_deref(),
-        ctx.mcp.instructions_block().as_deref(),
-    );
+    // Filesystem work (repository anchor, skills walk, AGENTS.md reads) runs
+    // off the executor; see `DrainCtx::observe_sources`.
+    let observed = ctx.observe_sources().await?;
     let (system_static, tool_count): (Arc<str>, usize) = {
         let guidance: Vec<(&str, Option<&'static str>)> = ctx.tools.guidances().collect();
         // The baseline log's tool count is the registry size; the names

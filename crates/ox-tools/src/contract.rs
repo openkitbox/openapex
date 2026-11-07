@@ -110,6 +110,35 @@ pub trait Tool: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>>;
 }
 
+/// The boxed future [`Tool::execute`] returns.
+pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = ToolOutput> + Send + 'a>>;
+
+/// Run a synchronous tool body on tokio's blocking pool.
+///
+/// The file tools (`read`, `write`, `edit`, `patch`, `glob`, `grep`) are plain
+/// filesystem work: a `grep` walks the whole tree, a `read` can pull in a
+/// large file. Executed inline in the tool task they would hold an async
+/// worker thread for that long, stalling every other actor sharing it;
+/// here they occupy a blocking thread instead and the executor stays
+/// responsive. A body that panics fails the call with the panic message
+/// rather than taking the step down with it.
+pub fn blocking<F>(ctx: ToolContext, input: Value, run: F) -> ToolFuture<'static>
+where
+    F: FnOnce(&ToolContext, &Value) -> ToolOutput + Send + 'static,
+{
+    Box::pin(async move {
+        match tokio::task::spawn_blocking(move || run(&ctx, &input)).await {
+            Ok(output) => output,
+            Err(error) => ToolOutput {
+                content: Value::Null,
+                error: Some(format!("tool execution aborted: {error}")),
+                metadata: None,
+                attachments: None,
+            },
+        }
+    })
+}
+
 /// Name-keyed tool registry. Definitions iterate in name order so the wire
 /// `tools` array is stable across steps (keeps the provider's cached prefix).
 #[derive(Default)]

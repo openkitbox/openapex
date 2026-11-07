@@ -128,6 +128,9 @@ pub(crate) struct DrainCtx {
     /// Process-wide per-session prompt-cache accounting ([`CacheLedger`]):
     /// diagnostics only, never read on the request path.
     pub cache_ledger: Arc<CacheLedger>,
+    /// Per-session permission grants ("allow for this session"), read by the
+    /// tool gate before every execution.
+    pub grants: Arc<super::permissions::Grants>,
     /// The session's cached git-toplevel anchor, cloned from the session
     /// handle so step and generate share the same per-directory slot.
     pub instruction_root: super::InstructionRootCache,
@@ -151,6 +154,37 @@ impl DrainCtx {
         self.mcp = Arc::clone(&svc.mcp);
         self.tools = svc.tools_for(self.agent);
         self.generation = svc.generation;
+    }
+
+    /// Observe this step's instruction sources (`prompt::gather`) off the
+    /// async executor. The observation is filesystem work — the repository
+    /// anchor (libgit2 discovery + canonicalize, cached per directory), the
+    /// skills directory walk and the AGENTS.md ancestor reads — and it runs
+    /// on every step so a mid-session edit lands as a delta; a slow disk or a
+    /// large skills tree must stall this turn, not every actor sharing the
+    /// worker thread. The MCP block is read first, on the executor: it is a
+    /// memory snapshot, and the hub is not `'static`-movable.
+    ///
+    /// The gather runs on the anchor's canonical directory, not
+    /// `self.directory`: the instruction chain and the repository root share
+    /// one namespace only in that spelling (a symlink component the root lost
+    /// would degrade the chain to the leaf alone).
+    pub(crate) async fn observe_sources(&self) -> Result<Vec<crate::prompt::Observed>> {
+        let directory = self.directory.clone();
+        let home = self.home.clone();
+        let anchor = self.instruction_root.clone();
+        let mcp_instructions = self.mcp.instructions_block();
+        tokio::task::spawn_blocking(move || {
+            let (directory, project_root) = anchor.get_or_compute(&directory);
+            crate::prompt::gather(
+                &directory,
+                &home,
+                project_root.as_deref(),
+                mcp_instructions.as_deref(),
+            )
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("instruction observation task failed: {error}"))
     }
 }
 
@@ -558,12 +592,7 @@ async fn maybe_spawn_title_generation(ctx: &DrainCtx) {
 /// head owns the boundary — it runs before the continuation step; a move
 /// still bounds it (handled at drain level after the turn).
 async fn deliver_pending_steers(ctx: &DrainCtx, token: &CancellationToken) -> Result<()> {
-    let steers: Vec<InboxRow> = list_rows(&ctx.db, &ctx.session_id)
-        .await?
-        .into_iter()
-        .filter(|row| row.item.delivery() == Delivery::Steer)
-        .collect();
-    let steers = reorder_steers(steers);
+    let steers = pending_steers(&ctx.db, &ctx.session_id).await?;
     let Some(head) = steers.first() else {
         return Ok(());
     };
@@ -585,32 +614,66 @@ async fn deliver_pending_steers(ctx: &DrainCtx, token: &CancellationToken) -> Re
 // Inbox scanning + promotion (packages/core/src/session/inbox.ts)
 // ---------------------------------------------------------------------------
 
-/// `SessionInbox.list`: every pending row in arrival order.
-async fn list_rows(db: &Db, session_id: &str) -> Result<Vec<InboxRow>> {
+/// The wire literal of a delivery class, as stored in `session_inbox.delivery`.
+fn delivery_literal(delivery: Delivery) -> &'static str {
+    match delivery {
+        Delivery::Steer => "steer",
+        Delivery::Queue => "queue",
+    }
+}
+
+/// `SessionInbox.list` narrowed to one delivery class: the pending rows of
+/// that class in arrival order, at most `limit` of them. Reads through
+/// `session_inbox_session_delivery_seq_idx`, so a scan touches only the rows
+/// it returns instead of decoding the whole inbox and filtering in Rust.
+async fn list_rows(
+    db: &Db,
+    session_id: &str,
+    delivery: Delivery,
+    limit: i64,
+) -> Result<Vec<InboxRow>> {
     let conn = db.acquire().await?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, session_id, type, payload, delivery
-             FROM session_inbox WHERE session_id = ?1
-             ORDER BY enqueued_seq ASC",
+            "SELECT id, type, payload, delivery
+             FROM session_inbox WHERE session_id = ?1 AND delivery = ?2
+             ORDER BY enqueued_seq ASC LIMIT ?3",
         )
         .await?;
-    let mut rows = stmt.query([session_id]).await?;
-    let mut raw = Vec::new();
+    let mut rows = stmt
+        .query((session_id, delivery_literal(delivery), limit))
+        .await?;
+    let mut decoded = Vec::new();
     while let Some(row) = rows.next().await? {
-        raw.push((
-            row.get::<String>(0)?,
-            row.get::<String>(1)?,
-            row.get::<String>(2)?,
-            row.get::<String>(3)?,
-            row.get::<String>(4)?,
-        ));
+        let id = row.get::<String>(0)?;
+        let kind = row.get::<String>(1)?;
+        let payload = row.get::<String>(2)?;
+        let delivery = row.get::<String>(3)?;
+        decoded.push(InboxRow::from_columns(
+            id,
+            &kind,
+            serde_json::from_str(&payload)?,
+            &delivery,
+        )?);
     }
-    raw.into_iter()
-        .map(|(id, _session_id, kind, payload, delivery)| {
-            InboxRow::from_columns(id, &kind, serde_json::from_str(&payload)?, &delivery)
-        })
-        .collect()
+    Ok(decoded)
+}
+
+/// `pendingSteers` as one read: the steer rows in arrival order with the
+/// first compaction control unshifted ahead ([`reorder_steers`]).
+async fn pending_steers(db: &Db, session_id: &str) -> Result<Vec<InboxRow>> {
+    Ok(reorder_steers(
+        list_rows(db, session_id, Delivery::Steer, i64::MAX).await?,
+    ))
+}
+
+/// The oldest queued row, if any. Only the head is ever promoted, so the
+/// query stops at one row.
+async fn queue_head(db: &Db, session_id: &str) -> Result<Option<InboxRow>> {
+    Ok(list_rows(db, session_id, Delivery::Queue, 1)
+        .await?
+        .into_iter()
+        .next())
 }
 
 /// `pendingSteers`: steer rows in arrival order with the first compaction
@@ -633,22 +696,13 @@ fn reorder_steers(rows: Vec<InboxRow>) -> Vec<InboxRow> {
 /// `nextPromotable`: the head steer (compaction-unshifted), else the oldest
 /// queue item when the scope allows input.
 async fn next_promotable(db: &Db, session_id: &str, input_scope: bool) -> Result<Option<InboxRow>> {
-    let steers: Vec<InboxRow> = list_rows(db, session_id)
-        .await?
-        .into_iter()
-        .filter(|row| row.item.delivery() == Delivery::Steer)
-        .collect();
-    let steers = reorder_steers(steers);
-    if let Some(head) = steers.into_iter().next() {
+    if let Some(head) = pending_steers(db, session_id).await?.into_iter().next() {
         return Ok(Some(head));
     }
     if !input_scope {
         return Ok(None);
     }
-    Ok(list_rows(db, session_id)
-        .await?
-        .into_iter()
-        .find(|row| row.item.delivery() == Delivery::Queue))
+    queue_head(db, session_id).await
 }
 
 /// Deliver items at one boundary (task contract + upstream inbox.ts):
@@ -660,12 +714,7 @@ async fn next_promotable(db: &Db, session_id: &str, input_scope: bool) -> Result
 ///
 /// Returns the delivered count; `Ok(0)` when nothing was deliverable.
 async fn promote(ctx: &DrainCtx, scope: Promotable) -> Result<usize> {
-    let steers: Vec<InboxRow> = list_rows(&ctx.db, &ctx.session_id)
-        .await?
-        .into_iter()
-        .filter(|row| row.item.delivery() == Delivery::Steer)
-        .collect();
-    let steers = reorder_steers(steers);
+    let steers = pending_steers(&ctx.db, &ctx.session_id).await?;
     if steers.first().is_some_and(InboxRow::is_control) {
         return Ok(0);
     }
@@ -674,19 +723,12 @@ async fn promote(ctx: &DrainCtx, scope: Promotable) -> Result<usize> {
     }
     // Input boundary: the steer batch, then one queued item, then new steers.
     let mut count = deliver_up_to_control(ctx, steers).await?;
-    let queued = list_rows(&ctx.db, &ctx.session_id)
-        .await?
-        .into_iter()
-        .find(|row| row.item.delivery() == Delivery::Queue);
+    let queued = queue_head(&ctx.db, &ctx.session_id).await?;
     if let Some(queued) = queued.filter(|row| !row.is_control()) {
         deliver(ctx, &queued.id).await?;
         count += 1;
-        let arrived: Vec<InboxRow> = list_rows(&ctx.db, &ctx.session_id)
-            .await?
-            .into_iter()
-            .filter(|row| row.item.delivery() == Delivery::Steer)
-            .collect();
-        count += deliver_up_to_control(ctx, reorder_steers(arrived)).await?;
+        let arrived = pending_steers(&ctx.db, &ctx.session_id).await?;
+        count += deliver_up_to_control(ctx, arrived).await?;
     }
     Ok(count)
 }

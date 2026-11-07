@@ -738,6 +738,15 @@ impl Db {
     async fn connect(&self) -> Result<Connection> {
         let conn = self.database.connect()?;
         conn.pragma_update("journal_mode", "'wal'").await?;
+        // turso defaults to FULL (an fsync of the WAL on every COMMIT). The
+        // event bus commits one transaction per durable event — around ten per
+        // model step — so that fsync is the floor of every step's latency.
+        // NORMAL syncs the WAL only at checkpoint: in WAL mode a power loss
+        // can roll back the last few commits but never corrupts the file, and
+        // every ox write is replayable (the next turn re-derives what a lost
+        // event would have projected). Per connection, like the pragmas
+        // around it.
+        conn.pragma_update("synchronous", "NORMAL").await?;
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         conn.pragma_update("foreign_keys", "ON").await?;
         // Per connection, like the pragmas above: turso's 2000-page default is

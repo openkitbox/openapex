@@ -133,6 +133,10 @@ pub trait SubagentSpawner: Send + Sync {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>>;
     /// Whether work is scheduled or a busy period is in flight.
     fn is_active(&self, session_id: &str) -> bool;
+    /// Resolve once the session has no work scheduled or in flight (at once
+    /// for an idle or unknown session). Event-driven on the runner side, so a
+    /// waiting parent costs nothing until the child settles.
+    fn wait_idle<'a>(&'a self, session_id: &'a str) -> WaitIdle<'a>;
     /// Cancel the session's busy period.
     fn interrupt(&self, session_id: &str) -> bool;
     /// The rows a settled child is judged by: its newest idle row and its
@@ -141,6 +145,9 @@ pub trait SubagentSpawner: Send + Sync {
     /// several transcripts at once.
     fn settled_tail<'a>(&'a self, session_id: &'a str) -> SettledTail<'a>;
 }
+
+/// The boxed future [`SubagentSpawner::wait_idle`] answers with.
+pub type WaitIdle<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
 
 /// The boxed future [`SubagentSpawner::settled_tail`] answers with.
 pub type SettledTail<'a> = std::pin::Pin<
@@ -684,13 +691,8 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
     // user can stop it. A wedged child is visible to the user, who can
     // interrupt the turn; killing healthy work on a wall clock is the worse
     // failure mode.
-    let wait = async {
-        while spawner.is_active(&child_id) {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-    };
     tokio::select! {
-        () = wait => {}
+        () = spawner.wait_idle(&child_id) => {}
         () = ctx.cancellation.cancelled() => {
             spawner.interrupt(&child_id);
             // The child is cancelled with the turn: the parent holds that
@@ -963,11 +965,9 @@ fn spawn_completion_watcher(
         let (state, text) = if let Some(text) = start_error {
             ("error", text)
         } else {
-            // Poll only the process-local active set — the DB is not touched
-            // until the child has settled.
-            while spawner.is_active(&child_id) {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
+            // Park on the runner's settle notification — the DB is not
+            // touched until the child has settled.
+            spawner.wait_idle(&child_id).await;
             let Ok(tail) = spawner.settled_tail(&child_id).await else {
                 tracing::warn!(child = %child_id, "subagent finished but its transcript is unreadable; dropping notification");
                 return;

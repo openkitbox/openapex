@@ -318,6 +318,122 @@ impl Default for TurnConfig {
     }
 }
 
+/// What happens when the model calls a tool (`[permissions]` policies).
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Permission {
+    /// Run the call.
+    #[default]
+    Allow,
+    /// Put the call to the user first; a refusal or no answer fails the call.
+    Ask,
+    /// Fail the call without running it.
+    Deny,
+}
+
+/// One tool's entry under `[permissions.tools]`: either a bare policy
+/// (`shell = "ask"`) or a table with patterns that escalate an `allow` to a
+/// prompt (`shell = { policy = "allow", ask_if = ["rm -rf", "git push"] }`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ToolPermission {
+    Policy(Permission),
+    Rule(ToolPermissionRule),
+}
+
+/// The table form of a [`ToolPermission`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolPermissionRule {
+    /// The base policy; `allow` unless stated.
+    #[serde(default)]
+    pub policy: Permission,
+    /// Regular expressions matched against the call's compact JSON arguments
+    /// (for `shell`, that text contains the command). A match on an `allow`
+    /// policy turns that one call into `ask`; patterns never relax a policy.
+    /// Compiled at load, so a malformed pattern fails the config instead of
+    /// a tool call.
+    #[serde(default, deserialize_with = "deserialize_regexes")]
+    pub ask_if: Vec<regex::Regex>,
+}
+
+fn deserialize_regexes<'de, D>(deserializer: D) -> Result<Vec<regex::Regex>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let patterns: Vec<String> = Vec::deserialize(deserializer)?;
+    patterns
+        .iter()
+        .map(|pattern| {
+            regex::Regex::new(pattern).map_err(|error| {
+                serde::de::Error::custom(format!(
+                    "permissions ask_if pattern `{pattern}` is not a valid regex: {error}"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Tool permissions (`[permissions]` section). Every tool call — built-in,
+/// `ctx_*` or MCP — is checked against this table before it runs. The
+/// default is `allow` for everything, which is the pre-permission behaviour;
+/// a user opts into prompting or blocking per tool:
+///
+/// ```toml
+/// [permissions]
+/// default = "allow"
+///
+/// [permissions.tools]
+/// shell = { ask_if = ["rm -rf", "git push", "sudo"] }
+/// webfetch = "ask"
+/// write = "deny"
+/// ```
+///
+/// An `ask` prompt is a form on the session's root (the window the user is
+/// looking at), with "allow once" / "allow for this session" / "deny". A
+/// child session's call therefore asks on its parent's screen rather than
+/// hanging on a form no client shows.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PermissionsConfig {
+    /// Policy for a tool with no entry under `tools`.
+    #[serde(default)]
+    pub default: Permission,
+    /// Per-tool policies, keyed by the advertised tool name (an MCP tool by
+    /// its prefixed name, e.g. `github_create_issue`).
+    #[serde(default)]
+    pub tools: BTreeMap<String, ToolPermission>,
+}
+
+impl PermissionsConfig {
+    /// The policy for one call: the tool's entry (or `default`), escalated to
+    /// [`Permission::Ask`] when the entry's `ask_if` matches `arguments`.
+    #[must_use]
+    pub fn policy_for(&self, tool: &str, arguments: &str) -> Permission {
+        match self.tools.get(tool) {
+            None => self.default,
+            Some(ToolPermission::Policy(policy)) => *policy,
+            Some(ToolPermission::Rule(rule)) => match rule.policy {
+                Permission::Allow if rule.ask_if.iter().any(|re| re.is_match(arguments)) => {
+                    Permission::Ask
+                }
+                policy => policy,
+            },
+        }
+    }
+
+    /// Whether any call could ever prompt or be refused — `false` for the
+    /// default table, so the gate can skip the lookup entirely.
+    #[must_use]
+    pub fn is_permissive(&self) -> bool {
+        self.default == Permission::Allow
+            && self.tools.values().all(|entry| match entry {
+                ToolPermission::Policy(policy) => *policy == Permission::Allow,
+                ToolPermission::Rule(rule) => {
+                    rule.policy == Permission::Allow && rule.ask_if.is_empty()
+                }
+            })
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     /// LLM endpoint configuration. Flattened: its keys (`cardinal_url`,
@@ -361,6 +477,9 @@ pub struct Config {
     /// Per-turn step cap (`[turn]` section).
     #[serde(default)]
     pub turn: TurnConfig,
+    /// Tool permissions (`[permissions]` section). Allow-all by default.
+    #[serde(default)]
+    pub permissions: PermissionsConfig,
 }
 
 fn default_event_heartbeat_ms() -> u64 {
@@ -381,6 +500,7 @@ impl Default for Config {
             sessions: SessionsConfig::default(),
             tmp: TmpConfig::default(),
             turn: TurnConfig::default(),
+            permissions: PermissionsConfig::default(),
         }
     }
 }

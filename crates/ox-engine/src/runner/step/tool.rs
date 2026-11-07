@@ -11,6 +11,7 @@ use ox_schema::support::{Content, Record, SessionError};
 
 use super::super::ToolContext;
 use super::super::drain::DrainCtx;
+use super::super::permissions::Decision;
 use super::attempt::{StepParams, TOOLS_INTERRUPTED};
 use super::error::aborted_error;
 use super::stream::ToolAccum;
@@ -211,7 +212,38 @@ fn spawn_tool_task(
     // The session's live toolset rides in the context: `capability_search`
     // indexes its catalog from here.
     let registry = ctx.tools.clone();
+    let gate = super::super::permissions::Gate {
+        config: Arc::clone(&ctx.config),
+        db: ctx.db.clone(),
+        grants: Arc::clone(&ctx.grants),
+    };
     tokio::spawn(async move {
+        // The permission gate runs inside the task so an `ask` that waits on
+        // the user neither stalls the stream nor the sibling calls.
+        if let Decision::Deny(reason) = gate
+            .authorize(&session_id, &directory, tool.name(), &input, &cancellation)
+            .await
+        {
+            let event = SessionEventData::ToolFailed {
+                session_id,
+                assistant_message_id: message_id,
+                id: call_id,
+                error: SessionError {
+                    kind: "permission.denied".to_owned(),
+                    message: reason,
+                    status: None,
+                    response: None,
+                },
+                content: None,
+                metadata: None,
+                executed: false,
+                result_state: None,
+            };
+            if let Err(error) = bus.publish(event).await {
+                tracing::error!(error = %error, "permission denial failed to publish");
+            }
+            return;
+        }
         let output = tool
             .execute(
                 ToolContext {

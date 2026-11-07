@@ -168,9 +168,7 @@ pub(crate) async fn wait_idle(req: &mut Request, depot: &mut Depot, res: &mut Re
             return;
         }
     }
-    while app.runner.is_active(&session_id) {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
+    app.runner.wait_idle(&session_id).await;
     res.status_code(StatusCode::NO_CONTENT);
 }
 
