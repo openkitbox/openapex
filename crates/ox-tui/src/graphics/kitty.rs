@@ -164,7 +164,7 @@ pub fn transmit(id: u32, png: &[u8], wrapper: Wrapper) -> Vec<u8> {
         out.push_str(framing.start);
         out.push_str(framing.escape);
         if index == 0 {
-            write!(out, "_Gf=100,t=d,a=t,U=1,i={id},q=2,m={more};")
+            write!(out, "_Gf=100,t=d,a=T,U=1,i={id},q=2,m={more};")
         } else {
             write!(out, "_Gm={more};")
         }
