@@ -48,7 +48,7 @@ pub(super) fn explored_block(
             ) else {
                 continue;
             };
-            lines.extend(text_row(&text, call.state, false, None, view, width));
+            lines.extend(text_row(&text, call.state, None, view, width));
             lines.extend(loaded_lines(&text));
         }
     }
@@ -143,17 +143,12 @@ pub(super) fn tool_block(
     );
     let expandable = tool_expandable(block);
     let focused = view.tool_focused && expandable;
-    // Upstream `Subagent` row (`routes/session/index.tsx:3289`): while the
-    // child runs the call itself is already done, so the spinner replaces the
-    // icon and a dim `Background` badge follows the label.
+    // The pipeline includes live child activity in `state`; the background
+    // badge describes the call's result and must not force a spinner.
     let row = RowView {
-        state: if background {
-            ToolState::Running
-        } else {
-            state
-        },
+        state,
         spinner: SPINNER_FRAMES[view.spin % SPINNER_FRAMES.len()],
-        hovered: false,
+        hovered: view.hovered,
         error_expanded: false,
     };
     let mut header = tool_header(tool, summary, row, focused);
@@ -211,7 +206,7 @@ pub(super) fn text_tool_block(
     let state = *state;
     let failed = matches!(state, ToolState::Failed);
     let error = (failed && !output.is_empty()).then_some(output);
-    let mut lines = text_row(text, state, *background, error, view, width);
+    let mut lines = text_row(text, state, error, view, width);
     if let Some(header) = lines.first_mut() {
         if *background {
             push_background_badge(header);
@@ -230,18 +225,17 @@ pub(super) fn text_tool_block(
 
 /// One `tool_text` row drawn by `tool_row` (upstream `InlineToolRow`): a
 /// spinner row shows the label next to the spinner; otherwise icon + label
-/// once complete or failed, else the spinner + pending text. A background
-/// subagent spins with its badge.
+/// once complete or failed, else the spinner + pending text. The background
+/// badge is independent of spinner activity.
 fn text_row(
     text: &ToolText<'_>,
     state: ToolState,
-    background: bool,
     error: Option<&str>,
     view: ViewState,
     width: u16,
 ) -> Vec<Line<'static>> {
     let failed = matches!(state, ToolState::Failed);
-    let spinning = text.spinner || background;
+    let spinning = text.spinner;
     let spec = InlineSpec {
         icon: text.icon,
         pending: if spinning { &text.label } else { text.pending },
@@ -251,7 +245,7 @@ fn text_row(
     let row = RowView {
         state: if spinning { ToolState::Running } else { state },
         spinner: SPINNER_FRAMES[view.spin % SPINNER_FRAMES.len()],
-        hovered: false,
+        hovered: view.hovered,
         error_expanded: view.tool_expanded,
     };
     tool_row::lines(&spec, row, width)

@@ -1,4 +1,5 @@
 pub mod error;
+pub mod family;
 pub mod form;
 pub mod history;
 pub mod rest;

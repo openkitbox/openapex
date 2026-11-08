@@ -65,7 +65,10 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
             generation,
         } => list_sessions(&client, &tx, directory, generation).await,
         AppCommand::ListRunningRoots => list_running_roots(&client, &tx).await,
-        AppCommand::ListFamily { session } => list_family(&client, &tx, session).await,
+        AppCommand::ListFamily {
+            session,
+            generation,
+        } => list_family(&client, &tx, session, generation).await,
         AppCommand::SyncShells { generation } => sync_shells(&client, generation, &tx).await,
         AppCommand::ShellOutput { session, id } => shell_output(&client, &tx, session, &id).await,
         AppCommand::ShellPoll { id, cursor, mode } => {
@@ -112,7 +115,6 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
         AppCommand::LoadAttachments(text) => load_attachments(&tx, text).await,
         AppCommand::ReadClipboard => read_clipboard(&tx).await,
         AppCommand::WriteClipboard(text) => write_clipboard(&tx, text).await,
-        AppCommand::ProbeChildren { children } => probe_children(&client, &tx, children).await,
         AppCommand::FetchMedia {
             session,
             key,
@@ -248,12 +250,19 @@ async fn running_roots(client: &Client) -> HashSet<String> {
 /// Deepest subagent nesting `running_roots` climbs before giving up.
 const MAX_CLIMB: usize = 32;
 
-async fn list_family(client: &Client, tx: &Events, session: String) {
-    let event = match client.session_family(&session).await {
-        Ok(members) => AppEvent::Family { session, members },
-        Err(err) => session_failed("Failed to list subagents", err),
+async fn list_family(client: &Client, tx: &Events, session: String, generation: u64) {
+    let members = match client.session_family(&session).await {
+        Ok(members) => Some(members),
+        Err(err) => {
+            tracing::warn!(%err, "family sync failed");
+            None
+        }
     };
-    let _ = tx.send(event);
+    let _ = tx.send(AppEvent::Family {
+        session,
+        generation,
+        members,
+    });
 }
 
 /// `GET /api/shell`, reduced to the running shells with the session that owns
@@ -463,21 +472,6 @@ async fn session_chrome(client: &Client, tx: &Events, session: String) {
             let _ = tx.send(AppEvent::SessionChrome { session, selection });
         }
         Err(err) => tracing::warn!(%err, "session chrome lookup failed"),
-    }
-}
-
-/// Probe the children one after another (a handful at most, so one task and
-/// no fan-out). A failed lookup is skipped: the event stream still drives
-/// that child.
-async fn probe_children(client: &Client, tx: &Events, children: Vec<String>) {
-    for child in children {
-        match client.session_info(&child).await {
-            Ok(info) => {
-                let running = info.time.is_running();
-                let _ = tx.send(AppEvent::ChildRunning { child, running });
-            }
-            Err(err) => tracing::warn!(%err, child, "child session probe failed"),
-        }
     }
 }
 

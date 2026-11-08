@@ -190,9 +190,9 @@ pub struct App {
     /// than the one shown is dropped instead of resurrecting `Connecting …`.
     mcp_issued: u64,
     mcp_applied: McpStamp,
-    /// The family the activity panel lists, fetched when the panel opened and
-    /// replaced on every fetch.
-    family: Vec<FamilyMember>,
+    family_generation: u64,
+    pending_family: Option<u64>,
+    family_refresh_needed: bool,
     /// The tab the user explicitly opened (`/subagents`, `/shells`, bare `↓`),
     /// i.e. upstream's `composer.open` + `composer.tab` store. `None` does not
     /// mean no panel: a subagent session shows one without anyone opening it,
@@ -314,7 +314,9 @@ impl App {
             osc52_attempted: false,
             mcp_issued: 0,
             mcp_applied: McpStamp::default(),
-            family: Vec::new(),
+            family_generation: 0,
+            pending_family: None,
+            family_refresh_needed: false,
             panel: None,
             cursor: activity_panel::Cursor::new(),
             selection_pending: false,
@@ -386,11 +388,6 @@ impl App {
                 items,
                 running_since,
             } => self.handle_history(request_id, items, running_since),
-            AppEvent::ChildRunning { child, running } => {
-                if self.store.apply_probe(&child, running) {
-                    self.family_state_changed();
-                }
-            }
             AppEvent::SessionReady {
                 session,
                 prompt,
@@ -473,7 +470,7 @@ impl App {
                     // 交给 `settle_selection`。
                     if first && self.parent.is_some() {
                         self.selection_pending = true;
-                        let _ = self.commands.send(AppCommand::ListFamily { session });
+                        self.request_family();
                     }
                     self.dirty = true;
                 }
@@ -518,7 +515,11 @@ impl App {
                     self.dirty = true;
                 }
             }
-            AppEvent::Family { session, members } => self.on_family(&session, members),
+            AppEvent::Family {
+                session,
+                generation,
+                members,
+            } => self.on_family(&session, generation, members),
             AppEvent::RunningShells { generation, shells } => {
                 if self.store.set_running_shells(generation, shells) {
                     self.child_state_changed();
@@ -571,13 +572,37 @@ impl App {
 
     /// Keep the family the panel lists. A late answer (the user moved to
     /// another session) is dropped.
-    fn on_family(&mut self, session: &str, members: Vec<FamilyMember>) {
-        if self.session.as_deref() != Some(session) {
+    fn on_family(&mut self, session: &str, generation: u64, members: Option<Vec<FamilyMember>>) {
+        if self.session.as_deref() != Some(session) || self.pending_family != Some(generation) {
             return;
         }
-        self.family = members;
+        self.pending_family = None;
+        if self.store.family.finish_sync(generation, members) {
+            self.child_state_changed();
+        }
         self.settle_selection();
         self.dirty = true;
+        if std::mem::take(&mut self.family_refresh_needed) {
+            self.request_family();
+        }
+    }
+
+    fn request_family(&mut self) {
+        let Some(session) = self.session.clone() else {
+            return;
+        };
+        if self.pending_family.is_some() {
+            self.family_refresh_needed = true;
+            return;
+        }
+        self.family_generation += 1;
+        let generation = self.family_generation;
+        self.pending_family = Some(generation);
+        self.store.family.begin_sync(generation);
+        let _ = self.commands.send(AppCommand::ListFamily {
+            session,
+            generation,
+        });
     }
 
     /// A fresh MCP server list. The home footer's summary follows every
@@ -739,7 +764,8 @@ impl App {
     fn session_changed(&mut self) {
         self.pending_session_list = None;
         self.panel = None;
-        self.family.clear();
+        self.pending_family = None;
+        self.family_refresh_needed = false;
         self.cursor = self.cursor.reset();
         self.selection_pending = false;
         self.parent = None;
@@ -932,6 +958,7 @@ impl App {
                 .send(AppCommand::LoadSessionChrome { session: id });
             self.request_forms();
             self.request_running_shells();
+            self.request_family();
             return;
         }
         let mut store = DataStore::default();
@@ -967,6 +994,7 @@ impl App {
             .commands
             .send(AppCommand::LoadSessionChrome { session: id });
         self.request_running_shells();
+        self.request_family();
         self.refresh();
     }
 
@@ -986,6 +1014,7 @@ impl App {
             files,
         });
         self.request_running_shells();
+        self.request_family();
         self.refresh();
     }
 
@@ -1059,21 +1088,7 @@ impl App {
         };
         self.store.replace_items(items, hydration);
         self.refresh();
-        // Starts missed while the history was loading, or while the stream
-        // was down, are not replayed: ask the server about every child.
-        let children = self.store.referenced_children();
-        self.probe_children(children);
-    }
-
-    /// Ask the server whether each of `children` is running. The store is told
-    /// first so an execution event that arrives while the request is in
-    /// flight wins over its (older) answer; see `DataStore::apply_probe`.
-    fn probe_children(&mut self, children: Vec<String>) {
-        if children.is_empty() {
-            return;
-        }
-        self.store.mark_probing(&children);
-        let _ = self.commands.send(AppCommand::ProbeChildren { children });
+        self.request_family();
     }
 
     fn request_reload(&mut self) {
@@ -1638,7 +1653,7 @@ impl App {
                 });
             }
             CommandAction::Subagents => {
-                if let Some(session) = self.session.clone() {
+                if self.session.is_some() {
                     // Upstream's tabs take the composer's place; the panel is
                     // up at once and fills in when the family lands, with the
                     // selection moving to the session on screen.
@@ -1646,7 +1661,7 @@ impl App {
                     self.cursor = self.cursor.reset();
                     self.selection_pending = true;
                     self.dirty = true;
-                    let _ = self.commands.send(AppCommand::ListFamily { session });
+                    self.request_family();
                 }
             }
             CommandAction::Images => {
@@ -1827,7 +1842,7 @@ impl App {
             return Vec::new();
         }
         activity_panel::rows(
-            &self.family,
+            self.store.family.members(),
             self.session.as_deref().unwrap_or_default(),
             self.cursor.active,
         )
@@ -2089,21 +2104,6 @@ impl App {
         self.dirty = true;
     }
 
-    /// A child's own turn started or ended. Its `running` state lives on the
-    /// session row the family endpoint reports, so a panel that is open over it
-    /// must be re-listed: upstream's tab is a live memo over the session list,
-    /// while ox holds the family it last fetched. Only a child the store names
-    /// flips it (see `DataStore::observe_foreign`), which no shell or capture
-    /// update does, so this cannot turn a poll into a request loop.
-    fn family_state_changed(&mut self) {
-        self.child_state_changed();
-        if self.panel_tab() == Some(activity_panel::Tab::Subagents)
-            && let Some(session) = self.session.clone()
-        {
-            let _ = self.commands.send(AppCommand::ListFamily { session });
-        }
-    }
-
     /// What the footer shows as going on: the focused session's own turn
     /// only, like upstream. Running children are shown on their tool rows.
     fn activity(&self) -> Activity {
@@ -2288,7 +2288,9 @@ impl App {
 
     fn handle_stream(&mut self, msg: StreamMsg) {
         match msg {
+            StreamMsg::Ready => self.request_family(),
             StreamMsg::Reconnected => {
+                self.request_family();
                 if let Some(session) = self.session.clone() {
                     self.directory_pending = true;
                     let _ = self.commands.send(AppCommand::RefreshDirectory { session });
@@ -2319,6 +2321,22 @@ impl App {
                     return;
                 }
                 let typed = envelope.parse_typed();
+                let known = typed
+                    .data
+                    .session_id()
+                    .is_some_and(|id| self.store.family.contains(id));
+                if self.store.family.observe(&typed, self.session.as_deref()) {
+                    self.child_state_changed();
+                    self.settle_selection();
+                }
+                if matches!(
+                    typed.data,
+                    ox_schema::event::SessionEventData::SessionCreated { .. }
+                        | ox_schema::event::SessionEventData::SessionDeleted { .. }
+                ) || (execution_edge(&typed.data) && !known)
+                {
+                    self.request_family();
+                }
                 // A turn started or ended somewhere: the open session list
                 // re-reads which trees are running.
                 if self.dialog.as_ref().and_then(Dialog::tag) == Some(session_dialog::LIST_TAG)
@@ -2330,13 +2348,21 @@ impl App {
                 // store filters them by `form.sessionID` itself.
                 let is_form = envelope.kind.starts_with("form.");
                 if !is_form && typed.data.session_id() != self.session.as_deref() {
-                    // 其它会话不进 reducer；子会话的执行起止由 store 自己筛选。
-                    if self.store.observe_foreign(&typed) {
-                        self.family_state_changed();
-                    }
                     return;
                 }
                 ox_client::store::reduce(&mut self.store, &typed);
+                if let ox_schema::event::SessionEventData::ToolCalled {
+                    assistant_message_id,
+                    id,
+                    ..
+                } = &typed.data
+                    && self
+                        .store
+                        .tool_part(assistant_message_id, id)
+                        .is_some_and(|part| part.tool == "subagent")
+                {
+                    self.request_family();
+                }
                 if matches!(
                     typed.data,
                     ox_schema::event::SessionEventData::SessionMoved { .. }
@@ -2357,10 +2383,9 @@ impl App {
                     id,
                     ..
                 } = &typed.data
-                    && let Some(child) = self.store.tool_child(assistant_message_id, id)
+                    && self.store.tool_child(assistant_message_id, id).is_some()
                 {
-                    let child = child.session_id.clone();
-                    self.probe_children(vec![child]);
+                    self.request_family();
                 }
                 // 服务端换了会话的 model / agent：metadata 行跟着刷新。
                 if let Some(session) = self.session.clone()
@@ -2584,7 +2609,7 @@ impl App {
         // being built a second time here.
         let panel = tab.map(|tab| {
             activity_panel::lines(
-                &self.family,
+                self.store.family.members(),
                 &self.panel_shells(),
                 self.session.as_deref().unwrap_or_default(),
                 tab,

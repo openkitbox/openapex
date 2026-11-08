@@ -273,8 +273,8 @@ impl Transcript {
     }
 
     /// The child session a click at screen cell (`x`, `y`) opens: the title
-    /// row of a Completion notice that carries a `child_id` (upstream
-    /// `routes/session/index.tsx:2090-2151`). `None` anywhere else.
+    /// row of a subagent call or Completion notice with a validated `child_id`
+    /// (upstream `Subagent`/`Completion`). `None` anywhere else.
     #[must_use]
     pub fn child_at(&self, x: u16, y: u16) -> Option<&str> {
         // Row 0 is the block's blank margin; row 1 is the title.
@@ -283,12 +283,13 @@ impl Transcript {
         };
         match &self.entries[index].block {
             Block::Completion { child_id, .. } => child_id.as_deref(),
+            Block::Tool { child_id, .. } => child_id.as_deref(),
             _ => None,
         }
     }
 
     /// The entry a pointer at (`x`, `y`) lights up: an Explored or Reasoning
-    /// title row, a Completion title row that links to a child session, or
+    /// title row, a tool/Completion title row that links to a child session, or
     /// anywhere in a User block (upstream `group-view.tsx:146, 166-177` and
     /// `routes/session/index.tsx:2127-2128, 2379-2383`).
     fn hover_target(&self, x: u16, y: u16) -> Option<usize> {
@@ -297,6 +298,7 @@ impl Transcript {
             Block::Explored(_) | Block::Reasoning { .. } => (row == 1).then_some(index),
             Block::User { .. } => Some(index),
             Block::Completion { child_id, .. } => (row == 1 && child_id.is_some()).then_some(index),
+            Block::Tool { child_id, .. } => (row == 1 && child_id.is_some()).then_some(index),
             Block::Shell { .. } => (row > 0 && self.entries[index].expandable).then_some(index),
             Block::Assistant { .. }
             | Block::Switch(_)
@@ -304,7 +306,6 @@ impl Transcript {
             | Block::Error(_)
             | Block::CompactionQueued
             | Block::BackgroundHint
-            | Block::Tool { .. }
             | Block::Todo { .. }
             | Block::Compaction { .. } => None,
         }
@@ -615,6 +616,7 @@ impl Transcript {
             Block::Tool { id, .. } => ViewState {
                 tool_expanded: tool_expandable(block) && self.tool_expanded.contains(id),
                 tool_focused: self.focused_tool.as_deref() == Some(id.as_str()),
+                hovered,
                 spin: if spins(block) { self.spin_frame } else { 0 },
                 ..Default::default()
             },

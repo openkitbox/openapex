@@ -93,13 +93,6 @@ pub enum AppEvent {
         /// missed `execution.started`, so this is the only source on a switch.
         running_since: Option<i64>,
     },
-    /// Answer to `AppCommand::ProbeChildren` for one child session. Applies
-    /// only if no execution event for the child arrived since the probe went
-    /// out. A failed probe sends nothing.
-    ChildRunning {
-        child: String,
-        running: bool,
-    },
     /// A lazily created session is ready; `prompt` is the text that triggered
     /// the creation (the app shows it optimistically and sends it).
     SessionReady {
@@ -173,7 +166,8 @@ pub enum AppEvent {
     /// the activity panel lists it.
     Family {
         session: String,
-        members: Vec<ox_client::rest::FamilyMember>,
+        generation: u64,
+        members: Option<Vec<ox_client::rest::FamilyMember>>,
     },
     /// Answer to `AppCommand::SyncShells`: the server's running shells and the
     /// session that owns each. Replaces `DataStore`'s running map; a failed

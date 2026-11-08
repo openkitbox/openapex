@@ -395,18 +395,6 @@ impl ChildRef {
             session_id: session_id.to_owned(),
         })
     }
-
-    /// Whether some tool part in `items` names `session_id` as its child.
-    fn referenced_in(items: &[Item], session_id: &str) -> bool {
-        items.iter().any(|item| match item {
-            Item::Assistant(assistant) => assistant.tools.iter().any(|part| {
-                part.child
-                    .as_ref()
-                    .is_some_and(|c| c.session_id == session_id)
-            }),
-            _ => false,
-        })
-    }
 }
 
 /// The background shell a `shell` tool call is bound to, read from its result
@@ -421,7 +409,7 @@ pub struct ShellRef {
 
 /// One outstanding `GET /api/shell` rebuild: the shell frames seen since it
 /// was issued are newer than its answer, so they are replayed over it (the
-/// `probing` rule for children, per shell id).
+/// family snapshot overlay rule, per shell id).
 #[derive(Debug, Default)]
 struct ShellSync {
     generation: u64,
@@ -556,6 +544,30 @@ pub struct ToolPart {
 }
 
 impl ToolPart {
+    /// A continuation input is only a hint: it must name a confirmed direct
+    /// child of the focused session, matching the server's resume guard.
+    /// Failed calls cannot authorize navigation through their submitted input.
+    #[must_use]
+    pub fn child_session<'part>(
+        &'part self,
+        family: &crate::family::FamilyState,
+        focused: Option<&str>,
+    ) -> Option<&'part str> {
+        if let Some(child) = &self.child {
+            return Some(&child.session_id);
+        }
+        if self.tool != ChildRef::SUBAGENT_TOOL || self.state == ToolState::Failed {
+            return None;
+        }
+        let id = self.input.get("sessionID")?.as_str()?;
+        let parent = focused?;
+        family
+            .members()
+            .iter()
+            .any(|member| member.id == id && member.parent_id.as_deref() == Some(parent))
+            .then_some(id)
+    }
+
     /// The shell this call is bound to; derived from [`Self::metadata`] so it
     /// cannot drift from it.
     #[must_use]
@@ -667,14 +679,8 @@ pub struct DataStore {
     /// when the answer lands means the live run state is newer than the
     /// answer's snapshot (see [`Hydration::KeepLive`]).
     lifecycle_epoch: u64,
-    /// Known child sessions (see [`ChildRef`]) whose turn is in flight.
-    /// Derived from `session.execution.*` events alone; see
-    /// [`DataStore::observe_foreign`].
-    running_children: HashSet<String>,
-    /// Children whose REST probe is in flight. An execution event for a child
-    /// removes it from here, so the (older) probe result is then discarded:
-    /// the event stream is newer than the answer to a request sent before it.
-    probing: HashSet<String>,
+    /// Confirmed family activity; never trimmed by transcript hydration.
+    pub family: crate::family::FamilyState,
     /// Running shells by id, each with the session that owns it (`None` when
     /// the server recorded no `metadata.sessionID`) and its command. From the
     /// `shell.*` frames and the `GET /api/shell` rebuild; the cap is the number
@@ -848,7 +854,7 @@ impl DataStore {
     /// Whether `session_id` is a known child whose turn is in flight.
     #[must_use]
     pub fn is_child_running(&self, session_id: &str) -> bool {
-        self.running_children.contains(session_id)
+        self.family.is_running(session_id)
     }
 
     /// Whether shell `id` is running (upstream: present in `data.shell`).
@@ -893,18 +899,10 @@ impl DataStore {
         shells
     }
 
-    /// Children named by a tool part that are running right now: the prompt
-    /// footer's subagent count. Derived, so it cannot drift from the rows.
-    ///
-    /// Deviation: upstream walks the session's family and keeps the members
-    /// whose status is `running` (`feature-plugins/prompt/footer.tsx:24-29`),
-    /// so a child the transcript has not named yet still counts. ox's family
-    /// is only fetched while the panel is open, so `running_children` (same
-    /// source as the subagent rows) is the resident count: a still-unnamed
-    /// child is the one case it misses.
+    /// Running confirmed family members other than the focused session.
     #[must_use]
     pub fn running_subagents(&self) -> usize {
-        self.running_children.len()
+        self.family.running_subagents(self.session.as_deref())
     }
 
     /// Feed one `shell.*` frame (`ox-tools/src/shell/events.rs:frame`):
@@ -1026,115 +1024,20 @@ impl DataStore {
         true
     }
 
-    /// Feed an event that belongs to a session OTHER than the focused one.
-    /// The caller (the TUI event loop) must route every such event here
-    /// instead of dropping it, and must NOT pass it to [`reduce`]. Only
-    /// `session.execution.*` of a child already named by a tool part of the
-    /// current items has an effect; everything else is ignored, so other
-    /// clients' sessions on the same server cannot make this one look busy.
-    ///
-    /// Limitation: a child's `execution.started` that arrives before the
-    /// parent's tool result names the child is ignored (the id is not known
-    /// yet), and so is a `succeeded` seen in that window. The REST rebuild
-    /// after history load is responsible for that window.
-    ///
-    /// Returns whether the event named a known child (so the caller needs to
-    /// repaint); `false` for every event that changed nothing.
-    pub fn observe_foreign(&mut self, event: &EventEnvelope<SessionEventData>) -> bool {
-        let (session_id, running) = match &event.data {
-            SessionEventData::ExecutionStarted { session_id } => (session_id, true),
-            SessionEventData::ExecutionSucceeded { session_id }
-            | SessionEventData::ExecutionFailed { session_id, .. }
-            | SessionEventData::ExecutionInterrupted { session_id, .. } => (session_id, false),
-            _ => return false,
-        };
-        // Fail closed: the focused session is `reduce`'s business.
-        if !self.is_foreign_child(session_id) {
-            return false;
-        }
-        self.probing.remove(session_id);
-        self.set_running(session_id, running);
-        true
-    }
-
-    fn set_running(&mut self, session_id: &str, running: bool) {
-        if running {
-            self.running_children.insert(session_id.to_owned());
-        } else {
-            self.running_children.remove(session_id);
-        }
-    }
-
-    /// Whether `session_id` is a child the current items name and not the
-    /// focused session itself (`reduce`'s business).
-    fn is_foreign_child(&self, session_id: &str) -> bool {
-        self.session.as_deref() != Some(session_id)
-            && ChildRef::referenced_in(&self.items, session_id)
-    }
-
-    /// Set a child's running state from a source other than the event stream
-    /// (the REST probe). Same fail-closed rule as [`observe_foreign`]: only a
-    /// child some tool part names is touched. Returns whether it acted.
-    pub fn set_child_running(&mut self, session_id: &str, running: bool) -> bool {
-        if !self.is_foreign_child(session_id) {
-            return false;
-        }
-        self.set_running(session_id, running);
-        true
-    }
-
-    /// Every child session the items name, once each, in first-seen order.
+    /// Look up one tool part without copying its payload.
     #[must_use]
-    pub fn referenced_children(&self) -> Vec<String> {
-        let mut seen = HashSet::new();
-        let mut children = Vec::new();
-        for item in &self.items {
-            let Item::Assistant(assistant) = item else {
-                continue;
-            };
-            for child in assistant
-                .tools
-                .iter()
-                .filter_map(|part| part.child.as_ref())
-            {
-                if seen.insert(child.session_id.as_str()) {
-                    children.push(child.session_id.clone());
-                }
-            }
-        }
-        children
+    pub fn tool_part(&self, message_id: &str, part_id: &str) -> Option<&ToolPart> {
+        let index = *self.assistant_index.get(message_id)?;
+        let Item::Assistant(assistant) = self.items.get(index)? else {
+            return None;
+        };
+        assistant.tools.iter().find(|part| part.id == part_id)
     }
 
     /// The child of tool part `part_id` inside assistant message `message_id`.
     #[must_use]
     pub fn tool_child(&self, message_id: &str, part_id: &str) -> Option<&ChildRef> {
-        let index = *self.assistant_index.get(message_id)?;
-        let Item::Assistant(assistant) = self.items.get(index)? else {
-            return None;
-        };
-        assistant
-            .tools
-            .iter()
-            .find(|part| part.id == part_id)?
-            .child
-            .as_ref()
-    }
-
-    /// Note that a REST probe for each referenced child in `ids` is about to
-    /// be sent. Must be called before the request goes out.
-    pub fn mark_probing(&mut self, ids: &[String]) {
-        for id in ids {
-            if self.is_foreign_child(id) {
-                self.probing.insert(id.clone());
-            }
-        }
-    }
-
-    /// Apply a probe answer unless an execution event for the child arrived
-    /// after [`mark_probing`] (or the child is no longer referenced). Each
-    /// `mark_probing` is consumed by one answer. Returns whether it applied.
-    pub fn apply_probe(&mut self, session_id: &str, running: bool) -> bool {
-        self.probing.remove(session_id) && self.set_child_running(session_id, running)
+        self.tool_part(message_id, part_id)?.child.as_ref()
     }
 
     /// See the `lifecycle_epoch` field: how many `execution.*` events the
@@ -1190,10 +1093,6 @@ impl DataStore {
                 assistant.done = true;
             }
         }
-        let items = &self.items;
-        self.running_children
-            .retain(|id| ChildRef::referenced_in(items, id));
-        self.probing.retain(|id| ChildRef::referenced_in(items, id));
         self.assistant_index.clear();
         self.pending_synthetics.clear();
         self.shown_error = ShownError::default();
@@ -1496,6 +1395,7 @@ pub fn reduce(store: &mut DataStore, event: &EventEnvelope<SessionEventData>) {
                 if let Some(child) = ChildRef::from_metadata(&part.tool, Some(metadata)) {
                     part.child = Some(child);
                 }
+                part.metadata = Some(Arc::new(metadata.clone()));
                 part.version += 1;
             }
             store.touch(index);

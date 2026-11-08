@@ -45,11 +45,6 @@ pub enum AppCommand {
         session: String,
         request_id: u64,
     },
-    /// Read each child (subagent) session's `time.busy/idle`, one request
-    /// after another; every answer is an `AppEvent::ChildRunning`.
-    ProbeChildren {
-        children: Vec<String>,
-    },
     /// Fetch one attachment's bytes for a thumbnail; answered with
     /// `AppEvent::Media`. `cells` is the grid the image will be drawn on, which
     /// only a sixel terminal needs: its encode is made for that exact grid.
@@ -130,6 +125,7 @@ pub enum AppCommand {
     /// Fetch the session family of `session`; answered with `AppEvent::Family`.
     ListFamily {
         session: String,
+        generation: u64,
     },
     /// Fetch the background shells to rebuild the running set; answered with
     /// `AppEvent::RunningShells`, which never opens a dialog. `generation`

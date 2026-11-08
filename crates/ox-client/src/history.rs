@@ -363,13 +363,16 @@ fn tool_part(
         WireToolState::Streaming { input } => {
             (ToolState::Input, None, String::new(), input.clone(), None)
         }
-        WireToolState::Running { input, .. } => (
-            ToolState::Running,
-            Some(input),
-            String::new(),
-            String::new(),
-            None,
-        ),
+        WireToolState::Running { input, metadata } => {
+            child = ChildRef::from_metadata(name, Some(metadata));
+            (
+                ToolState::Running,
+                Some(input),
+                String::new(),
+                String::new(),
+                Some(metadata),
+            )
+        }
         WireToolState::Completed {
             input,
             content,

@@ -49,6 +49,7 @@ use ox_client::store::{AssistantItem, DataStore, Item, ShellRef, ToolPart};
 use ox_schema::support::FinishReason;
 
 use crate::shell_captures::ShellCaptures;
+
 use crate::ui::timeline::{Block, Delivery, Explored, ExploredCall, ExploredCount, TurnFooter};
 
 /// Projection of the store's ordered items into display blocks. Ordering is
@@ -294,21 +295,27 @@ fn push_tools(
             });
             continue;
         }
+        let child_id = tool.child_session(&store.family, store.session.as_deref());
+        let child_running = child_id.is_some_and(|id| store.is_child_running(id));
         blocks.push(Block::Tool {
             id: tool.id.clone(),
             version: tool.version,
             tool: tool.tool.clone(),
-            state: tool.state,
+            state: if child_running && tool.state != ox_client::store::ToolState::Failed {
+                ox_client::store::ToolState::Running
+            } else {
+                tool.state
+            },
             summary: tool.summary.clone(),
             output: Arc::clone(&tool.output),
-            // Upstream `isBackgroundSubagent`: the badge is a finished
-            // call whose child still runs. A foreground call holds its child
-            // too now, so the outcome is what tells the two apart.
-            background: tool.state == ox_client::store::ToolState::Success
-                && tool
-                    .child
-                    .as_ref()
-                    .is_some_and(|child| store.is_child_running(&child.session_id)),
+            // Upstream `isBackgroundSubagent`: the badge records how this
+            // call completed, independently of the child's current activity.
+            background: tool.tool == "subagent"
+                && tool.state == ox_client::store::ToolState::Success
+                && tool.metadata.as_deref().is_some_and(|metadata| {
+                    metadata.get("status").and_then(|status| status.as_str()) == Some("running")
+                }),
+            child_id: child_id.map(str::to_owned),
             input: Arc::clone(&tool.input),
             metadata: tool.metadata.clone(),
             media: Arc::clone(&tool.media),

@@ -142,10 +142,12 @@ pub enum Block {
         state: ToolState,
         summary: String,
         output: std::sync::Arc<String>,
-        /// A subagent call whose child session is still running. Not part of
-        /// the part, so a child starting or ending does not bump `version`:
-        /// equality compares it too.
+        /// This call completed in the background (`metadata.status == "running"`),
+        /// independent of the child's current activity.
         background: bool,
+        /// Trusted metadata or a confirmed direct-child continuation. Membership
+        /// can arrive without a part version bump, so equality compares it too.
+        child_id: Option<String>,
         /// The parsed call input, shared with the `ToolPart` (per-tool
         /// texts read their fields from it).
         input: std::sync::Arc<Record>,
@@ -304,6 +306,8 @@ impl PartialEq for Block {
                     id: aid,
                     version: aversion,
                     background: abackground,
+                    child_id: achild,
+                    state: astate,
                     media: amedia,
                     ..
                 },
@@ -311,6 +315,8 @@ impl PartialEq for Block {
                     id: bid,
                     version: bversion,
                     background: bbackground,
+                    child_id: bchild,
+                    state: bstate,
                     media: bmedia,
                     ..
                 },
@@ -320,6 +326,8 @@ impl PartialEq for Block {
                 aid == bid
                     && aversion == bversion
                     && abackground == bbackground
+                    && achild == bchild
+                    && astate == bstate
                     && std::sync::Arc::ptr_eq(amedia, bmedia)
             }
             (

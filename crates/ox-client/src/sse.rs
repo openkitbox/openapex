@@ -80,6 +80,8 @@ fn truncate_on_char_boundary(s: &str, max: usize) -> &str {
 
 #[derive(Debug)]
 pub enum StreamMsg {
+    /// First successful connection: compensate the startup snapshot/stream gap.
+    Ready,
     /// The stream is connected again after a drop; the caller should refetch
     /// history. Not sent for the first connection or while the server is down.
     Reconnected,
@@ -202,7 +204,12 @@ async fn stream_once(
     }
 
     *connected = true;
-    if reconnecting && tx.send(StreamMsg::Reconnected).is_err() {
+    let ready = if reconnecting {
+        StreamMsg::Reconnected
+    } else {
+        StreamMsg::Ready
+    };
+    if tx.send(ready).is_err() {
         return Ok(());
     }
 

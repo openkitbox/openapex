@@ -17,7 +17,7 @@ pub(super) struct ViewState {
     /// Explored blocks: the per-call tool rows are listed under the title.
     pub(super) explored_expanded: bool,
     /// The pointer is over this Explored title, Reasoning header, User block
-    /// or the title row of a Completion notice that links to a child session.
+    /// or a tool/Completion title row that links to a child session.
     pub(super) hovered: bool,
     /// The spinner frame of a block that spins (see `spins`).
     pub(super) spin: usize,
@@ -43,7 +43,7 @@ pub(super) const SPINNER_FRAMES: [char; 10] = spinner::BRAILLE_FRAMES;
 pub(super) const SPINNER_INTERVAL_MS: u128 = spinner::BRAILLE_INTERVAL_MS;
 
 /// Blocks whose spinner moves with the clock: streaming reasoning, running
-/// tool and todo rows, and background subagent rows.
+/// tool and todo rows (including calls whose child is currently running).
 pub(super) fn spins(block: &Block) -> bool {
     let running = |state: &ToolState| {
         matches!(
@@ -53,9 +53,7 @@ pub(super) fn spins(block: &Block) -> bool {
     };
     match block {
         Block::Reasoning { done, .. } => !done,
-        Block::Tool {
-            state, background, ..
-        } => *background || running(state),
+        Block::Tool { state, .. } => running(state),
         Block::Todo { state, .. } => running(state),
         Block::Shell {
             state,
