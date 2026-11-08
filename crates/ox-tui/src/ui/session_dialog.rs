@@ -71,6 +71,7 @@ fn relative(now: &Zoned, then: &Zoned) -> String {
 /// show a spinner instead (upstream `sessionStatusGutter`).
 #[must_use]
 pub fn list(
+    directory: &str,
     sessions: &[SessionSummary],
     current: Option<&str>,
     running: &HashSet<String>,
@@ -87,10 +88,16 @@ pub fn list(
             Item::new(session.id.as_str(), title_of(session))
                 .category(category(&updated, &now))
                 .footer(relative(&now, &updated))
+                .description(
+                    session
+                        .location
+                        .as_ref()
+                        .map_or("", |location| location.directory.as_str()),
+                )
                 .running(running.contains(&session.id))
         })
         .collect();
-    let mut select = Select::new("Sessions", items)
+    let mut select = Select::new(format!("Sessions · {directory}"), items)
         .large()
         .tag(LIST_TAG)
         .action(DELETE_KEY, Some("Press ctrl+d again to confirm"))

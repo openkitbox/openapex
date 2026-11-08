@@ -32,6 +32,16 @@ impl std::fmt::Debug for Fetched {
 
 #[derive(Debug)]
 pub enum AppEvent {
+    DirectoryChanged {
+        session: Option<String>,
+        generation: u64,
+        directory: String,
+    },
+    Directories {
+        query: String,
+        generation: u64,
+        paths: Vec<String>,
+    },
     Key(KeyEvent),
     /// Bracketed paste: the whole pasted text, moved from the terminal event.
     Paste(String),
@@ -151,6 +161,8 @@ pub enum AppEvent {
     /// Answer to `AppCommand::ListSessions`; opens the `/sessions` dialog.
     /// `running` holds the root sessions with a turn in flight in their tree.
     Sessions {
+        directory: String,
+        generation: u64,
         sessions: Vec<ox_client::rest::SessionSummary>,
         running: std::collections::HashSet<String>,
     },
@@ -197,9 +209,10 @@ pub enum AppEvent {
         title: &'static str,
         error: String,
     },
-    /// Answer to `AppCommand::FindFiles`, tagged with the query it answers.
+    /// Answer to `AppCommand::FindFiles`, tagged with its query and directory generation.
     Files {
         query: String,
+        generation: u64,
         entries: Vec<ox_client::rest::FileEntry>,
     },
     /// Answer to `AppCommand::LoadAttachments`. `loaded` is `None` when any

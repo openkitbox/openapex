@@ -13,6 +13,8 @@
 /// What the app should do when the user picks a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandAction {
+    /// Change the active working directory.
+    Cd,
     /// Leave the current session and go back to the home screen.
     New,
     /// Drop the transcript and go back to the home screen.
@@ -71,6 +73,14 @@ pub struct Command {
 /// The whole registry. Keep it alphabetical by primary name; the menu sorts by
 /// display anyway, this is for humans reading the file.
 pub const COMMANDS: &[Command] = &[
+    Command {
+        name: "cd",
+        aliases: &[],
+        description: "Change working directory",
+        title: "Change working directory",
+        group: "Session",
+        action: CommandAction::Cd,
+    },
     Command {
         name: "agents",
         aliases: &[],
@@ -162,7 +172,7 @@ pub const COMMANDS: &[Command] = &[
     },
     Command {
         name: "sessions",
-        aliases: &["resume", "continue"],
+        aliases: &["session", "resume", "continue"],
         description: "Switch session",
         title: "Switch session",
         group: "Session",

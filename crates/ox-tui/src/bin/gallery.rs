@@ -777,6 +777,7 @@ fn session_case(
     ];
     let running: std::collections::HashSet<String> = ["ses_c".to_owned()].into();
     let mut dialog = session_dialog::list(
+        "/workspace/ox",
         &sessions,
         Some("ses_a"),
         &running,

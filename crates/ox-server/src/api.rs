@@ -164,6 +164,87 @@ async fn location_get(req: &mut Request, depot: &mut Depot, res: &mut Response) 
     }));
 }
 
+// Keep the existing compat resolution contract local to these filesystem routes:
+// request parsing is nonblocking, but canonicalization and cwd lookup are not.
+async fn directory_base(req: &Request) -> Result<PathBuf, tokio::task::JoinError> {
+    let requested = compat::request_directory(req);
+    tokio::task::spawn_blocking(move || {
+        let path = requested.map_or_else(
+            || std::env::current_dir().unwrap_or_default(),
+            |raw| {
+                let path = PathBuf::from(raw);
+                path.canonicalize().unwrap_or(path)
+            },
+        );
+        // compat::directory_of renders lossily before callers reparse the path.
+        PathBuf::from(path.to_string_lossy().as_ref())
+    })
+    .await
+}
+
+/// Validate a Home directory without creating a session or changing location.get.
+#[handler]
+async fn location_validate(req: &mut Request, res: &mut Response) {
+    let Some(raw) = req.query::<String>("directory") else {
+        res.status_code(StatusCode::BAD_REQUEST);
+        return;
+    };
+    let Ok(base) = directory_base(req).await else {
+        res.status_code(StatusCode::BAD_REQUEST);
+        return;
+    };
+    let expanded = ox_core::home_paths::expand_tilde(&raw, &ox_core::config::user_home())
+        .unwrap_or_else(|| PathBuf::from(&raw));
+    let destination = base.join(expanded);
+    if let Ok(path) = tokio::fs::canonicalize(destination).await
+        && !raw.trim().is_empty()
+        && tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_dir())
+    {
+        res.render(Json(
+            serde_json::json!({"directory": path.display().to_string()}),
+        ));
+    } else {
+        res.status_code(StatusCode::BAD_REQUEST);
+    }
+}
+
+/// Immediate child directories for /cd, including paths outside the project.
+#[handler]
+async fn directories(req: &mut Request, res: &mut Response) {
+    let query = req.query::<String>("query").unwrap_or_default();
+    let query = if query == "~" || !query.is_empty() && query.split('/').all(|part| part == "..") {
+        format!("{query}/")
+    } else {
+        query
+    };
+    let (parent, prefix) = query
+        .rsplit_once('/')
+        .map_or(("", query.as_str()), |(p, s)| (&query[..p.len() + 1], s));
+    let expanded = ox_core::home_paths::expand_tilde(parent, &ox_core::config::user_home())
+        .unwrap_or_else(|| PathBuf::from(parent));
+    let mut paths = Vec::new();
+    let Ok(base) = directory_base(req).await else {
+        res.render(Json(paths));
+        return;
+    };
+    let root = base.join(expanded);
+    let prefix = prefix.to_lowercase();
+    if let Ok(mut entries) = tokio::fs::read_dir(root).await {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.to_lowercase().starts_with(&prefix)
+                && (!prefix.is_empty() || !name.starts_with('.'))
+                && entry.metadata().await.is_ok_and(|m| m.is_dir())
+            {
+                paths.push(format!("{parent}{name}/"));
+            }
+        }
+    }
+    paths.sort();
+    paths.truncate(200);
+    res.render(Json(paths));
+}
+
 /// `POST /api/location/reload` — re-read `ox.toml` and hot-swap the services
 /// derived from it. Any failure answers 503 `ServiceUnavailableError` and the
 /// running services stay in place.
@@ -760,6 +841,8 @@ pub fn build_router(state: AppState) -> Router {
         // opencode paths stay distinguishable.
         .push(
             Router::with_path("ox")
+                .push(Router::with_path("location").post(location_validate))
+                .push(Router::with_path("directories").get(directories))
                 .push(Router::with_path("lease").get(lease::lease))
                 .push(Router::with_path("session/{id}/family").get(family::family))
                 .push(Router::with_path("session/{sessionID}/media/{messageID}").get(media::media)),

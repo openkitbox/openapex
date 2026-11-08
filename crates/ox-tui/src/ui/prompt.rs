@@ -363,9 +363,34 @@ impl Prompt {
         self.file_request.take()
     }
 
+    pub fn directory_completion(&self) -> bool {
+        self.auto.trigger() == Some(Trigger::Directory)
+    }
+
+    pub fn set_directories(&mut self, query: &str, paths: Vec<String>) {
+        if self.directory_completion() && self.auto.query() == query {
+            self.files = paths
+                .into_iter()
+                .map(|path| FileRow { path, is_dir: true })
+                .collect();
+            self.auto.clamp(self.files.len());
+        }
+    }
+
+    pub fn set_directory(&mut self, directory: &str) {
+        self.chrome.directory = directory.to_owned();
+        self.chrome.branch = None;
+        self.files.clear();
+        self.file_requested = None;
+        self.sync_files();
+    }
+
     /// Show the matches for `query`; answers for a query the user has since
     /// edited are dropped.
     pub fn set_files(&mut self, query: &str, entries: &[ox_client::rest::FileEntry]) {
+        if self.directory_completion() {
+            return;
+        }
         if self.auto.trigger().is_none_or(|t| t == Trigger::Command) || self.auto.query() != query {
             return;
         }
@@ -656,6 +681,14 @@ impl Prompt {
                 PromptAction::Ignored
             }
             (KeyCode::Enter, modifiers) if !modifiers.contains(KeyModifiers::SHIFT) => {
+                if self.directory_completion() {
+                    self.auto.hide();
+                    if let Some(submission) = self.composer.handle_key(key) {
+                        self.submitted(&submission.text);
+                        return PromptAction::Submit(submission);
+                    }
+                    return PromptAction::Ignored;
+                }
                 self.select()
             }
             (KeyCode::Tab, _) => self.select(),
@@ -683,6 +716,15 @@ impl Prompt {
 
     fn select(&mut self) -> PromptAction {
         match self.auto.trigger() {
+            Some(Trigger::Directory) => {
+                if let Some(row) = self.files.get(self.auto.selected()) {
+                    self.composer.set_text(&format!("/cd {}", row.path), true);
+                    self.sync_menu();
+                } else {
+                    self.auto.hide();
+                }
+                PromptAction::Ignored
+            }
             Some(Trigger::Mention { col }) => {
                 // Attachments are blocked server-side, so a pick is plain text.
                 // With nothing to pick, Enter just closes the menu.
@@ -700,6 +742,11 @@ impl Prompt {
                     return PromptAction::Ignored;
                 };
                 let action = row.action;
+                if action == CommandAction::Cd {
+                    self.composer.set_text("/cd ", true);
+                    self.sync_menu();
+                    return PromptAction::Ignored;
+                }
                 let (_, column) = self.composer.cursor();
                 self.composer.delete_leading(column);
                 self.auto.hide();
@@ -721,7 +768,9 @@ impl Prompt {
     /// results once no `@` menu is open.
     fn sync_files(&mut self) {
         let wanted = match self.auto.trigger() {
-            Some(Trigger::Mention { .. }) => Some(self.auto.query().to_owned()),
+            Some(Trigger::Mention { .. } | Trigger::Directory) => {
+                Some(self.auto.query().to_owned())
+            }
             _ => None,
         };
         if wanted.is_none() {
@@ -735,7 +784,7 @@ impl Prompt {
 
     fn menu_len(&self) -> usize {
         match self.auto.trigger() {
-            Some(Trigger::Mention { .. }) => self.files.len(),
+            Some(Trigger::Mention { .. } | Trigger::Directory) => self.files.len(),
             _ => self.rows().len(),
         }
     }
@@ -747,7 +796,7 @@ impl Prompt {
     /// `(label, description)` for each menu row, whichever menu is open.
     fn menu_items(&self, width: usize) -> Vec<(String, String)> {
         match self.auto.trigger() {
-            Some(Trigger::Mention { .. }) => self
+            Some(Trigger::Mention { .. } | Trigger::Directory) => self
                 .files
                 .iter()
                 .map(|row| {

@@ -131,6 +131,16 @@ pub struct App {
     pub transcript: Transcript,
     pub commands: mpsc::UnboundedSender<AppCommand>,
     seq_tx: watch::Sender<Option<i64>>,
+    /// Directory epoch for completion requests; results from an earlier epoch
+    /// must never repopulate the prompt, even when their query still matches.
+    completion_generation: u64,
+    navigation_generation: u64,
+    /// One-shot list request identity, independent of navigation (including
+    /// reopening the picker without changing the directory).
+    next_session_list_id: u64,
+    pending_session_list: Option<u64>,
+    directory_pending: bool,
+    directory: String,
     next_reload_id: u64,
     pending_reload: Option<PendingReload>,
     /// Home 提交后等待会话创建：失败时把这段文本放回 composer。
@@ -255,6 +265,7 @@ impl App {
         route: Route,
         session: Option<String>,
         home_chrome: Chrome,
+        directory: String,
         commands: mpsc::UnboundedSender<AppCommand>,
         seq_tx: watch::Sender<Option<i64>>,
     ) -> Self {
@@ -276,6 +287,12 @@ impl App {
             transcript: Transcript::new(80, 20),
             commands,
             seq_tx,
+            completion_generation: 0,
+            navigation_generation: 0,
+            next_session_list_id: 0,
+            pending_session_list: None,
+            directory_pending: false,
+            directory,
             next_reload_id: 0,
             pending_reload: None,
             pending_home_prompt: None,
@@ -330,6 +347,40 @@ impl App {
             AppEvent::Hover { x, y } => self.handle_hover(x, y),
             AppEvent::Wheel(direction) => self.handle_wheel(direction),
             AppEvent::Stream(msg) => self.handle_stream(msg),
+            AppEvent::DirectoryChanged {
+                session,
+                generation,
+                directory,
+            } => {
+                if session == self.session && generation == self.navigation_generation {
+                    self.directory_pending = false;
+                    if directory != self.directory {
+                        self.pending_session_list = None;
+                        if self.dialog.as_ref().and_then(Dialog::tag)
+                            == Some(session_dialog::LIST_TAG)
+                        {
+                            self.dialog = None;
+                            self.dialog_purpose = None;
+                        }
+                    }
+                    self.directory = directory.clone();
+                    self.completion_generation += 1;
+                    self.prompt.set_directory(&directory);
+                    self.flush_file_request();
+                    self.dirty = true;
+                }
+            }
+            AppEvent::Directories {
+                query,
+                generation,
+                paths,
+            } => {
+                if generation != self.completion_generation {
+                    return;
+                }
+                self.prompt.set_directories(&query, paths);
+                self.dirty = true;
+            }
             AppEvent::History {
                 request_id,
                 items,
@@ -368,7 +419,14 @@ impl App {
                 self.request_forms();
             }
             AppEvent::Media { key, class, result } => self.on_media(key, class, result),
-            AppEvent::Files { query, entries } => {
+            AppEvent::Files {
+                query,
+                generation,
+                entries,
+            } => {
+                if generation != self.completion_generation {
+                    return;
+                }
                 self.prompt.set_files(&query, &entries);
                 self.dirty = true;
             }
@@ -423,9 +481,25 @@ impl App {
             AppEvent::SwitchFailed { title, err } => {
                 self.show_toast(Toast::error(title, err, Instant::now()))
             }
-            AppEvent::Sessions { sessions, running } => {
-                if !self.form_open() {
+            AppEvent::Sessions {
+                directory,
+                generation,
+                sessions,
+                running,
+            } => {
+                if self.pending_session_list != Some(generation) {
+                    return;
+                }
+                self.pending_session_list = None;
+                if directory == self.directory
+                    && !self.form_open()
+                    && self
+                        .dialog
+                        .as_ref()
+                        .is_none_or(|dialog| dialog.tag() == Some(session_dialog::LIST_TAG))
+                {
                     self.dialog = Some(session_dialog::list(
+                        &directory,
                         &sessions,
                         self.session.as_deref(),
                         &running,
@@ -663,13 +737,17 @@ impl App {
     /// cursor (a stale one would make the next stream replay from the wrong
     /// place). The new session's pending forms are fetched when there is one.
     fn session_changed(&mut self) {
+        self.pending_session_list = None;
         self.panel = None;
         self.family.clear();
         self.cursor = self.cursor.reset();
         self.selection_pending = false;
         self.parent = None;
         let purposeful = self.dialog_purpose.take().is_some();
-        if purposeful || self.form_open() {
+        if purposeful
+            || self.form_open()
+            || self.dialog.as_ref().and_then(Dialog::tag) == Some(session_dialog::LIST_TAG)
+        {
             self.dialog = None;
         }
         self.settled_forms.clear();
@@ -684,6 +762,7 @@ impl App {
             DialogOutcome::Idle => {}
             DialogOutcome::Changed => self.dirty = true,
             DialogOutcome::Cancelled => {
+                self.pending_session_list = None;
                 let closed = self.dialog.take();
                 self.dialog_purpose = None;
                 self.dirty = true;
@@ -693,6 +772,7 @@ impl App {
                 self.sync_form_dialog();
             }
             DialogOutcome::FormSubmitted(answer) => {
+                self.pending_session_list = None;
                 let closed = self.dialog.take();
                 self.dirty = true;
                 if let Some(Dialog::Form(form)) = closed {
@@ -701,6 +781,7 @@ impl App {
                 self.sync_form_dialog();
             }
             DialogOutcome::Selected(value) => {
+                self.pending_session_list = None;
                 self.dialog = None;
                 self.dirty = true;
                 if tag == Some(session_dialog::LIST_TAG) {
@@ -749,6 +830,7 @@ impl App {
                         .commands
                         .send(AppCommand::DeleteSession { session: value });
                 } else if key == session_dialog::RENAME_KEY {
+                    self.pending_session_list = None;
                     let title = match &self.dialog {
                         Some(Dialog::Select(select)) => {
                             select.item(&value).map(|item| item.title.clone())
@@ -759,6 +841,7 @@ impl App {
                 }
             }
             DialogOutcome::Submitted { target, text } => {
+                self.pending_session_list = None;
                 self.dialog = None;
                 self.dirty = true;
                 let title = text.trim();
@@ -834,7 +917,21 @@ impl App {
     /// (store, transcript, the in-flight history reload), restart the stream
     /// from the live tail and fetch the new history.
     pub fn switch_session(&mut self, id: String) {
+        self.pending_session_list = None;
         if self.session.as_deref() == Some(id.as_str()) {
+            if !self.directory_pending {
+                return;
+            }
+            let _ = self.commands.send(AppCommand::AttachSession {
+                session: id.clone(),
+                generation: self.navigation_generation,
+            });
+            self.request_reload();
+            let _ = self
+                .commands
+                .send(AppCommand::LoadSessionChrome { session: id });
+            self.request_forms();
+            self.request_running_shells();
             return;
         }
         let mut store = DataStore::default();
@@ -859,8 +956,11 @@ impl App {
         self.prompt.set_footer(footer_of(self.route));
         self.prompt.set_placeholder("");
         self.session_changed();
+        self.navigation_generation += 1;
+        self.directory_pending = true;
         let _ = self.commands.send(AppCommand::AttachSession {
             session: id.clone(),
+            generation: self.navigation_generation,
         });
         self.request_reload();
         let _ = self
@@ -1125,20 +1225,37 @@ impl App {
     /// Send the prompt's pending `@` file lookup, if text just changed it.
     fn flush_file_request(&mut self) {
         if let Some(query) = self.prompt.take_file_request() {
-            let _ = self.commands.send(AppCommand::FindFiles(query));
+            let generation = self.completion_generation;
+            let command = if self.prompt.directory_completion() {
+                AppCommand::FindDirectories { query, generation }
+            } else {
+                AppCommand::FindFiles { query, generation }
+            };
+            let _ = self.commands.send(command);
         }
     }
 
     /// `handle_key` with the clock injected (the leader's 2s window).
     fn handle_key_at(&mut self, key: crossterm::event::KeyEvent, now: Instant) {
         // A selection takes the key first (upstream `handleSelectionKey`):
-        // esc only clears it; every other key clears it and carries on.
+        // esc clears it and cancels a pending picker; every other key carries on.
         if key.kind != crossterm::event::KeyEventKind::Release && self.transcript.clear_selection()
         {
             self.dirty = true;
             if key.code == KeyCode::Esc {
+                if self.dialog.is_none() {
+                    self.pending_session_list = None;
+                }
                 return;
             }
+        }
+        if key.kind != KeyEventKind::Release
+            && key.code == KeyCode::Esc
+            && self.dialog.is_none()
+            && self.pending_session_list.take().is_some()
+        {
+            self.dirty = true;
+            return;
         }
         // A question form takes the composer's place rather than covering
         // the session (upstream `routes/session/index.tsx:1625-1631`), so the
@@ -1340,6 +1457,7 @@ impl App {
     fn run_global(&mut self, action: Action) {
         match action {
             Action::OpenPalette => {
+                self.pending_session_list = None;
                 let context = palette::Context {
                     in_session: self.route == Route::Session,
                     has_queue: !self.store.queued.is_empty(),
@@ -1420,11 +1538,45 @@ impl App {
     }
 
     fn submit(&mut self, submission: Submission) {
-        if self.route == Route::Home {
-            if self.pending_home_prompt.is_some() {
-                // A creation is already in flight; keep whatever is typed.
-                return;
+        if self.route == Route::Home && self.pending_home_prompt.is_some() {
+            // Creation owns the directory until SessionReady, including /cd.
+            self.prompt.restore(&submission.text);
+            self.show_toast(Toast::error(
+                "Creating a session",
+                "Wait for session creation before submitting again",
+                Instant::now(),
+            ));
+            return;
+        }
+        if self.directory_pending {
+            self.prompt.restore(&submission.text);
+            self.show_toast(Toast::error(
+                "Directory unavailable",
+                "Wait for directory synchronization or reselect the session to retry",
+                Instant::now(),
+            ));
+            return;
+        }
+        if let Some(directory) = submission.text.strip_prefix("/cd")
+            && (directory.is_empty() || directory.starts_with(char::is_whitespace))
+        {
+            if directory.trim().is_empty() {
+                self.show_toast(Toast::error(
+                    "Failed to change directory",
+                    "Directory is required",
+                    Instant::now(),
+                ));
+            } else {
+                self.pending_session_list = None;
+                self.directory_pending = true;
+                let _ = self.commands.send(AppCommand::ChangeDirectory {
+                    session: self.session.clone(),
+                    directory: directory.trim().to_owned(),
+                });
             }
+            return;
+        }
+        if self.route == Route::Home {
             self.pending_home_prompt = Some(PendingHome {
                 text: submission.text.clone(),
                 dropped_files: submission.files.len(),
@@ -1455,7 +1607,11 @@ impl App {
     }
 
     fn run_command(&mut self, action: CommandAction) {
+        if action != CommandAction::Sessions {
+            self.pending_session_list = None;
+        }
         match action {
+            CommandAction::Cd => self.prompt.restore("/cd "),
             CommandAction::Exit => self.view.should_quit = true,
             CommandAction::Status => {
                 self.request_mcp_list(McpIntent::Status);
@@ -1472,7 +1628,14 @@ impl App {
                     .send(AppCommand::AgentList(command::AgentIntent::Dialog));
             }
             CommandAction::Sessions => {
-                let _ = self.commands.send(AppCommand::ListSessions);
+                self.next_session_list_id += 1;
+                self.pending_session_list = Some(self.next_session_list_id);
+                // Keep recovery available: this is the committed UI scope,
+                // not the client's possibly unconfirmed navigation target.
+                let _ = self.commands.send(AppCommand::ListSessions {
+                    directory: self.directory.clone(),
+                    generation: self.next_session_list_id,
+                });
             }
             CommandAction::Subagents => {
                 if let Some(session) = self.session.clone() {
@@ -1566,7 +1729,12 @@ impl App {
                 self.prompt
                     .set_placeholder(&placeholder_line(pick_placeholder()));
                 self.session_changed();
-                let _ = self.commands.send(AppCommand::DetachSession);
+                self.navigation_generation += 1;
+                self.directory_pending = false;
+                let _ = self.commands.send(AppCommand::DetachSession {
+                    directory: self.directory.clone(),
+                    generation: self.navigation_generation,
+                });
             }
         }
     }
@@ -1837,6 +2005,19 @@ impl App {
     /// Send the user's decision and drop the form from the store at once, so
     /// the dialog does not reopen before the server's `form.*` frame arrives.
     fn settle_form(&mut self, id: &str, answer: Option<ox_client::form::Answer>) {
+        if self.directory_pending {
+            if let Some(session) = &self.session {
+                let _ = self.commands.send(AppCommand::RefreshDirectory {
+                    session: session.clone(),
+                });
+            }
+            self.show_toast(Toast::error(
+                "Directory unavailable",
+                "Retrying directory synchronization; answer again once ready",
+                Instant::now(),
+            ));
+            return;
+        }
         let Some(at) = self
             .store
             .pending_forms
@@ -2108,6 +2289,10 @@ impl App {
     fn handle_stream(&mut self, msg: StreamMsg) {
         match msg {
             StreamMsg::Reconnected => {
+                if let Some(session) = self.session.clone() {
+                    self.directory_pending = true;
+                    let _ = self.commands.send(AppCommand::RefreshDirectory { session });
+                }
                 // ephemeral deltas are not replayed → refetch history.
                 self.request_reload();
                 // form.* frames missed while down: reconcile with REST.
@@ -2152,6 +2337,14 @@ impl App {
                     return;
                 }
                 ox_client::store::reduce(&mut self.store, &typed);
+                if matches!(
+                    typed.data,
+                    ox_schema::event::SessionEventData::SessionMoved { .. }
+                ) && let Some(session) = self.session.clone()
+                {
+                    self.directory_pending = true;
+                    let _ = self.commands.send(AppCommand::RefreshDirectory { session });
+                }
                 // A tool event that names a child session may have missed
                 // that child's `execution.started`: probe it once.
                 if let ox_schema::event::SessionEventData::ToolSuccess {

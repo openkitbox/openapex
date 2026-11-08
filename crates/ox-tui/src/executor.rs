@@ -39,6 +39,19 @@ pub fn session_failed(title: &'static str, err: ox_client::Error) -> AppEvent {
 /// Execute one command and report its outcome on `tx`.
 pub async fn run(client: Client, tx: Events, command: AppCommand) {
     match command {
+        AppCommand::FindDirectories { query, generation } => match client.directories(&query).await
+        {
+            Ok(paths) => {
+                let _ = tx.send(AppEvent::Directories {
+                    query,
+                    generation,
+                    paths,
+                });
+            }
+            Err(err) => {
+                let _ = tx.send(session_failed("Failed to complete directory", err));
+            }
+        },
         AppCommand::Prompt {
             session,
             id,
@@ -47,7 +60,10 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
         } => prompt(&client, &tx, &session, &id, &text, &files).await,
         AppCommand::Interrupt { session } => interrupt(&client, &tx, &session).await,
         AppCommand::Background { session } => background(&client, &tx, &session).await,
-        AppCommand::ListSessions => list_sessions(&client, &tx).await,
+        AppCommand::ListSessions {
+            directory,
+            generation,
+        } => list_sessions(&client, &tx, directory, generation).await,
         AppCommand::ListRunningRoots => list_running_roots(&client, &tx).await,
         AppCommand::ListFamily { session } => list_family(&client, &tx, session).await,
         AppCommand::SyncShells { generation } => sync_shells(&client, generation, &tx).await,
@@ -90,7 +106,9 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
             report_form_result(&tx, client.cancel_form(&session, &form).await)
         }
         AppCommand::ListForms { session } => list_forms(&client, &tx, &session).await,
-        AppCommand::FindFiles(query) => find_files(&client, &tx, query).await,
+        AppCommand::FindFiles { query, generation } => {
+            find_files(&client, &tx, query, generation).await
+        }
         AppCommand::LoadAttachments(text) => load_attachments(&tx, text).await,
         AppCommand::ReadClipboard => read_clipboard(&tx).await,
         AppCommand::WriteClipboard(text) => write_clipboard(&tx, text).await,
@@ -125,8 +143,10 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
         } => reload_history(&client, &tx, &session, request_id).await,
         // Owned by main's serial loop (they touch the SSE attachment).
         AppCommand::CreateSessionAndPrompt(_)
+        | AppCommand::ChangeDirectory { .. }
+        | AppCommand::RefreshDirectory { .. }
         | AppCommand::AttachSession { .. }
-        | AppCommand::DetachSession
+        | AppCommand::DetachSession { .. }
         | AppCommand::Quit => {}
     }
 }
@@ -160,9 +180,11 @@ async fn background(client: &Client, tx: &Events, session: &str) {
     }
 }
 
-async fn list_sessions(client: &Client, tx: &Events) {
-    let event = match client.sessions().await {
+async fn list_sessions(client: &Client, tx: &Events, directory: String, generation: u64) {
+    let event = match client.sessions(&directory).await {
         Ok(sessions) => AppEvent::Sessions {
+            directory,
+            generation,
             sessions,
             running: running_roots(client).await,
         },
@@ -381,10 +403,14 @@ async fn list_forms(client: &Client, tx: &Events, session: &str) {
     }
 }
 
-async fn find_files(client: &Client, tx: &Events, query: String) {
+async fn find_files(client: &Client, tx: &Events, query: String, generation: u64) {
     match client.find_files(&query).await {
         Ok(entries) => {
-            let _ = tx.send(AppEvent::Files { query, entries });
+            let _ = tx.send(AppEvent::Files {
+                query,
+                generation,
+                entries,
+            });
         }
         Err(err) => tracing::warn!(%err, "file lookup failed"),
     }

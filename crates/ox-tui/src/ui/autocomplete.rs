@@ -58,10 +58,13 @@ fn take_chars(text: &str, count: usize) -> &str {
 /// Which token opened the menu.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
+    Directory,
     /// A leading `/command`.
     Command,
     /// An `@path` mention starting at this column of the cursor's row.
-    Mention { col: usize },
+    Mention {
+        col: usize,
+    },
 }
 
 /// Menu focus state. Visibility, trigger and query are always derived; only the
@@ -96,10 +99,17 @@ impl Autocomplete {
     /// Recompute from the editor. Returns `true` when the query changed, which
     /// is the caller's cue to re-filter and repaint.
     pub fn sync(&mut self, text: &str, cursor: (usize, usize)) -> bool {
-        let next = command_query(text, cursor)
-            .map(|query| (Trigger::Command, query))
+        let next = (cursor.0 == 0)
+            .then(|| take_chars(text, cursor.1))
+            .and_then(|text| text.strip_prefix("/cd "))
+            .map(|query| (Trigger::Directory, query.to_owned()))
             .or_else(|| {
-                mention_query(text, cursor).map(|(col, query)| (Trigger::Mention { col }, query))
+                command_query(text, cursor)
+                    .map(|query| (Trigger::Command, query))
+                    .or_else(|| {
+                        mention_query(text, cursor)
+                            .map(|(col, query)| (Trigger::Mention { col }, query))
+                    })
             });
         if next == self.open {
             return false;

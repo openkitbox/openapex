@@ -425,6 +425,46 @@ fn encode_path_segment(value: &str) -> String {
 }
 
 impl Client {
+    /// Validate and canonicalize a Home directory, without creating a session.
+    pub async fn validate_directory(&self, directory: &str) -> Result<String> {
+        let resp = self
+            .request(reqwest::Method::POST, "/ox/location")
+            .query(&[("directory", directory)])
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Error::Status(resp.status()));
+        }
+        Ok(resp.json::<SessionLocation>().await?.directory)
+    }
+
+    pub async fn move_session(&self, session: &str, directory: &str) -> Result<()> {
+        let resp = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/api/session/{session}/move"),
+            )
+            .json(&serde_json::json!({"directory": directory}))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Error::Status(resp.status()));
+        }
+        Ok(())
+    }
+
+    pub async fn directories(&self, query: &str) -> Result<Vec<String>> {
+        let resp = self
+            .request(reqwest::Method::GET, "/ox/directories")
+            .query(&[("query", query)])
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            return Err(Error::Status(resp.status()));
+        }
+        Ok(resp.json().await?)
+    }
+
     fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
         self.http
             .request(method, format!("{}{}", self.base, path))
@@ -476,12 +516,16 @@ impl Client {
         })
     }
 
-    /// Root sessions, most recently updated first (`GET /api/session`, the
-    /// upstream list dialog's query: `limit 50, order desc, parentID null`).
-    pub async fn sessions(&self) -> Result<Vec<SessionSummary>> {
+    /// Root sessions in `directory`, filtered on the server before its limit.
+    pub async fn sessions(&self, directory: &str) -> Result<Vec<SessionSummary>> {
         let resp = self
             .request(reqwest::Method::GET, "/api/session")
-            .query(&[("limit", "50"), ("order", "desc"), ("parentID", "null")])
+            .query(&[
+                ("directory", directory),
+                ("limit", "50"),
+                ("order", "desc"),
+                ("parentID", "null"),
+            ])
             .send()
             .await?;
         if !resp.status().is_success() {

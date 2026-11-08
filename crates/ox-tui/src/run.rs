@@ -99,7 +99,7 @@ pub async fn run() -> anyhow::Result<()> {
     let route;
     let online;
     let mut home_chrome = ui::prompt::Chrome::default();
-    let bootstrap: bootstrap::Bootstrap = match online_client {
+    let mut bootstrap: bootstrap::Bootstrap = match online_client {
         None => {
             online = false;
             route = app::state::Route::Session;
@@ -132,7 +132,16 @@ pub async fn run() -> anyhow::Result<()> {
         },
     };
 
-    let (command_tx, mut command_rx) = mpsc::unbounded_channel();
+    if let Some(session) = &bootstrap.session
+        && online
+    {
+        bootstrap.client.directory = bootstrap
+            .client
+            .session_directory(session)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Session has no working directory"))?;
+    }
+    let (command_tx, command_rx) = mpsc::unbounded_channel();
     let (seq_tx, seq_rx) = watch::channel(None);
 
     if online {
@@ -140,50 +149,30 @@ pub async fn run() -> anyhow::Result<()> {
 
         // 会话已知（--session）就现在挂 SSE；Home 模式推迟到会话创建后。
         // Attachment 由命令任务持有：切换会话时它中止旧流再挂新流。
-        let mut stream =
-            ox_client::sse::Attachment::new(bootstrap.client.clone(), seq_rx, stream_tx);
+        let mut stream = ox_client::sse::Attachment::new(
+            bootstrap.client.clone(),
+            seq_rx.clone(),
+            stream_tx.clone(),
+        );
         if let Some(session) = &bootstrap.session {
             stream.attach(session);
         }
 
-        // 命令执行：只有碰 SSE attachment 的命令留在串行循环里，其余各自
-        // 一个任务（executor::run），慢请求不会拖住 interrupt / 表单应答。
+        // ID-only controls bypass directory synchronization; the serial owner
+        // orders every other command against request and SSE context changes.
         {
-            let client = bootstrap.client.clone();
-            let tx = event_tx.clone();
-            tokio::spawn(async move {
-                while let Some(command) = command_rx.recv().await {
-                    match command {
-                        app::command::AppCommand::CreateSessionAndPrompt(submission) => {
-                            match client.create_session().await {
-                                Ok(session) => {
-                                    stream.attach(&session);
-                                    let _ = tx.send(app::event::AppEvent::SessionReady {
-                                        session,
-                                        prompt: submission.text,
-                                        files: submission.files,
-                                    });
-                                }
-                                Err(err) => {
-                                    let _ = tx
-                                        .send(app::event::AppEvent::SessionFailed(err.to_string()));
-                                }
-                            }
-                        }
-                        app::command::AppCommand::AttachSession { session } => {
-                            stream.attach(&session);
-                        }
-                        app::command::AppCommand::DetachSession => stream.detach(),
-                        app::command::AppCommand::Quit => break,
-                        other => {
-                            tokio::spawn(executor::run(client.clone(), tx.clone(), other));
-                        }
-                    }
-                }
-            });
+            tokio::spawn(commands(
+                bootstrap.client.clone(),
+                bootstrap.session.clone(),
+                command_rx,
+                event_tx.clone(),
+                seq_rx,
+                stream_tx,
+                stream,
+            ));
         }
 
-        // 把 SSE 流桥接成 AppEvent（spawn_events 之前流是空的，正常）。
+        // Bridge the stream into the UI event loop.
         {
             let tx = event_tx.clone();
             tokio::spawn(async move {
@@ -199,7 +188,14 @@ pub async fn run() -> anyhow::Result<()> {
         drop(seq_rx);
     }
 
-    let mut app = App::new(route, bootstrap.session, home_chrome, command_tx, seq_tx);
+    let mut app = App::new(
+        route,
+        bootstrap.session,
+        home_chrome,
+        bootstrap.client.directory,
+        command_tx,
+        seq_tx,
+    );
     if let Some(path) = ui::history::default_path() {
         app.attach_history(ui::history::History::load(path));
     }
@@ -208,14 +204,306 @@ pub async fn run() -> anyhow::Result<()> {
     }
     let result = app.run(&mut guard, event_rx).await;
     let reporter = app.take_herdr();
-    // Same drop order as without herdr (app, then the guard restoring the
-    // screen); the release waits last so a slow herdr cannot freeze the frame.
     drop(app);
     drop(guard);
     if let Some(reporter) = reporter {
         reporter.finish().await;
     }
     result
+}
+
+/// Keep ID-only controls responsive while the serial owner resolves directory
+/// context. No directory-dependent request may bypass that owner's gate.
+async fn commands(
+    client: ox_client::Client,
+    active_session: Option<String>,
+    mut command_rx: mpsc::UnboundedReceiver<app::command::AppCommand>,
+    tx: mpsc::UnboundedSender<app::event::AppEvent>,
+    seq_rx: watch::Receiver<Option<i64>>,
+    stream_tx: mpsc::UnboundedSender<ox_client::sse::StreamMsg>,
+    stream: ox_client::sse::Attachment,
+) {
+    use app::command::AppCommand;
+
+    let (serial_tx, serial_rx) = mpsc::unbounded_channel();
+    let owner = serial_commands(
+        client.clone(),
+        active_session,
+        serial_rx,
+        tx.clone(),
+        seq_rx,
+        stream_tx,
+        stream,
+    );
+    tokio::pin!(owner);
+    loop {
+        tokio::select! {
+            () = &mut owner => return,
+            command = command_rx.recv() => match command {
+                Some(AppCommand::Quit) => return, // Dropping owner also detaches SSE.
+                Some(command @ (AppCommand::Interrupt { .. }
+                    | AppCommand::Background { .. }
+                    | AppCommand::ReplyForm { .. }
+                    | AppCommand::CancelForm { .. }
+                    | AppCommand::ListForms { .. }
+                    | AppCommand::KillShell { .. }
+                    | AppCommand::SteerQueued { .. }
+                    | AppCommand::CancelQueued { .. })) => {
+                    tokio::spawn(executor::run(client.clone(), tx.clone(), command));
+                }
+                Some(command) => {
+                    if serial_tx.send(command).is_err() {
+                        return;
+                    }
+                }
+                None => {
+                    drop(serial_tx);
+                    owner.await;
+                    return;
+                }
+            },
+        }
+    }
+}
+
+/// Sole owner of request and stream context; failed resolution disables
+/// directory-dependent I/O until authoritative refresh or navigation succeeds.
+async fn serial_commands(
+    mut client: ox_client::Client,
+    mut active_session: Option<String>,
+    mut command_rx: mpsc::UnboundedReceiver<app::command::AppCommand>,
+    tx: mpsc::UnboundedSender<app::event::AppEvent>,
+    seq_rx: watch::Receiver<Option<i64>>,
+    stream_tx: mpsc::UnboundedSender<ox_client::sse::StreamMsg>,
+    mut stream: ox_client::sse::Attachment,
+) {
+    let mut generation = 0;
+    let mut directory_ready = true;
+    // Intent belongs to active_session, not to a cached session or directory.
+    // Navigation clears it; successful directory recovery consumes it once.
+    let mut chrome_pending = false;
+    while let Some(command) = command_rx.recv().await {
+        if !directory_ready
+            && matches!(
+                command,
+                app::command::AppCommand::CreateSessionAndPrompt(_)
+                    | app::command::AppCommand::Prompt { .. }
+                    | app::command::AppCommand::ChangeDirectory { .. }
+                    | app::command::AppCommand::FindDirectories { .. }
+                    | app::command::AppCommand::FindFiles { .. }
+                    | app::command::AppCommand::McpList { .. }
+                    | app::command::AppCommand::McpToggle { .. }
+                    | app::command::AppCommand::ModelList
+                    | app::command::AppCommand::LoadContextLimits
+                    | app::command::AppCommand::AgentList(_)
+            )
+        {
+            let error = "Working directory unavailable; reselect the session to retry".to_owned();
+            let event = match command {
+                app::command::AppCommand::Prompt { id, .. } => {
+                    app::event::AppEvent::PromptFailed { id, error }
+                }
+                app::command::AppCommand::CreateSessionAndPrompt(_) => {
+                    app::event::AppEvent::SessionFailed(error)
+                }
+                _ => app::event::AppEvent::SessionOpFailed {
+                    title: "Directory unavailable",
+                    error,
+                },
+            };
+            let _ = tx.send(event);
+            continue;
+        }
+        match command {
+            app::command::AppCommand::LoadSessionChrome { session } => {
+                if active_session.as_deref() == Some(&session) {
+                    chrome_pending = true;
+                }
+            }
+            app::command::AppCommand::ChangeDirectory { session, directory } => {
+                if session != active_session {
+                    continue;
+                }
+                let result = match &session {
+                    Some(id) => {
+                        let moved = client.move_session(id, &directory).await;
+                        match moved {
+                            // These handlers reject before publishing a move.
+                            Err(err @ ox_client::Error::Status(status))
+                                if matches!(status.as_u16(), 400 | 404) =>
+                            {
+                                Err(err)
+                            }
+                            moved => {
+                                // A lost response (or server error after publishing)
+                                // cannot prove the move failed. Stop using the old
+                                // context until the authoritative read succeeds.
+                                directory_ready = false;
+                                stream.detach();
+                                if let Err(err) = moved {
+                                    tracing::warn!(%err, "move outcome unknown; reading session directory");
+                                }
+                                session_directory(&client, id).await
+                            }
+                        }
+                    }
+                    None => client.validate_directory(&directory).await,
+                };
+                match result {
+                    Ok(directory) => {
+                        directory_ready = true;
+                        client.directory = directory.clone();
+                        stream = ox_client::sse::Attachment::new(
+                            client.clone(),
+                            seq_rx.clone(),
+                            stream_tx.clone(),
+                        );
+                        if let Some(session) = &session {
+                            stream.attach(session);
+                        }
+                        let _ = tx.send(app::event::AppEvent::DirectoryChanged {
+                            session,
+                            generation,
+                            directory,
+                        });
+                    }
+                    Err(err) => {
+                        if directory_ready {
+                            let _ = tx.send(app::event::AppEvent::DirectoryChanged {
+                                session,
+                                generation,
+                                directory: client.directory.clone(),
+                            });
+                        }
+                        let _ =
+                            tx.send(executor::session_failed("Failed to change directory", err));
+                    }
+                }
+            }
+            app::command::AppCommand::RefreshDirectory { session } => {
+                if active_session.as_deref() != Some(&session) {
+                    continue;
+                }
+                match session_directory(&client, &session).await {
+                    Ok(directory) => {
+                        if client.directory != directory || !directory_ready {
+                            client.directory = directory.clone();
+                            stream = ox_client::sse::Attachment::new(
+                                client.clone(),
+                                seq_rx.clone(),
+                                stream_tx.clone(),
+                            );
+                            stream.attach(&session);
+                        }
+                        directory_ready = true;
+                        let _ = tx.send(app::event::AppEvent::DirectoryChanged {
+                            session: Some(session),
+                            generation,
+                            directory,
+                        });
+                    }
+                    Err(err) => {
+                        directory_ready = false;
+                        let _ = tx.send(executor::session_failed(
+                            "Failed to read directory; reselect session to retry",
+                            err,
+                        ));
+                    }
+                }
+            }
+            app::command::AppCommand::CreateSessionAndPrompt(submission) => {
+                match client.create_session().await {
+                    Ok(session) => {
+                        chrome_pending = false;
+                        active_session = Some(session.clone());
+                        stream.attach(&session);
+                        let _ = tx.send(app::event::AppEvent::SessionReady {
+                            session,
+                            prompt: submission.text,
+                            files: submission.files,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = tx.send(app::event::AppEvent::SessionFailed(err.to_string()));
+                    }
+                }
+            }
+            app::command::AppCommand::AttachSession {
+                session,
+                generation: next,
+            } => {
+                generation = next;
+                chrome_pending = false;
+                active_session = Some(session.clone());
+                directory_ready = false;
+                stream.detach();
+                match session_directory(&client, &session).await {
+                    Ok(directory) => {
+                        client.directory = directory.clone();
+                        directory_ready = true;
+                        stream = ox_client::sse::Attachment::new(
+                            client.clone(),
+                            seq_rx.clone(),
+                            stream_tx.clone(),
+                        );
+                        stream.attach(&session);
+                        let _ = tx.send(app::event::AppEvent::DirectoryChanged {
+                            session: Some(session),
+                            generation,
+                            directory,
+                        });
+                    }
+                    Err(err) => {
+                        let _ = tx.send(executor::session_failed(
+                            "Failed to read directory; reselect session to retry",
+                            err,
+                        ));
+                    }
+                }
+            }
+            app::command::AppCommand::DetachSession {
+                directory,
+                generation: next,
+            } => {
+                generation = next;
+                chrome_pending = false;
+                active_session = None;
+                client.directory = directory;
+                directory_ready = true;
+                stream = ox_client::sse::Attachment::new(
+                    client.clone(),
+                    seq_rx.clone(),
+                    stream_tx.clone(),
+                );
+            }
+            app::command::AppCommand::Quit => break,
+            other => {
+                tokio::spawn(executor::run(client.clone(), tx.clone(), other));
+            }
+        }
+        if directory_ready && chrome_pending {
+            chrome_pending = false;
+            if let Some(session) = &active_session {
+                tokio::spawn(executor::run(
+                    client.clone(),
+                    tx.clone(),
+                    app::command::AppCommand::LoadSessionChrome {
+                        session: session.clone(),
+                    },
+                ));
+            }
+        }
+    }
+}
+
+async fn session_directory(client: &ox_client::Client, session: &str) -> ox_client::Result<String> {
+    client
+        .session_directory(session)
+        .await?
+        .filter(|directory| !directory.is_empty())
+        .ok_or(ox_client::Error::Status(
+            ox_client::reqwest::StatusCode::NOT_FOUND,
+        ))
 }
 
 /// Connect over the unix socket, starting the server if needed, and keep a

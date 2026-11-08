@@ -10,6 +10,17 @@ use crate::ui::composer::Submission;
 
 #[derive(Debug, Clone)]
 pub enum AppCommand {
+    ChangeDirectory {
+        session: Option<String>,
+        directory: String,
+    },
+    RefreshDirectory {
+        session: String,
+    },
+    FindDirectories {
+        query: String,
+        generation: u64,
+    },
     /// First prompt from Home: create a session, then the app receives
     /// `AppEvent::SessionReady` and follows up with `Prompt`.
     CreateSessionAndPrompt(Submission),
@@ -108,8 +119,11 @@ pub enum AppCommand {
         session: String,
     },
     Quit,
-    /// Fetch `GET /api/session` for the `/sessions` dialog.
-    ListSessions,
+    /// List roots in the UI's last committed directory, even during recovery.
+    ListSessions {
+        directory: String,
+        generation: u64,
+    },
     /// Re-resolve which root sessions are running; answered with
     /// `AppEvent::RunningRoots`.
     ListRunningRoots,
@@ -155,9 +169,13 @@ pub enum AppCommand {
     /// already reset the shared seq to `None`.
     AttachSession {
         session: String,
+        generation: u64,
     },
-    /// Stop following any session (the app went Home).
-    DetachSession,
+    /// Return Home with the directory last committed by the UI.
+    DetachSession {
+        directory: String,
+        generation: u64,
+    },
     RenameSession {
         session: String,
         title: String,
@@ -179,7 +197,10 @@ pub enum AppCommand {
         session: String,
     },
     /// `GET /api/fs/find` for the `@` file menu; the answer is `AppEvent::Files`.
-    FindFiles(String),
+    FindFiles {
+        query: String,
+        generation: u64,
+    },
     /// A paste that looks like image/PDF paths: read the files off the UI
     /// thread. The text is echoed in `AppEvent::Attachments` so a failed read
     /// can still be pasted as text.
