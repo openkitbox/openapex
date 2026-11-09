@@ -170,7 +170,20 @@ pub(crate) async fn run(
         // request: only a continuation (published failure) rebuilds context.
         let request = match prepared.take() {
             Some(request) => request,
-            None => build_request(ctx, params).await?,
+            None => match build_request(ctx, params).await {
+                Ok(request) => request,
+                Err(error) if error.is::<super::super::request_budget::NeedsCompaction>() => {
+                    return Ok(StepOutcome::Overflow {
+                        error: SessionError {
+                            kind: "context-overflow".to_owned(),
+                            message: error.to_string(),
+                            status: None,
+                            response: None,
+                        },
+                    });
+                }
+                Err(error) => return Err(error),
+            },
         };
 
         // The connect / endpoint-queue phase is interruptible too: a request
@@ -193,7 +206,10 @@ pub(crate) async fn run(
                 // unanswered. One log line decides ox-vs-downstream on the
                 // next recurrence — the id the upstream complained about
                 // cannot be in `sent` if the fault is not ours.
-                if let ChatError::Http { status: 400, body } = &error {
+                if let ChatError::Http {
+                    status: 400, body, ..
+                } = &error
+                {
                     let complained = pairing_rejection_ids(body);
                     let rejected = complained.is_some()
                         || body.contains("tool_call_id")
@@ -217,6 +233,7 @@ pub(crate) async fn run(
                 }
                 // Connect failure: nothing was published for this attempt.
                 if let Some(delay) = backoff.on_failure(retry::classify(&error), false) {
+                    let delay = delay.max(error.retry_after().unwrap_or_default());
                     schedule_retry(
                         ctx,
                         params,
@@ -254,7 +271,15 @@ pub(crate) async fn run(
                 // Upstream retry policy (step.ts): transparent retry before
                 // any output; after it, only an interrupted stream continues
                 // (Outcome.Continue).
-                let delay = backoff.on_failure(failure.retry_kind(), published);
+                let delay = backoff
+                    .on_failure(failure.retry_kind(), published)
+                    .map(|delay| {
+                        let advice = match &failure {
+                            AttemptFailure::Transport(error) => error.retry_after(),
+                            _ => None,
+                        };
+                        delay.max(advice.unwrap_or_default())
+                    });
                 if let Some(delay) = delay
                     && (failure.is_interrupted_stream() || !published)
                 {

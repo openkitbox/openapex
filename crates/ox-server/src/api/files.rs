@@ -34,7 +34,10 @@ use super::compat::{directory_of, percent_decode};
 const PREFIX: &str = "/api/fs/read/";
 
 #[handler]
-pub(crate) async fn read(req: &mut Request, res: &mut Response) {
+pub(crate) async fn read(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(app) = super::state(depot, res) else {
+        return;
+    };
     let raw = req.uri().path().strip_prefix(PREFIX).unwrap_or_default();
     let relative = percent_decode(raw);
     let location = directory_of(req);
@@ -89,11 +92,14 @@ pub(crate) async fn read(req: &mut Request, res: &mut Response) {
     };
 
     let path_clone = path.clone();
-    let bytes =
-        match tokio::task::spawn_blocking(move || read_slice(&path_clone, start, length)).await {
-            Ok(Ok(bytes)) => bytes,
-            _ => return not_found(res, &relative),
-        };
+    let bytes = match app
+        .runtime
+        .own_blocking(move || read_slice(&path_clone, start, length))
+        .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        _ => return not_found(res, &relative),
+    };
 
     res.status_code(status);
     validators(res, &tag, last_modified.as_deref());

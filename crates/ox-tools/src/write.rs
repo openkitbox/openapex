@@ -67,6 +67,10 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
     // "before" side, and a created file has none.
     let before = std::fs::read_to_string(&absolute).ok();
     let existed = before.is_some() || absolute.exists();
+    // Cancellation only gates entry; once allowed, finish writing and stamping.
+    if ctx.cancellation.is_cancelled() {
+        return fail("Tool execution interrupted");
+    }
     // Upstream's description promises automatic parent creation.
     if let Some(parent) = absolute.parent()
         && let Err(_) = std::fs::create_dir_all(parent)

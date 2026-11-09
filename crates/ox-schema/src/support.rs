@@ -29,6 +29,20 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// The `kv` key for a session's memory participation marker.
+/// The engine owns its meaning; fork projection preserves the stored marker.
+#[must_use]
+pub fn memory_mode_key(session_id: &str) -> String {
+    format!("mctx_memory_mode:{session_id}")
+}
+
+/// The `kv` key for a session's external-content marker.
+/// The engine owns its meaning; fork projection preserves the stored marker.
+#[must_use]
+pub fn session_taint_key(session_id: &str) -> String {
+    format!("mctx_tainted:{session_id}")
+}
+
 /// Upstream `Snapshot.ID` (branded string). Plain string on the wire.
 pub type SnapshotId = String;
 

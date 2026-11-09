@@ -165,7 +165,8 @@ pub(super) fn attempt_tokens(
                 return 0;
             }
         };
-        let ratio = crate::mctx::calibration::ratio_for(&ctx.calibrations, &ctx.session_id);
+        let ratio =
+            crate::mctx::calibration::ratio_for(&ctx.calibrations, &ctx.session_id, &request.model);
         estimate_prompt_tokens(body_len, ratio)
     })
 }

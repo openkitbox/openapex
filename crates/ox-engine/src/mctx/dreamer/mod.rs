@@ -1,8 +1,8 @@
 //! Dreamer: the scheduled memory-maintenance loop (Task 8).
 //!
 //! The dreamer is the only place in ox where a model is asked to *maintain*
-//! the memory store instead of answering a user turn. A tick enumerates the
-//! projects that have memories, and for every due `(project, task)` pair runs
+//! the memory store instead of answering a user turn. A tick derives each
+//! task's owners from its own inputs, and for every due `(owner, task)` pair runs
 //! one task: `verify` (memory vs. code), `curate` (duplicate/stale
 //! consolidation), `classify` (importance scoring for the injection budget),
 //! `retrospective` (durable lessons from the user's own turns) and
@@ -32,8 +32,9 @@
 //!   capped at `MAX_DREAM_BACKOFF_MILLIS`"; a success or skip resets it.
 //! - **Idle-project cost** — `dreamer/task-gates.ts` (gates are "cheap
 //!   counts" so "an idle project costs no model calls") and
-//!   `idle-schedule-prune.ts`. ox's enumeration of projects *with active
-//!   memories* is that pruning, reduced to the one identity form ox has.
+//!   `idle-schedule-prune.ts`. ox derives hygiene owners from active memories,
+//!   note-check owners from pending conditional notes, and retrospective owners
+//!   from eligible user activity. Input-specific gates then avoid idle model calls.
 //! - **`verify` gate: only memories whose backing files are missing or
 //!   changed** — `dreamer/verify-gate.ts` (a candidate is in scope if a mapped
 //!   file changed since that memory's verification, or was deleted) plus
@@ -204,13 +205,13 @@
 //!   evidence was one specific past turn can therefore go unjudged; the failure
 //!   direction is safe — the note stays parked — and a sweep that did not run at
 //!   all never advances the window, so the evidence survives a failure.
-//! - **A project with notes but no memories is not swept.** The tick enumerates
-//!   the projects that hold active memories
-//!   ([`memory::projects_with_active_memories`]), so a project whose only
-//!   durable text is parked notes never reaches `surface_notes`. Enumerating
-//!   note projects as well would put every task's cheap gate into projects the
-//!   dreamer has never seen — a scheduling change this task does not make, so
-//!   the limitation is recorded instead.
+//! - **Task-specific owners, not a project/task cross product.** Hygiene uses
+//!   [`memory::projects_with_active_memories`]; `surface_notes` independently
+//!   enumerates pending conditional-note owners, so archiving the last memory
+//!   does not stop note checks. `retrospective` independently enumerates eligible
+//!   user-activity owners, so a project can produce its first memory. Notes-only
+//!   and activity-only owners do not acquire unrelated hygiene work. Existing
+//!   task state remains authoritative for due times and successful watermarks.
 //! - **The user tier is an owner like any project.** `mc_memory.project` holds
 //!   [`memory::USER_SCOPE`] for the user's own observations, so the tick
 //!   enumerates it with the projects; [`DreamTask::applies_to`] limits it to

@@ -5,9 +5,9 @@
 //! replacement on every call; the tool echoes it back. The TUI renders the
 //! list from the transcript — the newest completed `todowrite` call's
 //! `state.input.todos` (`packages/tui/src/util/todo.ts` `sessionTodos`) — so
-//! there is no server-side list, no HTTP endpoint and no event. The only
-//! state this module touches is the reminder budget row, reset on every
-//! successful call (a touched list re-arms the completion reminder).
+//! there is no server-side list, no HTTP endpoint and no event. Reminder
+//! eligibility is derived from completed calls and durable reminder admissions;
+//! executing this tool never changes a separate budget.
 //!
 //! Deliberate deviation: upstream gates the tool behind `experimental.todo`;
 //! ox has no such config surface and always advertises it.
@@ -25,15 +25,12 @@ use ox_schema::wire::ToolDef;
 /// Upstream `TodoTool.Info` status literals, in display order.
 const STATUSES: [&str; 4] = ["pending", "in_progress", "completed", "cancelled"];
 
-pub struct TodoWriteTool {
-    /// Only for the reminder budget reset: the list itself is not stored.
-    db: Db,
-}
+pub struct TodoWriteTool;
 
 impl TodoWriteTool {
     #[must_use]
-    pub fn new(db: Db) -> Self {
-        Self { db }
+    pub fn new(_db: Db) -> Self {
+        Self
     }
 }
 
@@ -90,7 +87,7 @@ impl Tool for TodoWriteTool {
 
     fn execute(
         &self,
-        ctx: ToolContext,
+        _ctx: ToolContext,
         input: Value,
     ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
         Box::pin(async move {
@@ -98,136 +95,43 @@ impl Tool for TodoWriteTool {
                 Ok(todos) => todos,
                 Err(message) => return fail(format!("Invalid todowrite arguments: {message}")),
             };
-            // A touched list re-arms the completion reminder budget (was: the
-            // stateful tool's successful-mutation hook).
-            reset_reminder_budget(&self.db, &ctx.session_id).await;
-            ok_text(summarize(&todos)).with_metadata(json!({ "todos": todos }))
+            ok_text(summarize(todos)).with_metadata(json!({ "todos": todos }))
         })
     }
 }
 
-// ---------------------------------------------------------------------------
-// Reminder budget (the kv row the engine's reminder loop also uses)
-// ---------------------------------------------------------------------------
-
-/// `kv` key for the per-session reminder counter. The list itself is not
-/// stored server-side — `todowrite` echoes and the TUI reads the transcript —
-/// so this counter is the only todo-related kv row left.
-#[must_use]
-pub fn reminder_key(session_id: &str) -> String {
-    format!("todo:reminders:{session_id}")
-}
-
-/// The session's current reminder count (0 when the row is absent or garbage).
-pub async fn reminder_count(db: &Db, session_id: &str) -> anyhow::Result<u32> {
-    let conn = db.acquire().await?;
-    let mut stmt = conn.prepare("SELECT value FROM kv WHERE key = ?1").await?;
-    let Some(row) = ox_db::optional(&mut stmt, [reminder_key(session_id)]).await? else {
-        return Ok(0);
+/// Completed lists in generation order. Parsing failures deny a reminder rather
+/// than guessing that a missing or malformed list represents progress.
+pub fn completed_lists(raw: &str) -> anyhow::Result<Vec<Vec<(String, String)>>> {
+    let value: Value = serde_json::from_str(raw)?;
+    let Message::Assistant(assistant) = Message::from_row_data("", "assistant", value)? else {
+        anyhow::bail!("expected assistant message");
     };
-    let raw: String = row.get(0)?;
-    Ok(raw.parse().unwrap_or(0))
-}
-
-pub async fn set_reminder_count(db: &Db, session_id: &str, count: u32) -> anyhow::Result<()> {
-    let value = count.to_string();
-    let now = ox_schema::id::now_millis();
-    let conn = db.acquire().await?;
-    conn.execute(
-        "INSERT INTO kv (key, value, time_created, time_updated) VALUES (?1, ?2, ?3, ?3)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value, time_updated = ?3",
-        (reminder_key(session_id), value.as_str(), now),
-    )
-    .await?;
-    Ok(())
-}
-
-/// Whether a session's reminder counter is reset. Called by the todo tool after
-/// every successful mutation (the reference resets `reminderCount` whenever the
-/// list is touched or empties): any real progress re-arms the budget.
-pub async fn reset_reminder_budget(db: &Db, session_id: &str) {
-    if let Err(error) = set_reminder_count(db, session_id, 0).await {
-        tracing::debug!(session = %session_id, error = %error, "todo reminder budget reset failed");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Reminder data source
-// ---------------------------------------------------------------------------
-
-/// Open todo items for the completion reminder: the `pending`/`in_progress`
-/// entries of the session's newest COMPLETED `todowrite` call, as
-/// `(content, status)`. This is the same selection rule the TUI's
-/// `sessionTodos` applies (newest completed call wins; a newer running or
-/// errored call does not shadow it), minus the revert boundary, which is a
-/// TUI display concept. An empty newest list — or no call at all — means no
-/// open work.
-///
-/// Reads the transcript tail streaming, newest first: the common case hits
-/// within the first few rows, and only a session that never called todowrite
-/// scans to the end.
-pub async fn open_tasks(db: &Db, session_id: &str) -> anyhow::Result<Vec<(String, String)>> {
-    let conn = db.acquire().await?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT data FROM session_message
-             WHERE session_id = ?1 AND type = 'assistant'
-             ORDER BY seq DESC",
-        )
-        .await?;
-    let mut rows = stmt.query([session_id]).await?;
-    let mut found: Option<Vec<(String, String)>> = None;
-    while let Some(row) = rows.next().await? {
-        let raw: String = row.get(0)?;
-        if let Some(open) = open_from_assistant_row(&raw) {
-            found = Some(open);
-            break;
-        }
-    }
-    drop(rows);
-    drop(stmt);
-    drop(conn);
-    Ok(found.unwrap_or_default())
-}
-
-/// `Some` when this assistant row holds at least one completed `todowrite`
-/// part — the value is that call's open items (possibly empty). `None` keeps
-/// the scan walking older rows. A malformed row is skipped, not fatal: the
-/// reminder is advisory.
-fn open_from_assistant_row(raw: &str) -> Option<Vec<(String, String)>> {
-    let value = serde_json::from_str::<Value>(raw).ok()?;
-    let Ok(Message::Assistant(assistant)) = Message::from_row_data("", "assistant", value) else {
-        return None;
-    };
-    // Parts are in generation order; the last todowrite in a message is the
-    // latest call.
-    for part in assistant.content.iter().rev() {
+    let mut lists = Vec::new();
+    for part in assistant.content {
         let AssistantContent::Tool { name, state, .. } = part else {
             continue;
         };
         if name != "todowrite" {
             continue;
         }
-        let ToolState::Completed { input, .. } = &**state else {
+        let ToolState::Completed { input, .. } = *state else {
             continue;
         };
-        let Some(todos) = input.get("todos").and_then(Value::as_array) else {
-            return Some(Vec::new());
-        };
-        return Some(
-            todos
-                .iter()
-                .filter_map(|item| {
-                    let status = item.get("status")?.as_str()?;
-                    if !matches!(status, "pending" | "in_progress") {
-                        return None;
-                    }
-                    Some((item.get("content")?.as_str()?.to_owned(), status.to_owned()))
-                })
-                .collect(),
-        );
+        let input = Value::Object(input.into_iter().collect());
+        let todos = decode(&input).map_err(anyhow::Error::msg)?;
+        let mut list = Vec::with_capacity(todos.len());
+        for todo in todos {
+            let content = todo["content"].as_str().expect("validated content");
+            let status = todo["status"].as_str().expect("validated status");
+            list.push((
+                content.split_whitespace().collect::<Vec<_>>().join(" "),
+                status.to_owned(),
+            ));
+        }
+        lists.push(list);
     }
-    None
+    Ok(lists)
 }
 
 // ---------------------------------------------------------------------------
@@ -238,7 +142,7 @@ fn open_from_assistant_row(raw: &str) -> Option<Vec<(String, String)>> {
 /// model and `execute` (step.rs hands over the parsed arguments verbatim), so
 /// the tool validates its own input; a failure is recoverable — the model
 /// retries with a valid list.
-fn decode(input: &Value) -> Result<Vec<Value>, String> {
+fn decode(input: &Value) -> Result<&[Value], String> {
     let Some(object) = input.as_object() else {
         return Err("Expected an object".to_owned());
     };
@@ -265,7 +169,7 @@ fn decode(input: &Value) -> Result<Vec<Value>, String> {
             }
         }
     }
-    Ok(todos.clone())
+    Ok(todos)
 }
 
 /// Upstream `summarize()` verbatim: `Todos updated: 2/5 completed, 1 in

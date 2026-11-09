@@ -18,13 +18,15 @@
 //!   none and normalizes in memory on every pass ([`normalize_fact`]): a
 //!   derived column would drift from `content` across the memory tool's
 //!   UPDATEs, and a project holds few memories.
-//! - **D2 — no TTL.** The reference sets `expires_at` from a per-category TTL
-//!   and expires rows in the dreamer. Only its legacy categories carry a TTL,
-//!   and ox has none of them, so the path is not ported.
+//! - **D2 — no per-category TTL.** The reference stores `expires_at`; ox's
+//!   dreamer instead derives expiry for historian facts from existing usage,
+//!   verification and write timestamps in the dreamer's `expire` task.
 //! - **D3 — archived rows count as hits (same as the reference).** The
 //!   reference's hash lookup has no status filter; ox matches `active` and
 //!   `archived` rows alike. A hit on an archived row only bumps it: a fact the
-//!   user retired is not re-inserted, and reviving it stays the user's call.
+//!   user, expiry, verify, curate or merge retired is never automatically
+//!   reactivated or re-inserted. Archival is sticky regardless of reason; this
+//!   pass provides no restore API.
 //! - **D4 — no embedding.** The reference embeds new rows asynchronously after
 //!   commit. ox computes none here, matching `memory::write_memory`; the
 //!   historian transaction stays short.

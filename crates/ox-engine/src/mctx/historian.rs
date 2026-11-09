@@ -137,6 +137,7 @@ use anyhow::{Context, Result};
 use regex::Regex;
 use serde::Deserialize;
 
+use crate::completion::collect_text;
 use crate::mctx::budget::Budget;
 use crate::mctx::compartments::{self, NewCompartment, Tiers};
 use crate::mctx::historian_validate::{self, ValidateOptions};
@@ -144,8 +145,7 @@ use crate::mctx::memory::{self, MemoryRow};
 use crate::mctx::promotion;
 use ox_core::config::Config;
 use ox_llm::cardinal::chat::Chat;
-use ox_llm::cardinal::stream::StreamEvent;
-use ox_llm::cardinal::wire::{ChatMessage, ChatRequest, ToolChoice, ToolDef, Usage};
+use ox_llm::cardinal::wire::{ChatMessage, ChatRequest, ToolChoice, ToolDef};
 use ox_schema::id::{id, now_millis};
 use ox_schema::message::{AssistantContent, Message, ToolState};
 use ox_schema::support::{Content, Record};
@@ -1709,7 +1709,7 @@ pub fn build_prefixed_instruction(
 /// cacheable prefix, and a request that advertised none would share no prefix at
 /// all. `tool_choice` is forced to `None` (a separate body field, so the prompt
 /// prefix is untouched) because nothing here executes a call: without it a fold
-/// could answer with a tool call, which [`collect_completion`] discards, burning
+/// could answer with a tool call, which [`collect_text`] rejects, burning
 /// every attempt.
 ///
 /// The constructor's tool-result pairing stays inside the prefix too: a settled
@@ -2023,13 +2023,13 @@ pub const HISTORIAN_COMPLETION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// instead of blocking the session until restart.
 pub const HISTORIAN_LEASE: Duration = Duration::from_secs(2 * 5 * 60 + 60);
 
-/// [`collect_completion`] under [`HISTORIAN_COMPLETION_TIMEOUT`]. The
+/// [`collect_text`] under [`HISTORIAN_COMPLETION_TIMEOUT`]. The
 /// timeout is an error like any transport failure: the run settles `failed`
 /// and the caller decides whether to retry.
-async fn collect_completion_bounded(chat: &Arc<dyn Chat>, request: &ChatRequest) -> Result<String> {
+async fn collect_text_bounded(chat: &Arc<dyn Chat>, request: &ChatRequest) -> Result<String> {
     match tokio::time::timeout(
         HISTORIAN_COMPLETION_TIMEOUT,
-        collect_completion(chat, request, "historian"),
+        collect_text(chat, request, "historian"),
     )
     .await
     {
@@ -2155,7 +2155,7 @@ pub async fn run(ctx: &RunCtx<'_, '_>, plan: &RunPlan<'_>) -> Result<Option<RunO
             None => historian_request_with_prompt(model, &user_prompt, ctx.reasoning_effort),
         };
 
-        let text = match collect_completion_bounded(ctx.chat, &request).await {
+        let text = match collect_text_bounded(ctx.chat, &request).await {
             Ok(text) => text,
             Err(error) => {
                 // Nothing came back: one step down the chain, as one more
@@ -2642,7 +2642,7 @@ pub struct SideChannels {
 /// half; an unset reference falls back to ox's default model resolution.
 ///
 /// `pub(crate)` because the dreamer runs its hidden completions through the
-/// same resolution and the same transport ([`collect_completion`]): one route
+/// same resolution and the same transport ([`collect_text`]): one route
 /// to the model, not two.
 pub(crate) fn historian_model(
     config: &Config,
@@ -2665,57 +2665,4 @@ fn bare_model_id(qualified: &str) -> String {
         Some((_, id)) => id.to_owned(),
         None => qualified.to_owned(),
     }
-}
-
-/// Drive the hidden completion and collect its text, the same way the runner
-/// collects a compaction summary. Non-text events (reasoning, usage, finish)
-/// are ignored: the historian's contract is the text.
-///
-/// `pub(crate)`: shared with the dreamer, which drives the identical hidden
-/// sub-completion (the reference's dreamer and historian also share one
-/// provider-output path — `provider-output-failure.ts`).
-pub(crate) async fn collect_completion(
-    chat: &Arc<dyn Chat>,
-    request: &ChatRequest,
-    purpose: &'static str,
-) -> Result<String> {
-    let mut stream = match chat.stream_chat(request).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            crate::mctx::quota::observe(&error, now_millis());
-            return Err(anyhow::Error::new(error).context("historian completion request failed"));
-        }
-    };
-    let mut text = String::new();
-    let mut usage: Option<Usage> = None;
-    loop {
-        let next = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await;
-        match next {
-            Some(Ok(StreamEvent::TextDelta(delta))) => text.push_str(&delta),
-            Some(Ok(StreamEvent::Usage(reported))) => usage = Some(reported),
-            Some(Ok(_)) => {}
-            Some(Err(error)) => {
-                crate::mctx::quota::observe(&error, now_millis());
-                return Err(anyhow::Error::new(error).context("historian completion stream failed"));
-            }
-            None => break,
-        }
-    }
-    // The hidden completion's own request is otherwise invisible to the cache
-    // ledger (it settles no session message), so its prompt-cache split is
-    // logged here: `cache_read` is the part of the input the provider served
-    // from its prefix cache. `purpose` names which caller asked, because the
-    // historian, the dreamer, titles and one-shot generation all share this
-    // transport.
-    if let Some(usage) = usage {
-        let read = usage.cached_tokens.unwrap_or(0);
-        tracing::info!(
-            purpose,
-            prompt_tokens = usage.prompt_tokens,
-            cache_read = read,
-            cache_uncached = usage.prompt_tokens.saturating_sub(read),
-            "OX_COMPLETION_USAGE"
-        );
-    }
-    Ok(text)
 }

@@ -18,6 +18,7 @@ use anyhow::{Context as _, Result, anyhow};
 use dashmap::DashMap;
 use serde_json::Value;
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 use crate::projector::{PostCommit, project};
 use ox_db::Db;
@@ -105,11 +106,21 @@ async fn prune_events_before_in_batches(db: &Db, cutoff_ms: i64, batch_size: u64
 /// Sweep the replay log once now and then every [`PRUNE_INTERVAL`]. `days == 0`
 /// disables retention entirely (upstream keeps every event forever); the sweep
 /// is best-effort — a failure is logged and retried on the next tick.
-pub fn spawn_pruner(db: Db, days: u64) {
+///
+/// Returns the sweep's join handle — `None` when retention is off — so the
+/// caller awaits the last pass instead of detaching it. `stop` is checked at
+/// the sleep boundary only: a prune transaction already started is committed
+/// rather than dropped mid-flight.
+#[must_use]
+pub fn spawn_pruner(
+    db: Db,
+    days: u64,
+    stop: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
     if days == 0 {
-        return;
+        return None;
     }
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         loop {
             if let Some(cutoff) = retention_cutoff(now_millis(), days) {
                 match prune_events_before(&db, cutoff).await {
@@ -120,9 +131,12 @@ pub fn spawn_pruner(db: Db, days: u64) {
                     }
                 }
             }
-            tokio::time::sleep(PRUNE_INTERVAL).await;
+            tokio::select! {
+                () = stop.cancelled() => return,
+                () = tokio::time::sleep(PRUNE_INTERVAL) => {}
+            }
         }
-    });
+    }))
 }
 
 /// Event version for the persisted `type` suffix `{kind}@v{version}`.
@@ -209,14 +223,18 @@ impl EventBus {
     /// broadcast channel (never cloned): callers observe the event through
     /// the bus, not through the return value.
     pub async fn publish(&self, data: SessionEventData) -> Result<()> {
-        self.publish_durable(data, true, None).await
+        self.publish_durable(data, true, None, None)
+            .await
+            .map(|_| ())
     }
 
     /// [`Self::publish`] with a caller-supplied envelope id, so a client can
     /// correlate the event it caused (upstream `bus.publish(.., { id })`).
     /// Ephemeral kinds ignore the id and get a fresh one.
     pub async fn publish_as(&self, data: SessionEventData, event_id: String) -> Result<()> {
-        self.publish_durable(data, true, Some(event_id)).await
+        self.publish_durable(data, true, Some(event_id), None)
+            .await
+            .map(|_| ())
     }
 
     /// Publish an event without broadcasting it to live subscribers.
@@ -234,7 +252,34 @@ impl EventBus {
     /// reconnecting client replaying the event log still sees the event
     /// (deliberate: sequence integrity is never sacrificed for silence).
     pub async fn publish_quiet(&self, data: SessionEventData) -> Result<()> {
-        self.publish_durable(data, false, None).await
+        self.publish_durable(data, false, None, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Publish an idle checkpoint only if history has not changed since its
+    /// input was read and no blocking compaction owns a running row. The guard,
+    /// projection and event append share the existing write transaction.
+    pub async fn publish_quiet_checkpoint(
+        &self,
+        data: SessionEventData,
+        history_version: i64,
+    ) -> Result<bool> {
+        if !matches!(
+            &data,
+            SessionEventData::CompactionEnded {
+                reason: ox_schema::message::CompactionReason::Idle,
+                cost: None,
+                tokens: None,
+                ..
+            }
+        ) {
+            return Err(anyhow!(
+                "quiet checkpoint requires an idle compaction without usage"
+            ));
+        }
+        self.publish_durable(data, false, None, Some(history_version))
+            .await
     }
 
     /// Shared publish path. `fanout == false` suppresses only the post-commit
@@ -247,7 +292,8 @@ impl EventBus {
         data: SessionEventData,
         fanout: bool,
         event_id: Option<String>,
-    ) -> Result<()> {
+        checkpoint_version: Option<i64>,
+    ) -> Result<bool> {
         let kind = data.kind().to_string();
         let created = now_millis();
 
@@ -263,7 +309,7 @@ impl EventBus {
             };
             // Ignore SendError: no subscribers is fine.
             let _ = self.tx.send(env.into_generic());
-            return Ok(());
+            return Ok(true);
         }
 
         let aggregate_id = session_id_of(&data)
@@ -286,6 +332,30 @@ impl EventBus {
         // One transaction, projector included: the event log and the read
         // model it feeds must not be able to disagree.
         let tx = self.db.begin().await?;
+
+        if let Some(expected) = checkpoint_version {
+            let unchanged = {
+                let mut rows = tx.query(
+                    "SELECT COALESCE((SELECT seq FROM event_sequence WHERE aggregate_id = ?1), -1) = ?2
+                       AND EXISTS (SELECT 1 FROM session_v2 WHERE id = ?1)
+                       AND NOT EXISTS (SELECT 1 FROM session_message
+                         WHERE session_id = ?1 AND type = 'compaction'
+                           AND json_extract(data, '$.status') = 'running')",
+                    (aggregate_id.as_str(), expected),
+                ).await?;
+                rows.next()
+                    .await?
+                    .context("checkpoint guard returned no row")?
+                    .get::<i64>(0)?
+                    != 0
+            };
+            if !unchanged {
+                tx.rollback()
+                    .await
+                    .context("discard stale quiet checkpoint")?;
+                return Ok(false);
+            }
+        }
 
         let latest = {
             let mut stmt = tx
@@ -374,7 +444,7 @@ impl EventBus {
             }
         }
 
-        Ok(())
+        Ok(true)
     }
 
     /// The database handle (read-only fixtures in tests).

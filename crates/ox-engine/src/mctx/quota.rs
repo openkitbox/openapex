@@ -67,12 +67,14 @@ mod tests {
         let refusal = ChatError::Http {
             status: 400,
             body: String::new(),
+            retry_after: None,
         };
         observe(&refusal, base);
         assert_eq!(cooling_until(base), None);
         let throttle = ChatError::Http {
             status: 429,
             body: String::new(),
+            retry_after: None,
         };
         observe(&throttle, base);
         assert_eq!(cooling_until(base + 1), Some(base + cooldown));

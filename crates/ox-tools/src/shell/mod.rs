@@ -91,7 +91,7 @@ impl ShellTool {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            sessions: sessions::shared(),
+            sessions: Arc::new(sessions::ShellSessions::new()),
             completion: None,
             rtk: Arc::new(RtkRewriter::new()),
             jobs: None,
@@ -138,6 +138,9 @@ impl Default for ShellTool {
 }
 
 impl Tool for ShellTool {
+    fn owes_wakeup(&self, session: &str) -> bool {
+        self.sessions.owes_wakeup(session)
+    }
     fn name(&self) -> &str {
         "shell"
     }

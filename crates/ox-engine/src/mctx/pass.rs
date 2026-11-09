@@ -107,6 +107,23 @@ pub struct PassRequest<'a> {
 
 /// Run one transform pass for a session.
 pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
+    execute(request, Execution::Commit)
+        .await
+        .map(|(result, _)| result)
+}
+
+/// Preview the same pass without changing cache, floor, LKG or drop lifecycle.
+pub(crate) async fn preview(request: PassRequest<'_>) -> Result<(PassResult, Vec<u64>)> {
+    execute(request, Execution::Preview).await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Execution {
+    Commit,
+    Preview,
+}
+
+async fn execute(request: PassRequest<'_>, execution: Execution) -> Result<(PassResult, Vec<u64>)> {
     let PassRequest {
         db,
         session_id,
@@ -226,7 +243,15 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
     units.extend(drop_units(&drops));
     let renderer = PrecomputedRenderer { units, boundary_id };
 
-    let outcome = run_pass(&cache, &renderer, &signals).await?;
+    let outcome = match execution {
+        Execution::Commit => run_pass(&cache, &renderer, &signals).await?,
+        Execution::Preview => {
+            let action = crate::mctx::cache::classify(state.as_ref(), &signals);
+            let rendered = renderer.render(state.as_ref(), &signals);
+            crate::mctx::cache::transition(state, action, rendered, &signals).1
+        }
+    };
+    let mut applied = Vec::new();
     // The prefix is taken by value (it can be hundreds of KB; the outcome
     // rebuilt below carries no bytes).
     let (prefix, floor, outcome) = match outcome {
@@ -245,11 +270,13 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
         PassOutcome::BustApplied { prefix } => {
             // The bust froze these bytes, so the queued drops they carry are
             // now reflected in the prefix: mark them applied.
-            let tags: Vec<u64> = drops.iter().map(|(tag, _)| *tag).collect();
-            if !tags.is_empty() {
-                mark_drops_applied(db, session_id, &tags).await?;
+            applied = drops.iter().map(|(tag, _)| *tag).collect();
+            if execution == Execution::Commit {
+                if !applied.is_empty() {
+                    mark_drops_applied(db, session_id, &applied).await?;
+                }
+                save_materialized_floor(db, session_id, coverage).await?;
             }
-            save_materialized_floor(db, session_id, coverage).await?;
             (
                 prefix,
                 coverage,
@@ -304,13 +331,16 @@ pub async fn run(request: PassRequest<'_>) -> Result<PassResult> {
     };
 
     // Record the head actually served as the session's last-known-good.
-    if !prefix.is_empty() && !matches!(result.outcome, PassOutcome::ModulePanicked) {
+    if execution == Execution::Commit
+        && !prefix.is_empty()
+        && !matches!(result.outcome, PassOutcome::ModulePanicked)
+    {
         crate::mctx::cache::Lkg::new(db.clone())
             .save_lkg(session_id, &prefix)
             .await
             .context("save LKG")?;
     }
-    Ok(result)
+    Ok((result, applied))
 }
 
 /// The head halves as planned for one pass.

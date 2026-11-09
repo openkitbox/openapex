@@ -316,8 +316,8 @@ pub(crate) fn mctx_historian(
     let project = ctx.directory.to_string_lossy().into_owned();
     // Resolved here, not inside the detached task: the measurement is the
     // session's current value at the step boundary that decided to fire.
-    let ratio = calibration::ratio_for(&ctx.calibrations, &ctx.session_id);
-    tokio::spawn(async move {
+    let ratio = calibration::ratio_for(&ctx.calibrations, &ctx.session_id, &live.model_id);
+    if let Err(error) = ctx.tasks.spawn_auxiliary(async move {
         let firing = Firing {
             db: &db,
             config: &config,
@@ -361,7 +361,9 @@ pub(crate) fn mctx_historian(
                 tracing::warn!(session = %session_id, error = %error, "historian run failed");
             }
         }
-    });
+    }) {
+        tracing::debug!(%error, "historian registration closed");
+    }
 }
 
 /// The context the assistant asked the provider for, as the provider reported
@@ -510,6 +512,7 @@ pub(crate) async fn patch_fold(
     budget: Budget,
     floor: i64,
     reasoning_effort: Option<String>,
+    model_id: &str,
 ) -> Result<bool> {
     let project = ctx.directory.to_string_lossy();
     let firing = Firing {
@@ -520,7 +523,7 @@ pub(crate) async fn patch_fold(
         budget,
         session_id: &ctx.session_id,
         project: &project,
-        ratio: calibration::ratio_for(&ctx.calibrations, &ctx.session_id),
+        ratio: calibration::ratio_for(&ctx.calibrations, &ctx.session_id, model_id),
         reasoning_effort,
         prefix: None,
     };

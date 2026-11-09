@@ -12,8 +12,9 @@ use ox_schema::message::Message;
 use super::super::drain::DrainCtx;
 use super::super::instructions;
 use super::attempt::StepParams;
-use super::context::{assistant_tokens, build_chat_messages, compaction_boundary, mctx_head};
-use super::history::{load_history_after, load_overlaid_tail};
+use super::context::{assistant_tokens, build_chat_messages, mctx_head};
+use super::history::load_history_after;
+use super::load_overlaid_tail;
 /// Hits automatic recall may attach to one turn (the hint's line budget).
 const RECALL_LIMIT: usize = 3;
 /// Shortest typed prompt worth searching. A greeting or a `/clear` retrieves
@@ -34,8 +35,16 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
     // The magic-context head replaces everything it covers: the pass mints
     // the frozen bytes and reports the ordinal floor, so the transcript
     // starts after the covered range.
-    let budget = ctx.budget_for(&params.model.id);
-    let (head_m0, head_m1, floor) = mctx_head(ctx, budget).await;
+    let system_static = ctx.system_static();
+    let observed = ctx.observe_sources().await?;
+    {
+        let mut baselines = super::super::lock(&ctx.instruction_baselines);
+        baselines
+            .entry(ctx.session_id.clone())
+            .or_insert_with(|| instructions::baseline(&observed));
+    }
+    let budget = ctx.budget_for(&params.model.id, system_static.len());
+    let (head_m0, head_m1, floor) = mctx_head(ctx, budget, &params.model.id).await;
     let rows = if ctx.config.magic_context.enabled {
         // The §N§ overlay (tag prefixes + drop placeholders) is part of the
         // integration: with it off the request must stay byte-identical to
@@ -61,35 +70,26 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
     }
     // Filesystem work (repository anchor, skills walk, AGENTS.md reads) runs
     // off the executor; see `DrainCtx::observe_sources`.
-    let observed = ctx.observe_sources().await?;
-    let (system_static, tool_count): (Arc<str>, usize) = {
-        let guidance: Vec<(&str, Option<&'static str>)> = ctx.tools.guidances().collect();
-        // The baseline log's tool count is the registry size; the names
-        // iterate in the same order the definitions do.
-        let count = guidance.len();
-        (
-            Arc::from(prompt::system_static(&guidance, ctx.agent)),
-            count,
-        )
-    };
+    let tool_count = ctx.tools.guidances().count();
     // The baseline log needs the static layer's size, so it is built
     // before the sync: assembling it is pure string work over the
     // registry's guidance, unaffected by the keyed sources.
-    let instruction_update =
-        sync_instructions(ctx, &observed, &rows, system_static.len(), tool_count).await;
-    let instructions_initial: Arc<str> = {
-        let baselines = super::super::lock(&ctx.instruction_baselines);
-        baselines
-            .get(&ctx.session_id)
-            .map(|b| Arc::from(b.initial_render.as_str()))
-            .unwrap_or_else(|| Arc::from(""))
-    };
+    let (instructions_initial, instruction_update) =
+        sync_instructions(ctx, &observed, &rows, system_static.len(), tool_count).await?;
     let mut chat_messages = build_chat_messages(
         &system_static,
         &instructions_initial,
         &[head_m0.as_deref(), head_m1.as_deref()],
         &rows,
     );
+    let mut layers = super::super::request_budget::Layers {
+        system_static: system_static.len(),
+        frozen: instructions_initial.len(),
+        m0: head_m0.as_ref().map_or(0, String::len),
+        m1: head_m1.as_ref().map_or(0, String::len),
+        delta: instruction_update.as_ref().map_or(0, String::len),
+        ..Default::default()
+    };
     // Pressure is checked after the pass: the floor it reports is what the
     // live tail is measured above. Both windows were resolved once, when the
     // budget was derived. The trigger is called here rather than next to
@@ -120,19 +120,7 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
     // rows predate it, so the text rides this request in memory (upstream
     // `generate.ts:55` places `Message.system(instructionUpdate)` after the
     // transcript and BEFORE the current prompt).
-    if let Some(text) = instruction_update {
-        let delta = ChatMessage::System { content: text };
-        // Upstream `generate.ts:55` places the update before the current
-        // prompt (the transcript's trailing user row on the first
-        // attempt); later attempts end with tool output and tail-append.
-        match chat_messages.last() {
-            Some(ChatMessage::User { .. }) => {
-                let at = chat_messages.len() - 1;
-                chat_messages.insert(at, delta);
-            }
-            _ => chat_messages.push(delta),
-        }
-    }
+    instructions::insert_update(&mut chat_messages, instruction_update);
     // Automatic recall: the turn's opening request gets the top few
     // memories/notes/compartments matching the prompt's own typed text, as
     // one compact `<recall>` block appended to that user message.
@@ -187,6 +175,7 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
                     // is not cloned on the way. A parts-list user turn (prompt
                     // + media) keeps its bytes: the block is plain text.
                     let content = std::mem::take(text);
+                    layers.recall = block.len() + if content.is_empty() { 0 } else { 2 };
                     *text = append_recall(content, &block);
                 }
             }
@@ -208,7 +197,9 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
     request.apply_reasoning_effort(params.model.variant.as_deref());
     if params.final_step {
         apply_final_step(&mut request);
+        layers.final_step = MAX_STEPS_PROMPT.len();
     }
+    super::super::request_budget::apply(ctx, &mut request, layers)?;
     Ok(request)
 }
 
@@ -265,8 +256,8 @@ async fn sync_instructions(
     rows: &[Message],
     system0_bytes: usize,
     tool_count: usize,
-) -> Option<String> {
-    let (deltas, baseline_sizes) = {
+) -> Result<(Arc<str>, Option<String>)> {
+    let (preview, baseline_sizes) = {
         let mut baselines = super::super::lock(&ctx.instruction_baselines);
         // The sizes are pure from `observed`, so they can be reported after
         // the lock is released: tracing must not hold the baseline mutex.
@@ -274,10 +265,9 @@ async fn sync_instructions(
         let baseline = baselines
             .entry(ctx.session_id.clone())
             .or_insert_with(|| instructions::baseline(observed));
-        let wire = instructions::fold(rows, compaction_boundary(rows.iter()));
-        let deltas = instructions::diff(observed, &wire, baseline);
+        let preview = instructions::preview(observed, rows, Some(baseline))?;
         let sizes = fresh.then(|| prompt::injection_sizes(observed, system0_bytes, tool_count));
-        (deltas, sizes)
+        (preview, sizes)
     };
     if let Some(sizes) = baseline_sizes {
         tracing::info!(
@@ -295,8 +285,9 @@ async fn sync_instructions(
             "injection baseline"
         );
     }
+    let instructions::Preview { initial, deltas } = preview;
     if deltas.is_empty() {
-        return None;
+        return Ok((initial, None));
     }
     let text = instructions::render_updates(&deltas);
     let delta = instructions::delta_record(&deltas);
@@ -311,11 +302,11 @@ async fn sync_instructions(
         .await
     {
         tracing::warn!(session = %ctx.session_id, %error, "instruction update publish failed");
-        return None;
+        return Ok((initial, None));
     }
     let mut baselines = super::super::lock(&ctx.instruction_baselines);
     if let Some(baseline) = baselines.get_mut(&ctx.session_id) {
         instructions::apply(deltas, baseline);
     }
-    Some(text)
+    Ok((initial, Some(text)))
 }

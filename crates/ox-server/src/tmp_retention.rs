@@ -157,11 +157,20 @@ fn remove_entry(path: &Path) -> io::Result<()> {
 
 /// Sweep once now and then every [`SWEEP_INTERVAL`]. `days == 0` disables
 /// retention. Best-effort: a failed sweep is logged and retried next tick.
-pub(crate) fn spawn_sweeper(dir: PathBuf, days: u32) {
+///
+/// Returns the sweeper's join handle (`None` when retention is off). The
+/// blocking sweep already started is awaited to completion — a shutdown must
+/// not report success while a recursive delete is still walking `<ox_home>/tmp`
+/// — and `stop` is observed at the sleep boundary.
+pub(crate) fn spawn_sweeper(
+    dir: PathBuf,
+    days: u32,
+    stop: tokio_util::sync::CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
     if days == 0 {
-        return;
+        return None;
     }
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         loop {
             let target = dir.clone();
             let now = ox_schema::id::now_millis();
@@ -174,7 +183,10 @@ pub(crate) fn spawn_sweeper(dir: PathBuf, days: u32) {
                     tracing::warn!(error = %error, "tmp retention: sweep task failed");
                 }
             }
-            tokio::time::sleep(SWEEP_INTERVAL).await;
+            tokio::select! {
+                () = stop.cancelled() => return,
+                () = tokio::time::sleep(SWEEP_INTERVAL) => {}
+            }
         }
-    });
+    }))
 }

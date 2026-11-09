@@ -19,7 +19,7 @@ use super::stream::{ANTHROPIC_VERSION, MessagesDecoder};
 use super::wire::{MessagesPolicy, build_request};
 use crate::cardinal::chat::{Chat, ChatFuture};
 use crate::cardinal::wire::ChatRequest;
-use crate::error::{ChatError, HTTP_BODY_SNIPPET_BYTES};
+use crate::error::ChatError;
 use crate::sse::{SseChatStream, streaming_http_client};
 
 /// A live Messages stream.
@@ -93,13 +93,7 @@ impl MessagesClient {
         let response = builder.send().await?;
         let status = response.status();
         if !status.is_success() {
-            let body = response.bytes().await.unwrap_or_default();
-            let mut snippet = String::from_utf8_lossy(&body).into_owned();
-            snippet.truncate(HTTP_BODY_SNIPPET_BYTES);
-            return Err(ChatError::Http {
-                status: status.as_u16(),
-                body: snippet,
-            });
+            return Err(ChatError::from_response(response).await);
         }
         Ok(SseChatStream::new(response, MessagesDecoder::new()))
     }

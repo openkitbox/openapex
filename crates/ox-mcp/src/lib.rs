@@ -14,6 +14,7 @@ pub(crate) mod stdio;
 mod sync;
 pub(crate) mod tool;
 pub(crate) mod transport;
+mod transports;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
@@ -29,6 +30,8 @@ use ox_tools::contract::Tool;
 
 use client::Client;
 use transport::{CallError, Rpc};
+
+pub use transports::Transports;
 
 /// Server status, serialized exactly as upstream `Mcp.Status` (a tagged
 /// object: `{"status":"connected"}`, `{"status":"failed","error":"..."}`).
@@ -87,6 +90,7 @@ pub struct Hub {
     /// Names of the tools the owner registered from this hub, per server; see
     /// [`Hub::record_server_tools`].
     tool_names: RwLock<BTreeMap<String, Vec<String>>>,
+    transports: Arc<Transports>,
 }
 
 /// The tools one server returned, so the owner can record registrations
@@ -112,10 +116,12 @@ struct ConnectionMetadata {
 const TOOL_NAMING_LINE: &str = "Use tools from these servers directly by their `<server>_<tool>` names (sanitized server name, underscore, sanitized tool name).";
 
 impl Hub {
-    /// A hub with no servers. `Runner::new` uses this so tests that build a
-    /// runner directly get the pre-MCP behavior.
+    /// A hub with no servers, whose transport cleanup belongs to
+    /// `transports`. A composition creates one owner and passes it to every
+    /// hub it builds, so a hub that is dropped before shutdown cannot orphan a
+    /// spawned child or an open pipe.
     #[must_use]
-    pub fn empty() -> Self {
+    pub fn with_transports(transports: Arc<Transports>) -> Self {
         Self {
             servers: RwLock::new(BTreeMap::new()),
             metadata: RwLock::new(BTreeMap::new()),
@@ -123,6 +129,55 @@ impl Hub {
             resources: RwLock::new(Vec::new()),
             templates: RwLock::new(Vec::new()),
             tool_names: RwLock::new(BTreeMap::new()),
+            transports,
+        }
+    }
+
+    /// A hub with no servers. `Runner::new` uses this so tests that build a
+    /// runner directly get the pre-MCP behavior; it owns a private transport
+    /// scope, which [`Hub::shutdown`] still seals.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::with_transports(Arc::new(Transports::new()))
+    }
+
+    /// The transport owner this hub's connections register their cleanup
+    /// with.
+    #[must_use]
+    pub fn transports(&self) -> &Arc<Transports> {
+        &self.transports
+    }
+
+    /// Tear down every connection this hub still holds and await each
+    /// transport's shutdown. Idempotent: a second call finds nothing to drain.
+    /// The transport owner is *not* sealed here — the composition seals it
+    /// after every hub is shut down, because a dropped hub may have handed it
+    /// cleanup that no live hub accounts for.
+    pub async fn shutdown(&self) -> Result<(), String> {
+        let connections: Vec<Arc<dyn Rpc>> = std::mem::take(&mut *sync::write(&self.connections))
+            .into_values()
+            .collect();
+        let mut failure = None;
+        for rpc in connections {
+            let transports = Arc::clone(&self.transports);
+            let cleanup = tokio::spawn(async move {
+                rpc.shutdown().await;
+            });
+            match transports.adopt(cleanup) {
+                Ok(()) => {}
+                Err(handle) => {
+                    if let Err(error) = handle.await {
+                        failure.get_or_insert_with(|| format!("transport cleanup failed: {error}"));
+                    }
+                }
+            }
+        }
+        sync::write(&self.resources).clear();
+        sync::write(&self.templates).clear();
+        sync::write(&self.tool_names).clear();
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 

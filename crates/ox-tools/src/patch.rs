@@ -309,6 +309,11 @@ fn apply(ctx: &ToolContext, hunks: Vec<Hunk>) -> ToolOutput {
             return output;
         }
     }
+    // Preflight can create directories, so it starts the non-cancellable
+    // commit section for the entire prepared batch, including move pairs.
+    if ctx.cancellation.is_cancelled() {
+        return fail("Tool execution interrupted");
+    }
     for change in &prepared {
         match change.kind {
             "delete" => {
@@ -399,6 +404,8 @@ fn apply(ctx: &ToolContext, hunks: Vec<Hunk>) -> ToolOutput {
                             &applied,
                         );
                     }
+                    // The destination is committed even if removing the source fails.
+                    ctx.registry.files.record(&ctx.session_id, move_target);
                     if let Err(error) = std::fs::remove_file(&change.target) {
                         return failure(
                             format!(
@@ -409,10 +416,7 @@ fn apply(ctx: &ToolContext, hunks: Vec<Hunk>) -> ToolOutput {
                             &applied,
                         );
                     }
-                    // The update moved the content to the destination, so that
-                    // is the path whose state this session now knows; the source
-                    // no longer exists.
-                    ctx.registry.files.record(&ctx.session_id, move_target);
+                    // Source removal completed; forget its former stamp.
                     ctx.registry.files.forget(&ctx.session_id, &change.target);
                     applied.push(("update", move_resource.clone()));
                 }

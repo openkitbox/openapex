@@ -6,6 +6,8 @@
 //! protocol produced a failure. The messages here are therefore
 //! provider-neutral — they name what happened, not which gateway said it.
 
+use std::time::Duration;
+
 use thiserror::Error;
 
 /// Everything that can go wrong while streaming a chat turn.
@@ -19,6 +21,8 @@ pub enum ChatError {
         status: u16,
         /// Truncated response body (at most [`HTTP_BODY_SNIPPET_BYTES`]).
         body: String,
+        /// Provider's minimum retry delay, normalized at the HTTP boundary.
+        retry_after: Option<Duration>,
     },
     /// A chunk carried an `error` object (the endpoint forwards upstream
     /// failures in-band once the stream has started).
@@ -50,3 +54,71 @@ pub enum ChatError {
 
 /// Maximum bytes of a non-2xx response body kept in [`ChatError::Http`].
 pub const HTTP_BODY_SNIPPET_BYTES: usize = 512;
+
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(15 * 60);
+
+impl ChatError {
+    /// The endpoint's bounded minimum retry delay, when supplied.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Http { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
+    pub(crate) async fn from_response(response: reqwest::Response) -> Self {
+        let status = response.status().as_u16();
+        let retry_after = retry_after(response.headers(), jiff::Timestamp::now());
+        let body = response.bytes().await.unwrap_or_default();
+        let mut snippet = String::from_utf8_lossy(&body).into_owned();
+        let mut end = snippet.len().min(HTTP_BODY_SNIPPET_BYTES);
+        while !snippet.is_char_boundary(end) {
+            end -= 1;
+        }
+        snippet.truncate(end);
+        Self::Http {
+            status,
+            body: snippet,
+            retry_after,
+        }
+    }
+}
+
+fn retry_after(headers: &reqwest::header::HeaderMap, now: jiff::Timestamp) -> Option<Duration> {
+    let milliseconds = headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| decimal_delay(value, 1));
+    let seconds_or_date = || {
+        let value = headers
+            .get(reqwest::header::RETRY_AFTER)?
+            .to_str()
+            .ok()?
+            .trim();
+        decimal_delay(value, 1000).or_else(|| {
+            let timestamp = jiff::fmt::rfc2822::DateTimeParser::new()
+                .parse_timestamp(value)
+                .ok()?;
+            let nanos = timestamp
+                .as_nanosecond()
+                .saturating_sub(now.as_nanosecond())
+                .max(0);
+            Some(Duration::from_nanos(
+                u64::try_from(nanos).unwrap_or(u64::MAX),
+            ))
+        })
+    };
+    milliseconds
+        .or_else(seconds_or_date)
+        .map(|delay| delay.min(MAX_RETRY_AFTER))
+}
+
+fn decimal_delay(value: &str, milliseconds: u64) -> Option<Duration> {
+    let value = value.trim();
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let number = value.parse::<u64>().unwrap_or(u64::MAX);
+    Some(Duration::from_millis(number.saturating_mul(milliseconds)))
+}

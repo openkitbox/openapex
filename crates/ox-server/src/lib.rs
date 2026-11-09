@@ -7,7 +7,9 @@ pub mod api;
 pub mod instance;
 pub mod lifecycle;
 pub(crate) mod reload;
+pub mod runtime;
 mod session_retention;
+pub(crate) mod supervision;
 mod tmp_retention;
 pub(crate) mod worktree;
 
@@ -193,7 +195,8 @@ async fn build_state_with_mode(
     // HTTP layer. A server that fails to connect is a status, never a
     // startup error. `Deferred` keeps the hub empty here so `compose` can open
     // the listener first and install the handshakes through a generation swap.
-    let mcp = Arc::new(ox_mcp::Hub::empty());
+    let runtime = crate::runtime::Runtime::new();
+    let mcp = runtime.new_hub();
     if mcp_startup == McpStartup::Await {
         register_mcp_tools(&mcp, &config.mcp, &directory, &mut tools).await;
     }
@@ -205,7 +208,7 @@ async fn build_state_with_mode(
     ox_tools::form::init(bus.clone());
     // Same for `shell.created|exited|deleted`: the TUI marks a background
     // shell running by its presence in a store those frames fill.
-    ox_tools::shell::events::init(bus.clone());
+    ox_tools::shell::events::init(&tools.shells, bus.clone());
     // One read-only config behind an `Arc`: every actor and spawned task clones
     // the handle, never the struct.
     let config = std::sync::Arc::new(config);
@@ -232,6 +235,7 @@ async fn build_state_with_mode(
         config_path: ox_core::config::Config::default_path(),
         lifecycle: lifecycle::Lifecycle::new(std::time::Instant::now()),
         embedder,
+        runtime,
     })
 }
 
@@ -381,8 +385,30 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
         McpStartup::Deferred,
     )
     .await?;
-    spawn_runner_memory_stats(state.runner.clone());
-    mctx::memory::spawn_embedding_sweep(state.db.clone(), state.embedder.clone());
+    let stop = state.runtime.stop().clone();
+    // Startup producers are adopted before the listener exists: `compose`
+    // never runs once shutdown has started, but an adopted handle that the
+    // owner refuses is still awaited here rather than dropped.
+    async fn adopt(state: &AppState, handle: Option<tokio::task::JoinHandle<()>>) {
+        let Some(handle) = handle else {
+            return;
+        };
+        if let Err(handle) = state.runtime.adopt(handle)
+            && let Err(error) = handle.await
+        {
+            tracing::warn!(%error, "startup task failed while adoption was refused");
+        }
+    }
+    adopt(
+        &state,
+        spawn_runner_memory_stats(state.runner.clone(), &stop),
+    )
+    .await;
+    adopt(
+        &state,
+        mctx::memory::spawn_embedding_sweep(state.db.clone(), state.embedder.clone(), stop.clone()),
+    )
+    .await;
     // Warm the catalogue without holding the listener: the first client that
     // asks (`/api/model` at TUI startup) gets models, and a client that beats
     // the warm-up gets the same refresh the request path already performs on
@@ -390,25 +416,34 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
     let svc = state.services();
     {
         let catalog = Arc::clone(&svc.model_catalog);
-        tokio::spawn(async move {
-            catalog.warm().await;
-        });
+        let done = stop.clone();
+        adopt(
+            &state,
+            Some(tokio::spawn(async move {
+                tokio::select! {
+                    () = done.cancelled() => {}
+                    () = catalog.warm() => {}
+                }
+            })),
+        )
+        .await;
     }
     // MCP handshakes have their own 30 s per-server budget; finishing them
     // here would keep clients from connecting for that entire window. Install
     // them after the listener is up instead.
-    spawn_mcp_startup(&state);
+    adopt(&state, spawn_mcp_startup(&state)).await;
     // Background memory consolidation. Idle unless `[magic_context]` enables
     // it, and deliberately not part of `build_state_with`: tests must not
     // acquire a background loop that writes to their database.
     if svc.config.magic_context.enabled && svc.config.magic_context.dreamer_enabled {
-        mctx::dreamer::Dreamer::new(
+        let dreamer = mctx::dreamer::Dreamer::new(
             state.db.clone(),
             Arc::clone(&svc.config),
             state.runner.chat(),
             Arc::clone(&svc.model_catalog),
         )
-        .spawn();
+        .spawn(stop.clone());
+        adopt(&state, Some(dreamer)).await;
     }
     // A fold that was in flight when the previous process died left its
     // `mc_historian_run` row `running`, and "one pending run per session" reads
@@ -428,26 +463,55 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
     // above, and spawned: startup recovery must never delay the listener, so a
     // slow database cannot keep clients from connecting.
     if let Some(subagent) = subagent {
-        tokio::spawn(async move {
-            subagent.backfill_completions().await;
-        });
+        let done = stop.clone();
+        adopt(
+            &state,
+            Some(tokio::spawn(async move {
+                tokio::select! {
+                    () = done.cancelled() => {}
+                    () = subagent.backfill_completions() => {}
+                }
+            })),
+        )
+        .await;
     }
     // Replay-log retention: the `event` table is history for SSE reconnect, not
     // state, so old rows are swept on a fixed window (`[events] retention_days`,
     // 0 keeps everything). Deliberately started here rather than in
     // `build_state_with`: tests must not acquire a background writer.
-    event_bus::spawn_pruner(state.db.clone(), svc.config.events.retention_days);
+    adopt(
+        &state,
+        event_bus::spawn_pruner(
+            state.db.clone(),
+            svc.config.events.retention_days,
+            stop.clone(),
+        ),
+    )
+    .await;
     // Session trees past `[sessions] retention_days` (0 keeps everything) are
     // deleted by the same path as `DELETE /api/session/{id}`. Started here for
     // the same reason as the pruner: tests must not acquire a background writer.
-    session_retention::spawn_sweeper(state.clone(), svc.config.sessions.retention_days);
+    adopt(
+        &state,
+        session_retention::spawn_sweeper(
+            state.clone(),
+            svc.config.sessions.retention_days,
+            stop.clone(),
+        ),
+    )
+    .await;
     // `<ox_home>/tmp` (the dir `build_state_with` creates) is swept on
     // `[tmp] retention_days` (0 keeps everything); started here for the same
     // reason: tests must not acquire a background deleter.
-    tmp_retention::spawn_sweeper(
-        ox_core::config::ox_home().join("tmp"),
-        svc.config.tmp.retention_days,
-    );
+    adopt(
+        &state,
+        tmp_retention::spawn_sweeper(
+            ox_core::config::ox_home().join("tmp"),
+            svc.config.tmp.retention_days,
+            stop.clone(),
+        ),
+    )
+    .await;
     let router = build_router(state.clone());
     Ok((state, router))
 }
@@ -463,16 +527,23 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
 /// A reload that lands first has already connected MCP itself and installed
 /// generation 1; this task then steps aside rather than overwriting it with a
 /// handshake built from the config it started with.
-fn spawn_mcp_startup(state: &AppState) {
+fn spawn_mcp_startup(state: &AppState) -> Option<tokio::task::JoinHandle<()>> {
+    let runtime = Arc::clone(&state.runtime);
     let live = Arc::clone(&state.live);
     let directory = state.directory.clone();
     let servers = state.services().config.mcp.clone();
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         let base = live.current();
         let none: [&str; 0] = [];
         let mut tools = base.tools.without(&none);
-        let mcp = Arc::new(ox_mcp::Hub::empty());
+        let mcp = runtime.new_hub();
         register_mcp_tools(&mcp, &servers, &directory, &mut tools).await;
+        if runtime.is_closing() {
+            if let Err(error) = mcp.shutdown().await {
+                tracing::warn!(error = %error, "MCP startup cleanup failed during shutdown");
+            }
+            return;
+        }
         let registered = mcp.tool_names().len();
         let installed = live
             .replace(move |old| async move {
@@ -489,37 +560,42 @@ fn spawn_mcp_startup(state: &AppState) {
             })
             .await;
         match installed {
-            Ok(_) => {
-                tracing::info!(
-                    tools = registered,
-                    "MCP servers connected; their tools are live"
-                )
-            }
+            Ok(_) => tracing::info!(
+                tools = registered,
+                "MCP servers connected; their tools are live"
+            ),
             Err(error) => tracing::info!(%error, "MCP startup left the current generation alone"),
         }
-    });
+    }))
 }
 
 /// Disabled unless `OX_MEMORY_STATS_MS` selects a positive interval.
-fn spawn_runner_memory_stats(runner: Runner) {
+fn spawn_runner_memory_stats(
+    runner: Runner,
+    stop: &tokio_util::sync::CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
     let Ok(raw) = std::env::var("OX_MEMORY_STATS_MS") else {
-        return;
+        return None;
     };
     let Ok(milliseconds) = raw.parse::<u64>() else {
-        return;
+        return None;
     };
     if milliseconds == 0 {
-        return;
+        return None;
     }
-    tokio::spawn(async move {
+    let stop = stop.clone();
+    Some(tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(milliseconds));
         loop {
-            interval.tick().await;
+            tokio::select! {
+                () = stop.cancelled() => return,
+                _ = interval.tick() => {}
+            }
             let (sessions, baselines) = runner.diagnostic_table_sizes();
             tracing::info!(sessions, baselines, "OX_RUNNER_STATS");
             log_cache_stats(&runner);
         }
-    });
+    }))
 }
 
 /// Emit the runner's prompt-cache ledger: one aggregate `OX_CACHE_STATS` line,
@@ -582,11 +658,14 @@ pub enum Signals {
 /// Serve on `acceptor`. With `idle = Some(grace)` the server stops itself
 /// once [`lifecycle::Lifecycle::try_close`] says no lease, no turn and a full
 /// `grace` of quiet. With [`Signals::Handle`], SIGINT and SIGTERM stop it
-/// gracefully too. However serving ends (idle exit or a signal), every
-/// background shell
-/// process group is stopped before this returns, so none outlives the server
-/// (upstream shell finalizer); a SIGKILL of ox cannot be handled. Never
-/// composes state or reads the real home.
+/// gracefully too. Cancelling [`runtime::Runtime::stop`] also stops it, which
+/// is how an embedding caller (`ox acp` own mode) asks the listener to end.
+///
+/// However serving ends, [`runtime::Runtime::shutdown`] then closes
+/// admissions and awaits everything the composition owns: actors, the shell
+/// domain, maintenance producers, MCP transports and the database's rollback
+/// cleanup. A SIGKILL of ox cannot be handled. Never composes state or reads
+/// the real home.
 pub async fn serve_with(
     acceptor: impl salvo::conn::Acceptor,
     state: AppState,
@@ -595,10 +674,13 @@ pub async fn serve_with(
     signals: Signals,
 ) -> Result<()> {
     let server = Server::new(acceptor);
+    let runtime = Arc::clone(&state.runtime);
     let watcher = idle.map(|grace| {
         let handle = server.handle();
         let lifecycle = Arc::clone(&state.lifecycle);
         let runner = state.runner.clone();
+        let runtime = Arc::clone(&runtime);
+        let state = state.clone();
         lifecycle.touch(Instant::now());
         let period = (grace / 4).clamp(Duration::from_millis(10), Duration::from_secs(1));
         tokio::spawn(async move {
@@ -606,6 +688,7 @@ pub async fn serve_with(
                 tokio::time::sleep(period).await;
                 if lifecycle.try_close(Instant::now(), runner.has_active(), grace) {
                     tracing::info!("no clients left; shutting down");
+                    runtime.close_admissions(&state);
                     handle.stop_graceful(Duration::from_secs(2));
                     return;
                 }
@@ -614,18 +697,42 @@ pub async fn serve_with(
     });
     let signal_task = (signals == Signals::Handle).then(|| {
         let handle = server.handle();
+        let runtime = Arc::clone(&runtime);
+        let state = state.clone();
         tokio::spawn(async move {
             let signal = shutdown_signal().await;
             tracing::info!(signal, "shutdown signal received; stopping");
+            runtime.close_admissions(&state);
             handle.stop_graceful(Duration::from_secs(2));
         })
     });
+    // The stop token is a third way to end serving, and the one an embedding
+    // process uses. It only stops the listener: the composition's own cleanup
+    // runs once the accept loop has returned, below.
+    let stopped = {
+        let handle = server.handle();
+        let stop = runtime.stop().clone();
+        let runtime_for_stop = Arc::clone(&runtime);
+        let state_for_stop = state.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = stop.cancelled() => {
+                    tracing::info!("runtime stop requested; stopping the listener");
+                    runtime_for_stop.close_admissions(&state_for_stop);
+                    handle.stop_graceful(Duration::from_secs(2));
+                }
+                // Serving ended on its own: nothing to stop. Keep this task
+                // alive so the caller's abort below is what ends it.
+                () = std::future::pending() => {}
+            }
+        })
+    };
     server.serve(router).await;
-    for task in [watcher, signal_task].into_iter().flatten() {
+    for task in [watcher, signal_task, Some(stopped)].into_iter().flatten() {
         task.abort();
+        let _ = task.await;
     }
-    ox_tools::shell::sessions::shared().shutdown().await;
-    Ok(())
+    runtime.shutdown(&state).await
 }
 
 /// Resolve with the name of the first shutdown signal: SIGINT (ctrl+c) or

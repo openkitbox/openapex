@@ -22,7 +22,7 @@ use ox_schema::event::SessionEventData;
 use ox_schema::id;
 use ox_schema::inbox::{Delivery, Item, SyntheticPayload};
 use ox_schema::support::{Record, ShellOutput};
-use ox_tools::shell::sessions::{self, Owner, ShellSession, SpawnRequest};
+use ox_tools::shell::sessions::{Owner, ShellSession, ShellSessions, SpawnRequest};
 use ox_tools::shell::user;
 
 use super::response::{invalid_request, no_content, parse_body, session_not_found, unknown_error};
@@ -67,7 +67,8 @@ pub(crate) async fn shell(req: &mut Request, depot: &mut Depot, res: &mut Respon
         }
     };
 
-    let started = sessions::shared().spawn(SpawnRequest {
+    let shells = Arc::clone(&app.services().tools.shells);
+    let started = shells.spawn(SpawnRequest {
         command: body.command.clone(),
         cwd: PathBuf::from(&directory),
         timeout_ms: None,
@@ -105,23 +106,28 @@ pub(crate) async fn shell(req: &mut Request, depot: &mut Depot, res: &mut Respon
         Some(rest) => format!("evt_{rest}"),
         None => id,
     });
-    let run = tokio::spawn(record(
-        app.db.clone(),
-        app.bus.clone(),
-        session_id,
-        session,
-        event_id,
-    ));
-    match run.await {
+    let outcome = app
+        .runtime
+        .own(record(
+            shells,
+            app.db.clone(),
+            app.bus.clone(),
+            session_id,
+            session,
+            event_id,
+        ))
+        .await;
+    match outcome {
         Ok(Ok(())) => no_content(res),
         Ok(Err(error)) => unknown_error(res, &error),
-        Err(error) => unknown_error(res, &anyhow::Error::from(error)),
+        Err(error) => unknown_error(res, &error),
     }
 }
 
 /// Publish started, wait for the terminal state, publish ended with the
 /// output preview, then leave the user notification in the transcript.
 async fn record(
+    shells: Arc<ShellSessions>,
     db: Db,
     bus: EventBus,
     session_id: String,
@@ -140,18 +146,17 @@ async fn record(
 
     // Upstream reads the preview back by id; a session already dropped from
     // the table has no capture left.
-    let output =
-        sessions::shared()
-            .get(session.id.as_str())
-            .map_or_else(user::unavailable_output, |live| {
-                let (page, _) = live.poll(0, PREVIEW_BYTES);
-                ShellOutput {
-                    output: page.output,
-                    cursor: i64::try_from(page.cursor).unwrap_or(i64::MAX),
-                    size: i64::try_from(page.size).unwrap_or(i64::MAX),
-                    truncated: page.truncated,
-                }
-            });
+    let output = shells
+        .get(session.id.as_str())
+        .map_or_else(user::unavailable_output, |live| {
+            let (page, _) = live.poll(0, PREVIEW_BYTES);
+            ShellOutput {
+                output: page.output,
+                cursor: i64::try_from(page.cursor).unwrap_or(i64::MAX),
+                size: i64::try_from(page.size).unwrap_or(i64::MAX),
+                truncated: page.truncated,
+            }
+        });
     bus.publish(SessionEventData::SessionShellEnded {
         session_id: session_id.clone(),
         shell: session.info(),

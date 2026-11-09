@@ -117,16 +117,25 @@ fn derive_agent_tools(tools: &Arc<ToolRegistry>) -> Vec<(&'static Agent, Arc<Too
 /// Holder of the current [`Services`] generation.
 pub struct Live {
     current: RwLock<Arc<Services>>,
+    closed: std::sync::atomic::AtomicBool,
     /// Serializes [`Live::replace`] so each build sees the previous result.
     gate: AsyncMutex<()>,
 }
 
 impl Live {
+    /// Prevent both new builders and installation by builders already in flight.
+    pub fn close_updates(&self) {
+        let _current = self.current.write().unwrap_or_else(|p| p.into_inner());
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     /// Start at generation 0.
     #[must_use]
     pub fn new(set: ServiceSet) -> Self {
         Self {
             current: RwLock::new(Services::new(0, set)),
+            closed: std::sync::atomic::AtomicBool::new(false),
             gate: AsyncMutex::new(()),
         }
     }
@@ -154,10 +163,17 @@ impl Live {
         Fut: Future<Output = Result<ServiceSet>>,
     {
         let _gate = self.gate.lock().await;
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            anyhow::bail!("service updates are closed");
+        }
         let old = self.current();
         let set = build(Arc::clone(&old)).await?;
         let next = Services::new(old.generation + 1, set);
-        *self.current.write().unwrap_or_else(|p| p.into_inner()) = Arc::clone(&next);
+        let mut current = self.current.write().unwrap_or_else(|p| p.into_inner());
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            anyhow::bail!("service updates closed during build");
+        }
+        *current = Arc::clone(&next);
         Ok(next)
     }
 }

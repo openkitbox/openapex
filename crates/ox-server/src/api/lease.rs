@@ -32,7 +32,7 @@ pub(crate) async fn lease(depot: &mut Depot, res: &mut Response) {
     let period = Duration::from_millis(app.services().config.event_heartbeat_ms.max(1));
     let (tx, rx) = mpsc::channel::<String>(1);
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         // Held for the connection's lifetime; dropped on every exit path.
         let _guard = guard;
         if tx.send(": lease\n\n".to_owned()).await.is_err() {
@@ -51,6 +51,11 @@ pub(crate) async fn lease(depot: &mut Depot, res: &mut Response) {
             }
         }
     });
+    if let Err(task) = app.runtime.adopt(task)
+        && let Err(error) = task.await
+    {
+        tracing::debug!(%error, "lease task ended after shutdown sealed ownership");
+    }
 
     sse_stream(res, rx);
 }

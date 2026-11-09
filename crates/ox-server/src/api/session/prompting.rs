@@ -178,7 +178,10 @@ pub(crate) async fn prompt(req: &mut Request, depot: &mut Depot, res: &mut Respo
             // admission; file reads are blocking, so they run off the reactor.
             let files = match body.files {
                 Some(inputs) if !inputs.is_empty() => {
-                    match tokio::task::spawn_blocking(move || attachment::materialize(inputs)).await
+                    match app
+                        .runtime
+                        .own_blocking(move || attachment::materialize(inputs))
+                        .await
                     {
                         Ok(Ok(files)) => Some(files),
                         Ok(Err(error)) => {
@@ -187,7 +190,7 @@ pub(crate) async fn prompt(req: &mut Request, depot: &mut Depot, res: &mut Respo
                             return;
                         }
                         Err(error) => {
-                            unknown_error(res, &error.into());
+                            unknown_error(res, &error);
                             return;
                         }
                     }

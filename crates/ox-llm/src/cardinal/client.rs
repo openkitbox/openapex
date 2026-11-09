@@ -25,9 +25,9 @@
 
 use std::time::Duration;
 
+use super::ChatError;
 use super::stream::ChunkDecoder;
 use super::wire::ChatRequest;
-use super::{ChatError, HTTP_BODY_SNIPPET_BYTES};
 use crate::config::LlmConfig;
 use crate::sse::{SseChatStream, streaming_http_client};
 
@@ -92,13 +92,7 @@ impl CardinalClient {
         let response = builder.send().await?;
         let status = response.status();
         if !status.is_success() {
-            let body = response.bytes().await.unwrap_or_default();
-            let mut snippet = String::from_utf8_lossy(&body).into_owned();
-            snippet.truncate(HTTP_BODY_SNIPPET_BYTES);
-            return Err(ChatError::Http {
-                status: status.as_u16(),
-                body: snippet,
-            });
+            return Err(ChatError::from_response(response).await);
         }
         Ok(SseChatStream::new(response, ChunkDecoder::new()))
     }

@@ -33,6 +33,7 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
+use tokio::sync::TryAcquireError;
 use tokio_util::sync::CancellationToken;
 
 use super::{fail, object_param, ok_text, param};
@@ -125,6 +126,8 @@ const SPAWN_PREFIX: &str = "You are a subagent spawned by another session.\nDo n
 /// runner; the tool only ever sees this trait, which is what breaks the
 /// tool → engine dependency without a process-global slot.
 pub trait SubagentSpawner: Send + Sync {
+    fn try_admit(&self) -> Result<crate::contract::ExecutionAdmission, crate::contract::Closing>;
+    fn is_closing(&self) -> bool;
     /// Wake (or start) the session actor for an enqueued inbox row.
     fn dispatch<'a>(
         &'a self,
@@ -174,6 +177,8 @@ pub struct SubagentHandle {
     jobs: Arc<Jobs>,
     /// The background children still in flight, shared by every clone.
     in_flight: Arc<InFlightRegistry>,
+    stop: tokio_util::sync::CancellationToken,
+    watchers: crate::contract::TaskOwner,
 }
 
 /// One background child a live completion watcher is still responsible for.
@@ -236,12 +241,14 @@ impl InFlightRegistry {
     /// The `outstanding: 2 (ses_ab12:fix parser, ses_cd34:run tests)` line for
     /// `parent_id`, or `None` when it has nothing left in flight (the caller
     /// then appends no line at all).
-    fn outstanding(&self, parent_id: &str) -> Option<String> {
+    fn outstanding(&self, parent_id: &str, exclude: Option<u64>) -> Option<String> {
         let entries = self.lock();
         let mut labels: Vec<String> = entries
-            .values()
-            .filter(|in_flight| in_flight.parent_id == parent_id)
-            .map(|in_flight| outstanding_label(&in_flight.child_id, &in_flight.description))
+            .iter()
+            .filter(|(registration, in_flight)| {
+                Some(**registration) != exclude && in_flight.parent_id == parent_id
+            })
+            .map(|(_, in_flight)| outstanding_label(&in_flight.child_id, &in_flight.description))
             .collect();
         drop(entries);
         if labels.is_empty() {
@@ -281,6 +288,26 @@ fn outstanding_label(child_id: &str, description: &str) -> String {
 }
 
 impl SubagentHandle {
+    pub fn close(&self) {
+        self.stop.cancel();
+        self.slots.close();
+    }
+
+    /// Seal after actors end, including foreground watcher hand-backs.
+    pub async fn join(&self) -> anyhow::Result<()> {
+        self.close();
+        self.watchers.seal_and_join().await
+    }
+
+    /// Live watchers retain wake responsibility through durable admission.
+    #[must_use]
+    pub fn owes_wakeup(&self, parent: &str) -> bool {
+        self.in_flight
+            .lock()
+            .values()
+            .any(|entry| entry.parent_id == parent)
+    }
+
     /// `max_active` is the config's `[subagent] max_active`, validated `>= 1`
     /// at load; `0` would queue every call forever, so it is refused here too.
     /// `jobs` is the registry's shared job table, so `session.background` can
@@ -303,6 +330,8 @@ impl SubagentHandle {
             slots: Arc::new(Semaphore::new(max_active)),
             jobs,
             in_flight: Arc::new(InFlightRegistry::default()),
+            stop: tokio_util::sync::CancellationToken::new(),
+            watchers: crate::contract::TaskOwner::default(),
         }
     }
 
@@ -351,7 +380,7 @@ impl Tool for SubagentTool {
             "subagent",
             "Spawn a child session, delegate a prompt to it, and wait for its final reply. The child has its own context window and transcript; only its final message returns to this conversation. The output includes a sessionID you can pass back later to continue that specific conversation with the subagent. New child sessions start with fresh context, so include all relevant context and instructions when you don't pass a sessionID.\n\n\
              Foreground (default) runs the subagent to completion and returns its result. Background mode (background=true) launches it asynchronously and returns immediately; ox notifies you in this conversation when it finishes. Use background only for independent work that can run while you continue elsewhere.\n\n\
-             Several subagent calls in one turn run in parallel, up to a server-wide limit of active subagents; calls beyond it wait in order for a free slot rather than failing. Passing the sessionID of a subagent that is still running redirects it with the new prompt and returns its final reply. Set agent=\"explore\" for exploration or review that must not change anything; the child then cannot run shell or edit files.\n\n\
+             Several subagent calls in one turn run in parallel, up to a server-wide limit of active subagents. Root foreground calls wait FIFO for a free slot; nested foreground calls fail with Capacity when no slot is free, to avoid ancestors waiting on descendants that cannot start. Background calls may queue. Passing the sessionID of a subagent that is still running redirects it with the new prompt and returns its final reply. Set agent=\"explore\" for exploration or review that must not change anything; the child then cannot run shell or edit files.\n\n\
              When to use: an isolated research or exploration burst whose intermediate steps would flood this context (read a broad area, then summarize), or an independent subtask that needs the full toolkit but not this conversation's history.\n\
              When NOT to use: a question a single read or grep answers (do it directly), work that needs the parent's context, or several rounds of back-and-forth — the child gets one prompt and answers once.",
             object_param(
@@ -557,28 +586,41 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
     };
     let wants_slot = needs_slot(resumed, active);
 
-    // Foreground waits for its slot (cancellable); background never blocks
-    // the turn, so a full house is handled after the child row exists.
+    // Root foreground calls queue FIFO. Nested foreground calls must not
+    // wait while their ancestor holds a slot; background work may still queue.
     let mut permit: Option<OwnedSemaphorePermit> = None;
     let mut queued_for: Option<Duration> = None;
     let mut queued_in_background = false;
     if wants_slot {
         if background {
-            match tool.handle.slots.clone().try_acquire_owned() {
+            match try_slot(&tool.handle.slots, &ctx.cancellation) {
                 Ok(held) => permit = Some(held),
-                Err(_) => queued_in_background = true,
+                Err(SlotError::Capacity) => queued_in_background = true,
+                Err(error) => return slot_failure(error),
             }
         } else {
-            match acquire_slot(&tool.handle.slots, &ctx.cancellation).await {
+            let acquired = if depth > 0 {
+                try_slot(&tool.handle.slots, &ctx.cancellation).map(|permit| Acquired {
+                    permit,
+                    queued: None,
+                })
+            } else {
+                acquire_slot(&tool.handle.slots, &ctx.cancellation).await
+            };
+            match acquired {
                 Ok(acquired) => {
                     permit = Some(acquired.permit);
                     queued_for = acquired.queued;
                 }
-                Err(SlotCancelled) => return fail(CANCELLED_SENTINEL),
+                Err(error) => return slot_failure(error),
             }
         }
     }
 
+    let _admission = match spawner.try_admit() {
+        Ok(admission) if !tool.handle.stop.is_cancelled() => admission,
+        _ => return fail("Subagent execution admission is closed"),
+    };
     let child_id = match target {
         Target::Resume(id) => id,
         Target::New(parent) => {
@@ -673,6 +715,7 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         return background_output(&child_id, &description, queued_in_background);
     }
 
+    drop(_admission);
     // `permit` is held until this function returns on any path, so the slot
     // frees on success, failure, and cancellation alike, unless
     // `session.background` hands it to a completion watcher below.
@@ -695,6 +738,8 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         () = spawner.wait_idle(&child_id) => {}
         () = ctx.cancellation.cancelled() => {
             spawner.interrupt(&child_id);
+            // Keep the foreground permit until actual child cleanup completes.
+            spawner.wait_idle(&child_id).await;
             // The child is cancelled with the turn: the parent holds that
             // outcome, so the startup replay must not report it again.
             return fail(CANCELLED_SENTINEL)
@@ -808,9 +853,40 @@ fn needs_slot(resumed: bool, active: bool) -> bool {
     !(resumed && active)
 }
 
-/// The queue wait was cancelled before a slot was granted.
+/// Admission failures are distinct from the child's eventual outcome.
 #[derive(Debug, PartialEq, Eq)]
-struct SlotCancelled;
+enum SlotError {
+    Cancelled,
+    Closed,
+    Capacity,
+}
+
+fn slot_failure(error: SlotError) -> ToolOutput {
+    match error {
+        SlotError::Cancelled => fail(CANCELLED_SENTINEL),
+        SlotError::Closed => fail("Subagent admission is closed; no child was started"),
+        SlotError::Capacity => fail(
+            "Subagent Capacity exhausted: nested foreground calls cannot wait for a slot while ancestors hold slots. No child was started; use background=true for independent work or finish existing children first.",
+        ),
+    }
+}
+
+/// Atomically take a slot without joining the queue. No separate slot count
+/// can race admission; cancellation is checked before touching the semaphore.
+fn try_slot(
+    slots: &Arc<Semaphore>,
+    cancellation: &CancellationToken,
+) -> Result<OwnedSemaphorePermit, SlotError> {
+    if cancellation.is_cancelled() {
+        return Err(SlotError::Cancelled);
+    }
+    Arc::clone(slots)
+        .try_acquire_owned()
+        .map_err(|error| match error {
+            TryAcquireError::Closed => SlotError::Closed,
+            TryAcquireError::NoPermits => SlotError::Capacity,
+        })
+}
 
 /// A granted slot. Dropping `permit` frees it.
 struct Acquired {
@@ -825,27 +901,27 @@ struct Acquired {
 async fn acquire_slot(
     slots: &Arc<Semaphore>,
     cancellation: &CancellationToken,
-) -> Result<Acquired, SlotCancelled> {
-    if cancellation.is_cancelled() {
-        return Err(SlotCancelled);
-    }
-    if let Ok(permit) = slots.clone().try_acquire_owned() {
-        return Ok(Acquired {
-            permit,
-            queued: None,
-        });
+) -> Result<Acquired, SlotError> {
+    match try_slot(slots, cancellation) {
+        Ok(permit) => {
+            return Ok(Acquired {
+                permit,
+                queued: None,
+            });
+        }
+        Err(SlotError::Capacity) => {}
+        Err(error) => return Err(error),
     }
     let started = Instant::now();
     tokio::select! {
         biased;
-        () = cancellation.cancelled() => Err(SlotCancelled),
+        () = cancellation.cancelled() => Err(SlotError::Cancelled),
         acquired = slots.clone().acquire_owned() => match acquired {
             Ok(permit) => Ok(Acquired {
                 permit,
                 queued: Some(started.elapsed()),
             }),
-            // The semaphore is never closed; fail closed if that changes.
-            Err(_closed) => Err(SlotCancelled),
+            Err(_closed) => Err(SlotError::Closed),
         },
     }
 }
@@ -937,7 +1013,8 @@ fn spawn_completion_watcher(
     let in_flight = handle
         .in_flight
         .register(&parent_id, &child_id, &description);
-    tokio::spawn(async move {
+    let watchers = handle.watchers.clone();
+    if let Err(error) = watchers.spawn(async move {
         // Held for the whole task: the entry exists exactly as long as this
         // watcher does.
         let _in_flight = in_flight;
@@ -955,7 +1032,12 @@ fn spawn_completion_watcher(
                     tracing::warn!(child = %child_id, "subagent slots closed; queued child never started");
                     return;
                 };
+                let _admission = match spawner.try_admit() {
+                    Ok(admission) if !handle.stop.is_cancelled() => admission,
+                    _ => return,
+                };
                 if let Err(error) = spawner.dispatch(&child_id, &inbox_id).await {
+                    if handle.stop.is_cancelled() || spawner.is_closing() { return; }
                     tracing::warn!(child = %child_id, error = %error, "unable to start queued subagent");
                     start_error = Some(format!("Subagent failed to start: {error}"));
                 }
@@ -987,9 +1069,7 @@ fn spawn_completion_watcher(
                 return;
             }
         }
-        // This child is no longer outstanding, so its entry goes before the
-        // parent is told what is left.
-        drop(_in_flight);
+        // Exclude this watcher from the text, not from wake responsibility.
         let item = completion_item(
             &handle,
             &parent_id,
@@ -997,12 +1077,14 @@ fn spawn_completion_watcher(
             &description,
             state,
             &text,
-            NoticeDelivery::Live,
+            NoticeDelivery::Live(_in_flight.registration),
         );
         // The watcher is the live path: nothing counts what it delivers, and
         // `enqueue_completion` already warned if the notice did not land.
         let _ = enqueue_completion(&handle, &spawner, &parent_id, &child_id, item).await;
-    });
+    }) {
+        tracing::error!(%error, "subagent cleanup watcher registration failed");
+    }
 }
 
 /// The notification's `(state, text)` for a settled child's tail: the envelope
@@ -1024,7 +1106,7 @@ fn completion_state_text(tail: &[ox_schema::message::Message]) -> (&'static str,
 /// lost. Only the metadata key differs; the parent reads the same envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NoticeDelivery {
-    Live,
+    Live(u64),
     Backfilled,
 }
 
@@ -1046,7 +1128,11 @@ fn completion_item(
     // holding the full text, then close the envelope.
     let body = child_view(text, child_id, &output_dir(), INJECT_BUDGET);
     let mut wrapper = envelope(child_id, state, Some(description), &body);
-    if let Some(outstanding) = handle.in_flight.outstanding(parent_id) {
+    let exclude = match delivery {
+        NoticeDelivery::Live(registration) => Some(registration),
+        NoticeDelivery::Backfilled => None,
+    };
+    if let Some(outstanding) = handle.in_flight.outstanding(parent_id, exclude) {
         wrapper.push('\n');
         wrapper.push_str(&outstanding);
     }
@@ -1096,6 +1182,9 @@ async fn enqueue_completion(
     {
         tracing::warn!(parent = %parent_id, child = %child_id, error = %error, "unable to enqueue subagent completion");
         return false;
+    }
+    if handle.stop.is_cancelled() || spawner.is_closing() {
+        return true;
     }
     if let Err(error) = spawner.dispatch(parent_id, &inbox_id).await {
         tracing::warn!(parent = %parent_id, child = %child_id, error = %error, "unable to wake parent for subagent completion");

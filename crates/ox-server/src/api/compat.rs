@@ -229,13 +229,18 @@ fn walk(root: &std::path::Path, limit: usize) -> Vec<(String, &'static str)> {
 /// the requested location (`Path::join` replaces the base for absolute
 /// paths), never relative to the server process.
 #[handler] // operation_id: fs.list
-pub(crate) async fn fs_list(req: &mut Request, res: &mut Response) {
+pub(crate) async fn fs_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(app) = super::state(depot, res) else {
+        return;
+    };
     let directory = directory_of(req);
     let root =
         std::path::Path::new(&directory).join(req.query::<String>("path").unwrap_or_default());
     let limit = req.query::<usize>("limit").unwrap_or(200).min(2_000);
     // The walk is plain filesystem I/O; keep it off the async workers.
-    let entries = tokio::task::spawn_blocking(move || walk(&root, limit))
+    let entries = app
+        .runtime
+        .own_blocking(move || walk(&root, limit))
         .await
         .unwrap_or_default()
         .into_iter()
@@ -248,7 +253,10 @@ pub(crate) async fn fs_list(req: &mut Request, res: &mut Response) {
 /// `fs.find`: case-insensitive substring match over the walked paths (the
 /// @-file picker).
 #[handler] // operation_id: fs.find
-pub(crate) async fn fs_find(req: &mut Request, res: &mut Response) {
+pub(crate) async fn fs_find(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(app) = super::state(depot, res) else {
+        return;
+    };
     let directory = directory_of(req);
     let Some(query) = req.query::<String>("query") else {
         res.status_code(StatusCode::BAD_REQUEST);
@@ -262,7 +270,9 @@ pub(crate) async fn fs_find(req: &mut Request, res: &mut Response) {
     let limit = req.query::<usize>("limit").unwrap_or(20).min(500);
     let needle = query.to_lowercase();
     let root = std::path::PathBuf::from(&directory);
-    let entries = tokio::task::spawn_blocking(move || walk(&root, 5_000))
+    let entries = app
+        .runtime
+        .own_blocking(move || walk(&root, 5_000))
         .await
         .unwrap_or_default()
         .into_iter()

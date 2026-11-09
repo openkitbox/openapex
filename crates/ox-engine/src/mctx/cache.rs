@@ -389,18 +389,7 @@ pub async fn run_pass(
             // renderer can skip re-deriving the head on defers is its own
             // internal concern.
             let rendered = renderer.render(loaded.as_ref(), signals);
-            let input = build_pass_input(action, rendered, signals);
-            // The loaded state is single use: hand it to the kernel by value
-            // instead of deep-cloning it (a CoreState carries the cached head
-            // bytes, and every pass pays for that copy otherwise).
-            let mut state = loaded.take().unwrap_or_default();
-            let result: StepResult = state.step(input);
-            let prefix = state.cached_prefix_bytes();
-            let outcome = match result.action {
-                Action::SoftPlus => PassOutcome::DeferReplayed { prefix },
-                Action::Soft | Action::Hard => PassOutcome::BustApplied { prefix },
-            };
-            (state, outcome)
+            transition(loaded.take(), action, rendered, signals)
         }));
         let (state, outcome) = match stepped {
             Ok(pair) => pair,
@@ -427,6 +416,24 @@ pub async fn run_pass(
             Err(error) => return Err(error),
         }
     }
+}
+
+/// Step a locally owned snapshot; persistence belongs exclusively to the caller.
+pub(crate) fn transition(
+    loaded: Option<CoreState>,
+    action: Action,
+    rendered: RenderedPass,
+    signals: &Signals,
+) -> (CoreState, PassOutcome) {
+    let input = build_pass_input(action, rendered, signals);
+    let mut state = loaded.unwrap_or_default();
+    let result: StepResult = state.step(input);
+    let prefix = state.cached_prefix_bytes();
+    let outcome = match result.action {
+        Action::SoftPlus => PassOutcome::DeferReplayed { prefix },
+        Action::Soft | Action::Hard => PassOutcome::BustApplied { prefix },
+    };
+    (state, outcome)
 }
 
 /// Per-session last-known-good prefix: the last prefix bytes the transform

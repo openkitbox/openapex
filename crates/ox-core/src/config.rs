@@ -182,15 +182,10 @@ pub struct SubagentConfig {
     #[serde(default = "default_subagent_depth")]
     pub depth: usize,
     /// Maximum number of subagent child sessions running at once, across the
-    /// whole server. A call beyond the limit is not rejected: it waits in a
-    /// FIFO queue and starts when a slot frees. Must be at least `1`.
-    ///
-    /// Deadlock risk when `depth > 1`: a child holds its slot until it
-    /// settles, so a child that spawns a grandchild and waits for it needs a
-    /// second slot. If every slot is held by children waiting on descendants,
-    /// nothing can start. Keep `max_active` larger than the number of nesting
-    /// levels that can be in flight together. The default `depth = 1` forbids
-    /// grandchildren, so it cannot trigger this.
+    /// whole server. Root foreground calls wait FIFO when full; nested
+    /// foreground calls fail with Capacity instead of waiting while ancestors
+    /// hold slots. Background calls may queue at any depth. Resuming an already
+    /// active child needs no additional slot. Must be at least `1`.
     #[serde(default = "default_subagent_max_active")]
     pub max_active: usize,
 }

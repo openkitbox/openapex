@@ -224,16 +224,27 @@ pub(crate) async fn sweep_once(app: &AppState, now_ms: i64, days: u32) -> Result
 
 /// Sweep once now and then every [`SWEEP_INTERVAL`]. `days == 0` disables
 /// retention. Best-effort: a failed sweep is logged and retried next tick.
-pub(crate) fn spawn_sweeper(app: AppState, days: u32) {
+///
+/// Returns the sweeper's join handle (`None` when retention is off) so the
+/// composition can await its last deletion pass; `stop` is observed at the
+/// sleep boundary, so an in-progress tree deletion is never dropped.
+pub(crate) fn spawn_sweeper(
+    app: AppState,
+    days: u32,
+    stop: tokio_util::sync::CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
     if days == 0 {
-        return;
+        return None;
     }
-    tokio::spawn(async move {
+    Some(tokio::spawn(async move {
         loop {
             if let Err(error) = sweep_once(&app, ox_schema::id::now_millis(), days).await {
                 tracing::warn!(error = %error, "session retention: sweep failed");
             }
-            tokio::time::sleep(SWEEP_INTERVAL).await;
+            tokio::select! {
+                () = stop.cancelled() => return,
+                () = tokio::time::sleep(SWEEP_INTERVAL) => {}
+            }
         }
-    });
+    }))
 }

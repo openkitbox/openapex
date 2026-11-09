@@ -12,7 +12,8 @@
 //!   one-terminal-per-busy-period rule.
 //! - **Interruption**: the endpoint cancels the busy period's
 //!   [`CancellationToken`]; the drain aborts at the next await point and the
-//!   actor publishes the terminal. Idle interruption is a no-op.
+//!   actor publishes the terminal after owned tools settle. Scheduled periods
+//!   already own their token; idle interruption is a no-op.
 //! - **Parked handoff**: an idle session's mailbox receiver moves back into
 //!   the registry entry; the next dispatch takes it out and spawns a fresh
 //!   task. Send always happens before the take, and the parked task re-checks
@@ -36,9 +37,11 @@ mod loop_guard;
 mod output_budget;
 pub(crate) mod permissions;
 pub(crate) mod provider_error;
+mod request_budget;
 mod retry;
 mod services;
 pub mod step;
+mod tasks;
 pub mod title;
 pub(crate) mod todo_reminder;
 
@@ -72,11 +75,10 @@ pub enum ActorMsg {
     Enqueue {
         /// The `session_inbox` row id that was enqueued.
         inbox_id: String,
+        generation: u64,
     },
-    /// Abort the current busy period. The endpoint also cancels the period's
-    /// token directly; this message covers the mailbox-absorb bookkeeping so
-    /// a racing interrupt is never lost between absorb loops.
-    Interrupt,
+    /// Wake after cancelling a period. Activity, not this hint, owns cancellation.
+    Interrupt { generation: u64 },
     /// Stop serving this session and drop the actor entirely.
     Shutdown,
 }
@@ -121,7 +123,13 @@ struct Inner {
     /// Per-session "allow for this session" permission grants (process
     /// memory; a restart asks again).
     grants: Arc<permissions::Grants>,
+    /// Serializes registry replacement with process-table cleanup. Never held
+    /// across Activity, admission, DB access or await; shard guards are dropped
+    /// before the attached tables are locked.
+    registry_lifecycle: Mutex<()>,
     sessions: DashMap<String, SessionHandle>,
+    tasks: tasks::Tasks,
+    stop: CancellationToken,
 }
 
 /// Everything an actor task shares with the registry.
@@ -130,12 +138,8 @@ struct SessionHandle {
     tx: mpsc::Sender<ActorMsg>,
     /// `Some` while no task owns the mailbox receiver (session parked).
     parked: Arc<tokio::sync::Mutex<Option<mpsc::Receiver<ActorMsg>>>>,
-    /// Cancellation of the busy period in flight, if any.
-    cancel: Arc<Mutex<Option<CancellationToken>>>,
-    /// `true` from `dispatch` until the actor installs the busy period's
-    /// cancellation token — covers the gap between enqueue and the actor's
-    /// first poll so `is_active` never reports idle for scheduled work.
-    scheduled: Arc<Mutex<bool>>,
+    /// One owner from scheduling through terminal publication.
+    activity: Arc<Mutex<Activity>>,
     /// The session's instruction anchor: the git working-tree root of the
     /// session's directory, computed at most once per distinct directory
     /// (a `/cd` invalidates it by keying on the directory itself).
@@ -152,6 +156,85 @@ struct SessionHandle {
     /// settles, or the entry is forgotten. [`Runner::wait_idle`] parks on it
     /// instead of polling `is_active`.
     settled: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Scheduled,
+    Running,
+    Settling,
+}
+
+struct Period {
+    generation: u64,
+    token: CancellationToken,
+    phase: Phase,
+    pending: bool,
+}
+
+#[derive(Default)]
+struct Activity {
+    next: u64,
+    current: Option<Period>,
+    successor: Option<Period>,
+}
+
+impl Activity {
+    fn schedule(&mut self, stop: &CancellationToken) -> u64 {
+        let slot = if self
+            .current
+            .as_ref()
+            .is_some_and(|p| p.phase == Phase::Settling)
+        {
+            &mut self.successor
+        } else {
+            &mut self.current
+        };
+        let period = slot.get_or_insert_with(|| {
+            self.next += 1;
+            Period {
+                generation: self.next,
+                token: stop.child_token(),
+                phase: Phase::Scheduled,
+                pending: false,
+            }
+        });
+        period.pending = true;
+        period.generation
+    }
+
+    fn claim(&mut self) -> Option<(u64, CancellationToken)> {
+        let period = self.current.as_mut()?;
+        if period.phase != Phase::Scheduled {
+            return None;
+        }
+        period.phase = Phase::Running;
+        period.pending = false;
+        Some((period.generation, period.token.clone()))
+    }
+
+    /// The quiet check and terminal admission share dispatch's lock.
+    fn settle(&mut self, generation: u64, force: bool) -> bool {
+        let Some(period) = self.current.as_mut().filter(|p| p.generation == generation) else {
+            return false;
+        };
+        if !force && period.pending && !period.token.is_cancelled() {
+            period.pending = false;
+            return false;
+        }
+        period.phase = Phase::Settling;
+        true
+    }
+
+    fn finish(&mut self, generation: u64) {
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|p| p.generation == generation)
+        {
+            self.current = self.successor.take();
+        }
+    }
 }
 
 /// The working-tree root of the repository containing `directory`, or `None`
@@ -225,11 +308,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Whether the entry has work scheduled or in flight (`scheduled` covers
-/// the enqueue-to-busy gap, `cancel` the busy period itself). The idle
-/// sweep and the public `Runner::is_active` must answer this identically.
+/// Ownership remains active through cancellation and terminal publication.
 fn handle_is_active(handle: &SessionHandle) -> bool {
-    *lock(&handle.scheduled) || lock(&handle.cancel).is_some()
+    lock(&handle.activity).current.is_some()
 }
 
 /// A fresh registry entry: channels and flags only, idle-clock current.
@@ -238,8 +319,7 @@ fn new_session_handle() -> SessionHandle {
     SessionHandle {
         tx,
         parked: Arc::new(tokio::sync::Mutex::new(Some(rx))),
-        cancel: Arc::new(Mutex::new(None)),
-        scheduled: Arc::new(Mutex::new(false)),
+        activity: Arc::new(Mutex::new(Activity::default())),
         instruction_root: InstructionRootCache::default(),
         fold_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         last_used: Arc::new(std::sync::atomic::AtomicU64::new(
@@ -266,12 +346,21 @@ impl Inner {
     /// Only process state goes: the session's rows, events and compartments are
     /// the database's, and a later dispatch of an evicted session rebuilds the
     /// entry and re-baselines exactly as the existing shutdown path does.
-    fn forget(&self, session_id: &str) {
-        if let Some((_, handle)) = self.sessions.remove(session_id) {
-            // A waiter parked on this entry would otherwise never wake: the
-            // registry no longer answers for the session, so it is idle.
+    fn forget(&self, session_id: &str, owner: Option<&SessionHandle>) {
+        let _lifecycle = lock(&self.registry_lifecycle);
+        let removed = self.sessions.remove_if(session_id, |_, handle| {
+            owner.is_none_or(|owner| Arc::ptr_eq(&owner.activity, &handle.activity))
+        });
+        if let Some((_, handle)) = removed {
             handle.settled.notify_waiters();
+            self.forget_tables(session_id);
+        } else if owner.is_none() {
+            self.forget_tables(session_id);
         }
+    }
+
+    /// Caller owns `registry_lifecycle`, with no registry shard guard held.
+    fn forget_tables(&self, session_id: &str) {
         lock(&self.instruction_baselines).remove(session_id);
         crate::mctx::calibration::forget(&self.calibrations, session_id);
         self.cache_ledger.forget(session_id);
@@ -364,25 +453,21 @@ impl Runner {
             calibrations: Default::default(),
             cache_ledger: Default::default(),
             grants: Default::default(),
+            registry_lifecycle: Mutex::new(()),
             sessions: DashMap::new(),
+            tasks: tasks::Tasks::default(),
+            stop: CancellationToken::new(),
         });
         let tools = inner.live.current().tools.clone();
         if let Some(handle) = tools.subagent_handle.clone() {
-            handle.attach(Arc::new(Self {
-                inner: Arc::clone(&inner),
-            }));
+            handle.attach(Arc::new(WeakRunner(Arc::downgrade(&inner))));
         }
         if let Some(completion) = tools.shell_completion.clone() {
-            completion.attach(Arc::new(Self {
-                inner: Arc::clone(&inner),
-            }));
+            completion.attach(Arc::new(WeakRunner(Arc::downgrade(&inner))));
         }
         Self { inner }
     }
 
-    /// Whether work is scheduled or a busy period is currently in flight
-    /// (process-local view). `scheduled` bridges the gap between dispatch
-    /// and the actor's first poll installing the cancellation token.
     /// The chat transport this runner issues completions through. Background
     /// work that must not open a second transport (the dreamer) borrows it.
     #[must_use]
@@ -402,6 +487,7 @@ impl Runner {
         self.inner
             .sessions
             .get(session_id)
+            .map(|entry| entry.clone())
             .is_some_and(|handle| handle_is_active(&handle))
     }
 
@@ -435,21 +521,33 @@ impl Runner {
     /// Whether any session has work scheduled or in flight.
     #[must_use]
     pub fn has_active(&self) -> bool {
-        self.inner
+        // Snapshot only shared activity pointers: no ID copies or result Vec,
+        // and no Activity lock is acquired under a registry shard guard.
+        let activities: Vec<_> = self
+            .inner
             .sessions
             .iter()
-            .any(|entry| handle_is_active(entry.value()))
+            .map(|entry| Arc::clone(&entry.activity))
+            .collect();
+        activities
+            .into_iter()
+            .any(|activity| lock(&activity).current.is_some())
     }
 
     /// Ids of every session with work scheduled or in flight (upstream
     /// `SessionExecution.active`).
     #[must_use]
     pub fn active_sessions(&self) -> Vec<String> {
-        self.inner
+        let handles: Vec<_> = self
+            .inner
             .sessions
             .iter()
-            .filter(|entry| handle_is_active(entry.value()))
-            .map(|entry| entry.key().clone())
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+        handles
+            .into_iter()
+            .filter(|(_, handle)| handle_is_active(handle))
+            .map(|(id, _)| id)
             .collect()
     }
 
@@ -479,44 +577,63 @@ impl Runner {
     /// join the live task's mailbox. Safe to call repeatedly; the actor
     /// coalesces enqueues into one busy period.
     pub async fn dispatch(&self, session_id: &str, inbox_id: &str) -> Result<()> {
+        let _admission = self.try_admit()?;
         // Opportunistic idle sweep: dispatch is the one regular entry, so the
         // per-session tables stay bounded by live work (the sweep's own O(n)
         // is dozens of entries at most).
         self.sweep_idle(ox_schema::id::now_millis() as u64);
-        // Stamp and mark while holding the entry's shard lock: a concurrent
-        // sweep's retain serializes behind this guard, so it can never evict
-        // an entry this dispatch is about to use. Marking scheduled after the
-        // guard used to leave exactly that window open.
+        // Clone under the shard guard; its ownership prevents idle reaping.
+        // Activity is always acquired after releasing the registry guard.
         let handle = {
+            let _lifecycle = lock(&self.inner.registry_lifecycle);
             let entry = self.inner.sessions.entry(session_id.to_owned());
             let slot = entry.or_insert_with(new_session_handle);
             slot.last_used.store(
                 ox_schema::id::now_millis() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
-            // Mark scheduled BEFORE the send: once the message is in the
-            // mailbox the actor may install the busy period at any point, and
-            // `is_active` must hold continuously from here until the terminal
-            // settles.
-            *lock(&slot.scheduled) = true;
             slot.clone()
         };
-        // Send BEFORE taking the parked receiver: a task parking concurrently
-        // re-checks the channel under the slot lock, so a message that beat
-        // the send is picked up by exactly one side.
-        let sent = handle
-            .tx
-            .send(ActorMsg::Enqueue {
+        // Reserve before admission: failure has no generation to roll back and
+        // cannot clear a concurrent dispatch's work. Sending never holds Activity.
+        let permit = tokio::select! {
+            biased;
+            () = self.inner.stop.cancelled() => return Err(ox_tools::contract::Closing.into()),
+            permit = handle.tx.reserve() => permit
+                .map_err(|_| anyhow::anyhow!("session `{session_id}` actor mailbox closed"))?,
+        };
+        let generation = lock(&handle.activity).schedule(&self.inner.stop);
+        let scheduled = self.inner.tasks.gate.register(|| {
+            permit.send(ActorMsg::Enqueue {
                 inbox_id: inbox_id.to_owned(),
-            })
-            .await;
-        if sent.is_err() {
-            tracing::debug!(session = %session_id, "dispatch enqueue failed; mailbox closed");
-            *lock(&handle.scheduled) = false;
-        } else {
-            tracing::debug!(session = %session_id, inbox = %inbox_id, "dispatch enqueued");
+                generation,
+            });
+        });
+        if let Err(error) = scheduled {
+            let mut activity = lock(&handle.activity);
+            if activity.current.as_ref().is_some_and(|period| {
+                period.generation == generation && period.phase == Phase::Scheduled
+            }) {
+                activity.finish(generation);
+            }
+            drop(activity);
+            handle.settled.notify_waiters();
+            return Err(error.into());
         }
-        self.spawn_if_parked(session_id, handle).await;
+        if let Err(error) = self.spawn_if_parked(session_id, handle.clone()).await {
+            let mut activity = lock(&handle.activity);
+            if activity
+                .current
+                .as_ref()
+                .is_some_and(|period| period.phase == Phase::Scheduled)
+            {
+                activity.current = None;
+                activity.successor = None;
+            }
+            drop(activity);
+            handle.settled.notify_waiters();
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -524,32 +641,112 @@ impl Runner {
     /// (upstream `session.generate`, the TUI's `/btw` dependency). Nothing is
     /// persisted, no event is published and no tool loop runs.
     pub async fn generate(&self, session_id: &str, prompt: &str) -> Result<String> {
-        generate::run(&self.inner, session_id, prompt).await
+        let admission = self.try_admit()?;
+        let inner = Arc::clone(&self.inner);
+        let session_id = session_id.to_owned();
+        let prompt = prompt.to_owned();
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.inner.tasks.gate.register(|| {
+            self.inner.tasks.auxiliary.spawn(async move {
+                let _admission = admission;
+                let answer = generate::run(&inner, &session_id, &prompt).await;
+                let _ = reply.send(answer);
+            })
+        })??;
+        result
+            .await
+            .map_err(|_| anyhow::anyhow!("generate task ended without an answer"))?
     }
 
     /// Cancel the session's in-flight busy period. Returns whether one was
     /// running (idle interruption is a no-op, matching upstream).
     #[must_use]
     pub fn interrupt(&self, session_id: &str) -> bool {
-        let Some(handle) = self.inner.sessions.get(session_id) else {
+        let Some(handle) = self
+            .inner
+            .sessions
+            .get(session_id)
+            .map(|entry| entry.clone())
+        else {
             return false;
         };
-        let Some(token) = lock(&handle.cancel).take() else {
-            return false;
+        let generation = {
+            let activity = lock(&handle.activity);
+            let Some(period) = &activity.current else {
+                return false;
+            };
+            if period.phase != Phase::Settling {
+                period.token.cancel();
+            }
+            if let Some(successor) = &activity.successor {
+                successor.token.cancel();
+            }
+            period.generation
         };
-        token.cancel();
-        // Wake the actor's absorb loop so the terminal settles promptly even
-        // if the drain is parked between awaits.
-        let _ = handle.tx.try_send(ActorMsg::Interrupt);
+        // The token is authoritative; a full mailbox already wakes the actor.
+        let _ = handle.tx.try_send(ActorMsg::Interrupt { generation });
         true
     }
 
-    /// Ask every live actor to stop. Dispatching afterwards starts a fresh
-    /// actor (used by process-shutdown paths; task 9 wires signals).
-    pub fn shutdown(&self) {
-        for entry in self.inner.sessions.iter() {
-            let _ = entry.value().tx.try_send(ActorMsg::Shutdown);
+    /// Start manual title work through the same auxiliary owner as automatic titles.
+    pub fn spawn_title(&self, session_id: &str) -> Result<()> {
+        let inner = Arc::clone(&self.inner);
+        let session_id = session_id.to_owned();
+        self.inner.tasks.spawn_auxiliary(async move {
+            let svc = inner.live.current();
+            title::generate(
+                inner.db.clone(),
+                inner.bus.clone(),
+                Arc::clone(&svc.chat),
+                Arc::clone(&svc.config),
+                Arc::clone(&svc.model_catalog),
+                session_id,
+            )
+            .await;
+        })
+    }
+
+    pub fn try_admit(
+        &self,
+    ) -> Result<ox_tools::contract::ExecutionAdmission, ox_tools::contract::Closing> {
+        self.inner.tasks.gate.try_admit()
+    }
+
+    pub async fn wait_admissions(&self) {
+        self.inner.tasks.gate.wait().await;
+    }
+
+    /// Idempotently stop execution admission, then cooperatively cancel actors.
+    pub fn close(&self) {
+        self.inner.tasks.gate.close();
+        self.inner.stop.cancel();
+        let handles: Vec<_> = self
+            .inner
+            .sessions
+            .iter()
+            .map(|entry| entry.value().clone())
+            .collect();
+        for handle in handles {
+            let activity = lock(&handle.activity);
+            if let Some(period) = &activity.current {
+                period.token.cancel();
+            }
+            if let Some(period) = &activity.successor {
+                period.token.cancel();
+            }
         }
+    }
+
+    pub async fn join(&self) -> Result<()> {
+        self.close();
+        self.wait_admissions().await;
+        let actors = self.inner.tasks.actors.seal_and_join().await;
+        let auxiliary = self.inner.tasks.auxiliary.seal_and_join().await;
+        actors.and(auxiliary)
+    }
+
+    pub fn shutdown(&self) {
+        self.close();
     }
 
     /// Forget one session's process-local state: the API's delete path calls
@@ -565,7 +762,7 @@ impl Runner {
     /// (`resolve_selection` rejects a row that no longer exists).
     pub fn forget_session(&self, session_id: &str) {
         tracing::debug!(session = %session_id, "forgetting runner state for a deleted session");
-        self.inner.forget(session_id);
+        self.inner.forget(session_id, None);
     }
 
     /// Reap registry entries idle past [`RUNNER_IDLE_TTL_MS`]: the runner-side
@@ -577,11 +774,14 @@ impl Runner {
     /// existing shutdown path does. A busy entry is never touched, whatever
     /// its timestamp says.
     fn sweep_idle(&self, now_ms: u64) {
+        let _lifecycle = lock(&self.inner.registry_lifecycle);
         let mut evicted: Vec<String> = Vec::new();
         self.inner.sessions.retain(|id, handle| {
             let idle =
                 now_ms.saturating_sub(handle.last_used.load(std::sync::atomic::Ordering::Relaxed));
-            if idle > RUNNER_IDLE_TTL_MS && !handle_is_active(handle) {
+            // Dispatch and actors hold a handle outside the shard lock. Only
+            // an unshared parked entry can be reaped, without nesting locks.
+            if idle > RUNNER_IDLE_TTL_MS && Arc::strong_count(&handle.activity) == 1 {
                 evicted.push(id.clone());
                 return false;
             }
@@ -591,26 +791,29 @@ impl Runner {
             return;
         }
         for id in &evicted {
-            // Already removed from the registry by `retain`; the baseline and
-            // the calibration are what still has to go.
-            self.inner.forget(id);
+            // Replacement is excluded until the old owner's tables are gone.
+            self.inner.forget_tables(id);
         }
     }
 
     /// Take the parked receiver and hand it to a freshly spawned actor task.
     /// The parked task stores the receiver under the same mutex, so take and
     /// park are mutually exclusive: at most one live task per session.
-    async fn spawn_if_parked(&self, session_id: &str, handle: SessionHandle) {
-        let Some(rx) = handle.parked.lock().await.take() else {
-            return;
-        };
-        let task = ActorTask {
-            inner: self.inner.clone(),
-            session_id: session_id.to_owned(),
-            handle,
-            rx: Some(rx),
-        };
-        tokio::spawn(task.run());
+    async fn spawn_if_parked(&self, session_id: &str, handle: SessionHandle) -> Result<()> {
+        let mut parked = handle.parked.lock().await;
+        self.inner.tasks.gate.register(|| {
+            let Some(rx) = parked.take() else {
+                return Ok(());
+            };
+            let task = ActorTask {
+                inner: self.inner.clone(),
+                session_id: session_id.to_owned(),
+                handle: handle.clone(),
+                rx: Some(rx),
+                parked: false,
+            };
+            self.inner.tasks.actors.spawn(task.run())
+        })?
     }
 }
 
@@ -626,6 +829,24 @@ struct ActorTask {
     handle: SessionHandle,
     /// `Some` until parked; taken at task start.
     rx: Option<mpsc::Receiver<ActorMsg>>,
+    parked: bool,
+}
+
+impl Drop for ActorTask {
+    fn drop(&mut self) {
+        // A parked receiver can already belong to a successor actor. Only a
+        // terminal owner may clear activity; this also runs during unwinding.
+        if self.parked {
+            return;
+        }
+        let mut activity = lock(&self.handle.activity);
+        activity.current = None;
+        activity.successor = None;
+        drop(activity);
+        self.handle.settled.notify_waiters();
+        self.handle_shutdown();
+        // The task supervisor still observes the original panic as JoinError.
+    }
 }
 
 impl ActorTask {
@@ -634,61 +855,59 @@ impl ActorTask {
             return;
         };
         loop {
-            // Absorb the backlog; the first Enqueue opens a busy period.
-            let mut token: Option<CancellationToken> = None;
+            if self.inner.stop.is_cancelled() {
+                let mut activity = lock(&self.handle.activity);
+                activity.current = None;
+                activity.successor = None;
+                drop(activity);
+                self.handle.settled.notify_waiters();
+                self.handle_shutdown();
+                return;
+            }
+            // Doorbells are hints, never ownership. Old generations cannot
+            // create a new period, even when they arrive after cancellation.
             loop {
                 match rx.try_recv() {
-                    Ok(ActorMsg::Enqueue { .. }) if token.is_none() => {
-                        tracing::debug!(session = %self.session_id, "actor opened busy period");
-                        let period = CancellationToken::new();
-                        *lock(&self.handle.cancel) = Some(period.clone());
-                        // Upstream: the started hook publishes exactly once per
-                        // busy period, before the first drain.
-                        if let Err(error) = self
-                            .inner
-                            .bus
-                            .publish(SessionEventData::ExecutionStarted {
-                                session_id: self.session_id.clone(),
-                            })
-                            .await
-                        {
-                            tracing::error!(
-                                session = %self.session_id,
-                                error = %error,
-                                "execution.started failed; releasing busy period"
-                            );
-                            *lock(&self.handle.cancel) = None;
-                            // Nothing will run for this enqueue: the entry
-                            // is idle again, and a waiter must not hang on
-                            // a `scheduled` flag no busy period will clear.
-                            *lock(&self.handle.scheduled) = false;
-                            self.handle.settled.notify_waiters();
-                            break;
-                        }
-                        token = Some(period);
-                    }
-                    Ok(ActorMsg::Interrupt) => {
-                        // The endpoint cancelled the token; this covers the
-                        // absorb-window race where the slot was already taken.
-                        if let Some(period) = &token {
-                            period.cancel();
-                        }
-                    }
                     Ok(ActorMsg::Shutdown) => {
                         self.handle_shutdown();
                         return;
                     }
-                    Ok(_) => {}
+                    Ok(
+                        ActorMsg::Enqueue { generation, .. } | ActorMsg::Interrupt { generation },
+                    ) => {
+                        let _ = generation;
+                    }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => return,
                 }
             }
-            let Some(period) = token else {
+            let claimed = lock(&self.handle.activity).claim();
+            let Some((generation, period)) = claimed else {
                 if !self.park(&mut rx).await {
                     return;
                 }
                 continue;
             };
+            if let Err(error) = self
+                .inner
+                .bus
+                .publish(SessionEventData::ExecutionStarted {
+                    session_id: self.session_id.clone(),
+                })
+                .await
+            {
+                tracing::error!(session = %self.session_id, %error, "execution.started failed");
+                lock(&self.handle.activity).finish(generation);
+                self.handle.settled.notify_waiters();
+                continue;
+            }
+            if period.is_cancelled() {
+                lock(&self.handle.activity).settle(generation, true);
+                self.terminal_interrupted().await;
+                lock(&self.handle.activity).finish(generation);
+                self.handle.settled.notify_waiters();
+                continue;
+            }
 
             // Busy period: consecutive drains until the inbox is quiet. Every
             // coalesced drain shares one terminal publication. The project
@@ -725,21 +944,25 @@ impl ActorTask {
                 grants: Arc::clone(&self.inner.grants),
                 instruction_root: self.handle.instruction_root.clone(),
                 fold_in_flight: Arc::clone(&self.handle.fold_in_flight),
+                tasks: self.inner.tasks.clone(),
             };
             let mut scope = drain::Promotable::Input;
             loop {
                 if period.is_cancelled() {
+                    lock(&self.handle.activity).settle(generation, true);
                     self.terminal_interrupted().await;
                     break;
                 }
                 ctx.refresh();
                 match drain::drain(&ctx, &period, scope).await {
                     drain::DrainOutcome::Interrupted => {
+                        lock(&self.handle.activity).settle(generation, true);
                         tracing::debug!(session = %self.session_id, "drain interrupted");
                         self.terminal_interrupted().await;
                         break;
                     }
                     drain::DrainOutcome::Failed(error) => {
+                        lock(&self.handle.activity).settle(generation, true);
                         tracing::debug!(session = %self.session_id, error = ?error, "drain failed");
                         if let Err(publish_error) = self
                             .inner
@@ -762,11 +985,9 @@ impl ActorTask {
                         tracing::debug!(session = %self.session_id, "drain complete; doorbell check");
                         // Doorbell: work admitted during the drain keeps the
                         // busy period open instead of publishing a terminal.
-                        let mut more = false;
                         loop {
                             match rx.try_recv() {
-                                Ok(ActorMsg::Enqueue { .. }) => more = true,
-                                Ok(ActorMsg::Interrupt) => period.cancel(),
+                                Ok(ActorMsg::Enqueue { .. } | ActorMsg::Interrupt { .. }) => {}
                                 Ok(ActorMsg::Shutdown) => {
                                     self.handle_shutdown();
                                     return;
@@ -776,10 +997,15 @@ impl ActorTask {
                             }
                         }
                         if period.is_cancelled() {
+                            lock(&self.handle.activity).settle(generation, true);
                             self.terminal_interrupted().await;
                             break;
                         }
-                        if !more {
+                        if lock(&self.handle.activity).settle(generation, false) {
+                            if period.is_cancelled() {
+                                self.terminal_interrupted().await;
+                                break;
+                            }
                             tracing::debug!(session = %self.session_id, "publishing execution.succeeded");
                             if let Err(error) = self
                                 .inner
@@ -812,8 +1038,7 @@ impl ActorTask {
                     }
                 }
             }
-            *lock(&self.handle.cancel) = None;
-            *lock(&self.handle.scheduled) = false;
+            lock(&self.handle.activity).finish(generation);
             // The terminal is published and the flags are down: every
             // `wait_idle` re-checks `is_active` on this wake-up.
             self.handle.settled.notify_waiters();
@@ -826,7 +1051,7 @@ impl ActorTask {
         // dispatch builds a fresh handle instead of messaging a dead mailbox.
         // The baseline and the calibration go with it: a later dispatch simply
         // re-baselines from the sources and re-measures in one turn.
-        self.inner.forget(&self.session_id);
+        self.inner.forget(&self.session_id, Some(&self.handle));
     }
 
     /// The session's agent record, from its `agent` and `parent_id` (see
@@ -835,40 +1060,7 @@ impl ActorTask {
     /// missing tool for one busy period is cheaper than a writer the parent
     /// asked to withhold.
     async fn session_agent(&self) -> &'static Agent {
-        type Row = (Option<String>, Option<String>);
-        let looked_up: anyhow::Result<Option<Row>> = async {
-            let conn = self.inner.db.acquire().await?;
-            let mut stmt = conn
-                .prepare("SELECT parent_id, agent FROM session_v2 WHERE id = ?1")
-                .await?;
-            let row = ox_db::optional(&mut stmt, [self.session_id.as_str()]).await?;
-            match row {
-                Some(row) => Ok(Some((
-                    row.get::<Option<String>>(0)?,
-                    row.get::<Option<String>>(1)?,
-                ))),
-                None => Ok(None),
-            }
-        }
-        .await;
-        match looked_up {
-            Ok(Some((parent_id, agent))) => agent_of(parent_id.as_deref(), agent.as_deref()),
-            Ok(None) => {
-                tracing::warn!(
-                    session = %self.session_id,
-                    "session row missing; running with the read-only toolset"
-                );
-                agent::read_only()
-            }
-            Err(error) => {
-                tracing::warn!(
-                    session = %self.session_id,
-                    error = %error,
-                    "session agent lookup failed; running with the read-only toolset"
-                );
-                agent::read_only()
-            }
-        }
+        session_agent(&self.inner.db, &self.session_id).await
     }
 
     /// The session's project directory: the `directory` recorded on the
@@ -876,39 +1068,7 @@ impl ActorTask {
     /// server's directory when the row predates the column or the path is
     /// gone.
     async fn session_directory(&self) -> std::path::PathBuf {
-        let looked_up: anyhow::Result<Option<String>> = async {
-            let conn = self.inner.db.acquire().await?;
-            let mut stmt = conn
-                .prepare("SELECT directory FROM session_v2 WHERE id = ?1")
-                .await?;
-            let row = ox_db::optional(&mut stmt, [self.session_id.as_str()]).await?;
-            match row {
-                Some(row) => Ok(row.get::<Option<String>>(0)?),
-                None => Ok(None),
-            }
-        }
-        .await;
-        let raw = looked_up
-            .inspect_err(|error| {
-                tracing::warn!(
-                    session = %self.session_id,
-                    error = %error,
-                    "session directory lookup failed; falling back to server directory"
-                )
-            })
-            .ok()
-            .flatten();
-        match raw.map(std::path::PathBuf::from) {
-            Some(path) if path.is_dir() => path.canonicalize().unwrap_or(path),
-            other => {
-                tracing::warn!(
-                    session = %self.session_id,
-                    directory = ?other,
-                    "session directory missing or gone; falling back to server directory"
-                );
-                self.inner.directory.clone()
-            }
-        }
+        session_directory(&self.inner.db, &self.session_id, &self.inner.directory).await
     }
 
     async fn terminal_interrupted(&self) {
@@ -932,7 +1092,7 @@ impl ActorTask {
     /// Hand the receiver back to the registry and exit (the session is idle:
     /// zero tasks). Returns true to re-enter the absorb loop when a message
     /// was already waiting.
-    async fn park(&self, rx: &mut mpsc::Receiver<ActorMsg>) -> bool {
+    async fn park(&mut self, rx: &mut mpsc::Receiver<ActorMsg>) -> bool {
         // The turn truly ended here: the idle clock restarts from this point,
         // not from the dispatch that started the (possibly long) busy period.
         self.handle.last_used.store(
@@ -940,13 +1100,14 @@ impl ActorTask {
             std::sync::atomic::Ordering::Relaxed,
         );
         let mut slot = self.handle.parked.lock().await;
-        if !rx.is_empty() {
+        if !rx.is_empty() || handle_is_active(&self.handle) {
             return true;
         }
         // Any dispatch past this point finds the slot occupied and spawns a
         // fresh task, so the handoff loses nothing.
         let parked = std::mem::replace(rx, mpsc::channel(1).1);
         *slot = Some(parked);
+        self.parked = true;
         false
     }
 }
@@ -959,6 +1120,74 @@ pub(crate) fn unknown_error(message: impl Into<String>) -> SessionError {
         message: message.into(),
         status: None,
         response: None,
+    }
+}
+
+/// Shared directory lookup, with the actor's canonicalization/fallback policy.
+async fn session_directory(
+    db: &Db,
+    session_id: &str,
+    fallback: &std::path::Path,
+) -> std::path::PathBuf {
+    let looked_up: anyhow::Result<Option<String>> = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare("SELECT directory FROM session_v2 WHERE id = ?1")
+            .await?;
+        let row = ox_db::optional(&mut stmt, [session_id]).await?;
+        match row {
+            Some(row) => Ok(row.get::<Option<String>>(0)?),
+            None => Ok(None),
+        }
+    }
+    .await;
+    let raw = looked_up.inspect_err(|error| {
+        tracing::warn!(session = %session_id, error = %error, "session directory lookup failed; falling back to server directory")
+    }).ok().flatten();
+    match raw.map(std::path::PathBuf::from) {
+        Some(path) if path.is_dir() => path.canonicalize().unwrap_or(path),
+        other => {
+            tracing::warn!(session = %session_id, directory = ?other, "session directory missing or gone; falling back to server directory");
+            fallback.to_path_buf()
+        }
+    }
+}
+
+/// Shared session agent lookup. Missing rows and failed reads stay read-only.
+async fn session_agent(db: &Db, session_id: &str) -> &'static Agent {
+    type Row = (Option<String>, Option<String>);
+    let looked_up: anyhow::Result<Option<Row>> = async {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare("SELECT parent_id, agent FROM session_v2 WHERE id = ?1")
+            .await?;
+        let row = ox_db::optional(&mut stmt, [session_id]).await?;
+        match row {
+            Some(row) => Ok(Some((
+                row.get::<Option<String>>(0)?,
+                row.get::<Option<String>>(1)?,
+            ))),
+            None => Ok(None),
+        }
+    }
+    .await;
+    match looked_up {
+        Ok(Some((parent_id, agent))) => agent_of(parent_id.as_deref(), agent.as_deref()),
+        Ok(None) => {
+            tracing::warn!(
+                session = %session_id,
+                "session row missing; running with the read-only toolset"
+            );
+            agent::read_only()
+        }
+        Err(error) => {
+            tracing::warn!(
+                session = %session_id,
+                error = %error,
+                "session agent lookup failed; running with the read-only toolset"
+            );
+            agent::read_only()
+        }
     }
 }
 
@@ -1068,8 +1297,96 @@ impl ToolRegistryExt for ToolRegistry {
     }
 }
 
+struct WeakRunner(std::sync::Weak<Inner>);
+
+impl WeakRunner {
+    fn runner(&self) -> Result<Runner> {
+        self.0
+            .upgrade()
+            .map(|inner| Runner { inner })
+            .ok_or_else(|| ox_tools::contract::Closing.into())
+    }
+}
+
+impl ox_tools::shell::completion::ShellWaker for WeakRunner {
+    fn try_admit(
+        &self,
+    ) -> Result<ox_tools::contract::ExecutionAdmission, ox_tools::contract::Closing> {
+        let inner = self.0.upgrade().ok_or(ox_tools::contract::Closing)?;
+        inner.tasks.gate.try_admit()
+    }
+    fn dispatch<'a>(
+        &'a self,
+        session_id: &'a str,
+        inbox_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(async move { self.runner()?.dispatch(session_id, inbox_id).await })
+    }
+}
+
+impl ox_tools::subagent::SubagentSpawner for WeakRunner {
+    fn try_admit(
+        &self,
+    ) -> Result<ox_tools::contract::ExecutionAdmission, ox_tools::contract::Closing> {
+        let inner = self.0.upgrade().ok_or(ox_tools::contract::Closing)?;
+        inner.tasks.gate.try_admit()
+    }
+    fn is_closing(&self) -> bool {
+        self.0
+            .upgrade()
+            .is_none_or(|inner| inner.tasks.gate.is_closed())
+    }
+    fn dispatch<'a>(
+        &'a self,
+        session_id: &'a str,
+        inbox_id: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+        Box::pin(async move { self.runner()?.dispatch(session_id, inbox_id).await })
+    }
+    fn is_active(&self, session_id: &str) -> bool {
+        self.runner()
+            .is_ok_and(|runner| runner.is_active(session_id))
+    }
+    fn interrupt(&self, session_id: &str) -> bool {
+        self.runner()
+            .is_ok_and(|runner| runner.interrupt(session_id))
+    }
+    /// Block until the child is no longer active. Capture its handle before
+    /// returning the future so a later forget cannot turn an active wait idle.
+    fn wait_idle<'a>(&'a self, session_id: &'a str) -> ox_tools::subagent::WaitIdle<'a> {
+        let handle = self
+            .0
+            .upgrade()
+            .and_then(|inner| inner.sessions.get(session_id).map(|entry| entry.clone()));
+        Box::pin(async move {
+            let Some(handle) = handle else {
+                return;
+            };
+            loop {
+                let notified = handle.settled.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if !handle_is_active(&handle) {
+                    return;
+                }
+                notified.await;
+            }
+        })
+    }
+    fn settled_tail<'a>(&'a self, session_id: &'a str) -> ox_tools::subagent::SettledTail<'a> {
+        Box::pin(async move {
+            crate::runner::step::settled_tail(&self.runner()?.inner.db, session_id).await
+        })
+    }
+}
+
 /// Wakes a session for a background `shell` completion.
 impl ox_tools::shell::completion::ShellWaker for Runner {
+    fn try_admit(
+        &self,
+    ) -> Result<ox_tools::contract::ExecutionAdmission, ox_tools::contract::Closing> {
+        Runner::try_admit(self)
+    }
     fn dispatch<'a>(
         &'a self,
         session_id: &'a str,
@@ -1083,6 +1400,14 @@ impl ox_tools::shell::completion::ShellWaker for Runner {
 /// through, implemented over the registry: dispatch, activity, interruption
 /// and the projected transcript.
 impl ox_tools::subagent::SubagentSpawner for Runner {
+    fn try_admit(
+        &self,
+    ) -> Result<ox_tools::contract::ExecutionAdmission, ox_tools::contract::Closing> {
+        Runner::try_admit(self)
+    }
+    fn is_closing(&self) -> bool {
+        self.inner.tasks.gate.is_closed()
+    }
     fn dispatch<'a>(
         &'a self,
         session_id: &'a str,

@@ -158,7 +158,7 @@ use super::tagger::taggable_items;
 const DEFAULT_LIMIT: usize = 10;
 /// ox's cap on `limit`; the reference is unbounded (see the module docs).
 const MAX_LIMIT: usize = 25;
-/// Rows fetched from one indexed source before date filtering. Bounds each
+/// Eligible rows fetched from one indexed source after date filtering. Bounds each
 /// source's work; matches the reference's per-source `LIMIT 100`.
 const SOURCE_FETCH_LIMIT: i64 = 100;
 /// Milliseconds in one UTC day; `to` is the last millisecond of its day.
@@ -380,7 +380,6 @@ struct MemoryRow {
     id: String,
     category: String,
     content: String,
-    created_at: i64,
 }
 
 /// One indexed note row: `surface_condition` is part of the index body, so it
@@ -391,7 +390,6 @@ struct NoteRow {
     body: String,
     status: String,
     surface_condition: Option<String>,
-    created_at: i64,
 }
 
 /// One scanned compartment row that matched at least one query token. Rows
@@ -603,17 +601,25 @@ async fn search_memories(
         let conn = db.acquire().await?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, category, content, created_at
+                "SELECT id, category, content
                    FROM mc_memory
                   WHERE fts_match(content, ?1)
                     AND project = ?2
                     AND status = 'active'
+                    AND (?3 IS NULL OR created_at >= ?3)
+                    AND (?4 IS NULL OR created_at <= ?4)
                   ORDER BY fts_score(content, ?1) DESC, rowid
-                  LIMIT ?3",
+                  LIMIT ?5",
             )
             .await?;
         let mut candidates = stmt
-            .query((match_expr.as_str(), request.project, SOURCE_FETCH_LIMIT))
+            .query((
+                match_expr.as_str(),
+                request.project,
+                request.from_ms,
+                request.to_ms,
+                SOURCE_FETCH_LIMIT,
+            ))
             .await?;
         let mut rows = Vec::new();
         while let Some(row) = candidates.next().await? {
@@ -621,7 +627,6 @@ async fn search_memories(
                 id: row.get(0)?,
                 category: row.get(1)?,
                 content: row.get(2)?,
-                created_at: row.get(3)?,
             });
         }
         Ok::<_, anyhow::Error>(rows)
@@ -629,13 +634,9 @@ async fn search_memories(
     .await
     .context("search indexed memories")?;
 
-    // The date range is filtered before numbering: an out-of-range row is not
-    // part of this lane's ranking, so numbering it would leave rank holes and
-    // weight an in-range hit as if out-of-range hits sat above it — which the
-    // fusion reads as a lower rank.
+    // SQL applies eligibility before LIMIT; only eligible rows receive ranks.
     Ok(rows
         .into_iter()
-        .filter(|row| in_range(row.created_at, request.from_ms, request.to_ms))
         .enumerate()
         .map(|(rank, row)| RankedHit {
             rank,
@@ -680,6 +681,7 @@ async fn semantic_memories(
         .context("load embedded memories")?;
     let mut scored: Vec<(f32, super::memory::EmbeddedMemory)> = memories
         .into_iter()
+        .filter(|memory| in_range(memory.created_at, request.from_ms, request.to_ms))
         .map(|memory| (super::embed::cosine(&query, &memory.vector), memory))
         .collect();
     scored.sort_by(|left, right| {
@@ -691,7 +693,6 @@ async fn semantic_memories(
     Ok(scored
         .into_iter()
         .take(SOURCE_FETCH_LIMIT as usize)
-        .filter(|(_, memory)| in_range(memory.created_at, request.from_ms, request.to_ms))
         .enumerate()
         .map(|(rank, (_, memory))| RankedHit {
             rank,
@@ -782,17 +783,25 @@ async fn search_notes(
         let conn = db.acquire().await?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, title, body, status, surface_condition, created_at
+                "SELECT id, title, body, status, surface_condition
                    FROM mc_note
                   WHERE fts_match(title, body, surface_condition, ?1)
                     AND session_id = ?2
                     AND status != 'dismissed'
+                    AND (?3 IS NULL OR created_at >= ?3)
+                    AND (?4 IS NULL OR created_at <= ?4)
                   ORDER BY fts_score(title, body, surface_condition, ?1) DESC, rowid
-                  LIMIT ?3",
+                  LIMIT ?5",
             )
             .await?;
         let mut candidates = stmt
-            .query((match_expr.as_str(), request.session_id, SOURCE_FETCH_LIMIT))
+            .query((
+                match_expr.as_str(),
+                request.session_id,
+                request.from_ms,
+                request.to_ms,
+                SOURCE_FETCH_LIMIT,
+            ))
             .await?;
         let mut rows = Vec::new();
         while let Some(row) = candidates.next().await? {
@@ -802,7 +811,6 @@ async fn search_notes(
                 body: row.get(2)?,
                 status: row.get(3)?,
                 surface_condition: row.get(4)?,
-                created_at: row.get(5)?,
             });
         }
         Ok::<_, anyhow::Error>(rows)
@@ -813,10 +821,7 @@ async fn search_notes(
     Ok(rows
         .into_iter()
         .enumerate()
-        .filter_map(|(rank, row)| {
-            if !in_range(row.created_at, request.from_ms, request.to_ms) {
-                return None;
-            }
+        .map(|(rank, row)| {
             let mut text = row.title;
             if !row.body.is_empty() {
                 text.push('\n');
@@ -826,7 +831,7 @@ async fn search_notes(
                 text.push('\n');
                 text.push_str(condition);
             }
-            Some(RankedHit {
+            RankedHit {
                 rank,
                 hit: SearchHit {
                     source: Source::Note,
@@ -840,7 +845,7 @@ async fn search_notes(
                     range: None,
                     ordinal: None,
                 },
-            })
+            }
         })
         .collect())
 }

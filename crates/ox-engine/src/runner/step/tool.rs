@@ -12,9 +12,85 @@ use ox_schema::support::{Content, Record, SessionError};
 use super::super::ToolContext;
 use super::super::drain::DrainCtx;
 use super::super::permissions::Decision;
-use super::attempt::{StepParams, TOOLS_INTERRUPTED};
-use super::error::aborted_error;
+use super::attempt::StepParams;
 use super::stream::ToolAccum;
+/// Execution output belongs to the tool; this error only describes a failed
+/// durable settlement (or a task panic), never a reason to repeat execution.
+#[derive(Debug, thiserror::Error)]
+#[error("tool {call_id} {stage} failed: {source}")]
+pub(super) struct ToolSettlementError {
+    call_id: String,
+    stage: &'static str,
+    #[source]
+    source: anyhow::Error,
+}
+
+/// Step-local owner. Every stream exit calls finish; Drop is only a safety
+/// signal, never a substitute for awaiting side effects and settlement.
+pub(super) struct ToolTasks {
+    pub(super) cancellation: CancellationToken,
+    handles: Vec<(String, JoinHandle<Result<(), ToolSettlementError>>)>,
+}
+
+impl ToolTasks {
+    pub(super) fn new(parent: &CancellationToken) -> Self {
+        Self {
+            cancellation: parent.child_token(),
+            handles: Vec::new(),
+        }
+    }
+
+    pub(super) async fn finish(&mut self) -> Result<()> {
+        let mut primary = None;
+        while !self.handles.is_empty() {
+            // Observe any completed settlement, not only insertion order: a
+            // failed sibling must cancel a long-running earlier execution.
+            let (index, result) = std::future::poll_fn(|cx| {
+                for (index, (_, task)) in self.handles.iter_mut().enumerate() {
+                    if let std::task::Poll::Ready(result) = std::pin::Pin::new(task).poll(cx) {
+                        return std::task::Poll::Ready((index, result));
+                    }
+                }
+                std::task::Poll::Pending
+            })
+            .await;
+            let (call_id, _) = self.handles.swap_remove(index);
+            let outcome = match result {
+                Ok(result) => result,
+                Err(source) => Err(ToolSettlementError {
+                    call_id,
+                    stage: "task join",
+                    source: source.into(),
+                }),
+            };
+            if let Err(error) = outcome {
+                self.cancellation.cancel();
+                if primary.is_none() {
+                    primary = Some(error);
+                } else {
+                    tracing::error!(%error, "additional tool settlement failure");
+                }
+            }
+        }
+        match primary {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for ToolTasks {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        if !self.handles.is_empty() {
+            tracing::error!(
+                remaining = self.handles.len(),
+                "tool owner dropped without finish"
+            );
+        }
+    }
+}
+
 /// The failure a tool call gets in a final step (upstream `executeTool`:
 /// "Tools are disabled after the maximum agent steps").
 fn tools_disabled_error() -> SessionError {
@@ -82,8 +158,7 @@ pub(super) async fn settle_tool_calls(
     ctx: &DrainCtx,
     params: &StepParams<'_>,
     accs: &mut BTreeMap<u32, ToolAccum>,
-    tasks: &mut Vec<(String, JoinHandle<()>)>,
-    token: &CancellationToken,
+    tasks: &mut ToolTasks,
     length_finish: bool,
 ) -> Result<()> {
     for acc in accs.values_mut() {
@@ -159,9 +234,16 @@ pub(super) async fn settle_tool_calls(
             continue;
         }
         match ctx.tools.get(&acc.name) {
-            Some(tool) => tasks.push((
+            Some(tool) => tasks.handles.push((
                 acc.id.clone(),
-                spawn_tool_task(ctx, token, params, acc.id.clone(), tool, input_value),
+                spawn_tool_task(
+                    ctx,
+                    &tasks.cancellation,
+                    params,
+                    acc.id.clone(),
+                    tool,
+                    input_value,
+                ),
             )),
             None => {
                 // Upstream tool.ts:275 — the registry has no such tool.
@@ -201,7 +283,7 @@ fn spawn_tool_task(
     call_id: String,
     tool: Arc<dyn super::super::Tool>,
     input: Value,
-) -> JoinHandle<()> {
+) -> JoinHandle<Result<(), ToolSettlementError>> {
     let bus = ctx.bus.clone();
     let session_id = ctx.session_id.clone();
     let message_id = params.assistant_message_id.clone();
@@ -231,6 +313,7 @@ fn spawn_tool_task(
             .authorize(&session_id, &directory, tool.name(), &input, &cancellation)
             .await
         {
+            let settlement_id = call_id.clone();
             let event = SessionEventData::ToolFailed {
                 session_id,
                 assistant_message_id: message_id,
@@ -246,13 +329,24 @@ fn spawn_tool_task(
                 executed: false,
                 result_state: None,
             };
-            if let Err(error) = bus.publish(event).await {
-                tracing::error!(error = %error, "permission denial failed to publish");
-            }
-            return;
+            return bus
+                .publish(event)
+                .await
+                .map_err(|source| ToolSettlementError {
+                    call_id: settlement_id,
+                    stage: "permission settlement",
+                    source,
+                });
         }
-        let output = tool
-            .execute(
+        let output = if cancellation.is_cancelled() {
+            ox_tools::contract::ToolOutput {
+                content: Value::Null,
+                error: Some("Tool execution interrupted".to_owned()),
+                metadata: None,
+                attachments: None,
+            }
+        } else {
+            tool.execute(
                 ToolContext {
                     session_id: session_id.clone(),
                     directory,
@@ -263,7 +357,8 @@ fn spawn_tool_task(
                 },
                 input,
             )
-            .await;
+            .await
+        };
         if external_content && output.error.is_none() {
             // Marked before the success is published, so a fold triggered by
             // this very step already sees the session as tainted.
@@ -271,6 +366,7 @@ fn spawn_tool_task(
                 tracing::warn!(error = %error, tool = tool.name(), "could not mark session taint");
             }
         }
+        let settlement_id = call_id.clone();
         let event = match output.error {
             None => SessionEventData::ToolSuccess {
                 session_id,
@@ -311,9 +407,13 @@ fn spawn_tool_task(
                 result_state: None,
             },
         };
-        if let Err(error) = bus.publish(event).await {
-            tracing::error!(error = %error, "tool settlement failed to publish");
-        }
+        bus.publish(event)
+            .await
+            .map_err(|source| ToolSettlementError {
+                call_id: settlement_id,
+                stage: "result settlement",
+                source,
+            })
     })
 }
 
@@ -362,57 +462,6 @@ pub(super) async fn fail_unsettled_tools(
                 result_state: None,
             })
             .await?;
-    }
-    Ok(())
-}
-
-/// Wait for every spawned execution. An interrupt while waiting aborts the
-/// remaining tasks; a task cancelled before it settled gets its tool part
-/// settled `aborted` here (a task that finished first already published its
-/// own settlement, and the projector ignores a failure for a settled part).
-pub(super) async fn join_tool_tasks(
-    ctx: &DrainCtx,
-    params: &StepParams<'_>,
-    tasks: &mut [(String, JoinHandle<()>)],
-    token: &CancellationToken,
-) -> Result<()> {
-    let mut interrupted = false;
-    for (call_id, task) in tasks.iter_mut() {
-        if interrupted {
-            task.abort();
-        }
-        let result = if interrupted {
-            (&mut *task).await
-        } else {
-            let outcome = tokio::select! {
-                result = &mut *task => Ok(result),
-                () = token.cancelled() => Err(()),
-            };
-            match outcome {
-                Ok(result) => result,
-                Err(()) => {
-                    // Interrupted mid-wait: abort the execution and settle
-                    // its part aborted below.
-                    interrupted = true;
-                    task.abort();
-                    (&mut *task).await
-                }
-            }
-        };
-        if result.is_err() {
-            ctx.bus
-                .publish(SessionEventData::ToolFailed {
-                    session_id: ctx.session_id.clone(),
-                    assistant_message_id: params.assistant_message_id.clone(),
-                    id: call_id.clone(),
-                    error: aborted_error(TOOLS_INTERRUPTED),
-                    content: None,
-                    metadata: None,
-                    executed: false,
-                    result_state: None,
-                })
-                .await?;
-        }
     }
     Ok(())
 }

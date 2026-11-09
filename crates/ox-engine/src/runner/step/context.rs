@@ -26,6 +26,7 @@ use super::content::{content_is_blank, prefix_content, user_message_content};
 pub(crate) async fn mctx_head(
     ctx: &DrainCtx,
     budget: crate::mctx::budget::Budget,
+    model_id: &str,
 ) -> (Option<String>, Option<String>, i64) {
     if !ctx.config.magic_context.enabled {
         return (None, None, 0);
@@ -48,7 +49,11 @@ pub(crate) async fn mctx_head(
         run_started: false,
         // The session's measured provider ÷ local ratio: the pass fills `m[0]`
         // in the units its budget is written in.
-        calibration: crate::mctx::calibration::ratio_for(&ctx.calibrations, &ctx.session_id),
+        calibration: crate::mctx::calibration::ratio_for(
+            &ctx.calibrations,
+            &ctx.session_id,
+            model_id,
+        ),
     };
     match crate::mctx::pass::run(request).await {
         Ok(result) => (result.head_m0, result.head_m1, result.floor),
@@ -60,6 +65,50 @@ pub(crate) async fn mctx_head(
             );
             (None, None, 0)
         }
+    }
+}
+
+impl DrainCtx {
+    /// Preview the live head and tail together without persisting their decisions.
+    pub(crate) async fn preview_context(
+        &self,
+        budget: crate::mctx::budget::Budget,
+        model_id: &str,
+    ) -> Result<(
+        Option<String>,
+        Option<String>,
+        Vec<ox_schema::message::Message>,
+    )> {
+        if !self.config.magic_context.enabled {
+            let rows = super::history::load_history_after(&self.db, &self.session_id, 0).await?;
+            return Ok((None, None, rows));
+        }
+        let project = self.directory.to_string_lossy();
+        let request = crate::mctx::pass::PassRequest {
+            db: &self.db,
+            session_id: &self.session_id,
+            project: &project,
+            last_seq: latest_seq(&self.db, &self.session_id).await?,
+            budget,
+            forced: false,
+            run_started: false,
+            calibration: crate::mctx::calibration::ratio_for(
+                &self.calibrations,
+                &self.session_id,
+                model_id,
+            ),
+        };
+        let (m0, m1, floor, applied) = match crate::mctx::pass::preview(request).await {
+            Ok((head, applied)) => (head.head_m0, head.head_m1, head.floor, applied),
+            Err(error) => {
+                tracing::warn!(session = %self.session_id, error = %error, "mctx preview failed; continuing without a head");
+                (None, None, 0, Vec::new())
+            }
+        };
+        let rows =
+            super::history::preview_overlaid_tail(&self.db, &self.session_id, floor, &applied)
+                .await?;
+        Ok((m0, m1, rows))
     }
 }
 

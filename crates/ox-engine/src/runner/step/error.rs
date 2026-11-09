@@ -80,7 +80,7 @@ pub(super) fn tool_call_digest(request: &ChatRequest) -> String {
 /// family for connection-level faults.
 pub(super) fn to_session_error(error: &ChatError) -> SessionError {
     let (kind, status, response) = match error {
-        ChatError::Http { status, body } => (
+        ChatError::Http { status, body, .. } => (
             // Any remaining 4xx is a deterministic rejection of this request;
             // server-side statuses report a provider failure.
             if (400..500).contains(status) {

@@ -87,14 +87,17 @@ async fn handle(req: &mut Request, depot: &mut Depot, res: &mut Response, action
     };
     let server = req.param::<String>("server").unwrap_or_default();
     let directory = directory_of(req);
-    let task = tokio::spawn({
-        let state = state.clone();
-        let server = server.clone();
-        async move { run(&state, &directory, &server, action).await }
-    });
-    let outcome = match task.await {
+    let outcome = match state
+        .runtime
+        .own({
+            let state = state.clone();
+            let server = server.clone();
+            async move { run(&state, &directory, &server, action).await }
+        })
+        .await
+    {
         Ok(outcome) => outcome,
-        Err(join) => Err(anyhow::anyhow!("MCP {action:?} task failed: {join}")),
+        Err(error) => Err(error),
     };
     match outcome {
         Ok(()) => {

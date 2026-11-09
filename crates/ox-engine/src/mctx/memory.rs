@@ -282,19 +282,89 @@ pub(crate) async fn write_memory(
     let owner = owner_for(project, category);
     let result: Result<String> = async {
         let tx = db.begin().await?;
-        let id = next_memory_id(&tx).await?.to_string();
-        tx.execute(
-            "INSERT INTO mc_memory
-                 (id, project, content, category, created_at, updated_at, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, 'active')",
-            (id.as_str(), owner, content, category, now),
-        )
-        .await?;
+        let id = insert_memory(&tx, owner, content, category, now).await?;
         tx.commit().await?;
         Ok(id)
     }
     .await;
     result.with_context(|| context)
+}
+
+/// Outcome of publishing an automatic lesson; explicit writes bypass this gate.
+pub(crate) enum LessonPublication {
+    Recorded(String),
+    AlreadyRecorded,
+    Ineligible,
+}
+
+/// Recheck every contributing session, deduplicate the redacted fact, and insert
+/// under the same write transaction. Never hold this transaction across a model call.
+pub(crate) async fn publish_lesson(
+    db: &Db,
+    project: &str,
+    content: &str,
+    category: &str,
+    source_sessions: &[&str],
+) -> Result<LessonPublication> {
+    let content = redact::redact_secrets(content);
+    let tx = db.begin().await?;
+    let mut eligibility = tx
+        .prepare(
+            "SELECT 1 FROM session_v2 s WHERE s.id = ?1 AND s.directory = ?2
+         AND NOT EXISTS (SELECT 1 FROM kv WHERE key = ?3 OR key = ?4)",
+        )
+        .await?;
+    if source_sessions.is_empty() {
+        tx.rollback().await?;
+        return Ok(LessonPublication::Ineligible);
+    }
+    for session in source_sessions {
+        let eligible = optional(
+            &mut eligibility,
+            (
+                *session,
+                project,
+                ox_schema::support::memory_mode_key(session).as_str(),
+                ox_schema::support::session_taint_key(session).as_str(),
+            ),
+        )
+        .await?
+        .is_some();
+        if !eligible {
+            tx.rollback().await?;
+            return Ok(LessonPublication::Ineligible);
+        }
+    }
+    let mut recorded = tx.prepare(
+        "SELECT 1 FROM mc_memory WHERE project = ?1 AND status = 'active' AND content = ?2 LIMIT 1",
+    ).await?;
+    if optional(&mut recorded, (project, content.as_ref()))
+        .await?
+        .is_some()
+    {
+        tx.rollback().await?;
+        return Ok(LessonPublication::AlreadyRecorded);
+    }
+    let id = insert_memory(&tx, project, &content, category, now_millis()).await?;
+    tx.commit().await?;
+    Ok(LessonPublication::Recorded(id))
+}
+
+async fn insert_memory(
+    tx: &WriteTx<'_>,
+    owner: &str,
+    content: &str,
+    category: &str,
+    now: i64,
+) -> Result<String> {
+    let id = next_memory_id(tx).await?.to_string();
+    tx.execute(
+        "INSERT INTO mc_memory (id, project, content, category, created_at, updated_at, status)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5, 'active')",
+        (id.as_str(), owner, content, category, now),
+    )
+    .await?;
+    Ok(id)
 }
 
 /// The next free memory id: `MAX(id) + 1` over the whole table.
@@ -1121,11 +1191,14 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(600);
 /// tests must not acquire a background writer against their database (the same
 /// reason the dreamer, the pruners and the retention sweepers are started
 /// there).
-pub fn spawn_embedding_sweep(db: Db, embedder: Option<Arc<crate::mctx::embed::Embedder>>) {
-    let Some(embedder) = embedder else {
-        return;
-    };
-    tokio::spawn(async move {
+#[must_use]
+pub fn spawn_embedding_sweep(
+    db: Db,
+    embedder: Option<Arc<crate::mctx::embed::Embedder>>,
+    stop: tokio_util::sync::CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let embedder = embedder?;
+    Some(tokio::spawn(async move {
         loop {
             match embed_missing(&db, &embedder, SWEEP_BATCH_CAP).await {
                 Ok(report) => log_sweep(report, SWEEP_BATCH_CAP),
@@ -1135,9 +1208,12 @@ pub fn spawn_embedding_sweep(db: Db, embedder: Option<Arc<crate::mctx::embed::Em
             // `interval`'s default burst behaviour fires every missed tick back
             // to back, so an endpoint that hangs one pass would be hit again
             // immediately instead of once per interval.
-            tokio::time::sleep(SWEEP_INTERVAL).await;
+            tokio::select! {
+                () = stop.cancelled() => return,
+                () = tokio::time::sleep(SWEEP_INTERVAL) => {}
+            }
         }
-    });
+    }))
 }
 
 /// Log one sweep pass: nothing when the pass found no work (the common case on a
@@ -1215,18 +1291,8 @@ pub(crate) async fn embedded_memories(
     result.with_context(|| context)
 }
 
-/// The projects that have at least one active memory, ascending. The dreamer
-/// enumerates work by project (its grain is `(project, task)`), and a project
-/// with no memories has nothing for most of its tasks to do — this is the
-/// reference's cheap idle-project pruning (`pruneIdleScheduleIdentities`),
-/// reduced to the one identity form ox has.
-///
-/// One task is the exception: `surface_notes` works on `mc_note`, which is
-/// session-scoped, so a project that has parked notes but no memory at all is
-/// not enumerated and its notes stay parked. ox accepts that (a project the
-/// agent has worked in carries memories, and the alternative — enumerating note
-/// projects too — would put every task's gate into projects the dreamer has
-/// never seen) and it is recorded in the module docs' deviation list.
+/// Owners with active memories, ascending. Only pool-hygiene tasks use this
+/// enumeration; note and retrospective owners come from their own inputs.
 pub(crate) async fn projects_with_active_memories(db: &Db) -> Result<Vec<String>> {
     let result: Result<Vec<String>> = async {
         let conn = db.acquire().await?;

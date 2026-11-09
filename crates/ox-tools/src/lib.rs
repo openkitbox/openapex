@@ -69,7 +69,9 @@ impl ToolRegistry {
             Arc::new(skill::SkillTool),
             Arc::new(capability_search::CapabilitySearchTool),
             Arc::new(read::ReadTool),
-            Arc::new(shell::ShellTool::new()),
+            Arc::new(shell::ShellTool::with_sessions(Arc::clone(
+                &registry.shells,
+            ))),
             Arc::new(webfetch::WebFetchTool::new()),
             Arc::new(write::WriteTool),
         ]);
@@ -132,7 +134,7 @@ impl ToolRegistry {
         let completion = Arc::new(shell::completion::ShellCompletion::new(db, bus));
         self.remove("shell");
         self.register_all(vec![Arc::new(
-            shell::ShellTool::new()
+            shell::ShellTool::with_sessions(Arc::clone(&self.shells))
                 .with_completion(completion.sink())
                 .with_jobs(Arc::clone(&self.jobs)),
         ) as Arc<dyn Tool>]);

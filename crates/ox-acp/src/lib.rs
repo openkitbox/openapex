@@ -44,15 +44,14 @@ use ox_core::config::Config;
 pub async fn run(explicit_base: Option<String>, config: Config) -> anyhow::Result<()> {
     let base = explicit_base.unwrap_or_else(|| format!("http://{}", config.listen));
 
-    let owned = !probe(&base).await;
-    let base = if !owned {
-        base
+    let owned = if probe(&base).await {
+        None
     } else {
         // No server answered: own the runtime in-process on an ephemeral
-        // port. The composition is the same code path `ox::run` uses.
-        let (state, router) = ox_server::compose(config)
-            .await
-            .context("ox acp: composing the in-process server failed")?;
+        // port. Bind first so a bind failure cannot leave a composed runtime
+        // (database, producers, MCP children) behind, then keep the serve
+        // handle and the composition: shutdown must be awaited, not left to
+        // process exit.
         use salvo::conn::Listener as _;
         let acceptor = salvo::conn::TcpListener::new("127.0.0.1:0")
             .try_bind()
@@ -61,18 +60,50 @@ pub async fn run(explicit_base: Option<String>, config: Config) -> anyhow::Resul
         let addr = acceptor
             .local_addr()
             .context("ox acp: reading the bound port failed")?;
-        tokio::spawn(ox_server::serve_on(acceptor, state, router));
+        let (state, router) = ox_server::compose(config)
+            .await
+            .context("ox acp: composing the in-process server failed")?;
+        let served = tokio::spawn(ox_server::serve_on(acceptor, state.clone(), router));
         tracing::info!(%addr, "ox acp owns an in-process server");
-        format!("http://{addr}")
+        Some(Owned {
+            state,
+            served,
+            base: format!("http://{addr}"),
+        })
     };
+    let base = owned
+        .as_ref()
+        .map_or_else(|| base.clone(), |owned| owned.base.clone());
 
     let outcome = serve_stdio(base).await;
-    // The in-process server dies with this process without returning, so
-    // its shells are stopped here (an attached server keeps its own).
-    if owned {
-        ox_tools::shell::sessions::shared().shutdown().await;
+    if let Some(owned) = owned {
+        // Own mode: the composition is ours, so close its admissions, stop its
+        // listeners and await its resources. Attach mode never reaches here —
+        // the remote server and its shells belong to someone else.
+        owned.shutdown().await;
     }
     outcome
+}
+
+/// The in-process server `ox acp` owns in own mode.
+struct Owned {
+    state: ox_server::api::AppState,
+    served: tokio::task::JoinHandle<anyhow::Result<()>>,
+    base: String,
+}
+
+impl Owned {
+    /// Stop the listener, then wait for the composition's own cleanup. A serve
+    /// task that failed on its own is reported, but cleanup still runs: a
+    /// listener error is not a reason to leave children or producers behind.
+    async fn shutdown(self) {
+        self.state.runtime.stop().cancel();
+        match self.served.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::error!(error = %error, "ox acp: in-process server failed"),
+            Err(error) => tracing::error!(error = %error, "ox acp: serve task did not finish"),
+        }
+    }
 }
 
 /// `GET {base}/api/info` with a short timeout decides attach vs own.

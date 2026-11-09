@@ -579,6 +579,13 @@ pub struct Db {
     /// One writer at a time. ox's transactions are short, and serializing them
     /// here keeps `BEGIN IMMEDIATE` from ever meeting a busy database.
     write_gate: Arc<Mutex<()>>,
+    cleanup: Arc<std::sync::Mutex<Cleanup>>,
+}
+
+#[derive(Default)]
+struct Cleanup {
+    handles: Vec<tokio::task::JoinHandle<Result<()>>>,
+    completion: Option<tokio::sync::watch::Receiver<Option<Result<(), String>>>>,
 }
 
 /// Most connections ox will hold open at once.
@@ -648,6 +655,46 @@ fn restrict_permissions(path: &Path) {
 }
 
 impl Db {
+    /// Seal and await rollback cleanup after all database users have stopped.
+    /// Callers must drop every borrowed connection before calling this method.
+    pub async fn join_cleanup(&self) -> Result<()> {
+        let mut completion = {
+            let mut cleanup = self.cleanup.lock().unwrap_or_else(|p| p.into_inner());
+            if cleanup.completion.is_none() {
+                let handles = std::mem::take(&mut cleanup.handles);
+                let (done, completion) = tokio::sync::watch::channel(None);
+                // The supervisor retains handles even if a waiter is cancelled.
+                tokio::spawn(async move {
+                    let mut failure = None;
+                    for handle in handles {
+                        match handle.await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(error)) => {
+                                failure.get_or_insert_with(|| error.to_string());
+                            }
+                            Err(error) => {
+                                failure.get_or_insert_with(|| error.to_string());
+                            }
+                        }
+                    }
+                    done.send_replace(Some(failure.map_or(Ok(()), Err)));
+                });
+                cleanup.completion = Some(completion);
+            }
+            cleanup
+                .completion
+                .as_ref()
+                .expect("completion initialized above")
+                .clone()
+        };
+        loop {
+            if let Some(result) = completion.borrow_and_update().as_ref() {
+                return result.clone().map_err(anyhow::Error::msg);
+            }
+            completion.changed().await?;
+        }
+    }
+
     /// Open (creating if needed) the database at `path` and apply migrations.
     /// Parent directories are created automatically.
     pub async fn open(path: &Path) -> Result<Self> {
@@ -704,6 +751,7 @@ impl Db {
             permits: Arc::new(Semaphore::new(MAX_CONNECTIONS)),
             ephemeral: None,
             write_gate: Arc::new(Mutex::new(())),
+            cleanup: Arc::new(std::sync::Mutex::new(Cleanup::default())),
         };
         db.migrate().await?;
         restrict_permissions(Path::new(path));
@@ -886,13 +934,22 @@ impl Drop for Conn<'_> {
         let open_transaction = matches!(conn.is_autocommit(), Ok(false));
         if open_transaction && let Ok(handle) = tokio::runtime::Handle::try_current() {
             let idle = Arc::clone(&self.db.idle);
-            handle.spawn(async move {
-                let _ = conn.execute("ROLLBACK", ()).await;
+            let ephemeral = self.db.ephemeral.clone();
+            let task = handle.spawn(async move {
+                let _ephemeral = ephemeral;
+                conn.execute("ROLLBACK", ()).await?;
                 let mut idle = idle.lock().await;
                 if idle.len() < MAX_IDLE {
                     idle.push(conn);
                 }
+                Ok(())
             });
+            self.db
+                .cleanup
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .handles
+                .push(task);
             return;
         }
         // `try_lock` is enough: an idle slot is an optimisation.

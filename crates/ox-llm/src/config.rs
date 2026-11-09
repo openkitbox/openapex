@@ -316,6 +316,62 @@ pub struct ModelRouteConfig {
     pub candidates: Vec<CandidateConfig>,
 }
 
+/// Routing metadata shared by transport and runtime geometry; contains no credentials.
+#[derive(Default)]
+pub struct Routes {
+    explicit: BTreeMap<String, ModelRouteConfig>,
+    builtins: Vec<(&'static str, &'static BuiltinProvider)>,
+    passthrough: bool,
+}
+
+/// Borrowed routing decision in actual transport order.
+pub enum Targets<'a> {
+    Explicit(&'a [CandidateConfig]),
+    Endpoint { provider: &'a str, model: &'a str },
+    NoRoute,
+}
+
+impl Routes {
+    #[must_use]
+    pub fn new(config: &LlmConfig) -> Self {
+        Self {
+            explicit: config.models.clone(),
+            builtins: config
+                .builtins
+                .values()
+                .map(|resolved| (resolved.builtin.id, resolved.builtin))
+                .collect(),
+            passthrough: config.providers.is_empty(),
+        }
+    }
+
+    #[must_use]
+    pub fn resolve<'a>(&'a self, model: &'a str) -> Targets<'a> {
+        if let Some(route) = self.explicit.get(model) {
+            return if route.candidates.is_empty() {
+                Targets::NoRoute
+            } else {
+                Targets::Explicit(&route.candidates)
+            };
+        }
+        if let Some((provider, _)) = self
+            .builtins
+            .iter()
+            .find(|(_, builtin)| builtin.owns(model))
+        {
+            return Targets::Endpoint { provider, model };
+        }
+        if self.passthrough {
+            Targets::Endpoint {
+                provider: DEFAULT_PROVIDER_NAME,
+                model,
+            }
+        } else {
+            Targets::NoRoute
+        }
+    }
+}
+
 /// The LLM-endpoint slice of `ox.toml`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LlmConfig {

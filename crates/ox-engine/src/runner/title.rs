@@ -279,9 +279,9 @@ fn extract_title(text: &str) -> Option<String> {
 }
 
 /// Generate (or regenerate) the session title. All failures are silent: title
-/// generation is advisory background work, so a transport error or a vanished
-/// session logs at most and never surfaces to the turn or the HTTP request
-/// that spawned it (upstream's `Effect.orElseSucceed` posture on
+/// generation is advisory background work. An invalid completion retains the
+/// existing title; failures are logged and never surface to the turn or HTTP
+/// request (upstream's `Effect.orElseSucceed` posture on
 /// `store.context`).
 pub async fn generate(
     db: Db,
@@ -319,7 +319,7 @@ async fn generate_inner(
         vec![ChatMessage::system(PROMPT_TITLE), ChatMessage::user(text)],
     );
     request.apply_reasoning_effort(model.variant.as_deref());
-    let response = crate::mctx::historian::collect_completion(&chat, &request, "title").await?;
+    let response = crate::completion::collect_text(&chat, &request, "title").await?;
     let Some(title) = extract_title(&response) else {
         return Ok(());
     };

@@ -1,11 +1,12 @@
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use regex::Regex;
 
 use crate::mctx::memory::CATEGORIES;
-use ox_db::Db;
+
+use super::turns::EligibleTurn;
 
 use super::manifest::attr_of;
 use super::text::head_chars;
@@ -62,11 +63,15 @@ pub(super) struct RetrospectiveLesson {
 /// the order they happened. The character budget is spent from the newest end,
 /// so an over-long window drops the oldest turns rather than the most recent
 /// corrections — which are exactly the ones worth learning from.
-pub(super) fn render_retrospective_prompt(project: &str, turns: &[String]) -> String {
+pub(super) fn render_retrospective_prompt<'a>(
+    project: &str,
+    turns: &'a [EligibleTurn],
+) -> (String, Vec<&'a str>) {
     let mut kept: Vec<&str> = Vec::new();
+    let mut source_sessions = Vec::new();
     let mut budget = RETROSPECTIVE_TOTAL_CHARS;
     for turn in turns {
-        let text = head_chars(turn.trim(), RETROSPECTIVE_TURN_CHARS);
+        let text = head_chars(turn.text.trim(), RETROSPECTIVE_TURN_CHARS);
         let cost = text.chars().count();
         if cost == 0 {
             continue;
@@ -76,6 +81,9 @@ pub(super) fn render_retrospective_prompt(project: &str, turns: &[String]) -> St
         }
         budget -= cost;
         kept.push(text);
+        if !source_sessions.contains(&turn.session_id.as_str()) {
+            source_sessions.push(turn.session_id.as_str());
+        }
     }
     kept.reverse();
     let mut parts = vec![format!(
@@ -85,7 +93,7 @@ pub(super) fn render_retrospective_prompt(project: &str, turns: &[String]) -> St
         parts.push(format!("<turn>{text}</turn>"));
     }
     parts.push("</turns>".to_owned());
-    parts.join("\n")
+    (parts.join("\n"), source_sessions)
 }
 
 /// Parse the one `<memory …>…</memory>` element.
@@ -289,30 +297,6 @@ fn collapse_lines(text: &str) -> String {
         out.push_str(line);
     }
     out
-}
-
-/// Whether the project already carries this exact fact as an active memory.
-///
-/// Equality on the stored content is the dedup rule: a lesson identical to an
-/// existing memory teaches nothing, and rewriting the row would only bump
-/// `updated_at` (moving it up the pinboard's recency tie-break) for no gain.
-pub(super) async fn fact_recorded(db: &Db, project: &str, content: &str) -> Result<bool> {
-    let context = format!("check recorded facts for project {project}");
-    let result: Result<bool> = async {
-        let conn = db.acquire().await?;
-        let mut stmt = conn
-            .prepare(
-                "SELECT 1 FROM mc_memory
-                  WHERE project = ?1 AND status = 'active' AND content = ?2
-                  LIMIT 1",
-            )
-            .await?;
-        Ok(ox_db::optional(&mut stmt, (project, content))
-            .await?
-            .is_some())
-    }
-    .await;
-    result.with_context(|| context)
 }
 
 // Regex accessors return a clone so the lazy-DFA cache is dropped after the

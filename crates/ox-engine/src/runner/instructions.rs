@@ -5,6 +5,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use serde_json::Value;
 
@@ -13,9 +14,9 @@ use ox_schema::message::Message;
 
 /// sha256 hex of the value's canonical JSON (`"null"` when absent). The hash
 /// is persisted in delta-row metadata, so the algorithm must stay stable.
-pub(crate) fn hash(value: &Option<SourceValue>) -> String {
+pub(crate) fn hash(value: Option<&SourceValue>) -> String {
     use sha2::Digest;
-    let canonical = serde_json::to_string(value).expect("SourceValue is serializable");
+    let canonical = serde_json::to_string(&value).expect("SourceValue is serializable");
     digest_hex(&sha2::Sha256::digest(canonical.as_bytes()))
 }
 
@@ -41,7 +42,7 @@ pub(crate) struct SourceState {
 /// delta rows with a re-asserting delta).
 pub(crate) struct Baseline {
     /// Frozen system[1] bytes.
-    pub initial_render: String,
+    pub initial_render: Arc<str>,
     pub sources: BTreeMap<&'static str, SourceState>,
 }
 
@@ -49,27 +50,27 @@ pub(crate) fn baseline(observed: &[Observed]) -> Baseline {
     let mut sources = BTreeMap::new();
     for source in observed {
         let value = observed_value_to_option(&source.value);
-        let hash = hash(&value);
+        let hash = hash(value);
         sources.insert(
             source.key,
             SourceState {
                 initial_hash: hash.clone(),
-                initial_value: value.clone(),
+                initial_value: value.cloned(),
                 delivered_hash: hash,
-                delivered_value: value,
+                delivered_value: value.cloned(),
             },
         );
     }
     Baseline {
-        initial_render: prompt::render_initial(observed),
+        initial_render: Arc::from(prompt::render_initial(observed)),
         sources,
     }
 }
 
 /// `Present` → the value; `Removed`/`Unavailable` → absent for state purposes.
-fn observed_value_to_option(value: &ObservedValue) -> Option<SourceValue> {
+fn observed_value_to_option(value: &ObservedValue) -> Option<&SourceValue> {
     match value {
-        ObservedValue::Present(v) => Some(v.clone()),
+        ObservedValue::Present(v) => Some(v),
         ObservedValue::Removed | ObservedValue::Unavailable => None,
     }
 }
@@ -123,16 +124,16 @@ pub(crate) fn diff(
             continue;
         }
         let current = observed_value_to_option(&source.value);
-        let current_hash = hash(&current);
+        let current_hash = hash(current);
         let state = baseline.sources.get(source.key);
         // What the model is believed to hold: the visible wire delta when one
         // survives in the window, else the frozen initial render.
         let believed_hash = match wire.get(source.key) {
             Some(Some(wire_hash)) => Cow::Borrowed(wire_hash.as_str()),
-            Some(None) => Cow::Owned(hash(&None)),
+            Some(None) => Cow::Owned(hash(None)),
             None => match state {
                 Some(state) => Cow::Borrowed(state.initial_hash.as_str()),
-                None => Cow::Owned(hash(&None)),
+                None => Cow::Owned(hash(None)),
             },
         };
         if current_hash.as_str() == believed_hash.as_ref() {
@@ -168,11 +169,59 @@ pub(crate) fn diff(
         deltas.push(Delta {
             key: source.key,
             hash,
-            value: current,
+            value: current.cloned(),
             text,
         });
     }
     deltas
+}
+
+/// Read-only instruction decision for a fixed observation/history snapshot.
+/// A missing baseline is local only; callers own publication and state changes.
+pub(crate) struct Preview {
+    pub initial: Arc<str>,
+    pub deltas: Vec<Delta>,
+}
+
+pub(crate) fn preview(
+    observed: &[Observed],
+    rows: &[Message],
+    existing: Option<&Baseline>,
+) -> Result<Preview, prompt::BudgetExceeded> {
+    let fresh;
+    let baseline = match existing {
+        Some(existing) => existing,
+        None => {
+            fresh = baseline(observed);
+            &fresh
+        }
+    };
+    let wire = fold(rows, super::step::compaction_boundary(rows.iter()));
+    let deltas = diff(observed, &wire, baseline);
+    for delta in &deltas {
+        prompt::admit_rendered(delta.key, &delta.text)?;
+    }
+    Ok(Preview {
+        initial: Arc::clone(&baseline.initial_render),
+        deltas,
+    })
+}
+
+/// Insert an update before the trailing user prompt, or after tool output.
+/// Shared by live assembly and read-only generate; never writes a row.
+pub(crate) fn insert_update(
+    messages: &mut Vec<ox_llm::cardinal::wire::ChatMessage>,
+    text: Option<String>,
+) {
+    use ox_llm::cardinal::wire::ChatMessage;
+    if let Some(text) = text {
+        let at = if matches!(messages.last(), Some(ChatMessage::User { .. })) {
+            messages.len() - 1
+        } else {
+            messages.len()
+        };
+        messages.insert(at, ChatMessage::System { content: text });
+    }
 }
 
 /// Delta texts joined for the wire (upstream `render`: `"\n\n"`).
@@ -243,12 +292,12 @@ pub(crate) fn apply(deltas: Vec<Delta>, baseline: &mut Baseline) {
             .sources
             .entry(delta.key)
             .or_insert_with(|| SourceState {
-                initial_hash: hash(&None),
+                initial_hash: hash(None),
                 initial_value: None,
-                delivered_hash: hash(&None),
+                delivered_hash: hash(None),
                 delivered_value: None,
             });
-        state.delivered_hash = delta.hash.unwrap_or_else(|| hash(&None));
+        state.delivered_hash = delta.hash.unwrap_or_else(|| hash(None));
         state.delivered_value = delta.value;
     }
 }

@@ -124,6 +124,54 @@ impl Tagger {
         session_id: &str,
         messages: &[Value],
     ) -> Result<Vec<TaggedItem>> {
+        let (out, writes) = self.plan(db, session_id, messages).await?;
+        let conn = db.acquire().await?;
+        for write in writes {
+            match write.kind {
+                TagWriteKind::Refresh => {
+                    conn.execute(
+                        "UPDATE mc_tag SET digest = ?3 WHERE session_id = ?1 AND tag = ?2",
+                        (session_id, write.tag as i64, write.digest.as_str()),
+                    )
+                    .await?;
+                }
+                TagWriteKind::Insert => {
+                    conn.execute(
+                        "INSERT INTO mc_tag (session_id, tag, message_id, part_path, digest)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        (
+                            session_id,
+                            write.tag as i64,
+                            write.message_id.as_str(),
+                            write.part_path.as_str(),
+                            write.digest.as_str(),
+                        ),
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Compute the live assignment using only reads; unallocated tags stay local.
+    pub(crate) async fn preview(
+        &self,
+        db: &Db,
+        session_id: &str,
+        messages: &[Value],
+    ) -> Result<Vec<TaggedItem>> {
+        self.plan(db, session_id, messages)
+            .await
+            .map(|(tags, _)| tags)
+    }
+
+    async fn plan(
+        &self,
+        db: &Db,
+        session_id: &str,
+        messages: &[Value],
+    ) -> Result<(Vec<TaggedItem>, Vec<TagWrite>)> {
         // Extract only the taggable items before entering the async body —
         // cloning the whole decoded history per pass is wasted work on long
         // sessions.
@@ -135,7 +183,7 @@ impl Tagger {
                 (!taggables.is_empty()).then_some((id, taggables))
             })
             .collect();
-        let result: Result<Vec<TaggedItem>> = async {
+        let result: Result<(Vec<TaggedItem>, Vec<TagWrite>)> = async {
             let conn = db.acquire().await?;
             // Existing identity mapping for the session, keyed by
             // (message_id, part_path) → (tag, digest).
@@ -169,53 +217,67 @@ impl Tagger {
             };
             next += 1;
 
-            let mut out = Vec::new();
-            for (message_id, taggables) in &items {
-                for (part_path, content) in taggables {
-                    let content_digest = digest_hex(content);
-                    let key = (message_id.clone(), part_path.clone());
-                    if let Some(&(tag, ref stored)) = existing.get(&key) {
-                        if *stored != content_digest {
-                            conn.execute(
-                                "UPDATE mc_tag SET digest = ?3
-                                     WHERE session_id = ?1 AND tag = ?2",
-                                (session_id, tag as i64, content_digest),
-                            )
-                            .await?;
-                        }
-                        out.push(TaggedItem {
-                            tag,
-                            message_id: message_id.clone(),
-                            part_path: part_path.clone(),
-                        });
-                        continue;
-                    }
-                    let tag = next;
-                    next += 1;
-                    conn.execute(
-                        "INSERT INTO mc_tag (session_id, tag, message_id, part_path, digest)
-                             VALUES (?1, ?2, ?3, ?4, ?5)",
-                        (
-                            session_id,
-                            tag as i64,
-                            message_id.as_str(),
-                            part_path.as_str(),
-                            content_digest.as_str(),
-                        ),
-                    )
-                    .await?;
-                    out.push(TaggedItem {
-                        tag,
-                        message_id: message_id.clone(),
-                        part_path: part_path.clone(),
-                    });
-                }
-            }
-            Ok(out)
+            Ok(plan_tags(&items, &existing, next))
         }
         .await;
         result.with_context(|| format!("assign mctx tags for session {session_id}"))
     }
+}
+
+enum TagWriteKind {
+    Refresh,
+    Insert,
+}
+
+struct TagWrite {
+    kind: TagWriteKind,
+    tag: u64,
+    message_id: String,
+    part_path: String,
+    digest: String,
+}
+
+fn plan_tags(
+    items: &[(String, Vec<(String, String)>)],
+    existing: &HashMap<(String, String), (u64, String)>,
+    mut next: u64,
+) -> (Vec<TaggedItem>, Vec<TagWrite>) {
+    let mut tags = Vec::new();
+    let mut writes = Vec::new();
+    for (message_id, parts) in items {
+        for (part_path, content) in parts {
+            let digest = digest_hex(content);
+            let key = (message_id.clone(), part_path.clone());
+            let stored = existing.get(&key);
+            let tag = match stored {
+                Some((tag, _)) => *tag,
+                None => {
+                    let tag = next;
+                    next += 1;
+                    tag
+                }
+            };
+            if stored.is_none_or(|(_, old)| *old != digest) {
+                writes.push(TagWrite {
+                    kind: if stored.is_some() {
+                        TagWriteKind::Refresh
+                    } else {
+                        TagWriteKind::Insert
+                    },
+                    tag,
+                    message_id: message_id.clone(),
+                    part_path: part_path.clone(),
+                    digest,
+                });
+            }
+            tags.push(TaggedItem {
+                tag,
+                message_id: message_id.clone(),
+                part_path: part_path.clone(),
+            });
+        }
+    }
+    (tags, writes)
 }
 
 /// The taggable items of one decoded message: `(part_path, content)` pairs

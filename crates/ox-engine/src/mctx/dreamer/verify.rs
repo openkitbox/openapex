@@ -18,6 +18,11 @@ use super::manifest::{
 /// cost; ox keeps the same number so a batch stays a readable prompt).
 pub(super) const VERIFY_MEMORY_LIMIT: usize = 20;
 
+/// Missing references become eligible again after seven days. This is a
+/// cooldown, not a completion SLO: the bounded batch and failure backoff can
+/// delay a check further. Reusing `verified_at` also extends existing expiry.
+const MISSING_RECHECK_MILLIS: i64 = 7 * 24 * 60 * 60 * 1000;
+
 /// Characters of each referenced file the host shows the verifier. The
 /// reference reads short line ranges through a tool; ox has no tools, so it
 /// prints an excerpt instead. File heads carry the declarations (paths,
@@ -64,8 +69,8 @@ Rules:
 // verify: the host-side gate
 // ---------------------------------------------------------------------------
 
-/// One memory that needs a re-check (a cited file is newer, or missing for a
-/// never-verified memory), with every path its text named and what the host
+/// One memory that needs a re-check (a cited file is newer, or missing and due),
+/// with every path its text named and what the host
 /// found there.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Candidate {
@@ -87,8 +92,8 @@ struct PathState {
     /// The path as the memory wrote it, for the prompt.
     written: String,
     /// False when the file does not exist (the reference's "was deleted"), or
-    /// when the path is outside the project. A missing path only makes a
-    /// never-verified memory a candidate (see [`needs_check`]).
+    /// when the path is outside the project. Missing references use a bounded
+    /// recheck cadence after their first verdict (see [`needs_check`]).
     exists: bool,
     /// The file's mtime in epoch milliseconds, when readable.
     mtime: Option<i64>,
@@ -102,12 +107,16 @@ struct PathState {
 /// is free to leave alone. A memory that names no path is never a candidate
 /// (the reference's "file-independent" exclusion); [`needs_check`] decides the
 /// rest from what the filesystem said.
-pub(super) fn candidate(project_dir: &str, memory: &memory::StoredMemory) -> Option<Candidate> {
+pub(super) fn candidate(
+    project_dir: &str,
+    memory: &memory::StoredMemory,
+    now: i64,
+) -> Option<Candidate> {
     let paths: Vec<PathState> = referenced_paths(&memory.content)
         .into_iter()
         .map(|written| inspect(project_dir, &written, memory.verified_at))
         .collect();
-    if !needs_check(&paths, memory.verified_at) {
+    if !needs_check(&paths, memory.verified_at, now) {
         return None;
     }
     Some(Candidate {
@@ -121,15 +130,14 @@ pub(super) fn candidate(project_dir: &str, memory: &memory::StoredMemory) -> Opt
 
 /// Whether the inspected paths make a memory worth a verify completion.
 ///
-/// A stamped memory (`verified_at > 0`) has already been judged against its
-/// missing file, so re-sending it can never change the outcome, and the
-/// deletion time is not recorded. Deviation: a file deleted AFTER stamping is
-/// not re-checked until the memory is rewritten (which resets `verified_at` to
-/// 0 in memory.rs) or another cited file changes.
-fn needs_check(paths: &[PathState], verified_at: i64) -> bool {
-    paths
-        .iter()
-        .any(|state| (state.exists && state.newer) || (!state.exists && verified_at == 0))
+/// Never-verified memories and newer files are immediately eligible. A missing
+/// reference is reconsidered after the cooldown even if deleted AFTER the last
+/// verdict. Missing or unreadable evidence alone never archives a memory.
+fn needs_check(paths: &[PathState], verified_at: i64, now: i64) -> bool {
+    let missing_due = now.saturating_sub(verified_at) >= MISSING_RECHECK_MILLIS;
+    paths.iter().any(|state| {
+        verified_at == 0 || (state.exists && state.newer) || (!state.exists && missing_due)
+    })
 }
 
 /// Resolve one written path against the project directory and read the

@@ -1,154 +1,191 @@
-//! Session todo completion reminder, ported from oh-my-pi
-//! `packages/coding-agent/src/session/todo-tracker.ts` (`checkCompletion`).
-//!
-//! A turn that ends naturally (no tool calls pending) with open todo tasks gets
-//! one synthetic user prompt telling the model to finish or close them. The
-//! mechanics differ from the reference — ox has no developer-role messages or
-//! `scheduleAgentContinue`; the synthetic rides the inbox as a steer, which the
-//! drain promotes at the next turn boundary — but the guards are the same:
-//!
-//! - **Budget**: at most [`MAX_REMINDERS`] reminders per list (the reference's
-//!   `todo.remindersMax`, default 3). The open items come from the transcript's
-//!   newest completed `todowrite` call (`tool::todowrite::open_tasks`); only the
-//!   reminder counter lives in `kv`, and it resets whenever the list is touched,
-//!   so a fresh `todowrite` call starts a fresh budget.
-//! - **No progress, no re-ask**: a reminder that did not move the list suppresses
-//!   further reminders until the model touches `todo` again (the reference's
-//!   `reminderAwaitingProgress`).
-//! - **Waiting on the user**: a final message that asks a question is a hand-off,
-//!   not a stop — no reminder (the reference's `isAwaitingUserAnswer`, reduced
-//!   here to a trailing-question-mark heuristic).
-//!
-//! The reminder never fires mid-turn: it runs when a turn ends with
-//! [`TurnOutcome::Ended`], so a `tool-calls` continuation is unaffected.
+//! Advisory todo reminders. Unlike the reference's mutable counter, the budget
+//! is derived from completed lists and durable inbox admissions. No waiting
+//! table or counter can drift from the transcript. An unfinished epoch ends only
+//! at a terminal/empty list; each normalized revision is reminded once, at most
+//! three admissions per epoch. Legacy notices count as admissions, not progress.
 
-use ox_tools::todowrite::{reminder_count, reset_reminder_budget, set_reminder_count};
-use serde_json::json;
+use std::collections::HashSet;
+
+use anyhow::Result;
+use serde_json::{Value, json};
 
 use ox_db::Db;
 use ox_schema::event::SessionEventData;
 use ox_tools::todowrite;
 
-/// The reference's `todo.remindersMax` default (`settings.ts:387`).
 const MAX_REMINDERS: u32 = 3;
 
-/// Whether the assistant's final text hands the turn to the user. The
-/// reference's `isAwaitingUserAnswer` is an elaborate closing-ask classifier; the
-/// essence for ox is the trailing question — the cheapest reliable "waiting on
-/// you" signal, and the false negatives (a stop with a question buried mid-prose)
-/// only cost a reminder, which the budget bounds.
+#[derive(Debug, PartialEq, Eq)]
+enum Decision {
+    NoWork,
+    AwaitExternal,
+    AwaitUser,
+    NoProgress,
+    BudgetExhausted,
+    Remind(u32),
+}
+
+#[derive(Default)]
+struct History {
+    list: Vec<(String, String)>,
+    epoch: String,
+    revision: String,
+    admissions: u32,
+    reminded: HashSet<String>,
+}
+
+fn is_open(status: &str) -> bool {
+    matches!(status, "pending" | "in_progress")
+}
+
+fn decide(history: &History, external: bool, waiting_user: bool) -> Decision {
+    if !history.list.iter().any(|(_, status)| is_open(status)) {
+        Decision::NoWork
+    } else if external {
+        Decision::AwaitExternal
+    } else if waiting_user {
+        Decision::AwaitUser
+    } else if history.reminded.contains(&history.revision) {
+        Decision::NoProgress
+    } else if history.admissions >= MAX_REMINDERS {
+        Decision::BudgetExhausted
+    } else {
+        Decision::Remind(history.admissions + 1)
+    }
+}
+
+impl History {
+    fn list(&mut self, list: Vec<(String, String)>, identity: String) -> Result<()> {
+        let was_open = self.list.iter().any(|(_, status)| is_open(status));
+        let open = list.iter().any(|(_, status)| is_open(status));
+        if !open || !was_open {
+            self.admissions = 0;
+            self.reminded.clear();
+            self.epoch = identity;
+        }
+        self.revision = serde_json::to_string(&list)?;
+        self.list = list;
+        Ok(())
+    }
+
+    fn notice(&mut self, metadata: &Value) {
+        // Epoch metadata survives promotion, whose message seq can be newer
+        // than a later list. Never count such a notice in the new epoch.
+        if metadata
+            .get("epoch")
+            .and_then(Value::as_str)
+            .is_some_and(|epoch| epoch != self.epoch)
+        {
+            return;
+        }
+        self.admissions = self.admissions.saturating_add(1);
+        if let Some(revision) = metadata.get("revision").and_then(Value::as_str) {
+            self.reminded.insert(revision.to_owned());
+        }
+    }
+}
+
+/// Each page is bounded; neither the complete transcript nor the event replay
+/// log is loaded. Pending/promoted rows are mutually exclusive under the same
+/// read transaction, so an admission is counted exactly once.
+async fn history(db: &Db, session: &str) -> Result<History> {
+    let tx = db.begin().await?;
+    let mut history = History::default();
+    let mut after = -1_i64;
+    loop {
+        let mut stmt = tx
+            .prepare(
+                "SELECT id, seq, type, data FROM session_message
+             WHERE session_id = ?1 AND seq > ?2 AND type IN ('assistant','synthetic')
+             UNION ALL
+             SELECT id, enqueued_seq, type, payload FROM session_inbox
+             WHERE session_id = ?1 AND enqueued_seq > ?2 AND type = 'synthetic'
+             ORDER BY 2 LIMIT 64",
+            )
+            .await?;
+        let mut rows = stmt.query((session, after)).await?;
+        let mut count = 0;
+        while let Some(row) = rows.next().await? {
+            let id: String = row.get(0)?;
+            after = row.get(1)?;
+            let kind: String = row.get(2)?;
+            let raw: String = row.get(3)?;
+            if kind == "assistant" {
+                for (index, list) in todowrite::completed_lists(&raw)?.into_iter().enumerate() {
+                    history.list(list, format!("{id}:{index}"))?;
+                }
+            } else {
+                let value: Value = serde_json::from_str(&raw)?;
+                let metadata = &value["metadata"];
+                if metadata["source"] == "todo-reminder" {
+                    history.notice(metadata);
+                }
+            }
+            count += 1;
+        }
+        if count < 64 {
+            break;
+        }
+    }
+    tx.commit().await?;
+    Ok(history)
+}
+
+async fn pending_completion(db: &Db, session: &str) -> Result<bool> {
+    let conn = db.acquire().await?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT 1 FROM session_inbox WHERE session_id = ?1 AND type = 'synthetic'
+         AND json_extract(payload, '$.metadata.source') IN ('subagent','shell') LIMIT 1",
+        )
+        .await?;
+    Ok(ox_db::optional(&mut stmt, [session]).await?.is_some())
+}
+
 fn awaits_user_answer(text: &str) -> bool {
     text.trim_end().ends_with('?') || text.trim_end().ends_with('？')
 }
 
-/// Build the reminder text: the open items, the ask, and the budget state.
 fn reminder_text(open: &[(String, String)], attempt: u32) -> String {
-    let mut lines = Vec::with_capacity(open.len() + 4);
-    lines.push("<system-reminder>".to_owned());
-    lines.push(format!(
-        "You stopped with {} incomplete todo item(s):",
-        open.len()
-    ));
-    for (content, status) in open {
+    let mut lines = vec!["<system-reminder>".to_owned()];
+    for (content, status) in open.iter().filter(|(_, status)| is_open(status)) {
         lines.push(format!("  - {content} [{status}]"));
     }
-    lines.push(
-        "Continue working on these tasks, or mark them completed/cancelled if they are \
-         actually finished. Do not leave the list behind."
-            .to_owned(),
-    );
-    lines.push(format!("(Reminder {attempt}/{MAX_REMINDERS})"));
+    lines.push(format!("Continue working on these tasks, or mark them completed/cancelled if actually finished. (Reminder {attempt}/{MAX_REMINDERS})"));
     lines.push("</system-reminder>".to_owned());
     lines.join("\n")
 }
 
-/// Called when a turn ends naturally. Publishes one synthetic steer when open
-/// todo work remains and the budget allows; otherwise resets the budget (a
-/// finished or empty list starts the next list fresh). Every failure is logged
-/// and swallowed: a reminder is advisory and must never fail the turn.
+/// The caller reads live wake obligations BEFORE this function reads durable
+/// pending completions: the owner may commit and retire between those reads,
+/// but can never fall through the handoff gap.
 pub(crate) async fn on_turn_ended(db: &Db, bus: &ox_core::event_bus::EventBus, session_id: &str) {
-    let open = match todowrite::open_tasks(db, session_id).await {
-        Ok(open) => open,
-        Err(error) => {
-            tracing::debug!(session = %session_id, error = %error, "todo reminder: read failed");
-            return;
-        }
+    if let Err(error) = remind(db, bus, session_id).await {
+        tracing::warn!(session = session_id, %error, "todo reminder skipped");
+    }
+}
+
+async fn remind(db: &Db, bus: &ox_core::event_bus::EventBus, session: &str) -> Result<()> {
+    let external = pending_completion(db, session).await?;
+    let history = history(db, session).await?;
+    let text = crate::runner::step::last_assistant_text(db, session).await?;
+    let waiting = text.as_deref().is_some_and(awaits_user_answer);
+    let Decision::Remind(attempt) = decide(&history, external, waiting) else {
+        return Ok(());
     };
-    if open.is_empty() {
-        // Nothing open: the list is finished, empty, or absent — a fresh budget
-        // either way.
-        reset_reminder_budget(db, session_id).await;
-        return;
-    }
-
-    let attempt = match reminder_count(db, session_id).await {
-        Ok(count) => count + 1,
-        Err(error) => {
-            tracing::debug!(session = %session_id, error = %error, "todo reminder: count failed");
-            return;
-        }
-    };
-    if attempt > MAX_REMINDERS {
-        tracing::debug!(session = %session_id, attempt, "todo reminder: budget exhausted");
-        return;
-    }
-
-    // A stop that ends in a question is a hand-off, not an abandonment. The
-    // text read is best-effort; failing it only skips this reminder.
-    let waiting = match crate::runner::step::last_assistant_text(db, session_id).await {
-        Ok(Some(text)) => awaits_user_answer(&text),
-        _ => false,
-    };
-    if waiting {
-        tracing::debug!(session = %session_id, "todo reminder: waiting on user, skipping");
-        return;
-    }
-
-    if let Err(error) = set_reminder_count(db, session_id, attempt).await {
-        tracing::debug!(session = %session_id, error = %error, "todo reminder: save count failed");
-        return;
-    }
-
-    // The synthetic rides as a steer: the drain promotes it at the next turn
-    // boundary, ahead of queued work, which is exactly the reference's
-    // `scheduleAgentContinue` semantics.
-    let inbox_id = ox_schema::id::id("msg");
-    if let Err(error) = bus
-        .publish(SessionEventData::InboxEnqueued {
-            session_id: session_id.to_owned(),
-            inbox_id: inbox_id.clone(),
-            item: ox_schema::inbox::Item::Synthetic {
-                payload: ox_schema::inbox::SyntheticPayload {
-                    text: reminder_text(&open, attempt),
-                    description: None,
-                    metadata: Some(
-                        json!({ "source": "todo-reminder", "attempt": attempt })
-                            .as_object()
-                            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                            .unwrap_or_default(),
-                    ),
-                },
-                delivery: ox_schema::inbox::Delivery::Steer,
+    let metadata = json!({"source":"todo-reminder", "attempt":attempt, "epoch":history.epoch, "revision":history.revision});
+    bus.publish(SessionEventData::InboxEnqueued {
+        session_id: session.to_owned(),
+        inbox_id: ox_schema::id::id("msg"),
+        item: ox_schema::inbox::Item::Synthetic {
+            payload: ox_schema::inbox::SyntheticPayload {
+                text: reminder_text(&history.list, attempt),
+                description: Some(format!("todo reminder {attempt}/{MAX_REMINDERS}")),
+                metadata: Some(serde_json::from_value(metadata)?),
             },
-        })
-        .await
-    {
-        tracing::warn!(session = %session_id, error = %error, "todo reminder: enqueue failed");
-        return;
-    }
-    if let Err(error) = bus
-        .publish(SessionEventData::SessionSynthetic {
-            session_id: session_id.to_owned(),
-            text: String::new(),
-            description: Some(format!(
-                "todo reminder {attempt}/{MAX_REMINDERS} · {} open item{}",
-                open.len(),
-                if open.len() == 1 { "" } else { "s" }
-            )),
-            metadata: None,
-        })
-        .await
-    {
-        tracing::warn!(session = %session_id, error = %error, "todo reminder: notice failed");
-    }
+            delivery: ox_schema::inbox::Delivery::Steer,
+        },
+    })
+    .await?;
+    Ok(())
 }

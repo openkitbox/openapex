@@ -13,9 +13,9 @@ use crate::api::compat::envelope;
 use crate::api::state;
 use ox_tools::shell::sessions::{self, DEFAULT_PAGE_BYTES, ShellSessions};
 
-/// The process-wide table, shared with the shell tool.
-fn sessions() -> std::sync::Arc<ShellSessions> {
-    sessions::shared()
+/// The composition's table, shared with its shell tool.
+fn sessions(app: &crate::api::AppState) -> std::sync::Arc<ShellSessions> {
+    std::sync::Arc::clone(&app.services().tools.shells)
 }
 
 /// `GET /api/shell` — upstream `shell.list`: every running session in this
@@ -23,17 +23,17 @@ fn sessions() -> std::sync::Arc<ShellSessions> {
 /// `output`.
 #[handler] // operation_id: shell.list
 pub(crate) async fn list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let Some(_app) = state(depot, res) else {
+    let Some(app) = state(depot, res) else {
         return;
     };
     let directory = crate::api::compat::directory_of(req);
-    res.render(Json(envelope(&directory, json!(sessions().list()))));
+    res.render(Json(envelope(&directory, json!(sessions(app).list()))));
 }
 
 /// `GET /api/shell/{id}` — upstream `shell.get`.
 #[handler] // operation_id: shell.get
 pub(crate) async fn get(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let Some(_app) = state(depot, res) else {
+    let Some(app) = state(depot, res) else {
         return;
     };
     let Some(id) = req.param::<String>("id") else {
@@ -45,7 +45,7 @@ pub(crate) async fn get(req: &mut Request, depot: &mut Depot, res: &mut Response
         return;
     };
     let directory = crate::api::compat::directory_of(req);
-    match sessions().get(&id) {
+    match sessions(app).get(&id) {
         Some(session) => res.render(Json(envelope(&directory, json!(session.info())))),
         None => {
             res.status_code(StatusCode::NOT_FOUND);
@@ -63,7 +63,7 @@ pub(crate) async fn get(req: &mut Request, depot: &mut Depot, res: &mut Response
 /// currently ends (`size`).
 #[handler] // operation_id: shell.output
 pub(crate) async fn output(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let Some(_app) = state(depot, res) else {
+    let Some(app) = state(depot, res) else {
         return;
     };
     let Some(id) = req.param::<String>("id") else {
@@ -74,7 +74,7 @@ pub(crate) async fn output(req: &mut Request, depot: &mut Depot, res: &mut Respo
         })));
         return;
     };
-    let Some(session) = sessions().get(&id) else {
+    let Some(session) = sessions(app).get(&id) else {
         res.status_code(StatusCode::NOT_FOUND);
         res.render(Json(json!({
             "_tag": "ShellNotFoundError",
@@ -109,7 +109,7 @@ pub(crate) async fn output(req: &mut Request, depot: &mut Depot, res: &mut Respo
 /// `Shell.NotFoundError` to success, so the answer is 204 either way.
 #[handler] // operation_id: shell.remove
 pub(crate) async fn remove(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let Some(_app) = state(depot, res) else {
+    let Some(app) = state(depot, res) else {
         return;
     };
     let Some(id) = req.param::<String>("id") else {
@@ -120,7 +120,7 @@ pub(crate) async fn remove(req: &mut Request, depot: &mut Depot, res: &mut Respo
         })));
         return;
     };
-    let table = sessions();
+    let table = sessions(app);
     // Always `stop`, even for a settled session: `settled()` flips before the
     // exited notice goes out, and `stop` on a settled session only kills any
     // leftover background process group and waits for the announcement, so

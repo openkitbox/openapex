@@ -36,6 +36,27 @@ const SURFACE_BODY_CHARS: usize = 300;
 /// uses, for the same reason (a correction is a sentence; a paste is not).
 const SURFACE_TURN_CHARS: usize = 600;
 
+/// Directories whose pending notes have a condition to evaluate, independently
+/// of whether the project has ever produced a memory.
+pub(super) async fn projects_with_parked_notes(db: &Db) -> Result<Vec<String>> {
+    let conn = db.acquire().await?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT s.directory FROM mc_note n
+               JOIN session_v2 s ON s.id = n.session_id
+              WHERE n.status = 'pending'
+                AND n.surface_condition IS NOT NULL AND n.surface_condition <> ''
+              ORDER BY s.directory",
+        )
+        .await?;
+    let mut rows = stmt.query(()).await?;
+    let mut owners = Vec::new();
+    while let Some(row) = rows.next().await? {
+        owners.push(row.get(0)?);
+    }
+    Ok(owners)
+}
+
 // ---------------------------------------------------------------------------
 // surface_notes
 // ---------------------------------------------------------------------------

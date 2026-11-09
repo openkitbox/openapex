@@ -45,11 +45,13 @@ use super::sessions::{Completion, Status};
 /// A completion sink that also learns which session the shell belongs to.
 /// The tool binds the session id per background call, so the shell session table
 /// stays unaware of sessions.
-pub type SessionSink = Arc<dyn Fn(&str, Completion) + Send + Sync + 'static>;
+pub type SessionSink =
+    Arc<dyn Fn(&str, Completion) -> super::sessions::CompletionFuture + Send + Sync + 'static>;
 
 /// Wakes a session for a newly enqueued inbox item. Implemented by the
 /// runner; a trait here keeps the shell session table from depending on it.
 pub trait ShellWaker: Send + Sync {
+    fn try_admit(&self) -> Result<crate::contract::ExecutionAdmission, crate::contract::Closing>;
     fn dispatch<'a>(
         &'a self,
         session_id: &'a str,
@@ -65,6 +67,8 @@ pub struct ShellCompletion {
     /// `None` until the runner attaches; a completion without a waker is
     /// dropped (fail closed) rather than persisted and left undelivered.
     waker: OnceLock<Arc<dyn ShellWaker>>,
+    wakes_closed: std::sync::atomic::AtomicBool,
+    deliveries: crate::contract::TaskOwner,
 }
 
 impl ShellCompletion {
@@ -74,7 +78,19 @@ impl ShellCompletion {
             db,
             bus,
             waker: OnceLock::new(),
+            wakes_closed: std::sync::atomic::AtomicBool::new(false),
+            deliveries: crate::contract::TaskOwner::default(),
         }
+    }
+
+    pub fn close_wakes(&self) {
+        self.wakes_closed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub async fn seal_and_join(&self) -> anyhow::Result<()> {
+        self.close_wakes();
+        self.deliveries.seal_and_join().await
     }
 
     /// The waker connecting completions to the runner. Registering twice keeps
@@ -83,19 +99,34 @@ impl ShellCompletion {
         let _ = self.waker.set(waker);
     }
 
-    /// The sink handed to the `shell` tool. Each completion returns at once:
-    /// persistence and wake-up run on a spawned task, so the drive loop that
-    /// publishes the terminal state never waits on the database.
+    /// The sink returns a future through persistence and wake-up. ShellSession
+    /// owns its execution and retains completion-gate debt until it returns;
+    /// the process drive loop never waits on the database.
     pub fn sink(self: &Arc<Self>) -> SessionSink {
         let this = Arc::clone(self);
         Arc::new(move |session_id: &str, completion: Completion| {
             let this = Arc::clone(&this);
             let session_id = session_id.to_owned();
-            tokio::spawn(async move {
+            let (reply, result) = tokio::sync::oneshot::channel();
+            let owner = this.deliveries.clone();
+            if this.wakes_closed.load(std::sync::atomic::Ordering::Acquire) {
+                return Box::pin(async {});
+            }
+            let registered = owner.spawn(async move {
                 let payload = payload(&completion);
                 this.enqueue_and_wake(&session_id, &completion.id, payload)
                     .await;
+                let _ = reply.send(());
             });
+            Box::pin(async move {
+                if let Err(error) = registered {
+                    tracing::error!(%error, "shell completion registration closed");
+                    return;
+                }
+                if result.await.is_err() {
+                    tracing::error!("shell completion task failed");
+                }
+            })
         })
     }
 
@@ -126,6 +157,9 @@ impl ShellCompletion {
         };
         if let Err(error) = self.bus.publish(enqueued).await {
             tracing::warn!(parent = %session_id, shell = %shell_id, error = %error, "unable to enqueue shell completion");
+            return;
+        }
+        if self.wakes_closed.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
         if let Err(error) = waker.dispatch(session_id, &inbox_id).await {

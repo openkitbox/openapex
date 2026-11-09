@@ -8,16 +8,17 @@
 //!   model retrieved within [`UNCONFIRMED_TTL`]. They never rode a request;
 //!   archiving them is bookkeeping, not forgetting.
 //! - **Confirmed historian facts** that nothing has touched — no write, no
-//!   verification, no retrieval, no citation — for [`UNUSED_TTL`]. A fact a
-//!   project went half a year without needing is a fact the historian can
-//!   extract again if the project ever needs it.
+//!   verification, no retrieval, no citation — for [`UNUSED_TTL`]. Periodic
+//!   verification (including SKIP) touches this existing expiry clock.
 //!
 //! Rows written on purpose (`ctx_memory`, a retrospective, a merge) never
 //! expire: a person or a task decided they matter, and only a person or a
-//! verdict should retire them. Archiving is reversible (`archive_reason`
-//! names this task), and archived rows still count as dedup hits for the
-//! promotion pass, so an expired fact the historian sees again bumps the
-//! archived row instead of resurrecting a duplicate.
+//! verdict should retire them. Archival is sticky: expired, manually archived,
+//! verify/curate-archived and merged rows all remain archived on later automatic
+//! extraction. Archived rows still count as promotion dedup hits; a repeated
+//! fact only bumps the archived row, never reactivates it or inserts a duplicate.
+//! `archive_reason` identifies the decision; it does not enable restoration.
+//! There is no restore API here.
 //!
 //! Reference: codex's `memories` prune — a 30-day usage window with the
 //! usage counted from the model's own citations — reduced to ox's columns.

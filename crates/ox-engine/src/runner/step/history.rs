@@ -167,6 +167,30 @@ pub(crate) async fn load_overlaid_tail(
     rows.into_iter().map(decode_row_owned).collect()
 }
 
+/// The request tail using locally planned tags and locally applied preview drops.
+pub(super) async fn preview_overlaid_tail(
+    db: &ox_db::Db,
+    session_id: &str,
+    floor: i64,
+    applied: &[u64],
+) -> Result<Vec<Message>> {
+    let mut rows = rows_after(db, session_id, floor).await?;
+    let tags = crate::mctx::tagger::Tagger
+        .preview(db, session_id, &rows)
+        .await?;
+    let mut drops = crate::mctx::tagger::drops(db, session_id).await?;
+    for tag in applied {
+        drops.insert(*tag, crate::mctx::tagger::DropState::Applied);
+    }
+    crate::mctx::tagger::apply_overlay(
+        &mut rows,
+        &tags,
+        &drops,
+        crate::mctx::tagger::OverlayMode::Request,
+    );
+    rows.into_iter().map(decode_row_owned).collect()
+}
+
 /// As [`load_overlaid_tail`], but every message keeps the ordinal it was loaded
 /// at.
 ///

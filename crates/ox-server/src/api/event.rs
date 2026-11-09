@@ -51,6 +51,7 @@
 //! subscriber overflow; reconnect-with-cursor is ox's repair path).
 
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -124,7 +125,17 @@ pub(crate) async fn subscribe(req: &mut Request, depot: &mut Depot, res: &mut Re
     let bus: EventBus = state.bus.clone();
     // Guard against a zero interval spinning the select loop.
     let period = Duration::from_millis(state.services().config.event_heartbeat_ms.max(1));
-    stream(res, bus, period, cursor, None, true, true).await;
+    stream(
+        res,
+        bus,
+        period,
+        cursor,
+        None,
+        true,
+        true,
+        state.runtime.clone(),
+    )
+    .await;
 }
 
 /// `GET /api/experimental/session/{sessionID}/log` — the session-scoped durable
@@ -179,6 +190,7 @@ pub(crate) async fn log(req: &mut Request, depot: &mut Depot, res: &mut Response
         Some(session_id),
         false,
         follow,
+        state.runtime.clone(),
     )
     .await;
 }
@@ -207,6 +219,7 @@ async fn stream(
     only: Option<String>,
     connected: bool,
     follow: bool,
+    runtime: Arc<crate::runtime::Runtime>,
 ) {
     // Subscribe to the broadcast BEFORE the replay query runs (in the task
     // below): anything committed while the replay reads is buffered here and
@@ -214,7 +227,7 @@ async fn stream(
     let mut live = bus.subscribe();
     let (tx, rx) = mpsc::channel::<String>(BODY_CHANNEL_CAPACITY);
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         // Upstream sends `server.connected` immediately on connect (no
         // `created` field on this frame).
         if connected {
@@ -313,6 +326,11 @@ async fn stream(
             }
         }
     });
+    if let Err(task) = runtime.adopt(task)
+        && let Err(error) = task.await
+    {
+        tracing::debug!(%error, "event stream task ended after shutdown sealed ownership");
+    }
 
     sse_stream(res, rx);
 }

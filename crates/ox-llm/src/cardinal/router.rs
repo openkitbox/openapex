@@ -41,6 +41,7 @@ pub(crate) struct Candidate {
 /// Ordered candidate routing over the configured endpoints. One per process,
 /// built at the composition root; stateless per request.
 pub struct EndpointRouter {
+    resolver: crate::config::Routes,
     /// `[models.<id>]` candidates in configured order.
     routes: BTreeMap<String, Vec<Candidate>>,
     /// One candidate per credential-resolved builtin, with the table row that
@@ -129,6 +130,7 @@ impl EndpointRouter {
             None
         };
         Ok(Self {
+            resolver: crate::config::Routes::new(config),
             routes,
             builtins,
             passthrough,
@@ -139,27 +141,19 @@ impl EndpointRouter {
     /// that owns its namespace, else the passthrough endpoint, else `NoRoute`.
     /// Never returns an empty list.
     pub(crate) fn candidates_for(&self, model: &str) -> Result<&[Candidate], ChatError> {
-        if let Some(route) = self.routes.get(model)
-            && !route.is_empty()
-        {
-            return Ok(route);
+        match self.resolver.resolve(model) {
+            crate::config::Targets::Explicit(_) => self.routes.get(model).map(Vec::as_slice),
+            crate::config::Targets::Endpoint { provider, .. } => self
+                .builtins
+                .iter()
+                .find(|(candidate, _)| candidate.provider == provider)
+                .map(|(candidate, _)| std::slice::from_ref(candidate))
+                .or_else(|| self.passthrough.as_ref().map(std::slice::from_ref)),
+            crate::config::Targets::NoRoute => None,
         }
-        // Ownership comes after an explicit route (the operator's mapping wins)
-        // and before the passthrough endpoint (a materialized builtin exists
-        // only because its own key was supplied).
-        if let Some((candidate, _)) = self
-            .builtins
-            .iter()
-            .find(|(_, builtin)| builtin.owns(model))
-        {
-            return Ok(std::slice::from_ref(candidate));
-        }
-        match &self.passthrough {
-            Some(candidate) => Ok(std::slice::from_ref(candidate)),
-            None => Err(ChatError::NoRoute {
-                model: model.to_owned(),
-            }),
-        }
+        .ok_or_else(|| ChatError::NoRoute {
+            model: model.to_owned(),
+        })
     }
 }
 

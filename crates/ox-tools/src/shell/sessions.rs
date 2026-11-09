@@ -317,7 +317,7 @@ pub struct ShellSession {
     completion: Option<CompletionCallback>,
     /// Decides, together with the terminal state, whether the completion is
     /// delivered. Always locked BEFORE `exit` (see [`ShellSession::publish_terminal`]).
-    gate: Mutex<Gate>,
+    gate: Arc<Mutex<Gate>>,
     stop_requested: AtomicBool,
     /// Set once `publish_terminal` has delivered the exited notice (and the
     /// completion). `settled` flips a moment earlier; `stop` waits for this
@@ -352,7 +352,8 @@ pub struct ShellSession {
 /// be observed apart:
 ///
 /// - `Armed`: the model was told this run is in the background; the settle
-///   delivers the completion (`Sent`).
+///   hands off to `Delivering`, retained until the sink returns after durable
+///   commit or explicit failure. Only then does the gate become `Sent`.
 /// - `Held`: a foreground run still inside its yield window. Settling here
 ///   means the tool returns the result inline, so nothing is delivered
 ///   (`Quiet`); being handed back first makes it `Armed`.
@@ -361,6 +362,7 @@ pub struct ShellSession {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Gate {
     Armed,
+    Delivering,
     Held,
     Quiet,
     Sent,
@@ -395,7 +397,8 @@ pub struct Completion {
 }
 
 /// Receives one completion for each session that reaches a terminal state.
-pub type CompletionCallback = Arc<dyn Fn(Completion) + Send + Sync + 'static>;
+pub type CompletionFuture = std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+pub type CompletionCallback = Arc<dyn Fn(Completion) -> CompletionFuture + Send + Sync + 'static>;
 
 /// The session a run belongs to (upstream stores `{ sessionID }` in
 /// `Shell.Info.metadata`; the directory is the location its events carry).
@@ -548,14 +551,14 @@ impl ShellSession {
             }
             match *gate {
                 Gate::Armed => {
-                    *gate = Gate::Sent;
+                    *gate = Gate::Delivering;
                     true
                 }
                 Gate::Held => {
                     *gate = Gate::Quiet;
                     false
                 }
-                Gate::Quiet | Gate::Sent => false,
+                Gate::Quiet | Gate::Sent | Gate::Delivering => false,
             }
         };
         self.clear_deadline();
@@ -593,7 +596,7 @@ impl ShellSession {
                 HandBack::Background
             }
             Gate::Quiet => HandBack::Settled,
-            Gate::Armed | Gate::Sent => HandBack::Background,
+            Gate::Armed | Gate::Sent | Gate::Delivering => HandBack::Background,
         }
     }
 
@@ -612,8 +615,15 @@ impl ShellSession {
         }
     }
 
-    /// Whether this session reports its completion through a sink. Such a
-    /// session needs no polling: the model is notified when it settles.
+    /// Whether the completion gate still owes durable notification.
+    fn owes_wakeup(&self) -> bool {
+        matches!(
+            *self.gate.lock().unwrap_or_else(|p| p.into_inner()),
+            Gate::Armed | Gate::Delivering
+        )
+    }
+
+    /// Whether this session reports its completion through a sink.
     pub fn notifies_on_completion(&self) -> bool {
         self.completion.is_some()
     }
@@ -658,11 +668,24 @@ impl ShellSession {
             output: self.recent(super::MAX_BYTES),
             truncated: self.size() > super::MAX_BYTES as u64,
         };
-        // A panicking sink must not unwind through `drive`: the session is
-        // already settled, and the rest of finalization (waking waiters) still
-        // has to run.
-        if std::panic::catch_unwind(AssertUnwindSafe(move || callback(completion))).is_err() {
-            tracing::error!(id = %self.id, "shell completion callback panicked");
+        let delivery = callback(completion);
+        let gate = Arc::clone(&self.gate);
+        let Some(table) = self.table.upgrade() else {
+            tracing::error!(id = %self.id, "shell delivery lost its owner");
+            return;
+        };
+        if let Err(error) = table.deliveries.spawn(async move {
+            // Drop also releases the obligation on explicit failure/cancellation.
+            struct DeliveryGuard(Arc<Mutex<Gate>>);
+            impl Drop for DeliveryGuard {
+                fn drop(&mut self) {
+                    *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Gate::Sent;
+                }
+            }
+            let _guard = DeliveryGuard(gate);
+            delivery.await;
+        }) {
+            tracing::error!(%error, "shell delivery registration failed");
         }
     }
 
@@ -694,7 +717,26 @@ impl ShellSession {
     /// group is gone but its id is not yet reused: a group that dies and is
     /// reassigned before any probe runs is indistinguishable from ours, so
     /// that narrow window remains.
-    pub async fn stop(&self, force: bool) {
+    pub async fn stop(self: &Arc<Self>, force: bool) {
+        let Some(table) = self.table.upgrade() else {
+            tracing::error!(id = %self.id, "shell stop lost its domain owner");
+            return;
+        };
+        let session = Arc::clone(self);
+        let (done, wait) = tokio::sync::oneshot::channel();
+        if let Err(error) = table.stops.spawn(async move {
+            session.stop_owned(force).await;
+            let _ = done.send(());
+        }) {
+            tracing::error!(%error, "shell stop registration failed");
+            return;
+        }
+        if let Err(error) = wait.await {
+            tracing::error!(%error, "shell stop task failed");
+        }
+    }
+
+    async fn stop_owned(&self, force: bool) {
         if self.settled() {
             self.stop_settled_group(force).await;
             self.wait_announced().await;
@@ -822,6 +864,14 @@ pub struct SpawnRequest {
 /// The process-wide session table, cloned as an `Arc` by the tool and the API.
 pub struct ShellSessions {
     sessions: Mutex<HashMap<String, Arc<ShellSession>>>,
+    closed: Mutex<bool>,
+    tasks: crate::contract::TaskOwner,
+    deliveries: crate::contract::TaskOwner,
+    pumps: crate::contract::TaskOwner,
+    stops: crate::contract::TaskOwner,
+    shutdown_started: Mutex<bool>,
+    shutdown_task: crate::contract::TaskOwner,
+    shutdown_error: Mutex<Option<String>>,
     /// Where lifecycle notices go. The composition root installs the event
     /// bridge; the table itself knows nothing about the bus.
     observer: Mutex<Option<Observer>>,
@@ -846,6 +896,14 @@ impl ShellSessions {
             .map_or_else(|| "sh".into(), |name| name.to_string_lossy());
         Self {
             sessions: Mutex::default(),
+            closed: Mutex::new(false),
+            tasks: crate::contract::TaskOwner::default(),
+            deliveries: crate::contract::TaskOwner::default(),
+            pumps: crate::contract::TaskOwner::default(),
+            stops: crate::contract::TaskOwner::default(),
+            shutdown_started: Mutex::new(false),
+            shutdown_task: crate::contract::TaskOwner::default(),
+            shutdown_error: Mutex::new(None),
             observer: Mutex::default(),
             shell_name: Arc::from(shell_name.as_ref()),
             shell,
@@ -869,6 +927,10 @@ impl ShellSessions {
     /// Spawn one session and start capturing its output. The caller decides
     /// how long to wait before returning control to the model.
     pub fn spawn(self: &Arc<Self>, request: SpawnRequest) -> std::io::Result<Arc<ShellSession>> {
+        let closed = self.closed.lock().unwrap_or_else(|p| p.into_inner());
+        if *closed {
+            return Err(std::io::Error::other("shell admission is closed"));
+        }
         let (events, _) = broadcast::channel(32);
         let spawned = process::spawn(&self.shell, &request.command, &request.cwd)?;
         let session = Arc::new(ShellSession {
@@ -883,11 +945,13 @@ impl ShellSessions {
             shell_name: Arc::clone(&self.shell_name),
             changed: Notify::new(),
             events: events.clone(),
-            gate: Mutex::new(match (request.completion.is_some(), request.foreground) {
-                (false, _) => Gate::Sent,
-                (true, true) => Gate::Held,
-                (true, false) => Gate::Armed,
-            }),
+            gate: Arc::new(Mutex::new(
+                match (request.completion.is_some(), request.foreground) {
+                    (false, _) => Gate::Sent,
+                    (true, true) => Gate::Held,
+                    (true, false) => Gate::Armed,
+                },
+            )),
             completion: request.completion,
             stop_requested: AtomicBool::new(false),
             announced: AtomicBool::new(false),
@@ -903,11 +967,13 @@ impl ShellSessions {
             table: Arc::downgrade(self),
         });
         if let Some(timeout) = request.timeout_ms.filter(|timeout| *timeout > 0) {
-            let handle = tokio::spawn(deadline_timer(
-                Arc::downgrade(&session),
-                std::time::Duration::from_millis(timeout),
-            ))
-            .abort_handle();
+            let handle = self
+                .tasks
+                .spawn_with_handle(deadline_timer(
+                    Arc::downgrade(&session),
+                    std::time::Duration::from_millis(timeout),
+                ))
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
             *session
                 .deadline
                 .lock()
@@ -927,7 +993,10 @@ impl ShellSessions {
         // Announce before the driver starts: a command that exits at once must
         // not publish `exited` ahead of `created`.
         session.notify(Notice::Created(Box::new(session.info())));
-        tokio::spawn(drive(Arc::clone(&session), spawned));
+        self.tasks
+            .spawn(drive(Arc::clone(&session), spawned))
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        drop(closed);
         Ok(session)
     }
 
@@ -936,6 +1005,21 @@ impl ShellSessions {
             .lock()
             .ok()
             .and_then(|table| table.get(id).cloned())
+    }
+
+    /// Includes settled shells whose sink has not finished durable admission.
+    pub fn owes_wakeup(&self, owner: &str) -> bool {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .any(|session| {
+                session
+                    .owner
+                    .as_ref()
+                    .is_some_and(|entry| entry.session_id == owner)
+                    && session.owes_wakeup()
+            })
     }
 
     /// Every running session, oldest first (upstream `Shell.list`). Settled
@@ -964,7 +1048,7 @@ impl ShellSessions {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match table.get(id) {
-                Some(session) if !session.settled() => return false,
+                Some(session) if !session.settled() || session.owes_wakeup() => return false,
                 Some(_) => table.remove(id),
                 None => return false,
             }
@@ -1018,7 +1102,51 @@ impl ShellSessions {
     /// Their completions are silenced first: a turn woken while ox exits is
     /// paid for and cut off. Sessions stay in the table. The stops run
     /// concurrently, so the whole call is bounded by one [`STOP_GRACE`].
-    pub async fn shutdown(&self) {
+    /// Close process admission and silence only notifications not yet started.
+    pub fn close(&self) {
+        let mut closed = self.closed.lock().unwrap_or_else(|p| p.into_inner());
+        *closed = true;
+        let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        for session in sessions.values() {
+            session.silence();
+        }
+    }
+
+    pub async fn shutdown(self: &Arc<Self>) {
+        if let Err(error) = self.stop_all_and_join().await {
+            tracing::error!(%error, "shell shutdown failed");
+        }
+    }
+
+    /// Wait for a previously closed shell domain; cancellation only drops a waiter.
+    pub async fn stop_all_and_join(self: &Arc<Self>) -> anyhow::Result<()> {
+        self.close();
+        {
+            let mut started = self
+                .shutdown_started
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if !*started {
+                let table = Arc::clone(self);
+                self.shutdown_task.spawn(async move {
+                    table.finish_shutdown().await;
+                })?;
+                *started = true;
+            }
+        }
+        self.shutdown_task.seal_and_join().await?;
+        match self
+            .shutdown_error
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            Some(error) => Err(anyhow::anyhow!("{error}")),
+            None => Ok(()),
+        }
+    }
+
+    async fn finish_shutdown(&self) {
         let live: Vec<Arc<ShellSession>> = self
             .sessions
             .lock()
@@ -1031,6 +1159,16 @@ impl ShellSessions {
             session.silence();
         }
         stop_concurrently(&live).await;
+        let stops = self.stops.seal_and_join().await;
+        let tasks = self.tasks.seal_and_join().await;
+        let pumps = self.pumps.seal_and_join().await;
+        let deliveries = self.deliveries.seal_and_join().await;
+        if let Err(error) = stops.and(tasks).and(pumps).and(deliveries) {
+            *self
+                .shutdown_error
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(error.to_string());
+        }
     }
 
     /// Bound the settled history: drop sessions settled longer than
@@ -1068,7 +1206,7 @@ impl ShellSessions {
                 .map(|session| SettledCapture {
                     completed: session.exit().completed.unwrap_or_default(),
                     retained: session.retained(),
-                    pinned: session.group_alive(),
+                    pinned: session.group_alive() || session.owes_wakeup(),
                 })
                 .collect();
             let plan = eviction_plan(&captures, now_ms);
@@ -1096,27 +1234,27 @@ impl ShellSessions {
     }
 }
 
-/// The process-wide session table. The tool and the `/api/shell` handlers
-/// share one instance, so a session the model started is the session a client
-/// can list and page.
-pub fn shared() -> Arc<ShellSessions> {
-    static TABLE: std::sync::OnceLock<Arc<ShellSessions>> = std::sync::OnceLock::new();
-    TABLE.get_or_init(|| Arc::new(ShellSessions::new())).clone()
-}
-
 /// Run `stop(false)` on every session at once and wait for all of them, so
 /// the total wait is one [`STOP_GRACE`] however many there are. Each stop is
 /// a detached task: if the caller is dropped mid-grace (a client hangs up on
 /// `DELETE`), the stops still escalate to SIGKILL. Each task owns one `Arc`
 /// clone; no session data is copied.
 async fn stop_concurrently(sessions: &[Arc<ShellSession>]) {
-    let stops: Vec<tokio::task::JoinHandle<()>> = sessions
-        .iter()
-        .map(|session| {
-            let session = Arc::clone(session);
-            tokio::spawn(async move { session.stop(false).await })
-        })
-        .collect();
+    let mut stops = Vec::new();
+    for session in sessions {
+        let Some(table) = session.table.upgrade() else {
+            continue;
+        };
+        let session = Arc::clone(session);
+        let (reply, result) = tokio::sync::oneshot::channel();
+        match table.stops.spawn(async move {
+            session.stop_owned(false).await;
+            let _ = reply.send(());
+        }) {
+            Ok(()) => stops.push(result),
+            Err(error) => tracing::error!(%error, "shell stop registration failed"),
+        }
+    }
     for stop in stops {
         if let Err(error) = stop.await {
             tracing::error!(%error, "shell stop task failed");
@@ -1181,7 +1319,11 @@ async fn drive(session: Arc<ShellSession>, spawned: Spawned) {
         mut reader,
         ..
     } = spawned;
-    let mut pump = tokio::spawn({
+    let Some(table) = session.table.upgrade() else {
+        return;
+    };
+    let (pump_done, mut pump) = tokio::sync::oneshot::channel();
+    let registration = table.pumps.spawn({
         let session = Arc::clone(&session);
         async move {
             let result = process::pump(&mut reader, |chunk| {
@@ -1194,16 +1336,21 @@ async fn drive(session: Arc<ShellSession>, spawned: Spawned) {
             if let Ok(mut buffer) = session.output.lock() {
                 buffer.shrink_to_retained();
             }
-            result
+            let _ = pump_done.send(result);
         }
     });
+    drop(table);
+    if let Err(error) = registration {
+        tracing::error!(%error, "shell pump registration failed");
+        return;
+    }
 
     let waited = child.wait().await;
     // The shell is gone: a deadline firing now would kill background
     // children that are meant to outlive the call.
     session.clear_deadline();
     // Whatever is already in the pipe arrives within the grace; a background
-    // child that keeps the pipe open is left to the detached pump.
+    // child that keeps the pipe open remains owned by the domain pump supervisor.
     let _ = tokio::time::timeout(DRAIN_GRACE, &mut pump).await;
 
     // Recorded before the terminal state is published: from then on `stop`

@@ -14,7 +14,7 @@ use super::schedule::Fingerprint;
 pub enum DreamTask {
     /// Archive historian facts nobody confirmed or used (no model call).
     Expire,
-    /// Re-check memories whose referenced files are newer (or missing, if never verified).
+    /// Re-check newer referenced files and periodically reconsider missing ones.
     Verify,
     /// Duplicate/stale consolidation of one memory category.
     Curate,

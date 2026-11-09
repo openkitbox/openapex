@@ -57,8 +57,12 @@ pub struct Calibration {
 impl Calibration {
     /// The ratio to scale local counts by: `1.0` until the first sample.
     #[must_use]
-    pub fn ratio(&self) -> f64 {
-        if self.samples == 0 { 1.0 } else { self.ratio }
+    pub fn ratio(&self, model: &str) -> f64 {
+        if self.samples == 0 || self.model.as_deref() != Some(model) {
+            1.0
+        } else {
+            self.ratio
+        }
     }
 
     /// Whether one more observation would still move the ratio for `model`.
@@ -105,8 +109,10 @@ pub(crate) type Store =
     std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Calibration>>>;
 
 /// The session's ratio, `1.0` when unmeasured.
-pub(crate) fn ratio_for(store: &Store, session_id: &str) -> f64 {
-    lock(store).get(session_id).map_or(1.0, Calibration::ratio)
+pub(crate) fn ratio_for(store: &Store, session_id: &str, model: &str) -> f64 {
+    lock(store)
+        .get(session_id)
+        .map_or(1.0, |calibration| calibration.ratio(model))
 }
 
 /// Whether the session still needs an observation for `model` (cheap check,

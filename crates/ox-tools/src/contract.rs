@@ -14,6 +14,200 @@ use tokio_util::sync::CancellationToken;
 
 use ox_schema::wire::ToolDef;
 
+/// Completion owner shared by a domain's task registration sites. The unique
+/// supervisor holds handles; tasks only retain this registration endpoint.
+#[derive(Clone, Default)]
+pub struct TaskOwner {
+    state: Arc<std::sync::Mutex<TaskState>>,
+}
+
+type TaskCompletion = tokio::sync::watch::Receiver<Option<Result<(), Arc<str>>>>;
+
+#[derive(Default)]
+struct TaskState {
+    sealed: bool,
+    sender: Option<tokio::sync::mpsc::UnboundedSender<tokio::task::JoinHandle<()>>>,
+    result: Option<TaskCompletion>,
+}
+
+impl TaskOwner {
+    /// Register and start atomically with respect to sealing.
+    pub fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) -> Result<()> {
+        self.spawn_with_handle(future).map(|_| ())
+    }
+
+    pub fn spawn_with_handle(
+        &self,
+        future: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<tokio::task::AbortHandle> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.sealed {
+            bail!("task registration is closed");
+        }
+        if state.sender.is_none() {
+            let (sender, mut receiver) =
+                tokio::sync::mpsc::unbounded_channel::<tokio::task::JoinHandle<()>>();
+            let (done, result) = tokio::sync::watch::channel(None);
+            // This supervisor never owns the registration endpoint or the domain.
+            tokio::spawn(async move {
+                let mut pending = tokio::task::JoinSet::new();
+                let mut error: Option<Arc<str>> = None;
+                loop {
+                    tokio::select! {
+                        handle = receiver.recv() => match handle {
+                            Some(handle) => { pending.spawn(handle); }
+                            None => break,
+                        },
+                        result = pending.join_next(), if !pending.is_empty() => {
+                            record_task_result(result, &mut error);
+                        }
+                    }
+                }
+                while let Some(result) = pending.join_next().await {
+                    record_task_result(Some(result), &mut error);
+                }
+                done.send_replace(Some(error.map_or(Ok(()), Err)));
+            });
+            state.sender = Some(sender);
+            state.result = Some(result);
+        }
+        let sender = state.sender.as_ref().expect("supervisor initialized above");
+        let handle = tokio::spawn(future);
+        let abort = handle.abort_handle();
+        sender
+            .send(handle)
+            .map_err(|_| anyhow::anyhow!("task supervisor stopped"))?;
+        Ok(abort)
+    }
+
+    /// Seal only after every producer has ended. Waiting is cancellation safe:
+    /// callers observe a watch value, never take ownership of task handles.
+    pub async fn seal_and_join(&self) -> Result<()> {
+        let result = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.sealed = true;
+            state.sender.take();
+            state.result.clone()
+        };
+        let Some(mut result) = result else {
+            return Ok(());
+        };
+        loop {
+            if let Some(done) = result.borrow_and_update().as_ref() {
+                return done.clone().map_err(|error| anyhow::anyhow!("{error}"));
+            }
+            result
+                .changed()
+                .await
+                .map_err(|_| anyhow::anyhow!("task supervisor lost its completion result"))?;
+        }
+    }
+}
+
+fn record_task_result(
+    result: Option<Result<Result<(), tokio::task::JoinError>, tokio::task::JoinError>>,
+    first_error: &mut Option<Arc<str>>,
+) {
+    let error = match result {
+        Some(Ok(Ok(()))) | None => return,
+        Some(Ok(Err(error))) if error.is_cancelled() => return,
+        Some(Ok(Err(error)) | Err(error)) => error,
+    };
+    tracing::error!(%error, "owned task failed");
+    if first_error.is_none() {
+        *first_error = Some(Arc::from(error.to_string()));
+    }
+}
+
+/// Execution admission has closed; durable pending work remains pending.
+#[derive(Debug, Clone, Copy)]
+pub struct Closing;
+
+impl std::fmt::Display for Closing {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("execution admission is closed")
+    }
+}
+
+impl std::error::Error for Closing {}
+
+/// A short transaction admission, not a session execution-state mirror.
+pub struct ExecutionAdmission {
+    gate: AdmissionGate,
+}
+
+#[derive(Clone, Default)]
+pub struct AdmissionGate {
+    state: Arc<std::sync::Mutex<AdmissionState>>,
+    changed: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Default)]
+struct AdmissionState {
+    closed: bool,
+    admitted: usize,
+}
+
+impl AdmissionGate {
+    pub fn try_admit(&self) -> Result<ExecutionAdmission, Closing> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.closed {
+            return Err(Closing);
+        }
+        state.admitted += 1;
+        Ok(ExecutionAdmission { gate: self.clone() })
+    }
+
+    /// Run a synchronous registration under the same gate as close.
+    pub fn register<Output>(&self, register: impl FnOnce() -> Output) -> Result<Output, Closing> {
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.closed {
+            drop(state);
+            return Err(Closing);
+        }
+        Ok(register())
+    }
+
+    pub fn close(&self) {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).closed = true;
+        self.changed.notify_waiters();
+    }
+
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).closed
+    }
+
+    pub async fn wait(&self) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .admitted
+                == 0
+            {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl Drop for ExecutionAdmission {
+    fn drop(&mut self) {
+        self.gate
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .admitted -= 1;
+        self.gate.changed.notify_waiters();
+    }
+}
+
 /// Look a registered `subagent` tool's runner slot up; `None` until
 /// [`crate::register_subagent`] ran (see [`crate::subagent::SubagentHandle`]).
 pub type SubagentSlot = Option<std::sync::Arc<crate::subagent::SubagentHandle>>;
@@ -90,6 +284,10 @@ impl ToolOutput {
 /// A model-invocable unit of work. Task 7 registers real implementations;
 /// the runner only needs the name/definition seam plus one async entry.
 pub trait Tool: Send + Sync {
+    /// Whether this tool owns a future durable wake for the session.
+    fn owes_wakeup(&self, _session: &str) -> bool {
+        false
+    }
     /// Registry key; must equal `definition().function.name`.
     fn name(&self) -> &str;
     /// The OpenAI `tools` array entry advertised to the model.
@@ -103,6 +301,9 @@ pub trait Tool: Send + Sync {
         None
     }
     /// Run the tool with the parsed `arguments` object.
+    /// Cancellation is cooperative: callers must await this future through
+    /// cleanup and settlement, not drop or abort it. Once a file tool enters
+    /// its commit section it finishes the mutation and stamps before returning.
     fn execute(
         &self,
         ctx: ToolContext,
@@ -127,7 +328,14 @@ where
     F: FnOnce(&ToolContext, &Value) -> ToolOutput + Send + 'static,
 {
     Box::pin(async move {
-        match tokio::task::spawn_blocking(move || run(&ctx, &input)).await {
+        match tokio::task::spawn_blocking(move || {
+            if ctx.cancellation.is_cancelled() {
+                return crate::fail("Tool execution interrupted");
+            }
+            run(&ctx, &input)
+        })
+        .await
+        {
             Ok(output) => output,
             Err(error) => ToolOutput {
                 content: Value::Null,
@@ -157,6 +365,8 @@ pub struct ToolRegistry {
     /// The completion sink the registered `shell` tool reports through, so the
     /// runner can attach its waker the moment it exists.
     pub shell_completion: Option<std::sync::Arc<crate::shell::completion::ShellCompletion>>,
+    /// Composition-scoped process domain, shared by tools and HTTP handlers.
+    pub shells: Arc<crate::shell::sessions::ShellSessions>,
     /// Shared blocking-job registry; the server's `session.background`
     /// endpoint reaches the foreground tools' registrations through here.
     pub jobs: Arc<crate::jobs::Jobs>,
@@ -168,6 +378,14 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
+    /// Read live owners before the caller reads durable pending completions.
+    pub fn owes_wakeup(&self, session: &str) -> bool {
+        self.subagent_handle
+            .as_ref()
+            .is_some_and(|handle| handle.owes_wakeup(session))
+            || self.tools.values().any(|tool| tool.owes_wakeup(session))
+    }
+
     /// An empty registry.
     #[must_use]
     pub fn new() -> Self {
@@ -215,6 +433,7 @@ impl ToolRegistry {
             definitions_bytes_cache: std::sync::OnceLock::new(),
             subagent_handle: self.subagent_handle.clone(),
             shell_completion: self.shell_completion.clone(),
+            shells: Arc::clone(&self.shells),
             jobs: Arc::clone(&self.jobs),
             files: Arc::clone(&self.files),
         }
@@ -237,6 +456,7 @@ impl ToolRegistry {
             definitions_bytes_cache: std::sync::OnceLock::new(),
             subagent_handle: self.subagent_handle.clone(),
             shell_completion: self.shell_completion.clone(),
+            shells: Arc::clone(&self.shells),
             jobs: Arc::clone(&self.jobs),
             files: Arc::clone(&self.files),
         }

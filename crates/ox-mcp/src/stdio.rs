@@ -64,11 +64,19 @@ pub(crate) struct StdioRpc {
     pending: Arc<Mutex<Pending>>,
     protocol: Mutex<ProtocolMode>,
     next_id: AtomicU64,
-    child: Arc<Mutex<Option<Child>>>,
-    reader: JoinHandle<()>,
-    writer_task: JoinHandle<()>,
-    stderr: JoinHandle<()>,
+    /// The child and its three pipe tasks. Taken by [`Self::shutdown`] so they
+    /// can be awaited: abort alone asks the tasks to stop without proving the
+    /// pipes and the process are gone.
+    io: Arc<Mutex<Option<Io>>>,
     closed: Arc<AtomicBool>,
+}
+
+/// Everything one spawned child owns: the process and its pipe tasks.
+struct Io {
+    child: Child,
+    reader: JoinHandle<()>,
+    writer: JoinHandle<()>,
+    stderr: JoinHandle<()>,
 }
 
 impl StdioRpc {
@@ -230,10 +238,12 @@ impl StdioRpc {
             pending,
             protocol: Mutex::new(ProtocolMode::Legacy),
             next_id: AtomicU64::new(1),
-            child: Arc::new(Mutex::new(Some(child))),
-            reader,
-            writer_task,
-            stderr: stderr_task,
+            io: Arc::new(Mutex::new(Some(Io {
+                child,
+                reader,
+                writer: writer_task,
+                stderr: stderr_task,
+            }))),
             closed,
         })
     }
@@ -360,14 +370,28 @@ impl Rpc for StdioRpc {
     fn shutdown<'a>(&'a self) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             self.closed.store(true, Ordering::SeqCst);
-            let child = sync::lock(&self.child).take();
-            if let Some(mut child) = child {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-            }
-            self.reader.abort();
-            self.writer_task.abort();
-            self.stderr.abort();
+            let Some(Io {
+                mut child,
+                reader,
+                writer,
+                stderr,
+            }) = sync::lock(&self.io).take()
+            else {
+                return;
+            };
+            // Kill first, then reap: reaping closes the pipes, so the reader and
+            // stderr tasks reach EOF and the writer's next send fails instead of
+            // waiting on a channel that will never produce.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            // Abort only asks the tasks to stop; awaiting the handles is what
+            // proves the pipes no longer hold the child's fds.
+            reader.abort();
+            writer.abort();
+            stderr.abort();
+            let _ = reader.await;
+            let _ = writer.await;
+            let _ = stderr.await;
             for (_, sender) in sync::lock(&self.pending).drain() {
                 let _ = sender.send(Err(CallError::Closed));
             }
@@ -379,9 +403,9 @@ impl Drop for StdioRpc {
     fn drop(&mut self) {
         // `kill_on_drop` already covers the child; this makes the intent
         // explicit and reaps the process when the last tool handle goes away.
-        let child = sync::lock(&self.child).take();
-        if let Some(mut child) = child {
-            let _ = child.start_kill();
+        let io = sync::lock(&self.io).take();
+        if let Some(mut io) = io {
+            let _ = io.child.start_kill();
         }
     }
 }

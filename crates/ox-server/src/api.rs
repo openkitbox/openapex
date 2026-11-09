@@ -55,6 +55,9 @@ pub struct AppState {
     /// Embedding client shared by the memory tools and the coverage sweep; read
     /// only by the server's composer.
     pub(crate) embedder: Option<Arc<Embedder>>,
+    /// Composition-scoped shutdown owner. HTTP handlers use it to reject new
+    /// ingress, while the serve loop is its sole close/wait supervisor.
+    pub runtime: Arc<crate::runtime::Runtime>,
 }
 
 impl AppState {
@@ -63,6 +66,32 @@ impl AppState {
     #[must_use]
     pub fn services(&self) -> Arc<Services> {
         self.live.current()
+    }
+
+    /// The shell domain shared by the registry and HTTP handlers.
+    #[must_use]
+    pub fn shells(&self) -> Arc<ox_tools::shell::sessions::ShellSessions> {
+        Arc::clone(&self.services().tools.shells)
+    }
+
+    /// Whether this composition has closed HTTP ingress.
+    #[must_use]
+    pub fn is_closing(&self) -> bool {
+        self.runtime.is_closing()
+    }
+}
+
+/// A request is admitted only while the composition is open. This is a thin
+/// ingress check: execution admission remains the runner's responsibility.
+#[handler]
+async fn reject_when_closing(depot: &mut Depot, res: &mut Response, ctrl: &mut FlowCtrl) {
+    let Some(state) = state(depot, res) else {
+        ctrl.skip_rest();
+        return;
+    };
+    if state.is_closing() {
+        res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+        ctrl.skip_rest();
     }
 }
 
@@ -837,6 +866,7 @@ fn agent_info(agent: &'static ox_tools::agent::Agent) -> AgentInfo {
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         .hoop(affix_state::inject(state))
+        .hoop(reject_when_closing)
         // ox-only endpoints live beside `/api`, never under it, so upstream
         // opencode paths stay distinguishable.
         .push(
@@ -849,6 +879,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .push(
             Router::with_path("api")
+                .hoop(reject_when_closing)
                 .push(Router::with_path("info").get(server_info))
                 .push(
                     Router::with_path("location")

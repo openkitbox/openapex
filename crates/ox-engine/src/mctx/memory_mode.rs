@@ -81,16 +81,11 @@ impl Withheld {
     }
 }
 
-/// The `kv` key of a session's switch.
-fn key(session_id: &str) -> String {
-    format!("mctx_memory_mode:{session_id}")
-}
-
 /// Set the session's switch. `On` deletes the row (the default is implicit),
 /// `Off` writes it; both are idempotent.
 pub async fn set(db: &Db, session_id: &str, mode: MemoryMode) -> Result<()> {
     let conn = db.acquire().await?;
-    let key = key(session_id);
+    let key = ox_schema::support::memory_mode_key(session_id);
     match mode {
         MemoryMode::On => {
             conn.execute("DELETE FROM kv WHERE key = ?1", [key.as_str()])
@@ -118,9 +113,12 @@ pub async fn mode_of(db: &Db, session_id: &str) -> Result<MemoryMode> {
         .prepare("SELECT 1 FROM kv WHERE key = ?1")
         .await
         .context("read session memory mode")?;
-    let row = optional(&mut stmt, [key(session_id).as_str()])
-        .await
-        .context("read session memory mode")?;
+    let row = optional(
+        &mut stmt,
+        [ox_schema::support::memory_mode_key(session_id).as_str()],
+    )
+    .await
+    .context("read session memory mode")?;
     Ok(if row.is_some() {
         MemoryMode::Off
     } else {

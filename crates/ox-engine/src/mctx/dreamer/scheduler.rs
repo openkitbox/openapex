@@ -1,12 +1,12 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
 
-use crate::mctx::historian::{ModelChain, collect_completion};
+use crate::completion::collect_text;
+use crate::mctx::historian::{HISTORIAN_COMPLETION_TIMEOUT, ModelChain};
 use crate::mctx::memory;
-use crate::mctx::redact;
 use ox_core::config::Config;
 use ox_db::Db;
 use ox_llm::cardinal::chat::Chat;
@@ -23,7 +23,7 @@ use super::curate::{
 };
 use super::expire::run_expire;
 use super::retrospective::{
-    RETROSPECTIVE_SYSTEM_PROMPT, fact_recorded, parse_retrospective, render_retrospective_prompt,
+    RETROSPECTIVE_SYSTEM_PROMPT, parse_retrospective, render_retrospective_prompt,
     validate_retrospective_lesson,
 };
 use super::schedule::{
@@ -36,7 +36,7 @@ use super::surface_notes::{
 use super::task::{
     DreamTask, FailureClass, TaskEntry, TaskFailure, TaskOutcome, TickReport, TickStatus,
 };
-use super::turns::recent_user_turns;
+use super::turns::{TurnPurpose, recent_user_turns};
 use super::verify::{
     Candidate, VERIFY_MEMORY_LIMIT, VERIFY_SYSTEM_PROMPT, apply_verify_manifest, candidate,
     parse_verify_manifest, render_verify_prompt,
@@ -129,19 +129,26 @@ impl Dreamer {
     }
 
     /// Spawn the interval loop. The first tick fires immediately, then every
-    /// interval. The handle is detached on drop, which is what a process-wide
-    /// background loop wants.
+    /// interval. The returned handle is the composition's to await; `stop` is
+    /// observed only between ticks, so an inner tick that is already running is
+    /// always awaited instead of being dropped mid-commit.
     ///
     /// Each tick runs in its own task, so a panic is contained to that tick
     /// (the join reports it) instead of ending the loop: memory consolidation
     /// is background work, and a bug in one pass must not stop every later
     /// pass for the life of the process.
-    pub fn spawn(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+    pub fn spawn(
+        self: Arc<Self>,
+        stop: tokio_util::sync::CancellationToken,
+    ) -> tokio::task::JoinHandle<()> {
         let every = Duration::from_millis(self.interval_millis() as u64);
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(every);
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    () = stop.cancelled() => return,
+                    _ = ticker.tick() => {}
+                }
                 let dreamer = Arc::clone(&self);
                 let joined = tokio::spawn(async move { dreamer.tick(now_millis()).await }).await;
                 match joined {
@@ -175,11 +182,10 @@ impl Dreamer {
                 "dreamer: provider throttled recently; model-backed tasks deferred"
             );
         }
-        // Owners, not only projects: the user tier is listed like any other
-        // when it holds memories, and each task decides whether it applies.
-        let projects = memory::projects_with_active_memories(&self.db).await?;
-        for project in projects {
-            for task in DreamTask::ALL {
+        // Derive each task's owners from its authoritative input, not from a
+        // union that would run unrelated hygiene on notes/activity-only owners.
+        for (project, tasks) in self.task_owners().await? {
+            for task in tasks {
                 if !task.applies_to(&project) || (cooling.is_some() && task.needs_model()) {
                     continue;
                 }
@@ -251,6 +257,31 @@ impl Dreamer {
             }
         }
         Ok(report)
+    }
+
+    async fn task_owners(&self) -> Result<BTreeMap<String, Vec<DreamTask>>> {
+        let mut owners = BTreeMap::<String, Vec<DreamTask>>::new();
+        for owner in memory::projects_with_active_memories(&self.db).await? {
+            owners.entry(owner).or_default().extend([
+                DreamTask::Expire,
+                DreamTask::Verify,
+                DreamTask::Curate,
+                DreamTask::Classify,
+            ]);
+        }
+        for owner in super::turns::projects_with_eligible_activity(&self.db).await? {
+            owners
+                .entry(owner)
+                .or_default()
+                .push(DreamTask::Retrospective);
+        }
+        for owner in super::surface_notes::projects_with_parked_notes(&self.db).await? {
+            owners
+                .entry(owner)
+                .or_default()
+                .push(DreamTask::SurfaceNotes);
+        }
+        Ok(owners)
     }
 
     /// Claim `(project, task)` for this process, or `None` when it is already
@@ -349,6 +380,25 @@ impl Dreamer {
     /// output steps once down the [`ModelChain`] (the catalogue default, since
     /// a dream has no session).
     async fn complete(&self, system: &str, user_prompt: &str) -> Result<String, TaskFailure> {
+        // One budget for queueing, stream-open, all deltas and all fallbacks.
+        // Dropping the timed-out future also drops its live stream/permit.
+        tokio::time::timeout(
+            HISTORIAN_COMPLETION_TIMEOUT,
+            self.complete_chain(system, user_prompt),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(TaskFailure {
+                class: FailureClass::ProviderError,
+                message: format!(
+                    "dreamer completion chain timed out after {}s",
+                    HISTORIAN_COMPLETION_TIMEOUT.as_secs()
+                ),
+            })
+        })
+    }
+
+    async fn complete_chain(&self, system: &str, user_prompt: &str) -> Result<String, TaskFailure> {
         let chain = ModelChain::resolve(&self.config, &self.catalog, None).map_err(|error| {
             TaskFailure {
                 class: FailureClass::NoModels,
@@ -360,7 +410,7 @@ impl Dreamer {
             let request = dreamer_request(model, system, user_prompt);
             // Dreamer has no parent session policy; the request carries no
             // reasoning effort deliberately, leaving the provider's default.
-            match collect_completion(&self.chat, &request, "dreamer").await {
+            match collect_text(&self.chat, &request, "dreamer").await {
                 Ok(text) => break text,
                 Err(error) => {
                     let Some(next) = chain.next_after(model) else {
@@ -409,21 +459,26 @@ impl Dreamer {
     // -- verify -------------------------------------------------------------
 
     /// `verify`: candidates are memories whose referenced files are newer than
-    /// the memory's last check, or missing for a never-verified memory; only
-    /// then is one completion issued.
+    /// the memory's last check, or missing and due for a periodic recheck.
+    /// Oldest checks lead the bounded batch; only then is a completion issued.
     async fn run_verify(&self, project: &str, started_at: i64) -> TaskOutcome {
         let memories = match memory::active_memories_with_watermark(&self.db, project).await {
             Ok(memories) => memories,
             Err(error) => return TaskOutcome::Failed(TaskFailure::host("read memories", &error)),
         };
-        let candidates: Vec<Candidate> = memories
-            .iter()
-            .filter_map(|memory| candidate(project, memory))
+        // The store returns numeric id order. Stable sorting preserves that
+        // tie-break while keeping frequently changed files from starving old
+        // missing references. Inspect and own only candidates up to the cap.
+        let mut ordered: Vec<&memory::StoredMemory> = memories.iter().collect();
+        ordered.sort_by_key(|memory| memory.verified_at);
+        let batch: Vec<Candidate> = ordered
+            .into_iter()
+            .filter_map(|memory| candidate(project, memory, started_at))
+            .take(VERIFY_MEMORY_LIMIT)
             .collect();
-        let batch: Vec<Candidate> = candidates.into_iter().take(VERIFY_MEMORY_LIMIT).collect();
         if batch.is_empty() {
             return TaskOutcome::skipped(
-                "no memory cites a file that is missing or newer than it".to_owned(),
+                "no memory cites a newer file or a missing reference due for recheck".to_owned(),
             );
         }
         let prompt = render_verify_prompt(project, &batch);
@@ -578,11 +633,16 @@ impl Dreamer {
     /// turns and pay for the same answer again. Advancing the watermark is what
     /// makes a sweep a sweep.
     ///
-    /// The write goes through [`memory::write_memory`] — the same path
-    /// `ctx_memory` uses — so a lesson is an ordinary memory row (and changes
-    /// the pinboard exactly once, by design).
+    /// The write goes through [`memory::publish_lesson`], which rechecks source
+    /// eligibility and deduplicates inside the same memory write transaction.
     async fn run_retrospective(&self, project: &str, state: &DreamState) -> TaskOutcome {
-        let turns = match recent_user_turns(&self.db, project, state.last_run_at.unwrap_or(0)).await
+        let turns = match recent_user_turns(
+            &self.db,
+            project,
+            state.last_run_at.unwrap_or(0),
+            TurnPurpose::Retrospective,
+        )
+        .await
         {
             Ok(turns) => turns,
             Err(error) => {
@@ -592,7 +652,7 @@ impl Dreamer {
         if turns.is_empty() {
             return TaskOutcome::skipped("no recent user messages".to_owned());
         }
-        let prompt = render_retrospective_prompt(project, &turns);
+        let (prompt, source_sessions) = render_retrospective_prompt(project, &turns);
         let text = match self.complete(RETROSPECTIVE_SYSTEM_PROMPT, &prompt).await {
             Ok(text) => text,
             Err(failure) => return TaskOutcome::Failed(failure),
@@ -615,7 +675,7 @@ impl Dreamer {
         // That is a correct outcome, not a parse failure, so the tick
         // completes — and completes-without-write is also what advances the
         // watermark past a rejected window.
-        let source_turns: Vec<&str> = turns.iter().map(String::as_str).collect();
+        let source_turns: Vec<&str> = turns.iter().map(|turn| turn.text.as_str()).collect();
         if let Err(reason) = validate_retrospective_lesson(&lesson.content, &source_turns) {
             tracing::info!(
                 target: "mctx::dreamer",
@@ -624,21 +684,27 @@ impl Dreamer {
             );
             return TaskOutcome::completed(format!("rejected: {reason:?}"));
         }
-        // The store keeps the redacted text, so the exact-match dedup must
-        // compare the redacted form too; the write re-redacts it as a no-op.
-        let content = redact::redact_secrets(&lesson.content);
-        match fact_recorded(&self.db, project, &content).await {
-            Ok(false) => {}
-            Ok(true) => {
-                return TaskOutcome::completed("already recorded".to_owned());
+        match memory::publish_lesson(
+            &self.db,
+            project,
+            &lesson.content,
+            lesson.category,
+            &source_sessions,
+        )
+        .await
+        {
+            Ok(memory::LessonPublication::Recorded(id)) => {
+                TaskOutcome::completed(format!("recorded memory #{id}"))
             }
-            Err(error) => {
-                return TaskOutcome::Failed(TaskFailure::host("check recorded facts", &error));
+            Ok(memory::LessonPublication::AlreadyRecorded) => {
+                TaskOutcome::completed("already recorded".to_owned())
             }
-        }
-        match memory::write_memory(&self.db, project, &content, lesson.category).await {
-            Ok(id) => TaskOutcome::completed(format!("recorded memory #{id}")),
-            Err(error) => TaskOutcome::Failed(TaskFailure::host("write memory", &error)),
+            // Keep the successful watermark unchanged so still-eligible activity
+            // can be reconsidered without the now-private contributor.
+            Ok(memory::LessonPublication::Ineligible) => {
+                TaskOutcome::skipped("source session no longer eligible")
+            }
+            Err(error) => TaskOutcome::Failed(TaskFailure::host("publish lesson", &error)),
         }
     }
 
@@ -682,7 +748,13 @@ impl Dreamer {
         if batch.is_empty() {
             return TaskOutcome::skipped("no parked notes with a condition".to_owned());
         }
-        let turns = match recent_user_turns(&self.db, project, state.last_run_at.unwrap_or(0)).await
+        let turns = match recent_user_turns(
+            &self.db,
+            project,
+            state.last_run_at.unwrap_or(0),
+            TurnPurpose::NoteConditions,
+        )
+        .await
         {
             Ok(turns) => turns,
             Err(error) => {
@@ -694,7 +766,8 @@ impl Dreamer {
                 "no recent activity to check conditions against".to_owned(),
             );
         }
-        let prompt = render_surface_prompt(project, &batch, &turns);
+        let texts: Vec<String> = turns.into_iter().map(|turn| turn.text).collect();
+        let prompt = render_surface_prompt(project, &batch, &texts);
         let text = match self.complete(SURFACE_SYSTEM_PROMPT, &prompt).await {
             Ok(text) => text,
             // This is the one task whose contract allows an empty answer ("no

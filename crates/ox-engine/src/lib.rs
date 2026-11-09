@@ -5,6 +5,7 @@
 //! model so tightly that splitting them would buy a crate boundary and pay
 //! for it with a cycle.
 
+mod completion;
 pub mod mctx;
 pub mod prompt;
 pub mod runner;

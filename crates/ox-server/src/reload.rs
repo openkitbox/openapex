@@ -69,7 +69,7 @@ pub(crate) async fn run(state: &AppState, directory: &str) -> Result<()> {
             let chat = chat_transport(&next)?;
             let model_catalog = ModelCatalog::new(&next.llm);
             model_catalog.refresh().await?;
-            let mcp = std::sync::Arc::new(ox_mcp::Hub::empty());
+            let mcp = state.runtime.new_hub();
             let stale = old.mcp.tool_names();
             let stale: Vec<&str> = stale.iter().map(String::as_str).collect();
             let mut tools = old.tools.without(&stale);

@@ -11,7 +11,7 @@
 use ox_core::event_bus::EventBus;
 use serde_json::{Value, json};
 
-use super::sessions::{self, Notice};
+use super::sessions::{Notice, ShellSessions};
 
 /// `(event type, data)` for one notice, in the upstream shapes:
 /// `shell.created { info }`, `shell.exited { id, exit?, status }`,
@@ -35,8 +35,8 @@ pub fn frame(notice: Notice) -> (&'static str, Value) {
 /// session's directory (the TUI drops `shell.*` frames without a location).
 /// The composition root calls this once per boot; a later call replaces the
 /// bus, as [`crate::form::init`] does.
-pub fn init(bus: EventBus) {
-    sessions::shared().set_observer(std::sync::Arc::new(move |directory, notice| {
+pub fn init(sessions: &ShellSessions, bus: EventBus) {
+    sessions.set_observer(std::sync::Arc::new(move |directory, notice| {
         let (kind, data) = frame(notice);
         bus.broadcast_ephemeral(kind, data, Some(directory));
     }));

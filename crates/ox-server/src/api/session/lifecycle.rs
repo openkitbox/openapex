@@ -8,7 +8,6 @@ use ox_db::Db;
 use ox_schema::event::SessionEventData;
 use ox_schema::id;
 use ox_schema::support::{ForkBoundary, LocationRef, ModelRef, Rule, SessionMetadata};
-use ox_tools::shell::sessions;
 
 use super::response::{
     invalid_request, invalid_request_kind, message_not_found, no_content, parse_body,
@@ -257,7 +256,7 @@ pub(crate) async fn update(req: &mut Request, depot: &mut Depot, res: &mut Respo
             // session.ts:234 → `title.generate`). Generation is background
             // work: the request answers 204 and the title arrives as a
             // `session.renamed` event, exactly as upstream does.
-            spawn_title_generation(app, session_id.clone());
+            spawn_title_generation(app, session_id.clone()).await;
         }
     }
 
@@ -314,7 +313,7 @@ pub(crate) async fn update(req: &mut Request, depot: &mut Depot, res: &mut Respo
 /// Spawn one background title generation for `session_id` (upstream
 /// `SessionTitle.generate`). Fire-and-forget: title generation is advisory, so
 /// a failure is logged inside the task and never reaches the response.
-fn spawn_title_generation(app: &crate::api::AppState, session_id: String) {
+async fn spawn_title_generation(app: &crate::api::AppState, session_id: String) {
     let db = app.db.clone();
     let bus = app.bus.clone();
     // One snapshot, so chat, catalog and config share a generation.
@@ -322,9 +321,15 @@ fn spawn_title_generation(app: &crate::api::AppState, session_id: String) {
     let chat = Arc::clone(&svc.chat);
     let config = Arc::clone(&svc.config);
     let catalog = Arc::clone(&svc.model_catalog);
-    tokio::spawn(async move {
-        ox_engine::runner::title::generate(db, bus, chat, config, catalog, session_id).await;
-    });
+    if let Err(error) = app
+        .runtime
+        .own(async move {
+            ox_engine::runner::title::generate(db, bus, chat, config, catalog, session_id).await;
+        })
+        .await
+    {
+        tracing::debug!(%error, "title generation ended after shutdown sealed ownership");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -384,7 +389,7 @@ pub(crate) async fn delete_session_tree(app: &crate::api::AppState, root: &str) 
     for target in &order {
         let _ = app.runner.interrupt(target);
     }
-    sessions::shared().stop_owned(&order).await;
+    app.services().tools.shells.stop_owned(&order).await;
     for target in order {
         app.bus
             .publish(SessionEventData::SessionDeleted {

@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::future::poll_fn;
 
 use anyhow::Result;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use ox_core::copied_tags::strip_copied_tag_notation;
@@ -20,7 +19,7 @@ use super::attempt::{
     settle_interrupted,
 };
 use super::error::{aborted_error, invalid_output_error, to_session_error};
-use super::tool::{fail_unsettled_tools, join_tool_tasks, settle_tool_calls};
+use super::tool::{ToolTasks, fail_unsettled_tools, settle_tool_calls};
 use super::usage::{attempt_tokens, observe_request_cost};
 use crate::mctx::citation::{self, CitationGate};
 /// One accumulating tool call from `ToolCallDelta` fragments.
@@ -51,7 +50,42 @@ pub(super) async fn consume(
     request: &ChatRequest,
     dispatch: i64,
     started: &mut bool,
+    stream: BoxChatStream,
+) -> Result<Attempt> {
+    let mut tool_tasks = ToolTasks::new(token);
+    let result = consume_owned(
+        ctx,
+        token,
+        params,
+        request,
+        dispatch,
+        started,
+        stream,
+        &mut tool_tasks,
+    )
+    .await;
+    if !matches!(result, Ok(Attempt::Done(StepOutcome::Completed { .. }))) {
+        tool_tasks.cancellation.cancel();
+    }
+    let settlement = tool_tasks.finish().await;
+    // A persistence failure must never enter provider retry/continuation.
+    settlement?;
+    result
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "step owner adds the task scope to the existing stream inputs"
+)]
+async fn consume_owned(
+    ctx: &DrainCtx,
+    token: &CancellationToken,
+    params: &StepParams<'_>,
+    request: &ChatRequest,
+    dispatch: i64,
+    started: &mut bool,
     mut stream: BoxChatStream,
+    tool_tasks: &mut ToolTasks,
 ) -> Result<Attempt> {
     let mut text = String::new();
     // Keeps a `<mem-used>` mark out of the deltas; `text` stays raw and is
@@ -66,11 +100,6 @@ pub(super) async fn consume(
     let mut usage: Option<Usage> = None;
     // Tool-call fragments by stream index.
     let mut tool_acc: BTreeMap<u32, ToolAccum> = BTreeMap::new();
-    // In-flight tool executions paired with their call ids. Each task
-    // publishes its own settlement; the step joins them before `step.ended`
-    // (upstream: tools run while the stream continues, and the step waits
-    // for all spawned tools).
-    let mut tool_tasks: Vec<(String, JoinHandle<()>)> = Vec::new();
     // Model output was received in this attempt (unlike `started`, which a
     // retry announcement also sets).
     let mut produced = false;
@@ -102,7 +131,8 @@ pub(super) async fn consume(
                 // BEFORE `step.failed`.
                 fail_unsettled_tools(ctx, params, &mut tool_acc, aborted_error(TOOLS_INTERRUPTED))
                     .await?;
-                join_tool_tasks(ctx, params, &mut tool_tasks, token).await?;
+                tool_tasks.cancellation.cancel();
+                tool_tasks.finish().await?;
                 return Ok(Attempt::Done(
                     settle_interrupted(
                         ctx,
@@ -141,7 +171,8 @@ pub(super) async fn consume(
                 // `Finish`, so open inputs fail with the stream error itself
                 // (failTools `uncalled`) and no tool part stays streaming.
                 fail_unsettled_tools(ctx, params, &mut tool_acc, to_session_error(&error)).await?;
-                join_tool_tasks(ctx, params, &mut tool_tasks, token).await?;
+                tool_tasks.cancellation.cancel();
+                tool_tasks.finish().await?;
                 return Ok(Attempt::Failed {
                     failure: AttemptFailure::Transport(error),
                     published: produced,
@@ -257,8 +288,7 @@ pub(super) async fn consume(
                         ctx,
                         params,
                         &mut tool_acc,
-                        &mut tool_tasks,
-                        token,
+                        tool_tasks,
                         mapped == FinishReason::Length,
                     )
                     .await?;
@@ -299,7 +329,8 @@ pub(super) async fn consume(
         // (run's Outcome.Continue gate). Open inputs fail with the same
         // error (failAssistant), and the attempt keeps its usage.
         fail_unsettled_tools(ctx, params, &mut tool_acc, invalid_output_error()).await?;
-        join_tool_tasks(ctx, params, &mut tool_tasks, token).await?;
+        tool_tasks.cancellation.cancel();
+        tool_tasks.finish().await?;
         return Ok(Attempt::Failed {
             failure: AttemptFailure::IncompleteStream,
             published: true,
@@ -311,15 +342,7 @@ pub(super) async fn consume(
     // stream that ended before its finish chunk carried no calls) is
     // idempotently settled here.
     let length_finish = mapped_finish == FinishReason::Length;
-    settle_tool_calls(
-        ctx,
-        params,
-        &mut tool_acc,
-        &mut tool_tasks,
-        token,
-        length_finish,
-    )
-    .await?;
+    settle_tool_calls(ctx, params, &mut tool_acc, tool_tasks, length_finish).await?;
     let needs_continuation = tool_acc.values().any(|acc| acc.called);
     let calls: Vec<u64> = tool_acc
         .values()
@@ -333,9 +356,8 @@ pub(super) async fn consume(
             assistant_message_id: params.assistant_message_id.clone(),
         })
         .await?;
-    // Wait for every spawned execution; an interrupt while waiting aborts
-    // the remainder and settles their parts aborted.
-    join_tool_tasks(ctx, params, &mut tool_tasks, token).await?;
+    // Await actual execution/cleanup and durable settlement before step end.
+    tool_tasks.finish().await?;
     // An interrupt that landed during the join settles the step
     // interrupted (upstream: failAssistant, no step.ended).
     if token.is_cancelled() {

@@ -106,8 +106,58 @@ struct CatalogEndpoint {
     builtin: Option<&'static BuiltinProvider>,
 }
 
+/// A physical dimension is never inferred from display metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Limit {
+    Known { tokens: u64, source: &'static str },
+    Unknown { reason: &'static str },
+}
+
+impl Limit {
+    #[must_use]
+    pub fn tokens(self) -> Option<u64> {
+        match self {
+            Self::Known { tokens, .. } => Some(tokens),
+            Self::Unknown { .. } => None,
+        }
+    }
+}
+
+/// Intersection across every endpoint the router can attempt.
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeLimits {
+    pub shared_context: Limit,
+    pub input: Limit,
+    pub output: Limit,
+    pub candidates: usize,
+    pub stale: bool,
+}
+
+impl Default for RuntimeLimits {
+    fn default() -> Self {
+        let unknown = Limit::Unknown {
+            reason: "missing_snapshot_or_unverified_geometry",
+        };
+        Self {
+            shared_context: unknown,
+            input: unknown,
+            output: unknown,
+            candidates: 0,
+            stale: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CandidateLimits {
+    shared_context: Limit,
+    output: Limit,
+    advertised: [Option<i64>; 3],
+}
+
 /// A fetched model catalogue with a TTL cache.
 pub struct ModelCatalog {
+    resolver: crate::config::Routes,
     client: reqwest::Client,
     /// The implicit `cardinal_url` endpoint plus every `[providers]` entry.
     endpoints: Vec<CatalogEndpoint>,
@@ -123,6 +173,7 @@ pub struct ModelCatalog {
 
 #[derive(Default)]
 struct Snapshot {
+    limits: BTreeMap<String, BTreeMap<String, CandidateLimits>>,
     entries: Arc<Vec<ModelEntry>>,
     fetched_at: Option<Instant>,
 }
@@ -189,6 +240,7 @@ impl ModelCatalog {
             );
         }
         Arc::new(Self {
+            resolver: crate::config::Routes::new(config),
             client,
             endpoints: endpoints.into_values().collect(),
             routes: config
@@ -206,11 +258,13 @@ impl ModelCatalog {
     #[must_use]
     pub fn from_entries(entries: Vec<ModelEntry>) -> Self {
         Self {
+            resolver: crate::config::Routes::new(&LlmConfig::default()),
             client: crate::http_client().build().unwrap_or_default(),
             endpoints: Vec::new(),
             routes: BTreeMap::new(),
             context_caps: BTreeMap::new(),
             cache: RwLock::new(Snapshot {
+                limits: BTreeMap::new(),
                 entries: Arc::new(entries),
                 fetched_at: Some(Instant::now()),
             }),
@@ -281,6 +335,57 @@ impl ModelCatalog {
         u32::try_from(context).ok().filter(|window| *window > 0)
     }
 
+    /// Physical limits for the exact logical wire model; never uses UI projection.
+    pub fn runtime_limits(&self, model: &str) -> Result<RuntimeLimits, crate::error::ChatError> {
+        use crate::config::Targets;
+        let cache = self.cache.read().expect("catalog lock");
+        let mut result = RuntimeLimits {
+            stale: cache
+                .fetched_at
+                .is_none_or(|at| at.elapsed() >= CATALOG_TTL),
+            ..RuntimeLimits::default()
+        };
+        let mut add = |provider: &str, wire: &str| {
+            let candidate = cache
+                .limits
+                .get(provider)
+                .and_then(|models| models.get(wire));
+            let unknown = Limit::Unknown {
+                reason: "missing_endpoint_model",
+            };
+            let context = candidate.map_or(unknown, |limits| limits.shared_context);
+            let output = candidate.map_or(unknown, |limits| limits.output);
+            if let Some(candidate) = candidate {
+                tracing::debug!(provider, model = wire, advertised = ?candidate.advertised, "runtime candidate advertised limits");
+            }
+            result.shared_context = intersect(result.shared_context, context, result.candidates);
+            result.output = intersect(result.output, output, result.candidates);
+            result.candidates += 1;
+        };
+        match self.resolver.resolve(model) {
+            Targets::Explicit(candidates) => {
+                for candidate in candidates {
+                    add(&candidate.provider, &candidate.model);
+                }
+            }
+            Targets::Endpoint { provider, model } => add(provider, model),
+            Targets::NoRoute => {
+                return Err(crate::error::ChatError::NoRoute {
+                    model: model.to_owned(),
+                });
+            }
+        }
+        if let Some(cap) = self.context_caps.get(model)
+            && let Limit::Known { tokens, .. } = result.shared_context
+        {
+            result.shared_context = Limit::Known {
+                tokens: tokens.min(u64::from(*cap)),
+                source: "builtin_seed_with_context_cap",
+            };
+        }
+        Ok(result)
+    }
+
     /// Fetch `GET /v1/models` from every endpoint and replace the snapshot.
     /// One failing endpoint only warns; the others still serve. When every
     /// endpoint fails the refresh errors, so the previous list is kept
@@ -294,10 +399,14 @@ impl ModelCatalog {
             return Ok(());
         }
         let mut entries: Vec<ModelEntry> = Vec::new();
+        let mut limits = BTreeMap::new();
         let mut failures = 0usize;
         for endpoint in &self.endpoints {
             match self.fetch_endpoint(endpoint).await {
-                Ok(mut fetched) => entries.append(&mut fetched),
+                Ok(mut fetched) => {
+                    record_limits(&mut limits, endpoint, &fetched);
+                    entries.append(&mut fetched);
+                }
                 // A builtin ships its model table, so an unreachable list is a
                 // degraded start, not an empty catalogue: the seeds are the
                 // same entries the endpoint would have reported, minus any it
@@ -357,6 +466,7 @@ impl ModelCatalog {
         {
             let mut cache = self.cache.write().expect("catalog lock");
             cache.entries = Arc::new(entries);
+            cache.limits = limits;
             cache.fetched_at = Some(Instant::now());
         }
         tracing::debug!(models = count, "model catalogue refreshed");
@@ -440,6 +550,61 @@ impl ModelCatalog {
                 }
             })
             .collect()
+    }
+}
+
+fn intersect(previous: Limit, next: Limit, count: usize) -> Limit {
+    if count == 0 {
+        return next;
+    }
+    match (previous, next) {
+        (Limit::Known { tokens: left, .. }, Limit::Known { tokens: right, .. }) => Limit::Known {
+            tokens: left.min(right),
+            source: "all_candidates_builtin_seed",
+        },
+        (Limit::Unknown { reason }, _) | (_, Limit::Unknown { reason }) => {
+            Limit::Unknown { reason }
+        }
+    }
+}
+
+fn record_limits(
+    limits: &mut BTreeMap<String, BTreeMap<String, CandidateLimits>>,
+    endpoint: &CatalogEndpoint,
+    entries: &[ModelEntry],
+) {
+    for entry in entries {
+        let unknown = Limit::Unknown {
+            reason: "unverified_geometry",
+        };
+        let seed = endpoint
+            .builtin
+            .and_then(|builtin| builtin.models.iter().find(|seed| seed.id == entry.id));
+        let known = |tokens: i64| {
+            u64::try_from(tokens)
+                .ok()
+                .filter(|tokens| *tokens > 0)
+                .map_or(unknown, |tokens| Limit::Known {
+                    tokens,
+                    source: "builtin_seed",
+                })
+        };
+        let candidate = CandidateLimits {
+            shared_context: seed.map_or(unknown, |seed| known(seed.context)),
+            output: seed.map_or(unknown, |seed| known(seed.output)),
+            advertised: [entry.context, entry.input, entry.output],
+        };
+        limits
+            .entry(endpoint.name.clone())
+            .or_default()
+            .entry(entry.id.clone())
+            .and_modify(|existing| {
+                existing.shared_context = Limit::Unknown {
+                    reason: "ambiguous_endpoint_model",
+                };
+                existing.output = existing.shared_context;
+            })
+            .or_insert(candidate);
     }
 }
 

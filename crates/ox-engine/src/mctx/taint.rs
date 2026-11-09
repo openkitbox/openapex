@@ -15,8 +15,8 @@
 //! once by the tool step ([`mark`]) and read by the historian's publish
 //! ([`is_tainted`]). It is sticky for the session's life: the fetched text
 //! stays in the transcript (and in the compartments folded from it), so
-//! there is no later point at which the session is clean again. A session
-//! fork copies no `kv`, so a child starts clean.
+//! there is no later point at which the session is clean again. Forks inherit
+//! the mark atomically, even when their boundary precedes the external fetch.
 //!
 //! Reference: codex marks a thread `polluted` on web/MCP content and skips
 //! its memory extraction; ox skips the promotion step instead so the fold
@@ -26,11 +26,6 @@ use anyhow::{Context as _, Result};
 use ox_db::{Db, optional};
 use ox_schema::id::now_millis;
 
-/// The `kv` key of a session's mark.
-fn key(session_id: &str) -> String {
-    format!("mctx_tainted:{session_id}")
-}
-
 /// Mark `session_id` as carrying external content, naming the tool that
 /// brought it. Idempotent: a second mark only refreshes the timestamp.
 pub async fn mark(db: &Db, session_id: &str, tool: &str) -> Result<()> {
@@ -39,7 +34,11 @@ pub async fn mark(db: &Db, session_id: &str, tool: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO kv (key, value, time_created, time_updated) VALUES (?1, ?2, ?3, ?3)
          ON CONFLICT(key) DO UPDATE SET value = excluded.value, time_updated = ?3",
-        (key(session_id).as_str(), tool, now),
+        (
+            ox_schema::support::session_taint_key(session_id).as_str(),
+            tool,
+            now,
+        ),
     )
     .await
     .with_context(|| format!("mark session {session_id} as tainted by {tool}"))?;
@@ -53,8 +52,11 @@ pub async fn is_tainted(db: &Db, session_id: &str) -> Result<bool> {
         .prepare("SELECT 1 FROM kv WHERE key = ?1")
         .await
         .context("read session taint")?;
-    let row = optional(&mut stmt, [key(session_id).as_str()])
-        .await
-        .context("read session taint")?;
+    let row = optional(
+        &mut stmt,
+        [ox_schema::support::session_taint_key(session_id).as_str()],
+    )
+    .await
+    .context("read session taint")?;
     Ok(row.is_some())
 }

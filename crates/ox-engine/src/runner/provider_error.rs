@@ -141,7 +141,7 @@ pub(crate) fn is_payload_too_large(message: &str) -> bool {
 /// and matches on the body alone).
 pub(crate) fn is_overflow_error(error: &ChatError) -> bool {
     match error {
-        ChatError::Http { status, body } => {
+        ChatError::Http { status, body, .. } => {
             (400..=499).contains(status)
                 && (*status == 413
                     || is_payload_too_large(body)

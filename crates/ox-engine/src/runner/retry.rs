@@ -1,65 +1,41 @@
-//! Retry policy for transient provider failures.
+//! Retry decisions for one step, independent of I/O and settlement.
 //!
-//! Owns two decisions and nothing else: which [`ChatError`]s are worth
-//! retrying ([`classify`]) and how long to wait, or whether to give up
-//! ([`Backoff::on_failure`]). Pure, no I/O; the caller (`step.rs`) owns
-//! events, sleeping and settlement.
+//! Transport and bounded provider errors allow ten retries; timeouts allow
+//! three. None of these budgets reset on partial output. Published failures
+//! additionally share a ten-continuation cap. The consecutive network delay
+//! ladder alone restarts on progress.
 //!
-//! [`Backoff`] owns three independent counters for one step:
-//!
-//! - `network`: consecutive [`RetryKind::Network`] failures; drives the delay
-//!   ladder `min(2s * 2^(n-1), 10s)`, never exhausts, and restarts whenever
-//!   an attempt received model output (progress was made).
-//! - `bounded`: [`RetryKind::Bounded`] failures, capped at
-//!   [`MAX_BOUNDED_RETRIES`]; never reset, not even by progress. A long
-//!   network outage does not consume this allowance.
-//! - `continuations`: attempts that failed after receiving model output,
-//!   capped at [`MAX_CONTINUATIONS`], whatever the error kind.
-//!
-//! Deliberate deviations from upstream `model-retry.ts`: network-class errors
-//! retry without limit, the per-step continuation cap, and there is no jitter
-//! and no `retry-after` handling (`ChatError::Http` carries no headers;
-//! single user, no thundering herd).
+//! Deliberate OpenCode deviations: no jitter, and no one-hour offline special
+//! case (offline cannot be reliably distinguished from other connect failures).
+//! Provider advice is a minimum delay, normalized and capped by the transport.
 
 use std::time::Duration;
 
 use ox_llm::cardinal::ChatError;
 
-/// Maximum consecutive failures for [`RetryKind::Bounded`] errors (upstream
-/// `model-retry.ts` `recurs(10)`).
 pub(crate) const MAX_BOUNDED_RETRIES: usize = 10;
-
-/// Maximum attempts per step that fail after receiving model output. A
-/// flapping upstream that cuts every stream after a few tokens must not loop
-/// forever: each cycle costs a billed request, a partial assistant row and a
-/// synthetic continue message.
 pub(crate) const MAX_CONTINUATIONS: usize = 10;
-
+const MAX_TIMEOUT_RETRIES: usize = 3;
 const BASE_DELAY: Duration = Duration::from_secs(2);
 const MAX_DELAY: Duration = Duration::from_secs(10);
 
-/// How an error should be retried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RetryKind {
-    /// Fail immediately.
     Never,
-    /// Retry up to [`MAX_BOUNDED_RETRIES`] consecutive failures.
     Bounded,
-    /// Retry until it recovers (or the user interrupts).
     Network,
+    Timeout,
 }
 
-/// Classify a provider error. Exhaustive on purpose: a new variant must get an
-/// explicit decision here.
+/// Every error variant must make an explicit retry decision.
 pub(crate) fn classify(error: &ChatError) -> RetryKind {
     match error {
-        ChatError::Transport(e) => {
-            // `is_decode()` is a body read failure (reqwest wraps every
-            // `Response::chunk()` error as decode; ox-llm never parses JSON
-            // through reqwest), so it falls through to `Network`.
-            if e.is_builder() {
+        ChatError::Transport(error) => {
+            if error.is_builder() {
                 RetryKind::Never
-            } else if e.is_redirect() {
+            } else if error.is_timeout() {
+                RetryKind::Timeout
+            } else if error.is_redirect() {
                 RetryKind::Bounded
             } else {
                 RetryKind::Network
@@ -75,50 +51,44 @@ pub(crate) fn classify(error: &ChatError) -> RetryKind {
     }
 }
 
-/// Delay for the `n`-th consecutive failure: `min(2s * 2^(n-1), 10s)`;
-/// `n == 0` counts as 1.
 fn ladder(n: usize) -> Duration {
-    // Clamp the shift: 2s * 2^4 already exceeds the cap.
     let shift = u32::try_from(n.max(1) - 1).unwrap_or(u32::MAX).min(4);
     BASE_DELAY.saturating_mul(1 << shift).min(MAX_DELAY)
 }
 
-/// Retry state of one step: decides the delay before the next attempt, or
-/// `None` when the step must fail. See the module doc for the counters.
 #[derive(Debug, Default)]
 pub(crate) struct Backoff {
+    network_ladder: usize,
     network: usize,
+    timeouts: usize,
     bounded: usize,
     continuations: usize,
 }
 
 impl Backoff {
-    /// Record a failed attempt and return the delay before the next one, or
-    /// `None` to give up. `produced` says the attempt received model output
-    /// before failing.
-    ///
-    /// - `Never` => `None`, counters untouched.
-    /// - `produced` => `continuations += 1` and the network ladder restarts;
-    ///   more than [`MAX_CONTINUATIONS`] => `None`, for any kind.
-    /// - `Network` => `ladder(network)`, never exhausts.
-    /// - `Bounded` => `ladder(bounded)`; more than [`MAX_BOUNDED_RETRIES`]
-    ///   => `None`. Never reset, not even by progress.
+    /// Record one failed attempt; progress resets only the delay ladder.
     pub(crate) fn on_failure(&mut self, kind: RetryKind, produced: bool) -> Option<Duration> {
         if kind == RetryKind::Never {
             return None;
         }
         if produced {
             self.continuations = self.continuations.saturating_add(1);
-            self.network = 0;
+            self.network_ladder = 0;
             if self.continuations > MAX_CONTINUATIONS {
                 return None;
             }
         }
         match kind {
             RetryKind::Never => None,
-            RetryKind::Network => {
-                self.network = self.network.saturating_add(1);
-                Some(ladder(self.network))
+            RetryKind::Network | RetryKind::Timeout => {
+                self.network_ladder = self.network_ladder.saturating_add(1);
+                let (count, cap) = if kind == RetryKind::Timeout {
+                    (&mut self.timeouts, MAX_TIMEOUT_RETRIES)
+                } else {
+                    (&mut self.network, MAX_BOUNDED_RETRIES)
+                };
+                *count = count.saturating_add(1);
+                (*count <= cap).then(|| ladder(self.network_ladder))
             }
             RetryKind::Bounded => {
                 self.bounded = self.bounded.saturating_add(1);

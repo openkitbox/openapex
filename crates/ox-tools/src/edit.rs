@@ -180,6 +180,10 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
         });
     }
     let output_text: String = replaced.into_iter().collect();
+    // Commit entry: after this gate cancellation must not skip the stamp/result.
+    if ctx.cancellation.is_cancelled() {
+        return fail("Tool execution interrupted");
+    }
     if std::fs::write(&absolute, output_text.as_bytes()).is_err() {
         return fail(format!("Unable to edit {path}"));
     }

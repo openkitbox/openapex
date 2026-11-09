@@ -483,6 +483,28 @@ pub fn build_request(
     };
     let (thinking, output_config) =
         policy.thinking(&request.model, request.reasoning_effort.as_deref());
+    let max_tokens = policy.max_tokens_for(&request.model, request.max_tokens);
+    if request
+        .max_tokens
+        .is_some_and(|tokens| tokens == 0 || tokens > u64::from(u32::MAX))
+    {
+        return Err(ChatError::Http {
+            status: 400,
+            body: "context_length_exceeded: output cap is not representable by Messages".to_owned(),
+            retry_after: None,
+        });
+    }
+    if let Some(Thinking::EnabledBudget { budget_tokens }) = &thinking
+        && *budget_tokens >= max_tokens
+    {
+        return Err(ChatError::Http {
+            status: 400,
+            body:
+                "context_length_exceeded: output room cannot accommodate selected thinking budget"
+                    .to_owned(),
+            retry_after: None,
+        });
+    }
 
     // `system` is the *join* of every `System` message in the list, so a
     // request carrying one more or one fewer of them opens differently even
@@ -505,7 +527,7 @@ pub fn build_request(
 
     Ok(MessagesRequest {
         model: request.model.clone(),
-        max_tokens: policy.max_tokens_for(&request.model, request.max_tokens),
+        max_tokens,
         system,
         messages,
         tools,

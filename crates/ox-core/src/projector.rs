@@ -801,6 +801,21 @@ async fn project_fork(tx: &Connection, env: &EventEnvelope<SessionEventData>) ->
         bail!("SessionAlreadyProjected: `{session_id}` already exists");
     }
 
+    // Privacy markers describe the parent's entire session, not a historical
+    // boundary. Preserve only these two rows, even for an empty-history fork,
+    // in the same transaction as the child and its history.
+    for marker_key in [
+        ox_schema::support::memory_mode_key,
+        ox_schema::support::session_taint_key,
+    ] {
+        tx.execute(
+            "INSERT INTO kv (key, value, time_created, time_updated)
+             SELECT ?1, value, time_created, time_updated FROM kv WHERE key = ?2",
+            (marker_key(session_id), marker_key(parent_id)),
+        )
+        .await?;
+    }
+
     // TODO(instructions): `instructionEntries` / `instructions` snapshots need
     // the instruction tables, which are out of scope for this task.
 

@@ -9,16 +9,14 @@
 //! magic-context head, the wire tail) plus the caller's prompt as a final user
 //! message. Nothing is persisted and no event is published — the model answers
 //! from what is already there. No tool loop runs (upstream notes that a tool
-//! call "would surface as an empty answer"), so a tool-only completion yields
-//! `""`.
+//! call "would surface as an empty answer"). Deliberate safety deviation:
+//! tool calls and incomplete completions return an error rather than an empty
+//! or truncated answer.
 //!
-//! Deliberate deviation from upstream, recorded here: the instruction layer is
-//! the baseline render of the *current* sources rather than
-//! `SessionHistory.preview`'s initial-plus-update pair. ox keeps no per-session
-//! instruction state on disk, and the visible wire window already carries every
-//! delta row (`build_chat_messages` folds them in as system messages), so only
-//! the frozen initial block needs recomputing; nothing is hashed, diffed or
-//! recorded here.
+//! Instruction decisions share the live path's pure preview: frozen initial
+//! bytes plus any currently needed delta, without publishing or applying it.
+//! Equality is defined only for the same sources/history/head snapshot; the
+//! caller's final prompt and live automatic recall intentionally differ.
 
 use std::sync::Arc;
 
@@ -28,6 +26,7 @@ use ox_llm::cardinal::wire::{ChatMessage, ChatRequest};
 
 use super::Inner;
 use super::drain::DrainCtx;
+use super::instructions;
 
 /// Answer `prompt` from the session's current context. Read-only: the session
 /// transcript, the instruction baseline and the event log are untouched.
@@ -35,16 +34,18 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
     let svc = inner.live.current();
     let (_agent, model) =
         super::resolve_selection(&inner.db, session_id, &svc.config, &svc.model_catalog).await?;
+    let agent = super::session_agent(&inner.db, session_id).await;
     let ctx = DrainCtx {
+        tasks: inner.tasks.clone(),
         session_id: session_id.to_owned(),
-        agent: ox_tools::agent::default_agent(),
-        directory: inner.directory.clone(),
+        agent,
+        directory: super::session_directory(&inner.db, session_id, &inner.directory).await,
         home: inner.home.clone(),
         config: Arc::clone(&svc.config),
         db: inner.db.clone(),
         bus: inner.bus.clone(),
         chat: Arc::clone(&svc.chat),
-        tools: Arc::clone(&svc.tools),
+        tools: svc.tools_for(agent),
         model_catalog: Arc::clone(&svc.model_catalog),
         mcp: Arc::clone(&svc.mcp),
         live: Arc::clone(&inner.live),
@@ -66,28 +67,55 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
         },
     };
 
-    let budget = ctx.budget_for(&model.id);
-    let (head_m0, head_m1, floor) = super::step::mctx_head(&ctx, budget).await;
-    let rows = if ctx.config.magic_context.enabled {
-        super::step::load_overlaid_tail(&ctx.db, &ctx.session_id, floor).await?
-    } else {
-        super::step::load_history_after(&ctx.db, &ctx.session_id, floor).await?
-    };
-
+    let system_static = ctx.system_static();
     let observed = ctx.observe_sources().await?;
-    let guidance: Vec<(&str, Option<&'static str>)> = ctx.tools.guidances().collect();
-    let system_static = crate::prompt::system_static(&guidance, ctx.agent);
-    let instructions = super::instructions::baseline(&observed).initial_render;
+    let frozen = {
+        let baselines = super::lock(&ctx.instruction_baselines);
+        baselines
+            .get(session_id)
+            .map(|baseline| Arc::clone(&baseline.initial_render))
+    }
+    .unwrap_or_else(|| instructions::baseline(&observed).initial_render);
+    let fixed_local = crate::mctx::tokens::heuristic_bytes(
+        system_static.len() + frozen.len() + ctx.tools.definitions_bytes(),
+    );
+    let ratio = crate::mctx::calibration::ratio_for(&ctx.calibrations, session_id, &model.id);
+    let budget = crate::mctx::budget_for(
+        &ctx.config,
+        &ctx.model_catalog,
+        &model.id,
+        (fixed_local as f64 * ratio).ceil() as u32,
+    );
+    let (head_m0, head_m1, rows) = ctx.preview_context(budget, &model.id).await?;
+
+    // Shared admission rejects BudgetExceeded before constructing a preview;
+    // unlike transient Unavailable it cannot fall back to prior instructions.
+    let preview = {
+        let baselines = super::lock(&ctx.instruction_baselines);
+        instructions::preview(&observed, &rows, baselines.get(session_id))?
+    };
     let mut messages = super::step::build_chat_messages(
         &system_static,
-        &instructions,
+        &preview.initial,
         &[head_m0.as_deref(), head_m1.as_deref()],
         &rows,
     );
+    let update =
+        (!preview.deltas.is_empty()).then(|| instructions::render_updates(&preview.deltas));
+    let layers = super::request_budget::Layers {
+        system_static: system_static.len(),
+        frozen: preview.initial.len(),
+        m0: head_m0.as_ref().map_or(0, String::len),
+        m1: head_m1.as_ref().map_or(0, String::len),
+        delta: update.as_ref().map_or(0, String::len),
+        ..Default::default()
+    };
+    instructions::insert_update(&mut messages, update);
     messages.push(ChatMessage::user(prompt));
 
     let mut request = ChatRequest::new(model.id.clone(), messages);
     request.tools = ctx.tools.definitions_shared();
     request.apply_reasoning_effort(model.variant.as_deref());
-    crate::mctx::historian::collect_completion(&ctx.chat, &request, "generate").await
+    super::request_budget::apply(&ctx, &mut request, layers)?;
+    crate::completion::collect_text(&ctx.chat, &request, "generate").await
 }

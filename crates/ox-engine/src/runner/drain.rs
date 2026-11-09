@@ -138,6 +138,7 @@ pub(crate) struct DrainCtx {
     /// drain entry knows a running compaction row is alive, and so a manual
     /// compaction never runs beside a fold.
     pub fold_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    pub(super) tasks: super::tasks::Tasks,
 }
 
 impl DrainCtx {
@@ -159,19 +160,34 @@ impl DrainCtx {
     /// The session's budgets for a step running `model_id`, with the fixed
     /// layers this context sends on every request — the static system layer
     /// and the tools array — measured as the usage baseline. The static layer
-    /// is assembled here only to be measured (string work over the registry's
-    /// guidance); the tools array's size is cached by the registry.
-    pub(crate) fn budget_for(&self, model_id: &str) -> crate::mctx::budget::Budget {
-        let guidance: Vec<(&str, Option<&'static str>)> = self.tools.guidances().collect();
-        let system_bytes = crate::prompt::system_static(&guidance, self.agent).len();
-        let baseline =
-            crate::mctx::tokens::heuristic_bytes(system_bytes + self.tools.definitions_bytes());
+    /// is rendered by the caller once for both assembly and measurement;
+    /// the tools array's size is cached by the registry.
+    pub(crate) fn budget_for(
+        &self,
+        model_id: &str,
+        system_bytes: usize,
+    ) -> crate::mctx::budget::Budget {
+        let frozen_bytes = super::lock(&self.instruction_baselines)
+            .get(&self.session_id)
+            .map_or(0, |baseline| baseline.initial_render.len());
+        let local = crate::mctx::tokens::heuristic_bytes(
+            system_bytes + frozen_bytes + self.tools.definitions_bytes(),
+        );
+        let ratio =
+            crate::mctx::calibration::ratio_for(&self.calibrations, &self.session_id, model_id);
+        let baseline = (local as f64 * ratio).ceil() as usize;
         crate::mctx::budget_for(
             &self.config,
             &self.model_catalog,
             model_id,
             u32::try_from(baseline).unwrap_or(u32::MAX),
         )
+    }
+
+    /// Render the fixed layer once; both budgeting and request assembly use it.
+    pub(crate) fn system_static(&self) -> Arc<str> {
+        let guidance: Vec<(&str, Option<&'static str>)> = self.tools.guidances().collect();
+        Arc::from(crate::prompt::system_static(&guidance, self.agent))
     }
 
     /// Observe this step's instruction sources (`prompt::gather`) off the
@@ -192,6 +208,7 @@ impl DrainCtx {
         let home = self.home.clone();
         let anchor = self.instruction_root.clone();
         let mcp_instructions = self.mcp.instructions_block();
+        let discovery = self.tools.get("capability_search").is_some();
         tokio::task::spawn_blocking(move || {
             let (directory, project_root) = anchor.get_or_compute(&directory);
             crate::prompt::gather(
@@ -199,10 +216,12 @@ impl DrainCtx {
                 &home,
                 project_root.as_deref(),
                 mcp_instructions.as_deref(),
+                discovery,
             )
         })
         .await
-        .map_err(|error| anyhow::anyhow!("instruction observation task failed: {error}"))
+        .map_err(|error| anyhow::anyhow!("instruction observation task failed: {error}"))?
+        .map_err(Into::into)
     }
 }
 
@@ -453,7 +472,13 @@ async fn run_turn(busy: &DrainCtx, token: &CancellationToken) -> Result<TurnOutc
                     // item is enqueued as a steer, so the drain loop picks it up
                     // on its next scan (upstream `checkCompletion` →
                     // `scheduleAgentContinue`).
-                    super::todo_reminder::on_turn_ended(&ctx.db, &ctx.bus, &ctx.session_id).await;
+                    if !token.is_cancelled()
+                        && !ctx.tasks.gate.is_closed()
+                        && !ctx.tools.owes_wakeup(&ctx.session_id)
+                    {
+                        super::todo_reminder::on_turn_ended(&ctx.db, &ctx.bus, &ctx.session_id)
+                            .await;
+                    }
                     return Ok(TurnOutcome::Ended);
                 }
                 // Upstream Outcome.OutputLimit (llm.ts): a tool-call length
@@ -600,9 +625,11 @@ async fn maybe_spawn_title_generation(ctx: &DrainCtx) {
     let config = ctx.config.clone();
     let catalog = Arc::clone(&ctx.model_catalog);
     let session_id = ctx.session_id.clone();
-    tokio::spawn(async move {
+    if let Err(error) = ctx.tasks.spawn_auxiliary(async move {
         crate::runner::title::generate(db, bus, chat, config, catalog, session_id).await;
-    });
+    }) {
+        tracing::debug!(%error, "title registration closed");
+    }
 }
 
 /// Deliver the steers pending at a step boundary, steer-scope only: queued
@@ -807,11 +834,11 @@ async fn settle_stale_tool_calls(bus: &EventBus, db: &Db, session_id: &str) -> R
         out
     };
     for (message_id, data) in rows {
-        let message: Value = serde_json::from_str(&data)?;
-        let Some(content) = message.get("content").and_then(Value::as_array) else {
+        let mut message: Value = serde_json::from_str(&data)?;
+        let Some(Value::Array(content)) = message.get_mut("content").map(Value::take) else {
             continue;
         };
-        for part in content {
+        for mut part in content {
             let is_tool = part.get("type").and_then(Value::as_str) == Some("tool");
             let status = part
                 .get("state")
@@ -820,6 +847,25 @@ async fn settle_stale_tool_calls(bus: &EventBus, db: &Db, session_id: &str) -> R
             if !is_tool || !matches!(status, Some("running") | Some("streaming")) {
                 continue;
             }
+            let executed = part
+                .get("executed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            // Move only durable facts into the existing settlement event. Child
+            // identity seen only in ephemeral progress is still unrecoverable;
+            // naming a child does not turn a running hand-off into delivery.
+            let metadata = part
+                .pointer_mut("/state/metadata")
+                .map(Value::take)
+                .filter(|value| !value.is_null())
+                .map(serde_json::from_value)
+                .transpose()?;
+            let result_state = part
+                .get_mut("providerResultState")
+                .map(Value::take)
+                .filter(|value| !value.is_null())
+                .map(serde_json::from_value)
+                .transpose()?;
             let Some(id) = part.get("id").and_then(Value::as_str) else {
                 continue;
             };
@@ -834,9 +880,9 @@ async fn settle_stale_tool_calls(bus: &EventBus, db: &Db, session_id: &str) -> R
                     response: None,
                 },
                 content: None,
-                metadata: None,
-                executed: false,
-                result_state: None,
+                metadata,
+                executed,
+                result_state,
             })
             .await?;
         }

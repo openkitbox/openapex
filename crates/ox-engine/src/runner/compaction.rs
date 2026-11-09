@@ -27,7 +27,6 @@
 
 use anyhow::Result;
 use ox_db::Db;
-use ox_llm::cardinal::stream::StreamEvent;
 use ox_llm::cardinal::wire::{ChatMessage, ChatRequest};
 use ox_schema::event::SessionEventData;
 use ox_schema::message::{CompactionReason, Message};
@@ -247,49 +246,33 @@ async fn stream_summary(
         status: None,
         response: None,
     };
-    let mut stream = match ctx.chat.stream_chat(request).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            crate::mctx::quota::observe(&error, ox_schema::id::now_millis());
-            let kind = if super::provider_error::is_overflow_error(&error) {
+    let completion =
+        crate::completion::collect_with_deltas(&ctx.chat, request, |delta| async move {
+            if emit_deltas {
+                ctx.bus
+                    .publish(SessionEventData::CompactionDelta {
+                        session_id: ctx.session_id.clone(),
+                        text: delta,
+                    })
+                    .await?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|error| {
+            // Only a real provider input-overflow error may shrink the request.
+            // A length finish is an incomplete output, never an input overflow.
+            let kind = if error
+                .downcast_ref::<ox_llm::error::ChatError>()
+                .is_some_and(super::provider_error::is_overflow_error)
+            {
                 "compaction.overflow"
             } else {
                 "compaction.failed"
             };
-            return Err(failure(kind, format!("compaction request failed: {error}")));
-        }
-    };
-    let mut summary = String::new();
-    loop {
-        let next = std::future::poll_fn(|cx| stream.as_mut().poll_next(cx)).await;
-        match next {
-            Some(Ok(StreamEvent::TextDelta(delta))) => {
-                summary.push_str(&delta);
-                if emit_deltas
-                    && let Err(error) = ctx
-                        .bus
-                        .publish(SessionEventData::CompactionDelta {
-                            session_id: ctx.session_id.clone(),
-                            text: delta,
-                        })
-                        .await
-                {
-                    return Err(failure("unknown", error.to_string()));
-                }
-            }
-            Some(Ok(_)) => {}
-            Some(Err(error)) => {
-                let kind = if super::provider_error::is_overflow_error(&error) {
-                    "compaction.overflow"
-                } else {
-                    "compaction.failed"
-                };
-                return Err(failure(kind, format!("compaction stream failed: {error}")));
-            }
-            None => break,
-        }
-    }
-    Ok(summary)
+            failure(kind, format!("compaction completion failed: {error:#}"))
+        })?;
+    Ok(completion.text)
 }
 
 /// Run one compaction to completion: resolve the model, publish
@@ -705,6 +688,24 @@ async fn latest_seq(db: &Db, session_id: &str) -> Result<i64> {
     Ok(row.get::<i64>(0)?)
 }
 
+/// Capture the authoritative event watermark before reading checkpoint input.
+/// Any durable change after this read invalidates the quiet publication, even
+/// if it updates an existing row rather than appending a new message.
+async fn history_version(db: &Db, session_id: &str) -> Result<i64> {
+    let conn = db.acquire().await?;
+    let mut rows = conn
+        .query(
+            "SELECT COALESCE((SELECT seq FROM event_sequence WHERE aggregate_id = ?1), -1)",
+            [session_id],
+        )
+        .await?;
+    Ok(rows
+        .next()
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no history watermark"))?
+        .get(0)?)
+}
+
 /// The ordinal of the newest settled checkpoint — the row a later compaction
 /// resumes from — or the negative sentinel when none exists.
 async fn last_checkpoint_seq(db: &Db, session_id: &str) -> Result<i64> {
@@ -1025,8 +1026,10 @@ pub(crate) fn spawn_background_fold(ctx: &DrainCtx) {
         tracing::debug!(session = %ctx.session_id, "background fold already in flight");
         return;
     }
+    let tasks = ctx.tasks.clone();
+    let flag = std::sync::Arc::clone(&ctx.fold_in_flight);
     let ctx = ctx.clone();
-    tokio::spawn(async move {
+    if let Err(error) = tasks.spawn_auxiliary(async move {
         // Cleared on every exit path — including a panic unwind, so a dead
         // fold can never wedge the gate shut.
         let _guard = FlagGuard(&ctx.fold_in_flight);
@@ -1043,7 +1046,10 @@ pub(crate) fn spawn_background_fold(ctx: &DrainCtx) {
                 tracing::warn!(session = %ctx.session_id, error = %error, "background fold failed")
             }
         }
-    });
+    }) {
+        flag.store(false, std::sync::atomic::Ordering::Release);
+        tracing::debug!(%error, "fold registration closed");
+    }
 }
 
 /// Releases the in-flight slot when the fold task ends, unwinding included.
@@ -1064,6 +1070,7 @@ impl Drop for FlagGuard<'_> {
 /// the gate (plan D8).
 async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
     let started_at = std::time::Instant::now();
+    let version = history_version(&ctx.db, &ctx.session_id).await?;
     let (_, model) = resolve_selection(&ctx.db, &ctx.session_id, &ctx.config, &ctx.model_catalog)
         .await
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -1075,6 +1082,7 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
     let count_tokens = crate::mctx::tokens::counter_fn(crate::mctx::calibration::ratio_for(
         &ctx.calibrations,
         &ctx.session_id,
+        &model.id,
     ));
 
     let latest = latest_seq(&ctx.db, &ctx.session_id).await?;
@@ -1084,7 +1092,8 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
     // assistant turn past the checkpoint, measured exactly like the
     // historian trigger measures it. Both mctx modes need it, so the budget
     // is derived unconditionally; the floor stays mctx-only.
-    let budget = ctx.budget_for(&model.id);
+    let system_static = ctx.system_static();
+    let budget = ctx.budget_for(&model.id, system_static.len());
     let usage_pct = {
         let tail = super::step::rows_after_with_seq(&ctx.db, &ctx.session_id, checkpoint).await?;
         let usage = tail.iter().rev().find_map(|(_, row)| prompt_tokens(row));
@@ -1094,7 +1103,7 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
     // both the coverage reading for the decision and the fast-path summary
     // candidate. It is never called a second time without a patch in between.
     let (head_m0, head_floor) = if ctx.config.magic_context.enabled {
-        let (head_m0, _head_m1, floor) = super::step::mctx_head(ctx, budget).await;
+        let (head_m0, _head_m1, floor) = super::step::mctx_head(ctx, budget, &model.id).await;
         (head_m0, floor)
     } else {
         (None, 0)
@@ -1117,6 +1126,7 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
         head_floor,
         &count_tokens,
         reasoning_effort,
+        &model.id,
     )
     .await?
     {
@@ -1134,7 +1144,8 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
                     rows_before: floor.saturating_sub(checkpoint),
                     duration_ms: started_at.elapsed().as_millis(),
                 };
-                let settled = settle_quiet_outcome(ctx, model, Ok(summary), recent).await?;
+                let settled =
+                    settle_quiet_outcome(ctx, model, Ok(summary), recent, version).await?;
                 return Ok(settled.then_some(stats));
             }
             // Mid-fold growth busted the budget between the gate read and
@@ -1144,10 +1155,28 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
                 floor,
                 "background fold tail outgrew the recent budget mid-fold; template fallback"
             );
-            template_fold(ctx, &model, latest, checkpoint, started_at, &count_tokens).await
+            template_fold(
+                ctx,
+                &model,
+                latest,
+                checkpoint,
+                started_at,
+                &count_tokens,
+                version,
+            )
+            .await
         }
         CheckpointPlan::Template => {
-            template_fold(ctx, &model, latest, checkpoint, started_at, &count_tokens).await
+            template_fold(
+                ctx,
+                &model,
+                latest,
+                checkpoint,
+                started_at,
+                &count_tokens,
+                version,
+            )
+            .await
         }
     }
 }
@@ -1165,6 +1194,7 @@ async fn select_checkpoint_source(
     floor: i64,
     count_tokens: &(impl Fn(&str) -> usize + Sync),
     reasoning_effort: Option<String>,
+    model_id: &str,
 ) -> Result<CheckpointPlan> {
     let Some(summary) = head_m0 else {
         // The pass produced no head (off above, or failed): the template is
@@ -1180,7 +1210,8 @@ async fn select_checkpoint_source(
     // rather than hold it across the await.
     drop(tail);
     drop(summary);
-    match super::historian_trigger::patch_fold(ctx, budget, floor, reasoning_effort).await {
+    match super::historian_trigger::patch_fold(ctx, budget, floor, reasoning_effort, model_id).await
+    {
         Ok(true) => {}
         Ok(false) => return Ok(CheckpointPlan::Template),
         Err(error) => {
@@ -1192,7 +1223,7 @@ async fn select_checkpoint_source(
             return Ok(CheckpointPlan::Template);
         }
     }
-    let (head_m0, _head_m1, floor) = super::step::mctx_head(ctx, budget).await;
+    let (head_m0, _head_m1, floor) = super::step::mctx_head(ctx, budget, model_id).await;
     let Some(summary) = head_m0 else {
         return Ok(CheckpointPlan::Template);
     };
@@ -1227,7 +1258,10 @@ async fn template_fold(
     checkpoint: i64,
     started_at: std::time::Instant,
     count_tokens: &(impl Fn(&str) -> usize + Sync),
+    version: i64,
 ) -> Result<Option<FoldStats>> {
+    // Cover the summary input as well as the final tail read: a concurrent
+    // blocking checkpoint or edit must not become an unseen summary baseline.
     // D4: snapshot. The summary describes only rows that existed now; rows
     // that land while it streams are carried verbatim in `recent` (I5).
     // Loaded raw with seqs: the hierarchical summarizer chunks over the raw
@@ -1246,15 +1280,17 @@ async fn template_fold(
         rows_before: snapshot.saturating_sub(checkpoint),
         duration_ms: started_at.elapsed().as_millis(),
     };
-    // The tail read happens as late as possible, so the window for a row to
-    // land after it and before the checkpoint appends is one publish wide.
     let recent = if run.is_ok() {
         let tail = super::step::rows_after_with_seq(&ctx.db, &ctx.session_id, snapshot).await?;
-        recent_text(&tail, count_tokens)
+        let Some(recent) = head_recent(&tail, count_tokens) else {
+            tracing::info!(session = %ctx.session_id, "background fold discarded: unseen tail exceeds recent budget");
+            return Ok(None);
+        };
+        recent
     } else {
         String::new()
     };
-    let settled = settle_quiet_outcome(ctx, model.clone(), run, recent).await?;
+    let settled = settle_quiet_outcome(ctx, model.clone(), run, recent, version).await?;
     Ok(settled.then_some(stats))
 }
 
@@ -1263,27 +1299,21 @@ async fn template_fold(
 /// as a quiet `idle` checkpoint row or the whole result is discarded.
 /// Coalescing comes first: a running compaction row means a blocking
 /// compaction owns the session's compaction state, so the result is dropped
-/// wholesale. (The check and the publish are not atomic; in the sub-ms gap an
-/// overflow `started` can still slip in and adopt this summary — convergent,
-/// because the overflow's own `ended` then appends the latest completed row.)
+/// wholesale. The event bus checks both ownership and the captured history
+/// watermark in the event/projection transaction; a changed history is discarded.
 /// Returns whether a checkpoint row landed.
 async fn settle_quiet_outcome(
     ctx: &DrainCtx,
     model: ModelRef,
     run: std::result::Result<String, SessionError>,
     recent: String,
+    version: i64,
 ) -> Result<bool> {
-    if has_running_compaction(&ctx.db, &ctx.session_id).await? {
-        tracing::info!(
-            session = %ctx.session_id,
-            "background fold superseded by a blocking compaction"
-        );
-        return Ok(false);
-    }
     match run {
-        Ok(summary) => {
-            ctx.bus
-                .publish_quiet(SessionEventData::CompactionEnded {
+        Ok(summary) => ctx
+            .bus
+            .publish_quiet_checkpoint(
+                SessionEventData::CompactionEnded {
                     session_id: ctx.session_id.clone(),
                     reason: CompactionReason::Idle,
                     model: Some(model),
@@ -1293,11 +1323,11 @@ async fn settle_quiet_outcome(
                     recent,
                     cost: None,
                     tokens: None,
-                })
-                .await
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            Ok(true)
-        }
+                },
+                version,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string())),
         Err(error) => {
             // Silent by design (plan D4): no `compaction.failed` event — the
             // log line is the failure's only trace.
