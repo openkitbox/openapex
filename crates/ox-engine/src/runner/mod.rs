@@ -34,6 +34,7 @@ pub(crate) mod generate;
 mod historian_trigger;
 pub(crate) mod instructions;
 mod loop_guard;
+pub(crate) mod model_roles;
 mod output_budget;
 pub(crate) mod permissions;
 pub(crate) mod provider_error;
@@ -62,7 +63,7 @@ use ox_core::config::Config;
 use ox_core::event_bus::EventBus;
 use ox_db::Db;
 use ox_schema::event::{InterruptReason, SessionEventData};
-use ox_schema::support::SessionError;
+use ox_schema::support::{ModelRef, SessionError};
 use ox_tools::agent;
 use ox_tools::agent::Agent;
 use ox_tools::agent::Mode;
@@ -1378,6 +1379,14 @@ impl ox_tools::subagent::SubagentSpawner for WeakRunner {
             crate::runner::step::settled_tail(&self.runner()?.inner.db, session_id).await
         })
     }
+    /// Forward to the live runner. A dropped engine refuses instead of
+    /// resolving against a catalogue it no longer has.
+    fn child_model(&self, agent: &str) -> std::result::Result<Option<ModelRef>, String> {
+        let Some(inner) = self.0.upgrade() else {
+            return Err("Engine is shutting down; no child model was resolved".to_owned());
+        };
+        <Runner as ox_tools::subagent::SubagentSpawner>::child_model(&Runner { inner }, agent)
+    }
 }
 
 /// Wakes a session for a background `shell` completion.
@@ -1433,5 +1442,27 @@ impl ox_tools::subagent::SubagentSpawner for Runner {
             &self.inner.db,
             session_id,
         ))
+    }
+
+    /// The child's model comes from the agent's logical preference resolved
+    /// against the current services generation. An agent the table does not
+    /// define, or one without a preference, inherits the parent's model; a
+    /// preference the catalogue does not know refuses the spawn rather than
+    /// quietly running the child on the parent's model.
+    fn child_model(&self, agent_id: &str) -> std::result::Result<Option<ModelRef>, String> {
+        let services = self.inner.live.current();
+        let Some(profile) = agent::get(agent_id) else {
+            return Ok(None);
+        };
+        let Some(id) = model_roles::agent_model(&services.config, profile) else {
+            return Ok(None);
+        };
+        model_roles::logical(&services.model_catalog, id)
+            .map(Some)
+            .ok_or_else(|| {
+                format!(
+                    "Agent `{agent_id}` prefers model `{id}`, which the model catalogue does not know. Configure it under `[models.{id}]` or remove the preference; no child was started."
+                )
+            })
     }
 }

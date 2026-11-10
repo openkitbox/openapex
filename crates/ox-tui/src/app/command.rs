@@ -30,6 +30,9 @@ pub enum AppCommand {
         id: String,
         text: String,
         files: Vec<FileInput>,
+        /// One-turn logical model override for this prompt only (`/slim`).
+        /// `None` keeps the session's model; the engine resolves the id.
+        model: Option<String>,
     },
     Interrupt {
         session: String,

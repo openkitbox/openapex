@@ -219,6 +219,22 @@ fn rolling_log_writer(path: &Path) -> Result<(NonBlocking, WorkerGuard)> {
         .with_context(|| format!("failed to open log file `{}`", path.display()))?;
     Ok(tracing_appender::non_blocking(appender))
 }
+
+/// Load `~/.ox/ox.toml` and reject `[agents.<id>]` overrides naming no
+/// built-in agent.
+///
+/// `ox-core` parses the table but cannot see the built-in id table, which
+/// lives in `ox-tools`, so the check runs here on every path that loads the
+/// config for a long-running process. A misspelled id fails the load instead
+/// of being silently ignored.
+fn load_config() -> Result<ox::config::Config> {
+    let config = ox::config::Config::load()?;
+    let path = ox::config::Config::default_path();
+    ox_tools::agent::validate_ids(config.agents.keys().map(String::as_str))
+        .with_context(|| format!("failed to load config file {}", path.display()))?;
+    Ok(config)
+}
+
 fn serve_options(outputs: &LogOutputs) -> ox::ServeOptions {
     ox::ServeOptions {
         exit_when_idle: outputs.exit_when_idle,
@@ -238,12 +254,12 @@ async fn main() -> Result<()> {
                 ox::acp::validate_base(base)?;
             }
             init_tracing(&outputs, true)?;
-            let config = ox::config::Config::load()?;
+            let config = load_config()?;
             ox::acp::run(explicit_base, config).await
         }
         Command::Serve(outputs) => {
             init_tracing(&outputs, false)?;
-            let config = ox::config::Config::load()?;
+            let config = load_config()?;
             tracing::info!(
                 listen = %config.listen,
                 db = %config.db_path.display(),

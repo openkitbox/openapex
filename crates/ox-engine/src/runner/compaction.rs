@@ -275,20 +275,30 @@ async fn stream_summary(
     Ok(completion.text)
 }
 
-/// Run one compaction to completion: resolve the model, publish
+/// Run one compaction to completion: resolve the compaction model, publish
 /// `compaction.started` (the projector appends the `running` row — also the
 /// in-flight marker for background folds), stream the summarization request, then
 /// settle the row through `publish_outcome`. Returns the summary on success;
 /// the failure error after publishing `compaction.failed` otherwise.
+///
+/// `turn` is the model snapshot of the turn this compaction runs inside (`None`
+/// for a compaction that stands on its own). The compaction role outranks it —
+/// an operator policy, not a per-turn downgrade — and both outrank the session
+/// model. The chosen model drives the request, its size budget and the row's
+/// recorded model; the session's own model is never rewritten.
 pub(crate) async fn compact(
     ctx: &DrainCtx,
     token: &CancellationToken,
     reason: CompactionReason,
     input_id: Option<String>,
+    turn: Option<&ModelRef>,
 ) -> std::result::Result<String, SessionError> {
-    let (_, model) = resolve_selection(&ctx.db, &ctx.session_id, &ctx.config, &ctx.model_catalog)
-        .await
-        .map_err(|error| unknown_error(error.to_string()))?;
+    let (_, session_model) =
+        resolve_selection(&ctx.db, &ctx.session_id, &ctx.config, &ctx.model_catalog)
+            .await
+            .map_err(|error| unknown_error(error.to_string()))?;
+    let model =
+        super::model_roles::compaction_model(&ctx.config, &ctx.model_catalog, turn, session_model);
 
     publish_started(ctx, reason, input_id.clone()).await?;
     // An interrupt cancels the summarization here, inside `compact`, so the
@@ -1071,18 +1081,22 @@ impl Drop for FlagGuard<'_> {
 async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
     let started_at = std::time::Instant::now();
     let version = history_version(&ctx.db, &ctx.session_id).await?;
-    let (_, model) = resolve_selection(&ctx.db, &ctx.session_id, &ctx.config, &ctx.model_catalog)
-        .await
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    // One selection serves both the model and the policy: re-resolving either
-    // inside the fold could pair a model with another selection's variant.
-    let reasoning_effort = model.variant.clone();
+    let (_, session_model) =
+        resolve_selection(&ctx.db, &ctx.session_id, &ctx.config, &ctx.model_catalog)
+            .await
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    // One selection serves both the variant and the counter: re-resolving
+    // either inside the fold could pair a model with another selection's
+    // variant. The pressure gate, the mctx head and the historian patch all
+    // describe THIS session's context, so they stay on the session model even
+    // when the summary itself runs on the compaction model.
+    let reasoning_effort = session_model.variant.clone();
     // One counter resolution per fold: the session's measured provider ÷ local
     // ratio scales every local count into the budget's units below.
     let count_tokens = crate::mctx::tokens::counter_fn(crate::mctx::calibration::ratio_for(
         &ctx.calibrations,
         &ctx.session_id,
-        &model.id,
+        &session_model.id,
     ));
 
     let latest = latest_seq(&ctx.db, &ctx.session_id).await?;
@@ -1093,7 +1107,7 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
     // historian trigger measures it. Both mctx modes need it, so the budget
     // is derived unconditionally; the floor stays mctx-only.
     let system_static = ctx.system_static();
-    let budget = ctx.budget_for(&model.id, system_static.len());
+    let budget = ctx.budget_for(&session_model.id, system_static.len());
     let usage_pct = {
         let tail = super::step::rows_after_with_seq(&ctx.db, &ctx.session_id, checkpoint).await?;
         let usage = tail.iter().rev().find_map(|(_, row)| prompt_tokens(row));
@@ -1103,7 +1117,8 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
     // both the coverage reading for the decision and the fast-path summary
     // candidate. It is never called a second time without a patch in between.
     let (head_m0, head_floor) = if ctx.config.magic_context.enabled {
-        let (head_m0, _head_m1, floor) = super::step::mctx_head(ctx, budget, &model.id).await;
+        let (head_m0, _head_m1, floor) =
+            super::step::mctx_head(ctx, budget, &session_model.id).await;
         (head_m0, floor)
     } else {
         (None, 0)
@@ -1119,17 +1134,23 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
         tracing::debug!(session = %ctx.session_id, ?decision, "background fold skipped");
         return Ok(None);
     }
-    match select_checkpoint_source(
+    let plan = select_checkpoint_source(
         ctx,
         budget,
         head_m0,
         head_floor,
         &count_tokens,
         reasoning_effort,
-        &model.id,
+        &session_model.id,
     )
-    .await?
-    {
+    .await?;
+    // Past the gate and the head patch, the summary is the only work left, and
+    // it is the only thing `[roles].compaction` is allowed to retarget. A
+    // background fold belongs to no user turn, so it has no turn snapshot to
+    // inherit: the role decides, else the session model.
+    let model =
+        super::model_roles::compaction_model(&ctx.config, &ctx.model_catalog, None, session_model);
+    match plan {
         CheckpointPlan::Head { summary, floor } => {
             // D7: this is the SECOND tail read past the floor (the first was
             // the gate's fit check in `select_checkpoint_source`) — semantic,

@@ -50,8 +50,9 @@ TUI 要能回答提问，得先配一个 provider —— 见 [配置](#配置)�
 `OX_SUBAGENT_DEPTH` 三个环境变量覆盖同名设置。
 
 `listen`、`db_path`、`default_model` 这类顶层键，与 `[providers]`、`[models]`、
-`[context_caps]`、`[magic_context]`、`[mcp]`、`[subagent]`、`[events]`、
-`[sessions]`、`[tmp]`、`[turn]` 这些段并列。
+`[context_caps]`、`[roles]`、`[agents]`、`[magic_context]`、`[mcp]`、
+`[permissions]`、`[subagent]`、`[events]`、`[sessions]`、`[tmp]`、`[turn]`
+这些段并列。
 
 ### Provider
 
@@ -84,6 +85,24 @@ candidates = [
 
 更早的 `cardinal_url` / `cardinal_key` 两个键仍然描述那个隐式默认端点，路由可以用
 它的 provider 名引用它。
+
+### 模型角色
+
+有三类请求不属于会话本身的这一轮，可以各自指定逻辑模型。值必须是模型目录认识的
+逻辑 id（`[models.<id>]` 的路由键，或单端点模式下的 wire id）：
+
+```toml
+[roles]
+title = "slim"        # 默认就是逻辑模型 `slim`
+# compaction = "big"  # 默认跟随会话模型（/slim 那一轮则是该轮模型）
+
+[agents.explore]
+model = "slim"        # 默认值来自内置 agent 表
+```
+
+目录里没有 `slim` 时，标题生成回退到会话模型；`/slim` 只让下一条请求走 `slim`，
+不改变会话。子会话的 agent 指定了模型却查不到目录里时，它会直接报错，而不是静默
+用父会话的模型。
 
 ### MCP
 

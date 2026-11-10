@@ -11,10 +11,12 @@
 //!   prompt rides as a plain system message, exactly as the compaction
 //!   request does with `COMPACTION_SYSTEM`. Tools are never attached, so the
 //!   agent's `permissions: all-deny` posture holds by construction.
-//! - **The session's primary model generates the title.** No small-model
-//!   family preference and no minimal-reasoning variant lookup — the catalog
-//!   has no family concept, and the variant list is an upstream model
-//!   registry feature.
+//! - **The title model is role-driven, not the session's model.** The request
+//!   uses `[roles].title` — logical model `slim` by default — resolved through
+//!   the catalogue, so title cost does not follow the conversation's model. When
+//!   that logical model is unavailable, the session's own model is used and a
+//!   warning is logged. The session's persisted model is never rewritten: the
+//!   chosen model lives only on this request.
 //! - **The rename guard is a re-read, not a sequence assertion.** Before
 //!   publishing, the stored title is compared to the title snapshot taken
 //!   when generation started; a changed value means a manual rename (or a
@@ -142,17 +144,24 @@ pub(crate) async fn is_root_session(db: &Db, session_id: &str) -> Result<bool> {
         .is_none())
 }
 
-/// The model that generates the title: the session's selection, exactly as
-/// `drain.rs` resolves it for the turn (no small-model preference — see the
-/// module doc).
+/// The model that generates the title: `[roles].title`, defaulting to the
+/// logical model `slim`, resolved through the catalogue (see the module doc).
+///
+/// The session's selection is only the fallback basis for a logical model the
+/// catalogue does not know; it is never written back to the session, and
+/// `model_roles` logs the warning that explains the fallback.
 async fn title_model(
     db: &Db,
     session_id: &str,
     config: &ox_core::config::Config,
     catalog: &ox_llm::model_catalog::ModelCatalog,
 ) -> Result<ModelRef> {
-    let (_, model) = super::resolve_selection(db, session_id, config, catalog).await?;
-    Ok(model)
+    let (_, session_model) = super::resolve_selection(db, session_id, config, catalog).await?;
+    Ok(super::model_roles::title_model(
+        config,
+        catalog,
+        session_model,
+    ))
 }
 
 /// The title input: upstream `generate`'s text construction.
@@ -312,8 +321,9 @@ async fn generate_inner(
     let model = title_model(db, session_id, config, catalog).await?;
     // Upstream's request is tools-free and single-shot (the agent's deny-all
     // permissions); `ChatRequest::new` already advertises no tools.
-    // The session's primary model generates the title (the same selection
-    // `drain.rs` resolves), so the variant rides the hidden completion too.
+    // The role model (default logical `slim`) generates the title, so a
+    // cheaper model serves it regardless of the session's model; only a
+    // fallback to the session model carries that model's reasoning variant.
     let mut request = ChatRequest::new(
         model.id.clone(),
         vec![ChatMessage::system(PROMPT_TITLE), ChatMessage::user(text)],

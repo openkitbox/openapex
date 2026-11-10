@@ -13,7 +13,7 @@ use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use ox_client::rest::{FamilyMember, ShellInfo, ShellTail};
 use ox_client::sse::StreamMsg;
 use ox_client::store::{DataStore, Hydration, Item, ShellRef};
-use ox_schema::support::FileInput;
+use ox_schema::support::{FileInput, SLIM};
 use ratatui::layout::Rect;
 use tokio::sync::{mpsc, watch};
 
@@ -84,10 +84,13 @@ pub enum Mode {
 /// The home submission awaiting its session. Only the text is kept for a
 /// restore; the attachments travel with the command alone (keeping them here
 /// would duplicate up to ~27 MB each), so a failure just counts what is lost.
+/// The one-turn model override is kept here because `SessionReady` echoes only
+/// the text and files, so the app is the bridge across session creation.
 #[derive(Debug, PartialEq)]
 struct PendingHome {
     text: String,
     dropped_files: usize,
+    model: Option<String>,
 }
 
 /// The history reload in flight: its request id, and the store's
@@ -145,6 +148,15 @@ pub struct App {
     pending_reload: Option<PendingReload>,
     /// Home 提交后等待会话创建：失败时把这段文本放回 composer。
     pending_home_prompt: Option<PendingHome>,
+    /// The `/slim` intent: it applies to the next submitted prompt only and is
+    /// never a session-wide switch. Submit takes it, so the turn after that
+    /// returns to the session's model; a prompt the server refused puts it back.
+    pending_model: Option<String>,
+    /// The override the newest submitted prompt carries, with that prompt's id,
+    /// so `PromptFailed` can hand it back to `pending_model`. One slot rather
+    /// than a map: prompts carrying an override are human-paced, and the newest
+    /// intent is the only one worth restoring.
+    submitted_model: Option<(String, String)>,
     /// Title of the open session, for the `/rename` prefill.
     session_title: Option<String>,
     /// Parent of the open session, i.e. upstream's `session()?.parentID`
@@ -296,6 +308,8 @@ impl App {
             next_reload_id: 0,
             pending_reload: None,
             pending_home_prompt: None,
+            pending_model: None,
+            submitted_model: None,
             session_title: None,
             parent: None,
             dirty: true,
@@ -395,7 +409,17 @@ impl App {
             } => self.handle_session_ready(session, prompt, files),
             AppEvent::SessionFailed(err) => self.handle_session_failed(err),
             AppEvent::PromptFailed { id, error } => {
-                // The server never admitted it, so no delivery will come.
+                // The server never admitted the prompt, so no delivery will come
+                // and a one-turn model override it carried was not used: hand
+                // that intent back instead of dropping it silently.
+                if self
+                    .submitted_model
+                    .as_ref()
+                    .is_some_and(|(failed, _)| *failed == id)
+                    && let Some((_, model)) = self.submitted_model.take()
+                {
+                    self.pending_model.get_or_insert(model);
+                }
                 self.store.retract_user(&id);
                 self.refresh();
                 self.show_toast(Toast::error("Failed to send prompt", error, Instant::now()))
@@ -999,7 +1023,11 @@ impl App {
     }
 
     fn handle_session_ready(&mut self, session: String, prompt: String, files: Vec<FileInput>) {
-        self.pending_home_prompt = None;
+        // The home prompt's one-turn override waited here across creation.
+        let model = self
+            .pending_home_prompt
+            .take()
+            .and_then(|pending| pending.model);
         self.session = Some(session.clone());
         self.store.session = Some(session.clone());
         self.route = Route::Session;
@@ -1007,11 +1035,13 @@ impl App {
         self.prompt.set_placeholder("");
         let id = ox_schema::id::id("msg");
         self.store.push_user(&id, &prompt);
+        self.submitted_model = model.as_ref().map(|model| (id.clone(), model.clone()));
         let _ = self.commands.send(AppCommand::Prompt {
             session,
             id,
             text: prompt,
             files,
+            model,
         });
         self.request_running_shells();
         self.request_family();
@@ -1022,6 +1052,9 @@ impl App {
         let mut message = err;
         if let Some(pending) = self.pending_home_prompt.take() {
             self.prompt.restore(&pending.text);
+            // No session was created, so nothing carried the override: keep it
+            // for the next attempt rather than dropping the `/slim` intent.
+            self.pending_model = pending.model;
             if pending.dropped_files > 0 {
                 message = format!("{message} (attachments were dropped)");
             }
@@ -1552,7 +1585,7 @@ impl App {
         }
     }
 
-    fn submit(&mut self, submission: Submission) {
+    fn submit(&mut self, mut submission: Submission) {
         if self.route == Route::Home && self.pending_home_prompt.is_some() {
             // Creation owns the directory until SessionReady, including /cd.
             self.prompt.restore(&submission.text);
@@ -1591,27 +1624,38 @@ impl App {
             }
             return;
         }
+        // The one-turn `/slim` intent belongs to the prompt being sent: the
+        // guards above restored the draft without sending anything, so it is
+        // taken only here.
+        submission.model = self.pending_model.take();
         if self.route == Route::Home {
+            // `SessionReady` echoes only the text and files, so the app is the
+            // bridge for the override across session creation.
             self.pending_home_prompt = Some(PendingHome {
                 text: submission.text.clone(),
                 dropped_files: submission.files.len(),
+                model: submission.model.take(),
             });
             let _ = self
                 .commands
                 .send(AppCommand::CreateSessionAndPrompt(submission));
             return;
         }
-        let Submission { text, files } = submission;
+        let Submission { text, files, model } = submission;
         // 本地乐观显示：随后一帧就有用户消息；`session.inbox.delivered` 按 id 把它标为已送达。
         let id = ox_schema::id::id("msg");
         self.store.push_user(&id, &text);
         self.refresh();
         if let Some(session) = self.session.clone() {
+            // Remember which prompt holds the override, so a refused send can
+            // hand it back instead of dropping it.
+            self.submitted_model = model.as_ref().map(|model| (id.clone(), model.clone()));
             let _ = self.commands.send(AppCommand::Prompt {
                 session,
                 id,
                 text,
                 files,
+                model,
             });
         }
     }
@@ -1728,6 +1772,19 @@ impl App {
                 if let Some(session) = self.session.clone() {
                     let _ = self.commands.send(AppCommand::ClearMemory { session });
                 }
+            }
+            CommandAction::Slim => {
+                // Idempotent, never a toggle: re-running `/slim` keeps the same
+                // intent. It only records what the next prompt carries, so no
+                // `session.switchModel` request is sent and the session's
+                // stored model stays what it is.
+                self.pending_model = Some(SLIM.to_owned());
+                self.show_toast(Toast::new(
+                    toast::Variant::Info,
+                    None,
+                    "Next prompt uses slim (that turn only)",
+                    Instant::now(),
+                ));
             }
             CommandAction::New | CommandAction::Clear => {
                 self.session = None;

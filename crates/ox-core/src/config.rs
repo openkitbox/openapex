@@ -429,6 +429,58 @@ impl PermissionsConfig {
     }
 }
 
+/// Reject a blank logical model id: an empty id names no model, so the shape is
+/// wrong before any catalogue lookup happens.
+fn validate_model_id(key: &str, value: Option<&str>) -> Result<()> {
+    match value {
+        Some(id) if id.trim().is_empty() => {
+            anyhow::bail!("`{key}` must not be empty or whitespace")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Auxiliary-request model roles (`[roles]` section). Both values are logical
+/// model ids: the model catalogue decides the wire model, so nothing here names
+/// a provider endpoint.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct RolesConfig {
+    /// Logical model for session title generation. `None` leaves the default to
+    /// the use site (`ox_schema::support::SLIM`) rather than fixing it here.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// Logical model for context compaction. `None` keeps the session's own
+    /// model, which is today's behavior.
+    #[serde(default)]
+    pub compaction: Option<String>,
+}
+
+impl RolesConfig {
+    /// Reject blank values at load, naming the key, rather than at first use.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_model_id("[roles] title", self.title.as_deref())?;
+        validate_model_id("[roles] compaction", self.compaction.as_deref())
+    }
+}
+
+/// One agent's model preference (`[agents.<id>]` section). The id is a built-in
+/// agent id; `ox_tools::agent::get` is the authority on the valid set.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+pub struct AgentConfig {
+    /// Logical model for that agent's child sessions. `None` keeps the built-in
+    /// preference from the agent table.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+impl AgentConfig {
+    /// Reject a blank model id. The `[agents.<id>]` key lives in the owning map,
+    /// so the load path adds it to the message.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        validate_model_id("model", self.model.as_deref())
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     /// LLM endpoint configuration. Flattened: its keys (`cardinal_url`,
@@ -475,6 +527,15 @@ pub struct Config {
     /// Tool permissions (`[permissions]` section). Allow-all by default.
     #[serde(default)]
     pub permissions: PermissionsConfig,
+    /// Auxiliary-request model roles (`[roles]` section). Absent means title
+    /// generation falls back to its use-site default and compaction follows the
+    /// session model.
+    #[serde(default)]
+    pub roles: RolesConfig,
+    /// Per-agent model overrides (`[agents.<id>]` sections), keyed by built-in
+    /// agent id. Absent means each agent keeps its built-in preference.
+    #[serde(default)]
+    pub agents: BTreeMap<String, AgentConfig>,
 }
 
 fn default_event_heartbeat_ms() -> u64 {
@@ -496,6 +557,8 @@ impl Default for Config {
             tmp: TmpConfig::default(),
             turn: TurnConfig::default(),
             permissions: PermissionsConfig::default(),
+            roles: RolesConfig::default(),
+            agents: BTreeMap::new(),
         }
     }
 }
@@ -584,6 +647,13 @@ impl Config {
         config.mcp.validate()?;
         config.llm.validate()?;
         config.subagent.validate()?;
+        config.roles.validate()?;
+        for (id, agent) in &config.agents {
+            anyhow::ensure!(!id.trim().is_empty(), "[agents] ids must not be empty");
+            if let Err(error) = agent.validate() {
+                anyhow::bail!("[agents.{id}]: {error}");
+            }
+        }
         Ok(config)
     }
 

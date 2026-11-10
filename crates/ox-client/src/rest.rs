@@ -16,6 +16,29 @@ struct PromptBody<'a> {
     text: &'a str,
     #[serde(skip_serializing_if = "<[FileInput]>::is_empty")]
     files: &'a [FileInput],
+    /// Omitted entirely unless this prompt overrides the model for its turn,
+    /// so an ordinary prompt's JSON stays byte-identical to before.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata: Option<TurnModel<'a>>,
+}
+
+/// The user-prompt `metadata` carrying a one-turn logical model override.
+///
+/// It serializes as `{ ox_schema::inbox::TURN_MODEL_KEY: <logical id> }` — the
+/// key is written from the shared constant rather than a per-call map, and the
+/// id is the product-level logical name (`slim`), not a provider/model pair.
+struct TurnModel<'a>(&'a str);
+
+impl Serialize for TurnModel<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(1))?;
+        map.serialize_entry(ox_schema::inbox::TURN_MODEL_KEY, self.0)?;
+        map.end()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -892,19 +915,29 @@ impl Client {
     ///
     /// `id` becomes the inbox and message id, so the caller's optimistic echo
     /// can be matched to the `session.inbox.delivered` that names it.
+    ///
+    /// `model` is a one-turn logical model override (`/slim`). It rides in the
+    /// prompt's `metadata` so the engine binds it to this user request only;
+    /// when absent the field is not serialized at all.
     pub async fn prompt(
         &self,
         session: &str,
         id: &str,
         text: &str,
         files: &[FileInput],
+        model: Option<&str>,
     ) -> Result<Value> {
         let resp = self
             .request(
                 reqwest::Method::POST,
                 &format!("/api/session/{session}/prompt"),
             )
-            .json(&PromptBody { id, text, files })
+            .json(&PromptBody {
+                id,
+                text,
+                files,
+                metadata: model.map(TurnModel),
+            })
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -1173,5 +1206,37 @@ impl Client {
             return Err(Error::Status(resp.status()));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PromptBody, TurnModel};
+
+    /// A prompt with no override must stay byte-identical to the body before
+    /// `/slim` existed; one with it must carry exactly the metadata object the
+    /// engine reads.
+    #[test]
+    fn prompt_body_carries_the_turn_model_only_when_set() {
+        let plain = PromptBody {
+            id: "msg_1",
+            text: "hi",
+            files: &[],
+            metadata: None,
+        };
+        let json = serde_json::to_string(&plain).expect("a prompt body is serializable");
+        assert_eq!(json, r#"{"id":"msg_1","text":"hi"}"#);
+
+        let overridden = PromptBody {
+            id: "msg_1",
+            text: "hi",
+            files: &[],
+            metadata: Some(TurnModel("slim")),
+        };
+        let json = serde_json::to_string(&overridden).expect("a prompt body is serializable");
+        assert_eq!(
+            json,
+            r#"{"id":"msg_1","text":"hi","metadata":{"model":"slim"}}"#
+        );
     }
 }

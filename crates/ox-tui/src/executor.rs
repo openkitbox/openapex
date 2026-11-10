@@ -57,7 +57,8 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
             id,
             text,
             files,
-        } => prompt(&client, &tx, &session, &id, &text, &files).await,
+            model,
+        } => prompt(&client, &tx, &session, &id, &text, &files, model.as_deref()).await,
         AppCommand::Interrupt { session } => interrupt(&client, &tx, &session).await,
         AppCommand::Background { session } => background(&client, &tx, &session).await,
         AppCommand::ListSessions {
@@ -153,6 +154,8 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
     }
 }
 
+/// `model` is the prompt's one-turn logical model override (`/slim`), passed
+/// straight to the request's `metadata`; `None` leaves the body as it was.
 async fn prompt(
     client: &Client,
     tx: &Events,
@@ -160,8 +163,9 @@ async fn prompt(
     id: &str,
     text: &str,
     files: &[FileInput],
+    model: Option<&str>,
 ) {
-    if let Err(err) = client.prompt(session, id, text, files).await {
+    if let Err(err) = client.prompt(session, id, text, files, model).await {
         tracing::warn!(%err, "prompt failed");
         let _ = tx.send(AppEvent::PromptFailed {
             id: id.to_owned(),

@@ -1,8 +1,9 @@
 //! The built-in agent records.
 //!
-//! Each record decides two things for a session created with its id: the
-//! static system prompt layer (replaced when [`Agent::system`] is set) and the
-//! visible toolset ([`Agent::tools`], applied over the registered tools).
+//! Each record decides what a session created with its id gets: the static
+//! system prompt layer (replaced when [`Agent::system`] is set), the visible
+//! toolset ([`Agent::tools`], applied over the registered tools), and the
+//! child-session model preference ([`Agent::model`]).
 //!
 //! Invariants:
 //! - Tool registries own whether a tool name exists; this table only names which
@@ -14,6 +15,10 @@
 //!   checked there (they join the registry at wiring time), so a typo in one of
 //!   them silently drops that tool.
 //! - The first entry is the default agent ([`default_agent`]).
+//! - This table is the only authority on which agent ids exist; model catalogues
+//!   and configuration validate ids against it rather than keeping a list.
+
+use ox_schema::support::SLIM;
 
 /// Whether the user drives the agent or `subagent` spawns it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +46,13 @@ pub struct Agent {
     /// When set, replaces the whole static system layer (upstream `agent.system`).
     pub system: Option<&'static str>,
     pub tools: Tools,
+    /// The logical model id a *child* session of this agent prefers, or `None`
+    /// to inherit the parent session's model.
+    ///
+    /// A logical id (`slim`), never a provider endpoint: the model catalogue and
+    /// router decide the wire model. Ignored for primary agents, whose persisted
+    /// `session.model` is authoritative.
+    pub model: Option<&'static str>,
 }
 
 /// The agent a session uses when none is named.
@@ -159,24 +171,28 @@ static AGENTS: [Agent; 4] = [
         mode: Mode::Primary,
         system: None,
         tools: Tools::All,
+        model: None,
     },
     Agent {
         id: SUBAGENT_AGENT,
         mode: Mode::Subagent,
         system: None,
         tools: Tools::Without(CHILD_EXCLUDED_TOOLS),
+        model: None,
     },
     Agent {
         id: READ_ONLY_AGENT,
         mode: Mode::Subagent,
         system: Some(EXPLORE_SYSTEM),
         tools: Tools::Only(READ_ONLY_TOOLS),
+        model: Some(SLIM),
     },
     Agent {
         id: REVIEW_AGENT,
         mode: Mode::Subagent,
         system: Some(REVIEW_SYSTEM),
         tools: Tools::Only(REVIEW_TOOLS),
+        model: None,
     },
 ];
 
@@ -190,6 +206,33 @@ pub fn all() -> &'static [Agent] {
 #[must_use]
 pub fn get(id: &str) -> Option<&'static Agent> {
     AGENTS.iter().find(|agent| agent.id == id)
+}
+
+/// Reject `[agents.<id>]` ids that cannot take a model preference.
+///
+/// This table is the only authority on which ids exist and what they do, but the
+/// `[agents]` config table lives in `ox-core`, which this crate depends on and
+/// which therefore cannot see this module: the check runs at whichever layer
+/// owns both, which passes the ids it read from `ox.toml`. Fail closed — a
+/// misspelled id, or one on a primary agent (whose sessions run on their
+/// persisted model), would otherwise sit in the config and do nothing.
+pub fn validate_ids<'id>(ids: impl IntoIterator<Item = &'id str>) -> anyhow::Result<()> {
+    for id in ids {
+        let Some(agent) = get(id) else {
+            let mut valid: Vec<&str> = AGENTS.iter().map(|agent| agent.id).collect();
+            valid.sort_unstable();
+            anyhow::bail!(
+                "[agents.{id}] is not a built-in agent (valid ids: {})",
+                valid.join(", ")
+            );
+        };
+        if agent.mode == Mode::Primary {
+            anyhow::bail!(
+                "[agents.{id}] cannot set a model: {id} is a primary agent, whose sessions run on their persisted model (only subagent agents spawn children)"
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The agent a session uses when none is named (`apex`).

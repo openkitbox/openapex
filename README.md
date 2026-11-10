@@ -54,9 +54,9 @@ at all, opens the TUI.
 `OX_LISTEN` and `OX_SUBAGENT_DEPTH` override the matching settings.
 
 Top-level keys such as `listen`, `db_path` and `default_model` sit next to the
-sections `[providers]`, `[models]`, `[context_caps]`, `[magic_context]`,
-`[mcp]`, `[permissions]`, `[subagent]`, `[events]`, `[sessions]`, `[tmp]` and
-`[turn]`.
+sections `[providers]`, `[models]`, `[context_caps]`, `[roles]`, `[agents]`,
+`[magic_context]`, `[mcp]`, `[permissions]`, `[subagent]`, `[events]`,
+`[sessions]`, `[tmp]` and `[turn]`.
 
 ### Provider
 
@@ -90,6 +90,26 @@ candidates = [
 
 The older `cardinal_url` / `cardinal_key` keys still describe the implicit
 default endpoint, which routes may reference by its provider name.
+
+### Model roles
+
+Three requests are not the session's own turn, so each can name its own logical
+model. Values are logical ids the model catalogue knows (`[models.<id>]` route
+keys, or the wire id in single-endpoint mode):
+
+```toml
+[roles]
+title = "slim"        # default: the logical model `slim`
+# compaction = "big"  # default: the session's model (or a /slim turn's)
+
+[agents.explore]
+model = "slim"        # default comes from the built-in agent table
+```
+
+Title generation falls back to the session model when `slim` is missing, and a
+`/slim` prompt asks for one turn on `slim` without changing the session. A
+subagent whose agent names a model refuses to start when that model is not in
+the catalogue, instead of silently running on the parent's model.
 
 ### MCP
 

@@ -147,6 +147,14 @@ pub trait SubagentSpawner: Send + Sync {
     /// whole transcript: several children settling together must not hold
     /// several transcripts at once.
     fn settled_tail<'a>(&'a self, session_id: &'a str) -> SettledTail<'a>;
+    /// The model a fresh child session of `agent` starts on, resolved by the
+    /// engine from the agent's logical model preference.
+    ///
+    /// `Ok(None)` means inherit the parent session's model. `Err` is a
+    /// fail-closed refusal: the preference names a model the engine cannot
+    /// resolve, and silently starting the child on the parent's model would
+    /// defeat the cost policy the caller asked for.
+    fn child_model(&self, agent: &str) -> Result<Option<ModelRef>, String>;
 }
 
 /// The boxed future [`SubagentSpawner::wait_idle`] answers with.
@@ -931,6 +939,11 @@ async fn acquire_slot(
 /// and the parent link; `metadata` stays empty (upstream keeps it
 /// host-owned). `agent` is the child's agent id; the engine picks the child's
 /// system prompt and toolset from it.
+///
+/// The model is resolved once, here: the engine answers the agent's logical
+/// preference through [`SubagentSpawner::child_model`], and an agent without a
+/// preference inherits the parent session's model. A resume never reaches this
+/// function, so a resumed child keeps the model persisted on its row.
 async fn create_child(
     handle: &SubagentHandle,
     parent_session_id: &str,
@@ -938,7 +951,11 @@ async fn create_child(
     parent: ParentTuple,
     agent: &str,
 ) -> Result<String, String> {
-    let (project_id, directory, workspace_id, subpath, model) = parent;
+    let (project_id, directory, workspace_id, subpath, parent_model) = parent;
+    let Some(spawner) = handle.spawner() else {
+        return Err("Subagent runner is not attached; no child was started".to_owned());
+    };
+    let model = spawner.child_model(agent)?.or(parent_model);
     let child_id = ox_schema::id::id("ses");
     let created = SessionEventData::SessionCreated {
         session_id: child_id.clone(),

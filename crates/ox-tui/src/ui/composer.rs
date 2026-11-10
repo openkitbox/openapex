@@ -14,13 +14,19 @@ use crate::theme;
 use crate::ui::media;
 use crate::ui::paste::{self, Pasted};
 
-/// What one submit hands to the app: the prompt text and the files that ride
-/// with it. It moves by value from the composer to the HTTP request; the
-/// attachments (base64, up to ~27 MB each) are never cloned on the way.
+/// What one submit hands to the app: the prompt text, the files that ride with
+/// it, and the one-turn logical model override the app attaches (`/slim`;
+/// `None` for an ordinary prompt). It moves by value from the composer to the
+/// HTTP request; the attachments (base64, up to ~27 MB each) are never cloned
+/// on the way, and `model` is a tiny id the app fills in at submit — never a
+/// resolved provider/model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Submission {
     pub text: String,
     pub files: Vec<FileInput>,
+    /// Logical model id for this prompt's turn only (`ox_schema::support::SLIM`
+    /// for `/slim`); the engine resolves it and leaves the session model alone.
+    pub model: Option<String>,
 }
 
 impl Submission {
@@ -29,6 +35,7 @@ impl Submission {
         Self {
             text: text.into(),
             files: Vec::new(),
+            model: None,
         }
     }
 }
@@ -126,7 +133,13 @@ impl Composer {
             let text = paste::expand(trimmed, &self.pasted);
             let files = self.take_attached(trimmed);
             self.clear();
-            return Some(Submission { text, files });
+            return Some(Submission {
+                text,
+                files,
+                // The composer knows nothing about models: the app fills this
+                // in at submit from its one-shot `/slim` intent.
+                model: None,
+            });
         }
         self.textarea.input(key);
         None

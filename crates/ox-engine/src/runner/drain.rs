@@ -41,7 +41,7 @@ use ox_schema::event::SessionEventData;
 use ox_schema::id;
 use ox_schema::inbox::{Delivery, Item};
 use ox_schema::message::{CompactionReason, Message};
-use ox_schema::support::{FinishReason, SessionError};
+use ox_schema::support::{FinishReason, ModelRef, SessionError};
 use ox_tools::agent::Agent;
 
 use super::ToolRegistry;
@@ -307,9 +307,16 @@ pub(crate) async fn drain(
                         session = %ctx.session_id,
                         "manual compaction skipped: a background fold is running"
                     );
-                } else if let Err(error) =
-                    compaction::compact(ctx, token, CompactionReason::Manual, Some(next.id.clone()))
-                        .await
+                } else if let Err(error) = compaction::compact(
+                    ctx,
+                    token,
+                    CompactionReason::Manual,
+                    Some(next.id.clone()),
+                    // A manual compaction is its own control, not part of a
+                    // turn: no snapshot to inherit, so the role decides.
+                    None,
+                )
+                .await
                 {
                     tracing::warn!(session = %ctx.session_id, error = %error.message, "compaction failed");
                 }
@@ -353,7 +360,23 @@ pub(crate) async fn drain(
                 // (untitled + generated titles are never untitled) keeps it to
                 // one completion in practice.
                 maybe_spawn_title_generation(ctx).await;
-                match run_turn(ctx, token).await {
+                // A one-turn model override rides the request that carries it
+                // (its inbox metadata), and only that request: the turn after it
+                // starts from the session model again. Synthetic items carry
+                // metadata too — the client can enqueue one — so they are read
+                // the same way; controls (compaction, move) never carry one.
+                let requested = match &next.item {
+                    Item::User { payload, .. } => payload
+                        .metadata
+                        .as_ref()
+                        .and_then(super::model_roles::override_id),
+                    Item::Synthetic { payload, .. } => payload
+                        .metadata
+                        .as_ref()
+                        .and_then(super::model_roles::override_id),
+                    _ => None,
+                };
+                match run_turn(ctx, token, requested).await {
                     Ok(TurnOutcome::Ended) => {
                         // The next scan re-opens the entry boundary when the
                         // head is a queued item (llm.ts:109-112), chaining
@@ -378,8 +401,8 @@ enum TurnOutcome {
     Failed(SessionError),
 }
 
-/// One turn: consecutive steps sharing the session's model selection
-/// (upstream `drain` step loop). A step that finished with tool calls
+/// One turn: consecutive steps sharing one model snapshot (upstream `drain`
+/// step loop). A step that finished with tool calls
 /// continues into the next step after its tools settled; a step rejected as
 /// context overflow compacts once (reason `auto`) and retries; a
 /// length-truncated step continues via the tool-call boundary when the
@@ -396,10 +419,22 @@ enum TurnOutcome {
 /// Arc/String fields per turn) so it can follow a services reload: the copy
 /// is re-pointed at the newest generation when the turn starts and at the top
 /// of every step.
-async fn run_turn(busy: &DrainCtx, token: &CancellationToken) -> Result<TurnOutcome> {
+///
+/// `requested` is the one-turn model override of the inbox item that opened
+/// this turn (a user prompt, or a synthetic item a client enqueued); the turn
+/// resolves it once, up front, into the single
+/// [`ModelRef`] every step, retry, continuation and auto compaction of the turn
+/// then uses. The session's own model row is never written or re-read
+/// mid-turn: the override lives only in the inbox item, so the next turn starts
+/// from the session model again.
+async fn run_turn(
+    busy: &DrainCtx,
+    token: &CancellationToken,
+    requested: Option<&str>,
+) -> Result<TurnOutcome> {
     let mut local = busy.clone();
     local.refresh();
-    let (agent, model) = match resolve_selection(
+    let (agent, session_model) = match resolve_selection(
         &local.db,
         &local.session_id,
         &local.config,
@@ -410,6 +445,9 @@ async fn run_turn(busy: &DrainCtx, token: &CancellationToken) -> Result<TurnOutc
         Ok(selection) => selection,
         Err(error) => return Ok(TurnOutcome::Failed(unknown_error(error.to_string()))),
     };
+    // The snapshot is taken from the refreshed generation, the same one the
+    // agent selection above came from, so the two cannot cross revisions.
+    let model = super::model_roles::turn_model(&local.model_catalog, requested, session_model);
     let mut compacted = false;
     // Per-turn state: loop iterations started, the repeated-call detector,
     // and whether it asked for the next step to be the final one.
@@ -464,7 +502,7 @@ async fn run_turn(busy: &DrainCtx, token: &CancellationToken) -> Result<TurnOutc
                     // The step settled its tool parts (success/failed rows);
                     // steer items that arrived mid-turn join before the
                     // continuation step (upstream step boundary: steer-only).
-                    deliver_pending_steers(ctx, token).await?;
+                    deliver_pending_steers(ctx, token, &model).await?;
                     continue;
                 }
                 if finish != FinishReason::Length {
@@ -484,7 +522,7 @@ async fn run_turn(busy: &DrainCtx, token: &CancellationToken) -> Result<TurnOutc
                 // Upstream Outcome.OutputLimit (llm.ts): a tool-call length
                 // truncation continues without a prompt (`needsContinuation`).
                 if needs_continuation {
-                    deliver_pending_steers(ctx, token).await?;
+                    deliver_pending_steers(ctx, token, &model).await?;
                     continue;
                 }
                 // A text truncation continues via a synthetic user prompt;
@@ -528,7 +566,8 @@ async fn run_turn(busy: &DrainCtx, token: &CancellationToken) -> Result<TurnOutc
                 // overflow error (llm.ts:221 — compaction failures carry
                 // only compaction.failed + execution.failed, no step.failed).
                 if let Err(compact_error) =
-                    compaction::compact(ctx, token, CompactionReason::Auto, None).await
+                    compaction::compact(ctx, token, CompactionReason::Auto, None, Some(&model))
+                        .await
                 {
                     // An interrupt cancelled the compaction: report that, not
                     // the overflow that triggered it.
@@ -636,7 +675,14 @@ async fn maybe_spawn_title_generation(ctx: &DrainCtx) {
 /// items wait for the next turn entry. A compaction control at the steer
 /// head owns the boundary — it runs before the continuation step; a move
 /// still bounds it (handled at drain level after the turn).
-async fn deliver_pending_steers(ctx: &DrainCtx, token: &CancellationToken) -> Result<()> {
+///
+/// `turn` is the running turn's model snapshot: a compaction control at this
+/// boundary belongs to the turn, so it may not re-resolve the session model.
+async fn deliver_pending_steers(
+    ctx: &DrainCtx,
+    token: &CancellationToken,
+    turn: &ModelRef,
+) -> Result<()> {
     let steers = pending_steers(&ctx.db, &ctx.session_id).await?;
     let Some(head) = steers.first() else {
         return Ok(());
@@ -644,8 +690,14 @@ async fn deliver_pending_steers(ctx: &DrainCtx, token: &CancellationToken) -> Re
     if matches!(head.item, Item::Compaction { .. }) {
         let inbox_id = head.id.clone();
         deliver(ctx, &inbox_id).await?;
-        if let Err(error) =
-            compaction::compact(ctx, token, CompactionReason::Manual, Some(inbox_id)).await
+        if let Err(error) = compaction::compact(
+            ctx,
+            token,
+            CompactionReason::Manual,
+            Some(inbox_id),
+            Some(turn),
+        )
+        .await
         {
             tracing::warn!(session = %ctx.session_id, error = %error.message, "mid-turn compaction failed");
         }

@@ -13,7 +13,8 @@
 //!
 //! Everything is built inside `Live::replace`, so concurrent reloads
 //! serialize and each starts from the previous generation. Any failure (bad
-//! TOML, every model endpoint down) leaves the running services untouched.
+//! TOML, an unknown `[agents.<id>]`, every model endpoint down) leaves the
+//! running services untouched.
 //! A new registry is the old one minus the MCP tools the old hub registered
 //! (`Hub::tool_names`, recorded by `register_mcp_tools` from what it really
 //! registered, never from what merely collided with a builtin) plus the new
@@ -46,6 +47,10 @@ pub(crate) async fn run(state: &AppState, directory: &str) -> Result<()> {
         .live
         .replace(|old| async move {
             let mut next = Config::load_from(state.config_path.clone())
+                .with_context(|| format!("reload {}", state.config_path.display()))?;
+            // A misspelled `[agents.<id>]` fails the reload, like any other bad
+            // edit: `Live::replace` leaves the old services running.
+            ox_tools::agent::validate_ids(next.agents.keys().map(String::as_str))
                 .with_context(|| format!("reload {}", state.config_path.display()))?;
             // Keys `/connect` stored live in the database, not in `ox.toml`, so
             // every reload re-reads them before the transport is rebuilt —

@@ -15,6 +15,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::support::{LocationRef, Prompt, Record};
 
+/// The `metadata` key of a user prompt that carries a one-turn logical model
+/// override (`/slim`); the value is a logical model id string.
+///
+/// The override belongs to that one user request — it rides in the inbox item's
+/// metadata so a queued or replayed prompt keeps its model — and never becomes
+/// a session-wide model switch.
+pub const TURN_MODEL_KEY: &str = "model";
+
 /// Upstream `SessionInbox.Delivery` literal union.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]

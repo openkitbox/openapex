@@ -26,6 +26,9 @@ pub enum CommandAction {
     Status,
     /// Fetch the model catalogue and open the model picker.
     Models,
+    /// Use the `slim` logical model for the next submitted prompt only
+    /// (ox-only: one turn, never a session-wide model switch).
+    Slim,
     /// Fetch the agents and open the agent picker.
     Agents,
     /// Fetch the MCP servers and open the connect/disconnect dialog
@@ -187,6 +190,16 @@ pub const COMMANDS: &[Command] = &[
         title: "Show background shells",
         group: "Session",
         action: CommandAction::Shells,
+    },
+    // ox-only: one turn on the `slim` logical model. The engine resolves the
+    // logical id; this command only records the intent for the next prompt.
+    Command {
+        name: "slim",
+        aliases: &[],
+        description: "Use slim for the next prompt (one turn)",
+        title: "Use slim for the next prompt",
+        group: "Agent",
+        action: CommandAction::Slim,
     },
     Command {
         name: "images",
