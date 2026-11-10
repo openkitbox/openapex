@@ -230,6 +230,15 @@ fn live_spans(live: Live, pal: &theme::Palette) -> Vec<Span<'static>> {
     spans
 }
 
+/// The draft a menu pick leaves behind for a command that takes an argument.
+fn argument_template(action: CommandAction) -> Option<&'static str> {
+    match action {
+        CommandAction::Cd => Some("/cd "),
+        CommandAction::Slim => Some("/slim "),
+        _ => None,
+    }
+}
+
 /// What a key meant to the app.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PromptAction {
@@ -742,8 +751,11 @@ impl Prompt {
                     return PromptAction::Ignored;
                 };
                 let action = row.action;
-                if action == CommandAction::Cd {
-                    self.composer.set_text("/cd ", true);
+                // Commands that take an argument stay in the composer as a
+                // template: the user types the rest, and Enter submits one
+                // prompt with it. Running them here would drop the argument.
+                if let Some(template) = argument_template(action) {
+                    self.composer.set_text(template, true);
                     self.sync_menu();
                     return PromptAction::Ignored;
                 }

@@ -191,13 +191,14 @@ pub const COMMANDS: &[Command] = &[
         group: "Session",
         action: CommandAction::Shells,
     },
-    // ox-only: one turn on the `slim` logical model. The engine resolves the
-    // logical id; this command only records the intent for the next prompt.
+    // ox-only: one turn on the `slim` logical model. The prompt rides after the
+    // command (`/slim hi`), so the override and the message are always one
+    // submit; the engine resolves the logical id.
     Command {
         name: "slim",
         aliases: &[],
-        description: "Use slim for the next prompt (one turn)",
-        title: "Use slim for the next prompt",
+        description: "Send this prompt on slim (one turn): /slim <prompt>",
+        title: "Send this prompt on slim",
         group: "Agent",
         action: CommandAction::Slim,
     },
