@@ -99,6 +99,10 @@ pub enum AppEvent {
         session: String,
         prompt: String,
         files: Vec<FileInput>,
+        /// The model switch accepted while creating the first session. Home
+        /// keeps its chrome optimistic, so the preference is committed only
+        /// after this success event reaches the app.
+        model: Option<super::command::SessionModel>,
     },
     /// Lazy session creation failed; the draft must be restored.
     SessionFailed(String),
@@ -108,9 +112,10 @@ pub enum AppEvent {
         id: String,
         error: String,
     },
-    /// Answer to `AppCommand::LoadSessionChrome`.
+    /// Answer to `AppCommand::LoadSessionChrome`, with the request context
+    /// required to reject a response from an older navigation or reload.
     SessionChrome {
-        session: String,
+        request: super::command::SessionChromeRequest,
         selection: crate::bootstrap::Selection,
     },
     /// Answer to `AppCommand::McpList` (or the list after a toggle), for the
@@ -134,15 +139,28 @@ pub enum AppEvent {
     },
     /// Answer to `AppCommand::LoadContextLimits`: `providerID/id` → window.
     ContextLimits(std::collections::HashMap<String, i64>),
+    /// Answer to `AppCommand::VariantList`; it repeats the request's session
+    /// context so the UI can reject an answer from an old navigation.
+    Variants {
+        request: super::command::VariantRequest,
+        variants: Vec<ox_client::rest::ModelVariant>,
+    },
+    /// A variant catalogue request failed. Its identity keeps an old toast
+    /// from leaking into a newer session or dialog.
+    VariantFailed {
+        request: super::command::VariantRequest,
+        err: String,
+    },
     /// Answer to `AppCommand::AgentList`.
     Agents {
         agents: Vec<ox_client::rest::AgentRef>,
         intent: super::command::AgentIntent,
     },
     /// The server accepted a model/agent change; the chrome follows.
-    Switched(super::command::Switch),
-    /// A model/agent lookup or change failed; shown as a toast.
+    Switched(super::command::SwitchRequest),
+    /// A model/agent lookup or change failed; shown to the matching request.
     SwitchFailed {
+        request: Option<super::command::SwitchRequest>,
         title: &'static str,
         err: String,
     },

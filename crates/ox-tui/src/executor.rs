@@ -19,7 +19,8 @@ use ratatui::layout::Size;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::command::{
-    AgentIntent, AppCommand, CancelReason, McpAction, McpIntent, McpStamp, Switch,
+    AgentIntent, AppCommand, CancelReason, McpAction, McpIntent, McpStamp, SessionChromeRequest,
+    SessionModel, Switch, SwitchRequest, VariantRequest,
 };
 use crate::app::event::AppEvent;
 use crate::app::event::Fetched;
@@ -129,7 +130,7 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
             cells,
             class,
         } => media_inline(&tx, key, bytes, cells, class).await,
-        AppCommand::LoadSessionChrome { session } => session_chrome(&client, &tx, session).await,
+        AppCommand::LoadSessionChrome { request } => session_chrome(&client, &tx, request).await,
         AppCommand::McpList { intent, stamp } => mcp_list(&client, &tx, intent, stamp).await,
         AppCommand::McpToggle {
             server,
@@ -138,14 +139,15 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
         } => mcp_toggle(&client, &tx, server, action, stamp).await,
         AppCommand::ModelList => model_list(&client, &tx).await,
         AppCommand::LoadContextLimits => context_limits(&client, &tx).await,
+        AppCommand::VariantList { request } => variant_list(&client, &tx, request).await,
         AppCommand::AgentList(intent) => agent_list(&client, &tx, intent).await,
-        AppCommand::Switch { session, switch } => switch_to(&client, &tx, &session, switch).await,
+        AppCommand::Switch { request } => switch_to(&client, &tx, request).await,
         AppCommand::ReloadHistory {
             session,
             request_id,
         } => reload_history(&client, &tx, &session, request_id).await,
         // Owned by main's serial loop (they touch the SSE attachment).
-        AppCommand::CreateSessionAndPrompt(_)
+        AppCommand::CreateSessionAndPrompt { .. }
         | AppCommand::ChangeDirectory { .. }
         | AppCommand::RefreshDirectory { .. }
         | AppCommand::AttachSession { .. }
@@ -467,13 +469,13 @@ async fn write_clipboard(tx: &Events, text: String) {
     let _ = tx.send(AppEvent::ClipboardWritten { host_ok });
 }
 
-async fn session_chrome(client: &Client, tx: &Events, session: String) {
+async fn session_chrome(client: &Client, tx: &Events, request: SessionChromeRequest) {
     // 尽力而为：取不到就保留当前显示，不打扰用户。
-    match client.session_info(&session).await {
+    match client.session_info(&request.session).await {
         Ok(info) => {
             let providers = client.providers().await.unwrap_or_default();
             let selection = crate::bootstrap::selection_of(&info, &providers);
-            let _ = tx.send(AppEvent::SessionChrome { session, selection });
+            let _ = tx.send(AppEvent::SessionChrome { request, selection });
         }
         Err(err) => tracing::warn!(%err, "session chrome lookup failed"),
     }
@@ -625,7 +627,29 @@ async fn model_list(client: &Client, tx: &Events) {
         Err(err) => {
             tracing::warn!(%err, "model list failed");
             let _ = tx.send(AppEvent::SwitchFailed {
+                request: None,
                 title: "Failed to load models",
+                err: err.to_string(),
+            });
+        }
+    }
+}
+
+async fn variant_list(client: &Client, tx: &Events, request: VariantRequest) {
+    match client.models().await {
+        Ok(models) => {
+            let variants = models
+                .into_iter()
+                .find(|model| {
+                    model.provider_id == request.provider_id && model.model_id == request.model_id
+                })
+                .map_or_else(Vec::new, |model| model.variants);
+            let _ = tx.send(AppEvent::Variants { request, variants });
+        }
+        Err(err) => {
+            tracing::warn!(%err, "variant list failed");
+            let _ = tx.send(AppEvent::VariantFailed {
+                request,
                 err: err.to_string(),
             });
         }
@@ -640,6 +664,7 @@ async fn agent_list(client: &Client, tx: &Events, intent: AgentIntent) {
         Err(err) => {
             tracing::warn!(%err, "agent list failed");
             let _ = tx.send(AppEvent::SwitchFailed {
+                request: None,
                 title: "Failed to load agents",
                 err: err.to_string(),
             });
@@ -647,28 +672,52 @@ async fn agent_list(client: &Client, tx: &Events, intent: AgentIntent) {
     }
 }
 
-async fn switch_to(client: &Client, tx: &Events, session: &str, switch: Switch) {
-    let result = match &switch {
+pub(crate) async fn apply_model_switch(
+    client: &Client,
+    session: &str,
+    model: &SessionModel,
+) -> ox_client::Result<()> {
+    client
+        .switch_model(
+            session,
+            &model.provider_id,
+            &model.model_id,
+            model.variant.as_deref(),
+        )
+        .await
+}
+
+async fn switch_to(client: &Client, tx: &Events, request: SwitchRequest) {
+    let result = match &request.switch {
         Switch::Model {
             provider_id,
             model_id,
             variant,
             ..
         } => {
-            client
-                .switch_model(session, provider_id, model_id, variant.as_deref())
-                .await
+            apply_model_switch(
+                client,
+                &request.session,
+                &SessionModel {
+                    provider_id: provider_id.clone(),
+                    model_id: model_id.clone(),
+                    variant: variant.clone(),
+                },
+            )
+            .await
         }
-        Switch::Agent { id, .. } => client.switch_agent(session, id).await,
+        Switch::Agent { id, .. } => client.switch_agent(&request.session, id.as_str()).await,
     };
     match result {
         Ok(()) => {
-            let _ = tx.send(AppEvent::Switched(switch));
+            let _ = tx.send(AppEvent::Switched(request));
         }
         Err(err) => {
             tracing::warn!(%err, "switch failed");
+            let title = request.switch.failure_title();
             let _ = tx.send(AppEvent::SwitchFailed {
-                title: switch.failure_title(),
+                request: Some(request),
+                title,
                 err: err.to_string(),
             });
         }

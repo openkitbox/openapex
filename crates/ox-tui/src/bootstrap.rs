@@ -30,6 +30,8 @@ pub struct Selection {
     pub agent: Option<String>,
     pub model: Option<String>,
     pub provider: Option<String>,
+    /// Provider id used for subsequent model/variant requests.
+    pub provider_id: Option<String>,
     pub variant: Option<String>,
     /// 会话标题（`/rename` 的预填值）。
     pub title: Option<String>,
@@ -55,6 +57,7 @@ pub fn selection_of(info: &SessionInfo, providers: &[ProviderRef]) -> Selection 
             .map(display_agent),
         model: info.model_id.clone(),
         provider,
+        provider_id: info.provider_id.clone(),
         variant: info
             .variant
             .clone()
@@ -93,6 +96,7 @@ pub async fn chrome(client: &Client, directory: &str, session: Option<&str>) -> 
     // 上游 metadata 行把 model 与 provider 当作两段：model 是 id，provider 是显示名。
     if let Ok(model) = client.default_model().await {
         out.model = Some(model.model_id.clone());
+        out.provider_id = Some(model.provider_id.clone());
         if let Ok(providers) = client.providers().await {
             out.provider = providers
                 .into_iter()
@@ -112,6 +116,7 @@ pub async fn chrome(client: &Client, directory: &str, session: Option<&str>) -> 
         if selection.model.is_some() {
             out.model = selection.model;
             out.provider = selection.provider;
+            out.provider_id = selection.provider_id;
             out.variant = selection.variant;
         }
     }

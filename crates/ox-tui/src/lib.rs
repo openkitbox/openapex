@@ -6,6 +6,7 @@ pub mod executor;
 pub mod graphics;
 pub mod herdr;
 pub mod lifecycle;
+pub mod model_preference;
 pub mod pipeline;
 pub mod run;
 pub mod shell_captures;

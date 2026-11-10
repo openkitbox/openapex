@@ -1130,6 +1130,7 @@ fn chrome(mcp: Option<McpSummary>) -> Chrome {
         agent: Some("Build".into()),
         model: Some("k3-256k".into()),
         provider: Some("Cardinal".into()),
+        provider_id: Some("cardinal".into()),
         variant: None,
         directory: "~/Developer/openkitbox/ox".into(),
         branch: Some("main".into()),

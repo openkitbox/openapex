@@ -26,6 +26,9 @@ pub enum CommandAction {
     Status,
     /// Fetch the model catalogue and open the model picker.
     Models,
+    /// Fetch the current model's reasoning levels and open the variant picker
+    /// (`/variants`, also `thinking` / `effort`).
+    Variants,
     /// Use the `slim` logical model for the next submitted prompt only
     /// (ox-only: one turn, never a session-wide model switch).
     Slim,
@@ -115,6 +118,14 @@ pub const COMMANDS: &[Command] = &[
         title: "MCP servers",
         group: "Agent",
         action: CommandAction::Mcps,
+    },
+    Command {
+        name: "variants",
+        aliases: &["thinking", "effort"],
+        description: "Switch model variant",
+        title: "Switch model variant",
+        group: "Agent",
+        action: CommandAction::Variants,
     },
     Command {
         name: "models",

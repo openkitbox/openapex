@@ -68,6 +68,64 @@ fn footer_of(route: Route) -> Footer {
     }
 }
 
+/// Whether a session chrome answer still describes the session on screen and
+/// the newest read for it.
+fn chrome_answer_matches(
+    session: Option<&str>,
+    navigation_generation: u64,
+    latest_request: u64,
+    latest_switch_generation: u64,
+    request: &command::SessionChromeRequest,
+) -> bool {
+    session == Some(request.session.as_str())
+        && request.request_id == latest_request
+        && request.switch_generation == latest_switch_generation
+        && request.navigation_generation == navigation_generation
+}
+
+/// Whether a chrome answer changed the model identity the prompt shows. A
+/// plain reload of the same session usually returns the selection the row
+/// already has; that must not invalidate a `ctrl+t` request in flight.
+fn chrome_changes_model_identity(chrome: &Chrome, selection: &crate::bootstrap::Selection) -> bool {
+    chrome.provider_id != selection.provider_id
+        || chrome.model != selection.model
+        || chrome.variant != selection.variant
+}
+
+/// Whether a `Switched` answer belongs to the request still current on screen.
+/// Home's local synthetic switch has no server session, so only its zero id
+/// and empty session are accepted there.
+fn switch_answer_matches(
+    session: Option<&str>,
+    navigation_generation: u64,
+    latest_request: u64,
+    latest_session: Option<&str>,
+    request: &command::SwitchRequest,
+) -> bool {
+    if session.is_none() {
+        return request.request_id == 0
+            && request.session.is_empty()
+            && request.navigation_generation == navigation_generation;
+    }
+    session == Some(request.session.as_str())
+        && request.request_id == latest_request
+        && request.navigation_generation == navigation_generation
+        && latest_session == Some(request.session.as_str())
+}
+
+/// Whether a `SwitchFailed` still belongs to the current session, navigation
+/// and newest request. A failure from before a navigation is stale context.
+fn switch_failure_applies(
+    session: Option<&str>,
+    navigation_generation: u64,
+    latest_request: u64,
+    request: &command::SwitchRequest,
+) -> bool {
+    session == Some(request.session.as_str())
+        && request.request_id == latest_request
+        && request.navigation_generation == navigation_generation
+}
+
 /// Three modes, no cursor: `Compose` types into the prompt, `SearchInput`
 /// edits the `ctrl+f` query, `Browse` navigates the finished search (n/N, j/k,
 /// g/G). Letter keys are global only in `Browse`, so typing a message is never
@@ -173,6 +231,20 @@ pub struct App {
     dialog: Option<Dialog>,
     /// What the open `Select` is for (see `ui::models::DialogPurpose`).
     dialog_purpose: Option<crate::ui::models::DialogPurpose>,
+    /// The newest session chrome read. Responses must match the session,
+    /// request id and navigation generation before changing the prompt.
+    chrome_request_id: u64,
+    /// The newest switch request for the active session. Responses must match
+    /// both this id and the navigation generation before changing chrome.
+    switch_request_id: u64,
+    switch_generation: u64,
+    switch_session: Option<String>,
+    /// A variant list belongs to the prompt model and session that requested it.
+    /// The counter also serves as the invalidation epoch: changing that context
+    /// bumps it, so an answer from before the change can never match.
+    variant_request_id: u64,
+    variant_session: Option<String>,
+    variant_navigation_generation: u64,
     /// Global bindings: the command palette and the `ctrl+x` leader.
     keymap: Keymap,
     /// The one visible toast; a newer one replaces it (upstream `ui/toast.tsx`).
@@ -241,6 +313,8 @@ pub struct App {
     dock_hover: DockHover,
     /// Whether the pointer is over the prompt footer's live chip.
     live_hover: bool,
+    /// Persistent per-model variant choices, loaded once during startup.
+    model_preference: Option<crate::model_preference::ModelPreference>,
     /// Reports the focused session's state to the herdr pane this TUI runs
     /// in; `None` outside herdr.
     herdr: Option<herdr::Reporter>,
@@ -250,6 +324,14 @@ impl App {
     /// Back the prompt history with a file (startup only; tests stay in memory).
     pub fn attach_history(&mut self, history: crate::ui::history::History) {
         self.prompt.set_history(history);
+    }
+
+    /// Attach the per-model variant preference store (startup only).
+    pub fn attach_model_preference(
+        &mut self,
+        preferences: crate::model_preference::ModelPreference,
+    ) {
+        self.model_preference = Some(preferences);
     }
 
     /// Report agent state to herdr (startup only, inside a herdr pane).
@@ -309,6 +391,13 @@ impl App {
             show_help: false,
             dialog: None,
             dialog_purpose: None,
+            chrome_request_id: 0,
+            switch_request_id: 0,
+            switch_generation: 0,
+            switch_session: None,
+            variant_request_id: 0,
+            variant_session: None,
+            variant_navigation_generation: 0,
             keymap: Keymap::default(),
             toast: None,
             context_limits: std::collections::HashMap::new(),
@@ -333,6 +422,7 @@ impl App {
             graphics: Graphics::new(),
             media_pending: HashSet::new(),
             media_failed: HashSet::new(),
+            model_preference: None,
             herdr: None,
         }
     }
@@ -395,7 +485,8 @@ impl App {
                 session,
                 prompt,
                 files,
-            } => self.handle_session_ready(session, prompt, files),
+                model,
+            } => self.handle_session_ready(session, prompt, files, model),
             AppEvent::SessionFailed(err) => self.handle_session_failed(err),
             AppEvent::PromptFailed { id, error } => {
                 // The server never admitted the prompt, so no delivery will come.
@@ -441,46 +532,60 @@ impl App {
                 error,
             } => self.on_mcp_toggled(&server, action, error),
             AppEvent::Models { models, providers } => self.on_models(models, providers),
+            AppEvent::Variants { request, variants } => self.on_variants(request, variants),
+            AppEvent::VariantFailed { request, err } => self.on_variant_failed(request, err),
             AppEvent::ContextLimits(limits) => {
                 self.context_limits = limits;
                 self.refresh_context();
                 self.dirty = true;
             }
             AppEvent::Agents { agents, intent } => self.on_agents(agents, intent),
-            AppEvent::Switched(switch) => self.on_switched(switch),
-            AppEvent::SessionChrome { session, selection } => {
-                // 切走之后迟到的答案不能覆盖新会话的显示。
-                if self.session.as_deref() == Some(session.as_str()) {
-                    self.session_title = selection.title;
-                    // `session_changed` clears `parent`, so a parent that is
-                    // still unknown means this is the first chrome answer for
-                    // the session on screen — upstream's
-                    // `selectedSessionID !== route.sessionID`
-                    // (`subagents-tab.tsx:84`). Chrome is also reloaded on a
-                    // model or agent switch inside the same session, and that
-                    // must not yank the panel's selection back.
-                    let first = self.parent.is_none();
-                    self.parent = selection.parent_id;
-                    self.prompt.set_selection(
-                        selection.agent,
-                        selection.model,
-                        selection.provider,
-                        selection.variant,
-                    );
-                    // 子会话里上游的 subagent 面板是常驻的
-                    // （`routes/session/index.tsx:1587-1588`），而常驻的面板得有行
-                    // 可列，所以 chrome 一回来就把 family 拉上；落地前的选中行
-                    // 交给 `settle_selection`。
-                    if first && self.parent.is_some() {
-                        self.selection_pending = true;
-                        self.request_family();
-                    }
-                    self.dirty = true;
+            AppEvent::Switched(request) => self.on_switched(request),
+            AppEvent::SessionChrome { request, selection } => {
+                if !chrome_answer_matches(
+                    self.session.as_deref(),
+                    self.navigation_generation,
+                    self.chrome_request_id,
+                    self.switch_generation,
+                    &request,
+                ) {
+                    return;
                 }
+                if chrome_changes_model_identity(self.prompt.chrome(), &selection) {
+                    self.invalidate_variant_requests();
+                }
+                self.session_title = selection.title;
+                // `session_changed` clears `parent`, so a parent that is
+                // still unknown means this is the first chrome answer for
+                // the session on screen — upstream's
+                // `selectedSessionID !== route.sessionID`
+                // (`subagents-tab.tsx:84`). Chrome is also reloaded on a
+                // model or agent switch inside the same session, and that
+                // must not yank the panel's selection back.
+                let first = self.parent.is_none();
+                self.parent = selection.parent_id;
+                self.prompt.set_selection(
+                    selection.agent,
+                    selection.model,
+                    selection.provider,
+                    selection.provider_id,
+                    selection.variant,
+                );
+                // 子会话里上游的 subagent 面板是常驻的
+                // （`routes/session/index.tsx:1587-1588`），而常驻的面板得有行
+                // 可列，所以 chrome 一回来就把 family 拉上；落地前的选中行
+                // 交给 `settle_selection`。
+                if first && self.parent.is_some() {
+                    self.selection_pending = true;
+                    self.request_family();
+                }
+                self.dirty = true;
             }
-            AppEvent::SwitchFailed { title, err } => {
-                self.show_toast(Toast::error(title, err, Instant::now()))
-            }
+            AppEvent::SwitchFailed {
+                request,
+                title,
+                err,
+            } => self.on_switch_failed(request, title, err),
             AppEvent::Sessions {
                 directory,
                 generation,
@@ -753,6 +858,68 @@ impl App {
         }
     }
 
+    fn switch_response_matches(&self, request: &command::SwitchRequest) -> bool {
+        switch_answer_matches(
+            self.session.as_deref(),
+            self.navigation_generation,
+            self.switch_request_id,
+            self.switch_session.as_deref(),
+            request,
+        )
+    }
+
+    /// A switch the server refused. Chrome is optimistic, so the newest
+    /// failure triggers an authoritative chrome read: if an earlier switch
+    /// succeeded, only the server knows the selection the row must show. A
+    /// failure already superseded by a newer request, or superseded by
+    /// navigation, is dropped instead of toasting over the new context.
+    fn on_switch_failed(
+        &mut self,
+        request: Option<command::SwitchRequest>,
+        title: &'static str,
+        err: String,
+    ) {
+        let Some(request) = request else {
+            self.show_toast(Toast::error(title, err, Instant::now()));
+            return;
+        };
+        if !switch_failure_applies(
+            self.session.as_deref(),
+            self.navigation_generation,
+            self.switch_request_id,
+            &request,
+        ) {
+            return;
+        }
+        self.show_toast(Toast::error(title, err, Instant::now()));
+        let _ = self.request_session_chrome(request.session);
+    }
+
+    fn request_session_chrome(&mut self, session: String) -> bool {
+        if self.session.as_deref() != Some(session.as_str()) {
+            return false;
+        }
+        self.chrome_request_id = self.chrome_request_id.wrapping_add(1);
+        let request = command::SessionChromeRequest {
+            session,
+            request_id: self.chrome_request_id,
+            switch_generation: self.switch_generation,
+            navigation_generation: self.navigation_generation,
+        };
+        let _ = self
+            .commands
+            .send(AppCommand::LoadSessionChrome { request });
+        true
+    }
+
+    /// Session navigation exists no pending switch: a response from before it
+    /// must not touch the new session's chrome or preference store.
+    fn invalidate_switch_requests(&mut self) {
+        self.switch_request_id = self.switch_request_id.wrapping_add(1);
+        self.switch_generation = self.switch_generation.wrapping_add(1);
+        self.switch_session = None;
+    }
+
     /// A form dialog is open. It is the most urgent modal (the agent is
     /// blocked on it), so asynchronous dialog answers never replace it.
     fn form_open(&self) -> bool {
@@ -765,6 +932,9 @@ impl App {
     /// cursor (a stale one would make the next stream replay from the wrong
     /// place). The new session's pending forms are fetched when there is one.
     fn session_changed(&mut self) {
+        self.invalidate_switch_requests();
+        self.invalidate_variant_requests();
+        self.chrome_request_id = self.chrome_request_id.wrapping_add(1);
         self.pending_session_list = None;
         self.panel = None;
         self.pending_family = None;
@@ -956,9 +1126,7 @@ impl App {
                 generation: self.navigation_generation,
             });
             self.request_reload();
-            let _ = self
-                .commands
-                .send(AppCommand::LoadSessionChrome { session: id });
+            let _ = self.request_session_chrome(id);
             self.request_forms();
             self.request_running_shells();
             self.request_family();
@@ -993,17 +1161,27 @@ impl App {
             generation: self.navigation_generation,
         });
         self.request_reload();
-        let _ = self
-            .commands
-            .send(AppCommand::LoadSessionChrome { session: id });
+        let _ = self.request_session_chrome(id);
         self.request_running_shells();
         self.request_family();
         self.refresh();
     }
 
-    fn handle_session_ready(&mut self, session: String, prompt: String, files: Vec<FileInput>) {
+    fn handle_session_ready(
+        &mut self,
+        session: String,
+        prompt: String,
+        files: Vec<FileInput>,
+        model: Option<command::SessionModel>,
+    ) {
+        // The executor emits this only after the first-session model switch was
+        // accepted. Commit the pending preference at that same success boundary;
+        // a failed switch emits SessionFailed and never reaches this path.
+        if let Some(model) = model {
+            self.persist_session_model_preference(&model);
+        }
         // The home prompt's one-turn override waited here across creation.
-        let model = self
+        let prompt_model = self
             .pending_home_prompt
             .take()
             .and_then(|pending| pending.model);
@@ -1019,7 +1197,7 @@ impl App {
             id,
             text: prompt,
             files,
-            model,
+            model: prompt_model,
         });
         self.request_running_shells();
         self.request_family();
@@ -1524,6 +1702,10 @@ impl App {
                 _ => {}
             }
         }
+        if self.cycle_variant_key(&key) {
+            self.dirty = true;
+            return;
+        }
         if self.cycle_agent_key(&key) {
             self.dirty = true;
             return;
@@ -1626,9 +1808,10 @@ impl App {
                 dropped_files: submission.files.len(),
                 model: submission.model.take(),
             });
+            let model = self.session_model();
             let _ = self
                 .commands
-                .send(AppCommand::CreateSessionAndPrompt(submission));
+                .send(AppCommand::CreateSessionAndPrompt { submission, model });
             return;
         }
         let Submission { text, files, model } = submission;
@@ -1653,6 +1836,7 @@ impl App {
     }
 
     fn run_command(&mut self, action: CommandAction) {
+        self.invalidate_variant_requests();
         if action != CommandAction::Sessions {
             self.pending_session_list = None;
         }
@@ -1666,8 +1850,10 @@ impl App {
                 self.request_mcp_list(McpIntent::Dialog);
             }
             CommandAction::Models => {
+                self.invalidate_variant_requests();
                 let _ = self.commands.send(AppCommand::ModelList);
             }
+            CommandAction::Variants => self.request_variants(false),
             CommandAction::Agents => {
                 let _ = self
                     .commands
@@ -2427,9 +2613,7 @@ impl App {
                             | ox_schema::event::SessionEventData::SessionAgentSelected { .. }
                     )
                 {
-                    let _ = self
-                        .commands
-                        .send(AppCommand::LoadSessionChrome { session });
+                    let _ = self.request_session_chrome(session);
                 }
                 self.seq_tx.send_replace(self.store.last_seq);
                 // Deltas arrive far faster than frames: rebuilding the blocks
@@ -2782,9 +2966,7 @@ impl App {
             // gets, and keeps `AppEvent::SessionChrome` the single writer of
             // `parent`.
             if let Some(session) = self.session.clone() {
-                let _ = self
-                    .commands
-                    .send(AppCommand::LoadSessionChrome { session });
+                let _ = self.request_session_chrome(session);
             }
         }
 
@@ -2922,4 +3104,75 @@ fn flush_osc52(pending: &mut Option<String>, out: &mut impl std::io::Write) -> s
         out.flush()?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::command::{SessionChromeRequest, Switch, SwitchRequest};
+    use crate::bootstrap::Selection;
+
+    fn switch_request(id: u64, generation: u64, session: &str) -> SwitchRequest {
+        SwitchRequest {
+            session: session.to_owned(),
+            switch: Switch::Agent {
+                id: "agent".to_owned(),
+                label: "Agent".to_owned(),
+            },
+            request_id: id,
+            navigation_generation: generation,
+        }
+    }
+
+    #[test]
+    fn stale_switched_is_rejected_after_home_navigation() {
+        let request = switch_request(4, 8, "old");
+        assert!(!switch_answer_matches(
+            Some("home"),
+            9,
+            4,
+            Some("home"),
+            &request
+        ));
+        assert!(!switch_answer_matches(None, 9, 0, None, &request));
+    }
+
+    #[test]
+    fn chrome_reload_same_identity_keeps_variant_request_valid() {
+        let chrome = Chrome {
+            provider_id: Some("provider".to_owned()),
+            model: Some("model".to_owned()),
+            variant: Some("high".to_owned()),
+            ..Chrome::default()
+        };
+        let selection = Selection {
+            provider_id: chrome.provider_id.clone(),
+            model: chrome.model.clone(),
+            variant: chrome.variant.clone(),
+            ..Selection::default()
+        };
+        assert!(!chrome_changes_model_identity(&chrome, &selection));
+    }
+
+    #[test]
+    fn chrome_request_requires_session_and_identity() {
+        let request = SessionChromeRequest {
+            session: "one".to_owned(),
+            request_id: 3,
+            switch_generation: 7,
+            navigation_generation: 5,
+        };
+        assert!(chrome_answer_matches(Some("one"), 5, 3, 7, &request));
+        assert!(!chrome_answer_matches(Some("home"), 5, 3, 7, &request));
+        assert!(!chrome_answer_matches(Some("one"), 4, 3, 7, &request));
+        assert!(!chrome_answer_matches(Some("one"), 5, 3, 8, &request));
+    }
+
+    #[test]
+    fn latest_switch_failure_applies_and_older_one_does_not() {
+        let latest = switch_request(3, 5, "one");
+        let old = switch_request(2, 5, "one");
+        assert!(switch_failure_applies(Some("one"), 5, 3, &latest));
+        assert!(!switch_failure_applies(Some("one"), 5, 3, &old));
+    }
 }

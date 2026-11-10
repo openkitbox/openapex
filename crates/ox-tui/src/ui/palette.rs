@@ -42,6 +42,7 @@ const ORDER: &[CommandAction] = &[
     CommandAction::Forget,
     CommandAction::Slim,
     CommandAction::Models,
+    CommandAction::Variants,
     CommandAction::Agents,
     CommandAction::Mcps,
     CommandAction::Status,
@@ -73,7 +74,7 @@ pub struct Context {
 /// Upstream `suggested` per command.
 fn suggested(action: CommandAction, context: Context) -> bool {
     match action {
-        CommandAction::Sessions | CommandAction::Models => true,
+        CommandAction::Sessions | CommandAction::Models | CommandAction::Variants => true,
         CommandAction::New => context.in_session,
         _ => false,
     }

@@ -1,6 +1,7 @@
 //! The `ox` TUI entry point: argument handling, terminal setup, wiring.
 
 use crate::lifecycle::{self, Transport};
+use crate::model_preference::{self, ModelPreference};
 use crate::{app, bootstrap, executor, herdr, terminal, ui};
 
 use tokio::sync::{mpsc, watch};
@@ -199,6 +200,9 @@ pub async fn run() -> anyhow::Result<()> {
     if let Some(path) = ui::history::default_path() {
         app.attach_history(ui::history::History::load(path));
     }
+    if let Some(path) = model_preference::default_path() {
+        app.attach_model_preference(ModelPreference::load(path));
+    }
     if let Some(reporter) = herdr_flags.and_then(herdr::Reporter::from_env) {
         app.attach_herdr(reporter);
     }
@@ -266,6 +270,26 @@ async fn commands(
     }
 }
 
+/// Commands that need the active session's directory context cannot run while
+/// that context is unavailable. ID-only commands remain responsive.
+fn directory_dependent(command: &app::command::AppCommand) -> bool {
+    matches!(
+        command,
+        app::command::AppCommand::CreateSessionAndPrompt { .. }
+            | app::command::AppCommand::Prompt { .. }
+            | app::command::AppCommand::ChangeDirectory { .. }
+            | app::command::AppCommand::FindDirectories { .. }
+            | app::command::AppCommand::FindFiles { .. }
+            | app::command::AppCommand::McpList { .. }
+            | app::command::AppCommand::McpToggle { .. }
+            | app::command::AppCommand::ModelList
+            | app::command::AppCommand::VariantList { .. }
+            | app::command::AppCommand::LoadContextLimits
+            | app::command::AppCommand::AgentList(_)
+            | app::command::AppCommand::Switch { .. }
+    )
+}
+
 /// Sole owner of request and stream context; failed resolution disables
 /// directory-dependent I/O until authoritative refresh or navigation succeeds.
 async fn serial_commands(
@@ -281,30 +305,29 @@ async fn serial_commands(
     let mut directory_ready = true;
     // Intent belongs to active_session, not to a cached session or directory.
     // Navigation clears it; successful directory recovery consumes it once.
-    let mut chrome_pending = false;
+    let mut chrome_pending = None;
     while let Some(command) = command_rx.recv().await {
-        if !directory_ready
-            && matches!(
-                command,
-                app::command::AppCommand::CreateSessionAndPrompt(_)
-                    | app::command::AppCommand::Prompt { .. }
-                    | app::command::AppCommand::ChangeDirectory { .. }
-                    | app::command::AppCommand::FindDirectories { .. }
-                    | app::command::AppCommand::FindFiles { .. }
-                    | app::command::AppCommand::McpList { .. }
-                    | app::command::AppCommand::McpToggle { .. }
-                    | app::command::AppCommand::ModelList
-                    | app::command::AppCommand::LoadContextLimits
-                    | app::command::AppCommand::AgentList(_)
-            )
-        {
+        if !directory_ready && directory_dependent(&command) {
             let error = "Working directory unavailable; reselect the session to retry".to_owned();
             let event = match command {
                 app::command::AppCommand::Prompt { id, .. } => {
                     app::event::AppEvent::PromptFailed { id, error }
                 }
-                app::command::AppCommand::CreateSessionAndPrompt(_) => {
+                app::command::AppCommand::CreateSessionAndPrompt { .. } => {
                     app::event::AppEvent::SessionFailed(error)
+                }
+                app::command::AppCommand::VariantList { request } => {
+                    app::event::AppEvent::VariantFailed {
+                        request,
+                        err: error,
+                    }
+                }
+                app::command::AppCommand::Switch { request } => {
+                    app::event::AppEvent::SwitchFailed {
+                        title: request.switch.failure_title(),
+                        request: Some(request),
+                        err: error,
+                    }
                 }
                 _ => app::event::AppEvent::SessionOpFailed {
                     title: "Directory unavailable",
@@ -315,9 +338,19 @@ async fn serial_commands(
             continue;
         }
         match command {
-            app::command::AppCommand::LoadSessionChrome { session } => {
-                if active_session.as_deref() == Some(&session) {
-                    chrome_pending = true;
+            app::command::AppCommand::LoadSessionChrome { request } => {
+                if active_session.as_deref() == Some(&request.session) {
+                    chrome_pending = Some(request);
+                }
+            }
+            app::command::AppCommand::Switch { request } => {
+                if active_session.as_deref() == Some(&request.session) {
+                    executor::run(
+                        client.clone(),
+                        tx.clone(),
+                        app::command::AppCommand::Switch { request },
+                    )
+                    .await;
                 }
             }
             app::command::AppCommand::ChangeDirectory { session, directory } => {
@@ -411,17 +444,42 @@ async fn serial_commands(
                     }
                 }
             }
-            app::command::AppCommand::CreateSessionAndPrompt(submission) => {
+            app::command::AppCommand::CreateSessionAndPrompt { submission, model } => {
                 match client.create_session().await {
                     Ok(session) => {
-                        chrome_pending = false;
-                        active_session = Some(session.clone());
-                        stream.attach(&session);
-                        let _ = tx.send(app::event::AppEvent::SessionReady {
-                            session,
-                            prompt: submission.text,
-                            files: submission.files,
-                        });
+                        // Home's model row is local until the session exists:
+                        // apply it before the first prompt so the row and the
+                        // turn cannot disagree. A refusal fails the creation,
+                        // leaving the draft on Home with its selection.
+                        let applied = match &model {
+                            Some(model) => {
+                                executor::apply_model_switch(&client, &session, model).await
+                            }
+                            None => Ok(()),
+                        };
+                        match applied {
+                            Ok(()) => {
+                                chrome_pending = None;
+                                active_session = Some(session.clone());
+                                stream.attach(&session);
+                                let _ = tx.send(app::event::AppEvent::SessionReady {
+                                    session,
+                                    prompt: submission.text,
+                                    files: submission.files,
+                                    model,
+                                });
+                            }
+                            Err(err) => {
+                                let cleanup = client.delete_session(&session).await;
+                                let detail = match cleanup {
+                                    Ok(()) => format!("Failed to apply the selected model: {err}"),
+                                    Err(cleanup_err) => format!(
+                                        "Failed to apply the selected model: {err}; failed to clean up session {session}: {cleanup_err}"
+                                    ),
+                                };
+                                let _ = tx.send(app::event::AppEvent::SessionFailed(detail));
+                            }
+                        }
                     }
                     Err(err) => {
                         let _ = tx.send(app::event::AppEvent::SessionFailed(err.to_string()));
@@ -433,7 +491,7 @@ async fn serial_commands(
                 generation: next,
             } => {
                 generation = next;
-                chrome_pending = false;
+                chrome_pending = None;
                 active_session = Some(session.clone());
                 directory_ready = false;
                 stream.detach();
@@ -466,7 +524,7 @@ async fn serial_commands(
                 generation: next,
             } => {
                 generation = next;
-                chrome_pending = false;
+                chrome_pending = None;
                 active_session = None;
                 client.directory = directory;
                 directory_ready = true;
@@ -481,17 +539,12 @@ async fn serial_commands(
                 tokio::spawn(executor::run(client.clone(), tx.clone(), other));
             }
         }
-        if directory_ready && chrome_pending {
-            chrome_pending = false;
-            if let Some(session) = &active_session {
-                tokio::spawn(executor::run(
-                    client.clone(),
-                    tx.clone(),
-                    app::command::AppCommand::LoadSessionChrome {
-                        session: session.clone(),
-                    },
-                ));
-            }
+        if directory_ready && let Some(request) = chrome_pending.take() {
+            tokio::spawn(executor::run(
+                client.clone(),
+                tx.clone(),
+                app::command::AppCommand::LoadSessionChrome { request },
+            ));
         }
     }
 }
@@ -535,4 +588,44 @@ async fn connect_unix(directory: &str) -> anyhow::Result<ox_client::Client> {
     .map_err(|_| anyhow::anyhow!("ox server did not grant a lease; check the server log"))??;
     tokio::spawn(lifecycle::run_lease(client.clone(), first, reconnect));
     Ok(client)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::command::{AppCommand, VariantRequest};
+
+    fn variant_request() -> VariantRequest {
+        VariantRequest {
+            provider_id: "provider".to_owned(),
+            model_id: "model".to_owned(),
+            provider_label: "Provider".to_owned(),
+            cycle: false,
+            request_id: 2,
+            session: Some("one".to_owned()),
+            navigation_generation: 3,
+        }
+    }
+
+    #[test]
+    fn directory_gate_rejects_variant_requests_and_reports_their_identity() {
+        assert!(directory_dependent(&AppCommand::VariantList {
+            request: variant_request(),
+        }));
+    }
+
+    #[test]
+    fn switch_uses_the_serial_directory_gate() {
+        assert!(directory_dependent(&AppCommand::Switch {
+            request: crate::app::command::SwitchRequest {
+                session: "one".to_owned(),
+                switch: crate::app::command::Switch::Agent {
+                    id: "agent".to_owned(),
+                    label: "Agent".to_owned(),
+                },
+                request_id: 2,
+                navigation_generation: 3,
+            },
+        }));
+    }
 }

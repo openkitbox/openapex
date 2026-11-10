@@ -27,8 +27,15 @@ use crate::bootstrap::display_agent;
 /// display labels for the chrome come from.
 #[derive(Debug)]
 pub enum DialogPurpose {
-    /// `/models`: values are [`encode`]d `provider/model`.
-    Model(Vec<ProviderRef>),
+    /// `/models`: values are [`encode`]d `provider/model`, plus the catalog
+    /// needed to open the variant picker.
+    Model(Vec<ProviderRef>, Vec<ModelInfo>),
+    /// Variant picker for one model.
+    Variant {
+        provider_id: String,
+        model_id: String,
+        provider_label: String,
+    },
     /// `/agents`: values are agent ids.
     Agent(Vec<AgentRef>),
 }
@@ -68,7 +75,64 @@ pub fn cycle_variant<'a>(
     named.get(index + 1).copied()
 }
 
-/// Rows for the variant picker: default first, followed by supported levels.
+/// The current chrome is authoritative for an existing session. Home has
+/// no session chrome, so its saved preference is authoritative instead.
+#[must_use]
+pub fn selected_variant(
+    has_session: bool,
+    current_provider: Option<&str>,
+    current_model: Option<&str>,
+    current_variant: Option<&str>,
+    target_provider: &str,
+    target_model: &str,
+    preference: Option<&str>,
+) -> Option<String> {
+    let same_current_model =
+        current_provider == Some(target_provider) && current_model == Some(target_model);
+    if same_current_model && has_session {
+        return normalize_variant(current_variant).map(str::to_owned);
+    }
+    match preference {
+        Some(value) => normalize_variant(Some(value)).map(str::to_owned),
+        None if same_current_model => normalize_variant(current_variant).map(str::to_owned),
+        None => None,
+    }
+}
+
+/// Resolve the model level for a first prompt versus an existing session.
+/// Home has no server chrome, so a saved value (including explicit `default`)
+/// is authoritative; an existing session uses its live chrome instead.
+#[must_use]
+pub fn session_model_variant(
+    has_session: bool,
+    current_variant: Option<&str>,
+    preference: Option<&str>,
+) -> Option<String> {
+    if has_session {
+        normalize_variant(current_variant).map(str::to_owned)
+    } else {
+        match preference {
+            Some(value) => normalize_variant(Some(value)).map(str::to_owned),
+            None => normalize_variant(current_variant).map(str::to_owned),
+        }
+    }
+}
+/// Whether a model switch would change the authoritative session selection.
+/// `default` and an absent/empty variant are the same server value.
+#[must_use]
+pub fn model_switch_needed(
+    current_provider: Option<&str>,
+    current_model: Option<&str>,
+    current_variant: Option<&str>,
+    target_provider: &str,
+    target_model: &str,
+    target_variant: Option<&str>,
+) -> bool {
+    current_provider != Some(target_provider)
+        || current_model != Some(target_model)
+        || normalize_variant(current_variant) != normalize_variant(target_variant)
+}
+
 #[must_use]
 pub fn variant_items(variants: &[ox_client::rest::ModelVariant]) -> Vec<Item> {
     let mut items = vec![Item::new("default", "Default")];
@@ -79,6 +143,23 @@ pub fn variant_items(variants: &[ox_client::rest::ModelVariant]) -> Vec<Item> {
             .map(|variant| Item::new(&variant.id, &variant.id)),
     );
     items
+}
+
+/// Whether the model has a level to cycle to. The catalogue's `default` entry
+/// is not one, so a model that lists only it behaves like a plain model.
+#[must_use]
+pub fn has_named_variants(variants: &[ox_client::rest::ModelVariant]) -> bool {
+    variants
+        .iter()
+        .any(|variant| variant.id != "default" && !variant.id.is_empty())
+}
+
+/// The `/variants` dialog; `current` marks and starts on the active level,
+/// with `default` standing in for "no named level".
+#[must_use]
+pub fn variant_select(variants: &[ox_client::rest::ModelVariant], current: Option<&str>) -> Select {
+    Select::new("Select variant", variant_items(variants))
+        .current(normalize_variant(current).unwrap_or("default"))
 }
 
 /// Inverse of [`encode`].
@@ -198,5 +279,169 @@ pub fn agent_select(agents: &[AgentRef], current: Option<&str>) -> Select {
     match current_index(agents, current) {
         Some(index) => select.current(&agents[index].id),
         None => select,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn variant(id: &str) -> ox_client::rest::ModelVariant {
+        ox_client::rest::ModelVariant { id: id.to_owned() }
+    }
+
+    #[test]
+    fn current_default_does_not_reuse_stale_preference() {
+        assert_eq!(
+            selected_variant(
+                true,
+                Some("provider"),
+                Some("model"),
+                None,
+                "provider",
+                "model",
+                Some("high"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn home_same_model_prefers_saved_variant_over_placeholder_chrome() {
+        assert_eq!(
+            selected_variant(
+                false,
+                Some("provider"),
+                Some("model"),
+                None,
+                "provider",
+                "model",
+                Some("high"),
+            ),
+            Some("high".to_owned())
+        );
+    }
+
+    #[test]
+    fn home_explicit_default_preference_does_not_fall_back_to_chrome() {
+        assert_eq!(
+            selected_variant(
+                false,
+                Some("provider"),
+                Some("model"),
+                Some("high"),
+                "provider",
+                "model",
+                Some("default"),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn home_uses_saved_preference_when_chrome_has_no_variant() {
+        assert_eq!(
+            session_model_variant(false, None, Some("high")),
+            Some("high".to_owned())
+        );
+    }
+
+    #[test]
+    fn explicit_home_default_preference_wins_over_saved_variant() {
+        assert_eq!(session_model_variant(false, None, Some("default")), None);
+    }
+
+    #[test]
+    fn existing_session_chrome_is_authoritative_over_saved_preference() {
+        assert_eq!(session_model_variant(true, None, Some("high")), None);
+    }
+
+    #[test]
+    fn different_model_uses_saved_preference() {
+        assert_eq!(
+            selected_variant(
+                false,
+                Some("provider"),
+                Some("current"),
+                None,
+                "provider",
+                "target",
+                Some("high"),
+            ),
+            Some("high".to_owned())
+        );
+    }
+
+    #[test]
+    fn default_switch_is_a_noop_only_for_same_model_without_variant() {
+        assert!(!model_switch_needed(
+            Some("provider"),
+            Some("model"),
+            None,
+            "provider",
+            "model",
+            None,
+        ));
+        assert!(model_switch_needed(
+            Some("provider"),
+            Some("model"),
+            Some("high"),
+            "provider",
+            "model",
+            None,
+        ));
+        assert!(model_switch_needed(
+            Some("provider"),
+            Some("model"),
+            None,
+            "other",
+            "model",
+            None,
+        ));
+    }
+
+    #[test]
+    fn variant_cycle_wraps_named_levels_back_to_default() {
+        let variants = vec![variant("default"), variant("high"), variant("low")];
+        assert_eq!(cycle_variant(None, &variants), Some("high"));
+        assert_eq!(cycle_variant(Some("high"), &variants), Some("low"));
+        assert_eq!(cycle_variant(Some("low"), &variants), None);
+        assert_eq!(cycle_variant(Some("default"), &variants), Some("high"));
+    }
+
+    #[test]
+    fn variant_picker_has_default_first_and_omits_catalog_default() {
+        let items = variant_items(&[variant("high"), variant("default"), variant("low")]);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.value.as_str())
+                .collect::<Vec<_>>(),
+            ["default", "high", "low"]
+        );
+    }
+
+    #[test]
+    fn variant_picker_starts_on_the_active_level_or_default() {
+        let variants = [variant("high"), variant("low")];
+        assert_eq!(
+            variant_select(&variants, Some("low")).selected_value(),
+            Some("low")
+        );
+        assert_eq!(
+            variant_select(&variants, None).selected_value(),
+            Some("default")
+        );
+        assert_eq!(
+            variant_select(&variants, Some("default")).selected_value(),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn named_variants_ignore_the_catalog_default_entry() {
+        assert!(!has_named_variants(&[]));
+        assert!(!has_named_variants(&[variant("default")]));
+        assert!(has_named_variants(&[variant("default"), variant("high")]));
     }
 }

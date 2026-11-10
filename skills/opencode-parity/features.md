@@ -68,7 +68,7 @@
 | dialog | dialog-theme-list | component/dialog-theme-list.tsx:1 |  | todo |  |
 | dialog | dialog-timeline | routes/session/dialog-timeline.tsx:1 | crates/ox-tui/src/ui/timeline_dialog.rs:15 | todo | ox 有对应对话框,字段与交互未逐项核对 |
 | dialog | dialog-update | component/dialog-update.tsx:1 |  | todo |  |
-| dialog | dialog-variant | component/dialog-variant.tsx:1 |  | todo |  |
+| dialog | dialog-variant | component/dialog-variant.tsx:1 | crates/ox-tui/src/ui/models.rs:141 | aligned | Default first, catalog named variants in server order; model selection opens the picker, explicit default clears the named variant; `/variants` applies default directly when no named levels exist |
 | dialog | dialog-workspace-file-changes | component/dialog-workspace-file-changes.tsx:1 |  | todo |  |
 | dialog | dialog-workspaces | component/dialog-workspaces.tsx:1 |  | todo |  |
 | dialog | dialog-worktree-name | component/dialog-worktree-name.tsx:1 |  | todo |  |
@@ -303,8 +303,8 @@
 | keybind | theme.switch | config/keybind.ts:93 |  | todo |  |
 | keybind | theme.switch_mode | config/keybind.ts:94 |  | todo |  |
 | keybind | usage.show | config/keybind.ts:173 |  | todo |  |
-| keybind | variant.cycle | config/keybind.ts:178 |  | todo |  |
-| keybind | variant.list | config/keybind.ts:179 |  | todo |  |
+| keybind | variant.cycle | config/keybind.ts:178 | crates/ox-tui/src/app/switching.rs:413 | aligned | `ctrl+t` cycles default → named catalog levels → default; stale responses are rejected and default-only models do not issue a no-op switch |
+| keybind | variant.list | config/keybind.ts:179 | crates/ox-tui/src/ui/commands.rs:123 | aligned | `/variants` with `thinking` and `effort` aliases opens the picker or applies default for a model with no named levels |
 | keybind | which-key.end | config/keybind.ts:302 |  | todo |  |
 | keybind | which-key.group.next | config/keybind.ts:296 |  | todo |  |
 | keybind | which-key.group.previous | config/keybind.ts:295 |  | todo |  |
@@ -381,7 +381,7 @@
 | slash | undo | routes/session/index.tsx:1110 |  | todo |  |
 | slash | update | app.tsx:1067 |  | todo |  |
 | slash | usage | app.tsx:961 |  | todo |  |
-| slash | variants | app.tsx:997 |  | todo |  |
+| slash | variants | app.tsx:997 | crates/ox-tui/src/ui/commands.rs:123 | aligned | `/variants` plus `thinking`/`effort` aliases; selection persists per provider/model and is applied through the session model switch before the next prompt |
 | slash | worktrees | component/prompt/index.tsx:627 |  | todo |  |
 | slash_alias | continue | app.tsx:768 | crates/ox-tui/src/ui/commands.rs:114 | todo | ox 有同名别名,行为未逐项核对 |
 | slash_alias | effort | app.tsx:997 |  | todo |  |

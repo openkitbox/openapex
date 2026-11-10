@@ -126,6 +126,9 @@ pub struct Chrome {
     pub model: Option<String>,
     /// Provider display name (`Cardinal`), a separate segment upstream.
     pub provider: Option<String>,
+    /// Provider id (`cardinal`), the half of the pair the server needs when a
+    /// switch names this model; the display name above cannot be sent.
+    pub provider_id: Option<String>,
     /// Model variant (`high`); `default` is normalised away like upstream.
     pub variant: Option<String>,
     /// `~`-abbreviated working directory.
@@ -479,22 +482,30 @@ impl Prompt {
         self.chrome.agent = Some(agent);
     }
 
-    /// Show a newly selected model (id plus provider display name). A new
-    /// model starts without a variant.
-    pub fn set_model(&mut self, model: String, provider: Option<String>) {
+    /// Show a newly selected model (id plus provider display name) and the
+    /// reasoning level the server accepted with it.
+    pub fn set_model(
+        &mut self,
+        provider_id: Option<String>,
+        model: String,
+        provider: Option<String>,
+        variant: Option<String>,
+    ) {
+        self.chrome.provider_id = provider_id.filter(|id| !id.is_empty());
         self.chrome.model = Some(model);
         self.chrome.provider = provider.filter(|name| !name.is_empty());
-        self.chrome.variant = None;
+        self.chrome.variant = variant.filter(|name| !name.is_empty() && name != "default");
     }
 
-    /// Replace agent, model, provider and variant at once (a session's own
-    /// selection). Absent parts keep the current value, so a partial answer
-    /// never blanks the row.
+    /// Replace agent, model, provider, variant and provider id at once (a
+    /// session's own selection). Absent parts keep the current value, so a
+    /// partial answer never blanks the row.
     pub fn set_selection(
         &mut self,
         agent: Option<String>,
         model: Option<String>,
         provider: Option<String>,
+        provider_id: Option<String>,
         variant: Option<String>,
     ) {
         if let Some(agent) = agent {
@@ -503,7 +514,8 @@ impl Prompt {
         if let Some(model) = model {
             self.chrome.model = Some(model);
             self.chrome.provider = provider.filter(|name| !name.is_empty());
-            self.chrome.variant = variant.filter(|name| !name.is_empty());
+            self.chrome.provider_id = provider_id.filter(|id| !id.is_empty());
+            self.chrome.variant = variant.filter(|name| !name.is_empty() && name != "default");
         }
     }
 
