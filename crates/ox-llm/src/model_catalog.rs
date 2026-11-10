@@ -164,6 +164,7 @@ pub struct ModelCatalog {
     /// `[models]` route table; non-empty switches the served surface from the
     /// endpoints' raw lists to the route keys.
     routes: BTreeMap<String, Vec<CandidateConfig>>,
+    preserve_unrouted: bool,
     /// `[context_caps]` by model id. Applied where the window is read
     /// ([`Self::window_of`]) as `min(reported, cap)` — a cap lowers, never
     /// raises. Inert or unsatisfiable caps warn once per refresh.
@@ -248,6 +249,7 @@ impl ModelCatalog {
                 .iter()
                 .map(|(id, route)| (id.clone(), route.candidates.clone()))
                 .collect(),
+            preserve_unrouted: config.providers.is_empty(),
             context_caps: config.context_caps.clone(),
             cache: RwLock::new(Snapshot::default()),
         })
@@ -262,6 +264,7 @@ impl ModelCatalog {
             client: crate::http_client().build().unwrap_or_default(),
             endpoints: Vec::new(),
             routes: BTreeMap::new(),
+            preserve_unrouted: true,
             context_caps: BTreeMap::new(),
             cache: RwLock::new(Snapshot {
                 limits: BTreeMap::new(),
@@ -434,11 +437,17 @@ impl ModelCatalog {
         }
         // A stable order: the default falls back to the first entry, so the
         // order must not depend on how the gateway happened to serialise.
-        entries.sort_by(|left, right| left.id.cmp(&right.id));
-        entries.dedup_by(|left, right| left.id == right.id && left.provider == right.provider);
-        if !self.routes.is_empty() {
-            entries = Self::project_routes(&self.routes, &entries);
-        }
+        let builtin_providers: Vec<&BuiltinProvider> = self
+            .endpoints
+            .iter()
+            .filter_map(|endpoint| endpoint.builtin)
+            .collect();
+        entries = Self::merge_entries(
+            &self.routes,
+            entries,
+            self.preserve_unrouted,
+            &builtin_providers,
+        );
         // Caps that cannot bite are configuration drift the operator should
         // see: at or over the reported window (inert), or on a model with no
         // reported context at all (inactive — the unknown-window fallback
@@ -506,6 +515,28 @@ impl ModelCatalog {
         Ok(entries)
     }
 
+    fn merge_entries(
+        routes: &BTreeMap<String, Vec<CandidateConfig>>,
+        mut entries: Vec<ModelEntry>,
+        preserve_unrouted: bool,
+        builtin_providers: &[&BuiltinProvider],
+    ) -> Vec<ModelEntry> {
+        entries.sort_by(|left, right| {
+            left.id
+                .cmp(&right.id)
+                .then_with(|| left.provider.cmp(&right.provider))
+        });
+        entries.dedup_by(|left, right| left.id == right.id && left.provider == right.provider);
+        if routes.is_empty() {
+            if preserve_unrouted {
+                return entries;
+            }
+            entries.retain(|entry| is_builtin_entry(entry, builtin_providers));
+            return entries;
+        }
+        Self::project_routes(routes, entries, preserve_unrouted, builtin_providers)
+    }
+
     /// The served model face when `[models]` is configured: one entry per
     /// route key, provider = the first candidate's provider (the routing
     /// truth). The first candidate donates `context`/`reasoning`/levels from
@@ -515,41 +546,249 @@ impl ModelCatalog {
     /// usable entry with unknown context.
     fn project_routes(
         routes: &BTreeMap<String, Vec<CandidateConfig>>,
-        raw: &[ModelEntry],
+        raw: Vec<ModelEntry>,
+        preserve_unrouted: bool,
+        builtin_providers: &[&BuiltinProvider],
     ) -> Vec<ModelEntry> {
-        routes
-            .iter()
-            .map(|(id, route)| {
-                let first = route.first();
-                let donor = first.and_then(|candidate| {
-                    let mut matches = raw.iter().filter(|entry| entry.id == candidate.model);
-                    let first_match = matches.next()?;
-                    matches.next().is_none().then_some(first_match)
-                });
+        let donors = raw;
+        let mut entries = if preserve_unrouted {
+            donors.clone()
+        } else {
+            donors
+                .iter()
+                .filter(|entry| is_builtin_entry(entry, builtin_providers))
+                .cloned()
+                .collect()
+        };
+        for (id, route) in routes {
+            let first = route.first();
+            let donor = first.and_then(|candidate| {
+                let mut matches = donors.iter().filter(|entry| entry.id == candidate.model);
+                let first_match = matches.next()?;
+                matches.next().is_none().then_some(first_match)
+            });
+            let projection = ModelEntry {
+                id: id.clone(),
+                provider: first
+                    .map(|candidate| candidate.provider.clone())
+                    .unwrap_or_else(|| DEFAULT_PROVIDER_NAME.to_owned()),
+                context: donor.and_then(|entry| entry.context),
+                input: donor.and_then(|entry| entry.input),
+                output: donor.and_then(|entry| entry.output),
+                input_modalities: donor
+                    .map(|entry| entry.input_modalities.clone())
+                    .unwrap_or_default(),
+                output_modalities: donor
+                    .map(|entry| entry.output_modalities.clone())
+                    .unwrap_or_default(),
+                name: donor.and_then(|entry| entry.name.clone()),
+                model_type: donor.and_then(|entry| entry.model_type.clone()),
+                temperature: donor.and_then(|entry| entry.temperature),
+                reasoning: donor.map(|entry| entry.reasoning).unwrap_or(false),
+                supported_reasoning_levels: donor
+                    .map(|entry| entry.supported_reasoning_levels.clone())
+                    .unwrap_or_default(),
+            };
+            entries
+                .retain(|entry| entry.id != projection.id || entry.provider != projection.provider);
+            entries.push(projection);
+        }
+        if !preserve_unrouted {
+            entries.retain(|entry| {
+                is_builtin_entry(entry, builtin_providers)
+                    || routes.get(&entry.id).is_some_and(|route| {
+                        route
+                            .first()
+                            .is_some_and(|candidate| candidate.provider == entry.provider)
+                    })
+            });
+        }
+        entries.sort_by(|left, right| {
+            left.id
+                .cmp(&right.id)
+                .then_with(|| left.provider.cmp(&right.provider))
+        });
+        entries.dedup_by(|left, right| left.id == right.id && left.provider == right.provider);
+        entries
+    }
+}
+
+fn is_builtin_entry(entry: &ModelEntry, builtins: &[&BuiltinProvider]) -> bool {
+    builtins
+        .iter()
+        .any(|builtin| builtin.id == entry.provider && builtin.owns(&entry.id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(provider: &str, id: &str) -> ModelEntry {
+        ModelEntry {
+            provider: provider.to_owned(),
+            id: id.to_owned(),
+            name: None,
+            model_type: None,
+            context: None,
+            input: None,
+            output: None,
+            input_modalities: Vec::new(),
+            output_modalities: Vec::new(),
+            temperature: None,
+            reasoning: false,
+            supported_reasoning_levels: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn refresh_merge_preserves_raw_entries_and_applies_logical_routes() {
+        let routes = BTreeMap::from([
+            (
+                "k3-256k".to_owned(),
+                vec![CandidateConfig {
+                    provider: "cardinal".to_owned(),
+                    model: "deepseek-flash".to_owned(),
+                }],
+            ),
+            (
+                "slim".to_owned(),
+                vec![CandidateConfig {
+                    provider: "cardinal".to_owned(),
+                    model: "deepseek-flash".to_owned(),
+                }],
+            ),
+        ]);
+        let raw = vec![
+            ModelEntry {
+                context: Some(4_096),
+                ..entry("cardinal", "deepseek-flash")
+            },
+            entry("cardinal", "ertong-fabel"),
+            ModelEntry {
+                context: Some(128),
+                ..entry("cardinal", "k3-256k")
+            },
+        ];
+
+        // This is the merge entry point used by refresh(), rather than the
+        // route-only projection helper: endpoint rows are deduplicated first,
+        // then logical routes replace same-identity rows and add aliases.
+        let merged = ModelCatalog::merge_entries(&routes, raw, true, &[]);
+
+        assert_eq!(
+            merged,
+            vec![
                 ModelEntry {
-                    id: id.clone(),
-                    provider: first
-                        .map(|candidate| candidate.provider.clone())
-                        .unwrap_or_else(|| DEFAULT_PROVIDER_NAME.to_owned()),
-                    context: donor.and_then(|entry| entry.context),
-                    input: donor.and_then(|entry| entry.input),
-                    output: donor.and_then(|entry| entry.output),
-                    input_modalities: donor
-                        .map(|entry| entry.input_modalities.clone())
-                        .unwrap_or_default(),
-                    output_modalities: donor
-                        .map(|entry| entry.output_modalities.clone())
-                        .unwrap_or_default(),
-                    name: donor.and_then(|entry| entry.name.clone()),
-                    model_type: donor.and_then(|entry| entry.model_type.clone()),
-                    temperature: donor.and_then(|entry| entry.temperature),
-                    reasoning: donor.map(|entry| entry.reasoning).unwrap_or(false),
-                    supported_reasoning_levels: donor
-                        .map(|entry| entry.supported_reasoning_levels.clone())
-                        .unwrap_or_default(),
-                }
-            })
-            .collect()
+                    context: Some(4_096),
+                    ..entry("cardinal", "deepseek-flash")
+                },
+                entry("cardinal", "ertong-fabel"),
+                ModelEntry {
+                    context: Some(4_096),
+                    ..entry("cardinal", "k3-256k")
+                },
+                ModelEntry {
+                    context: Some(4_096),
+                    ..entry("cardinal", "slim")
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn route_projection_preserves_raw_entries_and_adds_logical_routes() {
+        let routes = BTreeMap::from([
+            (
+                "k3-256k".to_owned(),
+                vec![CandidateConfig {
+                    provider: "cardinal".to_owned(),
+                    model: "k3-256k".to_owned(),
+                }],
+            ),
+            (
+                "slim".to_owned(),
+                vec![CandidateConfig {
+                    provider: "cardinal".to_owned(),
+                    model: "deepseek-flash".to_owned(),
+                }],
+            ),
+        ]);
+        let raw = vec![
+            entry("cardinal", "deepseek-flash"),
+            entry("cardinal", "ertong-fabel"),
+            entry("cardinal", "ertong-fabel"),
+            ModelEntry {
+                context: Some(128),
+                ..entry("cardinal", "k3-256k")
+            },
+        ];
+
+        let projected = ModelCatalog::project_routes(&routes, raw, true, &[]);
+
+        assert_eq!(
+            projected,
+            vec![
+                entry("cardinal", "deepseek-flash"),
+                entry("cardinal", "ertong-fabel"),
+                ModelEntry {
+                    context: Some(128),
+                    ..entry("cardinal", "k3-256k")
+                },
+                entry("cardinal", "slim"),
+            ]
+        );
+    }
+
+    #[test]
+    fn raw_entries_are_deduplicated_after_sorting_by_identity() {
+        let raw = vec![
+            entry("provider-b", "model"),
+            entry("provider-a", "model"),
+            entry("provider-b", "model"),
+        ];
+
+        let merged = ModelCatalog::merge_entries(&BTreeMap::new(), raw, true, &[]);
+
+        assert_eq!(
+            merged,
+            vec![entry("provider-a", "model"), entry("provider-b", "model")]
+        );
+    }
+
+    #[test]
+    fn non_passthrough_catalog_excludes_unrouted_raw_entries() {
+        let routes = BTreeMap::from([(
+            "logical".to_owned(),
+            vec![CandidateConfig {
+                provider: "provider".to_owned(),
+                model: "wire-model".to_owned(),
+            }],
+        )]);
+        let raw = vec![entry("provider", "wire-model"), entry("provider", "orphan")];
+
+        let merged = ModelCatalog::merge_entries(&routes, raw, false, &[]);
+
+        assert_eq!(merged, vec![entry("provider", "logical")]);
+    }
+
+    #[test]
+    fn non_passthrough_catalog_preserves_routable_builtin_entries() {
+        let builtin = crate::config::builtin(crate::config::DEEPSEEK).expect("builtin exists");
+        let raw = vec![
+            entry("deepseek", "deepseek-flash"),
+            entry("deepseek", "deepseek-new-model"),
+            entry("deepseek", "other-provider-model"),
+        ];
+
+        let merged = ModelCatalog::merge_entries(&BTreeMap::new(), raw, false, &[builtin]);
+
+        assert_eq!(
+            merged,
+            vec![
+                entry("deepseek", "deepseek-flash"),
+                entry("deepseek", "deepseek-new-model"),
+            ]
+        );
     }
 }
 
