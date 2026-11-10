@@ -255,6 +255,7 @@ pub enum Switch {
     Model {
         provider_id: String,
         model_id: String,
+        variant: Option<String>,
         provider_label: String,
     },
     Agent {

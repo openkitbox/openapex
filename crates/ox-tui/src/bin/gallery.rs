@@ -800,6 +800,7 @@ fn model_dialog() -> dialog::Select {
         model_id: id.into(),
         provider_id: provider.into(),
         name: name.into(),
+        variants: Vec::new(),
         enabled: true,
         limit: Default::default(),
     };

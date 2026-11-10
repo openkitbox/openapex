@@ -652,8 +652,13 @@ async fn switch_to(client: &Client, tx: &Events, session: &str, switch: Switch) 
         Switch::Model {
             provider_id,
             model_id,
+            variant,
             ..
-        } => client.switch_model(session, provider_id, model_id).await,
+        } => {
+            client
+                .switch_model(session, provider_id, model_id, variant.as_deref())
+                .await
+        }
         Switch::Agent { id, .. } => client.switch_agent(session, id).await,
     };
     match result {

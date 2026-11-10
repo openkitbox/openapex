@@ -40,6 +40,47 @@ pub fn encode(provider_id: &str, model_id: &str) -> String {
     format!("{provider_id}/{model_id}")
 }
 
+/// The server uses `default` for the absence of a named reasoning level.
+#[must_use]
+pub fn normalize_variant(variant: Option<&str>) -> Option<&str> {
+    variant.filter(|value| !value.is_empty() && *value != "default")
+}
+
+/// Cycle through named reasoning levels, returning `None` for the default.
+/// The catalogue's `default` entry is never shown as a named level.
+#[must_use]
+pub fn cycle_variant<'a>(
+    current: Option<&str>,
+    variants: &'a [ox_client::rest::ModelVariant],
+) -> Option<&'a str> {
+    let named: Vec<&str> = variants
+        .iter()
+        .map(|variant| variant.id.as_str())
+        .filter(|id| *id != "default" && !id.is_empty())
+        .collect();
+    if named.is_empty() {
+        return None;
+    }
+    let current = normalize_variant(current);
+    let Some(index) = current.and_then(|value| named.iter().position(|id| *id == value)) else {
+        return Some(named[0]);
+    };
+    named.get(index + 1).copied()
+}
+
+/// Rows for the variant picker: default first, followed by supported levels.
+#[must_use]
+pub fn variant_items(variants: &[ox_client::rest::ModelVariant]) -> Vec<Item> {
+    let mut items = vec![Item::new("default", "Default")];
+    items.extend(
+        variants
+            .iter()
+            .filter(|variant| variant.id != "default" && !variant.id.is_empty())
+            .map(|variant| Item::new(&variant.id, &variant.id)),
+    );
+    items
+}
+
 /// Inverse of [`encode`].
 #[must_use]
 pub fn decode(value: &str) -> Option<(&str, &str)> {

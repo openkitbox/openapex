@@ -82,12 +82,21 @@ pub struct ModelInfo {
     pub provider_id: String,
     #[serde(default)]
     pub name: String,
+    /// Reasoning levels supported by this model, in server/catalogue order.
+    #[serde(default)]
+    pub variants: Vec<ModelVariant>,
     /// Disabled models stay in the catalogue but are not selectable.
     #[serde(default = "enabled_by_default")]
     pub enabled: bool,
     /// Token limits; `context == 0` means the server does not know the window.
     #[serde(default)]
     pub limit: ModelLimit,
+}
+
+/// One named reasoning level in a model catalogue entry.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ModelVariant {
+    pub id: String,
 }
 
 /// `limit` of a catalogue entry; only the context window is read.
@@ -1065,15 +1074,18 @@ impl Client {
         session: &str,
         provider_id: &str,
         model_id: &str,
+        variant: Option<&str>,
     ) -> Result<()> {
+        let mut model = serde_json::json!({ "id": model_id, "providerID": provider_id });
+        if let Some(variant) = variant {
+            model["variant"] = serde_json::Value::String(variant.to_owned());
+        }
         let resp = self
             .request(
                 reqwest::Method::POST,
                 &format!("/api/session/{session}/model"),
             )
-            .json(&serde_json::json!({
-                "model": { "id": model_id, "providerID": provider_id }
-            }))
+            .json(&serde_json::json!({ "model": model }))
             .send()
             .await?;
         if !resp.status().is_success() {

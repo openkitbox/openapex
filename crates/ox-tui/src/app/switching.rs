@@ -72,6 +72,7 @@ impl App {
                 models::decode(&value).map(|(provider_id, model_id)| Switch::Model {
                     provider_id: provider_id.to_owned(),
                     model_id: model_id.to_owned(),
+                    variant: None,
                     provider_label: models::provider_label(&providers, provider_id).to_owned(),
                 })
             }
