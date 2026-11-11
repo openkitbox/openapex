@@ -8,9 +8,9 @@
 //! `Result<StreamEvent, ChatError>` item type. The real client boxes
 //! its `ChatStream` unchanged.
 //!
-//! The trait shape is intentionally one method — `stream_chat(&ChatRequest)
-//! -> Result<stream, ChatError>` — mirroring the client; only the stream
-//! type is erased.
+//! The trait keeps provider selection outside the wire request. The optional
+//! provider-aware method is the routing seam for hidden requests and defaults
+//! to the existing request-only behavior for transports that have no routing.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -34,6 +34,17 @@ pub type ChatFuture<'a> =
 pub trait Chat: Send + Sync {
     /// Start a streaming chat completion for `request`.
     fn stream_chat<'a>(&'a self, request: &'a ChatRequest) -> ChatFuture<'a>;
+
+    /// Start a request while selecting an internal provider without adding a
+    /// provider field to the public wire request shape.
+    fn stream_chat_for<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+        provider: Option<&'a str>,
+    ) -> ChatFuture<'a> {
+        let _ = provider;
+        self.stream_chat(request)
+    }
 }
 
 impl Chat for CardinalClient {

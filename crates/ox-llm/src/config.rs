@@ -320,6 +320,7 @@ pub struct ModelRouteConfig {
 #[derive(Default)]
 pub struct Routes {
     explicit: BTreeMap<String, ModelRouteConfig>,
+    providers: Vec<String>,
     builtins: Vec<(&'static str, &'static BuiltinProvider)>,
     passthrough: bool,
 }
@@ -336,6 +337,7 @@ impl Routes {
     pub fn new(config: &LlmConfig) -> Self {
         Self {
             explicit: config.models.clone(),
+            providers: config.providers.keys().cloned().collect(),
             builtins: config
                 .builtins
                 .values()
@@ -346,12 +348,32 @@ impl Routes {
     }
 
     #[must_use]
-    pub fn resolve<'a>(&'a self, model: &'a str) -> Targets<'a> {
-        if let Some(route) = self.explicit.get(model) {
+    pub fn resolve<'a>(&'a self, provider: Option<&'a str>, model: &'a str) -> Targets<'a> {
+        if let Some(route) = self.explicit.get(model)
+            && provider.is_none_or(|selected| {
+                route
+                    .candidates
+                    .first()
+                    .is_some_and(|candidate| candidate.provider == selected)
+            })
+        {
             return if route.candidates.is_empty() {
                 Targets::NoRoute
             } else {
                 Targets::Explicit(&route.candidates)
+            };
+        }
+        if let Some(selected) = provider {
+            return if selected == DEFAULT_PROVIDER_NAME
+                || self.providers.iter().any(|name| name == selected)
+                || self.builtins.iter().any(|(name, _)| *name == selected)
+            {
+                Targets::Endpoint {
+                    provider: selected,
+                    model,
+                }
+            } else {
+                Targets::NoRoute
             };
         }
         if let Some((provider, _)) = self
@@ -591,5 +613,88 @@ impl LlmConfig {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_less_legacy_provider_uses_implicit_endpoint_in_passthrough_mode() {
+        let routes = Routes::new(&LlmConfig::default());
+        let legacy_provider = DEFAULT_PROVIDER_NAME;
+
+        assert!(matches!(
+            routes.resolve(Some(legacy_provider), "default"),
+            Targets::Endpoint { provider, model }
+                if provider == DEFAULT_PROVIDER_NAME && model == "default"
+        ));
+    }
+
+    #[test]
+    fn unknown_provider_is_rejected_when_explicit_providers_are_configured() {
+        let mut config = LlmConfig::default();
+        config.providers.insert(
+            "other".to_owned(),
+            ProviderConfig {
+                base_url: "https://other.example".to_owned(),
+                api_key: None,
+                protocol: None,
+                limits: EndpointLimits::default(),
+            },
+        );
+        let routes = Routes::new(&config);
+
+        assert!(matches!(
+            routes.resolve(Some("opencode"), "default"),
+            Targets::NoRoute
+        ));
+    }
+
+    #[test]
+    fn selected_provider_is_authoritative_for_shared_model_ids() {
+        let mut config = LlmConfig::default();
+        config.providers.insert(
+            "other".to_owned(),
+            ProviderConfig {
+                base_url: "https://other.example".to_owned(),
+                api_key: None,
+                protocol: None,
+                limits: EndpointLimits::default(),
+            },
+        );
+        config.builtins.insert(
+            DEEPSEEK.to_owned(),
+            ResolvedBuiltin {
+                builtin: builtin(DEEPSEEK).expect("deepseek builtin exists"),
+                config: ProviderConfig {
+                    base_url: "https://api.deepseek.com".to_owned(),
+                    api_key: Some("key".to_owned()),
+                    protocol: Some(Protocol::Messages),
+                    limits: EndpointLimits::default(),
+                },
+            },
+        );
+        let routes = Routes::new(&config);
+
+        assert!(matches!(
+            routes.resolve(Some(DEFAULT_PROVIDER_NAME), "deepseek-flash"),
+            Targets::Endpoint { provider, model }
+                if provider == DEFAULT_PROVIDER_NAME && model == "deepseek-flash"
+        ));
+        assert!(matches!(
+            routes.resolve(Some(DEEPSEEK), "deepseek-flash"),
+            Targets::Endpoint { provider, model }
+                if provider == DEEPSEEK && model == "deepseek-flash"
+        ));
+        assert!(matches!(
+            routes.resolve(Some("missing"), "deepseek-flash"),
+            Targets::NoRoute
+        ));
+        assert!(matches!(
+            routes.resolve(None, "deepseek-flash"),
+            Targets::Endpoint { provider, .. } if provider == DEEPSEEK
+        ));
     }
 }

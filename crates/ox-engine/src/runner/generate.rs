@@ -69,24 +69,8 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
 
     let system_static = ctx.system_static();
     let observed = ctx.observe_sources().await?;
-    let frozen = {
-        let baselines = super::lock(&ctx.instruction_baselines);
-        baselines
-            .get(session_id)
-            .map(|baseline| Arc::clone(&baseline.initial_render))
-    }
-    .unwrap_or_else(|| instructions::baseline(&observed).initial_render);
-    let fixed_local = crate::mctx::tokens::heuristic_bytes(
-        system_static.len() + frozen.len() + ctx.tools.definitions_bytes(),
-    );
-    let ratio = crate::mctx::calibration::ratio_for(&ctx.calibrations, session_id, &model.id);
-    let budget = crate::mctx::budget_for(
-        &ctx.config,
-        &ctx.model_catalog,
-        &model.id,
-        (fixed_local as f64 * ratio).ceil() as u32,
-    );
-    let (head_m0, head_m1, rows) = ctx.preview_context(budget, &model.id).await?;
+    let budget = ctx.budget_for(&model, system_static.len());
+    let (head_m0, head_m1, rows) = ctx.preview_context(budget, &model).await?;
 
     // Shared admission rejects BudgetExceeded before constructing a preview;
     // unlike transient Unavailable it cannot fall back to prior instructions.
@@ -116,6 +100,6 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
     let mut request = ChatRequest::new(model.id.clone(), messages);
     request.tools = ctx.tools.definitions_shared();
     request.apply_reasoning_effort(model.variant.as_deref());
-    super::request_budget::apply(&ctx, &mut request, layers)?;
-    crate::completion::collect_text(&ctx.chat, &request, "generate").await
+    super::request_budget::apply(&ctx, &mut request, &model.provider_id, layers)?;
+    crate::completion::collect_text(&ctx.chat, &request, Some(&model.provider_id), "generate").await
 }

@@ -164,7 +164,7 @@ impl DrainCtx {
     /// the tools array's size is cached by the registry.
     pub(crate) fn budget_for(
         &self,
-        model_id: &str,
+        model: &ox_schema::support::ModelRef,
         system_bytes: usize,
     ) -> crate::mctx::budget::Budget {
         let frozen_bytes = super::lock(&self.instruction_baselines)
@@ -173,13 +173,18 @@ impl DrainCtx {
         let local = crate::mctx::tokens::heuristic_bytes(
             system_bytes + frozen_bytes + self.tools.definitions_bytes(),
         );
-        let ratio =
-            crate::mctx::calibration::ratio_for(&self.calibrations, &self.session_id, model_id);
+        let ratio = crate::mctx::calibration::ratio_for(
+            &self.calibrations,
+            &self.session_id,
+            &model.provider_id,
+            &model.id,
+        );
         let baseline = (local as f64 * ratio).ceil() as usize;
         crate::mctx::budget_for(
             &self.config,
             &self.model_catalog,
-            model_id,
+            model.id.as_str(),
+            model.provider_id.as_str(),
             u32::try_from(baseline).unwrap_or(u32::MAX),
         )
     }

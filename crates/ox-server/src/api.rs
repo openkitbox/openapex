@@ -683,7 +683,7 @@ fn model_info(m: &ox_llm::model_catalog::ModelEntry, catalog: &ModelCatalog) -> 
         enabled: true,
         limit: ModelLimit {
             context: catalog
-                .window_of(&m.id)
+                .window_of_for(&m.provider, &m.id)
                 .map_or_else(|| m.context.unwrap_or(0), i64::from),
             input: m.input.unwrap_or(0),
             output: m.output.unwrap_or(0),
@@ -1012,4 +1012,44 @@ async fn unmatched(req: &mut Request, res: &mut Response) {
         "_tag": "NotFoundError",
         "message": format!("No route for {} {}", req.method(), req.uri().path()),
     })));
+}
+
+#[cfg(test)]
+mod provider_routing_tests {
+    use super::*;
+
+    #[test]
+    fn model_projection_uses_provider_and_model_identity_for_context() {
+        let catalog = ModelCatalog::from_entries(vec![
+            entry("cardinal", "shared", 100),
+            entry("deepseek", "shared", 200),
+        ]);
+        let entries = catalog.cached();
+        let model = entries
+            .iter()
+            .find(|model| model.provider == "deepseek")
+            .expect("deepseek entry exists");
+
+        let info = model_info(model, &catalog);
+
+        assert_eq!(info.provider_id, "deepseek");
+        assert_eq!(info.limit.context, 200);
+    }
+
+    fn entry(provider: &str, id: &str, context: i64) -> ox_llm::model_catalog::ModelEntry {
+        ox_llm::model_catalog::ModelEntry {
+            provider: provider.to_owned(),
+            id: id.to_owned(),
+            name: None,
+            model_type: None,
+            context: Some(context),
+            input: None,
+            output: None,
+            input_modalities: Vec::new(),
+            output_modalities: Vec::new(),
+            temperature: None,
+            reasoning: false,
+            supported_reasoning_levels: Vec::new(),
+        }
+    }
 }

@@ -231,7 +231,7 @@ pub fn trigger(
 
 /// The chunk one historian run covers: a contiguous ordinal range of the tail,
 /// formatted into the reference's `[range] R: text` transcript.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Chunk {
     /// First covered ordinal (inclusive).
     pub start_ordinal: i64,
@@ -1722,7 +1722,7 @@ pub fn build_prefixed_instruction(
 #[allow(clippy::too_many_arguments)] // `build_chat_messages`' four inputs, plus the historian's own four.
 #[must_use]
 pub fn prefixed_request(
-    model: &str,
+    model: &ox_schema::support::ModelRef,
     system_static: &str,
     instructions: &str,
     head: &[Option<&str>],
@@ -1744,7 +1744,7 @@ pub fn prefixed_request(
     messages.push(ChatMessage::User {
         content: format!("{historian_system}\n\n{instruction}").into(),
     });
-    let mut request = ChatRequest::new(model.to_owned(), messages);
+    let mut request = ChatRequest::new(model.id.clone(), messages);
     request.tools = Arc::clone(tools);
     request.tool_choice = ToolChoice::None;
     request.apply_reasoning_effort(reasoning_effort);
@@ -1756,12 +1756,12 @@ pub fn prefixed_request(
 /// a hidden sub-completion has none.
 #[must_use]
 pub fn historian_request_with_prompt(
-    model: &str,
+    model: &ox_schema::support::ModelRef,
     user_prompt: &str,
     reasoning_effort: Option<&str>,
 ) -> ChatRequest {
     let mut request = ChatRequest::new(
-        model.to_owned(),
+        model.id.clone(),
         vec![
             ChatMessage::System {
                 content: HISTORIAN_SYSTEM_PROMPT.to_owned(),
@@ -1779,7 +1779,7 @@ pub fn historian_request_with_prompt(
 /// run's context blocks.
 #[must_use]
 pub fn historian_request(
-    model: &str,
+    model: &ox_schema::support::ModelRef,
     chunk_text: &str,
     inputs: &CompartmentPromptInputs<'_>,
     reasoning_effort: Option<&str>,
@@ -1873,7 +1873,7 @@ pub struct RunCtx<'a, 'historian> {
     /// The session's live model, the one the user is actually talking to.
     /// A run whose historian model fails before producing output retries
     /// once through it ([`ModelChain`]); `None` falls back to the default.
-    pub session_model: Option<&'historian str>,
+    pub(crate) session_model: Option<&'a ox_schema::support::ModelRef>,
 }
 
 /// The models a hidden completion may try, in order: the historian's own
@@ -1890,10 +1890,10 @@ pub struct RunCtx<'a, 'historian> {
 ///
 /// Reference: codex `compact_model_fallback.rs` — compaction that failed on
 /// the previous model is retried once on the current one when they differ.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ModelChain<'a> {
-    primary: String,
-    fallback: Option<std::borrow::Cow<'a, str>>,
+    primary: ox_schema::support::ModelRef,
+    fallback: Option<std::borrow::Cow<'a, ox_schema::support::ModelRef>>,
 }
 
 impl<'a> ModelChain<'a> {
@@ -1904,29 +1904,36 @@ impl<'a> ModelChain<'a> {
     pub(crate) fn resolve(
         config: &Config,
         catalog: &ox_llm::model_catalog::ModelCatalog,
-        session_model: Option<&'a str>,
+        session_model: Option<&'a ox_schema::support::ModelRef>,
     ) -> Result<Self> {
         let primary = historian_model(config, catalog)?;
         let fallback = match session_model {
             Some(model) => Some(std::borrow::Cow::Borrowed(model)),
-            None => catalog
-                .default_entry(&config.llm)
-                .map(|entry| std::borrow::Cow::Owned(entry.id)),
+            None => catalog.default_entry(&config.llm).map(|entry| {
+                std::borrow::Cow::Owned(ox_schema::support::ModelRef {
+                    id: entry.id,
+                    provider_id: entry.provider,
+                    variant: None,
+                })
+            }),
         }
-        .filter(|model| **model != primary);
+        .filter(|model| model.provider_id != primary.provider_id || model.id != primary.id);
         Ok(Self { primary, fallback })
     }
 
     /// The model a completion starts with.
-    pub(crate) fn primary(&self) -> &str {
+    pub(crate) fn primary(&self) -> &ox_schema::support::ModelRef {
         &self.primary
     }
 
     /// The model to try after `current` failed before producing output:
     /// the fallback when `current` is the primary, nothing further after
     /// that (one step down, never a loop).
-    pub(crate) fn next_after(&self, current: &str) -> Option<&str> {
-        if current != self.primary {
+    pub(crate) fn next_after(
+        &self,
+        current: &ox_schema::support::ModelRef,
+    ) -> Option<&ox_schema::support::ModelRef> {
+        if current.provider_id != self.primary.provider_id || current.id != self.primary.id {
             return None;
         }
         self.fallback.as_deref()
@@ -2026,10 +2033,14 @@ pub const HISTORIAN_LEASE: Duration = Duration::from_secs(2 * 5 * 60 + 60);
 /// [`collect_text`] under [`HISTORIAN_COMPLETION_TIMEOUT`]. The
 /// timeout is an error like any transport failure: the run settles `failed`
 /// and the caller decides whether to retry.
-async fn collect_text_bounded(chat: &Arc<dyn Chat>, request: &ChatRequest) -> Result<String> {
+async fn collect_text_bounded(
+    chat: &Arc<dyn Chat>,
+    request: &ChatRequest,
+    provider: &str,
+) -> Result<String> {
     match tokio::time::timeout(
         HISTORIAN_COMPLETION_TIMEOUT,
-        collect_text(chat, request, "historian"),
+        collect_text(chat, request, Some(provider), "historian"),
     )
     .await
     {
@@ -2155,7 +2166,7 @@ pub async fn run(ctx: &RunCtx<'_, '_>, plan: &RunPlan<'_>) -> Result<Option<RunO
             None => historian_request_with_prompt(model, &user_prompt, ctx.reasoning_effort),
         };
 
-        let text = match collect_text_bounded(ctx.chat, &request).await {
+        let text = match collect_text_bounded(ctx.chat, &request, &model.provider_id).await {
             Ok(text) => text,
             Err(error) => {
                 // Nothing came back: one step down the chain, as one more
@@ -2166,8 +2177,8 @@ pub async fn run(ctx: &RunCtx<'_, '_>, plan: &RunPlan<'_>) -> Result<Option<RunO
                 };
                 tracing::warn!(
                     session = %plan.session_id,
-                    failed_model = model,
-                    fallback_model = next,
+                    failed_model = %format!("{}/{}", model.provider_id, model.id),
+                    fallback_model = %format!("{}/{}", next.provider_id, next.id),
                     error = %error,
                     "historian completion failed before output; retrying on the fallback model"
                 );
@@ -2647,22 +2658,26 @@ pub struct SideChannels {
 pub(crate) fn historian_model(
     config: &Config,
     catalog: &ox_llm::model_catalog::ModelCatalog,
-) -> Result<String> {
+) -> Result<ox_schema::support::ModelRef> {
     if let Some(qualified) = &config.magic_context.historian_model {
-        return Ok(bare_model_id(qualified));
+        let (provider_id, id) = qualified.rsplit_once('/').map_or(
+            (ox_llm::config::DEFAULT_PROVIDER_NAME, qualified.as_str()),
+            |(provider, id)| (provider, id),
+        );
+        return Ok(ox_schema::support::ModelRef {
+            id: id.to_owned(),
+            provider_id: provider_id.to_owned(),
+            variant: None,
+        });
     }
     match catalog.default_entry(&config.llm) {
-        Some(entry) => Ok(entry.id),
+        Some(entry) => Ok(ox_schema::support::ModelRef {
+            id: entry.id,
+            provider_id: entry.provider,
+            variant: None,
+        }),
         None => anyhow::bail!(
             "no model configured for the historian completion: set magic_context.historian_model or a default model"
         ),
-    }
-}
-
-/// The id half of a `provider/id` reference (`id` alone when unqualified).
-fn bare_model_id(qualified: &str) -> String {
-    match qualified.rsplit_once('/') {
-        Some((_, id)) => id.to_owned(),
-        None => qualified.to_owned(),
     }
 }

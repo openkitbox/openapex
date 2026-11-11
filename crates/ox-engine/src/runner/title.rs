@@ -329,7 +329,8 @@ async fn generate_inner(
         vec![ChatMessage::system(PROMPT_TITLE), ChatMessage::user(text)],
     );
     request.apply_reasoning_effort(model.variant.as_deref());
-    let response = crate::completion::collect_text(&chat, &request, "title").await?;
+    let response =
+        crate::completion::collect_text(&chat, &request, Some(&model.provider_id), "title").await?;
     let Some(title) = extract_title(&response) else {
         return Ok(());
     };

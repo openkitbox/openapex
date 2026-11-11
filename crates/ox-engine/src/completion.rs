@@ -43,6 +43,7 @@ pub(crate) struct TextCompletion {
 pub(crate) async fn collect_with_deltas<Delta, Pending>(
     chat: &Arc<dyn Chat>,
     request: &ChatRequest,
+    provider: Option<&str>,
     mut on_delta: Delta,
 ) -> Result<TextCompletion>
 where
@@ -50,7 +51,7 @@ where
     Pending: Future<Output = Result<()>>,
 {
     let mut stream = chat
-        .stream_chat(request)
+        .stream_chat_for(request, provider)
         .await
         .map_err(observe_error)
         .context("hidden completion request failed")?;
@@ -98,9 +99,11 @@ fn observe_error(error: ox_llm::error::ChatError) -> ox_llm::error::ChatError {
 pub(crate) async fn collect_text(
     chat: &Arc<dyn Chat>,
     request: &ChatRequest,
+    provider: Option<&str>,
     purpose: &'static str,
 ) -> Result<String> {
-    let completion = collect_with_deltas(chat, request, |_| std::future::ready(Ok(()))).await?;
+    let completion =
+        collect_with_deltas(chat, request, provider, |_| std::future::ready(Ok(()))).await?;
     if let Some(usage) = completion.usage {
         let read = usage.cached_tokens.unwrap_or(0);
         tracing::info!(

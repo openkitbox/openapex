@@ -26,7 +26,7 @@ use super::content::{content_is_blank, prefix_content, user_message_content};
 pub(crate) async fn mctx_head(
     ctx: &DrainCtx,
     budget: crate::mctx::budget::Budget,
-    model_id: &str,
+    model: &ox_schema::support::ModelRef,
 ) -> (Option<String>, Option<String>, i64) {
     if !ctx.config.magic_context.enabled {
         return (None, None, 0);
@@ -52,7 +52,8 @@ pub(crate) async fn mctx_head(
         calibration: crate::mctx::calibration::ratio_for(
             &ctx.calibrations,
             &ctx.session_id,
-            model_id,
+            &model.provider_id,
+            &model.id,
         ),
     };
     match crate::mctx::pass::run(request).await {
@@ -73,7 +74,7 @@ impl DrainCtx {
     pub(crate) async fn preview_context(
         &self,
         budget: crate::mctx::budget::Budget,
-        model_id: &str,
+        model: &ox_schema::support::ModelRef,
     ) -> Result<(
         Option<String>,
         Option<String>,
@@ -95,7 +96,8 @@ impl DrainCtx {
             calibration: crate::mctx::calibration::ratio_for(
                 &self.calibrations,
                 &self.session_id,
-                model_id,
+                &model.provider_id,
+                &model.id,
             ),
         };
         let (m0, m1, floor, applied) = match crate::mctx::pass::preview(request).await {

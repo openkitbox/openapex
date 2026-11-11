@@ -141,17 +141,10 @@ pub(crate) fn compaction_max_tokens(
 }
 
 fn model_limits(ctx: &DrainCtx, model: &ModelRef) -> (Option<u64>, Option<u64>) {
-    let entries = ctx.model_catalog.cached();
-    let Some(entry) = entries
-        .iter()
-        .find(|entry| entry.id == model.id && entry.provider == model.provider_id)
-    else {
-        return (None, None);
-    };
-    (
-        ctx.model_catalog.window_of(&entry.id).map(u64::from),
-        entry.output.and_then(|value| u64::try_from(value).ok()),
-    )
+    ctx.model_catalog
+        .runtime_limits_for(Some(&model.provider_id), &model.id)
+        .map(|limits| (limits.shared_context.tokens(), limits.output.tokens()))
+        .unwrap_or((None, None))
 }
 
 fn measured_prompt_tokens(messages: &[Message]) -> Option<u64> {
@@ -238,6 +231,7 @@ fn filled(summary: &str) -> bool {
 async fn stream_summary(
     ctx: &DrainCtx,
     request: &ChatRequest,
+    provider: &str,
     emit_deltas: bool,
 ) -> std::result::Result<String, SessionError> {
     let failure = |kind: &str, message: String| SessionError {
@@ -246,8 +240,11 @@ async fn stream_summary(
         status: None,
         response: None,
     };
-    let completion =
-        crate::completion::collect_with_deltas(&ctx.chat, request, |delta| async move {
+    let completion = crate::completion::collect_with_deltas(
+        &ctx.chat,
+        request,
+        Some(provider),
+        |delta| async move {
             if emit_deltas {
                 ctx.bus
                     .publish(SessionEventData::CompactionDelta {
@@ -257,21 +254,22 @@ async fn stream_summary(
                     .await?;
             }
             Ok(())
-        })
-        .await
-        .map_err(|error| {
-            // Only a real provider input-overflow error may shrink the request.
-            // A length finish is an incomplete output, never an input overflow.
-            let kind = if error
-                .downcast_ref::<ox_llm::error::ChatError>()
-                .is_some_and(super::provider_error::is_overflow_error)
-            {
-                "compaction.overflow"
-            } else {
-                "compaction.failed"
-            };
-            failure(kind, format!("compaction completion failed: {error:#}"))
-        })?;
+        },
+    )
+    .await
+    .map_err(|error| {
+        // Only a real provider input-overflow error may shrink the request.
+        // A length finish is an incomplete output, never an input overflow.
+        let kind = if error
+            .downcast_ref::<ox_llm::error::ChatError>()
+            .is_some_and(super::provider_error::is_overflow_error)
+        {
+            "compaction.overflow"
+        } else {
+            "compaction.failed"
+        };
+        failure(kind, format!("compaction completion failed: {error:#}"))
+    })?;
     Ok(completion.text)
 }
 
@@ -343,6 +341,7 @@ pub(crate) async fn summarize(
 async fn summarized_reply(
     ctx: &DrainCtx,
     mut request: ChatRequest,
+    provider: &str,
     emit_deltas: bool,
 ) -> std::result::Result<String, SessionError> {
     let failure = |kind: &str, message: String| SessionError {
@@ -352,14 +351,15 @@ async fn summarized_reply(
         response: None,
     };
     let mut ladder = OverflowLadder::new(request.max_tokens);
-    let mut summary = stream_until_fits(ctx, &mut request, &mut ladder, emit_deltas).await?;
+    let mut summary =
+        stream_until_fits(ctx, &mut request, provider, &mut ladder, emit_deltas).await?;
     // Upstream `send` (compaction.ts): a reply that ignores the summary
     // template gets one nudge before it counts as a failure. The nudge is a
     // content-only re-ask: preserve the already-derived positive `max_tokens`
     // instead of recalculating the budget for the extra user turn.
     if !filled(&summary) {
         append_nudge(&mut request);
-        summary = stream_until_fits(ctx, &mut request, &mut ladder, emit_deltas).await?;
+        summary = stream_until_fits(ctx, &mut request, provider, &mut ladder, emit_deltas).await?;
         if !filled(&summary) {
             return Err(failure(
                 "compaction.failed",
@@ -381,11 +381,12 @@ async fn summarized_reply(
 async fn stream_until_fits(
     ctx: &DrainCtx,
     request: &mut ChatRequest,
+    provider: &str,
     ladder: &mut OverflowLadder,
     emit_deltas: bool,
 ) -> std::result::Result<String, SessionError> {
     loop {
-        match stream_summary(ctx, request, emit_deltas).await {
+        match stream_summary(ctx, request, provider, emit_deltas).await {
             Ok(summary) => return Ok(summary),
             Err(error) if error.kind == "compaction.overflow" && ladder.descend(request) => {}
             Err(error) => return Err(error),
@@ -464,7 +465,7 @@ async fn summarize_transcript(
     let measured_prompt = measured_prompt_tokens(rows);
     let mut request = summarization_request(model, &messages);
     apply_compaction_budget(ctx, model, &mut request, measured_prompt);
-    summarized_reply(ctx, request, emit_deltas).await
+    summarized_reply(ctx, request, &model.provider_id, emit_deltas).await
 }
 
 /// The global pass's input: every segment's summary under one `[seq a..b]`
@@ -541,7 +542,7 @@ async fn summarize_hierarchical(
         }],
     );
     apply_compaction_budget(ctx, model, &mut request, None);
-    let global = summarized_reply(ctx, request, false).await?;
+    let global = summarized_reply(ctx, request, &model.provider_id, false).await?;
     // The consolidation is the checkpoint. The segment count is the one number
     // that says whether the fold's input range was right: an incremental fold
     // sees one or two segments, and a rising count means it is re-reading rows
@@ -1096,6 +1097,7 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
     let count_tokens = crate::mctx::tokens::counter_fn(crate::mctx::calibration::ratio_for(
         &ctx.calibrations,
         &ctx.session_id,
+        &session_model.provider_id,
         &session_model.id,
     ));
 
@@ -1107,7 +1109,7 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
     // historian trigger measures it. Both mctx modes need it, so the budget
     // is derived unconditionally; the floor stays mctx-only.
     let system_static = ctx.system_static();
-    let budget = ctx.budget_for(&session_model.id, system_static.len());
+    let budget = ctx.budget_for(&session_model, system_static.len());
     let usage_pct = {
         let tail = super::step::rows_after_with_seq(&ctx.db, &ctx.session_id, checkpoint).await?;
         let usage = tail.iter().rev().find_map(|(_, row)| prompt_tokens(row));
@@ -1117,8 +1119,7 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
     // both the coverage reading for the decision and the fast-path summary
     // candidate. It is never called a second time without a patch in between.
     let (head_m0, head_floor) = if ctx.config.magic_context.enabled {
-        let (head_m0, _head_m1, floor) =
-            super::step::mctx_head(ctx, budget, &session_model.id).await;
+        let (head_m0, _head_m1, floor) = super::step::mctx_head(ctx, budget, &session_model).await;
         (head_m0, floor)
     } else {
         (None, 0)
@@ -1141,7 +1142,7 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
         head_floor,
         &count_tokens,
         reasoning_effort,
-        &session_model.id,
+        &session_model,
     )
     .await?;
     // Past the gate and the head patch, the summary is the only work left, and
@@ -1215,7 +1216,7 @@ async fn select_checkpoint_source(
     floor: i64,
     count_tokens: &(impl Fn(&str) -> usize + Sync),
     reasoning_effort: Option<String>,
-    model_id: &str,
+    model: &ox_schema::support::ModelRef,
 ) -> Result<CheckpointPlan> {
     let Some(summary) = head_m0 else {
         // The pass produced no head (off above, or failed): the template is
@@ -1231,8 +1232,7 @@ async fn select_checkpoint_source(
     // rather than hold it across the await.
     drop(tail);
     drop(summary);
-    match super::historian_trigger::patch_fold(ctx, budget, floor, reasoning_effort, model_id).await
-    {
+    match super::historian_trigger::patch_fold(ctx, budget, floor, reasoning_effort, model).await {
         Ok(true) => {}
         Ok(false) => return Ok(CheckpointPlan::Template),
         Err(error) => {
@@ -1244,7 +1244,7 @@ async fn select_checkpoint_source(
             return Ok(CheckpointPlan::Template);
         }
     }
-    let (head_m0, _head_m1, floor) = super::step::mctx_head(ctx, budget, model_id).await;
+    let (head_m0, _head_m1, floor) = super::step::mctx_head(ctx, budget, model).await;
     let Some(summary) = head_m0 else {
         return Ok(CheckpointPlan::Template);
     };

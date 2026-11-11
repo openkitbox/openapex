@@ -43,8 +43,8 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
             .entry(ctx.session_id.clone())
             .or_insert_with(|| instructions::baseline(&observed));
     }
-    let budget = ctx.budget_for(&params.model.id, system_static.len());
-    let (head_m0, head_m1, floor) = mctx_head(ctx, budget, &params.model.id).await;
+    let budget = ctx.budget_for(params.model, system_static.len());
+    let (head_m0, head_m1, floor) = mctx_head(ctx, budget, params.model).await;
     let rows = if ctx.config.magic_context.enabled {
         // The §N§ overlay (tag prefixes + drop placeholders) is part of the
         // integration: with it off the request must stay byte-identical to
@@ -110,6 +110,7 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
             head_m0,
             head_m1,
             model_id: params.model.id.clone(),
+            provider_id: params.model.provider_id.clone(),
             // The same `Arc` the request below advertises, by refcount: providers
             // render the tools array *before* the system prompt, so a fold that
             // offered none would share no cached prefix at all.
@@ -199,7 +200,7 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
         apply_final_step(&mut request);
         layers.final_step = MAX_STEPS_PROMPT.len();
     }
-    super::super::request_budget::apply(ctx, &mut request, layers)?;
+    super::super::request_budget::apply(ctx, &mut request, &params.model.provider_id, layers)?;
     Ok(request)
 }
 

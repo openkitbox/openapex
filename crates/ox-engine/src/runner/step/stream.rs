@@ -138,7 +138,15 @@ async fn consume_owned(
                         ctx,
                         params,
                         *started,
-                        (*started).then(|| attempt_tokens(ctx, request, usage)),
+                        (*started).then(|| {
+                            attempt_tokens(
+                                ctx,
+                                &params.model.provider_id,
+                                &params.model.id,
+                                request,
+                                usage,
+                            )
+                        }),
                     )
                     .await?,
                 ));
@@ -295,7 +303,13 @@ async fn consume_owned(
                 }
                 StreamEvent::Usage(seen) => {
                     usage = Some(seen);
-                    observe_request_cost(ctx, &params.model.id, request, seen.prompt_tokens);
+                    observe_request_cost(
+                        ctx,
+                        &params.model.provider_id,
+                        &params.model.id,
+                        request,
+                        seen.prompt_tokens,
+                    );
                 }
                 StreamEvent::Done => break,
             },
@@ -334,7 +348,13 @@ async fn consume_owned(
         return Ok(Attempt::Failed {
             failure: AttemptFailure::IncompleteStream,
             published: true,
-            tokens: Some(attempt_tokens(ctx, request, usage)),
+            tokens: Some(attempt_tokens(
+                ctx,
+                &params.model.provider_id,
+                &params.model.id,
+                request,
+                usage,
+            )),
         });
     };
 
@@ -366,7 +386,15 @@ async fn consume_owned(
                 ctx,
                 params,
                 *started,
-                (*started).then(|| attempt_tokens(ctx, request, usage)),
+                (*started).then(|| {
+                    attempt_tokens(
+                        ctx,
+                        &params.model.provider_id,
+                        &params.model.id,
+                        request,
+                        usage,
+                    )
+                }),
             )
             .await?,
         ));
@@ -379,7 +407,13 @@ async fn consume_owned(
             raw_finish: Some(raw_finish),
             provider_state: None,
             cost: ox_schema::support::Finite::Int(0),
-            tokens: attempt_tokens(ctx, request, usage),
+            tokens: attempt_tokens(
+                ctx,
+                &params.model.provider_id,
+                &params.model.id,
+                request,
+                usage,
+            ),
             snapshot: None,
             files: None,
         })

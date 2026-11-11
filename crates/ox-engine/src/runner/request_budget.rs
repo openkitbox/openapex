@@ -137,11 +137,18 @@ pub(crate) fn output(
 pub(crate) fn apply(
     ctx: &super::drain::DrainCtx,
     request: &mut ChatRequest,
+    provider: &str,
     layers: Layers,
 ) -> anyhow::Result<()> {
-    let limits = ctx.model_catalog.runtime_limits(&request.model)?;
-    let ratio =
-        crate::mctx::calibration::ratio_for(&ctx.calibrations, &ctx.session_id, &request.model);
+    let limits = ctx
+        .model_catalog
+        .runtime_limits_for(Some(provider), &request.model)?;
+    let ratio = crate::mctx::calibration::ratio_for(
+        &ctx.calibrations,
+        &ctx.session_id,
+        provider,
+        &request.model,
+    );
     let bill = measure(request, ratio)?;
     let selected = output(&bill, limits, request.max_tokens);
     let attributed = layers.system_static

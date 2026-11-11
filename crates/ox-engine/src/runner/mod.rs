@@ -1247,7 +1247,7 @@ pub(crate) async fn resolve_selection(
             },
             None => ox_schema::support::ModelRef {
                 id: "default".to_owned(),
-                provider_id: "opencode".to_owned(),
+                provider_id: ox_llm::config::DEFAULT_PROVIDER_NAME.to_owned(),
                 variant: None,
             },
         },

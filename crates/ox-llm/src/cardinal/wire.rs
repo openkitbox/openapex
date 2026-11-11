@@ -106,6 +106,20 @@ impl Serialize for ChatRequest {
     }
 }
 
+#[cfg(test)]
+mod provider_routing_tests {
+    use super::*;
+
+    #[test]
+    fn provider_metadata_is_not_serialized() {
+        let request = ChatRequest::new("shared", vec![ChatMessage::user("hello")]);
+        let wire = serde_json::to_value(&request).expect("request serializes");
+
+        assert_eq!(wire["model"], "shared");
+        assert!(wire.get("provider").is_none());
+    }
+}
+
 /// The byte length of the request's serialized body, without building it.
 ///
 /// The calibration observation (`super::super::runner::step`) divides the

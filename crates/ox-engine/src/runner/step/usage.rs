@@ -153,6 +153,8 @@ fn estimate_prompt_tokens(body_len: usize, ratio: f64) -> i64 {
 /// accumulation per settled attempt, reported usage only.
 pub(super) fn attempt_tokens(
     ctx: &DrainCtx,
+    provider_id: &str,
+    model_id: &str,
     request: &ChatRequest,
     usage: Option<Usage>,
 ) -> TokenUsage {
@@ -165,8 +167,12 @@ pub(super) fn attempt_tokens(
                 return 0;
             }
         };
-        let ratio =
-            crate::mctx::calibration::ratio_for(&ctx.calibrations, &ctx.session_id, &request.model);
+        let ratio = crate::mctx::calibration::ratio_for(
+            &ctx.calibrations,
+            &ctx.session_id,
+            provider_id,
+            model_id,
+        );
         estimate_prompt_tokens(body_len, ratio)
     })
 }
@@ -187,11 +193,17 @@ pub(super) fn attempt_tokens(
 /// blocks the step.
 pub(super) fn observe_request_cost(
     ctx: &DrainCtx,
+    provider_id: &str,
     model_id: &str,
     request: &ChatRequest,
     prompt_tokens: u64,
 ) {
-    if !crate::mctx::calibration::wants_sample(&ctx.calibrations, &ctx.session_id, model_id) {
+    if !crate::mctx::calibration::wants_sample(
+        &ctx.calibrations,
+        &ctx.session_id,
+        provider_id,
+        model_id,
+    ) {
         return;
     }
     // Only the body's size is needed, so it is measured rather than built: a
@@ -202,6 +214,7 @@ pub(super) fn observe_request_cost(
     crate::mctx::calibration::observe(
         &ctx.calibrations,
         &ctx.session_id,
+        provider_id,
         model_id,
         prompt_tokens,
         crate::mctx::tokens::heuristic_bytes(body_len),

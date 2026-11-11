@@ -330,7 +330,19 @@ impl ModelCatalog {
     /// Never refreshes: callers on a step boundary must not wait on the
     /// network.
     pub fn window_of(&self, id: &str) -> Option<u32> {
-        let context = self.cached().iter().find(|entry| entry.id == id)?.context?;
+        self.cached()
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| self.window_of_for(&entry.provider, id))
+    }
+
+    /// The context window for the exact provider and model identity.
+    pub fn window_of_for(&self, provider: &str, id: &str) -> Option<u32> {
+        let context = self
+            .cached()
+            .iter()
+            .find(|entry| entry.provider == provider && entry.id == id)?
+            .context?;
         let context = match self.context_caps.get(id) {
             Some(cap) => context.min(i64::from(*cap)),
             None => context,
@@ -340,6 +352,15 @@ impl ModelCatalog {
 
     /// Physical limits for the exact logical wire model; never uses UI projection.
     pub fn runtime_limits(&self, model: &str) -> Result<RuntimeLimits, crate::error::ChatError> {
+        self.runtime_limits_for(None, model)
+    }
+
+    /// Physical limits for a selected provider and logical model identity.
+    pub fn runtime_limits_for(
+        &self,
+        provider: Option<&str>,
+        model: &str,
+    ) -> Result<RuntimeLimits, crate::error::ChatError> {
         use crate::config::Targets;
         let cache = self.cache.read().expect("catalog lock");
         let mut result = RuntimeLimits {
@@ -365,7 +386,7 @@ impl ModelCatalog {
             result.output = intersect(result.output, output, result.candidates);
             result.candidates += 1;
         };
-        match self.resolver.resolve(model) {
+        match self.resolver.resolve(provider, model) {
             Targets::Explicit(candidates) => {
                 for candidate in candidates {
                     add(&candidate.provider, &candidate.model);
@@ -789,6 +810,95 @@ mod tests {
                 entry("deepseek", "deepseek-new-model"),
             ]
         );
+    }
+
+    #[test]
+    fn window_lookup_keeps_same_model_ids_separate_by_provider() {
+        let catalog = ModelCatalog::from_entries(vec![
+            ModelEntry {
+                provider: "cardinal".to_owned(),
+                id: "shared".to_owned(),
+                context: Some(100),
+                ..entry("cardinal", "shared")
+            },
+            ModelEntry {
+                provider: "deepseek".to_owned(),
+                id: "shared".to_owned(),
+                context: Some(200),
+                ..entry("deepseek", "shared")
+            },
+        ]);
+
+        assert_eq!(catalog.window_of_for("cardinal", "shared"), Some(100));
+        assert_eq!(catalog.window_of_for("deepseek", "shared"), Some(200));
+    }
+
+    #[test]
+    fn runtime_limits_keep_same_model_ids_separate_by_provider() {
+        let mut config = LlmConfig::default();
+        config.providers.insert(
+            "deepseek".to_owned(),
+            crate::config::ProviderConfig {
+                base_url: "https://deepseek.example".to_owned(),
+                api_key: None,
+                protocol: None,
+                limits: crate::config::EndpointLimits::default(),
+            },
+        );
+        let mut catalog = ModelCatalog::from_entries(vec![
+            entry("cardinal", "shared"),
+            entry("deepseek", "shared"),
+        ]);
+        catalog.resolver = crate::config::Routes::new(&config);
+        {
+            let mut cache = catalog.cache.write().expect("catalog lock");
+            cache.limits.insert(
+                "cardinal".to_owned(),
+                BTreeMap::from([(
+                    "shared".to_owned(),
+                    CandidateLimits {
+                        shared_context: Limit::Known {
+                            tokens: 100,
+                            source: "test",
+                        },
+                        output: Limit::Known {
+                            tokens: 10,
+                            source: "test",
+                        },
+                        advertised: [Some(100), None, Some(10)],
+                    },
+                )]),
+            );
+            cache.limits.insert(
+                "deepseek".to_owned(),
+                BTreeMap::from([(
+                    "shared".to_owned(),
+                    CandidateLimits {
+                        shared_context: Limit::Known {
+                            tokens: 200,
+                            source: "test",
+                        },
+                        output: Limit::Known {
+                            tokens: 20,
+                            source: "test",
+                        },
+                        advertised: [Some(200), None, Some(20)],
+                    },
+                )]),
+            );
+        }
+
+        let cardinal = catalog
+            .runtime_limits_for(Some("cardinal"), "shared")
+            .expect("cardinal route resolves");
+        let deepseek = catalog
+            .runtime_limits_for(Some("deepseek"), "shared")
+            .expect("deepseek route resolves");
+
+        assert_eq!(cardinal.shared_context.tokens(), Some(100));
+        assert_eq!(deepseek.shared_context.tokens(), Some(200));
+        assert_eq!(cardinal.output.tokens(), Some(10));
+        assert_eq!(deepseek.output.tokens(), Some(20));
     }
 }
 

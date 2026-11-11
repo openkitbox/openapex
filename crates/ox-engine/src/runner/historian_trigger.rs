@@ -51,6 +51,7 @@ use ox_db::Db;
 use ox_llm::cardinal::chat::Chat;
 use ox_llm::cardinal::wire::ToolDef;
 use ox_schema::message::Message;
+use ox_schema::support::ModelRef;
 
 // ---------------------------------------------------------------------------
 // Historian trigger (step boundary)
@@ -272,9 +273,10 @@ pub(crate) struct PrefixContext {
     /// The frozen head halves (`m[0]`, `m[1]`), as the live request sent them.
     pub(crate) head_m0: Option<String>,
     pub(crate) head_m1: Option<String>,
-    /// The session's model id: a hidden completion that routes anywhere else
-    /// cannot reuse these bytes, because the prefix is model-scoped.
+    /// The model identity used by the live request; both provider and id are
+    /// needed because a hidden completion may otherwise reuse the wrong prefix.
     pub(crate) model_id: String,
+    pub(crate) provider_id: String,
     /// The tool definitions the step request advertises
     /// (`ctx.tools.definitions_shared()`, the same `Arc` the request itself
     /// carries). They are part of the prefix: providers render the tools array
@@ -316,7 +318,12 @@ pub(crate) fn mctx_historian(
     let project = ctx.directory.to_string_lossy().into_owned();
     // Resolved here, not inside the detached task: the measurement is the
     // session's current value at the step boundary that decided to fire.
-    let ratio = calibration::ratio_for(&ctx.calibrations, &ctx.session_id, &live.model_id);
+    let ratio = calibration::ratio_for(
+        &ctx.calibrations,
+        &ctx.session_id,
+        &live.provider_id,
+        &live.model_id,
+    );
     if let Err(error) = ctx.tasks.spawn_auxiliary(async move {
         let firing = Firing {
             db: &db,
@@ -512,7 +519,7 @@ pub(crate) async fn patch_fold(
     budget: Budget,
     floor: i64,
     reasoning_effort: Option<String>,
-    model_id: &str,
+    model: &ox_schema::support::ModelRef,
 ) -> Result<bool> {
     let project = ctx.directory.to_string_lossy();
     let firing = Firing {
@@ -523,7 +530,12 @@ pub(crate) async fn patch_fold(
         budget,
         session_id: &ctx.session_id,
         project: &project,
-        ratio: calibration::ratio_for(&ctx.calibrations, &ctx.session_id, model_id),
+        ratio: calibration::ratio_for(
+            &ctx.calibrations,
+            &ctx.session_id,
+            &model.provider_id,
+            &model.id,
+        ),
         reasoning_effort,
         prefix: None,
     };
@@ -651,6 +663,14 @@ fn request_shape(facts: ShapeFacts) -> RequestShape {
         return RequestShape::FlatChunk(FlatReason::EmptyRegion);
     }
     RequestShape::Prefixed
+}
+
+/// Prefix reuse is gated by the complete logical model identity. The provider
+/// comparison is intentionally beside the id comparison: equal wire model ids
+/// from different endpoints must never share a cached prefix.
+#[must_use]
+fn same_model(live_provider: &str, live_model: &str, model: &ModelRef) -> bool {
+    live_provider == model.provider_id && live_model == model.id
 }
 
 /// The ordinal the fold's region starts at: where the live render starts, never
@@ -1062,6 +1082,11 @@ impl Firing<'_> {
             user_observations_requested: true,
             extraction_free: false,
         };
+        let session_model = live.map(|live| ox_schema::support::ModelRef {
+            id: live.model_id.clone(),
+            provider_id: live.provider_id.clone(),
+            variant: None,
+        });
         let run_ctx = historian::RunCtx {
             db,
             config,
@@ -1071,14 +1096,15 @@ impl Firing<'_> {
             // event and lends the same string to every run it executes, so
             // the field never outlives the event it came from.
             reasoning_effort: self.reasoning_effort.as_deref(),
-            session_model: live.map(|live| live.model_id.as_str()),
+            session_model: session_model.as_ref(),
         };
         // The request shape, decided before the region is loaded because only a
         // prefix-shaped run pays for it. `same_model` reads the same resolver the
         // run itself uses, so the two can never disagree about the route.
         let switch_on = config.magic_context.historian_prefix_cache;
         let same_model = live.is_some_and(|live| {
-            historian::historian_model(config, catalog).is_ok_and(|model| model == live.model_id)
+            historian::historian_model(config, catalog)
+                .is_ok_and(|model| same_model(&live.provider_id, &live.model_id, &model))
         });
         let (region, fold_below_live_start) = if switch_on && live.is_some() && same_model {
             // THE REGION MUST START WHERE THE LIVE RENDER STARTS. The loop's
@@ -1193,4 +1219,27 @@ struct Published {
     covered: String,
     /// Compartments the event or patch published.
     compartments: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_model;
+    use ox_schema::support::ModelRef;
+
+    fn model(provider_id: &str, id: &str) -> ModelRef {
+        ModelRef {
+            provider_id: provider_id.to_owned(),
+            id: id.to_owned(),
+            variant: None,
+        }
+    }
+
+    #[test]
+    fn historian_prefix_gate_requires_provider_and_model_id() {
+        let selected = model("selected", "shared");
+
+        assert!(same_model("selected", "shared", &selected));
+        assert!(!same_model("other", "shared", &selected));
+        assert!(!same_model("selected", "different", &selected));
+    }
 }

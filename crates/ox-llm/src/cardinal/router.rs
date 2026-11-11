@@ -15,9 +15,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::config::{
-    BuiltinProvider, DEFAULT_PROVIDER_NAME, EndpointLimits, LlmConfig, Protocol, ProviderConfig,
-};
+use crate::config::{DEFAULT_PROVIDER_NAME, EndpointLimits, LlmConfig, Protocol, ProviderConfig};
 
 use super::ChatError;
 use super::chat::{Chat, ChatFuture};
@@ -44,12 +42,9 @@ pub struct EndpointRouter {
     resolver: crate::config::Routes,
     /// `[models.<id>]` candidates in configured order.
     routes: BTreeMap<String, Vec<Candidate>>,
-    /// One candidate per credential-resolved builtin, with the table row that
-    /// owns its model namespace (so `deepseek-flash` needs no `[models]` route).
-    builtins: Vec<(Candidate, &'static BuiltinProvider)>,
-    /// The passthrough candidate for unrouted models; `None` once
-    /// `[providers]` makes routing explicit (then unrouted is `NoRoute`).
-    passthrough: Option<Candidate>,
+    /// One direct candidate per configured endpoint, including the implicit
+    /// cardinal endpoint and credential-resolved builtins.
+    direct: BTreeMap<String, Candidate>,
 }
 
 impl EndpointRouter {
@@ -83,21 +78,16 @@ impl EndpointRouter {
                 ),
             );
         }
-        let builtins: Vec<(Candidate, &'static BuiltinProvider)> = config
-            .builtins
+        let direct: BTreeMap<String, Candidate> = clients
             .iter()
-            .map(|(name, resolved)| {
-                let chat = clients
-                    .get(name)
-                    .unwrap_or_else(|| panic!("builtin client `{name}` missing after insert"));
+            .map(|(name, chat)| {
                 (
+                    name.clone(),
                     Candidate {
                         chat: Arc::clone(chat),
-                        // The logical id is already the builtin's wire id.
                         model: None,
                         provider: name.clone(),
                     },
-                    resolved.builtin,
                 )
             })
             .collect();
@@ -120,35 +110,26 @@ impl EndpointRouter {
                 .collect();
             routes.insert(id.clone(), candidates);
         }
-        let passthrough = if config.providers.is_empty() {
-            Some(Candidate {
-                chat: Arc::clone(&clients[DEFAULT_PROVIDER_NAME]),
-                model: None,
-                provider: DEFAULT_PROVIDER_NAME.to_owned(),
-            })
-        } else {
-            None
-        };
         Ok(Self {
             resolver: crate::config::Routes::new(config),
             routes,
-            builtins,
-            passthrough,
+            direct,
         })
     }
 
     /// The candidates serving `model`: the explicit route, else the builtin
     /// that owns its namespace, else the passthrough endpoint, else `NoRoute`.
     /// Never returns an empty list.
-    pub(crate) fn candidates_for(&self, model: &str) -> Result<&[Candidate], ChatError> {
-        match self.resolver.resolve(model) {
+    pub(crate) fn candidates_for(
+        &self,
+        provider: Option<&str>,
+        model: &str,
+    ) -> Result<&[Candidate], ChatError> {
+        match self.resolver.resolve(provider, model) {
             crate::config::Targets::Explicit(_) => self.routes.get(model).map(Vec::as_slice),
-            crate::config::Targets::Endpoint { provider, .. } => self
-                .builtins
-                .iter()
-                .find(|(candidate, _)| candidate.provider == provider)
-                .map(|(candidate, _)| std::slice::from_ref(candidate))
-                .or_else(|| self.passthrough.as_ref().map(std::slice::from_ref)),
+            crate::config::Targets::Endpoint { provider, .. } => {
+                self.direct.get(provider).map(std::slice::from_ref)
+            }
             crate::config::Targets::NoRoute => None,
         }
         .ok_or_else(|| ChatError::NoRoute {
@@ -159,8 +140,16 @@ impl EndpointRouter {
 
 impl Chat for EndpointRouter {
     fn stream_chat<'a>(&'a self, request: &'a ChatRequest) -> ChatFuture<'a> {
+        self.stream_chat_for(request, None)
+    }
+
+    fn stream_chat_for<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+        provider: Option<&'a str>,
+    ) -> ChatFuture<'a> {
         Box::pin(async move {
-            let candidates = self.candidates_for(&request.model)?;
+            let candidates = self.candidates_for(provider, &request.model)?;
             let mut last: Option<ChatError> = None;
             for candidate in candidates {
                 // The wire model is rewritten only when it differs: the
@@ -179,7 +168,11 @@ impl Chat for EndpointRouter {
                         &rewritten
                     }
                 };
-                match candidate.chat.stream_chat(wire).await {
+                match candidate
+                    .chat
+                    .stream_chat_for(wire, Some(&candidate.provider))
+                    .await
+                {
                     Ok(stream) => return Ok(stream),
                     Err(error) => {
                         let failover = should_failover(&error);
@@ -270,5 +263,220 @@ pub(crate) fn should_failover(error: &ChatError) -> bool {
         | ChatError::Upstream(_)
         | ChatError::EarlyClose
         | ChatError::Sse(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cardinal::chat::BoxChatStream;
+    use crate::cardinal::stream::StreamEvent;
+    use crate::config::ProviderConfig;
+
+    #[test]
+    fn direct_selection_uses_the_selected_provider_endpoint() {
+        let mut config = LlmConfig::default();
+        config.providers.insert(
+            "other".to_owned(),
+            ProviderConfig {
+                base_url: "https://other.example".to_owned(),
+                api_key: None,
+                protocol: None,
+                limits: EndpointLimits::default(),
+            },
+        );
+        let cardinal = CardinalClient::new("https://cardinal.example", None)
+            .expect("cardinal client should construct");
+        let router = EndpointRouter::from_config(&config, cardinal)
+            .expect("configured endpoints should construct");
+
+        let candidates = router
+            .candidates_for(Some("other"), "shared")
+            .expect("selected provider should route directly");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].provider, "other");
+        assert!(candidates[0].model.is_none());
+        assert!(router.candidates_for(Some("missing"), "shared").is_err());
+    }
+
+    struct EmptyStream;
+
+    impl futures_core::Stream for EmptyStream {
+        type Item = Result<StreamEvent, ChatError>;
+
+        fn poll_next(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            std::task::Poll::Ready(None)
+        }
+    }
+
+    /// One attempt a recorder saw: the provider it was routed to and the
+    /// serialized body, so a test asserts the wire bytes, not a reconstruction.
+    struct Call {
+        provider: Option<String>,
+        body: serde_json::Value,
+    }
+
+    struct ProviderRecorder {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<Call>>>,
+    }
+
+    impl Chat for ProviderRecorder {
+        fn stream_chat<'a>(&'a self, _request: &'a ChatRequest) -> ChatFuture<'a> {
+            panic!("the router must use the provider-aware seam");
+        }
+
+        fn stream_chat_for<'a>(
+            &'a self,
+            request: &'a ChatRequest,
+            provider: Option<&'a str>,
+        ) -> ChatFuture<'a> {
+            self.calls
+                .lock()
+                .expect("recorder mutex is not poisoned")
+                .push(Call {
+                    provider: provider.map(str::to_owned),
+                    body: serde_json::to_value(request).expect("request serializes"),
+                });
+            Box::pin(async { Ok(Box::pin(EmptyStream) as BoxChatStream) })
+        }
+    }
+
+    #[test]
+    fn stream_chat_for_uses_matching_explicit_route_and_wire_model() {
+        let mut config = LlmConfig::default();
+        config.providers.insert(
+            "route-provider".to_owned(),
+            ProviderConfig {
+                base_url: "https://route.example".to_owned(),
+                api_key: None,
+                protocol: None,
+                limits: EndpointLimits::default(),
+            },
+        );
+        config.models.insert(
+            "logical-alias".to_owned(),
+            crate::config::ModelRouteConfig {
+                candidates: vec![crate::config::CandidateConfig {
+                    provider: "route-provider".to_owned(),
+                    model: "wire-model".to_owned(),
+                }],
+            },
+        );
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let candidate = Candidate {
+            chat: std::sync::Arc::new(ProviderRecorder {
+                calls: std::sync::Arc::clone(&calls),
+            }),
+            model: Some("wire-model".to_owned()),
+            provider: "route-provider".to_owned(),
+        };
+        let router = EndpointRouter {
+            resolver: crate::config::Routes::new(&config),
+            routes: BTreeMap::from([("logical-alias".to_owned(), vec![candidate])]),
+            direct: BTreeMap::new(),
+        };
+        let request = ChatRequest::new("logical-alias", Vec::new());
+        let mut future = router.stream_chat_for(&request, Some("route-provider"));
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        let result = std::future::Future::poll(std::pin::Pin::as_mut(&mut future), &mut context);
+
+        assert!(
+            result.is_ready(),
+            "route candidate should open an empty stream"
+        );
+        drop(future);
+        let calls = calls.lock().expect("recorder mutex is not poisoned");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].provider.as_deref(), Some("route-provider"));
+        assert_eq!(calls[0].body["model"], "wire-model");
+        assert!(
+            calls[0].body.get("provider").is_none(),
+            "provider metadata must stay off the wire"
+        );
+    }
+
+    #[test]
+    fn stream_chat_for_passes_selected_provider_to_candidate() {
+        let mut config = LlmConfig::default();
+        config.providers.insert(
+            "selected".to_owned(),
+            ProviderConfig {
+                base_url: "https://selected.example".to_owned(),
+                api_key: None,
+                protocol: None,
+                limits: EndpointLimits::default(),
+            },
+        );
+        config.providers.insert(
+            "route-provider".to_owned(),
+            ProviderConfig {
+                base_url: "https://route.example".to_owned(),
+                api_key: None,
+                protocol: None,
+                limits: EndpointLimits::default(),
+            },
+        );
+        config.models.insert(
+            "shared".to_owned(),
+            crate::config::ModelRouteConfig {
+                candidates: vec![crate::config::CandidateConfig {
+                    provider: "route-provider".to_owned(),
+                    model: "route-model".to_owned(),
+                }],
+            },
+        );
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut direct = BTreeMap::new();
+        direct.insert(
+            "selected".to_owned(),
+            Candidate {
+                chat: std::sync::Arc::new(ProviderRecorder {
+                    calls: std::sync::Arc::clone(&calls),
+                }),
+                model: None,
+                provider: "selected".to_owned(),
+            },
+        );
+        let router = EndpointRouter {
+            resolver: crate::config::Routes::new(&config),
+            routes: BTreeMap::new(),
+            direct,
+        };
+        let request = ChatRequest::new("shared", Vec::new());
+        let mut future = router.stream_chat_for(&request, Some("selected"));
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        let result = std::future::Future::poll(std::pin::Pin::as_mut(&mut future), &mut context);
+
+        assert!(
+            result.is_ready(),
+            "selected endpoint should open an empty stream"
+        );
+        drop(future);
+        let calls = calls.lock().expect("recorder mutex is not poisoned");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].provider.as_deref(), Some("selected"));
+        assert_eq!(calls[0].body["model"], "shared");
+        assert!(
+            calls[0].body.get("provider").is_none(),
+            "provider metadata must stay off the wire"
+        );
+
+        let mut unknown = router.stream_chat_for(&request, Some("missing"));
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        let result = std::future::Future::poll(std::pin::Pin::as_mut(&mut unknown), &mut context);
+        assert!(
+            matches!(
+                result,
+                std::task::Poll::Ready(Err(ChatError::NoRoute { .. }))
+            ),
+            "unknown provider must fail closed"
+        );
     }
 }

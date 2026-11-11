@@ -45,9 +45,13 @@ use super::verify::{
 /// Build a dreamer's hidden completion request. Dreamer has no parent session,
 /// so the request deliberately leaves reasoning effort unset.
 #[must_use]
-pub fn dreamer_request(model: &str, system: &str, user_prompt: &str) -> ChatRequest {
+pub fn dreamer_request(
+    model: &ox_schema::support::ModelRef,
+    system: &str,
+    user_prompt: &str,
+) -> ChatRequest {
     ChatRequest::new(
-        model.to_owned(),
+        model.id.clone(),
         vec![
             ChatMessage::System {
                 content: system.to_owned(),
@@ -410,7 +414,7 @@ impl Dreamer {
             let request = dreamer_request(model, system, user_prompt);
             // Dreamer has no parent session policy; the request carries no
             // reasoning effort deliberately, leaving the provider's default.
-            match collect_text(&self.chat, &request, "dreamer").await {
+            match collect_text(&self.chat, &request, Some(&model.provider_id), "dreamer").await {
                 Ok(text) => break text,
                 Err(error) => {
                     let Some(next) = chain.next_after(model) else {
@@ -420,8 +424,8 @@ impl Dreamer {
                         });
                     };
                     tracing::warn!(
-                        failed_model = model,
-                        fallback_model = next,
+                        failed_model = %format!("{}/{}", model.provider_id, model.id),
+                        fallback_model = %format!("{}/{}", next.provider_id, next.id),
                         error = %error,
                         "dreamer completion failed before output; retrying on the fallback model"
                     );

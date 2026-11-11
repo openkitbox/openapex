@@ -191,7 +191,7 @@ pub(crate) async fn run(
         // the turn past an interrupt. Dropping the open future abandons the
         // queue slot or half-open connection.
         let opened = tokio::select! {
-            opened = ctx.chat.stream_chat(&request) => opened,
+            opened = ctx.chat.stream_chat_for(&request, Some(&params.model.provider_id)) => opened,
             () = token.cancelled() => {
                 return settle_interrupted(ctx, params, started, None).await;
             }

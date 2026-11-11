@@ -25,15 +25,16 @@ pub use ox_core::config::{EmbeddingConfig, EmbeddingProvider, MctxConfig};
 pub(crate) fn budget_for(
     config: &ox_core::config::Config,
     catalog: &ox_llm::model_catalog::ModelCatalog,
+    provider: &str,
     model_id: &str,
     baseline_tokens: u32,
 ) -> budget::Budget {
     let historian = historian::historian_model(config, catalog)
         .ok()
-        .and_then(|id| catalog.window_of(&id));
+        .and_then(|model| catalog.window_of_for(&model.provider_id, &model.id));
     budget::Budget::derive(
         &config.magic_context,
-        catalog.window_of(model_id),
+        catalog.window_of_for(provider, model_id),
         historian,
     )
     .with_baseline(baseline_tokens)

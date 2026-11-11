@@ -57,8 +57,9 @@ pub struct Calibration {
 impl Calibration {
     /// The ratio to scale local counts by: `1.0` until the first sample.
     #[must_use]
-    pub fn ratio(&self, model: &str) -> f64 {
-        if self.samples == 0 || self.model.as_deref() != Some(model) {
+    pub fn ratio(&self, provider: &str, model: &str) -> f64 {
+        let identity = format!("{provider}/{model}");
+        if self.samples == 0 || self.model.as_deref() != Some(identity.as_str()) {
             1.0
         } else {
             self.ratio
@@ -71,8 +72,9 @@ impl Calibration {
     /// ratio is frozen — the observation costs a serialization of the request.
     /// A different model is a fresh measurement and always wants a sample.
     #[must_use]
-    pub fn wants_sample(&self, model: &str) -> bool {
-        self.samples < SAMPLES_BEFORE_FREEZE || self.model.as_deref() != Some(model)
+    pub fn wants_sample(&self, provider: &str, model: &str) -> bool {
+        let identity = format!("{provider}/{model}");
+        self.samples < SAMPLES_BEFORE_FREEZE || self.model.as_deref() != Some(identity.as_str())
     }
 
     /// Fold one `(provider prompt_tokens, local estimate)` observation in.
@@ -80,10 +82,17 @@ impl Calibration {
     /// `model` identifies which model produced the sample. A different model in
     /// the same session starts the measurement over rather than blending two
     /// tokenizers. A zero on either side is not a measurement and is ignored.
-    pub fn observe(&mut self, model: &str, provider_tokens: u64, local_tokens: usize) {
-        if self.model.as_deref() != Some(model) {
+    pub fn observe(
+        &mut self,
+        provider: &str,
+        model: &str,
+        provider_tokens: u64,
+        local_tokens: usize,
+    ) {
+        let identity = format!("{provider}/{model}");
+        if self.model.as_deref() != Some(identity.as_str()) {
             *self = Self {
-                model: Some(model.to_owned()),
+                model: Some(identity),
                 ..Self::default()
             };
             // …and fall through: the triggering observation is the first sample
@@ -109,26 +118,33 @@ pub(crate) type Store =
     std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Calibration>>>;
 
 /// The session's ratio, `1.0` when unmeasured.
-pub(crate) fn ratio_for(store: &Store, session_id: &str, model: &str) -> f64 {
+pub(crate) fn ratio_for(store: &Store, session_id: &str, provider: &str, model: &str) -> f64 {
     lock(store)
         .get(session_id)
-        .map_or(1.0, |calibration| calibration.ratio(model))
+        .map_or(1.0, |calibration| calibration.ratio(provider, model))
 }
 
 /// Whether the session still needs an observation for `model` (cheap check,
 /// taken before the measurement work).
-pub(crate) fn wants_sample(store: &Store, session_id: &str, model: &str) -> bool {
+pub(crate) fn wants_sample(store: &Store, session_id: &str, provider: &str, model: &str) -> bool {
     lock(store)
         .get(session_id)
-        .is_none_or(|calibration| calibration.wants_sample(model))
+        .is_none_or(|calibration| calibration.wants_sample(provider, model))
 }
 
 /// Record one observation for the session.
-pub(crate) fn observe(store: &Store, session_id: &str, model: &str, provider: u64, local: usize) {
+pub(crate) fn observe(
+    store: &Store,
+    session_id: &str,
+    provider_id: &str,
+    model: &str,
+    provider_tokens: u64,
+    local: usize,
+) {
     lock(store)
         .entry(session_id.to_owned())
         .or_default()
-        .observe(model, provider, local);
+        .observe(provider_id, model, provider_tokens, local);
 }
 
 /// Drop a session's calibration (idle sweep, session delete, shutdown).
@@ -142,4 +158,22 @@ fn lock(
     store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Calibration;
+
+    #[test]
+    fn calibration_resets_when_provider_changes_for_same_model_id() {
+        let mut calibration = Calibration::default();
+        calibration.observe("cardinal", "shared", 200, 100);
+
+        assert_eq!(calibration.ratio("cardinal", "shared"), 2.0);
+        assert_eq!(calibration.ratio("deepseek", "shared"), 1.0);
+
+        calibration.observe("deepseek", "shared", 100, 100);
+
+        assert_eq!(calibration.ratio("deepseek", "shared"), 1.0);
+    }
 }
