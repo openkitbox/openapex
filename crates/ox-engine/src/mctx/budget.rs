@@ -115,6 +115,10 @@ pub struct Budget {
 }
 
 impl Budget {
+    #[must_use]
+    pub fn window(&self) -> Option<u32> {
+        self.window
+    }
     /// Derive the budgets for one session.
     ///
     /// `window` is the main model's context window, `historian` the window of
@@ -240,6 +244,25 @@ impl Budget {
         }
         let used = (prompt_tokens as f64 - baseline).max(0.0);
         Some(used / (window - baseline) * 100.0)
+    }
+
+    /// Conservative token ceiling for the volatile cache head. The fixed
+    /// request layers (system/instructions/tools) are `baseline`; the frozen
+    /// baseline is bounded by `m0_tokens`; and `trigger` reserves room for the
+    /// live tail. The usable window also reserves the configured pressure margin.
+    /// An unknown window retains the conservative fallback history ceiling.
+    /// The request-budget layer still derives the output cap from
+    /// the final serialized request, so this gate never relies on a guessed
+    /// output size to admit an over-window input.
+    #[must_use]
+    pub fn conservative_m1_budget(&self, m0_tokens: usize) -> usize {
+        let fixed = u64::from(self.baseline)
+            .saturating_add(u64::try_from(m0_tokens).unwrap_or(u64::MAX))
+            .saturating_add(u64::from(self.trigger));
+        let available = self.window.map_or(u64::from(self.history), |_| {
+            u64::from(self.usable).saturating_sub(fixed)
+        });
+        available.try_into().unwrap_or(usize::MAX)
     }
 
     /// How many tokens at the end of the tail a run must leave verbatim

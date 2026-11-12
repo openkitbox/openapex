@@ -44,7 +44,25 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
             .or_insert_with(|| instructions::baseline(&observed));
     }
     let budget = ctx.budget_for(params.model, system_static.len());
-    let (head_m0, head_m1, floor) = mctx_head(ctx, budget, params.model).await;
+    let head = mctx_head(ctx, budget, params.model).await;
+    let super::context::MctxHead {
+        m0: head_m0,
+        m1: head_m1,
+        floor,
+        diagnostic,
+    } = head;
+    tracing::debug!(
+        session = %ctx.session_id,
+        mctx_pass = diagnostic.outcome != "disabled" && diagnostic.outcome != "failed",
+        mctx_outcome = diagnostic.outcome,
+        mctx_m0_bytes = diagnostic.m0_bytes,
+        mctx_m1_bytes = diagnostic.m1_bytes,
+        mctx_head_bytes = diagnostic.head_bytes,
+        mctx_m0_hash = diagnostic.m0_hash,
+        mctx_m1_hash = diagnostic.m1_hash,
+        mctx_head_only_hash = diagnostic.mctx_head_hash,
+        "mctx request prefix diagnostic"
+    );
     let rows = if ctx.config.magic_context.enabled {
         // The §N§ overlay (tag prefixes + drop placeholders) is part of the
         // integration: with it off the request must stay byte-identical to

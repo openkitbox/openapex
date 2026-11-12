@@ -29,7 +29,7 @@ use anyhow::Result;
 use ox_db::Db;
 use ox_llm::cardinal::wire::{ChatMessage, ChatRequest};
 use ox_schema::event::SessionEventData;
-use ox_schema::message::{CompactionReason, Message};
+use ox_schema::message::CompactionReason;
 use ox_schema::support::{ModelRef, SessionError};
 use tokio_util::sync::CancellationToken;
 
@@ -114,66 +114,70 @@ pub(crate) async fn has_running_compaction(db: &Db, session_id: &str) -> Result<
     Ok(row.get::<i64>(0)? > 0)
 }
 
-/// Compute a bounded completion budget from the provider's measured prompt
-/// usage when available, falling back to the local request estimate. The
-/// ladder is intentionally finite: overflow recovery owns retrying the turn,
-/// while compaction must make one bounded request rather than loop on sizing.
-/// When the catalogue has no context window, the local/measured prompt itself
-/// is the bound; there is no project-wide output-cap constant to invent.
-pub(crate) fn compaction_max_tokens(
-    measured_prompt_tokens: Option<u64>,
-    local_prompt_tokens: u64,
-    context_limit: Option<u64>,
-    output_cap: Option<u64>,
-    shrink_step: usize,
-) -> u64 {
-    const SHRINK_LADDER: [u64; 4] = [85, 70, 50, 35];
-    let prompt = measured_prompt_tokens.unwrap_or(local_prompt_tokens);
-    let available = context_limit
-        .map(|limit| limit.saturating_sub(prompt))
-        .unwrap_or(prompt)
-        .max(1);
-    let shrink = SHRINK_LADDER[shrink_step.min(SHRINK_LADDER.len() - 1)];
-    let bounded = available.saturating_mul(shrink) / 100;
-    bounded
-        .max(1)
-        .min(output_cap.filter(|cap| *cap > 0).unwrap_or(u64::MAX))
-}
-
-fn model_limits(ctx: &DrainCtx, model: &ModelRef) -> (Option<u64>, Option<u64>) {
-    ctx.model_catalog
-        .runtime_limits_for(Some(&model.provider_id), &model.id)
-        .map(|limits| (limits.shared_context.tokens(), limits.output.tokens()))
-        .unwrap_or((None, None))
-}
-
-fn measured_prompt_tokens(messages: &[Message]) -> Option<u64> {
-    messages.iter().rev().find_map(|message| {
-        let Message::Assistant(assistant) = message else {
-            return None;
-        };
-        let tokens = assistant.tokens.as_ref()?;
-        u64::try_from(tokens.input.saturating_add(tokens.cache.read)).ok()
-    })
-}
-
+/// Apply admission and output reservation to the actual compaction request.
 fn apply_compaction_budget(
     ctx: &DrainCtx,
-    model: &ModelRef,
     request: &mut ChatRequest,
-    measured_prompt: Option<u64>,
-) {
-    let local_prompt = crate::mctx::tokens::heuristic_bytes(
-        ox_llm::cardinal::wire::serialized_len(request).unwrap_or_default(),
-    ) as u64;
-    let (context_limit, output_cap) = model_limits(ctx, model);
-    request.max_tokens = Some(compaction_max_tokens(
-        measured_prompt,
-        local_prompt,
-        context_limit,
-        output_cap,
-        0,
-    ));
+    provider: &str,
+    ladder: &mut OverflowLadder,
+) -> std::result::Result<(), SessionError> {
+    let limits = ctx
+        .model_catalog
+        .runtime_limits_for(Some(provider), &request.model)
+        .map_err(|error| SessionError {
+            kind: "compaction.admission".to_owned(),
+            message: format!("compaction request was not admitted: {error:#}"),
+            status: None,
+            response: None,
+        })?;
+    if limits.stale {
+        return Err(SessionError {
+            kind: "compaction.admission".to_owned(),
+            message: "compaction request was not admitted: catalog limits are stale".to_owned(),
+            status: None,
+            response: None,
+        });
+    }
+    if limits.shared_context.tokens().is_none() {
+        return Err(SessionError {
+            kind: "compaction.admission".to_owned(),
+            message: "compaction request was not admitted: shared context capacity is unknown"
+                .to_owned(),
+            status: None,
+            response: None,
+        });
+    }
+    let bill = super::request_budget::measure(request, 1.0).map_err(|error| SessionError {
+        kind: "compaction.admission".to_owned(),
+        message: format!("compaction request was not admitted: {error:#}"),
+        status: None,
+        response: None,
+    })?;
+    if bill.unsupported_media {
+        return Err(SessionError {
+            kind: "compaction.admission".to_owned(),
+            message: "compaction request was not admitted: media input cannot be estimated"
+                .to_owned(),
+            status: None,
+            response: None,
+        });
+    }
+    super::request_budget::apply(
+        ctx,
+        request,
+        provider,
+        super::request_budget::Layers::default(),
+    )
+    .map_err(|error| SessionError {
+        kind: "compaction.admission".to_owned(),
+        message: format!("compaction request was not admitted: {error:#}"),
+        status: None,
+        response: None,
+    })?;
+    if ladder.base_max_tokens.is_none() && ladder.shrink_step == 0 {
+        ladder.base_max_tokens = request.max_tokens;
+    }
+    Ok(())
 }
 
 /// Build the summarization request: system prompt + transcript (no working
@@ -354,9 +358,8 @@ async fn summarized_reply(
     let mut summary =
         stream_until_fits(ctx, &mut request, provider, &mut ladder, emit_deltas).await?;
     // Upstream `send` (compaction.ts): a reply that ignores the summary
-    // template gets one nudge before it counts as a failure. The nudge is a
-    // content-only re-ask: preserve the already-derived positive `max_tokens`
-    // instead of recalculating the budget for the extra user turn.
+    // template gets one nudge before it counts as a failure. Re-admit the
+    // changed request without increasing an already-shrunken output cap.
     if !filled(&summary) {
         append_nudge(&mut request);
         summary = stream_until_fits(ctx, &mut request, provider, &mut ladder, emit_deltas).await?;
@@ -386,6 +389,18 @@ async fn stream_until_fits(
     emit_deltas: bool,
 ) -> std::result::Result<String, SessionError> {
     loop {
+        ctx.model_catalog
+            .refresh_if_stale()
+            .await
+            .map_err(|error| SessionError {
+                kind: "compaction.admission".to_owned(),
+                message: format!(
+                    "compaction request was not admitted: catalog refresh failed: {error:#}"
+                ),
+                status: None,
+                response: None,
+            })?;
+        apply_compaction_budget(ctx, request, provider, ladder)?;
         match stream_summary(ctx, request, provider, emit_deltas).await {
             Ok(summary) => return Ok(summary),
             Err(error) if error.kind == "compaction.overflow" && ladder.descend(request) => {}
@@ -419,28 +434,38 @@ impl OverflowLadder {
 
     /// Apply the next rung to `request`; `false` when none is left.
     fn descend(&mut self, request: &mut ChatRequest) -> bool {
-        let can_shrink = |step: usize| request.max_tokens.is_some() && step < Self::MAX_SHRINKS;
+        let has_cap = request.max_tokens.is_some();
+        let can_shrink = |step: usize| has_cap && step < Self::MAX_SHRINKS;
         if self.shrink_step < Self::SHRINKS_BEFORE_ELISION && can_shrink(self.shrink_step) {
             return self.shrink(request);
         }
-        if !self.elided {
-            self.elided = true;
-            if fold_input::elide_tool_outputs(&mut request.messages) > 0 {
-                return true;
-            }
+        if self.elide(request) {
+            return true;
         }
         can_shrink(self.shrink_step) && self.shrink(request)
     }
 
+    fn elide(&mut self, request: &mut ChatRequest) -> bool {
+        if self.elided {
+            return false;
+        }
+        self.elided = true;
+        let count = fold_input::elide_tool_outputs(&mut request.messages);
+        if count > 0 {
+            tracing::warn!(
+                tool_outputs = count,
+                "compaction overflow ladder elided tool outputs; summary input is lossy"
+            );
+        }
+        count > 0
+    }
+
     fn shrink(&mut self, request: &mut ChatRequest) -> bool {
         self.shrink_step += 1;
-        request.max_tokens = Some(compaction_max_tokens(
-            self.base_max_tokens,
-            self.base_max_tokens.unwrap_or(1),
-            None,
-            None,
-            self.shrink_step,
-        ));
+        const SHRINK_LADDER: [u64; 4] = [70, 50, 35, 35];
+        let base = self.base_max_tokens.unwrap_or(1);
+        let next = (base.saturating_mul(SHRINK_LADDER[self.shrink_step - 1]) / 100).max(1);
+        request.max_tokens = Some(request.max_tokens.map_or(next, |current| current.min(next)));
         true
     }
 }
@@ -462,9 +487,7 @@ async fn summarize_transcript(
 ) -> std::result::Result<String, SessionError> {
     let mut messages = super::step::build_chat_messages("", "", &[], rows);
     fold_input::tighten_tool_outputs(&mut messages);
-    let measured_prompt = measured_prompt_tokens(rows);
-    let mut request = summarization_request(model, &messages);
-    apply_compaction_budget(ctx, model, &mut request, measured_prompt);
+    let request = summarization_request(model, &messages);
     summarized_reply(ctx, request, &model.provider_id, emit_deltas).await
 }
 
@@ -535,13 +558,12 @@ async fn summarize_hierarchical(
     let segment_tokens = count_tokens(&input);
     // The global pass: the segment summaries are the transcript; the summary
     // instruction is the same verbatim SUMMARY_PROMPT the flat path asks.
-    let mut request = summarization_request(
+    let request = summarization_request(
         model,
         &[ChatMessage::User {
             content: input.into(),
         }],
     );
-    apply_compaction_budget(ctx, model, &mut request, None);
     let global = summarized_reply(ctx, request, &model.provider_id, false).await?;
     // The consolidation is the checkpoint. The segment count is the one number
     // that says whether the fold's input range was right: an incremental fold
@@ -895,6 +917,9 @@ fn tail_fits_recent(
     tail: &[(i64, serde_json::Value)],
     count_tokens: &dyn Fn(&str) -> usize,
 ) -> bool {
+    if contains_completed_checkpoint(tail) {
+        return false;
+    }
     let budget_tokens = RECENT_KEEP_TOKENS as usize;
     let mut spent = 0usize;
     for (_, row) in tail.iter().rev() {
@@ -909,6 +934,13 @@ fn tail_fits_recent(
         spent += cost;
     }
     true
+}
+
+fn contains_completed_checkpoint(tail: &[(i64, serde_json::Value)]) -> bool {
+    tail.iter().any(|(_, row)| {
+        row.get("type").and_then(serde_json::Value::as_str) == Some("compaction")
+            && row.get("status").and_then(serde_json::Value::as_str) == Some("completed")
+    })
 }
 
 /// The head path's `recent` part, or `None` when the tail does not fit the
@@ -992,7 +1024,7 @@ struct FoldStats {
 /// only record of which path a fold took.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FoldSource {
-    /// The mctx baseline (`head_m0`) verbatim — zero completions.
+    /// The mctx history, including any new compartments — zero completions.
     Head,
     /// The template summarization over the snapshot — the fail-open.
     Template,
@@ -1001,7 +1033,7 @@ enum FoldSource {
 /// The selected checkpoint source for one fold (plan D6): the head is the
 /// fast path (the baseline is the summary), the template the fallback.
 enum CheckpointPlan {
-    /// `summary` is the baseline's `head_m0`; `floor` is the coverage the
+    /// `summary` contains the head's history; `floor` is the coverage the
     /// checkpoint's `recent` part must carry forward from.
     Head {
         summary: String,
@@ -1115,12 +1147,15 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
         let usage = tail.iter().rev().find_map(|(_, row)| prompt_tokens(row));
         usage.and_then(|tokens| budget.usage_percentage(tokens))
     };
-    // D6: the gate's pass is the fold's only pass — `(head_m0, floor)` is
+    // D6: the gate's pass is the fold's only pass — the head and floor are
     // both the coverage reading for the decision and the fast-path summary
     // candidate. It is never called a second time without a patch in between.
-    let (head_m0, head_floor) = if ctx.config.magic_context.enabled {
-        let (head_m0, _head_m1, floor) = super::step::mctx_head(ctx, budget, &session_model).await;
-        (head_m0, floor)
+    let (head_summary, head_floor) = if ctx.config.magic_context.enabled {
+        let head = super::step::mctx_head(ctx, budget, &session_model).await;
+        (
+            checkpoint_head_summary(head.m0, head.m1.as_deref()),
+            head.floor,
+        )
     } else {
         (None, 0)
     };
@@ -1138,7 +1173,7 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
     let plan = select_checkpoint_source(
         ctx,
         budget,
-        head_m0,
+        head_summary,
         head_floor,
         &count_tokens,
         reasoning_effort,
@@ -1203,27 +1238,53 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
     }
 }
 
-/// D6: pick where one fold's checkpoint summary comes from. The head fast
-/// path takes the mctx baseline verbatim when the tail it leaves fits the
-/// recent budget whole; when it does not, one synchronous historian patch
-/// folds the foldable range past the floor and the pass is re-rendered once.
-/// Everything else — mctx off (no candidate at all), a failed pass, a failed
-/// or insufficient patch, a tail that still busts — is the template.
+/// Extract only session history: memory, notes and the index are re-injected
+/// separately on live requests and must not be frozen into the checkpoint.
+/// Renderer-escaped compartment bodies cannot forge these literal tags.
+fn checkpoint_head_summary(mut m0: Option<String>, m1: Option<&str>) -> Option<String> {
+    let summary = m0.as_mut()?;
+    let delta = m1?;
+    const OPEN: &str = "<new-compartments>";
+    const CLOSE: &str = "</new-compartments>";
+    if let Some(start) = delta.find(OPEN) {
+        let rest = &delta[start + OPEN.len()..];
+        let end = rest.find(CLOSE)?;
+        if delta[..start].contains(CLOSE)
+            || rest[end + CLOSE.len()..].contains(OPEN)
+            || rest[..end].contains(OPEN)
+            || rest[end + CLOSE.len()..].contains(CLOSE)
+        {
+            return None;
+        }
+        summary.push_str("\n\n");
+        summary.push_str(&delta[start..start + OPEN.len() + end + CLOSE.len()]);
+    } else if delta.contains(CLOSE) {
+        return None;
+    }
+    m0
+}
+
+/// Select the head when its tail fits, otherwise patch once or use the template.
 async fn select_checkpoint_source(
     ctx: &DrainCtx,
     budget: crate::mctx::budget::Budget,
-    head_m0: Option<String>,
+    head_summary: Option<String>,
     floor: i64,
     count_tokens: &(impl Fn(&str) -> usize + Sync),
     reasoning_effort: Option<String>,
     model: &ox_schema::support::ModelRef,
 ) -> Result<CheckpointPlan> {
-    let Some(summary) = head_m0 else {
+    let Some(summary) = head_summary else {
         // The pass produced no head (off above, or failed): the template is
         // the fail-open, never a missing checkpoint.
         return Ok(CheckpointPlan::Template);
     };
     let tail = super::step::rows_after_with_seq(&ctx.db, &ctx.session_id, floor).await?;
+    // The head does not cover this checkpoint and `recent` cannot render it.
+    // Do not patch the head across it; the template must read the checkpoint.
+    if contains_completed_checkpoint(&tail) {
+        return Ok(CheckpointPlan::Template);
+    }
     if tail_fits_recent(&tail, count_tokens) {
         return Ok(CheckpointPlan::Head { summary, floor });
     }
@@ -1244,8 +1305,9 @@ async fn select_checkpoint_source(
             return Ok(CheckpointPlan::Template);
         }
     }
-    let (head_m0, _head_m1, floor) = super::step::mctx_head(ctx, budget, model).await;
-    let Some(summary) = head_m0 else {
+    let head = super::step::mctx_head(ctx, budget, model).await;
+    let floor = head.floor;
+    let Some(summary) = checkpoint_head_summary(head.m0, head.m1.as_deref()) else {
         return Ok(CheckpointPlan::Template);
     };
     let tail = super::step::rows_after_with_seq(&ctx.db, &ctx.session_id, floor).await?;

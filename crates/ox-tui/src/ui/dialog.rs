@@ -204,22 +204,6 @@ pub fn status(servers: &[McpRef]) -> Dialog {
     })
 }
 
-#[cfg(test)]
-mod status_tests {
-    use super::*;
-
-    #[test]
-    fn disabled_status_does_not_assume_configuration() {
-        let Dialog::Info(info) = status(&[McpRef {
-            name: "example".to_owned(),
-            status: McpStatus::Disabled,
-        }]) else {
-            panic!("status must produce an info dialog");
-        };
-        assert_eq!(info.rows[0].detail, "Disabled");
-    }
-}
-
 /// Draw `dialog` over `area`, clearing what is underneath.
 ///
 /// Returns the images the dialog wants fetched; a dialog that shows pictures

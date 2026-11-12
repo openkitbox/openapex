@@ -207,6 +207,27 @@ pub(crate) fn render_ready_notes_block(notes: &[ReadyNote]) -> String {
     lines.join("\n")
 }
 
+/// Render compartments that have not yet entered the frozen baseline.
+///
+/// New rows stay at P1 until the next hard fold, and are ordered by the
+/// chronological order supplied by [`crate::mctx::compartments::load`].
+pub(crate) fn render_new_compartments(compartments: &[DecayRenderCompartment<'_>]) -> String {
+    let mut rendered = Vec::with_capacity(compartments.len());
+    for compartment in compartments {
+        let body = crate::mctx::decay_render::render_compartment_at_tier(compartment, 1);
+        if !body.is_empty() {
+            rendered.push(body);
+        }
+    }
+    if rendered.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<new-compartments>\n{}\n</new-compartments>",
+        rendered.join("\n\n")
+    )
+}
+
 /// The first `max` characters of `text`, cut on a character boundary. Borrowed,
 /// never copied — the block above is built once per pass from rows the caller
 /// already owns.
@@ -229,6 +250,8 @@ pub(crate) struct M1Parts<'a> {
     pub index: &'a str,
     /// `<ready-notes>` ([`render_ready_notes_block`]).
     pub notes: &'a str,
+    /// `<new-compartments>` for covered rows not yet in m0.
+    pub new_compartments: &'a str,
 }
 
 /// What the `<memory-index>` tells the model about the archive it cannot see:
@@ -327,11 +350,21 @@ pub(crate) fn assemble_m1(parts: M1Parts<'_>) -> String {
         .into_iter()
         .filter(|part| !part.is_empty())
         .collect();
-    match (memory_tiers.is_empty(), parts.notes.is_empty()) {
+    let mut sections = memory_tiers;
+    if !parts.new_compartments.is_empty() {
+        sections.push(parts.new_compartments);
+    }
+    match (sections.is_empty(), parts.notes.is_empty()) {
         (true, true) => M1_PLACEHOLDER.to_string(),
-        (false, false) => format!("{}\n{}", memory_tiers.join("\n"), parts.notes),
-        (false, true) => format!("{}\n{M1_PLACEHOLDER}", memory_tiers.join("\n")),
         (true, false) => format!("{M1_PLACEHOLDER}\n{}", parts.notes),
+        (false, true) => {
+            sections.push(M1_PLACEHOLDER);
+            sections.join("\n")
+        }
+        (false, false) => {
+            sections.push(parts.notes);
+            sections.join("\n")
+        }
     }
 }
 

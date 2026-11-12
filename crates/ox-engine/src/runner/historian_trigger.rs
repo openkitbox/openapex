@@ -34,7 +34,7 @@
 
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::mctx::budget::Budget;
 use crate::mctx::calibration;
@@ -314,6 +314,7 @@ pub(crate) fn mctx_historian(
     let chat = Arc::clone(&ctx.chat);
     let bus = ctx.bus.clone();
     let catalog = Arc::clone(&ctx.model_catalog);
+    let calibrations = Arc::clone(&ctx.calibrations);
     let session_id = ctx.session_id.clone();
     let project = ctx.directory.to_string_lossy().into_owned();
     // Resolved here, not inside the detached task: the measurement is the
@@ -330,6 +331,7 @@ pub(crate) fn mctx_historian(
             config: &config,
             chat: &chat,
             catalog: &catalog,
+            calibrations: &calibrations,
             budget,
             session_id: &session_id,
             project: &project,
@@ -527,6 +529,7 @@ pub(crate) async fn patch_fold(
         config: &ctx.config,
         chat: &ctx.chat,
         catalog: &ctx.model_catalog,
+        calibrations: &ctx.calibrations,
         budget,
         session_id: &ctx.session_id,
         project: &project,
@@ -578,10 +581,9 @@ enum FlatReason {
     /// The hidden completion is not routed to the session's model, so the
     /// prefix it would reuse belongs to a different model's byte history.
     ModelDiffers,
-    /// The live render starts after the fold's last ordinal — a completed
-    /// compaction row sits above it — so the region has nothing the model was
-    /// shown, let alone a shared prefix.
-    FoldBelowLiveStart,
+    /// The live render starts after the fold's first ordinal, so the prefix
+    /// cannot include all of the history the chunk claims to cover.
+    FoldBeforeLiveStart,
     /// The fold's region renders no transcript at all: there is no conversation
     /// above the instruction to fold.
     EmptyRegion,
@@ -597,8 +599,8 @@ impl FlatReason {
             FlatReason::ModelDiffers => {
                 "the hidden completion is not routed to the session's model"
             }
-            FlatReason::FoldBelowLiveStart => {
-                "the live render starts after the fold's last ordinal"
+            FlatReason::FoldBeforeLiveStart => {
+                "the live render starts after the fold's first ordinal"
             }
             FlatReason::EmptyRegion => "the fold's region renders no transcript",
         }
@@ -611,9 +613,9 @@ impl FlatReason {
     fn is_degradation(self) -> bool {
         match self {
             FlatReason::ConfiguredOff | FlatReason::NoLiveContext => false,
-            FlatReason::ModelDiffers | FlatReason::FoldBelowLiveStart | FlatReason::EmptyRegion => {
-                true
-            }
+            FlatReason::ModelDiffers
+            | FlatReason::FoldBeforeLiveStart
+            | FlatReason::EmptyRegion => true,
         }
     }
 }
@@ -628,12 +630,9 @@ struct ShapeFacts {
     live_context: bool,
     /// Whether the hidden completion resolves to the session's own model.
     same_model: bool,
-    /// Whether the live render starts past the fold's last ordinal
-    /// ([`region_start`]). Read before `region_len` because a boundary above the
-    /// fold also empties the region, and the two are different signals: one is a
-    /// checkpoint the fold has not reached, the other a fold with nothing to
-    /// fold. Only the caller that loaded the region can answer it.
-    fold_below_live_start: bool,
+    /// Whether the live render starts after the fold's first ordinal
+    /// ([`region_start`]), omitting part or all of the covered chunk.
+    fold_starts_before_live: bool,
     /// The region's row count. Only read once the checks above hold: a caller
     /// that skipped the load passes 0, and an earlier check decides.
     region_len: usize,
@@ -656,8 +655,8 @@ fn request_shape(facts: ShapeFacts) -> RequestShape {
     if !facts.same_model {
         return RequestShape::FlatChunk(FlatReason::ModelDiffers);
     }
-    if facts.fold_below_live_start {
-        return RequestShape::FlatChunk(FlatReason::FoldBelowLiveStart);
+    if facts.fold_starts_before_live {
+        return RequestShape::FlatChunk(FlatReason::FoldBeforeLiveStart);
     }
     if facts.region_len == 0 {
         return RequestShape::FlatChunk(FlatReason::EmptyRegion);
@@ -698,13 +697,26 @@ fn region_start(rows: &[(i64, Message)], floor: i64) -> i64 {
 /// The fold's region: the rows inside `start..=end`, moved out of the loaded
 /// tail rather than copied.
 ///
-/// Empty when `start > end` — the live render starts past the fold's last
-/// ordinal — which is the case [`FlatReason::FoldBelowLiveStart`] names.
+/// Empty when `start > end`; the caller falls back to the flat chunk whenever
+/// the live boundary leaves any covered ordinal outside the prefix.
 fn region_rows(rows: Vec<(i64, Message)>, start: i64, end: i64) -> Vec<Message> {
     rows.into_iter()
         .filter(|(ordinal, _)| (start..=end).contains(ordinal))
         .map(|(_, message)| message)
         .collect()
+}
+
+fn prefix_region(
+    rows: Vec<(i64, Message)>,
+    floor: i64,
+    chunk: &historian::Chunk,
+) -> (Vec<Message>, bool) {
+    let start = region_start(&rows, floor);
+    let end = *chunk.covered.end();
+    (
+        region_rows(rows, start, end),
+        start > *chunk.covered.start(),
+    )
 }
 
 /// One firing decision's context: the session, its derived budgets, and the
@@ -723,6 +735,8 @@ struct Firing<'a> {
     /// ([`crate::mctx::calibration`]): every count this decision takes is scaled
     /// by it, because both `ChunkLimits` ceilings are in provider tokens.
     ratio: f64,
+    /// Per-session calibration keyed by the exact provider/model identity.
+    calibrations: &'a calibration::Store,
     /// Snapshot of the owning session's reasoning policy for this firing.
     reasoning_effort: Option<String>,
     /// The step request this firing may continue; `None` on the background
@@ -874,14 +888,35 @@ impl Firing<'_> {
                 },
                 &count,
             ) else {
+                if let Some((checkpoint_chunk, row)) = checkpoint_chunk(
+                    above,
+                    floor + 1,
+                    eligible_end,
+                    foldable,
+                    budget.historian_chunk as usize,
+                    &count,
+                ) {
+                    let executed = match self
+                        .execute_checkpoint(&checkpoint_chunk, row, Some(trigger))
+                        .await
+                    {
+                        Ok(Some(executed)) => executed,
+                        Ok(None) => break,
+                        Err(error) => {
+                            tracing::warn!(session = %session_id, error = %error, "historian checkpoint fold failed");
+                            return Err(error);
+                        }
+                    };
+                    event.record(*checkpoint_chunk.covered.start(), &executed);
+                    continue;
+                }
                 // Under real pressure this is the one shape mctx cannot resolve
                 // by itself, so it is an operator signal, not just a trace: a
                 // tail dominated by a single block stays unfolded until it
                 // grows past the fence. Below the pressure band the same skip
                 // is routine (a short session whose whole tail is protected),
                 // hence debug.
-                let message =
-                    "historian skipped: the oldest eligible block alone crosses the protected tail";
+                let message = "historian skipped: the oldest eligible block crosses the protected tail or checkpoint request budget";
                 if usage_pct.unwrap_or(0.0) >= budget.soft_pct {
                     tracing::warn!(
                         session = %session_id,
@@ -1016,20 +1051,38 @@ impl Firing<'_> {
             },
             &count,
         ) else {
+            if let Some((checkpoint_chunk, row)) = checkpoint_chunk(
+                &rows,
+                floor + 1,
+                *last_ordinal,
+                foldable,
+                budget.historian_chunk as usize,
+                &count,
+            ) {
+                return Ok(self
+                    .execute_checkpoint(&checkpoint_chunk, row, None)
+                    .await?
+                    .map(|executed| Published {
+                        covered: format!(
+                            "{}..{}",
+                            checkpoint_chunk.start_ordinal, executed.covered_end
+                        ),
+                        compartments: executed.compartments,
+                    }));
+            }
             tracing::debug!(
                 session = %session_id,
                 foldable,
                 protected_tail = protected,
-                "historian patch skipped: the oldest eligible block alone crosses the protected tail"
+                "historian patch skipped: the oldest eligible block crosses the protected tail or checkpoint request budget"
             );
             return Ok(None);
         };
-        let covered = format!("{}..{}", chunk.start_ordinal, chunk.end_ordinal);
         Ok(self
             .execute(&chunk, None, floor)
             .await?
             .map(|executed| Published {
-                covered,
+                covered: format!("{}..{}", chunk.start_ordinal, executed.covered_end),
                 compartments: executed.compartments,
             }))
     }
@@ -1106,7 +1159,7 @@ impl Firing<'_> {
             historian::historian_model(config, catalog)
                 .is_ok_and(|model| same_model(&live.provider_id, &live.model_id, &model))
         });
-        let (region, fold_below_live_start) = if switch_on && live.is_some() && same_model {
+        let (region, fold_starts_before_live) = if switch_on && live.is_some() && same_model {
             // THE REGION MUST START WHERE THE LIVE RENDER STARTS. The loop's
             // current `floor` is not that point: after the first fold it has
             // advanced past rows the live request still contains, so the load
@@ -1122,11 +1175,7 @@ impl Firing<'_> {
             // loaded here (exactly what the live step loaded) rather than the
             // chunk's window.
             let tail = load_overlaid_tail_with_ordinals(db, session_id, prefix_floor).await?;
-            let start = region_start(&tail, prefix_floor);
-            // The other side of the window: the historian may not read ordinals
-            // the fold does not cover.
-            let end = *chunk.covered.end();
-            (region_rows(tail, start, end), start > end)
+            prefix_region(tail, prefix_floor, chunk)
         } else {
             (Vec::new(), false)
         };
@@ -1134,7 +1183,7 @@ impl Firing<'_> {
             switch_on,
             live_context: live.is_some(),
             same_model,
-            fold_below_live_start,
+            fold_starts_before_live,
             region_len: region.len(),
         });
         let prefix = match shape {
@@ -1169,6 +1218,7 @@ impl Firing<'_> {
             attempt: 1,
             prompt,
             prefix,
+            checkpoint: None,
         };
         tracing::debug!(
             session = %session_id,
@@ -1185,20 +1235,119 @@ impl Firing<'_> {
             // picks the compartments up.
             return Ok(None);
         };
+        let published_compartments = compartments::load(db, session_id).await?;
+        let covered_end =
+            published_coverage_end(&published_compartments, &outcome.compartment_ids)?;
         tracing::info!(
             session = %session_id,
             trigger = ?trigger,
             run = %outcome.run_id,
-            covered = format!("{}..{}", chunk.start_ordinal, chunk.end_ordinal),
+            covered = format!("{}..{}", chunk.start_ordinal, covered_end),
             compartments = outcome.compartment_ids.len(),
             "historian published"
         );
         Ok(Some(Executed {
-            covered_end: *chunk.covered.end(),
-            context_tokens: chunk.context_tokens,
+            covered_end,
+            context_tokens: if covered_end == *chunk.covered.end() {
+                chunk.context_tokens
+            } else {
+                // The chunk includes an unpublished suffix; its full cost cannot
+                // be subtracted from the event's estimate.
+                0
+            },
             compartments: outcome.compartment_ids.len(),
         }))
     }
+
+    async fn execute_checkpoint(
+        &self,
+        chunk: &historian::Chunk,
+        row: &serde_json::Value,
+        trigger: Option<historian::Trigger>,
+    ) -> Result<Option<Executed>> {
+        // Refresh stale metadata before resolving the default historian model.
+        // Slice admission rechecks freshness and every routed candidate; any
+        // refresh failure is propagated before a run is claimed.
+        self.catalog.refresh_if_stale().await?;
+        let model = historian::historian_model(self.config, self.catalog)?;
+        let prompt = historian::CompartmentPromptInputs {
+            seed_examples: "",
+            session_references: "",
+            project_memory: "",
+            user_profile: "",
+            input_source: &chunk.text,
+            memory_enabled: true,
+            user_observations_requested: true,
+            extraction_free: false,
+        };
+        let plan = historian::RunPlan {
+            session_id: self.session_id,
+            project: self.project,
+            chunk,
+            attempt: 1,
+            prompt,
+            prefix: None,
+            checkpoint: Some(historian::CheckpointRun {
+                row,
+                ratio: calibration::ratio_for(
+                    self.calibrations,
+                    self.session_id,
+                    &model.provider_id,
+                    &model.id,
+                ),
+            }),
+        };
+        let run_ctx = historian::RunCtx {
+            db: self.db,
+            config: self.config,
+            chat: self.chat,
+            catalog: self.catalog,
+            reasoning_effort: self.reasoning_effort.as_deref(),
+            session_model: Some(&model),
+        };
+        let Some(outcome) = historian::run(&run_ctx, &plan).await? else {
+            return Ok(None);
+        };
+        let published = compartments::load(self.db, self.session_id).await?;
+        let covered_end = published_coverage_end(&published, &outcome.compartment_ids)?;
+        tracing::info!(session = %self.session_id, trigger = ?trigger, covered = %format!("{}..{}", chunk.start_ordinal, covered_end), compartments = outcome.compartment_ids.len(), "historian checkpoint published");
+        Ok(Some(Executed {
+            covered_end,
+            context_tokens: if covered_end == *chunk.covered.end() {
+                chunk.context_tokens
+            } else {
+                0
+            },
+            compartments: outcome.compartment_ids.len(),
+        }))
+    }
+}
+
+fn checkpoint_chunk<'a>(
+    rows: &'a [(i64, serde_json::Value)],
+    start: i64,
+    end: i64,
+    context: usize,
+    request: usize,
+    count: &dyn Fn(&str) -> usize,
+) -> Option<(historian::Chunk, &'a serde_json::Value)> {
+    historian::oversized_checkpoint(rows, start, end, ChunkLimits { request, context }, count)
+}
+
+/// Resolve the last row this run actually published, never the requested chunk.
+fn published_coverage_end(compartments: &[Compartment], ids: &[String]) -> Result<i64> {
+    let Some(last_id) = ids.last() else {
+        bail!("historian published no compartments");
+    };
+    let Some(last) = compartments
+        .iter()
+        .find(|compartment| &compartment.id == last_id)
+    else {
+        bail!("published historian compartment {last_id} is missing");
+    };
+    last.end_ordinal().ok_or_else(|| {
+        anyhow::anyhow!("published historian compartment {last_id} has invalid coverage")
+    })
 }
 
 /// What one executed fold covered, handed back so the pressure loop can
@@ -1219,27 +1368,4 @@ struct Published {
     covered: String,
     /// Compartments the event or patch published.
     compartments: usize,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::same_model;
-    use ox_schema::support::ModelRef;
-
-    fn model(provider_id: &str, id: &str) -> ModelRef {
-        ModelRef {
-            provider_id: provider_id.to_owned(),
-            id: id.to_owned(),
-            variant: None,
-        }
-    }
-
-    #[test]
-    fn historian_prefix_gate_requires_provider_and_model_id() {
-        let selected = model("selected", "shared");
-
-        assert!(same_model("selected", "shared", &selected));
-        assert!(!same_model("other", "shared", &selected));
-        assert!(!same_model("selected", "different", &selected));
-    }
 }

@@ -19,6 +19,61 @@ use super::content::{content_is_blank, prefix_content, user_message_content};
 // Context assembly (one named mapping; the e2e suite trusts this function)
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MctxDiagnostic {
+    pub outcome: &'static str,
+    pub m0_bytes: usize,
+    pub m1_bytes: usize,
+    pub head_bytes: usize,
+    pub m0_hash: u64,
+    pub m1_hash: u64,
+    pub mctx_head_hash: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct MctxHead {
+    pub m0: Option<String>,
+    pub m1: Option<String>,
+    pub floor: i64,
+    pub diagnostic: MctxDiagnostic,
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn hash_head(m0: Option<&str>, m1: Option<&str>) -> u64 {
+    let mut hash = 0xcbf29ce484222325;
+    for part in [m0.unwrap_or(""), m1.unwrap_or("")] {
+        for byte in part.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash ^= 0xff;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn mctx_diagnostic(m0: Option<&str>, m1: Option<&str>, outcome: &'static str) -> MctxDiagnostic {
+    let m0_bytes = m0.map_or(0, str::len);
+    let m1_bytes = m1.map_or(0, str::len);
+    MctxDiagnostic {
+        outcome,
+        m0_bytes,
+        m1_bytes,
+        head_bytes: m0_bytes.saturating_add(m1_bytes),
+        m0_hash: hash_bytes(m0.unwrap_or("").as_bytes()),
+        m1_hash: hash_bytes(m1.unwrap_or("").as_bytes()),
+        mctx_head_hash: hash_head(m0, m1),
+    }
+}
+
 /// The magic-context head for one step: the frozen `m[0]`/`m[1]` halves plus
 /// the transcript floor they cover, or `(None, None, 0)` when the integration
 /// is off or the pass failed (the prompt then stays byte-identical to the
@@ -27,15 +82,25 @@ pub(crate) async fn mctx_head(
     ctx: &DrainCtx,
     budget: crate::mctx::budget::Budget,
     model: &ox_schema::support::ModelRef,
-) -> (Option<String>, Option<String>, i64) {
+) -> MctxHead {
     if !ctx.config.magic_context.enabled {
-        return (None, None, 0);
+        return MctxHead {
+            m0: None,
+            m1: None,
+            floor: 0,
+            diagnostic: mctx_diagnostic(None, None, "disabled"),
+        };
     }
     let last_seq = match latest_seq(&ctx.db, &ctx.session_id).await {
         Ok(seq) => seq,
         Err(error) => {
             tracing::warn!(session = %ctx.session_id, error = %error, "mctx pass failed; continuing without a head");
-            return (None, None, 0);
+            return MctxHead {
+                m0: None,
+                m1: None,
+                floor: 0,
+                diagnostic: mctx_diagnostic(None, None, "failed"),
+            };
         }
     };
     let project = ctx.directory.to_string_lossy().into_owned();
@@ -55,16 +120,38 @@ pub(crate) async fn mctx_head(
             &model.provider_id,
             &model.id,
         ),
+        provider_id: &model.provider_id,
+        model_id: &model.id,
     };
     match crate::mctx::pass::run(request).await {
-        Ok(result) => (result.head_m0, result.head_m1, result.floor),
+        Ok(result) => {
+            let diagnostic = mctx_diagnostic(
+                result.head_m0.as_deref(),
+                result.head_m1.as_deref(),
+                match &result.outcome {
+                    crate::mctx::cache::PassOutcome::DeferReplayed { .. } => "defer_replayed",
+                    crate::mctx::cache::PassOutcome::BustApplied { .. } => "bust_applied",
+                },
+            );
+            MctxHead {
+                m0: result.head_m0,
+                m1: result.head_m1,
+                floor: result.floor,
+                diagnostic,
+            }
+        }
         Err(error) => {
             tracing::warn!(
                 session = %ctx.session_id,
                 error = %error,
                 "mctx pass failed; continuing without a head"
             );
-            (None, None, 0)
+            MctxHead {
+                m0: None,
+                m1: None,
+                floor: 0,
+                diagnostic: mctx_diagnostic(None, None, "failed"),
+            }
         }
     }
 }
@@ -99,6 +186,8 @@ impl DrainCtx {
                 &model.provider_id,
                 &model.id,
             ),
+            provider_id: &model.provider_id,
+            model_id: &model.id,
         };
         let (m0, m1, floor, applied) = match crate::mctx::pass::preview(request).await {
             Ok((head, applied)) => (head.head_m0, head.head_m1, head.floor, applied),

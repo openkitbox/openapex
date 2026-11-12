@@ -183,8 +183,8 @@ impl DrainCtx {
         crate::mctx::budget_for(
             &self.config,
             &self.model_catalog,
-            model.id.as_str(),
             model.provider_id.as_str(),
+            model.id.as_str(),
             u32::try_from(baseline).unwrap_or(u32::MAX),
         )
     }

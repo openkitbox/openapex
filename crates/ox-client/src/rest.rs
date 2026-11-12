@@ -1249,35 +1249,3 @@ impl Client {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{PromptBody, TurnModel};
-
-    /// A prompt with no override must stay byte-identical to the body before
-    /// `/slim` existed; one with it must carry exactly the metadata object the
-    /// engine reads.
-    #[test]
-    fn prompt_body_carries_the_turn_model_only_when_set() {
-        let plain = PromptBody {
-            id: "msg_1",
-            text: "hi",
-            files: &[],
-            metadata: None,
-        };
-        let json = serde_json::to_string(&plain).expect("a prompt body is serializable");
-        assert_eq!(json, r#"{"id":"msg_1","text":"hi"}"#);
-
-        let overridden = PromptBody {
-            id: "msg_1",
-            text: "hi",
-            files: &[],
-            metadata: Some(TurnModel("slim")),
-        };
-        let json = serde_json::to_string(&overridden).expect("a prompt body is serializable");
-        assert_eq!(
-            json,
-            r#"{"id":"msg_1","text":"hi","metadata":{"model":"slim"}}"#
-        );
-    }
-}

@@ -124,11 +124,10 @@
 //!   publish.** [`historian_validate`] parses `<facts>`/`<events>` and returns
 //!   them on `ValidatedChunk`. `mc_compartments` has no session-level column
 //!   for them (the reference keeps them on its assembly snapshot), so
-//!   [`settle_run`] stores both on the producing `mc_historian_run` row. The
-//!   facts are also promoted into `mc_memory` by
-//!   [`crate::mctx::promotion`], inside the same transaction that publishes
-//!   the compartments (as the reference's incremental runner does); events
-//!   have no consumer yet.
+//!   publication stores both on the producing `mc_historian_run` row. The
+//!   facts are also promoted into `mc_memory` by [`crate::mctx::promotion`];
+//!   completion, promotion and compartments commit together. Events have no
+//!   consumer yet.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -147,7 +146,7 @@ use ox_core::config::Config;
 use ox_llm::cardinal::chat::Chat;
 use ox_llm::cardinal::wire::{ChatMessage, ChatRequest, ToolChoice, ToolDef};
 use ox_schema::id::{id, now_millis};
-use ox_schema::message::{AssistantContent, Message, ToolState};
+use ox_schema::message::{AssistantContent, Compaction, Message, ToolState};
 use ox_schema::support::{Content, Record};
 
 // ---------------------------------------------------------------------------
@@ -228,6 +227,189 @@ pub fn trigger(
 // ---------------------------------------------------------------------------
 // Chunk
 // ---------------------------------------------------------------------------
+
+/// Which checkpoint field a borrowed slice belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointField {
+    /// Older checkpoint summary.
+    Summary,
+    /// Verbatim recent context following the summary.
+    Recent,
+}
+
+/// A contiguous UTF-8 portion of one checkpoint field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointInputSlice<'a> {
+    pub field: CheckpointField,
+    pub text: &'a str,
+    /// Estimated input plus reserved output, excluding the window's 15% reserve.
+    pub estimated_tokens: usize,
+}
+
+/// Admission inputs for a slice request. `fixed_parts` must include all static
+/// system, memory, instruction, field labels, request framing and transport
+/// overhead for the actual request, including any per-slice metadata. The caller
+/// must use the most restrictive known window across all possible routes, and
+/// supply the same calibrated counter used by the request budget walk.
+///
+/// `ratio` is the finite, positive model calibration used by
+/// [`crate::mctx::tokens::counter_fn`]; invalid ratios are rejected rather than
+/// silently falling back. The byte-based estimate is monotonic by construction.
+pub struct CheckpointSliceBudget<'a> {
+    pub window: Option<usize>,
+    pub output_tokens: usize,
+    pub fixed_parts: &'a [&'a str],
+    pub ratio: f64,
+}
+
+pub(crate) const MAX_CHECKPOINT_SLICES: usize = 32;
+
+/// Split summary then recent without copying their contents. Each field's slices
+/// concatenate to the original bytes. Prefer paragraph and line boundaries; fall
+/// back to a UTF-8 character boundary. The result is an estimate, not proof of
+/// provider token usage. Each actual request must match the budgeted framing;
+/// retries, repair prompts and different routes require fresh admission.
+pub fn slice_checkpoint<'a>(
+    summary: &'a str,
+    recent: &'a str,
+    budget: &CheckpointSliceBudget<'_>,
+) -> Result<Vec<CheckpointInputSlice<'a>>> {
+    let window = budget
+        .window
+        .filter(|window| *window > 0)
+        .ok_or_else(|| anyhow::anyhow!("checkpoint model window is unknown or zero"))?;
+    anyhow::ensure!(
+        budget.output_tokens > 0,
+        "checkpoint output reserve is zero"
+    );
+    anyhow::ensure!(
+        !budget.fixed_parts.is_empty(),
+        "checkpoint request framing is missing"
+    );
+    anyhow::ensure!(
+        budget.ratio.is_finite() && budget.ratio > 0.0,
+        "invalid checkpoint calibration ratio"
+    );
+    let count_tokens = crate::mctx::tokens::counter_fn(budget.ratio);
+    let limit = (window / 100)
+        .checked_mul(85)
+        .and_then(|whole| whole.checked_add((window % 100) * 85 / 100))
+        .ok_or_else(|| anyhow::anyhow!("checkpoint budget overflow"))?;
+    let fixed = budget
+        .fixed_parts
+        .iter()
+        .try_fold(budget.output_tokens, |total, part| {
+            total
+                .checked_add(count_tokens(part))
+                .ok_or_else(|| anyhow::anyhow!("checkpoint budget overflow"))
+        })?;
+    anyhow::ensure!(
+        fixed < limit,
+        "checkpoint framing and output exceed window budget"
+    );
+    let mut slices = Vec::new();
+    for (field, text) in [
+        (CheckpointField::Summary, summary),
+        (CheckpointField::Recent, recent),
+    ] {
+        let mut remaining = text;
+        while !remaining.is_empty() {
+            anyhow::ensure!(
+                slices.len() < MAX_CHECKPOINT_SLICES,
+                "checkpoint requires too many slices for the historian lease"
+            );
+            let end = checkpoint_slice_end(remaining, limit - fixed, budget.ratio)?;
+            let piece = &remaining[..end];
+            let cost = checkpoint_text_cost(piece, budget.ratio)?;
+            let estimated_tokens = fixed
+                .checked_add(cost)
+                .ok_or_else(|| anyhow::anyhow!("checkpoint budget overflow"))?;
+            slices.push(CheckpointInputSlice {
+                field,
+                text: piece,
+                estimated_tokens,
+            });
+            remaining = &remaining[end..];
+        }
+    }
+    anyhow::ensure!(!slices.is_empty(), "checkpoint has no content to slice");
+    Ok(slices)
+}
+
+// Account for JSON escaping in addition to the calibrated text estimate. The
+// fixed framing must separately include message envelope and field wrappers.
+fn checkpoint_text_cost(text: &str, ratio: f64) -> Result<usize> {
+    let escaped_bytes = text.chars().try_fold(0usize, |total, ch| {
+        total
+            .checked_add(match ch {
+                '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 1,
+                '\u{0}'..='\u{1f}' => 5,
+                _ => 0,
+            })
+            .ok_or_else(|| anyhow::anyhow!("checkpoint text estimate overflow"))
+    })?;
+    let bytes = text
+        .len()
+        .checked_add(escaped_bytes)
+        .ok_or_else(|| anyhow::anyhow!("checkpoint text estimate overflow"))?;
+    let base = crate::mctx::tokens::heuristic_bytes(bytes) as f64 * ratio;
+    if !base.is_finite() || base > usize::MAX as f64 {
+        return Err(anyhow::anyhow!("checkpoint text estimate overflow"));
+    }
+    Ok(base.ceil() as usize)
+}
+
+fn checkpoint_slice_end(text: &str, available: usize, ratio: f64) -> Result<usize> {
+    // Exponential probing bounds each search to roughly twice the slice size;
+    // binary search is valid because this estimate depends only on byte length.
+    let mut high = 1usize;
+    loop {
+        let end = floor_char_boundary(text, high.min(text.len()));
+        if high >= text.len() || checkpoint_text_cost(&text[..end], ratio)? > available {
+            break;
+        }
+        high = high.saturating_mul(2).min(text.len());
+    }
+    let mut low = 0;
+    let mut best = 0;
+    while low <= high {
+        let midpoint = low + (high - low) / 2;
+        let end = floor_char_boundary(text, midpoint);
+        if checkpoint_text_cost(&text[..end], ratio)? <= available {
+            best = end;
+            if midpoint == text.len() {
+                break;
+            }
+            low = midpoint + 1;
+        } else if midpoint == 0 {
+            break;
+        } else {
+            high = midpoint - 1;
+        }
+    }
+    anyhow::ensure!(
+        best > 0,
+        "checkpoint single character exceeds request budget"
+    );
+    if best == text.len() {
+        return Ok(best);
+    }
+    let prefix = &text[..best];
+    if let Some(pos) = prefix.rfind("\n\n").filter(|pos| *pos >= best / 2) {
+        return Ok(pos + 2);
+    }
+    if let Some(pos) = prefix.rfind('\n').filter(|pos| *pos >= best / 2) {
+        return Ok(pos + 1);
+    }
+    Ok(best)
+}
+
+fn floor_char_boundary(text: &str, mut end: usize) -> usize {
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
+}
 
 /// The chunk one historian run covers: a contiguous ordinal range of the tail,
 /// formatted into the reference's `[range] R: text` transcript.
@@ -336,9 +518,9 @@ impl ChunkLimits {
 /// of consecutive same-role messages, a block is emitted whole or not at all,
 /// and the run stops at the first block that would cross the request budget
 /// (unless nothing has been emitted yet, in which case a single oversize block
-/// is admitted so the run is never empty). Returning `None` means the eligible
-/// range held nothing worth a run, or its first message alone crosses the
-/// context ceiling.
+/// is admitted, except checkpoints, which must fit the request budget). Returning
+/// `None` means the eligible range held nothing worth a run, its first message
+/// crosses the context ceiling, or a checkpoint crosses the request ceiling.
 ///
 /// See [`ChunkLimits`] for the two ceilings. The context one is absolute: a
 /// block that would cross it is never admitted, not even as the first one.
@@ -396,6 +578,46 @@ pub fn chunk(
         }
     }
     builder.finish()
+}
+
+/// Select only an oversized completed checkpoint that fits the context fence.
+/// Earlier rows are not skipped: continuity must never advance over them.
+pub(crate) fn oversized_checkpoint<'a>(
+    rows: &'a [(i64, serde_json::Value)],
+    start: i64,
+    end: i64,
+    limits: ChunkLimits,
+    count: &dyn Fn(&str) -> usize,
+) -> Option<(Chunk, &'a serde_json::Value)> {
+    let mut row = None;
+    for candidate in rows
+        .iter()
+        .filter(|(ordinal, _)| *ordinal >= start && *ordinal < end)
+    {
+        let Ok(message) = crate::runner::step::decode_row(&candidate.1) else {
+            continue;
+        };
+        if matches!(message, Message::Synthetic { .. }) {
+            continue;
+        }
+        if matches!(message, Message::Compaction(item) if matches!(item.compaction, Compaction::Completed(_)))
+        {
+            row = Some(candidate);
+        }
+        break;
+    }
+    let row = row?;
+    let chunk = chunk(
+        std::slice::from_ref(row),
+        row.0,
+        end,
+        ChunkLimits::unbounded(),
+        count,
+    )?;
+    if chunk.context_tokens > limits.context || chunk.token_estimate <= limits.request {
+        return None;
+    }
+    Some((chunk, &row.1))
 }
 
 /// One block of the chunk: consecutive same-role messages collapsed into one
@@ -499,6 +721,8 @@ impl<'a> Builder<'a> {
         let brings_hashes = !commit_hashes.is_empty();
         if self.current.as_ref().is_some_and(|block| {
             block.role == compact_role
+                && block.label != "compaction"
+                && role != "compaction"
                 && self.absorbs(block, joined_tokens, result_tokens, brings_hashes)
         }) {
             let block = self.current.as_mut().expect("block checked above");
@@ -590,10 +814,28 @@ impl<'a> Builder<'a> {
         // verbatim — so it is tested before the oversize-first-block allowance
         // below, which exists only so one huge message cannot stall the fold.
         if self.context_tokens() + block_context > self.limits.context {
+            if block.label == "compaction" {
+                tracing::warn!(
+                    ordinal = block.end_ordinal,
+                    block_context,
+                    context_limit = self.limits.context,
+                    "historian checkpoint exceeds remaining context budget; coverage not advanced"
+                );
+            }
             self.current = Some(block);
             return false;
         }
-        if self.total_tokens + block_tokens > self.limits.request && self.total_tokens > 0 {
+        if self.total_tokens + block_tokens > self.limits.request
+            && (self.total_tokens > 0 || block.label == "compaction")
+        {
+            if block.label == "compaction" {
+                tracing::warn!(
+                    ordinal = block.end_ordinal,
+                    block_tokens,
+                    request_limit = self.limits.request,
+                    "historian checkpoint exceeds remaining request budget; coverage not advanced"
+                );
+            }
             self.current = Some(block);
             return false;
         }
@@ -680,6 +922,19 @@ fn render_parts(role: &str, message: &Message) -> (Vec<String>, Vec<String>) {
             } else {
                 (vec![text], Vec::new())
             }
+        }
+        Message::Compaction(message) => {
+            let Compaction::Completed(completed) = &message.compaction else {
+                return (Vec::new(), Vec::new());
+            };
+            let mut parts = Vec::new();
+            if !completed.summary.is_empty() {
+                parts.push(format!("Checkpoint summary: {}", completed.summary));
+            }
+            if !completed.recent.is_empty() {
+                parts.push(format!("Checkpoint recent context: {}", completed.recent));
+            }
+            (parts, Vec::new())
         }
         Message::Assistant(message) => {
             let mut parts = Vec::new();
@@ -1984,6 +2239,13 @@ pub struct RunPlan<'a> {
     /// produce it. `None` sends the fail-open shape: the chunk rendered as the
     /// prompt's transcript, in an independent two-message request.
     pub prefix: Option<Prefix<'a>>,
+    /// Original merged row and token calibration for an oversized checkpoint.
+    pub(crate) checkpoint: Option<CheckpointRun<'a>>,
+}
+
+pub(crate) struct CheckpointRun<'a> {
+    pub row: &'a serde_json::Value,
+    pub ratio: f64,
 }
 
 /// A settled run: the published compartments and the raw completion that
@@ -2100,9 +2362,6 @@ impl std::error::Error for ValidationFailure {}
 pub async fn run(ctx: &RunCtx<'_, '_>, plan: &RunPlan<'_>) -> Result<Option<RunOutcome>> {
     let chain = ModelChain::resolve(ctx.config, ctx.catalog, ctx.session_model)?;
     let mut model = chain.primary();
-    // The stored ranges are read before the run is claimed: a store failure must
-    // leave no row behind for a run that never started.
-    let prior = stored_ranges(ctx.db, plan.session_id).await?;
     // Which task text this run sends. The prefix shape's instruction carries no
     // transcript (its ordinal index names the blocks instead), so the fail-open
     // prompt — which formats the whole chunk — is assembled only when the run
@@ -2112,10 +2371,13 @@ pub async fn run(ctx: &RunCtx<'_, '_>, plan: &RunPlan<'_>) -> Result<Option<RunO
         .prefix
         .as_ref()
         .map(|_| build_prefixed_instruction(&plan.prompt, &plan.chunk.blocks));
-    let fail_open_prompt = plan
-        .prefix
-        .is_none()
-        .then(|| build_compartment_agent_prompt(&plan.prompt));
+    let fail_open_prompt = plan.prefix.is_none().then(|| {
+        if plan.checkpoint.is_some() {
+            String::new()
+        } else {
+            build_compartment_agent_prompt(&plan.prompt)
+        }
+    });
     let request_prompt = prefixed_instruction
         .as_deref()
         .or(fail_open_prompt.as_deref())
@@ -2123,7 +2385,9 @@ pub async fn run(ctx: &RunCtx<'_, '_>, plan: &RunPlan<'_>) -> Result<Option<RunO
             "one task text is always assembled: the prefix instruction or the fail-open prompt",
         );
     let chunk_ref = format!("{}..{}", plan.chunk.start_ordinal, plan.chunk.end_ordinal);
-    let Some(run_id) = claim_run(ctx.db, plan.session_id, &chunk_ref, plan.attempt).await? else {
+    let Some((run_id, prior)) =
+        claim_run(ctx.db, plan.session_id, &chunk_ref, plan.attempt).await?
+    else {
         tracing::debug!(
             session = %plan.session_id,
             chunk = %chunk_ref,
@@ -2131,6 +2395,33 @@ pub async fn run(ctx: &RunCtx<'_, '_>, plan: &RunPlan<'_>) -> Result<Option<RunO
         );
         return Ok(None);
     };
+    let continuity = check_chunk_continuity(ctx.db, plan.session_id, plan.chunk, &prior).await;
+    let continuity = match continuity {
+        Ok(continuity) => continuity,
+        Err(error) => {
+            settle_failed(ctx.db, &run_id, &error).await;
+            return Err(error);
+        }
+    };
+    if !continuity {
+        let error = "historian chunk no longer starts at the stored coverage boundary";
+        settle_run(ctx.db, &run_id, RunState::Aborted, Some(error), None).await?;
+        tracing::debug!(
+            session = %plan.session_id,
+            chunk = %chunk_ref,
+            error = %error,
+            "historian skipped a stale chunk after claiming"
+        );
+        return Ok(None);
+    }
+
+    if let Some(checkpoint) = &plan.checkpoint {
+        let result = run_checkpoint(ctx, plan, checkpoint, model, &run_id, &prior).await;
+        if let Err(error) = &result {
+            settle_failed(ctx.db, &run_id, error).await;
+        }
+        return result.map(Some);
+    }
 
     let last_attempt = plan.attempt + HISTORIAN_MAX_ATTEMPTS - 1;
     let mut attempt = plan.attempt;
@@ -2202,27 +2493,28 @@ pub async fn run(ctx: &RunCtx<'_, '_>, plan: &RunPlan<'_>) -> Result<Option<RunO
                     ..
                 } = validated;
                 let user_facts = promotion::user_candidates(user_observations);
+                let side_channels = SideChannels { facts, events };
                 let promotable = Promotable {
-                    facts: &facts,
+                    facts: &side_channels.facts,
                     user_facts: &user_facts,
                 };
-                let compartment_ids =
-                    match publish_compartments(ctx.db, plan, &mut compartments, promotable).await {
-                        Ok(ids) => ids,
-                        Err(error) => {
-                            settle_failed(ctx.db, &run_id, &error).await;
-                            return Err(error);
-                        }
-                    };
-                let side_channels = SideChannels { facts, events };
-                settle_run(
+                let compartment_ids = match publish_compartments(
                     ctx.db,
+                    plan,
                     &run_id,
-                    RunState::Completed,
-                    None,
-                    Some(&side_channels),
+                    &prior,
+                    &mut compartments,
+                    promotable,
+                    &side_channels,
                 )
-                .await?;
+                .await
+                {
+                    Ok(ids) => ids,
+                    Err(error) => {
+                        settle_failed(ctx.db, &run_id, &error).await;
+                        return Err(error);
+                    }
+                };
                 return Ok(Some(RunOutcome {
                     run_id,
                     text,
@@ -2243,6 +2535,68 @@ pub async fn run(ctx: &RunCtx<'_, '_>, plan: &RunPlan<'_>) -> Result<Option<RunO
             }
         }
     }
+}
+
+async fn run_checkpoint(
+    ctx: &RunCtx<'_, '_>,
+    plan: &RunPlan<'_>,
+    checkpoint: &CheckpointRun<'_>,
+    model: &ox_schema::support::ModelRef,
+    run_id: &str,
+    prior: &[historian_validate::MessageRange],
+) -> Result<RunOutcome> {
+    let message = crate::runner::step::decode_row(checkpoint.row)?;
+    let Message::Compaction(message) = message else {
+        anyhow::bail!("checkpoint row changed type")
+    };
+    let Compaction::Completed(completed) = message.compaction else {
+        anyhow::bail!("checkpoint is not completed")
+    };
+    let validated = crate::mctx::checkpoint_slices::run_checkpoint_slices(
+        ctx.chat,
+        ctx.catalog,
+        crate::mctx::checkpoint_slices::CheckpointSliceInput {
+            ordinal: plan.chunk.start_ordinal,
+            summary: &completed.summary,
+            recent: &completed.recent,
+            model,
+            extra_fields: &[],
+            ratio: checkpoint.ratio,
+            output_tokens: 4096,
+            reasoning_effort: ctx.reasoning_effort,
+        },
+    )
+    .await?;
+    let historian_validate::ValidatedChunk {
+        mut compartments,
+        facts,
+        events,
+        user_observations,
+        ..
+    } = validated;
+    let user_facts = promotion::user_candidates(user_observations);
+    let side_channels = SideChannels { facts, events };
+    let promotable = Promotable {
+        facts: &side_channels.facts,
+        user_facts: &user_facts,
+    };
+    let compartment_ids = publish_compartments(
+        ctx.db,
+        plan,
+        run_id,
+        prior,
+        &mut compartments,
+        promotable,
+        &side_channels,
+    )
+    .await?;
+    Ok(RunOutcome {
+        run_id: run_id.to_owned(),
+        text: String::new(),
+        attempt: plan.attempt,
+        compartment_ids,
+        side_channels,
+    })
 }
 
 /// Validate one completion against the chunk it was asked to summarize.
@@ -2280,20 +2634,40 @@ fn chunk_view(chunk: &Chunk) -> historian_validate::ChunkView<'_> {
     }
 }
 
-/// The session's published compartment ranges, chronological — validation's
-/// `prior_compartments`, read from ox's own store.
-async fn stored_ranges(
+/// Reject overlap or omitted decodable, non-synthetic messages above the actual floor.
+/// Gaps from retired rows and skipped synthetic messages are allowed.
+async fn check_chunk_continuity(
     db: &ox_db::Db,
     session_id: &str,
-) -> Result<Vec<historian_validate::MessageRange>> {
-    Ok(compartments::load(db, session_id)
-        .await?
-        .into_iter()
-        .map(|compartment| historian_validate::MessageRange {
-            start: compartment.tiers.start_message,
-            end: compartment.tiers.end_message,
-        })
-        .collect())
+    chunk: &Chunk,
+    prior: &[historian_validate::MessageRange],
+) -> Result<bool> {
+    let floor = prior.iter().map(|range| range.end).max().unwrap_or(0);
+    if chunk.start_ordinal <= floor {
+        return Ok(false);
+    }
+    let conn = db.acquire().await?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, type, data FROM session_message
+             WHERE session_id = ?1 AND seq > ?2 AND seq < ?3 ORDER BY seq",
+        )
+        .await?;
+    let mut rows = stmt.query((session_id, floor, chunk.start_ordinal)).await?;
+    while let Some(row) = rows.next().await? {
+        let id: String = row.get(0)?;
+        let kind: String = row.get(1)?;
+        let data: String = row.get(2)?;
+        let mut value: serde_json::Value = serde_json::from_str(&data)?;
+        Message::merge_row_columns(&id, &kind, &mut value);
+        let Ok(message) = crate::runner::step::decode_row(&value) else {
+            continue;
+        };
+        if !matches!(message, Message::Synthetic { .. }) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// Publish validated compartments, promote the run's facts, and return the
@@ -2302,8 +2676,8 @@ async fn stored_ranges(
 /// Coverage is derived from these rows, so writing the chunk's range is what
 /// advances the floor a later pass reads. Everything goes in one transaction:
 /// a partial publish would advance coverage past content that was never
-/// summarized, and the promoted memories commit or roll back with the
-/// compartments that produced them. Promotion runs only when the prompt asked
+/// summarized, and the run completion and promoted memories commit or roll back
+/// with the compartments that produced them. Promotion runs only when the prompt asked
 /// for facts (`memory_enabled`) and the model returned some.
 ///
 /// The side channels one publish may promote, borrowed from the validated
@@ -2326,8 +2700,11 @@ impl Promotable<'_> {
 async fn publish_compartments(
     db: &ox_db::Db,
     plan: &RunPlan<'_>,
+    run_id: &str,
+    prior: &[historian_validate::MessageRange],
     compartments: &mut [historian_validate::ValidatedCompartment],
     promotable: Promotable<'_>,
+    side_channels: &SideChannels,
 ) -> Result<Vec<String>> {
     let session_id = plan.session_id;
     let mut pending: Vec<(String, Tiers, f64)> = Vec::with_capacity(compartments.len());
@@ -2384,6 +2761,28 @@ async fn publish_compartments(
     }
     let promote = wanted && withheld.is_none();
     let tx = db.begin().await?;
+    verify_claim_and_coverage(&tx, session_id, run_id, prior).await?;
+    if let Some(checkpoint) = &plan.checkpoint {
+        let row = ox_db::optional(
+            &mut tx
+                .prepare(
+                    "SELECT id, type, data FROM session_message WHERE session_id = ?1 AND seq = ?2",
+                )
+                .await?,
+            (session_id, plan.chunk.start_ordinal),
+        )
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("checkpoint row is missing"))?;
+        let id: String = row.get(0)?;
+        let kind: String = row.get(1)?;
+        let data: String = row.get(2)?;
+        let mut value: serde_json::Value = serde_json::from_str(&data)?;
+        Message::merge_row_columns(&id, &kind, &mut value);
+        anyhow::ensure!(
+            &value == checkpoint.row && id == plan.chunk.end_message_id,
+            "checkpoint row changed before publication"
+        );
+    }
     compartments::insert_all_in(&tx, &rows, &tiers, now)
         .await
         .with_context(|| {
@@ -2395,10 +2794,79 @@ async fn publish_compartments(
     if promote {
         promote_side_channels(&tx, plan, promotable, now).await?;
     }
+    let facts =
+        serde_json::to_string(&side_channels.facts).context("serialize run facts side channel")?;
+    let events = serde_json::to_string(&side_channels.events)
+        .context("serialize run events side channel")?;
+    settle_run_in(
+        &tx,
+        run_id,
+        RunState::Completed,
+        None,
+        Some(&facts),
+        Some(&events),
+    )
+    .await?;
     tx.commit()
         .await
         .with_context(|| format!("commit historian publish for session {session_id}"))?;
     Ok(pending.into_iter().map(|(id, _, _)| id).collect())
+}
+
+async fn verify_claim_and_coverage(
+    tx: &ox_db::WriteTx<'_>,
+    session_id: &str,
+    run_id: &str,
+    prior: &[historian_validate::MessageRange],
+) -> Result<()> {
+    let (state, updated_at) = ox_db::optional(
+        &mut tx
+            .prepare(
+                "SELECT state, updated_at FROM mc_historian_run WHERE id = ?1 AND session_id = ?2",
+            )
+            .await?,
+        (run_id, session_id),
+    )
+    .await?
+    .map(|row| -> Result<(String, i64)> { Ok((row.get(0)?, row.get(1)?)) })
+    .transpose()?
+    .ok_or_else(|| anyhow::anyhow!("historian claim {run_id} is missing"))?;
+    if state != RunState::Running.as_str() {
+        anyhow::bail!("historian claim {run_id} is no longer running");
+    }
+    if updated_at < lease_floor(now_millis()) {
+        anyhow::bail!("historian claim {run_id} lease expired");
+    }
+    let current = stored_ranges_in(tx, session_id).await?;
+    if current != prior {
+        anyhow::bail!("stored historian coverage changed after claim");
+    }
+    Ok(())
+}
+
+async fn stored_ranges_in(
+    conn: &ox_db::WriteTx<'_>,
+    session_id: &str,
+) -> Result<Vec<historian_validate::MessageRange>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT tiers FROM mc_compartments
+             WHERE session_id = ?1
+             ORDER BY created_at, id",
+        )
+        .await?;
+    let mut rows = stmt.query([session_id]).await?;
+    let mut ranges = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let tiers: String = row.get(0)?;
+        let tiers: Tiers = serde_json::from_str(&tiers)
+            .with_context(|| format!("decode stored historian tiers for session {session_id}"))?;
+        ranges.push(historian_validate::MessageRange {
+            start: tiers.start_message,
+            end: tiers.end_message,
+        });
+    }
+    Ok(ranges)
 }
 
 /// Promote the project facts into the project and the user observations into
@@ -2454,12 +2922,15 @@ async fn settle_failed(db: &ox_db::Db, run_id: &str, error: &anyhow::Error) {
 async fn update_run_attempt(db: &ox_db::Db, run_id: &str, attempt: i64) -> Result<()> {
     let now = now_millis();
     let conn = db.acquire().await?;
-    conn.execute(
-        "UPDATE mc_historian_run SET attempt = ?2, updated_at = ?3 WHERE id = ?1",
+    let changed = conn.execute(
+        "UPDATE mc_historian_run SET attempt = ?2, updated_at = ?3 WHERE id = ?1 AND state = 'running'",
         (run_id, attempt, now),
     )
     .await
     .with_context(|| format!("record mc_historian_run attempt {attempt}"))?;
+    if changed == 0 {
+        anyhow::bail!("historian claim {run_id} is no longer running");
+    }
     Ok(())
 }
 
@@ -2549,7 +3020,7 @@ async fn claim_run(
     session_id: &str,
     chunk_ref: &str,
     attempt: i64,
-) -> Result<Option<String>> {
+) -> Result<Option<(String, Vec<historian_validate::MessageRange>)>> {
     let run_id = id("hrun");
     let now = now_millis();
     let tx = db.begin().await?;
@@ -2583,8 +3054,13 @@ async fn claim_run(
             None => None,
         }
     };
+    let Some(run_id) = claimed else {
+        tx.commit().await?;
+        return Ok(None);
+    };
+    let prior = stored_ranges_in(&tx, session_id).await?;
     tx.commit().await?;
-    Ok(claimed)
+    Ok(Some((run_id, prior)))
 }
 
 /// Move a run row to its terminal state.
@@ -2612,21 +3088,43 @@ async fn settle_run(
         ),
         None => None,
     };
+    let tx = db.begin().await?;
+    settle_run_in(
+        &tx,
+        run_id,
+        state,
+        error,
+        facts.as_deref(),
+        events.as_deref(),
+    )
+    .await?;
+    tx.commit().await
+}
+
+async fn settle_run_in(
+    tx: &ox_db::WriteTx<'_>,
+    run_id: &str,
+    state: RunState,
+    error: Option<&str>,
+    facts: Option<&str>,
+    events: Option<&str>,
+) -> Result<()> {
     let now = now_millis();
-    let conn = db.acquire().await?;
-    let settled = conn
+    let settled = tx
         .execute(
             "UPDATE mc_historian_run
              SET state = ?2, updated_at = ?3, error = ?4,
                  facts = COALESCE(?5, facts), events = COALESCE(?6, events)
-             WHERE id = ?1",
+             WHERE id = ?1 AND state = 'running'
+               AND (?2 != 'completed' OR updated_at >= ?7)",
             (
                 run_id,
                 state.as_str(),
                 now,
                 error,
-                facts.as_deref(),
-                events.as_deref(),
+                facts,
+                events,
+                lease_floor(now),
             ),
         )
         .await

@@ -44,6 +44,20 @@ pub(crate) async fn collect_with_deltas<Delta, Pending>(
     chat: &Arc<dyn Chat>,
     request: &ChatRequest,
     provider: Option<&str>,
+    on_delta: Delta,
+) -> Result<TextCompletion>
+where
+    Delta: FnMut(String) -> Pending,
+    Pending: Future<Output = Result<()>>,
+{
+    collect_with_limit(chat, request, provider, None, on_delta).await
+}
+
+async fn collect_with_limit<Delta, Pending>(
+    chat: &Arc<dyn Chat>,
+    request: &ChatRequest,
+    provider: Option<&str>,
+    max_bytes: Option<usize>,
     mut on_delta: Delta,
 ) -> Result<TextCompletion>
 where
@@ -64,6 +78,9 @@ where
             .context("hidden completion stream failed")?
         {
             StreamEvent::TextDelta(delta) => {
+                if max_bytes.is_some_and(|limit| delta.len() > limit.saturating_sub(text.len())) {
+                    anyhow::bail!("hidden completion exceeds output byte budget");
+                }
                 text.push_str(&delta);
                 on_delta(delta).await?;
             }
@@ -102,8 +119,20 @@ pub(crate) async fn collect_text(
     provider: Option<&str>,
     purpose: &'static str,
 ) -> Result<String> {
-    let completion =
-        collect_with_deltas(chat, request, provider, |_| std::future::ready(Ok(()))).await?;
+    collect_text_with_limit(chat, request, provider, purpose, None).await
+}
+
+pub(crate) async fn collect_text_with_limit(
+    chat: &Arc<dyn Chat>,
+    request: &ChatRequest,
+    provider: Option<&str>,
+    purpose: &'static str,
+    max_bytes: Option<usize>,
+) -> Result<String> {
+    let completion = collect_with_limit(chat, request, provider, max_bytes, |_| {
+        std::future::ready(Ok(()))
+    })
+    .await?;
     if let Some(usage) = completion.usage {
         let read = usage.cached_tokens.unwrap_or(0);
         tracing::info!(

@@ -78,6 +78,44 @@ pub struct FrozenUnit {
     pub reset_rule: String,
 }
 
+/// The inputs that produced the frozen history unit. This is deliberately
+/// separate from the provider/model identity: it records the complete m[0]
+/// render decision, including the budget and calibrated counter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct M0RenderIdentity {
+    pub provider_id: String,
+    pub model_id: String,
+    pub window: Option<u32>,
+    pub history_budget: u32,
+    pub calibration_bits: u64,
+    pub render_version: u8,
+}
+
+impl M0RenderIdentity {
+    #[must_use]
+    pub fn new(
+        provider_id: impl Into<String>,
+        model_id: impl Into<String>,
+        window: Option<u32>,
+        history_budget: u32,
+        calibration: f64,
+    ) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            model_id: model_id.into(),
+            window,
+            history_budget,
+            calibration_bits: calibration.to_bits(),
+            render_version: 1,
+        }
+    }
+
+    #[must_use]
+    pub fn calibration(&self) -> f64 {
+        f64::from_bits(self.calibration_bits)
+    }
+}
+
 /// The core's durable per-pass state. One atomic value: the harness CAS-writes it back
 /// whole (units + boundary + version), never per-field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -94,6 +132,24 @@ pub struct CoreState {
     /// to decide that the NEXT cache-busting pass rematerializes against the live array.
     #[serde(default)]
     pub reconcile_pending: bool,
+    /// The identity used to render the frozen m[0] unit.
+    #[serde(default)]
+    pub m0_identity: Option<M0RenderIdentity>,
+    /// Authoritative coverage and floor for the frozen payload. Legacy KV rows
+    /// are compatibility mirrors and never override these fields.
+    #[serde(default)]
+    pub baseline_coverage: Option<i64>,
+    #[serde(default)]
+    pub materialized_floor: Option<i64>,
+    /// Last completed checkpoint incorporated into a hard pass.
+    #[serde(default)]
+    pub completed_compaction: Option<CompactionIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionIdentity {
+    pub id: String,
+    pub seq: i64,
 }
 
 /// One pass into the core. `proposed` is the harness's classification; `boundary_present`
@@ -114,6 +170,10 @@ pub struct PassInput {
     /// A `RunStarted` / episode boundary: lineage units reproduce byte-identical, episode
     /// units reset.
     pub run_started: bool,
+    /// Identity to persist when this pass is a HARD rebuild.
+    pub new_m0_identity: Option<M0RenderIdentity>,
+    pub new_materialized_floor: Option<i64>,
+    pub new_baseline_coverage: Option<i64>,
 }
 
 impl PassInput {
@@ -230,6 +290,9 @@ impl CoreState {
         {
             self.boundary_id = new_boundary;
         }
+        if let Some(floor) = input.new_materialized_floor {
+            self.materialized_floor = Some(floor);
+        }
         self.version += 1;
         StepResult {
             action: Action::Soft,
@@ -248,6 +311,9 @@ impl CoreState {
         if let Some(new_boundary) = input.new_boundary_id {
             self.boundary_id = new_boundary;
         }
+        self.m0_identity = input.new_m0_identity;
+        self.materialized_floor = input.new_materialized_floor;
+        self.baseline_coverage = input.new_baseline_coverage;
         self.reconcile_pending = false;
         self.version += 1;
         StepResult {

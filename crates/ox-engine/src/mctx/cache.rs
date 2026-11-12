@@ -14,24 +14,23 @@
 //!   machine exercisable end-to-end until then).
 //! - [`McCache`] — whole-value CAS persistence of [`CoreState`] in the
 //!   `mc_frozen_state` table.
-//! - [`run_pass`] — the per-pass driver: load → classify → render → step
-//!   (panic-contained) → CAS write-back with a single whole-pass retry.
-//! - [`Lkg`] — per-session last-known-good prefix (a `kv` row keyed
-//!   `mctx_lkg:{session_id}`) backing the refuse-turn semantics wired up by
-//!   the integration tasks.
+//! - [`run_pass`] — the per-pass driver: load → classify → render → step →
+//!   snapshot CAS write-back. A lost race is returned to the caller.
 
-use super::cache_core::{Action, CoreState, DurabilityClass, FrozenUnit, PassInput, StepResult};
+use super::cache_core::{
+    Action, CompactionIdentity, CoreState, DurabilityClass, FrozenUnit, M0RenderIdentity,
+    PassInput, StepResult,
+};
 use anyhow::Context as _;
 
 use ox_db::{Db, optional};
-use ox_schema::id::now_millis;
 
 /// Full mctx cache error type: `thiserror` plumbing (see `McCacheError`).
 #[derive(Debug, thiserror::Error)]
 pub enum McCacheError {
     /// The `mc_frozen_state` row moved underneath us between load and save
-    /// (another writer won the CAS). The whole pass must retry against the
-    /// fresh value.
+    /// (another writer won the CAS). The caller must reload its sources and
+    /// replan against a fresh snapshot.
     #[error(
         "CAS conflict on mc_frozen_state for session {session_id}: expected version {expected}"
     )]
@@ -66,6 +65,7 @@ pub struct Signals {
     /// Only the delta (`m1`) differs from the frozen bytes: new coverage
     /// arrived and the frozen baseline is still valid.
     pub delta_changed: bool,
+    pub completed_compaction: Option<CompactionIdentity>,
 }
 
 /// Sentinel fed to the kernel as `boundary_present` when the boundary is
@@ -133,20 +133,18 @@ pub struct RenderedPass {
     pub queued: Vec<FrozenUnit>,
     /// The new coverage boundary minted by this pass, if any.
     pub new_boundary_id: Option<String>,
+    /// The m[0] render identity to persist on a HARD rebuild.
+    pub new_m0_identity: Option<M0RenderIdentity>,
+    /// Durable geometry written with the frozen state; KV mirrors follow it.
+    pub new_materialized_floor: Option<i64>,
+    pub new_baseline_coverage: Option<i64>,
 }
 
 /// The renderer seam: turns (state, signals) into the byte-complete units
 /// for this pass. `Send + Sync` so it can sit behind the runner.
 pub trait HeadRenderer: Send + Sync {
-    /// Render the pass handoff for the given state and signals.
-    ///
-    /// MUST be deterministic per `(state, signals)`: a CAS conflict re-runs
-    /// the whole pass, and the kernel requires the retried pass to re-splice
-    /// the SAME boundary id (kernel lib.rs boundary-presence contract).
-    /// Also runs on defer passes — it is the producer of `queued` (the
-    /// drop-queue carrier); only `rendered_units`/`new_boundary_id` are
-    /// structurally dropped there by [`build_pass_input`].
-    fn render(&self, state: Option<&CoreState>, signals: &Signals) -> RenderedPass;
+    /// A defer pass does not render: the kernel replays frozen bytes verbatim.
+    fn render(&mut self, state: Option<&CoreState>, signals: &Signals) -> RenderedPass;
 }
 
 /// A stand-in renderer: one `m0` unit with a static payload, minting a
@@ -163,7 +161,7 @@ pub struct TrivialRenderer {
 }
 
 impl HeadRenderer for TrivialRenderer {
-    fn render(&self, _state: Option<&CoreState>, _signals: &Signals) -> RenderedPass {
+    fn render(&mut self, _state: Option<&CoreState>, _signals: &Signals) -> RenderedPass {
         RenderedPass {
             rendered_units: vec![FrozenUnit {
                 key: "m0".into(),
@@ -174,6 +172,9 @@ impl HeadRenderer for TrivialRenderer {
             }],
             queued: self.queued.clone(),
             new_boundary_id: Some(self.boundary_id.clone()),
+            new_m0_identity: None,
+            new_materialized_floor: None,
+            new_baseline_coverage: None,
         }
     }
 }
@@ -195,6 +196,9 @@ fn build_pass_input(action: Action, rendered: RenderedPass, signals: &Signals) -
             queued: rendered.queued,
             new_boundary_id: None,
             run_started: signals.run_started,
+            new_m0_identity: rendered.new_m0_identity,
+            new_materialized_floor: rendered.new_materialized_floor,
+            new_baseline_coverage: rendered.new_baseline_coverage,
         },
         Action::Soft | Action::Hard => PassInput {
             proposed: Some(action),
@@ -204,6 +208,9 @@ fn build_pass_input(action: Action, rendered: RenderedPass, signals: &Signals) -
             queued: Vec::new(),
             new_boundary_id: rendered.new_boundary_id,
             run_started: signals.run_started,
+            new_m0_identity: rendered.new_m0_identity,
+            new_materialized_floor: rendered.new_materialized_floor,
+            new_baseline_coverage: rendered.new_baseline_coverage,
         },
     }
 }
@@ -221,21 +228,16 @@ pub enum PassOutcome {
         /// The cached prefix after the pass.
         prefix: String,
     },
-    /// The pass panicked mid-render/step. Durable state is untouched (no
-    /// poisoning); the caller serves the last-known-good prefix — or
-    /// refuses the turn when no LKG exists.
-    ModulePanicked,
 }
 
 impl PassOutcome {
-    /// The cached prefix after the pass, or `None` on a panicked pass.
+    /// The cached prefix after the pass.
     #[must_use]
     pub fn prefix(&self) -> Option<&str> {
         match self {
             PassOutcome::DeferReplayed { prefix } | PassOutcome::BustApplied { prefix } => {
                 Some(prefix)
             }
-            PassOutcome::ModulePanicked => None,
         }
     }
 }
@@ -244,6 +246,12 @@ impl PassOutcome {
 pub struct McCache {
     db: Db,
     session_id: String,
+}
+
+pub(crate) struct Snapshot {
+    pub state: Option<CoreState>,
+    json: Option<String>,
+    column_version: i64,
 }
 
 impl McCache {
@@ -268,6 +276,10 @@ impl McCache {
     /// are only ever written together, so divergence means an out-of-band
     /// edit).
     pub async fn load(&self) -> Result<Option<CoreState>, McCacheError> {
+        Ok(self.load_snapshot().await?.state)
+    }
+
+    pub(crate) async fn load_snapshot(&self) -> Result<Snapshot, McCacheError> {
         let context = || format!("load mc_frozen_state for session {}", self.session_id);
         let conn = self.db.acquire().await.with_context(context)?;
         let mut stmt = conn
@@ -278,7 +290,11 @@ impl McCache {
             .await
             .with_context(context)?;
         let Some(row) = row else {
-            return Ok(None);
+            return Ok(Snapshot {
+                state: None,
+                json: None,
+                column_version: 0,
+            });
         };
         let (json, column_version) = (|row: &ox_db::turso::Row| -> anyhow::Result<(String, i64)> {
             Ok((row.get(0)?, row.get(1)?))
@@ -298,7 +314,38 @@ impl McCache {
                 "mc_frozen_state version column diverges from the JSON payload; trusting the payload"
             );
         }
-        Ok(Some(state))
+        Ok(Snapshot {
+            state: Some(state),
+            json: Some(json),
+            column_version,
+        })
+    }
+
+    async fn save_snapshot(
+        &self,
+        snapshot: &Snapshot,
+        state: &CoreState,
+    ) -> Result<(), McCacheError> {
+        let json = serde_json::to_string(state).context("serialize mc_frozen_state")?;
+        let conn = self.db.acquire().await?;
+        let affected = if let Some(previous) = snapshot.json.as_deref() {
+            conn.execute(
+                "UPDATE mc_frozen_state SET state = ?1, version = ?2 WHERE session_id = ?3 AND state = ?4 AND version = ?5",
+                (json.as_str(), state.version as i64, self.session_id.as_str(), previous, snapshot.column_version),
+            ).await.context("update mc_frozen_state")?
+        } else {
+            conn.execute(
+                "INSERT INTO mc_frozen_state (session_id, state, version) VALUES (?1, ?2, ?3) ON CONFLICT(session_id) DO NOTHING",
+                (self.session_id.as_str(), json.as_str(), state.version as i64),
+            ).await.context("insert mc_frozen_state")?
+        };
+        if affected == 0 {
+            return Err(McCacheError::CasConflict {
+                session_id: self.session_id.clone(),
+                expected: snapshot.column_version as u64,
+            });
+        }
+        Ok(())
     }
 
     /// Whole-value CAS write-back for this handle's session: replace the row
@@ -345,77 +392,43 @@ impl McCache {
 }
 
 /// Drive one transform pass end to end: load the durable state, classify,
-/// render, step the kernel (panic-contained), and CAS-write the result
-/// back. On a CAS conflict the WHOLE pass retries once against the fresh
-/// value (a CAS-retry re-splices the same boundary per the kernel docs); a
-/// second conflict is a real contention error for the caller.
+/// render, step the kernel, and CAS-write the result
+/// back. A CAS conflict is returned to the caller. Reusing the failed attempt's
+/// state would risk overwriting a concurrent writer's newer state.
 ///
-/// Callers must serialize passes per session (the session turn loop does):
-/// the CAS is a crash/stale-handle safety net, not steady-state contention
-/// handling — hence the single retry. (Two concurrent defer passes at the
-/// same version are last-writer-wins by kernel contract: a defer never
-/// bumps `version`, so no guard can distinguish them.)
-///
-/// On a panic — in the renderer or the kernel — the durable row is left
-/// untouched and [`PassOutcome::ModulePanicked`] is returned; the caller
-/// applies LKG semantics. Nothing is poisoned.
+/// The CAS compares the complete persisted snapshot, including defer changes
+/// that do not bump the kernel version.
 ///
 /// The result is always saved, including on defer passes: a defer can queue
 /// drops and flip `reconcile_pending` without moving `version`, and both
 /// are durable state the next pass must see.
 pub async fn run_pass(
     cache: &McCache,
-    renderer: &dyn HeadRenderer,
+    renderer: &mut dyn HeadRenderer,
     signals: &Signals,
 ) -> Result<PassOutcome, McCacheError> {
-    let mut attempt: u32 = 0;
-    loop {
-        let mut loaded = cache.load().await?;
-        let action = classify(loaded.as_ref(), signals);
-        // The CAS guard is the version we loaded (see `save_cas`).
-        let expected_version = loaded.as_ref().map_or(0, |s| s.version);
+    let snapshot = cache.load_snapshot().await?;
+    run_snapshot(cache, snapshot, renderer, signals).await
+}
 
-        // Panic containment: neither the renderer nor the kernel step may
-        // take the server down. `AssertUnwindSafe` is sound here because a
-        // panic discards every value produced inside the closure. This
-        // REQUIRES the default unwind panic profile — `panic = "abort"`
-        // would kill the process instead of containing.
-        let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            // The renderer runs on defer passes too: it is the producer of
-            // `queued` (drop-queued units draining the kernel's
-            // `pending_changes` path — ctx_reduce's carrier). Only the
-            // `rendered_units`/boundary-mint halves are structurally dropped
-            // by `build_pass_input` on SoftPlus. Whether the real Task-5
-            // renderer can skip re-deriving the head on defers is its own
-            // internal concern.
-            let rendered = renderer.render(loaded.as_ref(), signals);
-            transition(loaded.take(), action, rendered, signals)
-        }));
-        let (state, outcome) = match stepped {
-            Ok(pair) => pair,
-            Err(payload) => {
-                let detail = payload
-                    .downcast_ref::<&str>()
-                    .map(|message| (*message).to_string())
-                    .or_else(|| payload.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| "unknown panic payload".to_string());
-                tracing::warn!(
-                    session = %cache.session_id(),
-                    detail = %detail,
-                    "mctx transform pass panicked; durable state untouched, LKG applies"
-                );
-                return Ok(PassOutcome::ModulePanicked);
-            }
-        };
+pub(crate) async fn run_snapshot(
+    cache: &McCache,
+    mut snapshot: Snapshot,
+    renderer: &mut dyn HeadRenderer,
+    signals: &Signals,
+) -> Result<PassOutcome, McCacheError> {
+    let mut loaded = snapshot.state.take();
+    let action = classify(loaded.as_ref(), signals);
 
-        match cache.save_cas(expected_version, &state).await {
-            Ok(()) => return Ok(outcome),
-            // One whole-pass retry after a lost race; a second loss is a
-            // real contention error.
-            Err(McCacheError::CasConflict { .. }) if attempt == 0 => attempt += 1,
-            Err(error) => return Err(error),
-        }
-    }
+    let rendered = if action == Action::SoftPlus {
+        RenderedPass::default()
+    } else {
+        renderer.render(loaded.as_ref(), signals)
+    };
+    let (state, outcome) = transition(loaded.take(), action, rendered, signals);
+
+    cache.save_snapshot(&snapshot, &state).await?;
+    Ok(outcome)
 }
 
 /// Step a locally owned snapshot; persistence belongs exclusively to the caller.
@@ -428,63 +441,15 @@ pub(crate) fn transition(
     let input = build_pass_input(action, rendered, signals);
     let mut state = loaded.unwrap_or_default();
     let result: StepResult = state.step(input);
+    if result.action == Action::Hard {
+        state
+            .completed_compaction
+            .clone_from(&signals.completed_compaction);
+    }
     let prefix = state.cached_prefix_bytes();
     let outcome = match result.action {
         Action::SoftPlus => PassOutcome::DeferReplayed { prefix },
         Action::Soft | Action::Hard => PassOutcome::BustApplied { prefix },
     };
     (state, outcome)
-}
-
-/// Per-session last-known-good prefix: the last prefix bytes the transform
-/// pass actually served. On a panicked pass the caller replays the LKG;
-/// with no LKG at all the turn is refused. Stored in the existing `kv`
-/// table under `mctx_lkg:{session_id}` — a separate table would be
-/// overkill for one string per session.
-pub struct Lkg {
-    db: Db,
-}
-
-fn lkg_key(session_id: &str) -> String {
-    format!("mctx_lkg:{session_id}")
-}
-
-impl Lkg {
-    /// An LKG store over `db`.
-    #[must_use]
-    pub fn new(db: Db) -> Self {
-        Self { db }
-    }
-
-    /// The last-known-good prefix for the session, if any.
-    pub async fn load_lkg(&self, session_id: &str) -> Result<Option<String>, McCacheError> {
-        let context = || format!("load LKG for session {session_id}");
-        let key = lkg_key(session_id);
-        let conn = self.db.acquire().await?;
-        let mut stmt = conn
-            .prepare("SELECT value FROM kv WHERE key = ?1")
-            .await
-            .with_context(context)?;
-        let row = optional(&mut stmt, [key.as_str()])
-            .await
-            .with_context(context)?;
-        Ok(row
-            .map(|row| row.get(0).map_err(anyhow::Error::from))
-            .transpose()?)
-    }
-
-    /// Record `prefix` as the session's last-known-good output.
-    pub async fn save_lkg(&self, session_id: &str, prefix: &str) -> Result<(), McCacheError> {
-        let key = lkg_key(session_id);
-        let now = now_millis();
-        let conn = self.db.acquire().await?;
-        conn.execute(
-            "INSERT INTO kv (key, value, time_created, time_updated) VALUES (?1, ?2, ?3, ?3)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value, time_updated = ?3",
-            (key.as_str(), prefix, now),
-        )
-        .await
-        .with_context(|| format!("save LKG for session {session_id}"))?;
-        Ok(())
-    }
 }

@@ -28,7 +28,7 @@ crossterm = { workspace = true, features = ["bracketed-paste"] }
 # Fenced-code highlighting: pure-Rust regex engine (no onig C build) and only the
 # bundled syntaxes; colours come from the theme tokens, not syntect themes.
 syntect = { version = "5.3", default-features = false, features = ["parsing", "default-syntaxes", "regex-fancy"] }
-tui-textarea-2 = { version = "0.13", default-features = false, features = ["crossterm"] }
+tui-textarea-2 = { version = "0.14", default-features = false, features = ["crossterm"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 serde_json.workspace = true
 textwrap.workspace = true

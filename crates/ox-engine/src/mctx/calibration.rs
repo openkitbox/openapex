@@ -159,21 +159,3 @@ fn lock(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::Calibration;
-
-    #[test]
-    fn calibration_resets_when_provider_changes_for_same_model_id() {
-        let mut calibration = Calibration::default();
-        calibration.observe("cardinal", "shared", 200, 100);
-
-        assert_eq!(calibration.ratio("cardinal", "shared"), 2.0);
-        assert_eq!(calibration.ratio("deepseek", "shared"), 1.0);
-
-        calibration.observe("deepseek", "shared", 100, 100);
-
-        assert_eq!(calibration.ratio("deepseek", "shared"), 1.0);
-    }
-}

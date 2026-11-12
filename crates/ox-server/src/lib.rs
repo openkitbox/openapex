@@ -615,6 +615,7 @@ fn log_cache_stats(runner: &Runner) {
         uncached += cache.uncached;
         tracing::debug!(
             session = %session,
+            cache_usage_source = "provider_reported",
             cache_read = cache.read,
             cache_uncached = cache.uncached,
             "OX_CACHE_STATS"
@@ -626,6 +627,7 @@ fn log_cache_stats(runner: &Runner) {
     };
     tracing::info!(
         sessions = ledger.len(),
+        cache_usage_source = "provider_reported",
         cache_read = read,
         cache_uncached = uncached,
         hit_ratio = ?hit_ratio,

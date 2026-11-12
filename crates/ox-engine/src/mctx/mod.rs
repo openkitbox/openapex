@@ -50,7 +50,7 @@ pub(crate) const CTX_GUIDANCE: &str = "ctx_note parks follow-ups, ctx_reduce dro
 pub mod embed;
 
 /// cache-core integration: classification predicates, render handoff,
-/// whole-value CAS state and LKG.
+/// whole-value CAS state.
 pub mod cache;
 mod cache_core;
 
@@ -96,6 +96,9 @@ pub mod budget;
 /// The per-session transform pass: plan → classify → step the cache kernel →
 /// CAS write-back (the `m[0]`/`m[1]` head producer).
 pub mod pass;
+
+/// Checkpoint slice request preparation and model execution.
+pub mod checkpoint_slices;
 
 /// Historian: triggering, chunking, prompt, cardinal execution, validation
 /// and publication of compartments.

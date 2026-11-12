@@ -129,6 +129,15 @@ pub struct ParsedCompartment {
     pub episode_type: Option<String>,
 }
 
+/// One independently generated fragment of an oversized single-ordinal checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointSlice<'a> {
+    /// Zero-based position in the complete slice set.
+    pub index: usize,
+    /// The historian XML for this slice.
+    pub text: &'a str,
+}
+
 /// A fact extracted from the `<facts>` block
 /// (`historian_validate.rs::FactCandidate`).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -602,6 +611,582 @@ pub fn validate_historian_output(
         unprocessed_from: last_new_end.saturating_add(1),
         discarded_last,
     })
+}
+
+/// Validate and merge slices of one oversized single-ordinal checkpoint.
+///
+/// Each slice is parsed and subjected to the ordinary compartment checks before
+/// any data is merged. The slice index is part of the input contract: all
+/// indices from zero through `slice_count - 1` must occur exactly once and in
+/// order. Side-channel anchors are required to point at that slice's only
+/// compartment, so merging cannot silently orphan data.
+pub fn validate_checkpoint_slices(
+    ordinal: i64,
+    slice_count: usize,
+    slices: &[CheckpointSlice<'_>],
+) -> Result<ValidatedChunk, HistorianValidationError> {
+    let next_ordinal = ordinal
+        .checked_add(1)
+        .ok_or_else(|| validation_error("checkpoint ordinal cannot advance"))?;
+    if slice_count == 0 || slices.len() != slice_count {
+        return Err(validation_error(format!(
+            "checkpoint requires exactly {slice_count} slices, got {}",
+            slices.len()
+        )));
+    }
+
+    let ordinals = [ordinal];
+    let chunk = ChunkView {
+        start_ordinal: ordinal,
+        end_ordinal: ordinal,
+        line_ordinals: &ordinals,
+        present_ordinals: &ordinals,
+        tool_only_ranges: &[],
+        completed_tool_arcs: &[],
+    };
+    let mut parsed_slices = Vec::with_capacity(slice_count);
+
+    for (expected_index, slice) in slices.iter().enumerate() {
+        if slice.index != expected_index {
+            return Err(validation_error(format!(
+                "checkpoint slice index {} is out of order; expected {expected_index}",
+                slice.index
+            )));
+        }
+
+        let elements = find_compartment_elements(slice.text);
+        if elements.len() != 1 {
+            return Err(validation_error(format!(
+                "checkpoint slice {expected_index} must contain exactly one compartment element"
+            )));
+        }
+        let before = &slice.text[..elements[0].start];
+        let after = &slice.text[elements[0].end..];
+        let opens = before.matches("<compartments>").count();
+        let closes = after.matches("</compartments>").count();
+        if opens != closes
+            || opens > 1
+            || before.contains("</compartments>")
+            || after.contains("<compartments>")
+        {
+            return Err(validation_error(format!(
+                "checkpoint slice {expected_index} has malformed compartment envelope"
+            )));
+        }
+        let outside = text_outside_compartments(slice.text, &elements);
+        if outside.contains("<unprocessed_from") {
+            return Err(validation_error(format!(
+                "checkpoint slice {expected_index} contains <unprocessed_from>"
+            )));
+        }
+        validate_checkpoint_tags(&outside, expected_index)?;
+        validate_checkpoint_channels(&outside, expected_index)?;
+        validate_checkpoint_tiers(elements[0].inner, expected_index)?;
+        let parsed = parse_compartment_output(slice.text)?;
+        if parsed.compartments.len() != 1 {
+            return Err(validation_error(format!(
+                "checkpoint slice {expected_index} must contain exactly one compartment, got {}",
+                parsed.compartments.len()
+            )));
+        }
+        if parsed.unprocessed_from.is_some() {
+            return Err(validation_error(format!(
+                "checkpoint slice {expected_index} is bounded by <unprocessed_from>"
+            )));
+        }
+        if parsed.dropped_fact_blocks != 0 || parsed.dropped_facts != 0 {
+            return Err(validation_error(format!(
+                "checkpoint slice {expected_index} contains unsupported fact categories"
+            )));
+        }
+
+        let compartment = &parsed.compartments[0];
+        if compartment.p1.as_deref().is_none_or(checkpoint_p1_is_blank) {
+            return Err(validation_error(format!(
+                "checkpoint slice {expected_index} has empty p1"
+            )));
+        }
+        validate_compartment_mapping(&parsed.compartments, &chunk).map_err(|error| {
+            validation_error(format!(
+                "checkpoint slice {expected_index} has invalid compartment output: {error}"
+            ))
+        })?;
+        if let Some(error) =
+            validate_parsed_compartments(&parsed.compartments, ordinal, ordinal, &ordinals, None)
+        {
+            return Err(validation_error(format!(
+                "checkpoint slice {expected_index} has invalid compartment output: {error}"
+            )));
+        }
+        validate_slice_anchors(&parsed, expected_index)?;
+        if compartment.start_message != ordinal || compartment.end_message != ordinal {
+            return Err(validation_error(format!(
+                "checkpoint slice {expected_index} must cover only ordinal {ordinal}, got {}-{}",
+                compartment.start_message, compartment.end_message
+            )));
+        }
+        parsed_slices.push(parsed);
+    }
+
+    merge_checkpoint_slices(ordinal, next_ordinal, parsed_slices)
+}
+
+// Numeric character references are not decoded by the permissive host parser.
+// Recognize whitespace references here without changing ordinary parsing.
+fn checkpoint_p1_is_blank(mut text: &str) -> bool {
+    while !text.is_empty() {
+        let Some(ch) = text.chars().next() else { break };
+        if ch.is_whitespace() {
+            text = &text[ch.len_utf8()..];
+            continue;
+        }
+        let Some(rest) = text.strip_prefix("&#") else {
+            return false;
+        };
+        let Some((number, suffix)) = rest.split_once(';') else {
+            return false;
+        };
+        let code = if let Some(hex) = number
+            .strip_prefix('x')
+            .or_else(|| number.strip_prefix('X'))
+        {
+            u32::from_str_radix(hex, 16).ok()
+        } else {
+            number.parse::<u32>().ok()
+        };
+        if !code
+            .and_then(char::from_u32)
+            .is_some_and(char::is_whitespace)
+        {
+            return false;
+        }
+        text = suffix;
+    }
+    true
+}
+
+fn validate_checkpoint_tiers(
+    text: &str,
+    slice_index: usize,
+) -> Result<(), HistorianValidationError> {
+    let mut seen = [false; 4];
+    let mut cursor = 0;
+    let opener = tier_open_regex();
+    while let Some(capture) = opener.captures_at(text, cursor) {
+        let Some(whole) = capture.get(0) else { break };
+        if !text[cursor..whole.start()].trim().is_empty() {
+            return Err(validation_error(format!(
+                "checkpoint slice {slice_index} has content outside tiers"
+            )));
+        }
+        let digit = tier_digit(&capture);
+        if !(1..=4).contains(&digit) {
+            return Err(validation_error(format!(
+                "checkpoint slice {slice_index} has unknown tier p{digit}"
+            )));
+        }
+        let index = (digit - 1) as usize;
+        if seen[index] {
+            return Err(validation_error(format!(
+                "checkpoint slice {slice_index} contains duplicate tier p{digit}"
+            )));
+        }
+        seen[index] = true;
+        cursor = whole.end();
+        if capture.get(2).is_some_and(|m| m.as_str() == "/") {
+            continue;
+        }
+        let close = format!("</p{digit}>");
+        let Some(length) = text[cursor..].find(&close) else {
+            return Err(validation_error(format!(
+                "checkpoint slice {slice_index} has unclosed tier p{digit}"
+            )));
+        };
+        if text[cursor..cursor + length].contains('<') {
+            return Err(validation_error(format!(
+                "checkpoint slice {slice_index} has nested or malformed tier content"
+            )));
+        }
+        cursor += length + close.len();
+    }
+    if !seen.into_iter().all(|present| present) || !text[cursor..].trim().is_empty() {
+        return Err(validation_error(format!(
+            "checkpoint slice {slice_index} must contain exactly four complete tiers"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_tags(
+    outside: &str,
+    slice_index: usize,
+) -> Result<(), HistorianValidationError> {
+    static PRIMER_MARKER: OnceLock<Regex> = OnceLock::new();
+    let primer_marker = PRIMER_MARKER
+        .get_or_init(|| {
+            Regex::new(r"(?i)<\s*/?\s*primer_candidates\b")
+                .expect("checkpoint primer candidate tag regex")
+        })
+        .clone();
+    if primer_marker.is_match(outside) {
+        return Err(validation_error(format!(
+            "checkpoint slice {slice_index} contains unsupported <primer_candidates>"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_channels(
+    outside: &str,
+    slice_index: usize,
+) -> Result<(), HistorianValidationError> {
+    validate_single_block(outside, "facts", slice_index)?;
+    validate_single_block(outside, "events", slice_index)?;
+    validate_single_block(outside, "user_observations", slice_index)?;
+    validate_event_channel(outside, slice_index)?;
+    if let Some(block) = user_observations_block_regex()
+        .captures(outside)
+        .and_then(|caps| caps.get(1))
+    {
+        validate_bullets(block.as_str(), slice_index, false)?;
+    }
+    validate_fallback_side_channels(outside, slice_index)?;
+    validate_fact_channel(outside, slice_index)
+}
+
+fn validate_single_block(
+    outside: &str,
+    name: &str,
+    slice_index: usize,
+) -> Result<(), HistorianValidationError> {
+    let marker_regex = checkpoint_channel_tag_regex();
+    let marker_count = marker_regex
+        .captures_iter(outside)
+        .filter(|caps| caps.get(2).is_some_and(|tag| tag.as_str() == name))
+        .count();
+    let opening_count = outside.matches(&format!("<{name}>")).count();
+    let closing_count = outside.matches(&format!("</{name}>")).count();
+    let malformed_prefix = outside.matches(&format!("<{name}")).count() != opening_count;
+    let complete_block = match name {
+        "facts" => facts_block_regex().is_match(outside),
+        "events" => events_block_regex().is_match(outside),
+        "user_observations" => user_observations_block_regex().is_match(outside),
+        _ => false,
+    };
+    if malformed_prefix
+        || marker_count != opening_count + closing_count
+        || opening_count != closing_count
+        || opening_count > 1
+        || (opening_count == 1 && !complete_block)
+    {
+        return Err(validation_error(format!(
+            "checkpoint slice {slice_index} has incomplete or duplicate <{name}> blocks"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_event_channel(
+    outside: &str,
+    slice_index: usize,
+) -> Result<(), HistorianValidationError> {
+    let Some(block) = events_block_regex()
+        .captures(outside)
+        .and_then(|caps| caps.get(1).map(|m| m.as_str()))
+    else {
+        return Ok(());
+    };
+    let mut cursor = 0;
+    let event_open = event_open_regex();
+    while let Some(event) = event_open.captures_at(block, cursor) {
+        let Some(whole) = event.get(0) else {
+            break;
+        };
+        if !block[cursor..whole.start()].trim().is_empty()
+            || event.get(2).and_then(|m| m.as_str().parse::<i64>().ok()) != Some(1)
+        {
+            return Err(validation_error(format!(
+                "checkpoint slice {slice_index} has malformed event or anchor"
+            )));
+        }
+        let kind = event.get(1).map_or("", |m| m.as_str());
+        let close_tag = format!("</{kind}>");
+        let body_start = whole.end();
+        let Some(relative_end) = block[body_start..].find(&close_tag) else {
+            return Err(validation_error(format!(
+                "checkpoint slice {slice_index} has malformed event block"
+            )));
+        };
+        let body_end = body_start + relative_end;
+        let body = &block[body_start..body_end];
+        let mut field_cursor = 0;
+        let mut names = std::collections::BTreeSet::new();
+        let field_open = event_field_open_regex();
+        while let Some(field) = field_open.captures_at(body, field_cursor) {
+            let Some(whole) = field.get(0) else {
+                break;
+            };
+            let name = field.get(1).map_or("", |m| m.as_str());
+            let close = format!("</{name}>");
+            let Some(length) = body[whole.end()..].find(&close) else {
+                return Err(validation_error(format!(
+                    "checkpoint slice {slice_index} has unclosed event field"
+                )));
+            };
+            let value = &body[whole.end()..whole.end() + length];
+            if !body[field_cursor..whole.start()].trim().is_empty()
+                || !names.insert(name)
+                || value.trim().is_empty()
+                || value.contains('<')
+            {
+                return Err(validation_error(format!(
+                    "checkpoint slice {slice_index} has malformed event fields"
+                )));
+            }
+            field_cursor = whole.end() + length + close.len();
+        }
+        if !body[field_cursor..].trim().is_empty() {
+            return Err(validation_error(format!(
+                "checkpoint slice {slice_index} has malformed event fields"
+            )));
+        }
+        cursor = body_end + close_tag.len();
+    }
+    if !block[cursor..].trim().is_empty() {
+        return Err(validation_error(format!(
+            "checkpoint slice {slice_index} has malformed event block"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_fallback_side_channels(
+    outside: &str,
+    slice_index: usize,
+) -> Result<(), HistorianValidationError> {
+    let without_events = events_block_regex().replace_all(outside, "");
+    let without_other = facts_side_channel_regex().replace_all(&without_events, "");
+    let without_facts = facts_block_regex().replace_all(&without_other, "");
+    let remaining = facts_envelope_regex().replace_all(&without_facts, "");
+    let remaining = remaining.trim();
+    if remaining.is_empty() {
+        return Ok(());
+    }
+    if facts_block_regex().is_match(&without_other) {
+        return Err(validation_error(format!(
+            "checkpoint slice {slice_index} has content outside its facts block"
+        )));
+    }
+    validate_fact_block(remaining, slice_index)
+}
+
+fn validate_fact_channel(
+    outside: &str,
+    slice_index: usize,
+) -> Result<(), HistorianValidationError> {
+    let Some(block) = facts_block_regex()
+        .captures(outside)
+        .and_then(|caps| caps.get(1).map(|m| m.as_str()))
+    else {
+        return Ok(());
+    };
+    validate_fact_block(block, slice_index)
+}
+
+fn validate_fact_block(block: &str, slice_index: usize) -> Result<(), HistorianValidationError> {
+    let mut cursor = 0;
+    let category_open = category_open_regex();
+    while let Some(category) = category_open.captures_at(block, cursor) {
+        let Some(whole) = category.get(0) else {
+            break;
+        };
+        if !block[cursor..whole.start()].trim().is_empty() {
+            return Err(validation_error(format!(
+                "checkpoint slice {slice_index} has malformed facts block"
+            )));
+        }
+        let name = category.get(1).map_or("", |m| m.as_str());
+        let close = format!("</{name}>");
+        let Some(relative_end) = block[whole.end()..].find(&close) else {
+            return Err(validation_error(format!(
+                "checkpoint slice {slice_index} has malformed facts block"
+            )));
+        };
+        let body_end = whole.end() + relative_end;
+        validate_bullets(&block[whole.end()..body_end], slice_index, true)?;
+        cursor = body_end + close.len();
+    }
+    if !block[cursor..].trim().is_empty() {
+        return Err(validation_error(format!(
+            "checkpoint slice {slice_index} has malformed facts block"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_bullets(
+    block: &str,
+    slice_index: usize,
+    check_anchors: bool,
+) -> Result<(), HistorianValidationError> {
+    for line in block.lines() {
+        let item = line.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let Some(item_text) = item.strip_prefix('*').map(str::trim) else {
+            return Err(validation_error(format!(
+                "checkpoint slice {slice_index} has malformed side-channel item"
+            )));
+        };
+        if item_text.is_empty() {
+            return Err(validation_error(format!(
+                "checkpoint slice {slice_index} has empty side-channel item"
+            )));
+        }
+        if check_anchors {
+            let has_anchor_marker =
+                item_text.contains("origin_compartment") || item_text.contains("at_compartment");
+            if !has_anchor_marker {
+                continue;
+            }
+            let decoded = unescape_xml(item_text);
+            let item_text = decoded.trim();
+            if !checkpoint_fact_anchor_regex().is_match(item_text) {
+                return Err(validation_error(format!(
+                    "checkpoint slice {slice_index} has malformed fact anchor"
+                )));
+            }
+            let Some(caps) = side_channel_anchor_regex().captures(item_text) else {
+                return Err(validation_error(format!(
+                    "checkpoint slice {slice_index} has malformed fact anchor"
+                )));
+            };
+            if caps.get(1).and_then(|m| m.as_str().parse::<i64>().ok()) != Some(1)
+                || caps.get(2).is_none_or(|m| {
+                    m.as_str().contains("origin_compartment")
+                        || m.as_str().contains("at_compartment")
+                })
+            {
+                return Err(validation_error(format!(
+                    "checkpoint slice {slice_index} has invalid fact anchor"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_slice_anchors(
+    parsed: &ParsedCompartmentOutput,
+    slice_index: usize,
+) -> Result<(), HistorianValidationError> {
+    let invalid_fact = parsed
+        .facts
+        .iter()
+        .find_map(|fact| fact.origin_compartment_index.filter(|index| *index != 1));
+    if let Some(index) = invalid_fact {
+        return Err(validation_error(format!(
+            "checkpoint slice {slice_index} has invalid fact anchor {index}"
+        )));
+    }
+    let invalid_event = parsed
+        .events
+        .iter()
+        .find_map(|event| event.at_compartment.filter(|index| *index != 1));
+    if let Some(index) = invalid_event {
+        return Err(validation_error(format!(
+            "checkpoint slice {slice_index} has invalid event anchor {index}"
+        )));
+    }
+    Ok(())
+}
+
+fn merge_checkpoint_slices(
+    ordinal: i64,
+    next_ordinal: i64,
+    parsed_slices: Vec<ParsedCompartmentOutput>,
+) -> Result<ValidatedChunk, HistorianValidationError> {
+    let mut slices = parsed_slices.into_iter();
+    let first = slices
+        .next()
+        .ok_or_else(|| validation_error("checkpoint has no slices"))?;
+    let first_compartment = first
+        .compartments
+        .into_iter()
+        .next()
+        .ok_or_else(|| validation_error("checkpoint slice has no compartment"))?;
+    let mut title = first_compartment.title;
+    let mut content = first_compartment.content;
+    let mut p1 = first_compartment.p1;
+    let mut p2 = first_compartment.p2;
+    let mut p3 = first_compartment.p3;
+    let mut p4 = first_compartment.p4;
+    let importance = first_compartment.importance;
+    let episode_type = first_compartment.episode_type;
+    let mut facts = first.facts;
+    let mut events = first.events;
+    let mut user_observations = first.user_observations;
+
+    for parsed in slices {
+        let compartment = parsed
+            .compartments
+            .into_iter()
+            .next()
+            .ok_or_else(|| validation_error("checkpoint slice has no compartment"))?;
+        if compartment.importance != importance || compartment.episode_type != episode_type {
+            return Err(validation_error(
+                "checkpoint slices disagree on compartment metadata",
+            ));
+        }
+        append_slice_text(&mut title, compartment.title);
+        append_slice_text(&mut content, compartment.content);
+        append_optional_text(&mut p1, compartment.p1);
+        append_optional_text(&mut p2, compartment.p2);
+        append_optional_text(&mut p3, compartment.p3);
+        append_optional_text(&mut p4, compartment.p4);
+        facts.extend(parsed.facts);
+        events.extend(parsed.events);
+        user_observations.extend(parsed.user_observations);
+    }
+
+    Ok(ValidatedChunk {
+        compartments: vec![ValidatedCompartment {
+            start_message: ordinal,
+            end_message: ordinal,
+            title,
+            content,
+            p1,
+            p2,
+            p3,
+            p4,
+            importance,
+            episode_type,
+        }],
+        facts,
+        dropped_fact_blocks: 0,
+        dropped_facts: 0,
+        events,
+        user_observations,
+        unprocessed_from: next_ordinal,
+        discarded_last: false,
+    })
+}
+
+fn append_slice_text(target: &mut String, value: String) {
+    target.push('\n');
+    target.push_str(&value);
+}
+
+fn append_optional_text(target: &mut Option<String>, value: Option<String>) {
+    let Some(value) = value else {
+        return;
+    };
+    if let Some(target) = target {
+        append_slice_text(target, value);
+    } else {
+        *target = Some(value);
+    }
 }
 
 /// Validate already-persisted ranges before appending new output
@@ -1510,6 +2095,24 @@ fn side_channel_anchor_regex() -> Regex {
             r#"^\s*[\[(]\s*(?:at_compartment|origin_compartment)\s*=\s*"?(\d+)"?\s*[\])]\s*(.+)$"#,
         )
         .expect("side channel anchor regex")
+    })
+    .clone()
+}
+
+fn checkpoint_channel_tag_regex() -> Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"<(/?)(facts|events|user_observations)\b[^>]*>")
+            .expect("checkpoint channel tag regex")
+    })
+    .clone()
+}
+
+fn checkpoint_fact_anchor_regex() -> Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"^(?:\[\s*(?:origin_compartment|at_compartment)\s*=\s*(?:1|"1")\s*\]|\(\s*(?:origin_compartment|at_compartment)\s*=\s*(?:1|"1")\s*\))\s+\S"#)
+            .expect("checkpoint fact anchor regex")
     })
     .clone()
 }

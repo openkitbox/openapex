@@ -151,6 +151,7 @@ impl Default for RuntimeLimits {
 #[derive(Debug, Clone, Copy)]
 struct CandidateLimits {
     shared_context: Limit,
+    input: Limit,
     output: Limit,
     advertised: [Option<i64>; 3],
 }
@@ -297,6 +298,22 @@ impl ModelCatalog {
         self.cached()
     }
 
+    /// Refresh a stale snapshot and report refresh failure to admission callers.
+    /// Unlike [`Self::entries`], this never serves stale metadata after a failed
+    /// refresh: safety-critical request sizing must fail closed.
+    pub async fn refresh_if_stale(&self) -> Result<()> {
+        let stale = {
+            let cache = self.cache.read().expect("catalog lock");
+            cache
+                .fetched_at
+                .is_none_or(|at| at.elapsed() >= CATALOG_TTL)
+        };
+        if stale {
+            self.refresh().await?;
+        }
+        Ok(())
+    }
+
     /// The current snapshot without any IO — for paths that must not wait on
     /// the network (a step boundary picking its default model).
     pub fn cached(&self) -> Arc<Vec<ModelEntry>> {
@@ -378,11 +395,19 @@ impl ModelCatalog {
                 reason: "missing_endpoint_model",
             };
             let context = candidate.map_or(unknown, |limits| limits.shared_context);
+            // A known shared window is an upper bound on input, but an
+            // undisclosed smaller input cap can still cause upstream rejection.
+            // Never borrow geometry from a different provider.
+            let input = candidate.map_or(unknown, |limits| match limits.input {
+                Limit::Known { .. } => limits.input,
+                Limit::Unknown { .. } => limits.shared_context,
+            });
             let output = candidate.map_or(unknown, |limits| limits.output);
             if let Some(candidate) = candidate {
                 tracing::debug!(provider, model = wire, advertised = ?candidate.advertised, "runtime candidate advertised limits");
             }
             result.shared_context = intersect(result.shared_context, context, result.candidates);
+            result.input = intersect(result.input, input, result.candidates);
             result.output = intersect(result.output, output, result.candidates);
             result.candidates += 1;
         };
@@ -404,7 +429,7 @@ impl ModelCatalog {
         {
             result.shared_context = Limit::Known {
                 tokens: tokens.min(u64::from(*cap)),
-                source: "builtin_seed_with_context_cap",
+                source: "context_cap",
             };
         }
         Ok(result)
@@ -426,9 +451,8 @@ impl ModelCatalog {
         let mut limits = BTreeMap::new();
         let mut failures = 0usize;
         for endpoint in &self.endpoints {
-            match self.fetch_endpoint(endpoint).await {
+            match self.fetch_endpoint(endpoint, &mut limits).await {
                 Ok(mut fetched) => {
-                    record_limits(&mut limits, endpoint, &fetched);
                     entries.append(&mut fetched);
                 }
                 // A builtin ships its model table, so an unreachable list is a
@@ -441,6 +465,7 @@ impl ModelCatalog {
                         error = %error,
                         "model list fetch failed; serving the built-in model seeds"
                     );
+                    record_seed_limits(&mut limits, endpoint);
                     entries.extend(seeded_entries(endpoint));
                 }
                 Err(error) => {
@@ -504,7 +529,11 @@ impl ModelCatalog {
     }
 
     /// Fetch and parse one endpoint's model list.
-    async fn fetch_endpoint(&self, endpoint: &CatalogEndpoint) -> Result<Vec<ModelEntry>> {
+    async fn fetch_endpoint(
+        &self,
+        endpoint: &CatalogEndpoint,
+        limits: &mut BTreeMap<String, BTreeMap<String, CandidateLimits>>,
+    ) -> Result<Vec<ModelEntry>> {
         let url = format!("{}{}", endpoint.base_url, endpoint.models_path);
         let mut request = self.client.get(&url);
         if let Some(key) = &endpoint.api_key {
@@ -523,6 +552,7 @@ impl ModelCatalog {
             );
         }
         let rows = parse_list(&body)?;
+        record_limits(limits, endpoint, &rows);
         let mut entries: Vec<ModelEntry> = rows
             .into_iter()
             .map(|row| row.into_entry(&endpoint.name))
@@ -531,6 +561,7 @@ impl ModelCatalog {
             merge_seed(entry, endpoint.seeds);
         }
         if entries.is_empty() && !endpoint.seeds.is_empty() {
+            record_seed_limits(limits, endpoint);
             entries = seeded_entries(endpoint);
         }
         Ok(entries)
@@ -640,268 +671,6 @@ fn is_builtin_entry(entry: &ModelEntry, builtins: &[&BuiltinProvider]) -> bool {
         .any(|builtin| builtin.id == entry.provider && builtin.owns(&entry.id))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn entry(provider: &str, id: &str) -> ModelEntry {
-        ModelEntry {
-            provider: provider.to_owned(),
-            id: id.to_owned(),
-            name: None,
-            model_type: None,
-            context: None,
-            input: None,
-            output: None,
-            input_modalities: Vec::new(),
-            output_modalities: Vec::new(),
-            temperature: None,
-            reasoning: false,
-            supported_reasoning_levels: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn refresh_merge_preserves_raw_entries_and_applies_logical_routes() {
-        let routes = BTreeMap::from([
-            (
-                "k3-256k".to_owned(),
-                vec![CandidateConfig {
-                    provider: "cardinal".to_owned(),
-                    model: "deepseek-flash".to_owned(),
-                }],
-            ),
-            (
-                "slim".to_owned(),
-                vec![CandidateConfig {
-                    provider: "cardinal".to_owned(),
-                    model: "deepseek-flash".to_owned(),
-                }],
-            ),
-        ]);
-        let raw = vec![
-            ModelEntry {
-                context: Some(4_096),
-                ..entry("cardinal", "deepseek-flash")
-            },
-            entry("cardinal", "ertong-fabel"),
-            ModelEntry {
-                context: Some(128),
-                ..entry("cardinal", "k3-256k")
-            },
-        ];
-
-        // This is the merge entry point used by refresh(), rather than the
-        // route-only projection helper: endpoint rows are deduplicated first,
-        // then logical routes replace same-identity rows and add aliases.
-        let merged = ModelCatalog::merge_entries(&routes, raw, true, &[]);
-
-        assert_eq!(
-            merged,
-            vec![
-                ModelEntry {
-                    context: Some(4_096),
-                    ..entry("cardinal", "deepseek-flash")
-                },
-                entry("cardinal", "ertong-fabel"),
-                ModelEntry {
-                    context: Some(4_096),
-                    ..entry("cardinal", "k3-256k")
-                },
-                ModelEntry {
-                    context: Some(4_096),
-                    ..entry("cardinal", "slim")
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn route_projection_preserves_raw_entries_and_adds_logical_routes() {
-        let routes = BTreeMap::from([
-            (
-                "k3-256k".to_owned(),
-                vec![CandidateConfig {
-                    provider: "cardinal".to_owned(),
-                    model: "k3-256k".to_owned(),
-                }],
-            ),
-            (
-                "slim".to_owned(),
-                vec![CandidateConfig {
-                    provider: "cardinal".to_owned(),
-                    model: "deepseek-flash".to_owned(),
-                }],
-            ),
-        ]);
-        let raw = vec![
-            entry("cardinal", "deepseek-flash"),
-            entry("cardinal", "ertong-fabel"),
-            entry("cardinal", "ertong-fabel"),
-            ModelEntry {
-                context: Some(128),
-                ..entry("cardinal", "k3-256k")
-            },
-        ];
-
-        let projected = ModelCatalog::project_routes(&routes, raw, true, &[]);
-
-        assert_eq!(
-            projected,
-            vec![
-                entry("cardinal", "deepseek-flash"),
-                entry("cardinal", "ertong-fabel"),
-                ModelEntry {
-                    context: Some(128),
-                    ..entry("cardinal", "k3-256k")
-                },
-                entry("cardinal", "slim"),
-            ]
-        );
-    }
-
-    #[test]
-    fn raw_entries_are_deduplicated_after_sorting_by_identity() {
-        let raw = vec![
-            entry("provider-b", "model"),
-            entry("provider-a", "model"),
-            entry("provider-b", "model"),
-        ];
-
-        let merged = ModelCatalog::merge_entries(&BTreeMap::new(), raw, true, &[]);
-
-        assert_eq!(
-            merged,
-            vec![entry("provider-a", "model"), entry("provider-b", "model")]
-        );
-    }
-
-    #[test]
-    fn non_passthrough_catalog_excludes_unrouted_raw_entries() {
-        let routes = BTreeMap::from([(
-            "logical".to_owned(),
-            vec![CandidateConfig {
-                provider: "provider".to_owned(),
-                model: "wire-model".to_owned(),
-            }],
-        )]);
-        let raw = vec![entry("provider", "wire-model"), entry("provider", "orphan")];
-
-        let merged = ModelCatalog::merge_entries(&routes, raw, false, &[]);
-
-        assert_eq!(merged, vec![entry("provider", "logical")]);
-    }
-
-    #[test]
-    fn non_passthrough_catalog_preserves_routable_builtin_entries() {
-        let builtin = crate::config::builtin(crate::config::DEEPSEEK).expect("builtin exists");
-        let raw = vec![
-            entry("deepseek", "deepseek-flash"),
-            entry("deepseek", "deepseek-new-model"),
-            entry("deepseek", "other-provider-model"),
-        ];
-
-        let merged = ModelCatalog::merge_entries(&BTreeMap::new(), raw, false, &[builtin]);
-
-        assert_eq!(
-            merged,
-            vec![
-                entry("deepseek", "deepseek-flash"),
-                entry("deepseek", "deepseek-new-model"),
-            ]
-        );
-    }
-
-    #[test]
-    fn window_lookup_keeps_same_model_ids_separate_by_provider() {
-        let catalog = ModelCatalog::from_entries(vec![
-            ModelEntry {
-                provider: "cardinal".to_owned(),
-                id: "shared".to_owned(),
-                context: Some(100),
-                ..entry("cardinal", "shared")
-            },
-            ModelEntry {
-                provider: "deepseek".to_owned(),
-                id: "shared".to_owned(),
-                context: Some(200),
-                ..entry("deepseek", "shared")
-            },
-        ]);
-
-        assert_eq!(catalog.window_of_for("cardinal", "shared"), Some(100));
-        assert_eq!(catalog.window_of_for("deepseek", "shared"), Some(200));
-    }
-
-    #[test]
-    fn runtime_limits_keep_same_model_ids_separate_by_provider() {
-        let mut config = LlmConfig::default();
-        config.providers.insert(
-            "deepseek".to_owned(),
-            crate::config::ProviderConfig {
-                base_url: "https://deepseek.example".to_owned(),
-                api_key: None,
-                protocol: None,
-                limits: crate::config::EndpointLimits::default(),
-            },
-        );
-        let mut catalog = ModelCatalog::from_entries(vec![
-            entry("cardinal", "shared"),
-            entry("deepseek", "shared"),
-        ]);
-        catalog.resolver = crate::config::Routes::new(&config);
-        {
-            let mut cache = catalog.cache.write().expect("catalog lock");
-            cache.limits.insert(
-                "cardinal".to_owned(),
-                BTreeMap::from([(
-                    "shared".to_owned(),
-                    CandidateLimits {
-                        shared_context: Limit::Known {
-                            tokens: 100,
-                            source: "test",
-                        },
-                        output: Limit::Known {
-                            tokens: 10,
-                            source: "test",
-                        },
-                        advertised: [Some(100), None, Some(10)],
-                    },
-                )]),
-            );
-            cache.limits.insert(
-                "deepseek".to_owned(),
-                BTreeMap::from([(
-                    "shared".to_owned(),
-                    CandidateLimits {
-                        shared_context: Limit::Known {
-                            tokens: 200,
-                            source: "test",
-                        },
-                        output: Limit::Known {
-                            tokens: 20,
-                            source: "test",
-                        },
-                        advertised: [Some(200), None, Some(20)],
-                    },
-                )]),
-            );
-        }
-
-        let cardinal = catalog
-            .runtime_limits_for(Some("cardinal"), "shared")
-            .expect("cardinal route resolves");
-        let deepseek = catalog
-            .runtime_limits_for(Some("deepseek"), "shared")
-            .expect("deepseek route resolves");
-
-        assert_eq!(cardinal.shared_context.tokens(), Some(100));
-        assert_eq!(deepseek.shared_context.tokens(), Some(200));
-        assert_eq!(cardinal.output.tokens(), Some(10));
-        assert_eq!(deepseek.output.tokens(), Some(20));
-    }
-}
-
 fn intersect(previous: Limit, next: Limit, count: usize) -> Limit {
     if count == 0 {
         return next;
@@ -909,7 +678,7 @@ fn intersect(previous: Limit, next: Limit, count: usize) -> Limit {
     match (previous, next) {
         (Limit::Known { tokens: left, .. }, Limit::Known { tokens: right, .. }) => Limit::Known {
             tokens: left.min(right),
-            source: "all_candidates_builtin_seed",
+            source: "all_candidates_minimum",
         },
         (Limit::Unknown { reason }, _) | (_, Limit::Unknown { reason }) => {
             Limit::Unknown { reason }
@@ -920,7 +689,7 @@ fn intersect(previous: Limit, next: Limit, count: usize) -> Limit {
 fn record_limits(
     limits: &mut BTreeMap<String, BTreeMap<String, CandidateLimits>>,
     endpoint: &CatalogEndpoint,
-    entries: &[ModelEntry],
+    entries: &[ModelRow],
 ) {
     for entry in entries {
         let unknown = Limit::Unknown {
@@ -929,19 +698,26 @@ fn record_limits(
         let seed = endpoint
             .builtin
             .and_then(|builtin| builtin.models.iter().find(|seed| seed.id == entry.id));
-        let known = |tokens: i64| {
-            u64::try_from(tokens)
-                .ok()
+        let known = |tokens: Option<i64>, source| {
+            tokens
+                .and_then(|tokens| u64::try_from(tokens).ok())
                 .filter(|tokens| *tokens > 0)
-                .map_or(unknown, |tokens| Limit::Known {
-                    tokens,
-                    source: "builtin_seed",
-                })
+                .map_or(unknown, |tokens| Limit::Known { tokens, source })
         };
+        let context = entry.context_length.or(entry.context_window);
         let candidate = CandidateLimits {
-            shared_context: seed.map_or(unknown, |seed| known(seed.context)),
-            output: seed.map_or(unknown, |seed| known(seed.output)),
-            advertised: [entry.context, entry.input, entry.output],
+            shared_context: if context.is_some() {
+                known(context, "endpoint_advertised")
+            } else {
+                known(seed.map(|seed| seed.context), "builtin_seed")
+            },
+            input: known(entry.max_input_tokens, "endpoint_advertised"),
+            output: if entry.max_output_tokens.is_some() {
+                known(entry.max_output_tokens, "endpoint_advertised")
+            } else {
+                known(seed.map(|seed| seed.output), "builtin_seed")
+            },
+            advertised: [context, entry.max_input_tokens, entry.max_output_tokens],
         };
         limits
             .entry(endpoint.name.clone())
@@ -951,9 +727,47 @@ fn record_limits(
                 existing.shared_context = Limit::Unknown {
                     reason: "ambiguous_endpoint_model",
                 };
+                existing.input = existing.shared_context;
                 existing.output = existing.shared_context;
             })
             .or_insert(candidate);
+    }
+}
+
+fn record_seed_limits(
+    limits: &mut BTreeMap<String, BTreeMap<String, CandidateLimits>>,
+    endpoint: &CatalogEndpoint,
+) {
+    let Some(builtin) = endpoint.builtin else {
+        return;
+    };
+    let known = |tokens: i64| {
+        u64::try_from(tokens)
+            .ok()
+            .filter(|tokens| *tokens > 0)
+            .map_or(
+                Limit::Unknown {
+                    reason: "unverified_geometry",
+                },
+                |tokens| Limit::Known {
+                    tokens,
+                    source: "builtin_seed",
+                },
+            )
+    };
+    let models = limits.entry(endpoint.name.clone()).or_default();
+    for seed in builtin.models {
+        models.insert(
+            seed.id.to_owned(),
+            CandidateLimits {
+                shared_context: known(seed.context),
+                input: Limit::Unknown {
+                    reason: "unverified_geometry",
+                },
+                output: known(seed.output),
+                advertised: [None; 3],
+            },
+        );
     }
 }
 

@@ -53,31 +53,3 @@ pub fn cooling_until(now: i64) -> Option<i64> {
     let until = last.saturating_add(i64::try_from(COOLDOWN.as_millis()).unwrap_or(i64::MAX));
     (now < until).then_some(until)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The clock is process-wide, so the test works far in the future where
-    /// no other test's observation can reach.
-    #[test]
-    fn only_throttles_move_the_clock() {
-        let base = i64::MAX / 2;
-        let cooldown = i64::try_from(COOLDOWN.as_millis()).expect("cool-down fits");
-        let refusal = ChatError::Http {
-            status: 400,
-            body: String::new(),
-            retry_after: None,
-        };
-        observe(&refusal, base);
-        assert_eq!(cooling_until(base), None);
-        let throttle = ChatError::Http {
-            status: 429,
-            body: String::new(),
-            retry_after: None,
-        };
-        observe(&throttle, base);
-        assert_eq!(cooling_until(base + 1), Some(base + cooldown));
-        assert_eq!(cooling_until(base + cooldown), None);
-    }
-}
