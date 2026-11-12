@@ -20,6 +20,9 @@ pub struct SessionModel {
 
 #[derive(Debug, Clone)]
 pub enum AppCommand {
+    ReloadConfig {
+        request_id: u64,
+    },
     ChangeDirectory {
         session: Option<String>,
         directory: String,
@@ -103,10 +106,9 @@ pub enum AppCommand {
         stamp: McpStamp,
     },
     /// Fetch the model catalogue for the `/models` dialog.
-    ModelList,
-    /// Fetch the catalogue only for its context windows (the footer's
-    /// percentage); answered with `AppEvent::ContextLimits`.
-    LoadContextLimits,
+    ModelList {
+        request_id: u64,
+    },
     /// Fetch the selected model's supported reasoning levels.
     VariantList {
         request: VariantRequest,

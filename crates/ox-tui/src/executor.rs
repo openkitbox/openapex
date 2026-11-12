@@ -40,6 +40,16 @@ pub fn session_failed(title: &'static str, err: ox_client::Error) -> AppEvent {
 /// Execute one command and report its outcome on `tx`.
 pub async fn run(client: Client, tx: Events, command: AppCommand) {
     match command {
+        AppCommand::ReloadConfig { request_id } => {
+            let result = client.reload_config().await.map_err(|err| match err {
+                ox_client::Error::Http(_) => format!("{err}; server outcome is unknown"),
+                ox_client::Error::Status(status) if status.is_success() => {
+                    format!("{err}; server outcome is unknown")
+                }
+                _ => err.to_string(),
+            });
+            let _ = tx.send(AppEvent::ConfigReloaded { request_id, result });
+        }
         AppCommand::FindDirectories { query, generation } => match client.directories(&query).await
         {
             Ok(paths) => {
@@ -137,8 +147,7 @@ pub async fn run(client: Client, tx: Events, command: AppCommand) {
             action,
             stamp,
         } => mcp_toggle(&client, &tx, server, action, stamp).await,
-        AppCommand::ModelList => model_list(&client, &tx).await,
-        AppCommand::LoadContextLimits => context_limits(&client, &tx).await,
+        AppCommand::ModelList { request_id } => model_list(&client, &tx, request_id).await,
         AppCommand::VariantList { request } => variant_list(&client, &tx, request).await,
         AppCommand::AgentList(intent) => agent_list(&client, &tx, intent).await,
         AppCommand::Switch { request } => switch_to(&client, &tx, request).await,
@@ -599,40 +608,12 @@ async fn mcp_toggle(
     });
 }
 
-async fn context_limits(client: &Client, tx: &Events) {
-    // 尽力而为：取不到就只显示 token 数，和上游缺 limit 时一致。
-    match client.models().await {
-        Ok(models) => {
-            let limits = models
-                .into_iter()
-                .filter(|model| model.limit.context > 0)
-                .map(|model| {
-                    (
-                        format!("{}/{}", model.provider_id, model.model_id),
-                        model.limit.context,
-                    )
-                })
-                .collect();
-            let _ = tx.send(AppEvent::ContextLimits(limits));
-        }
-        Err(err) => tracing::warn!(%err, "context limit lookup failed"),
-    }
-}
-
-async fn model_list(client: &Client, tx: &Events) {
-    match tokio::try_join!(client.models(), client.providers()) {
-        Ok((models, providers)) => {
-            let _ = tx.send(AppEvent::Models { models, providers });
-        }
-        Err(err) => {
-            tracing::warn!(%err, "model list failed");
-            let _ = tx.send(AppEvent::SwitchFailed {
-                request: None,
-                title: "Failed to load models",
-                err: err.to_string(),
-            });
-        }
-    }
+async fn model_list(client: &Client, tx: &Events, request_id: u64) {
+    let result = tokio::try_join!(client.models(), client.providers()).map_err(|err| {
+        tracing::warn!(%err, "model list failed");
+        err.to_string()
+    });
+    let _ = tx.send(AppEvent::Models { request_id, result });
 }
 
 async fn variant_list(client: &Client, tx: &Events, request: VariantRequest) {

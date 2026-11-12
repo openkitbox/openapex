@@ -184,7 +184,7 @@ pub fn status(servers: &[McpRef]) -> Dialog {
             let (tone, detail) = match &server.status {
                 McpStatus::Connected => (Tone::Accent, "Connected".to_owned()),
                 McpStatus::Pending => (Tone::Dim, "Pending".to_owned()),
-                McpStatus::Disabled => (Tone::Dim, "Disabled in configuration".to_owned()),
+                McpStatus::Disabled => (Tone::Dim, "Disabled".to_owned()),
                 McpStatus::Failed { error } if error.is_empty() => {
                     (Tone::Warn, "Failed".to_owned())
                 }
@@ -202,6 +202,22 @@ pub fn status(servers: &[McpRef]) -> Dialog {
         summary,
         rows,
     })
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn disabled_status_does_not_assume_configuration() {
+        let Dialog::Info(info) = status(&[McpRef {
+            name: "example".to_owned(),
+            status: McpStatus::Disabled,
+        }]) else {
+            panic!("status must produce an info dialog");
+        };
+        assert_eq!(info.rows[0].detail, "Disabled");
+    }
 }
 
 /// Draw `dialog` over `area`, clearing what is underneath.

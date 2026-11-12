@@ -204,6 +204,16 @@ pub struct App {
     directory: String,
     next_reload_id: u64,
     pending_reload: Option<PendingReload>,
+    next_config_reload_id: u64,
+    pending_config_reload: Option<u64>,
+    next_catalog_request_id: u64,
+    pending_catalog_request: Option<u64>,
+    catalog_open_requested: bool,
+    catalog_refresh_pending: bool,
+    /// A model/provider update invalidated the catalogue. Until a successful
+    /// authoritative response arrives, old picker rows and variant requests
+    /// must fail closed rather than reaching the server.
+    catalog_invalidated: bool,
     /// Home 提交后等待会话创建：失败时把这段文本放回 composer。
     pending_home_prompt: Option<PendingHome>,
     /// Title of the open session, for the `/rename` prefill.
@@ -380,6 +390,13 @@ impl App {
             directory,
             next_reload_id: 0,
             pending_reload: None,
+            next_config_reload_id: 0,
+            pending_config_reload: None,
+            next_catalog_request_id: 0,
+            pending_catalog_request: None,
+            catalog_open_requested: false,
+            catalog_refresh_pending: false,
+            catalog_invalidated: false,
             pending_home_prompt: None,
             session_title: None,
             parent: None,
@@ -531,13 +548,96 @@ impl App {
                 action,
                 error,
             } => self.on_mcp_toggled(&server, action, error),
-            AppEvent::Models { models, providers } => self.on_models(models, providers),
+            AppEvent::Models { request_id, result } => {
+                if self.pending_catalog_request != Some(request_id) {
+                    return;
+                }
+                self.pending_catalog_request = None;
+                if std::mem::take(&mut self.catalog_refresh_pending) {
+                    self.request_catalog(false);
+                    return;
+                }
+                let open = std::mem::take(&mut self.catalog_open_requested);
+                let catalog_was_invalidated = self.catalog_invalidated;
+                let (models, providers) = match result {
+                    Ok(catalog) => catalog,
+                    Err(error) => {
+                        if open || self.catalog_invalidated {
+                            self.show_toast(Toast::error(
+                                "Failed to load models",
+                                error,
+                                Instant::now(),
+                            ));
+                        }
+                        return;
+                    }
+                };
+                self.catalog_invalidated = false;
+                self.context_limits = models
+                    .iter()
+                    .filter(|model| model.limit.context > 0)
+                    .map(|model| {
+                        (
+                            format!("{}/{}", model.provider_id, model.model_id),
+                            model.limit.context,
+                        )
+                    })
+                    .collect();
+                self.limits_requested = true;
+                self.refresh_context();
+                if catalog_was_invalidated {
+                    self.invalidate_variant_requests();
+                }
+                if catalog_was_invalidated
+                    && matches!(
+                        self.dialog_purpose,
+                        Some(crate::ui::models::DialogPurpose::Variant { .. })
+                    )
+                {
+                    // The old picker may contain a model or variant that this
+                    // authoritative catalogue removed. Close it rather than
+                    // allowing a stale asynchronous selection to be submitted.
+                    self.dialog = None;
+                    self.dialog_purpose = None;
+                }
+                if matches!(
+                    self.dialog_purpose,
+                    Some(crate::ui::models::DialogPurpose::Model(..))
+                ) {
+                    if let Some(Dialog::Select(select)) = &mut self.dialog {
+                        select.replace_items(crate::ui::models::model_items(&models, &providers));
+                        self.dialog_purpose =
+                            Some(crate::ui::models::DialogPurpose::Model(providers, models));
+                    }
+                } else if open && self.dialog.is_none() {
+                    self.on_models(models, providers);
+                }
+                self.dirty = true;
+            }
             AppEvent::Variants { request, variants } => self.on_variants(request, variants),
             AppEvent::VariantFailed { request, err } => self.on_variant_failed(request, err),
-            AppEvent::ContextLimits(limits) => {
-                self.context_limits = limits;
-                self.refresh_context();
-                self.dirty = true;
+            AppEvent::ConfigReloaded { request_id, result } => {
+                if self.pending_config_reload != Some(request_id) {
+                    return;
+                }
+                self.pending_config_reload = None;
+                match result {
+                    Ok(()) => {
+                        self.show_toast(Toast::new(
+                            toast::Variant::Success,
+                            None,
+                            "Configuration reloaded",
+                            Instant::now(),
+                        ));
+                        self.request_mcp_list(McpIntent::Refresh);
+                        self.request_catalog(false);
+                    }
+                    Err(error) => self.show_toast(Toast::error(
+                        "Failed to reload configuration",
+                        error,
+                        Instant::now(),
+                    )),
+                }
             }
             AppEvent::Agents { agents, intent } => self.on_agents(agents, intent),
             AppEvent::Switched(request) => self.on_switched(request),
@@ -675,6 +775,14 @@ impl App {
                 format!("Archived {archived} project memories"),
                 Instant::now(),
             )),
+        }
+        if self.dialog.is_some()
+            && !matches!(
+                self.dialog_purpose,
+                Some(crate::ui::models::DialogPurpose::Model(..))
+            )
+        {
+            self.catalog_open_requested = false;
         }
     }
 
@@ -932,6 +1040,10 @@ impl App {
     /// cursor (a stale one would make the next stream replay from the wrong
     /// place). The new session's pending forms are fetched when there is one.
     fn session_changed(&mut self) {
+        self.pending_catalog_request = None;
+        self.catalog_open_requested = false;
+        self.catalog_refresh_pending = false;
+        self.limits_requested = false;
         self.invalidate_switch_requests();
         self.invalidate_variant_requests();
         self.chrome_request_id = self.chrome_request_id.wrapping_add(1);
@@ -961,6 +1073,7 @@ impl App {
             DialogOutcome::Idle => {}
             DialogOutcome::Changed => self.dirty = true,
             DialogOutcome::Cancelled => {
+                self.catalog_open_requested = false;
                 self.pending_session_list = None;
                 let closed = self.dialog.take();
                 self.dialog_purpose = None;
@@ -980,6 +1093,18 @@ impl App {
                 self.sync_form_dialog();
             }
             DialogOutcome::Selected(value) => {
+                if self.catalog_invalidated
+                    && matches!(
+                        self.dialog_purpose,
+                        Some(crate::ui::models::DialogPurpose::Model(..))
+                            | Some(crate::ui::models::DialogPurpose::Variant { .. })
+                    )
+                {
+                    if self.pending_catalog_request.is_none() {
+                        self.request_catalog(false);
+                    }
+                    return;
+                }
                 self.pending_session_list = None;
                 self.dialog = None;
                 self.dirty = true;
@@ -1438,6 +1563,9 @@ impl App {
 
     /// `handle_key` with the clock injected (the leader's 2s window).
     fn handle_key_at(&mut self, key: crossterm::event::KeyEvent, now: Instant) {
+        if key.kind != KeyEventKind::Release && key.code == KeyCode::Esc && self.dialog.is_none() {
+            self.catalog_open_requested = false;
+        }
         // A selection takes the key first (upstream `handleSelectionKey`):
         // esc clears it and cancels a pending picker; every other key carries on.
         if key.kind != crossterm::event::KeyEventKind::Release && self.transcript.clear_selection()
@@ -1647,6 +1775,7 @@ impl App {
         // Compose. `ctrl+f` opens the transcript search; upstream has no such
         // feature, and `/` now belongs to the slash-command menu.
         if keymap::is_search(&key) && self.route == Route::Session {
+            self.catalog_open_requested = false;
             self.transcript.clear_search();
             self.mode = Mode::SearchInput(Box::default());
             self.dirty = true;
@@ -1658,6 +1787,7 @@ impl App {
     fn run_global(&mut self, action: Action) {
         match action {
             Action::OpenPalette => {
+                self.catalog_open_requested = false;
                 self.pending_session_list = None;
                 let context = palette::Context {
                     in_session: self.route == Route::Session,
@@ -1837,6 +1967,9 @@ impl App {
 
     fn run_command(&mut self, action: CommandAction) {
         self.invalidate_variant_requests();
+        if action != CommandAction::Models {
+            self.catalog_open_requested = false;
+        }
         if action != CommandAction::Sessions {
             self.pending_session_list = None;
         }
@@ -1851,8 +1984,9 @@ impl App {
             }
             CommandAction::Models => {
                 self.invalidate_variant_requests();
-                let _ = self.commands.send(AppCommand::ModelList);
+                self.request_catalog(true);
             }
+            CommandAction::Refresh => self.request_config_reload(),
             CommandAction::Variants => self.request_variants(false),
             CommandAction::Agents => {
                 let _ = self
@@ -2521,6 +2655,11 @@ impl App {
                 self.request_running_shells();
                 // mcp.status.changed frames missed while down: re-list.
                 self.request_mcp_list(McpIntent::Refresh);
+                self.invalidate_variant_requests();
+                self.pending_catalog_request = None;
+                self.catalog_refresh_pending = false;
+                self.limits_requested = false;
+                self.request_catalog(false);
             }
             StreamMsg::Event(envelope) => {
                 // `shell.*` frames carry no session id: they would fail the
@@ -2536,6 +2675,11 @@ impl App {
                 // elsewhere (a config reload, another client).
                 if envelope.kind == "mcp.status.changed" {
                     self.request_mcp_list(McpIntent::Refresh);
+                    return;
+                }
+                if matches!(envelope.kind.as_str(), "model.updated" | "provider.updated") {
+                    self.invalidate_variant_requests();
+                    self.request_catalog(false);
                     return;
                 }
                 let typed = envelope.parse_typed();
@@ -2670,9 +2814,72 @@ impl App {
         });
         if usage.is_some() && !self.limits_requested {
             self.limits_requested = true;
-            let _ = self.commands.send(AppCommand::LoadContextLimits);
+            self.request_catalog_for_context();
         }
         self.prompt.set_ctx(usage);
+    }
+
+    fn request_catalog(&mut self, open: bool) {
+        self.request_catalog_inner(open, true);
+    }
+
+    fn request_catalog_for_context(&mut self) {
+        self.request_catalog_inner(false, false);
+    }
+
+    fn request_catalog_inner(&mut self, open: bool, invalidate: bool) {
+        if !open && invalidate {
+            self.catalog_invalidated = true;
+            self.invalidate_variant_requests();
+            if matches!(
+                self.dialog_purpose,
+                Some(crate::ui::models::DialogPurpose::Variant { .. })
+            ) {
+                self.dialog = None;
+                self.dialog_purpose = None;
+                self.dirty = true;
+            }
+        }
+        self.catalog_open_requested |= open;
+        self.limits_requested = true;
+        if self.pending_catalog_request.is_some() {
+            if !open && invalidate {
+                self.catalog_refresh_pending = true;
+            }
+            return;
+        }
+        self.next_catalog_request_id = self.next_catalog_request_id.wrapping_add(1);
+        let request_id = self.next_catalog_request_id;
+        self.pending_catalog_request = Some(request_id);
+        if self
+            .commands
+            .send(AppCommand::ModelList { request_id })
+            .is_err()
+        {
+            self.pending_catalog_request = None;
+        }
+    }
+
+    fn request_config_reload(&mut self) {
+        if self.pending_config_reload.is_some() {
+            self.show_toast(Toast::new(
+                toast::Variant::Info,
+                None,
+                "Reloading configuration…",
+                Instant::now(),
+            ));
+            return;
+        }
+        self.next_config_reload_id = self.next_config_reload_id.wrapping_add(1);
+        let request_id = self.next_config_reload_id;
+        self.pending_config_reload = Some(request_id);
+        self.show_toast(Toast::new(
+            toast::Variant::Info,
+            None,
+            "Reloading configuration…",
+            Instant::now(),
+        ));
+        let _ = self.commands.send(AppCommand::ReloadConfig { request_id });
     }
 
     /// Apply the stream events reduced since the last frame.
@@ -3111,6 +3318,600 @@ mod tests {
     use super::*;
     use crate::app::command::{SessionChromeRequest, Switch, SwitchRequest};
     use crate::bootstrap::Selection;
+
+    fn catalog_model(id: &str) -> ox_client::rest::ModelInfo {
+        serde_json::from_value(serde_json::json!({"modelID":id,"providerID":"p","name":id}))
+            .expect("model")
+    }
+
+    #[test]
+    fn initial_context_catalog_does_not_interfere_with_variants() {
+        for result_succeeds in [false, true] {
+            for variant_first in [false, true] {
+                for response_first in [false, true] {
+                    let (commands, mut rx) = mpsc::unbounded_channel();
+                    let (seq, _) = watch::channel(None);
+                    let chrome = Chrome {
+                        provider_id: Some("p".into()),
+                        model: Some("current".into()),
+                        ..Chrome::default()
+                    };
+                    let mut app = App::new(Route::Home, None, chrome, "/p".into(), commands, seq);
+                    app.store
+                        .items
+                        .push(ox_client::store::Item::Assistant(Box::new(
+                            ox_client::store::AssistantItem {
+                                context_tokens: 100,
+                                ..Default::default()
+                            },
+                        )));
+                    if variant_first {
+                        app.request_variants(false);
+                    }
+                    let request = if variant_first {
+                        let AppCommand::VariantList { request } =
+                            rx.try_recv().expect("variant request")
+                        else {
+                            panic!("variant request")
+                        };
+                        Some(request)
+                    } else {
+                        None
+                    };
+                    app.refresh_context();
+                    let AppCommand::ModelList { request_id } =
+                        rx.try_recv().expect("context catalog")
+                    else {
+                        panic!("context catalog")
+                    };
+                    if !variant_first {
+                        app.request_variants(false);
+                    }
+                    let request = request.unwrap_or_else(|| {
+                        let AppCommand::VariantList { request } =
+                            rx.try_recv().expect("variant request during context fetch")
+                        else {
+                            panic!("variant request")
+                        };
+                        request
+                    });
+                    if response_first {
+                        app.on_variants(
+                            request.clone(),
+                            vec![ox_client::rest::ModelVariant { id: "high".into() }],
+                        );
+                        assert!(
+                            matches!(
+                                app.dialog_purpose,
+                                Some(crate::ui::models::DialogPurpose::Variant { .. })
+                            ),
+                            "variant picker should open during initial fetch"
+                        );
+                    }
+                    app.handle(AppEvent::Models {
+                        request_id,
+                        result: if result_succeeds {
+                            Ok((vec![catalog_model("current")], vec![]))
+                        } else {
+                            Err("offline".into())
+                        },
+                    });
+                    if !response_first {
+                        app.on_variants(
+                            request,
+                            vec![ox_client::rest::ModelVariant { id: "high".into() }],
+                        );
+                    }
+                    assert!(
+                        matches!(
+                            app.dialog_purpose,
+                            Some(crate::ui::models::DialogPurpose::Variant { .. })
+                        ),
+                        "initial catalog completion must not close variants"
+                    );
+                    app.apply_dialog_outcome(None, DialogOutcome::Cancelled);
+                    app.request_variants(false);
+                    assert!(
+                        matches!(rx.try_recv(), Ok(AppCommand::VariantList { .. })),
+                        "initial fetch failure must not block variants"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn failed_catalog_does_not_retry_on_each_context_refresh_but_manual_retry_works() {
+        let (commands, mut rx) = mpsc::unbounded_channel();
+        let (seq, _) = watch::channel(None);
+        let mut app = App::new(
+            Route::Home,
+            None,
+            Chrome::default(),
+            "/p".into(),
+            commands,
+            seq,
+        );
+        app.store
+            .items
+            .push(ox_client::store::Item::Assistant(Box::new(
+                ox_client::store::AssistantItem {
+                    context_tokens: 100,
+                    ..Default::default()
+                },
+            )));
+        app.refresh_context();
+        let AppCommand::ModelList { request_id } = rx.try_recv().expect("initial catalog") else {
+            panic!("catalog command")
+        };
+        app.handle(AppEvent::Models {
+            request_id,
+            result: Err("offline".into()),
+        });
+        assert!(app.limits_requested, "failed catalog remains attempted");
+        app.refresh_context();
+        assert!(
+            rx.try_recv().is_err(),
+            "stream refresh must not retry a failed catalog"
+        );
+        app.run_command(CommandAction::Models);
+        assert!(
+            matches!(rx.try_recv(), Ok(AppCommand::ModelList { .. })),
+            "explicit model picker retries"
+        );
+    }
+
+    #[test]
+    fn failed_explicit_catalog_is_not_retried_by_later_context_usage() {
+        let (commands, mut rx) = mpsc::unbounded_channel();
+        let (seq, _) = watch::channel(None);
+        let mut app = App::new(
+            Route::Home,
+            None,
+            Chrome::default(),
+            "/p".into(),
+            commands,
+            seq,
+        );
+        app.run_command(CommandAction::Models);
+        let AppCommand::ModelList { request_id } = rx.try_recv().expect("catalog") else {
+            panic!("catalog command")
+        };
+        app.handle(AppEvent::Models {
+            request_id,
+            result: Err("offline".into()),
+        });
+        app.store
+            .items
+            .push(ox_client::store::Item::Assistant(Box::new(
+                ox_client::store::AssistantItem {
+                    context_tokens: 100,
+                    ..Default::default()
+                },
+            )));
+        app.refresh_context();
+        assert!(
+            rx.try_recv().is_err(),
+            "failed explicit request is already an attempt"
+        );
+    }
+
+    #[test]
+    fn late_model_response_does_not_replace_newer_dialog() {
+        let (commands, mut rx) = mpsc::unbounded_channel();
+        let (seq, _) = watch::channel(None);
+        let mut app = App::new(
+            Route::Home,
+            None,
+            Chrome::default(),
+            "/p".into(),
+            commands,
+            seq,
+        );
+        app.run_command(CommandAction::Models);
+        let AppCommand::ModelList { request_id } = rx.try_recv().expect("catalog") else {
+            panic!("catalog command")
+        };
+        app.handle(AppEvent::Agents {
+            agents: vec![],
+            intent: command::AgentIntent::Dialog,
+        });
+        assert!(matches!(
+            app.dialog_purpose,
+            Some(crate::ui::models::DialogPurpose::Agent(..))
+        ));
+        app.handle(AppEvent::Models {
+            request_id,
+            result: Ok((vec![catalog_model("new")], vec![])),
+        });
+        assert!(matches!(
+            app.dialog_purpose,
+            Some(crate::ui::models::DialogPurpose::Agent(..))
+        ));
+        app.apply_dialog_outcome(None, DialogOutcome::Cancelled);
+        assert!(app.dialog.is_none());
+    }
+
+    #[test]
+    fn dismissed_newer_dialog_does_not_restore_old_model_intent() {
+        let (commands, mut rx) = mpsc::unbounded_channel();
+        let (seq, _) = watch::channel(None);
+        let mut app = App::new(
+            Route::Home,
+            None,
+            Chrome::default(),
+            "/p".into(),
+            commands,
+            seq,
+        );
+        app.run_command(CommandAction::Models);
+        let AppCommand::ModelList { request_id } = rx.try_recv().expect("catalog") else {
+            panic!("catalog command")
+        };
+        app.handle(AppEvent::Agents {
+            agents: vec![],
+            intent: command::AgentIntent::Dialog,
+        });
+        app.apply_dialog_outcome(None, DialogOutcome::Cancelled);
+        app.handle(AppEvent::Models {
+            request_id,
+            result: Ok((vec![catalog_model("new")], vec![])),
+        });
+        assert!(app.dialog.is_none(), "older intent must stay cancelled");
+    }
+
+    #[test]
+    fn transcript_search_supersedes_pending_model_picker() {
+        for finish_search in [None, Some(KeyCode::Enter), Some(KeyCode::Esc)] {
+            let (commands, mut rx) = mpsc::unbounded_channel();
+            let (seq, _) = watch::channel(None);
+            let mut app = App::new(
+                Route::Session,
+                Some("session".into()),
+                Chrome::default(),
+                "/p".into(),
+                commands,
+                seq,
+            );
+            app.run_command(CommandAction::Models);
+            let AppCommand::ModelList { request_id } = rx.try_recv().expect("catalog") else {
+                panic!("catalog command")
+            };
+            app.handle(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char('f'),
+                crossterm::event::KeyModifiers::CONTROL,
+            )));
+            app.handle(AppEvent::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                crossterm::event::KeyModifiers::NONE,
+            )));
+            if let Some(key) = finish_search {
+                app.handle(AppEvent::Key(KeyEvent::new(
+                    key,
+                    crossterm::event::KeyModifiers::NONE,
+                )));
+            }
+            app.handle(AppEvent::Models {
+                request_id,
+                result: Ok((vec![catalog_model("new")], vec![])),
+            });
+            assert!(
+                app.dialog.is_none(),
+                "search intent must not reopen models: {finish_search:?}"
+            );
+            if finish_search.is_none() {
+                let Mode::SearchInput(search) = &app.mode else {
+                    panic!("search must remain active")
+                };
+                assert_eq!(search.text(), "x");
+            }
+        }
+    }
+
+    #[test]
+    fn refresh_preserves_filtered_picker_and_falls_back_when_selection_disappears() {
+        let (commands, mut rx) = mpsc::unbounded_channel();
+        let (seq, _) = watch::channel(None);
+        let mut app = App::new(
+            Route::Home,
+            None,
+            Chrome::default(),
+            "/p".into(),
+            commands,
+            seq,
+        );
+        app.on_models(
+            vec![catalog_model("alpha"), catalog_model("alpine")],
+            vec![],
+        );
+        let Some(Dialog::Select(select)) = &mut app.dialog else {
+            panic!("model picker")
+        };
+        select.on_paste("alp");
+        select.on_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Down,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(select.selected_value(), Some("p/alpine"));
+        app.request_catalog(false);
+        let AppCommand::ModelList { request_id } = rx.try_recv().expect("catalog") else {
+            panic!("catalog command")
+        };
+        app.handle(AppEvent::Models {
+            request_id,
+            result: Ok((
+                vec![catalog_model("alpine"), catalog_model("alpha")],
+                vec![],
+            )),
+        });
+        let Some(Dialog::Select(select)) = &app.dialog else {
+            panic!("model picker")
+        };
+        assert_eq!(select.filter(), "alp");
+        assert_eq!(select.selected_value(), Some("p/alpine"));
+        app.request_catalog(false);
+        let AppCommand::ModelList { request_id } = rx.try_recv().expect("catalog") else {
+            panic!("catalog command")
+        };
+        app.handle(AppEvent::Models {
+            request_id,
+            result: Ok((vec![catalog_model("alpha")], vec![])),
+        });
+        let Some(Dialog::Select(select)) = &app.dialog else {
+            panic!("model picker")
+        };
+        assert_eq!(select.filter(), "alp");
+        assert_eq!(select.selected_value(), Some("p/alpha"));
+    }
+
+    #[test]
+    fn catalog_update_closes_variant_picker_and_rejects_inflight_response() {
+        for remaining in [vec![catalog_model("other")], vec![catalog_model("chosen")]] {
+            let (commands, mut rx) = mpsc::unbounded_channel();
+            let (seq, _) = watch::channel(None);
+            let chrome = Chrome {
+                provider_id: Some("p".into()),
+                model: Some("chosen".into()),
+                ..Chrome::default()
+            };
+            let mut app = App::new(Route::Home, None, chrome, "/p".into(), commands, seq);
+            app.request_variants(false);
+            let AppCommand::VariantList { request } = rx.try_recv().expect("variant request")
+            else {
+                panic!("variant request")
+            };
+            let variants =
+                serde_json::from_value(serde_json::json!([{ "id": "high", "name": "High" }]))
+                    .expect("variants");
+            app.on_variants(request.clone(), variants);
+            assert!(matches!(
+                app.dialog_purpose,
+                Some(crate::ui::models::DialogPurpose::Variant { .. })
+            ));
+            let envelope = ox_schema::event::EventEnvelope {
+                id: "update".into(),
+                created: 0,
+                kind: "model.updated".into(),
+                data: serde_json::json!({}),
+                durable: None,
+                location: None,
+                metadata: None,
+            };
+            app.handle(AppEvent::Stream(StreamMsg::Event(Box::new(envelope))));
+            assert!(
+                app.dialog.is_none(),
+                "update must close picker before network refresh"
+            );
+            let AppCommand::ModelList { request_id } = rx.try_recv().expect("catalog request")
+            else {
+                panic!("catalog request")
+            };
+            app.handle(AppEvent::Models {
+                request_id,
+                result: Ok((remaining, vec![])),
+            });
+            assert!(
+                app.dialog.is_none(),
+                "variant picker must close when catalog changes"
+            );
+            let variants =
+                serde_json::from_value(serde_json::json!([{ "id": "high", "name": "High" }]))
+                    .expect("variants");
+            app.on_variants(request, variants);
+            assert!(
+                app.dialog.is_none(),
+                "old variant response must not reopen picker"
+            );
+        }
+    }
+
+    #[test]
+    fn pending_catalog_blocks_stale_picker_and_variant_requests_until_retry_succeeds() {
+        let (commands, mut rx) = mpsc::unbounded_channel();
+        let (seq, _) = watch::channel(None);
+        let chrome = Chrome {
+            provider_id: Some("p".into()),
+            model: Some("current".into()),
+            ..Chrome::default()
+        };
+        let mut app = App::new(Route::Home, None, chrome, "/p".into(), commands, seq);
+        app.on_models(vec![catalog_model("old")], vec![]);
+        let envelope = ox_schema::event::EventEnvelope {
+            id: "update".into(),
+            created: 0,
+            kind: "model.updated".into(),
+            data: serde_json::json!({}),
+            durable: None,
+            location: None,
+            metadata: None,
+        };
+        app.handle(AppEvent::Stream(StreamMsg::Event(Box::new(envelope))));
+        let AppCommand::ModelList { request_id } = rx.try_recv().expect("catalog request") else {
+            panic!("catalog request")
+        };
+        app.apply_dialog_outcome(None, DialogOutcome::Selected("p/old".into()));
+        assert_eq!(
+            app.prompt.chrome().model.as_deref(),
+            Some("current"),
+            "stale choice must not be applied"
+        );
+        assert!(
+            matches!(
+                app.dialog_purpose,
+                Some(crate::ui::models::DialogPurpose::Model(..))
+            ),
+            "picker must remain available"
+        );
+        app.request_variants(false);
+        app.request_variants(true);
+        assert!(
+            rx.try_recv().is_err(),
+            "variant requests must wait for catalog"
+        );
+        app.handle(AppEvent::Models {
+            request_id,
+            result: Err("offline".into()),
+        });
+        app.apply_dialog_outcome(None, DialogOutcome::Selected("p/old".into()));
+        assert_eq!(
+            app.prompt.chrome().model.as_deref(),
+            Some("current"),
+            "failure must remain fail closed"
+        );
+        let AppCommand::ModelList { request_id } = rx.try_recv().expect("retry catalog") else {
+            panic!("retry catalog")
+        };
+        app.handle(AppEvent::Models {
+            request_id,
+            result: Ok((vec![catalog_model("new")], vec![])),
+        });
+        let Some(Dialog::Select(select)) = &app.dialog else {
+            panic!("model picker")
+        };
+        assert_eq!(select.selected_value(), Some("p/new"));
+        app.apply_dialog_outcome(None, DialogOutcome::Selected("p/new".into()));
+        assert_eq!(app.prompt.chrome().model.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn pending_catalog_rejects_inflight_variant_response() {
+        for cycle in [false, true] {
+            let (commands, mut rx) = mpsc::unbounded_channel();
+            let (seq, _) = watch::channel(None);
+            let chrome = Chrome {
+                provider_id: Some("p".into()),
+                model: Some("current".into()),
+                ..Chrome::default()
+            };
+            let mut app = App::new(Route::Home, None, chrome, "/p".into(), commands, seq);
+            app.request_variants(cycle);
+            let AppCommand::VariantList { request } = rx.try_recv().expect("variant") else {
+                panic!("variant")
+            };
+            app.request_catalog(false);
+            let _ = rx.try_recv().expect("catalog");
+            app.on_variants(
+                request,
+                vec![ox_client::rest::ModelVariant { id: "high".into() }],
+            );
+            assert!(app.dialog.is_none(), "old response must not open a picker");
+            assert!(
+                app.prompt.chrome().variant.is_none(),
+                "old response must not cycle variant"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reload_http_outcomes_reach_app_toast() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        for response in [
+            Some("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"),
+            Some("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"),
+            Some(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 31\r\n\r\n{\"message\":\"bad configuration\"}",
+            ),
+            None,
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let address = listener.local_addr().expect("address");
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 1024];
+                while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                    let count = stream.read(&mut chunk).await.expect("request");
+                    assert!(count > 0, "request headers must be complete");
+                    bytes.extend_from_slice(&chunk[..count]);
+                }
+                assert!(String::from_utf8_lossy(&bytes).starts_with("POST /api/location/reload "));
+                if let Some(response) = response {
+                    stream
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("response");
+                }
+            });
+            let (commands, mut rx) = mpsc::unbounded_channel();
+            let (seq, _) = watch::channel(None);
+            let mut app = App::new(
+                Route::Home,
+                None,
+                Chrome::default(),
+                "/p".into(),
+                commands,
+                seq,
+            );
+            app.request_config_reload();
+            let command = rx.try_recv().expect("reload command");
+            let (events, mut event_rx) = mpsc::unbounded_channel();
+            crate::executor::run(
+                ox_client::Client::new(format!("http://{address}"), "/p"),
+                events,
+                command,
+            )
+            .await;
+            app.handle(event_rx.recv().await.expect("reload outcome"));
+            server.await.expect("server");
+            let toast = app.toast.as_ref().expect("feedback");
+            match response {
+                Some(value) if value.contains("204") => {
+                    assert_eq!(toast.variant, toast::Variant::Success);
+                    assert_eq!(toast.message, "Configuration reloaded");
+                    assert!(matches!(rx.try_recv(), Ok(AppCommand::McpList { .. })));
+                    assert!(matches!(rx.try_recv(), Ok(AppCommand::ModelList { .. })));
+                }
+                Some(value) if value.contains("200") => {
+                    assert_eq!(toast.variant, toast::Variant::Error);
+                    assert!(
+                        toast.message.contains("server outcome is unknown"),
+                        "{}",
+                        toast.message
+                    );
+                    assert!(rx.try_recv().is_err());
+                }
+                Some(_) => {
+                    assert_eq!(toast.variant, toast::Variant::Error);
+                    assert!(
+                        toast.message.contains("bad configuration"),
+                        "{}",
+                        toast.message
+                    );
+                    assert!(rx.try_recv().is_err());
+                }
+                None => {
+                    assert_eq!(toast.variant, toast::Variant::Error);
+                    assert!(
+                        toast.message.contains("server outcome is unknown"),
+                        "{}",
+                        toast.message
+                    );
+                    assert!(rx.try_recv().is_err());
+                }
+            }
+        }
+    }
 
     fn switch_request(id: u64, generation: u64, session: &str) -> SwitchRequest {
         SwitchRequest {

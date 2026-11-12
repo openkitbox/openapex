@@ -282,9 +282,9 @@ fn directory_dependent(command: &app::command::AppCommand) -> bool {
             | app::command::AppCommand::FindFiles { .. }
             | app::command::AppCommand::McpList { .. }
             | app::command::AppCommand::McpToggle { .. }
-            | app::command::AppCommand::ModelList
+            | app::command::AppCommand::ModelList { .. }
+            | app::command::AppCommand::ReloadConfig { .. }
             | app::command::AppCommand::VariantList { .. }
-            | app::command::AppCommand::LoadContextLimits
             | app::command::AppCommand::AgentList(_)
             | app::command::AppCommand::Switch { .. }
     )
@@ -329,6 +329,18 @@ async fn serial_commands(
                         err: error,
                     }
                 }
+                app::command::AppCommand::ReloadConfig { request_id } => {
+                    app::event::AppEvent::ConfigReloaded {
+                        request_id,
+                        result: Err(error),
+                    }
+                }
+                app::command::AppCommand::ModelList { request_id } => {
+                    app::event::AppEvent::Models {
+                        request_id,
+                        result: Err(error),
+                    }
+                }
                 _ => app::event::AppEvent::SessionOpFailed {
                     title: "Directory unavailable",
                     error,
@@ -338,6 +350,16 @@ async fn serial_commands(
             continue;
         }
         match command {
+            app::command::AppCommand::ReloadConfig { request_id } => {
+                // The gate above has already established the authoritative
+                // client directory; the network wait must not hold the serial
+                // owner or delay the next directory-dependent command.
+                tokio::spawn(executor::run(
+                    client.clone(),
+                    tx.clone(),
+                    app::command::AppCommand::ReloadConfig { request_id },
+                ));
+            }
             app::command::AppCommand::LoadSessionChrome { request } => {
                 if active_session.as_deref() == Some(&request.session) {
                     chrome_pending = Some(request);
@@ -594,6 +616,99 @@ async fn connect_unix(directory: &str) -> anyhow::Result<ox_client::Client> {
 mod tests {
     use super::*;
     use crate::app::command::{AppCommand, VariantRequest};
+
+    #[tokio::test]
+    async fn reload_captures_serial_directory_without_blocking_later_commands() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::time::{Duration, timeout};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let (requests, mut observed) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let requests = requests.clone();
+                tokio::spawn(async move {
+                    let mut bytes = Vec::new();
+                    let mut chunk = [0; 1024];
+                    while !bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                        let count = socket.read(&mut chunk).await.expect("read");
+                        if count == 0 {
+                            return;
+                        }
+                        bytes.extend_from_slice(&chunk[..count]);
+                    }
+                    let request = String::from_utf8(bytes).expect("headers");
+                    let _ = requests.send(request.clone());
+                    if request.starts_with("POST /ox/location?") {
+                        let body = r#"{"directory":"/resolved"}"#;
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        );
+                        socket
+                            .write_all(response.as_bytes())
+                            .await
+                            .expect("response");
+                    } else if request.starts_with("POST /api/location/reload") {
+                        std::future::pending::<()>().await;
+                    } else {
+                        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}").await.expect("response");
+                    }
+                });
+            }
+        });
+        let client = ox_client::Client::new(format!("http://{address}"), "/original");
+        let (commands, rx) = mpsc::unbounded_channel();
+        let (events, _event_rx) = mpsc::unbounded_channel();
+        let (_seq, seq_rx) = watch::channel(None);
+        let (stream_tx, _stream_rx) = mpsc::unbounded_channel();
+        let stream =
+            ox_client::sse::Attachment::new(client.clone(), seq_rx.clone(), stream_tx.clone());
+        let owner = tokio::spawn(serial_commands(
+            client, None, rx, events, seq_rx, stream_tx, stream,
+        ));
+        commands
+            .send(AppCommand::ChangeDirectory {
+                session: None,
+                directory: "/requested".into(),
+            })
+            .expect("change");
+        commands
+            .send(AppCommand::ReloadConfig { request_id: 1 })
+            .expect("reload");
+        commands
+            .send(AppCommand::ModelList { request_id: 2 })
+            .expect("models");
+        let (reload, model) = timeout(Duration::from_secs(3), async {
+            let mut reload = None;
+            let mut model = None;
+            while reload.is_none() || model.is_none() {
+                let request = observed.recv().await.expect("request");
+                if request.starts_with("POST /api/location/reload") {
+                    reload = Some(request);
+                } else if request.starts_with("GET /api/model ") {
+                    model = Some(request);
+                }
+            }
+            (reload, model)
+        })
+        .await
+        .expect("request types must arrive without blocking");
+        let reload = reload.expect("reload request").to_ascii_lowercase();
+        assert!(
+            reload.contains("x-opencode-directory: /resolved\r\n"),
+            "{reload}"
+        );
+        assert!(
+            model.is_some(),
+            "catalog request must pass the unfinished reload"
+        );
+        owner.abort();
+        server.abort();
+    }
 
     fn variant_request() -> VariantRequest {
         VariantRequest {

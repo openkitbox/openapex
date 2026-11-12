@@ -59,7 +59,8 @@ impl App {
     }
 
     fn variant_response_matches(&self, request: &VariantRequest) -> bool {
-        request.request_id == self.variant_request_id
+        !self.catalog_invalidated
+            && request.request_id == self.variant_request_id
             && self.variant_session == request.session
             && self.variant_navigation_generation == request.navigation_generation
             && self.session == request.session
@@ -218,6 +219,12 @@ impl App {
 
     /// `/variants` and `ctrl+t`: ask for the current model's levels.
     pub(super) fn request_variants(&mut self, cycle: bool) {
+        if self.catalog_invalidated {
+            if self.pending_catalog_request.is_none() {
+                self.request_catalog(false);
+            }
+            return;
+        }
         let chrome = self.prompt.chrome();
         let (Some(provider_id), Some(model_id)) =
             (chrome.provider_id.clone(), chrome.model.clone())

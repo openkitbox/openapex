@@ -32,6 +32,10 @@ impl std::fmt::Debug for Fetched {
 
 #[derive(Debug)]
 pub enum AppEvent {
+    ConfigReloaded {
+        request_id: u64,
+        result: Result<(), String>,
+    },
     DirectoryChanged {
         session: Option<String>,
         generation: u64,
@@ -134,11 +138,15 @@ pub enum AppEvent {
     },
     /// Answer to `AppCommand::ModelList`; opens the `/models` dialog.
     Models {
-        models: Vec<ox_client::rest::ModelInfo>,
-        providers: Vec<ox_client::rest::ProviderRef>,
+        request_id: u64,
+        result: Result<
+            (
+                Vec<ox_client::rest::ModelInfo>,
+                Vec<ox_client::rest::ProviderRef>,
+            ),
+            String,
+        >,
     },
-    /// Answer to `AppCommand::LoadContextLimits`: `providerID/id` → window.
-    ContextLimits(std::collections::HashMap<String, i64>),
     /// Answer to `AppCommand::VariantList`; it repeats the request's session
     /// context so the UI can reject an answer from an old navigation.
     Variants {

@@ -106,8 +106,26 @@ model = "slim"        # 默认值来自内置 agent 表
 
 ### MCP
 
-`[mcp.servers.<名字>]` 在启动时连上一个 MCP 服务器，把它的工具以服务器名作为前缀
-暴露出来。连接是进程级的，所以每个会话看到的工具注册表都一样。
+在 `~/.ox/ox.toml` 中配置本地和远程 MCP 服务器：
+
+```toml
+[mcp.servers.local-example]
+type = "local"
+command = ["my-mcp-server", "--stdio"]
+disabled = true
+
+[mcp.servers.remote-example]
+type = "remote"
+url = "https://mcp.example.com/mcp"
+disabled = true
+```
+
+`disabled` 默认为 `false`。设为 `true` 后，启动和重载配置时会跳过该服务器。
+可以在 TUI 的 `/mcps` 对话框中手动连接，作为临时覆盖；下次成功重载配置或重启
+服务端后，重新按配置决定是否连接。修改配置后执行 `/refresh` 或重启服务端生效。
+
+MCP 连接和工具注册表是进程级的，不按会话隔离。通过 `/mcps` 连接或断开服务器会
+影响所有会话；工具以服务器名作为前缀暴露。
 
 ## 编辑器集成
 

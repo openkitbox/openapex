@@ -60,6 +60,8 @@ pub enum CommandAction {
     Memory,
     /// Archive the project's active memories (ox-only).
     Forget,
+    /// Reload server configuration.
+    Refresh,
 }
 
 /// One registered command. `aliases` are rendered as their own menu rows,
@@ -79,6 +81,14 @@ pub struct Command {
 /// The whole registry. Keep it alphabetical by primary name; the menu sorts by
 /// display anyway, this is for humans reading the file.
 pub const COMMANDS: &[Command] = &[
+    Command {
+        name: "refresh",
+        aliases: &["reload"],
+        description: "Reload configuration",
+        title: "Reload configuration",
+        group: "System",
+        action: CommandAction::Refresh,
+    },
     Command {
         name: "cd",
         aliases: &[],

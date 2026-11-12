@@ -46,6 +46,7 @@ const ORDER: &[CommandAction] = &[
     CommandAction::Agents,
     CommandAction::Mcps,
     CommandAction::Status,
+    CommandAction::Refresh,
     CommandAction::Exit,
 ];
 

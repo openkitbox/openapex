@@ -113,9 +113,29 @@ the catalogue, instead of silently running on the parent's model.
 
 ### MCP
 
-`[mcp.servers.<name>]` connects an MCP server at startup and exposes its tools
-under the server name as a prefix. Connections are process-wide, so the tool
-registry is the same for every session.
+Configure local and remote MCP servers in `~/.ox/ox.toml`:
+
+```toml
+[mcp.servers.local-example]
+type = "local"
+command = ["my-mcp-server", "--stdio"]
+disabled = true
+
+[mcp.servers.remote-example]
+type = "remote"
+url = "https://mcp.example.com/mcp"
+disabled = true
+```
+
+`disabled` defaults to `false`. A disabled server is skipped at startup and on
+configuration reload. The TUI `/mcps` dialog can connect it manually as a
+temporary override; the next successful reload or server restart applies the
+configured value again. After editing the configuration, run `/refresh` or
+restart the server to apply it.
+
+MCP connections and the tool registry are process-wide, not session-specific.
+Connecting or disconnecting a server in `/mcps` affects every session. Its
+tools are exposed under the server name as a prefix.
 
 ### Permissions
 

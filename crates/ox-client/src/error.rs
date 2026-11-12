@@ -8,6 +8,11 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("server returned {0}")]
     Status(reqwest::StatusCode),
+    #[error("server returned {status}: {message}")]
+    StatusMessage {
+        status: reqwest::StatusCode,
+        message: String,
+    },
     #[error("event stream closed")]
     StreamClosed,
     #[error("no event or heartbeat for 30s")]

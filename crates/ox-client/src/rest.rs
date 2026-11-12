@@ -422,6 +422,8 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// `[mcp.timeout] startup` budget (30 s by default); with
 /// [`REQUEST_TIMEOUT`] a slow but successful start would read as a failure.
 const MCP_TOGGLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Reload waits for the model catalogue and MCP startup to settle.
+const RELOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// `Number.MAX_SAFE_INTEGER`: a cursor no capture reaches, so the answer only
 /// carries the capture's `size` (upstream's probe).
 const MAX_SAFE_CURSOR: u64 = 9_007_199_254_740_991;
@@ -514,6 +516,33 @@ impl Client {
             return Err(Error::Status(resp.status()));
         }
         Ok(resp.json().await?)
+    }
+
+    /// Reload server configuration for the current directory.
+    pub async fn reload_config(&self) -> Result<()> {
+        #[derive(Deserialize)]
+        struct Failure {
+            message: String,
+        }
+
+        let resp = self
+            .request(reqwest::Method::POST, "/api/location/reload")
+            .timeout(RELOAD_TIMEOUT)
+            .send()
+            .await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NO_CONTENT {
+            return Ok(());
+        }
+        if !status.is_success()
+            && let Ok(failure) = resp.json::<Failure>().await
+        {
+            return Err(Error::StatusMessage {
+                status,
+                message: failure.message,
+            });
+        }
+        Err(Error::Status(status))
     }
 
     /// The directory stored on the session (`session.location.directory`).

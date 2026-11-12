@@ -226,9 +226,9 @@ impl McpDialog {
             .find(|server| server.name == name)
             .map(|server| &server.status);
         let toggle = match status {
-            Some(McpStatus::Connected) => "disconnect",
-            Some(McpStatus::Failed { .. }) => "retry",
-            _ => "connect",
+            Some(McpStatus::Connected) => "disconnect (all sessions)",
+            Some(McpStatus::Failed { .. }) => "retry (all sessions)",
+            _ => "connect (all sessions)",
         };
         let mut hints = vec![Hint::new(toggle, "space")];
         if matches!(status, Some(McpStatus::Failed { .. })) {
@@ -268,5 +268,26 @@ pub fn draw(buf: &mut Buffer, area: Rect, dialog: &McpDialog, pal: &Palette) -> 
             None
         }
         None => Some(draw_select(buf, area, &dialog.select, pal)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toggle_hint_explains_session_scope() {
+        let dialog = McpDialog::new(vec![McpRef {
+            name: "example".to_owned(),
+            status: McpStatus::Disabled,
+        }]);
+        let area = Rect::new(0, 0, 80, 24);
+        let mut buf = Buffer::empty(area);
+        draw(&mut buf, area, &dialog, crate::theme::palette());
+        let text: String = buf.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(
+            text.contains("all sessions"),
+            "dialog must explain toggle scope: {text}"
+        );
     }
 }
