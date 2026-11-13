@@ -8,6 +8,7 @@ pub mod instance;
 pub mod lifecycle;
 pub(crate) mod reload;
 pub mod runtime;
+pub mod service;
 mod session_retention;
 pub(crate) mod supervision;
 mod tmp_retention;
@@ -236,6 +237,7 @@ async fn build_state_with_mode(
         lifecycle: lifecycle::Lifecycle::new(std::time::Instant::now()),
         embedder,
         runtime,
+        service_password: None,
     })
 }
 
@@ -345,10 +347,76 @@ pub async fn run_with(config: Config, opts: ServeOptions) -> Result<()> {
     outcome
 }
 
+/// Run an OpenCode-managed service on TCP only. The registration watcher is
+/// adopted by the composition runtime, so ownership loss follows normal
+/// graceful shutdown rather than leaving a detached task behind.
+pub async fn run_service(
+    mut config: Config,
+    service_config: service::ServiceConfig,
+    registration_path: PathBuf,
+) -> Result<()> {
+    let opts = ServeOptions::default();
+    let _lock = instance::InstanceLock::acquire(&opts.lock_path)?;
+    let bind = service::format_host_port(&service_config.hostname, service_config.port);
+    let tcp = TcpListener::new(bind).try_bind().await?;
+    let address = tcp.local_addr()?;
+    config.listen = address.to_string();
+    let password = service_config.password.clone();
+    let (state, router) = compose_with_service_password(config, Some(password.clone())).await?;
+    let registration = service::Registration {
+        id: service::new_registration_id(),
+        version: service::UPSTREAM_COMPAT_VERSION.to_owned(),
+        url: format!(
+            "http://{}",
+            service::format_host_port(&address.ip().to_string(), address.port())
+        ),
+        pid: std::process::id(),
+        password,
+    };
+    let registration_guard =
+        match service::write_registration(&registration_path, registration.clone()) {
+            Ok(guard) => guard,
+            Err(error) => {
+                if let Err(shutdown_error) = state.runtime.shutdown(&state).await {
+                    tracing::warn!(
+                        error = %shutdown_error,
+                        "managed service cleanup failed after registration write failure"
+                    );
+                }
+                return Err(error.into());
+            }
+        };
+    let runtime = Arc::clone(&state.runtime);
+    let stop = runtime.stop().clone();
+    let runtime_for_watch = Arc::clone(&runtime);
+    let watcher = tokio::spawn(service::watch_registration(
+        registration_path,
+        registration,
+        stop,
+        move || runtime_for_watch.stop().cancel(),
+    ));
+    if let Err(watcher) = state.runtime.adopt(watcher) {
+        watcher
+            .await
+            .map_err(|error| anyhow::anyhow!("service watcher failed: {error}"))?;
+    }
+    let outcome = serve_with(tcp, state, router, None, Signals::Handle).await;
+    registration_guard.release()?;
+    outcome
+}
+
 /// Compose the full server state and router without binding anything —
 /// the shared seam between [`run`] (binds `config.listen`) and `ox acp`
 /// own-mode (binds an ephemeral port and reports the real address).
 pub async fn compose(config: Config) -> Result<(AppState, Router)> {
+    compose_with_service_password(config, None).await
+}
+
+/// Compose the full server state with an optional managed-service credential.
+pub async fn compose_with_service_password(
+    config: Config,
+    service_password: Option<String>,
+) -> Result<(AppState, Router)> {
     let mut tools = runner::ToolRegistry::with_builtins();
     // The todowrite tool needs the DB (it resets the todo reminder budget and
     // the reminder scans the transcript), so it joins here at the composition
@@ -375,7 +443,7 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
     // replay below runs on the same handle the `subagent` tool uses.
     let subagent = tools.subagent_handle.clone();
     let chat = chat_transport(&config)?;
-    let state = build_state_with_mode(
+    let mut state = build_state_with_mode(
         config,
         chat,
         tools,
@@ -385,6 +453,7 @@ pub async fn compose(config: Config) -> Result<(AppState, Router)> {
         McpStartup::Deferred,
     )
     .await?;
+    state.service_password = service_password;
     let stop = state.runtime.stop().clone();
     // Startup producers are adopted before the listener exists: `compose`
     // never runs once shutdown has started, but an adopted handle that the

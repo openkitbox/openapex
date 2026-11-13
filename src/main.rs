@@ -49,6 +49,7 @@ struct LogOutputs {
     stdout: bool,
     log_file: Option<PathBuf>,
     exit_when_idle: bool,
+    service: bool,
 }
 
 impl Default for LogOutputs {
@@ -57,6 +58,7 @@ impl Default for LogOutputs {
             stdout: true,
             log_file: None,
             exit_when_idle: false,
+            service: false,
         }
     }
 }
@@ -142,10 +144,14 @@ where
                 outputs.log_file = Some(PathBuf::from(path.as_ref()));
             }
             "--exit-when-idle" => outputs.exit_when_idle = true,
+            "--service" => outputs.service = true,
             "--stdout" => set_stdout_flag(&mut outputs, &mut stdout_flag, true)?,
             "--no-stdout" => set_stdout_flag(&mut outputs, &mut stdout_flag, false)?,
             other => anyhow::bail!("unknown argument `{other}`"),
         }
+    }
+    if outputs.service && outputs.exit_when_idle {
+        anyhow::bail!("cannot combine --service and --exit-when-idle");
     }
     Ok(outputs)
 }
@@ -235,6 +241,34 @@ fn load_config() -> Result<ox::config::Config> {
     Ok(config)
 }
 
+fn load_service() -> Result<(
+    ox_server::service::ServiceConfig,
+    ox_server::service::ServicePaths,
+)> {
+    let home = ox_core::config::user_home();
+    let config_dir = std::env::var_os("OPENCODE_CONFIG_DIR");
+    let config_dir = config_dir.as_deref().map(Path::new);
+    let xdg_config = std::env::var_os("XDG_CONFIG_HOME");
+    let xdg_config = xdg_config.as_deref().map(Path::new);
+    let xdg_state = std::env::var_os("XDG_STATE_HOME");
+    let xdg_state = xdg_state.as_deref().map(Path::new);
+    let channel = std::env::var("OPENCODE_CHANNEL").unwrap_or_else(|_| "latest".to_owned());
+    let paths = ox_server::service::service_paths_for_process(
+        &home, config_dir, xdg_config, xdg_state, &channel,
+    );
+    let config = ox_server::service::load_or_create_config(
+        &paths.config_path,
+        ox_server::service::default_port(&channel),
+    )
+    .with_context(|| {
+        format!(
+            "failed to load service config {}",
+            paths.config_path.display()
+        )
+    })?;
+    Ok((config, paths))
+}
+
 fn serve_options(outputs: &LogOutputs) -> ox::ServeOptions {
     ox::ServeOptions {
         exit_when_idle: outputs.exit_when_idle,
@@ -260,6 +294,10 @@ async fn main() -> Result<()> {
         Command::Serve(outputs) => {
             init_tracing(&outputs, false)?;
             let config = load_config()?;
+            if outputs.service {
+                let (service, paths) = load_service()?;
+                return ox::run_service(config, service, paths.registration_path).await;
+            }
             tracing::info!(
                 listen = %config.listen,
                 db = %config.db_path.display(),
@@ -271,7 +309,6 @@ async fn main() -> Result<()> {
     }
 }
 
-/// In `acp` mode stdout is the NDJSON wire — logs always go to stderr.
 fn init_tracing(outputs: &LogOutputs, acp: bool) -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -309,4 +346,34 @@ fn init_tracing(outputs: &LogOutputs, acp: bool) -> Result<()> {
         .set(guards)
         .map_err(|_| anyhow::anyhow!("tracing guards already initialized"))?;
     Ok(())
+}
+
+/// In `acp` mode stdout is the NDJSON wire — logs always go to stderr.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_flag_selects_managed_service_mode() {
+        let outputs =
+            parse_server_args(["--service"]).expect("--service should select managed service mode");
+        assert!(outputs.service);
+        assert!(!outputs.exit_when_idle);
+    }
+
+    #[test]
+    fn service_mode_rejects_exit_when_idle() {
+        let error = parse_server_args(["--service", "--exit-when-idle"])
+            .expect_err("managed service mode cannot use idle shutdown");
+        assert!(error.to_string().contains("--service"));
+        assert!(error.to_string().contains("--exit-when-idle"));
+    }
+
+    #[test]
+    fn ordinary_serve_remains_non_service_mode() {
+        let outputs =
+            parse_server_args(["--no-stdout"]).expect("ordinary serve flags should remain valid");
+        assert!(!outputs.service);
+        assert!(!outputs.stdout);
+    }
 }

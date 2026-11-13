@@ -8,6 +8,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use salvo::http::StatusCode;
 use salvo::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -58,6 +60,8 @@ pub struct AppState {
     /// Composition-scoped shutdown owner. HTTP handlers use it to reject new
     /// ingress, while the serve loop is its sole close/wait supervisor.
     pub runtime: Arc<crate::runtime::Runtime>,
+    /// Optional password for managed service mode. `None` keeps the API anonymous.
+    pub service_password: Option<String>,
 }
 
 impl AppState {
@@ -93,6 +97,51 @@ async fn reject_when_closing(depot: &mut Depot, res: &mut Response, ctrl: &mut F
         res.status_code(StatusCode::SERVICE_UNAVAILABLE);
         ctrl.skip_rest();
     }
+}
+
+/// Require the managed service credential before any API handler runs.
+#[handler]
+async fn authenticate_service(
+    req: &mut Request,
+    depot: &mut Depot,
+    res: &mut Response,
+    ctrl: &mut FlowCtrl,
+) {
+    let Some(state) = state(depot, res) else {
+        ctrl.skip_rest();
+        return;
+    };
+    let Some(password) = state.service_password.as_deref() else {
+        return;
+    };
+    if service_authorization_is_valid(req.headers().get("authorization"), password) {
+        return;
+    }
+    res.status_code(StatusCode::UNAUTHORIZED);
+    let _ = res.add_header("WWW-Authenticate", "Basic realm=\"Secure Area\"", true);
+    res.render(Json(serde_json::json!({
+        "_tag": "UnauthorizedError",
+        "message": "Authentication required",
+    })));
+    ctrl.skip_rest();
+}
+
+/// Return whether an Authorization header exactly matches the service credential.
+fn service_authorization_is_valid(
+    authorization: Option<&salvo::http::HeaderValue>,
+    password: &str,
+) -> bool {
+    authorization
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            let mut fields = value.split_ascii_whitespace();
+            let scheme = fields.next()?;
+            let encoded = fields.next()?;
+            (fields.next().is_none() && scheme.eq_ignore_ascii_case("basic")).then_some(encoded)
+        })
+        .and_then(|encoded| BASE64_STANDARD.decode(encoded).ok())
+        .and_then(|decoded| String::from_utf8(decoded).ok())
+        .is_some_and(|credentials| credentials == format!("opencode:{password}"))
 }
 
 /// Fetch the injected app state; on failure logs the error and renders a
@@ -134,6 +183,11 @@ struct ServerCapabilities {
     persistent_pty: bool,
 }
 
+/// Keep the HTTP health version aligned with managed service registration.
+fn server_info_version() -> &'static str {
+    crate::service::UPSTREAM_COMPAT_VERSION
+}
+
 #[handler] // operation_id: server.info
 async fn server_info(depot: &mut Depot, res: &mut Response) {
     let Some(state) = state(depot, res) else {
@@ -141,7 +195,7 @@ async fn server_info(depot: &mut Depot, res: &mut Response) {
     };
     let svc = state.services();
     res.render(Json(ServerInfo {
-        version: env!("CARGO_PKG_VERSION"),
+        version: server_info_version(),
         pid: std::process::id(),
         urls: vec![format!("http://{}", svc.config.listen)],
         paths: ServerPaths {
@@ -867,6 +921,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .hoop(affix_state::inject(state))
         .hoop(reject_when_closing)
+        .hoop(authenticate_service)
         // ox-only endpoints live beside `/api`, never under it, so upstream
         // opencode paths stay distinguishable.
         .push(
@@ -1012,4 +1067,44 @@ async fn unmatched(req: &mut Request, res: &mut Response) {
         "_tag": "NotFoundError",
         "message": format!("No route for {} {}", req.method(), req.uri().path()),
     })));
+}
+
+#[cfg(test)]
+mod tests {
+    use salvo::http::HeaderValue;
+
+    use super::*;
+
+    #[test]
+    fn server_info_version_matches_service_registration_version() {
+        assert_eq!(
+            server_info_version(),
+            crate::service::UPSTREAM_COMPAT_VERSION
+        );
+    }
+
+    #[test]
+    fn service_authorization_requires_exact_opencode_password() {
+        let valid = HeaderValue::from_static("Basic b3BlbmNvZGU6c2VjcmV0");
+        let lowercase_scheme = HeaderValue::from_static("basic b3BlbmNvZGU6c2VjcmV0");
+        let multiple_spaces = HeaderValue::from_static("Basic   b3BlbmNvZGU6c2VjcmV0");
+        let wrong_user = HeaderValue::from_static("Basic YWRtaW46c2VjcmV0");
+        let wrong_password = HeaderValue::from_static("Basic b3BlbmNvZGU6d3Jvbmc=");
+
+        assert!(service_authorization_is_valid(Some(&valid), "secret"));
+        assert!(service_authorization_is_valid(
+            Some(&lowercase_scheme),
+            "secret"
+        ));
+        assert!(service_authorization_is_valid(
+            Some(&multiple_spaces),
+            "secret"
+        ));
+        assert!(!service_authorization_is_valid(Some(&wrong_user), "secret"));
+        assert!(!service_authorization_is_valid(
+            Some(&wrong_password),
+            "secret"
+        ));
+        assert!(!service_authorization_is_valid(None, "secret"));
+    }
 }

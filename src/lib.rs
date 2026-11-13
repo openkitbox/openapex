@@ -16,6 +16,7 @@ pub use ox_schema as schema;
 pub use ox_schema::{id, slug};
 pub use ox_server::{
     ServeOptions, api, build_router, build_state, build_state_on_with_bus, build_state_with,
-    build_state_with_home, compose, run, run_with, serve_on,
+    build_state_with_home, compose, compose_with_service_password, run, run_service, run_with,
+    serve_on,
 };
 pub use ox_tools as tool;

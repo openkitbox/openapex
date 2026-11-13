@@ -71,13 +71,9 @@ pub(super) fn is_due(state: &DreamState, now: i64, interval_millis: i64) -> bool
     {
         return false;
     }
-    if state.consecutive_failures >= MAX_DREAM_FAILURES
+    !(state.consecutive_failures >= MAX_DREAM_FAILURES
         && now - state.last_attempt_at
-            < failure_backoff_millis(state.consecutive_failures, interval_millis)
-    {
-        return false;
-    }
-    true
+            < failure_backoff_millis(state.consecutive_failures, interval_millis))
 }
 
 /// How long a row with `consecutive_failures` failures in a row waits after its
