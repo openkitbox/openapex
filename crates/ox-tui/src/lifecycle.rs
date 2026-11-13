@@ -43,6 +43,7 @@ pub fn transport_of(server_arg: Option<String>) -> Transport {
 pub fn server_args(log_file: &Path) -> Vec<OsString> {
     vec![
         "serve".into(),
+        "--service".into(),
         "--exit-when-idle".into(),
         "--no-stdout".into(),
         "--log-file".into(),
@@ -50,7 +51,7 @@ pub fn server_args(log_file: &Path) -> Vec<OsString> {
     ]
 }
 
-/// Start `exe serve --exit-when-idle` detached from the terminal. It gets its
+/// Start `exe serve --service --exit-when-idle` detached from the terminal. It gets its
 /// own process group, so Ctrl-C at the TUI does not reach it. The child is not
 /// waited on: when the TUI exits it is adopted by init; if the server exits
 /// first it stays a zombie until the TUI exits, which is harmless.
@@ -164,5 +165,31 @@ where
                 Err(err) => tracing::warn!(error = %err, "ox server unavailable; retrying"),
             }
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::server_args;
+    use std::path::Path;
+
+    #[test]
+    fn self_exec_uses_managed_idle_service() {
+        let args = server_args(Path::new("/tmp/ox.log"));
+        let args = args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "serve",
+                "--service",
+                "--exit-when-idle",
+                "--no-stdout",
+                "--log-file",
+                "/tmp/ox.log",
+            ]
+        );
     }
 }

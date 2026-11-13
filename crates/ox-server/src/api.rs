@@ -111,7 +111,11 @@ async fn authenticate_service(
         ctrl.skip_rest();
         return;
     };
-    let Some(password) = state.service_password.as_deref() else {
+    let password = state.service_password.as_deref();
+    if !service_authentication_required(req.local_addr(), password) {
+        return;
+    }
+    let Some(password) = password else {
         return;
     };
     if service_authorization_is_valid(req.headers().get("authorization"), password) {
@@ -124,6 +128,16 @@ async fn authenticate_service(
         "message": "Authentication required",
     })));
     ctrl.skip_rest();
+}
+
+/// Return whether managed service authentication applies to this transport.
+/// Unknown addresses fail closed; only an explicitly identified Unix socket
+/// bypasses Basic authentication.
+fn service_authentication_required(
+    address: &salvo::conn::SocketAddr,
+    password: Option<&str>,
+) -> bool {
+    password.is_some() && !address.is_unix()
 }
 
 /// Return whether an Authorization header exactly matches the service credential.
@@ -1081,6 +1095,40 @@ mod tests {
             server_info_version(),
             crate::service::UPSTREAM_COMPAT_VERSION
         );
+    }
+
+    #[test]
+    fn service_authentication_requires_password_only_for_managed_tcp() {
+        let tcp: salvo::conn::SocketAddr = "127.0.0.1:14090"
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
+            .into();
+        let unknown = salvo::conn::SocketAddr::Unknown;
+
+        assert!(service_authentication_required(&tcp, Some("secret")));
+        assert!(service_authentication_required(&unknown, Some("secret")));
+        assert!(!service_authentication_required(&tcp, None));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn service_authentication_skips_explicit_unix_socket() {
+        let path = std::env::temp_dir().join(format!(
+            "ox-api-auth-{}-{}.sock",
+            std::process::id(),
+            now_millis()
+        ));
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind test Unix socket");
+        let unix: salvo::conn::SocketAddr = listener
+            .local_addr()
+            .expect("read test Unix socket address")
+            .into();
+
+        assert!(unix.is_unix());
+        assert!(!service_authentication_required(&unix, Some("secret")));
+
+        drop(listener);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

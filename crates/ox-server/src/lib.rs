@@ -347,61 +347,116 @@ pub async fn run_with(config: Config, opts: ServeOptions) -> Result<()> {
     outcome
 }
 
-/// Run an OpenCode-managed service on TCP only. The registration watcher is
-/// adopted by the composition runtime, so ownership loss follows normal
-/// graceful shutdown rather than leaving a detached task behind.
+/// The listener and shutdown policy for a managed service. A managed service
+/// always joins the configured TCP listener with the ox unix socket; `idle`
+/// only changes when the shared serving loop stops itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ServiceServePlan {
+    idle: Option<Duration>,
+    joins_unix_socket: bool,
+}
+
+fn service_serve_plan(idle: Option<Duration>) -> ServiceServePlan {
+    ServiceServePlan {
+        idle,
+        joins_unix_socket: true,
+    }
+}
+
+/// Complete the portion of managed startup that owns a registration. Every
+/// outcome after registration is written still attempts release; the first
+/// failure remains the returned error.
+async fn run_after_registration<Adoption, Serve, Release>(
+    adoption: Adoption,
+    serve: Serve,
+    release: Release,
+) -> Result<()>
+where
+    Adoption: std::future::Future<Output = Result<()>>,
+    Serve: std::future::Future<Output = Result<()>>,
+    Release: FnOnce() -> std::io::Result<()>,
+{
+    let mut first_error = adoption.await.err();
+    if first_error.is_none() {
+        first_error = serve.await.err();
+    }
+    if let Err(error) = release()
+        && first_error.is_none()
+    {
+        first_error = Some(error.into());
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Run an OpenCode-managed service on its configured TCP endpoint and the ox
+/// unix socket. Both listeners share one composed state/router and one serving
+/// loop. The registration watcher is adopted by the composition runtime, so
+/// ownership loss follows normal graceful shutdown rather than leaving a
+/// detached task behind.
 pub async fn run_service(
     mut config: Config,
     service_config: service::ServiceConfig,
     registration_path: PathBuf,
+    idle: Option<Duration>,
 ) -> Result<()> {
     let opts = ServeOptions::default();
     let _lock = instance::InstanceLock::acquire(&opts.lock_path)?;
     let bind = service::format_host_port(&service_config.hostname, service_config.port);
     let tcp = TcpListener::new(bind).try_bind().await?;
     let address = tcp.local_addr()?;
+    let uds = instance::bind_unix(&opts.socket_path).await?;
     config.listen = address.to_string();
     let password = service_config.password.clone();
-    let (state, router) = compose_with_service_password(config, Some(password.clone())).await?;
-    let registration = service::Registration {
-        id: service::new_registration_id(),
-        version: service::UPSTREAM_COMPAT_VERSION.to_owned(),
-        url: format!(
-            "http://{}",
-            service::format_host_port(&address.ip().to_string(), address.port())
-        ),
-        pid: std::process::id(),
-        password,
-    };
-    let registration_guard =
-        match service::write_registration(&registration_path, registration.clone()) {
-            Ok(guard) => guard,
-            Err(error) => {
-                if let Err(shutdown_error) = state.runtime.shutdown(&state).await {
-                    tracing::warn!(
-                        error = %shutdown_error,
-                        "managed service cleanup failed after registration write failure"
-                    );
-                }
-                return Err(error.into());
-            }
+    let plan = service_serve_plan(idle);
+    let outcome = async {
+        let (state, router) = compose_with_service_password(config, Some(password.clone())).await?;
+        let registration = service::Registration {
+            id: service::new_registration_id(),
+            version: service::UPSTREAM_COMPAT_VERSION.to_owned(),
+            url: format!(
+                "http://{}",
+                service::format_host_port(&address.ip().to_string(), address.port())
+            ),
+            pid: std::process::id(),
+            password,
         };
-    let runtime = Arc::clone(&state.runtime);
-    let stop = runtime.stop().clone();
-    let runtime_for_watch = Arc::clone(&runtime);
-    let watcher = tokio::spawn(service::watch_registration(
-        registration_path,
-        registration,
-        stop,
-        move || runtime_for_watch.stop().cancel(),
-    ));
-    if let Err(watcher) = state.runtime.adopt(watcher) {
-        watcher
-            .await
-            .map_err(|error| anyhow::anyhow!("service watcher failed: {error}"))?;
+        let registration_guard =
+            match service::write_registration(&registration_path, registration.clone()) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    if let Err(shutdown_error) = state.runtime.shutdown(&state).await {
+                        tracing::warn!(
+                            error = %shutdown_error,
+                            "managed service cleanup failed after registration write failure"
+                        );
+                    }
+                    return Err(error.into());
+                }
+            };
+        let runtime = Arc::clone(&state.runtime);
+        let stop = runtime.stop().clone();
+        let runtime_for_watch = Arc::clone(&runtime);
+        let watcher = tokio::spawn(service::watch_registration(
+            registration_path,
+            registration,
+            stop,
+            move || runtime_for_watch.stop().cancel(),
+        ));
+        let adoption_runtime = Arc::clone(&state.runtime);
+        let adoption = async move {
+            if let Err(watcher) = adoption_runtime.adopt(watcher) {
+                watcher
+                    .await
+                    .map_err(|error| anyhow::anyhow!("service watcher failed: {error}"))?;
+            }
+            Ok(())
+        };
+        let acceptor = JoinedAcceptor::new(tcp, uds);
+        let serve = async { serve_with(acceptor, state, router, plan.idle, Signals::Handle).await };
+        run_after_registration(adoption, serve, || registration_guard.release()).await
     }
-    let outcome = serve_with(tcp, state, router, None, Signals::Handle).await;
-    registration_guard.release()?;
+    .await;
+    let _ = std::fs::remove_file(&opts.socket_path);
     outcome
 }
 
@@ -832,5 +887,64 @@ async fn shutdown_signal() -> &'static str {
     tokio::select! {
         () = interrupt => "SIGINT",
         () = terminate => "SIGTERM",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ServiceServePlan, run_after_registration, service_serve_plan};
+    use std::time::Duration;
+
+    #[test]
+    fn managed_service_always_joins_tcp_and_unix_listeners() {
+        assert_eq!(
+            service_serve_plan(None),
+            ServiceServePlan {
+                idle: None,
+                joins_unix_socket: true,
+            }
+        );
+        assert_eq!(
+            service_serve_plan(Some(Duration::from_secs(15))),
+            ServiceServePlan {
+                idle: Some(Duration::from_secs(15)),
+                joins_unix_socket: true,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_service_cleanup_runs_when_watcher_adoption_fails() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let served = Arc::new(AtomicBool::new(false));
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let served_in_serve = Arc::clone(&served);
+        let cleaned_in_cleanup = Arc::clone(&cleaned);
+
+        let error = run_after_registration(
+            async { Err(anyhow::anyhow!("watcher adoption failed")) },
+            async move {
+                served_in_serve.store(true, Ordering::Release);
+                Ok(())
+            },
+            move || {
+                cleaned_in_cleanup.store(true, Ordering::Release);
+                Ok(())
+            },
+        )
+        .await
+        .expect_err("adoption failure must be returned");
+
+        assert_eq!(error.to_string(), "watcher adoption failed");
+        assert!(
+            !served.load(Ordering::Acquire),
+            "serving must not start after watcher adoption fails"
+        );
+        assert!(
+            cleaned.load(Ordering::Acquire),
+            "registration cleanup must run after watcher adoption fails"
+        );
     }
 }

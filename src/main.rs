@@ -150,9 +150,6 @@ where
             other => anyhow::bail!("unknown argument `{other}`"),
         }
     }
-    if outputs.service && outputs.exit_when_idle {
-        anyhow::bail!("cannot combine --service and --exit-when-idle");
-    }
     Ok(outputs)
 }
 
@@ -296,7 +293,10 @@ async fn main() -> Result<()> {
             let config = load_config()?;
             if outputs.service {
                 let (service, paths) = load_service()?;
-                return ox::run_service(config, service, paths.registration_path).await;
+                let idle = outputs
+                    .exit_when_idle
+                    .then_some(ox::ServeOptions::default().grace);
+                return ox::run_service(config, service, paths.registration_path, idle).await;
             }
             tracing::info!(
                 listen = %config.listen,
@@ -362,11 +362,11 @@ mod tests {
     }
 
     #[test]
-    fn service_mode_rejects_exit_when_idle() {
-        let error = parse_server_args(["--service", "--exit-when-idle"])
-            .expect_err("managed service mode cannot use idle shutdown");
-        assert!(error.to_string().contains("--service"));
-        assert!(error.to_string().contains("--exit-when-idle"));
+    fn service_mode_accepts_exit_when_idle() {
+        let outputs = parse_server_args(["--service", "--exit-when-idle"])
+            .expect("managed service mode should accept idle shutdown");
+        assert!(outputs.service);
+        assert!(outputs.exit_when_idle);
     }
 
     #[test]
