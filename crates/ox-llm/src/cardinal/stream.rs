@@ -9,10 +9,13 @@
 //!    lines ignored, multi-line `data` values joined with `\n`, and the same
 //!    line/event size limits.
 //! 2. [`ChunkDecoder`] — one payload to zero or more [`StreamEvent`]s, the
-//!    exact vocabulary of cardinal's `StreamDecoder::observe_raw` (both the
+//!    similar vocabulary to cardinal's `StreamDecoder::observe_raw` (both the
 //!    DeepSeek `reasoning_content` and OpenRouter `reasoning` field names,
 //!    the running tool-call index fallback, and usage-only chunks with an
-//!    empty `choices` array that do not terminate the stream).
+//!    empty `choices` array that do not terminate the stream). Deliberate
+//!    deviations: refusal deltas are surfaced as text; `finish_reason: error`
+//!    is an upstream error rather than a successful finish; and Cardinal's
+//!    in-band error object is checked before any event is emitted.
 //! 3. [`Assembler`] — the deltas folded back into a final assistant message:
 //!    text, reasoning, and tool calls keyed by index with concatenated
 //!    argument fragments.
@@ -22,7 +25,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use super::ChatError;
-use crate::cardinal::wire::Usage;
+use crate::cardinal::wire::{CardinalChatUsageProof, Usage};
 use crate::sse::SseDecoder;
 
 pub use crate::sse::SseFramer;
@@ -99,9 +102,7 @@ impl ChunkDecoder {
         }
         let value: serde_json::Value = serde_json::from_str(data)
             .map_err(|error| ChatError::Sse(format!("invalid JSON payload: {error}")))?;
-        if let Some(error) = value.get("error")
-            && !error.is_null()
-        {
+        if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
             return Err(ChatError::Upstream(describe_error(error)));
         }
         if let Some(usage) = usage_from(&value) {
@@ -118,6 +119,11 @@ impl ChunkDecoder {
         };
         if let Some(delta) = choice.get("delta") {
             if let Some(text) = delta.get("content").and_then(serde_json::Value::as_str)
+                && !text.is_empty()
+            {
+                out.push(StreamEvent::TextDelta(text.to_owned()));
+            }
+            if let Some(text) = delta.get("refusal").and_then(serde_json::Value::as_str)
                 && !text.is_empty()
             {
                 out.push(StreamEvent::TextDelta(text.to_owned()));
@@ -168,6 +174,9 @@ impl ChunkDecoder {
             .get("finish_reason")
             .and_then(serde_json::Value::as_str)
         {
+            if reason == "error" {
+                return Err(ChatError::Upstream("upstream stream failed".to_owned()));
+            }
             out.push(StreamEvent::Finish {
                 reason: reason.to_owned(),
             });
@@ -198,10 +207,10 @@ fn usage_from(value: &serde_json::Value) -> Option<Usage> {
     let completion_tokens = usage
         .get("completion_tokens")
         .and_then(serde_json::Value::as_u64)?;
-    Some(Usage {
+    Some(Usage::from_cardinal_chat(
         prompt_tokens,
         completion_tokens,
-        cached_tokens: usage
+        usage
             .get("prompt_cache_hit_tokens")
             .or_else(|| {
                 usage
@@ -209,12 +218,17 @@ fn usage_from(value: &serde_json::Value) -> Option<Usage> {
                     .and_then(|details| details.get("cached_tokens"))
             })
             .and_then(serde_json::Value::as_u64),
-        reasoning_tokens: usage
+        usage
             .get("completion_tokens_details")
             .and_then(|details| details.get("reasoning_tokens"))
             .or_else(|| usage.get("reasoning_tokens"))
             .and_then(serde_json::Value::as_u64),
-    })
+        usage
+            .get("completion_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens_included"))
+            .and_then(serde_json::Value::as_bool),
+        CardinalChatUsageProof::new(),
+    ))
 }
 
 /// A tool call reconstructed from its streaming fragments.

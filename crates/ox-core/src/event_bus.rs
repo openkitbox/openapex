@@ -483,6 +483,7 @@ impl EventBus {
                     write: row.get::<i64>(5)?,
                 },
                 estimated: None,
+                reasoning_reported: None,
             },
         ))
     }

@@ -9,9 +9,11 @@
 //!
 //! [`SseFramer`] turns bytes into payloads; [`SseChatStream`] drives a live
 //! `reqwest::Response` through a decoder and yields [`StreamEvent`]s with one
-//! terminal contract for both protocols: a stream that ends without any
-//! terminal signal is [`ChatError::EarlyClose`], and a seen terminal event ends
-//! it cleanly even if the explicit terminator never arrives.
+//! terminal contract for both protocols: `Finish` records a semantic finish but
+//! the stream continues to drain trailing events and errors until `Done` or
+//! EOF. EOF after `Finish` synthesizes `Done` only if framing and decoding
+//! succeeded; EOF without a terminal signal is [`ChatError::EarlyClose`]. An
+//! explicit `Done` ends the stream and discards everything after it.
 //!
 //! # Cancellation
 //!
@@ -104,16 +106,14 @@ impl SseFramer {
 
     /// Flush a trailing partial line/event (a connection that closed without a
     /// final blank line). Returns any final payload via `out`.
-    pub fn finish(&mut self, out: &mut Vec<String>) {
+    pub fn finish(&mut self, out: &mut Vec<String>) -> Result<(), ChatError> {
         if !self.line.is_empty() {
-            // Ignore framing errors on the flush path: the event boundary is
-            // best-effort, and an oversized trailing line is reported on the
-            // next `push` anyway.
-            let _ = self.end_line(out);
+            self.end_line(out)?;
         }
         if !self.data.is_empty() {
             out.push(self.take_event());
         }
+        Ok(())
     }
 
     fn end_line(&mut self, out: &mut Vec<String>) -> Result<(), ChatError> {
@@ -124,6 +124,8 @@ impl SseFramer {
             }
             return Ok(());
         }
+        std::str::from_utf8(&line)
+            .map_err(|_| ChatError::Sse("SSE line is not valid UTF-8".to_owned()))?;
         // Comment (keep-alive) lines: a leading `:` means the whole line is a
         // comment.
         if line[0] == b':' {
@@ -178,6 +180,7 @@ pub struct SseChatStream<D: SseDecoder> {
     framer: SseFramer,
     decoder: D,
     pending: VecDeque<StreamEvent>,
+    pending_error: Option<ChatError>,
     eof: bool,
     finished: bool,
     saw_terminal: bool,
@@ -192,6 +195,7 @@ impl<D: SseDecoder + Unpin> SseChatStream<D> {
             framer: SseFramer::new(),
             decoder,
             pending: VecDeque::new(),
+            pending_error: None,
             eof: false,
             finished: false,
             saw_terminal: false,
@@ -229,6 +233,9 @@ impl<D: SseDecoder + Unpin> Stream for SseChatStream<D> {
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         loop {
+            if this.finished {
+                return Poll::Ready(None);
+            }
             if let Some(event) = this.pending.pop_front() {
                 match event {
                     StreamEvent::Done => this.finished = true,
@@ -237,8 +244,9 @@ impl<D: SseDecoder + Unpin> Stream for SseChatStream<D> {
                 }
                 return Poll::Ready(Some(Ok(event)));
             }
-            if this.finished {
-                return Poll::Ready(None);
+            if let Some(error) = this.pending_error.take() {
+                this.finished = true;
+                return Poll::Ready(Some(Err(error)));
             }
             if this.eof {
                 this.finished = true;
@@ -270,13 +278,14 @@ impl<D: SseDecoder + Unpin> Stream for SseChatStream<D> {
             match read {
                 Ok(Some(bytes)) => {
                     if let Err(error) = this.framer.push(&bytes, &mut payloads) {
-                        this.finished = true;
-                        return Poll::Ready(Some(Err(error)));
+                        this.pending_error = Some(error);
                     }
                 }
                 Ok(None) => {
                     this.eof = true;
-                    this.framer.finish(&mut payloads);
+                    if let Err(error) = this.framer.finish(&mut payloads) {
+                        this.pending_error = Some(error);
+                    }
                 }
                 Err(error) => {
                     this.finished = true;
@@ -285,11 +294,32 @@ impl<D: SseDecoder + Unpin> Stream for SseChatStream<D> {
             }
             for payload in payloads {
                 let mut events = Vec::new();
-                if let Err(error) = this.decoder.decode(&payload, &mut events) {
-                    this.finished = true;
-                    return Poll::Ready(Some(Err(error)));
+                let result = this.decoder.decode(&payload, &mut events);
+                if let Err(error) = result {
+                    // A decoder failure in this payload takes precedence over
+                    // any terminator it may also have emitted.
+                    this.pending.extend(
+                        events
+                            .into_iter()
+                            .take_while(|event| !matches!(event, StreamEvent::Done)),
+                    );
+                    this.pending_error = Some(error);
+                    break;
                 }
-                this.pending.extend(events);
+                // Done is the explicit end of the stream. Ignore bytes after it,
+                // including a framing error later in the same read.
+                let mut done = false;
+                for event in events {
+                    done = matches!(event, StreamEvent::Done);
+                    this.pending.push_back(event);
+                    if done {
+                        break;
+                    }
+                }
+                if done {
+                    this.pending_error = None;
+                    break;
+                }
             }
             // Loop: yield buffered events, or keep reading.
         }

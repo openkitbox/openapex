@@ -164,7 +164,7 @@ pub enum FinishReason {
 // token-usage.ts
 // ---------------------------------------------------------------------------
 
-/// Upstream `TokenUsage.Info`, plus the ox-only `estimated` extension.
+/// Upstream `TokenUsage.Info`, plus ox-only estimate and provenance extensions.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 pub struct TokenUsage {
     pub input: i64,
@@ -177,6 +177,12 @@ pub struct TokenUsage {
     /// serialize exactly as upstream's shape.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub estimated: Option<bool>,
+    /// `Some(true)` means the output split includes a trusted reasoning count;
+    /// `Some(false)` means no trusted reasoning split was available (including
+    /// an estimate, an absent or unmarked count, or an invalid count). `None`
+    /// is retained only for historical rows that predate this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_reported: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]

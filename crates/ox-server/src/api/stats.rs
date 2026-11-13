@@ -404,6 +404,7 @@ impl MsgRow {
                     write: integer(&row.get_value(11)?),
                 },
                 estimated: None,
+                reasoning_reported: None,
             },
             cost: real(&row.get_value(12)?),
         })
@@ -665,6 +666,7 @@ async fn compaction_usage(
                 write: integer(&row.get_value(4)?),
             },
             estimated: None,
+            reasoning_reported: None,
         };
         add_tokens(&mut tokens, &row_tokens);
         cost += real(&row.get_value(5)?);
@@ -706,6 +708,7 @@ fn empty_tokens() -> TokenUsage {
         reasoning: 0,
         cache: TokenCache { read: 0, write: 0 },
         estimated: None,
+        reasoning_reported: None,
     }
 }
 

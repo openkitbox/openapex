@@ -358,8 +358,8 @@ impl ChatMessage {
 /// mirror its vendor-shape fallbacks (DeepSeek's flat `prompt_cache_hit_tokens`
 /// vs OpenAI's `prompt_tokens_details.cached_tokens`, and
 /// `completion_tokens_details.reasoning_tokens` vs bare `reasoning_tokens`).
-/// Deserialization goes through the stream decoder, not a derived impl — the
-/// vendor fallback keys cannot be expressed as plain fields.
+/// Deserialization goes through the Cardinal Chat stream decoder, not a derived
+/// impl — the vendor fallback keys cannot be expressed as plain fields.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct Usage {
     /// Prompt (input) tokens.
@@ -372,6 +372,71 @@ pub struct Usage {
     /// Reasoning tokens, when the vendor reports them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u64>,
+    /// Whether Cardinal Chat verified that reasoning is included in completion
+    /// tokens. This is private so only the Cardinal Chat decoder can accept the
+    /// upstream marker; other protocol decoders construct unmarked usage. It is
+    /// internal metadata and never appears in serialized usage or stream events.
+    #[serde(skip)]
+    reasoning_tokens_included: Option<bool>,
+}
+
+impl Usage {
+    /// Construct usage from a decoder that has no protocol-specific inclusion
+    /// proof. This keeps the reasoning split untrusted by default.
+    #[must_use]
+    pub(crate) fn new(
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        cached_tokens: Option<u64>,
+        reasoning_tokens: Option<u64>,
+    ) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+            reasoning_tokens,
+            reasoning_tokens_included: None,
+        }
+    }
+
+    /// Construct usage after the Cardinal Chat decoder accepted its inclusion
+    /// marker. Kept crate-private so arbitrary protocol decoders cannot assert
+    /// this trust boundary.
+    #[must_use]
+    pub(crate) fn from_cardinal_chat(
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        cached_tokens: Option<u64>,
+        reasoning_tokens: Option<u64>,
+        reasoning_tokens_included: Option<bool>,
+        _proof: CardinalChatUsageProof,
+    ) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+            reasoning_tokens,
+            reasoning_tokens_included,
+        }
+    }
+
+    /// Whether the Cardinal Chat decoder proved that reasoning is included in
+    /// completion tokens.
+    #[must_use]
+    pub fn reasoning_tokens_included(&self) -> Option<bool> {
+        self.reasoning_tokens_included
+    }
+}
+
+/// Proof that usage was decoded by the Cardinal Chat path. Its private field
+/// prevents other protocol implementations from manufacturing the trust token.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct CardinalChatUsageProof(());
+
+impl CardinalChatUsageProof {
+    pub(crate) fn new() -> Self {
+        Self(())
+    }
 }
 
 /// A tool call issued by the assistant.

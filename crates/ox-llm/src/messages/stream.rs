@@ -78,12 +78,12 @@ impl UsageAccum {
         let prompt = self.input.unwrap_or(0)
             + self.cache_read.unwrap_or(0)
             + self.cache_creation.unwrap_or(0);
-        Some(Usage {
-            prompt_tokens: prompt,
-            completion_tokens: self.output.unwrap_or(0),
-            cached_tokens: self.cache_read,
-            reasoning_tokens: None,
-        })
+        Some(Usage::new(
+            prompt,
+            self.output.unwrap_or(0),
+            self.cache_read,
+            None,
+        ))
     }
 }
 

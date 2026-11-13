@@ -700,6 +700,7 @@ fn cases() -> Vec<Case> {
                     write: 0,
                 },
                 estimated: None,
+                reasoning_reported: None,
             };
             vec![
                 block("c1", Running, "", false, None),

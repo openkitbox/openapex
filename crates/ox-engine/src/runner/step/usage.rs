@@ -119,15 +119,39 @@ fn tokens_for(usage: Option<Usage>, estimate: impl FnOnce() -> i64) -> TokenUsag
             reasoning: 0,
             cache: TokenCache { read: 0, write: 0 },
             estimated: Some(true),
+            reasoning_reported: Some(false),
         };
     };
     let (read, input) = prompt_split(&usage);
+    let (output, reasoning, reasoning_reported) = match (
+        usage.reasoning_tokens_included(),
+        usage.reasoning_tokens,
+    ) {
+        (Some(true), Some(reasoning)) if reasoning <= usage.completion_tokens => (
+            (usage.completion_tokens - reasoning) as i64,
+            reasoning as i64,
+            Some(true),
+        ),
+        (Some(true), Some(_)) => {
+            tracing::warn!(
+                "cardinal reported reasoning tokens greater than completion tokens; ignoring reasoning"
+            );
+            (usage.completion_tokens as i64, 0, Some(false))
+        }
+        (_, Some(reasoning)) => (
+            usage.completion_tokens as i64,
+            reasoning as i64,
+            Some(false),
+        ),
+        (_, None) => (usage.completion_tokens as i64, 0, Some(false)),
+    };
     TokenUsage {
         input,
-        output: usage.completion_tokens as i64,
-        reasoning: usage.reasoning_tokens.unwrap_or(0) as i64,
+        output,
+        reasoning,
         cache: TokenCache { read, write: 0 },
         estimated: None,
+        reasoning_reported,
     }
 }
 
