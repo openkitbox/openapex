@@ -1,5 +1,4 @@
-//! Location-scoped version control reads for the TUI diff viewer and the
-//! worktree panel: `server/src/handlers/vcs.ts` over
+//! Location-scoped version control reads for API clients and worktree tooling: `server/src/handlers/vcs.ts` over
 //! `core/src/plugin/vcs/git.ts` + `core/src/vcs/patch.ts`.
 //!
 //! Ported in full where it decides *what* the client sees:

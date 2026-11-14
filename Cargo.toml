@@ -1,7 +1,6 @@
 [workspace]
 members = [
   "crates/ox-acp",
-  "crates/ox-client",
   "crates/ox-core",
   "crates/ox-db",
   "crates/ox-engine",
@@ -10,7 +9,6 @@ members = [
   "crates/ox-schema",
   "crates/ox-server",
   "crates/ox-tools",
-  "crates/ox-tui",
 ]
 resolver = "2"
 
@@ -25,7 +23,6 @@ edition = "2024"
 anyhow = "1.0"
 base64 = "0.23"
 bytes = "1.12"
-crossterm = "0.29"
 dashmap = "6.2.1"
 dirs = "7.0.0"
 futures-core = "0.3"
@@ -41,7 +38,6 @@ libc = "0.2"
 # "mimalloc" feature — which would install its own — stays disabled. The
 # no_thp feature rides on the same libmimalloc-sys build.
 rustfs-mimalloc = { version = "0.7", features = ["no_thp"] }
-ox-client = { path = "crates/ox-client" }
 ox-acp = { path = "crates/ox-acp" }
 ox-core = { path = "crates/ox-core" }
 ox-db = { path = "crates/ox-db" }
@@ -51,7 +47,6 @@ ox-mcp = { path = "crates/ox-mcp" }
 ox-schema = { path = "crates/ox-schema" }
 ox-server = { path = "crates/ox-server" }
 ox-tools = { path = "crates/ox-tools" }
-ox-tui = { path = "crates/ox-tui" }
 rand = "0.10"
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
@@ -60,7 +55,6 @@ serde = "1.0"
 serde_json = "1.0"
 sha1 = "0.11"
 sha2 = "0.11"
-textwrap = "0.16"
 thiserror = "2"
 tokio = "1.53"
 tokio-util = "0.7"
@@ -68,7 +62,6 @@ toml = "1.1"
 tracing = "0.1"
 tracing-appender = "0.2.5"
 tracing-subscriber = "0.3"
-unicode-width = "0.2"
 url = "2"
 
 [package]
@@ -93,7 +86,6 @@ ox-mcp.workspace = true
 ox-schema.workspace = true
 ox-server.workspace = true
 ox-tools.workspace = true
-ox-tui.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 tracing-appender.workspace = true
@@ -108,10 +100,9 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt"] }
 
-# One binary shipped to users: spend compile time on it once. Thin LTO plus a
-# single codegen unit lets the optimizer see across the eleven crates (the
-# step loop, the projector and the TUI renderer all cross crate boundaries on
-# their hot paths), and stripping symbols keeps the release artefact small.
+# Single codegen unit lets the optimizer see across the ten crates (the
+# step loop and the projector cross crate boundaries on their hot paths), and
+# stripping symbols keeps the release artefact small.
 # Panics still unwind: the server recovers poisoned locks and tool tasks are
 # isolated by `tokio::spawn`, both of which `panic = "abort"` would defeat.
 [profile.release]

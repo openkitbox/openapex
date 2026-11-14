@@ -1,10 +1,10 @@
-//! ox — pure-Rust, opencode v2 compatible chat-protocol server and TUI.
+//! ox — pure-Rust, opencode v2 compatible chat-protocol server and ACP agent.
 //!
-//! One binary, three modes picked by the first argument: no subcommand opens
-//! the TUI (which starts `ox serve --exit-when-idle` on demand), `serve` runs
+//! One binary, two explicit modes picked by the first argument: `serve` runs
 //! the HTTP server, and `acp` runs the Agent Client Protocol translator
-//! (`src/acp`). The library half (`lib.rs`) exposes config/db/id/api so
-//! integration tests can drive the real router.
+//! (`src/acp`). With no subcommand, the binary starts the ordinary HTTP server.
+//! The library half (`lib.rs`) exposes config/db/id/api so integration tests can
+//! drive the real router.
 //!
 //! ox owns the process-wide allocator: turso's default `mimalloc` feature
 //! (which would install its own `#[global_allocator]`) is disabled in
@@ -66,16 +66,11 @@ impl Default for LogOutputs {
 /// What the command line asks `ox` to run.
 #[derive(Debug, Eq, PartialEq)]
 enum Command {
-    Tui,
     Serve(LogOutputs),
     Acp(Option<String>, LogOutputs),
 }
 
-/// Options the TUI reads itself from `std::env::args` (`--name X` or `--name=X`).
-const TUI_OPTIONS: [&str; 3] = ["--server", "--directory", "--session"];
-
-const USAGE: &str =
-    "usage: ox [--server URL] [--directory DIR] [--session ID] | ox serve [flags] | ox acp [flags]";
+const USAGE: &str = "usage: ox [flags] | ox serve [flags] | ox acp [flags]";
 
 fn parse_command<I, S>(args: I) -> Result<Command>
 where
@@ -84,7 +79,7 @@ where
 {
     let mut args = args.into_iter();
     let Some(first) = args.next() else {
-        return Ok(Command::Tui);
+        return Ok(Command::Serve(LogOutputs::default()));
     };
     match first.as_ref() {
         "serve" => Ok(Command::Serve(parse_server_args(args)?)),
@@ -93,35 +88,11 @@ where
             Ok(Command::Acp(explicit_base, outputs))
         }
         flag if flag.starts_with('-') => {
-            check_tui_args(
-                std::iter::once(first.as_ref().to_owned())
-                    .chain(args.map(|a| a.as_ref().to_owned())),
-            )?;
-            Ok(Command::Tui)
+            let server_args = std::iter::once(first).chain(args);
+            Ok(Command::Serve(parse_server_args(server_args)?))
         }
         other => anyhow::bail!("unknown subcommand `{other}`; {USAGE}"),
     }
-}
-
-/// Reject anything the TUI would not understand. The TUI parses its own
-/// options, so this only validates them.
-fn check_tui_args(args: impl IntoIterator<Item = String>) -> Result<()> {
-    let mut args = args.into_iter();
-    while let Some(argument) = args.next() {
-        let name = argument
-            .split_once('=')
-            .map_or(argument.as_str(), |(name, _)| name);
-        if !TUI_OPTIONS.contains(&name) {
-            if argument.starts_with('-') {
-                anyhow::bail!("unknown option `{argument}`; use `ox serve` to start the server");
-            }
-            anyhow::bail!("unknown argument `{argument}`; {USAGE}");
-        }
-        if !argument.contains('=') && args.next().is_none() {
-            anyhow::bail!("{name} needs a value");
-        }
-    }
-    Ok(())
 }
 
 fn parse_server_args<I, S>(args: I) -> Result<LogOutputs>
@@ -275,11 +246,9 @@ fn serve_options(outputs: &LogOutputs) -> ox::ServeOptions {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // Mode split happens before tracing init: the TUI owns the terminal (no
-    // logs), `acp` uses stdout as the NDJSON wire (logs go to stderr), and
-    // `serve` logs to stdout and/or a file.
+    // Mode split happens before tracing init: `acp` uses stdout as the NDJSON
+    // wire (logs go to stderr), and `serve` logs to stdout and/or a file.
     match parse_command(std::env::args().skip(1))? {
-        Command::Tui => ox_tui::run::run().await,
         Command::Acp(explicit_base, outputs) => {
             if let Some(base) = &explicit_base {
                 ox::acp::validate_base(base)?;

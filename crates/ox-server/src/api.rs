@@ -459,7 +459,7 @@ async fn query_projects(db: &Db) -> anyhow::Result<Vec<Project>> {
 }
 
 // ---------------------------------------------------------------------------
-// worktree.list / worktree.refresh — the TUI's Worktrees panel
+// worktree.list / worktree.refresh — the server's worktree API
 // ---------------------------------------------------------------------------
 
 /// `GET /api/worktree?projectID=` — a bare `Worktree.Directory[]` (upstream
@@ -481,17 +481,16 @@ async fn worktree_list(req: &mut Request, depot: &mut Depot, res: &mut Response)
     res.render(Json(crate::worktree::list(&directory).await));
 }
 
-/// `POST /api/worktree/refresh` — the panel calls this on open to reconcile a
-/// server-side inventory with git. ox keeps none, so it only acknowledges; the
+/// `POST /api/worktree/refresh` — clients call this to reconcile a server-side
+/// inventory with git. ox keeps none, so it only acknowledges; the
 /// following list already answers from fresh `git worktree list` state.
 #[handler] // operation_id: worktree.refresh
 async fn worktree_refresh(res: &mut Response) {
     res.status_code(StatusCode::NO_CONTENT);
 }
 
-/// Upstream `Worktree.CreateInput` as the TUI sends it: `projectID` plus an
-/// optional name (`dialog-open.tsx:462`), with `from`/`branch`/`directory`
-/// available to other clients.
+/// Upstream `Worktree.CreateInput`: `projectID` plus an optional name, with
+/// `from`/`branch`/`directory` available to clients.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WorktreeCreateBody {
@@ -519,9 +518,8 @@ struct WorktreeRemoveBody {
     force: bool,
 }
 
-/// `POST /api/worktree` — create a linked checkout and tell the panel to
-/// refresh. Answers `Worktree.Info` (`{ directory }`), the exact field the TUI
-/// navigates to afterwards.
+/// `POST /api/worktree` — create a linked checkout and return
+/// `Worktree.Info` (`{ directory }`).
 #[handler] // operation_id: worktree.create
 async fn worktree_create(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let Some(state) = state(depot, res) else {
@@ -552,8 +550,7 @@ async fn worktree_create(req: &mut Request, depot: &mut Depot, res: &mut Respons
 }
 
 /// `DELETE /api/worktree` — remove a linked checkout. A dirty checkout without
-/// `force` answers a `WorktreeError` carrying `forceRequired`, which is what the
-/// panel turns into its force-confirmation prompt.
+/// `force` answers a `WorktreeError` carrying `forceRequired`.
 #[handler] // operation_id: worktree.remove
 async fn worktree_remove(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let Some(state) = state(depot, res) else {

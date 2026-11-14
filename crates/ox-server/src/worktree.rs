@@ -1,10 +1,10 @@
-//! Read-only worktree inventory for the TUI's Worktrees panel.
+//! Read-only worktree inventory for the server's worktree API.
 //!
 //! Upstream (`packages/core/src/worktree.ts` + `worktree/strategies.ts`) keeps a
 //! `worktree` table, reconciles it with git through pluggable strategies, and
 //! exposes create/remove/refresh over `/api/worktree`. ox has none of that; this
-//! module answers the panel's *list* call straight from `git worktree list`, so
-//! the panel renders the checkouts that exist on disk instead of failing with
+//! module answers the list call straight from `git worktree list`, so clients
+//! can inspect the checkouts that exist on disk instead of failing with
 //! "No route for GET /api/worktree".
 //!
 //! Deliberate deviations, recorded here:
@@ -17,8 +17,7 @@
 //!   the repository root and carries no `strategy`; every linked checkout gets
 //!   `"git"` — the only strategy upstream ships.
 //! - **Fail-soft.** A non-repository directory, a missing `git` binary or a
-//!   hanging git all degrade to the directory itself. The panel is a reader; a
-//!   degraded list is better than a 500.
+//!   hanging git all degrade to the directory itself. The endpoint is read-only; a degraded list is better than a 500.
 //! - **No strategy table.** `POST /api/worktree` always uses the built-in git
 //!   strategy (`git worktree add --detach -- <directory> <ref|HEAD>`, upstream
 //!   `core/src/git.ts:1254`); there is no configured strategy list to select
@@ -99,8 +98,7 @@ async fn git_worktrees(directory: &str) -> Option<Vec<String>> {
     (!paths.is_empty()).then_some(paths)
 }
 
-/// Absolute, symlink-resolved form (the panel compares these against the
-/// locations it already holds, which `directory_of` canonicalizes the same way).
+/// Absolute, symlink-resolved form used by the endpoint and `directory_of`.
 fn canonical(directory: &str) -> String {
     let path = PathBuf::from(directory);
     path.canonicalize().unwrap_or(path).display().to_string()

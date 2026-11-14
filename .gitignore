@@ -4,6 +4,3 @@ reference/
 Taskfile.yml
 node_modules/
 .worktrees/
-
-# python venv for the visual parity tool
-skills/opencode-parity/visual/v/

@@ -1,6 +1,6 @@
 //! `/connect`'s server side, minimal subset: builtin providers and API keys.
 //!
-//! The upstream dialog reads `GET /api/integration`
+//! Upstream clients read `GET /api/integration`
 //! (`packages/tui/src/component/dialog-integration.tsx:110-117` via
 //! `packages/client/src/solid/data.ts:2117`) and submits a key to
 //! `POST /api/integration/{integrationID}/connect/key`, which answers **204**
@@ -13,16 +13,13 @@
 //! the previous one inside a write transaction) and then reuses
 //! [`crate::reload::run`]. The reload re-reads `ox.toml`, applies the stored
 //! credentials and rebuilds the router and model catalogue, so the new
-//! provider is usable **without a restart** — required, because the TUI's
-//! `connected()` (dialog-integration.tsx:1249-1271) re-syncs the integration,
-//! model and provider lists as soon as the 204 lands and then opens the model
-//! picker. Keys never touch `ox.toml`; the table mirrors upstream's own
+//! provider is usable **without a restart**; clients can re-sync the
+//! integration, model and provider lists as soon as the 204 lands. Keys never touch `ox.toml`; the table mirrors upstream's own
 //! `credential` store, and `Db::open` keeps the database file owner-only.
 //!
 //! Out of scope, deliberately: OAuth, command and external methods, the
 //! credential activate/update/remove endpoints and `GET /api/integration/{id}`.
-//! Known deviation: the TUI still offers rename / switch / remove on a
-//! connected row, and those calls get a 404.
+//! Rename, switch and remove methods remain out of scope and answer 404.
 
 use salvo::http::StatusCode;
 use salvo::prelude::*;

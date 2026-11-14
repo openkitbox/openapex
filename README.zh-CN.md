@@ -2,8 +2,10 @@
 
 [English](README.md) · **简体中文**
 
-opencode v2 聊天协议的纯 Rust 实现。一个二进制，三种模式：HTTP/SSE
-**服务端**、终端 **TUI**，以及让编辑器直接驱动 ox 的 **ACP agent**。
+OpenApex 是 opencode v2 聊天协议的独立 agent 实现，使用 OpenCode 作为
+UI：OpenCode 负责面向用户的交互，OpenApex 提供 agent 运行时、会话引擎、工具
+和 provider 接入。一个二进制提供 HTTP/SSE **服务端**，以及用于编辑器集成的
+**ACP agent**。
 
 ox 用自己的数据库和配置，都在 `~/.ox` 下；它既不读也不写 Bun 实现的那套文件。
 
@@ -17,21 +19,22 @@ ox 用自己的数据库和配置，都在 `~/.ox` 下；它既不读也不写 B
 ```bash
 cargo build --release
 
-./target/release/ox          # TUI：连上正在跑的服务端，没有就自己拉一个
+./target/release/ox          # HTTP 服务端，默认 127.0.0.1:8787
 ./target/release/ox serve    # HTTP 服务端，默认 127.0.0.1:8787
 ./target/release/ox acp      # 走 stdio 的 ACP agent，给编辑器用
 ```
 
-TUI 要能回答提问，得先配一个 provider —— 见 [配置](#配置)。
+## OpenCode 集成
 
-## 三种模式
+OpenApex 使用 OpenCode 作为 UI。启动 OpenApex HTTP 服务端后，将 OpenCode
+指向兼容的 API endpoint；OpenCode 负责会话交互和展示，OpenApex 负责 agent
+执行、会话、工具和 provider 接入。
 
-第一个参数决定模式。以 `-` 开头的参数、或者干脆没有参数，都进入 TUI。
+第一个参数决定模式。以 `-` 开头的参数、或者干脆没有参数，都启动 HTTP 服务端。
 
 | 模式 | 命令 | 行为 |
 |---|---|---|
-| TUI | `ox [--server URL] [--directory DIR] [--session ID]` | 通过 `~/.ox/run/ox.sock` 连服务端；没有服务端在听就自己拉起 `ox serve --exit-when-idle`，并持有一个 lease，让它在最后一个客户端退出后收尾。给了 `--server` 就走纯 HTTP，不拉进程、不持 lease。 |
-| 服务端 | `ox serve [--stdout\|--no-stdout] [--log-file PATH] [--exit-when-idle]` | 跑 HTTP/SSE API 和会话引擎。每个 home 只允许一个服务端：它拿实例锁，并绑定私有 unix socket。`--exit-when-idle` 让它在没有任何客户端持 lease 后退出。 |
+| 服务端 | `ox [flags]` 或 `ox serve [--stdout\|--no-stdout] [--log-file PATH] [--exit-when-idle]` | 跑 HTTP/SSE API 和会话引擎。每个 home 只允许一个服务端：它拿实例锁，并绑定私有 unix socket。`--exit-when-idle` 让它在没有任何客户端持 lease 后退出。 |
 | ACP agent | `ox acp [--server URL] [--log-file PATH] [--no-stdout]` | 在 stdin/stdout 上以换行分隔的 JSON-RPC 说 Agent Client Protocol。`GET /api/info` 有响应就挂到已在跑的服务端，否则在进程内用一个临时回环端口自托管服务端。stdout 专供协议用，所以日志走 stderr 或 `--log-file`。 |
 
 ## 文件位置
@@ -121,11 +124,11 @@ disabled = true
 ```
 
 `disabled` 默认为 `false`。设为 `true` 后，启动和重载配置时会跳过该服务器。
-可以在 TUI 的 `/mcps` 对话框中手动连接，作为临时覆盖；下次成功重载配置或重启
-服务端后，重新按配置决定是否连接。修改配置后执行 `/refresh` 或重启服务端生效。
+手动连接是临时覆盖；下次成功重载配置或重启服务端后，重新按配置决定是否连接。
+修改配置后重启服务端生效。
 
-MCP 连接和工具注册表是进程级的，不按会话隔离。通过 `/mcps` 连接或断开服务器会
-影响所有会话；工具以服务器名作为前缀暴露。
+MCP 连接和工具注册表是进程级的，不按会话隔离。连接或断开服务器会影响所有会话；
+工具以服务器名作为前缀暴露。
 
 ## 编辑器集成
 
@@ -153,12 +156,11 @@ MCP 连接和工具注册表是进程级的，不按会话隔离。通过 `/mcps
 | `ox-tools` | 内置工具集：从上游移植的文件与 shell 工具，外加子会话、todo、skill 和检索 |
 | `ox-mcp` | MCP 客户端 hub |
 | `ox-server` | HTTP API、实例锁与生命周期 |
-| `ox-tui` | 终端客户端 —— 见[它自己的 README](crates/ox-tui/README.md) |
 | `ox-acp` | 给编辑器用的 ACP 翻译层 |
 
 依赖是单向的。`ox-schema` 是大家一起用的契约；`ox-llm` 只依赖它、不依赖 ox 的其它
 部分；`ox-core` 在其上加了存储和事件总线；引擎与工具集再往上；`ox-server` 负责装配。
-`ox-tui` 和 `ox-acp` 是客户端 —— 它们只说公开的 HTTP 契约，不伸手进 runner。
+`ox-acp` 是客户端 —— 它只说公开的 HTTP 契约，不伸手进 runner。
 
 ## 开发
 
@@ -171,11 +173,6 @@ cargo build --release
 质量闸门是 `cargo clippy --workspace --all-targets`：这个仓库有意不带自动化测试，
 所以 clippy 干净就是标准。
 
-`Taskfile.yml` 包住了常用流程：`task clippy`（fmt 加 clippy）、`task prod-build`
-（带 `-C target-cpu=native` 的 release 构建）、`task prod`（该构建装到
-`/opt/bin`）、`task tui`（release 版 TUI，指向正在跑的服务端）。
-
 ## 文档
 
-- [TUI](crates/ox-tui/README.md) —— 按键、布局、demo
 - [Skills](skills/README.md) —— 项目 skill 的加载

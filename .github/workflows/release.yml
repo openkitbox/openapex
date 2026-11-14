@@ -5,11 +5,9 @@
 # compile with the runner's own compiler.
 #
 # Windows (x64/arm64) is deliberately absent: ox is unix-only today. The server
-# binds a unix domain socket (crates/ox-server/src/instance.rs), the shell tool
-# owns process groups and signals (crates/ox-tools/src/shell/process.rs), and
-# the TUI spawns the server into its own process group
-# (crates/ox-tui/src/lifecycle.rs). Add `windows-*` targets here only after
-# that layer is ported.
+# binds a unix domain socket (crates/ox-server/src/instance.rs), and the shell
+# tool owns process groups and signals (crates/ox-tools/src/shell/process.rs).
+# Add `windows-*` targets here only after those layers are ported.
 
 name: release
 

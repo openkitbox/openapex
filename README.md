@@ -2,9 +2,11 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-A pure-Rust implementation of the opencode v2 chat protocol. One binary, three
-modes: an HTTP/SSE **server**, a terminal **TUI**, and an **ACP agent** that
-lets editors drive ox directly.
+OpenApex is an independent agent implementation for the opencode v2 chat
+protocol. It uses OpenCode as its UI: OpenCode handles the user-facing
+conversation, while OpenApex provides the agent runtime, session engine, tools,
+and provider integration. One binary provides the HTTP/SSE **server** and an
+**ACP agent** for editor integrations.
 
 ox keeps its own database and configuration under `~/.ox`; it never reads or
 writes the Bun implementation's files.
@@ -19,23 +21,24 @@ writes the Bun implementation's files.
 ```bash
 cargo build --release
 
-./target/release/ox          # TUI: attaches to a running server, starting one if needed
+./target/release/ox          # HTTP server on 127.0.0.1:8787 by default
 ./target/release/ox serve    # HTTP server on 127.0.0.1:8787 by default
 ./target/release/ox acp      # ACP agent over stdio, for editors
 ```
 
-The TUI needs a provider to talk to before it can answer a prompt — see
-[Configuration](#configuration).
+## OpenCode integration
 
-## Modes
+OpenApex is designed to use OpenCode as its UI. Run the OpenApex HTTP server,
+then point OpenCode at its compatible API endpoint; OpenCode owns the
+conversation and presentation while OpenApex owns agent execution, sessions,
+tools and provider access.
 
 The first argument picks the mode. Anything starting with `-`, or no argument
-at all, opens the TUI.
+at all, starts the HTTP server.
 
 | Mode | Command | Behaviour |
 |---|---|---|
-| TUI | `ox [--server URL] [--directory DIR] [--session ID]` | Attaches to a server over `~/.ox/run/ox.sock`, spawning `ox serve --exit-when-idle` when nothing is listening and holding a lease so it exits with the last client. `--server` switches to plain HTTP with no spawn and no lease. |
-| Server | `ox serve [--stdout\|--no-stdout] [--log-file PATH] [--exit-when-idle]` | Runs the HTTP/SSE API and the session engine. One server per home: it takes the instance lock and binds the private unix socket. `--exit-when-idle` makes it exit once no client holds a lease. |
+| Server | `ox [flags]` or `ox serve [--stdout\|--no-stdout] [--log-file PATH] [--exit-when-idle]` | Runs the HTTP/SSE API and the session engine. One server per home: it takes the instance lock and binds the private unix socket. `--exit-when-idle` makes it exit once no client holds a lease. |
 | ACP agent | `ox acp [--server URL] [--log-file PATH] [--no-stdout]` | Speaks the Agent Client Protocol on stdin/stdout as newline-delimited JSON-RPC. Attaches to a running server when `GET /api/info` answers, otherwise hosts the server in-process on an ephemeral loopback port. stdout is reserved for the wire, so logs go to stderr or `--log-file`. |
 
 ## Files
@@ -128,14 +131,13 @@ disabled = true
 ```
 
 `disabled` defaults to `false`. A disabled server is skipped at startup and on
-configuration reload. The TUI `/mcps` dialog can connect it manually as a
-temporary override; the next successful reload or server restart applies the
-configured value again. After editing the configuration, run `/refresh` or
-restart the server to apply it.
+configuration reload. A manual connection is a temporary override; the next
+successful reload or server restart applies the configured value again. After
+editing the configuration, restart the server to apply it.
 
 MCP connections and the tool registry are process-wide, not session-specific.
-Connecting or disconnecting a server in `/mcps` affects every session. Its
-tools are exposed under the server name as a prefix.
+Connecting or disconnecting a server affects every session. Its tools are exposed
+under the server name as a prefix.
 
 ### Permissions
 
@@ -187,14 +189,13 @@ Two things differ from a plain CLI shim:
 | `ox-tools` | Built-in toolset: file and shell tools ported from upstream, plus subagents, todos, skills and search |
 | `ox-mcp` | MCP client hub |
 | `ox-server` | HTTP API, instance lock and lifecycle |
-| `ox-tui` | Terminal client — see [its README](crates/ox-tui/README.md) |
 | `ox-acp` | ACP translator for editors |
 
 Dependencies point one way. `ox-schema` is the contract everything shares;
 `ox-llm` depends on it and nothing else of ox's; `ox-core` adds storage and the
 event bus; the engine and the toolset sit above that; `ox-server` composes them.
-`ox-tui` and `ox-acp` are clients — they speak the public HTTP contract rather
-than reaching into the runner.
+`ox-acp` is a client — it speaks the public HTTP contract rather than reaching
+into the runner.
 
 ## Development
 
@@ -207,12 +208,6 @@ cargo build --release
 `cargo clippy --workspace --all-targets` is the quality gate: the tree carries
 no automated test suite by design, so treat a clean clippy run as the bar.
 
-A `Taskfile.yml` wraps the common flows: `task clippy` (fmt plus clippy),
-`task prod-build` (release build with `-C target-cpu=native`), `task prod`
-(that build, installed to `/opt/bin`) and `task tui` (release TUI pointed at a
-running server).
-
 ## Docs
 
-- [TUI](crates/ox-tui/README.md) — keys, layout, demo
 - [Skills](skills/README.md) — loading project skills

@@ -3,7 +3,7 @@
 //! The `acp` subcommand turns the ox HTTP/SSE API into an ACP stdio agent so
 //! editors (Zed, JetBrains, …) can drive ox directly. It is a pure translator:
 //! it depends only on ox's public wire contract (the same surface the
-//! opencode CLI/TUI consume) plus the `agent-client-protocol` crate — never on
+//! opencode clients consume) plus the `agent-client-protocol` crate — never on
 //! the runner, the projector, or the database.
 //!
 //! Topology: attach to an already-running ox server when one answers
@@ -11,14 +11,10 @@
 //! ephemeral loopback port (turso holds an exclusive lock on `ox.db`, so a
 //! spawned child server could never coexist with the user's server).
 //!
-//! Known limitation: the idle server the TUI spawns (`--exit-when-idle`)
-//! binds only the unix socket (the `exit_when_idle` branch of
-//! `ox_server::run_with`), while the probe here only tries TCP on
-//! `config.listen`. The probe therefore misses that server and falls through
-//! to own-mode, where opening `ox.db` fails on turso's exclusive lock and
-//! `ox acp` exits. This fails closed (two processes never share the
-//! database), but attach does not work; the fix is to probe the unix socket
-//! too.
+//! Known limitation: the ACP probe checks the configured TCP endpoint only.
+//! A server reachable through another transport is not detected, so ACP falls
+//! through to own-mode; opening the shared database then fails closed rather
+//! than allowing two processes to use it concurrently.
 
 mod bridge;
 mod stream;
