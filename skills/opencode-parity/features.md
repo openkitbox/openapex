@@ -329,7 +329,7 @@
 | sdk_call | session.background | component/prompt/index.tsx:544 |  | partial | 服务端已对齐(crates/ox-server/src/api/session/control.rs:47,04229b4);ox-client/ox-tui 未调用 |
 | sdk_call | session.command | component/prompt/index.tsx:1325 |  | todo |  |
 | sdk_call | session.compact | routes/session/index.tsx:1092 |  | partial | 服务端已对齐(crates/ox-server/src/api/session/compaction.rs,60cdfa5);偏差:跳过 SessionRevert.commit、进程级准入锁;ox-tui 未调用 |
-| sdk_call | session.environment | component/prompt/index.tsx:1255 |  | todo |  |
+| sdk_call | session.environment | component/prompt/index.tsx:1255 |  | partial | 服务端已对齐(`crates/ox-server/src/api/session/environment.rs`);ox-client/ox-tui 未调用 |
 | sdk_call | session.interrupt | component/prompt/index.tsx:524 |  | todo |  |
 | sdk_call | session.list | component/dialog-session-list.tsx:63 |  | todo |  |
 | sdk_call | session.move | component/dialog-workspaces.tsx:318 |  | todo |  |

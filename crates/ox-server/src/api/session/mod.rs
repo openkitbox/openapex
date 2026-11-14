@@ -18,6 +18,7 @@
 mod compaction;
 mod control;
 mod cursor;
+mod environment;
 mod inbox;
 mod lifecycle;
 mod listing;
@@ -34,6 +35,7 @@ pub(crate) use compaction::compact;
 pub(crate) use control::{
     background, command, generate, interrupt, move_session, permission_list, synthetic, wait_idle,
 };
+pub(crate) use environment::set as set_environment;
 pub(crate) use inbox::{inbox_cancel, inbox_list, inbox_update};
 pub(crate) use lifecycle::{create, delete_session_tree, fork, get, remove, update};
 pub(crate) use listing::list;

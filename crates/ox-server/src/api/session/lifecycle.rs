@@ -389,7 +389,11 @@ pub(crate) async fn delete_session_tree(app: &crate::api::AppState, root: &str) 
     for target in &order {
         let _ = app.runner.interrupt(target);
     }
-    app.services().tools.shells.stop_owned(&order).await;
+    let shells = Arc::clone(&app.services().tools.shells);
+    shells.stop_owned(&order).await;
+    for target in &order {
+        shells.clear_environment(target);
+    }
     for target in order {
         app.bus
             .publish(SessionEventData::SessionDeleted {

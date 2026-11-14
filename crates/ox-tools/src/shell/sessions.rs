@@ -864,6 +864,7 @@ pub struct SpawnRequest {
 /// The process-wide session table, cloned as an `Arc` by the tool and the API.
 pub struct ShellSessions {
     sessions: Mutex<HashMap<String, Arc<ShellSession>>>,
+    environments: Mutex<HashMap<String, HashMap<String, String>>>,
     closed: Mutex<bool>,
     tasks: crate::contract::TaskOwner,
     deliveries: crate::contract::TaskOwner,
@@ -896,6 +897,7 @@ impl ShellSessions {
             .map_or_else(|| "sh".into(), |name| name.to_string_lossy());
         Self {
             sessions: Mutex::default(),
+            environments: Mutex::default(),
             closed: Mutex::new(false),
             tasks: crate::contract::TaskOwner::default(),
             deliveries: crate::contract::TaskOwner::default(),
@@ -924,6 +926,24 @@ impl ShellSessions {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(observer);
     }
 
+    /// Replace the ephemeral environment used by future shells owned by
+    /// `session_id`.
+    pub fn set_environment(&self, session_id: &str, environment: HashMap<String, String>) {
+        self.environments
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(session_id.to_owned(), environment);
+    }
+
+    /// Forget a session's ephemeral environment. Clearing an unknown session
+    /// is intentionally idempotent.
+    pub fn clear_environment(&self, session_id: &str) {
+        self.environments
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(session_id);
+    }
+
     /// Spawn one session and start capturing its output. The caller decides
     /// how long to wait before returning control to the model.
     pub fn spawn(self: &Arc<Self>, request: SpawnRequest) -> std::io::Result<Arc<ShellSession>> {
@@ -932,7 +952,20 @@ impl ShellSessions {
             return Err(std::io::Error::other("shell admission is closed"));
         }
         let (events, _) = broadcast::channel(32);
-        let spawned = process::spawn(&self.shell, &request.command, &request.cwd)?;
+        let environment = request.owner.as_ref().and_then(|owner| {
+            self.environments
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&owner.session_id)
+                .cloned()
+        });
+        let spawned = process::spawn(
+            &self.shell,
+            &request.command,
+            &request.cwd,
+            environment.as_ref(),
+            request.owner.is_some(),
+        )?;
         let session = Arc::new(ShellSession {
             id: ox_schema::id::id("sh"),
             command: request.command,
@@ -1398,5 +1431,159 @@ async fn drive(session: Arc<ShellSession>, spawned: Spawned) {
     // this and the next spawn sweeps instead.
     if let Some(table) = session.table.upgrade() {
         table.evict_idle(ox_schema::id::now_millis());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    fn request(owner: Option<Owner>, command: &str) -> SpawnRequest {
+        SpawnRequest {
+            command: command.to_owned(),
+            cwd: PathBuf::from("."),
+            timeout_ms: None,
+            completion: None,
+            foreground: false,
+            owner,
+            metadata: Record::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_environment_is_applied_to_owned_shells() {
+        let sessions = Arc::new(ShellSessions::new());
+        sessions.set_environment(
+            "session-1",
+            HashMap::from([(String::from("OX_SESSION_ENV"), String::from("from-session"))]),
+        );
+
+        let shell = sessions
+            .spawn(request(
+                Some(Owner {
+                    session_id: String::from("session-1"),
+                    directory: String::from("."),
+                }),
+                "printf '%s' \"${OX_SESSION_ENV-absent}\"",
+            ))
+            .expect("shell should spawn");
+        shell.wait_settled(Duration::from_secs(2)).await;
+
+        assert_eq!(shell.poll(0, 1024).0.output, "from-session");
+    }
+
+    #[tokio::test]
+    async fn owned_shells_receive_terminal_environment_variables() {
+        let sessions = Arc::new(ShellSessions::new());
+        let shell = sessions
+            .spawn(request(
+                Some(Owner {
+                    session_id: String::from("session-1"),
+                    directory: String::from("."),
+                }),
+                "printf '%s|%s' \"${TERM-absent}\" \"${OPENCODE_TERMINAL-absent}\"",
+            ))
+            .expect("owned shell should spawn");
+        shell.wait_settled(Duration::from_secs(2)).await;
+
+        assert_eq!(
+            shell.poll(0, 1024).0.output,
+            "xterm-256color|1",
+            "owned shells must receive the upstream terminal environment"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_environment_replaces_and_does_not_affect_unowned_shells() {
+        let sessions = Arc::new(ShellSessions::new());
+        sessions.set_environment(
+            "session-1",
+            HashMap::from([(String::from("OX_SESSION_ENV"), String::from("old"))]),
+        );
+        sessions.set_environment(
+            "session-1",
+            HashMap::from([(String::from("OX_SESSION_ENV"), String::from("new"))]),
+        );
+
+        let owned = sessions
+            .spawn(request(
+                Some(Owner {
+                    session_id: String::from("session-1"),
+                    directory: String::from("."),
+                }),
+                "printf '%s' \"${OX_SESSION_ENV-absent}\"",
+            ))
+            .expect("owned shell should spawn");
+        let unowned = sessions
+            .spawn(request(None, "printf '%s' \"${OX_SESSION_ENV-absent}\""))
+            .expect("shell should spawn");
+        owned.wait_settled(Duration::from_secs(2)).await;
+        unowned.wait_settled(Duration::from_secs(2)).await;
+
+        assert_eq!(owned.poll(0, 1024).0.output, "new");
+        assert_eq!(unowned.poll(0, 1024).0.output, "absent");
+    }
+
+    #[tokio::test]
+    async fn session_environment_cannot_restore_herdr_variables() {
+        let sessions = Arc::new(ShellSessions::new());
+        sessions.set_environment(
+            "session-1",
+            HashMap::from([(String::from("HERDR_FAKE"), String::from("must-remove"))]),
+        );
+
+        let shell = sessions
+            .spawn(request(
+                Some(Owner {
+                    session_id: String::from("session-1"),
+                    directory: String::from("."),
+                }),
+                "printf '%s' \"${HERDR_FAKE-absent}\"",
+            ))
+            .expect("shell should spawn");
+        shell.wait_settled(Duration::from_secs(2)).await;
+
+        assert_eq!(shell.poll(0, 1024).0.output, "absent");
+    }
+
+    #[tokio::test]
+    async fn session_environment_replaces_inherited_process_environment() {
+        let sessions = Arc::new(ShellSessions::new());
+        sessions.set_environment(
+            "session-1",
+            HashMap::from([(String::from("OX_SESSION_ENV"), String::from("set"))]),
+        );
+
+        let shell = sessions
+            .spawn(request(
+                Some(Owner {
+                    session_id: String::from("session-1"),
+                    directory: String::from("."),
+                }),
+                "printf '%s' \"${CARGO_MANIFEST_DIR-absent}\"",
+            ))
+            .expect("shell should spawn");
+        shell.wait_settled(Duration::from_secs(2)).await;
+
+        assert_eq!(shell.poll(0, 1024).0.output, "absent");
+    }
+
+    #[tokio::test]
+    async fn shell_without_session_environment_inherits_process_environment() {
+        let sessions = Arc::new(ShellSessions::new());
+        let expected = std::env::var("CARGO_MANIFEST_DIR")
+            .expect("test process should have CARGO_MANIFEST_DIR");
+
+        let shell = sessions
+            .spawn(request(
+                None,
+                "printf '%s' \"${CARGO_MANIFEST_DIR-absent}\"",
+            ))
+            .expect("shell should spawn");
+        shell.wait_settled(Duration::from_secs(2)).await;
+
+        assert_eq!(shell.poll(0, 1024).0.output, expected);
     }
 }

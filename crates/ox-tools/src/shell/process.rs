@@ -12,6 +12,7 @@
 //!   reader reaches EOF exactly when every process in the command's tree
 //!   (including background grandchildren) has closed its output.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io;
@@ -106,7 +107,13 @@ fn pane_identity_vars(vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<O
 /// Spawn `shell -c command` in `cwd` as the leader of a new process group,
 /// with stdin at `/dev/null` and stdout+stderr on one pipe. Must be called
 /// inside a tokio runtime (the read end is registered with its reactor).
-pub(super) fn spawn(shell: &Path, command: &str, cwd: &Path) -> io::Result<Spawned> {
+pub(super) fn spawn(
+    shell: &Path,
+    command: &str,
+    cwd: &Path,
+    environment: Option<&HashMap<String, String>>,
+    owned_session: bool,
+) -> io::Result<Spawned> {
     let (read, write) = io::pipe()?;
     let write_err = write.try_clone()?;
     let mut cmd = Command::new(shell);
@@ -118,8 +125,27 @@ pub(super) fn spawn(shell: &Path, command: &str, cwd: &Path) -> io::Result<Spawn
         .stderr(write_err)
         .process_group(0)
         .kill_on_drop(true);
+    if let Some(environment) = environment {
+        // A configured session environment replaces the inherited process
+        // environment. With no configured environment this branch is skipped,
+        // preserving the shell's normal inherited environment.
+        cmd.env_clear();
+        cmd.envs(environment);
+    }
+    if owned_session {
+        // Match upstream Session.shell: every session-owned local shell gets
+        // a stable terminal identity, even when no custom session environment
+        // has been configured.
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("OPENCODE_TERMINAL", "1");
+    }
     for key in pane_identity_vars(std::env::vars_os()) {
         cmd.env_remove(key);
+    }
+    if let Some(environment) = environment {
+        for key in environment.keys().filter(|key| key.starts_with("HERDR_")) {
+            cmd.env_remove(key);
+        }
     }
     let child = cmd.spawn()?;
     // `cmd` owns the parent's copies of the write ends; release them so EOF
