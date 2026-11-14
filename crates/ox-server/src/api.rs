@@ -249,13 +249,28 @@ async fn location_get(req: &mut Request, depot: &mut Depot, res: &mut Response) 
     // resolving its project; the client anchors the session's project on this
     // response.
     let directory = compat::directory_of(req);
-    let (project_id, project_directory) =
-        crate::api::session::resolve_project(&state.db, &directory).await;
+    let project =
+        match crate::project::resolve_project(&state.db, std::path::Path::new(&directory)).await {
+            Ok(project) => project,
+            Err(error) => {
+                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
+                res.render(Json(serde_json::json!({
+                    "_tag": "InternalError",
+                    "message": format!("project resolution failed: {error}"),
+                })));
+                return;
+            }
+        };
+    if let Err(error) = crate::project::activate_project(&state.db, &project.id, now_millis()).await
+    {
+        session::unknown_error(res, &error);
+        return;
+    }
     res.render(Json(LocationInfo {
         project: LocationProject {
-            id: project_id,
-            directory: project_directory,
-            canonical: directory.clone(),
+            id: project.id,
+            directory: project.directory.to_string_lossy().into_owned(),
+            canonical: project.canonical.to_string_lossy().into_owned(),
         },
         directory,
     }));
@@ -371,15 +386,33 @@ async fn location_reload(req: &mut Request, depot: &mut Depot, res: &mut Respons
 // project.list — GET /api/project
 // ---------------------------------------------------------------------------
 
-/// Upstream `Project` schema (required: id, canonical, time, sandboxes).
-/// Reads the `project` table when the DB file is shared with an upstream
-/// opencode server; otherwise returns a single synthetic project.
+/// Upstream `Project.Info` schema. Rows are durable project identities; the
+/// list endpoint never invents a project for the server working directory.
 #[derive(Serialize)]
 struct Project {
     id: String,
     canonical: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vcs: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    icon: Option<ProjectIcon>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    commands: Option<serde_json::Value>,
     time: ProjectTime,
     sandboxes: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ProjectIcon {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "override")]
+    override_value: Option<String>,
+    #[serde(rename = "color", skip_serializing_if = "Option::is_none")]
+    color: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -387,70 +420,81 @@ struct ProjectTime {
     created: i64,
     updated: i64,
     active: i64,
-}
-
-fn synthetic_project(directory: &std::path::Path) -> Project {
-    // `state.directory` is already canonicalized at startup.
-    let now = now_millis();
-    Project {
-        id: "default".to_owned(),
-        canonical: directory.to_string_lossy().into_owned(),
-        time: ProjectTime {
-            created: now,
-            updated: now,
-            active: now,
-        },
-        sandboxes: Vec::new(),
-    }
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archived: Option<i64>,
 }
 
 #[handler] // operation_id: project.list
-async fn project_list(depot: &mut Depot, res: &mut Response) {
+async fn project_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let Some(state) = state(depot, res) else {
         return;
     };
 
-    let projects = if state.db.table_exists("project").await.unwrap_or(false) {
-        // Shared upstream DB: map its `project` table rows onto the protocol
-        // shape (`worktree` column -> `canonical` field). Falls back to the
-        // synthetic project if the query fails (e.g. schema drift).
-        match query_projects(&state.db).await {
-            Ok(rows) => rows,
-            Err(err) => {
-                tracing::warn!(error = %err, "project table exists but query failed; using synthetic project");
-                vec![synthetic_project(&state.directory)]
-            }
+    let archived = match req.query::<String>("archived").as_deref() {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(value) => {
+            session::invalid_request(res, &format!("Invalid archived: {value}"));
+            return;
         }
-    } else {
-        vec![synthetic_project(&state.directory)]
+    };
+    let projects = match query_projects(&state.db, archived).await {
+        Ok(rows) => rows,
+        Err(error) => {
+            session::unknown_error(res, &error);
+            return;
+        }
     };
 
     res.render(Json(projects));
 }
 
-async fn query_projects(db: &Db) -> anyhow::Result<Vec<Project>> {
+async fn query_projects(db: &Db, archived: bool) -> anyhow::Result<Vec<Project>> {
     // Upstream's drizzle schema stores the canonical directory in the
     // `worktree` column and exposes it as `canonical` in the protocol
     // (`core/src/project.ts`: `canonical: row.worktree`). `sandboxes` is a
     // JSON-encoded TEXT array of strings.
     let conn = db.acquire().await?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, worktree, time_created, time_updated, time_active, sandboxes FROM project",
-        )
-        .await?;
+    let sql = if archived {
+        "SELECT id, worktree, vcs, name, icon_url, icon_url_override, icon_color,
+                commands, time_created, time_updated, time_active, time_archived, sandboxes
+         FROM project ORDER BY time_active DESC, id ASC"
+    } else {
+        "SELECT id, worktree, vcs, name, icon_url, icon_url_override, icon_color,
+                commands, time_created, time_updated, time_active, time_archived, sandboxes
+         FROM project WHERE time_archived IS NULL ORDER BY time_active DESC, id ASC"
+    };
+    let mut stmt = conn.prepare(sql).await?;
     let mut rows = stmt.query(()).await?;
     let mut out = Vec::new();
     while let Some(row) = rows.next().await? {
-        let sandboxes_raw: String = row.get(5)?;
+        let sandboxes_raw: String = row.get(12)?;
         let sandboxes: Vec<String> = serde_json::from_str(&sandboxes_raw).unwrap_or_default();
         out.push(Project {
             id: row.get(0)?,
             canonical: row.get(1)?,
+            vcs: row.get(2)?,
+            name: row.get(3)?,
+            icon: {
+                let url: Option<String> = row.get(4)?;
+                let override_value: Option<String> = row.get(5)?;
+                let color: Option<String> = row.get(6)?;
+                (url.is_some() || override_value.is_some() || color.is_some()).then_some(
+                    ProjectIcon {
+                        url,
+                        override_value,
+                        color,
+                    },
+                )
+            },
+            commands: row
+                .get::<Option<String>>(7)?
+                .and_then(|raw| serde_json::from_str(&raw).ok()),
             time: ProjectTime {
-                created: row.get(2)?,
-                updated: row.get(3)?,
-                active: row.get::<Option<i64>>(4)?.unwrap_or(0),
+                created: row.get(8)?,
+                updated: row.get(9)?,
+                active: row.get::<Option<i64>>(10)?.unwrap_or(0),
+                archived: row.get(11)?,
             },
             sandboxes,
         });
@@ -590,7 +634,7 @@ fn worktree_error(res: &mut Response, failure: crate::worktree::Failure) {
 /// otherwise the directory the client asked about (`x-opencode-directory`).
 async fn worktree_directory(state: &AppState, req: &mut Request, requested: &str) -> String {
     if !requested.is_empty() && state.db.table_exists("project").await.unwrap_or(false) {
-        match query_projects(&state.db).await {
+        match query_projects(&state.db, true).await {
             Ok(rows) => {
                 if let Some(project) = rows.into_iter().find(|project| project.id == requested) {
                     return project.canonical;

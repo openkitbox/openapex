@@ -13,7 +13,7 @@ use super::response::{
     invalid_request, invalid_request_kind, message_not_found, no_content, parse_body,
     session_not_found, unknown_error,
 };
-use super::session_row::{load_children, load_session, resolve_project, subpath_of};
+use super::session_row::{canonical_directory, load_children, load_session, subpath_of};
 use crate::api::state;
 
 // ---------------------------------------------------------------------------
@@ -80,77 +80,100 @@ pub(crate) async fn create(req: &mut Request, depot: &mut Depot, res: &mut Respo
 
     // Location, metadata and permissions are inherited from the parent the way
     // upstream inherits them in `Session.create`.
-    let (location, subpath, parent_metadata, parent_permissions, parent_agent, parent_model) =
-        match &body.parent_id {
-            Some(parent_id) => match load_session(&app.db, parent_id).await {
-                Ok(Some(parent)) => {
-                    let model = parent
-                        .model
-                        .as_deref()
-                        .and_then(|raw| serde_json::from_str::<ModelRef>(raw).ok());
-                    let metadata = parent
-                        .metadata
-                        .as_deref()
-                        .and_then(|raw| serde_json::from_str::<SessionMetadata>(raw).ok());
-                    let permissions = parent
-                        .permission
-                        .as_deref()
-                        .and_then(|raw| serde_json::from_str::<Vec<Rule>>(raw).ok());
-                    (
-                        LocationRef {
-                            directory: parent.directory.clone(),
-                            workspace_id: parent.workspace_id.clone(),
-                        },
-                        parent.path.clone(),
-                        metadata,
-                        permissions,
-                        parent.agent.clone(),
-                        model,
-                    )
-                }
-                Ok(None) => {
-                    session_not_found(res, parent_id);
-                    return;
-                }
+    let (location, subpath, project_id, parent_metadata, parent_permissions) = match &body.parent_id
+    {
+        Some(parent_id) => match load_session(&app.db, parent_id).await {
+            Ok(Some(parent)) => {
+                let project = match crate::project::resolve_project_canonical(
+                    &app.db,
+                    std::path::Path::new(&parent.directory),
+                )
+                .await
+                {
+                    Ok(project) => project,
+                    Err(error) => {
+                        unknown_error(res, &error);
+                        return;
+                    }
+                };
+                let metadata = parent
+                    .metadata
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<SessionMetadata>(raw).ok());
+                let permissions = parent
+                    .permission
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<Vec<Rule>>(raw).ok());
+                let subpath = subpath_of(&parent.directory, &project.directory.to_string_lossy());
+                (
+                    LocationRef {
+                        directory: parent.directory.clone(),
+                        workspace_id: parent.workspace_id.clone(),
+                    },
+                    subpath,
+                    project.id,
+                    metadata,
+                    permissions,
+                )
+            }
+            Ok(None) => {
+                session_not_found(res, parent_id);
+                return;
+            }
+            Err(error) => {
+                unknown_error(res, &error);
+                return;
+            }
+        },
+        None => {
+            let directory = body
+                .location
+                .as_ref()
+                .map(|l| l.directory.clone())
+                .or(request_directory)
+                .unwrap_or_else(|| app.directory.to_string_lossy().into_owned());
+            let directory = match canonical_directory(&directory).await {
+                Ok(directory) => directory,
                 Err(error) => {
                     unknown_error(res, &error);
                     return;
                 }
-            },
-            None => {
-                let directory = body
-                    .location
-                    .as_ref()
-                    .map(|l| l.directory.clone())
-                    .or(request_directory)
-                    .unwrap_or_else(|| app.directory.to_string_lossy().into_owned());
-                let (_, project_directory) = resolve_project(&app.db, &directory).await;
-                (
-                    LocationRef {
-                        directory: directory.clone(),
-                        workspace_id: body.location.as_ref().and_then(|l| l.workspace_id.clone()),
-                    },
-                    subpath_of(&directory, &project_directory),
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-            }
-        };
-
-    let (project_id, _) = resolve_project(&app.db, &location.directory).await;
+            };
+            let project = match crate::project::resolve_project_canonical(
+                &app.db,
+                std::path::Path::new(&directory),
+            )
+            .await
+            {
+                Ok(project) => project,
+                Err(error) => {
+                    unknown_error(res, &error);
+                    return;
+                }
+            };
+            (
+                LocationRef {
+                    directory: directory.clone(),
+                    workspace_id: body.location.as_ref().and_then(|l| l.workspace_id.clone()),
+                },
+                subpath_of(&directory, &project.directory.to_string_lossy()),
+                project.id,
+                None,
+                None,
+            )
+        }
+    };
 
     let event = SessionEventData::SessionCreated {
         session_id: session_id.clone(),
-        project_id,
+        project_id: project_id.clone(),
         location,
         subpath,
         parent_id: body.parent_id.clone(),
         slug: ox_schema::slug::create(),
         title: body.title.clone(),
-        agent: body.agent.clone().or(parent_agent),
-        model: body.model.clone().or(parent_model),
+        agent: body.agent.clone(),
+        model: body.model.clone(),
         metadata: body.metadata.clone().or(parent_metadata),
         permissions: body.permissions.clone().or(parent_permissions),
         version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -167,9 +190,20 @@ pub(crate) async fn create(req: &mut Request, depot: &mut Depot, res: &mut Respo
         }
         return;
     }
-
     match load_session(&app.db, &session_id).await {
-        Ok(Some(row)) => res.render(Json(json!({ "data": row.info() }))),
+        Ok(Some(row)) => {
+            if let Err(error) =
+                crate::project::activate_project(&app.db, &project_id, ox_schema::id::now_millis())
+                    .await
+            {
+                tracing::warn!(
+                    error = %error,
+                    project = %project_id,
+                    "unable to record project activity after session create"
+                );
+            }
+            res.render(Json(json!({ "data": row.info() })));
+        }
         Ok(None) => unknown_error(res, &anyhow!("session `{session_id}` missing after create")),
         Err(error) => unknown_error(res, &error),
     }

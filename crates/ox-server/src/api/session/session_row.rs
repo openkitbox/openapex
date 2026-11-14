@@ -18,7 +18,7 @@ pub(super) const SESSION_COLUMNS: &str = "id, project_id, workspace_id, parent_i
 /// are parsed lazily in [`SessionRow::info`].
 pub(super) struct SessionRow {
     pub(super) id: String,
-    project_id: String,
+    pub(super) project_id: String,
     pub(super) workspace_id: Option<String>,
     parent_id: Option<String>,
     fork_session_id: Option<String>,
@@ -209,27 +209,14 @@ pub(super) async fn load_children(db: &Db, parent_id: &str) -> Result<Vec<String
     Ok(ids)
 }
 
-/// The project a session belongs to: the shared `project` table row whose
-/// `worktree` is the directory, else the synthetic `default` project rooted at
-/// the directory itself (ox has no worktree discovery).
-pub(crate) async fn resolve_project(db: &Db, directory: &str) -> (String, String) {
-    if db.table_exists("project").await.unwrap_or(false) {
-        // A missing or unreadable `project` table falls through to the
-        // synthetic project, exactly as the old `.call` error did.
-        let found: Result<Option<String>> = async {
-            let conn = db.acquire().await?;
-            let mut stmt = conn
-                .prepare("SELECT id FROM project WHERE worktree = ?1 LIMIT 1")
-                .await?;
-            let row = ox_db::optional(&mut stmt, [directory]).await?;
-            Ok(row.map(|row| row.get::<String>(0)).transpose()?)
-        }
-        .await;
-        if let Ok(Some(id)) = found {
-            return (id, directory.to_owned());
-        }
-    }
-    ("default".to_owned(), directory.to_owned())
+pub(super) async fn canonical_directory(directory: &str) -> Result<String> {
+    let path = directory.to_owned();
+    Ok(
+        tokio::task::spawn_blocking(move || std::fs::canonicalize(path))
+            .await??
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 /// `subpath` for a location inside a project directory: the relative remainder,
@@ -244,4 +231,17 @@ pub(super) fn subpath_of(directory: &str, project_directory: &str) -> Option<Str
     let relative = directory.strip_prefix(project_directory)?;
     let trimmed = relative.trim_start_matches('/');
     Some(trimmed.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::subpath_of;
+
+    #[test]
+    fn subpath_of_returns_nested_directory_relative_to_project_root() {
+        assert_eq!(
+            subpath_of("/workspace/project/packages/app", "/workspace/project"),
+            Some("packages/app".to_owned())
+        );
+    }
 }

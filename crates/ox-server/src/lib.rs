@@ -6,6 +6,7 @@
 pub mod api;
 pub mod instance;
 pub mod lifecycle;
+pub mod project;
 pub(crate) mod reload;
 pub mod runtime;
 pub mod service;

@@ -11,7 +11,7 @@ use super::inbox::load_inbox_row;
 use super::response::{
     conflict_error, invalid_request, no_content, parse_body, session_not_found, unknown_error,
 };
-use super::session_row::{load_session, resolve_project, subpath_of};
+use super::session_row::{load_session, subpath_of};
 use crate::api::state;
 
 // ---------------------------------------------------------------------------
@@ -205,9 +205,16 @@ pub(crate) async fn generate(req: &mut Request, depot: &mut Depot, res: &mut Res
         invalid_request(res, "Missing prompt");
         return;
     }
-    if !matches!(load_session(&app.db, &session_id).await, Ok(Some(_))) {
-        session_not_found(res, &session_id);
-        return;
+    match load_session(&app.db, &session_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            session_not_found(res, &session_id);
+            return;
+        }
+        Err(error) => {
+            unknown_error(res, &error);
+            return;
+        }
     }
     match app.runner.generate(&session_id, prompt_text).await {
         Ok(text) => {
@@ -253,9 +260,16 @@ pub(crate) async fn move_session(req: &mut Request, depot: &mut Depot, res: &mut
     let Some(body) = parse_body::<MoveBody>(req, res).await else {
         return;
     };
-    let Some(session) = load_session(&app.db, &session_id).await.ok().flatten() else {
-        session_not_found(res, &session_id);
-        return;
+    let session = match load_session(&app.db, &session_id).await {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            session_not_found(res, &session_id);
+            return;
+        }
+        Err(error) => {
+            unknown_error(res, &error);
+            return;
+        }
     };
     let raw = body.directory.trim();
     if raw.is_empty() {
@@ -290,14 +304,23 @@ pub(crate) async fn move_session(req: &mut Request, depot: &mut Depot, res: &mut
         return;
     }
     let directory = canonical.display().to_string();
-    let (project_id, project_directory) = resolve_project(&app.db, &directory).await;
+    let project =
+        match crate::project::resolve_project_canonical(&app.db, std::path::Path::new(&directory))
+            .await
+        {
+            Ok(project) => project,
+            Err(error) => {
+                unknown_error(res, &error);
+                return;
+            }
+        };
     let payload = ox_schema::inbox::MovePayload {
         location: LocationRef {
             directory: directory.clone(),
             workspace_id: session.workspace_id.clone(),
         },
-        project_id,
-        subpath: subpath_of(&directory, &project_directory),
+        project_id: project.id,
+        subpath: subpath_of(&directory, &project.directory.to_string_lossy()),
     };
     if let Err(error) = app
         .bus
@@ -398,9 +421,16 @@ pub(crate) async fn synthetic(req: &mut Request, depot: &mut Depot, res: &mut Re
     let Some(body) = parse_body::<SyntheticBody>(req, res).await else {
         return;
     };
-    if !matches!(load_session(&app.db, &session_id).await, Ok(Some(_))) {
-        session_not_found(res, &session_id);
-        return;
+    match load_session(&app.db, &session_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            session_not_found(res, &session_id);
+            return;
+        }
+        Err(error) => {
+            unknown_error(res, &error);
+            return;
+        }
     }
 
     let message_id = body.id.clone().unwrap_or_else(|| id::id("msg"));

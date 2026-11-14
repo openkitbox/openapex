@@ -525,6 +525,26 @@ const MIGRATION_V21: &str = r#"
 ALTER TABLE mc_dream_state ADD COLUMN fingerprints text;
 "#;
 
+/// V22: the upstream-compatible durable project identity table.
+const MIGRATION_V22: &str = r#"
+CREATE TABLE IF NOT EXISTS project (
+  id text PRIMARY KEY,
+  worktree text NOT NULL,
+  vcs text,
+  name text,
+  icon_url text,
+  icon_url_override text,
+  icon_color text,
+  time_created integer NOT NULL,
+  time_updated integer NOT NULL,
+  time_initialized integer,
+  time_active integer NOT NULL DEFAULT 0,
+  time_archived integer,
+  sandboxes text NOT NULL,
+  commands text
+);
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
@@ -550,6 +570,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (19, MIGRATION_V19),
     (20, MIGRATION_V20),
     (21, MIGRATION_V21),
+    (22, MIGRATION_V22),
 ];
 
 /// Async handle to the database.

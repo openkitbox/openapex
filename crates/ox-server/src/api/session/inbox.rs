@@ -102,9 +102,16 @@ pub(crate) async fn inbox_list(req: &mut Request, depot: &mut Depot, res: &mut R
         invalid_request(res, "Missing sessionID");
         return;
     };
-    if !matches!(load_session(&app.db, &session_id).await, Ok(Some(_))) {
-        session_not_found(res, &session_id);
-        return;
+    match load_session(&app.db, &session_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            session_not_found(res, &session_id);
+            return;
+        }
+        Err(error) => {
+            unknown_error(res, &error);
+            return;
+        }
     }
     // Rows decode as they stream: the wire shape is built once, with no
     // intermediate tuple vector to unpack.
@@ -172,9 +179,16 @@ pub(crate) async fn inbox_update(req: &mut Request, depot: &mut Depot, res: &mut
         invalid_request(res, "Missing delivery");
         return;
     };
-    if !matches!(load_session(&app.db, &session_id).await, Ok(Some(_))) {
-        session_not_found(res, &session_id);
-        return;
+    match load_session(&app.db, &session_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            session_not_found(res, &session_id);
+            return;
+        }
+        Err(error) => {
+            unknown_error(res, &error);
+            return;
+        }
     }
 
     if let Err(error) = app
@@ -231,9 +245,16 @@ pub(crate) async fn inbox_cancel(req: &mut Request, depot: &mut Depot, res: &mut
         invalid_request(res, "Missing inboxID");
         return;
     };
-    if !matches!(load_session(&app.db, &session_id).await, Ok(Some(_))) {
-        session_not_found(res, &session_id);
-        return;
+    match load_session(&app.db, &session_id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            session_not_found(res, &session_id);
+            return;
+        }
+        Err(error) => {
+            unknown_error(res, &error);
+            return;
+        }
     }
 
     // Upstream swallows inbox lifecycle conflicts here: cancelling an

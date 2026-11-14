@@ -12,7 +12,7 @@ use ox_schema::support::{LocationRef, ModelRef, Rule, SessionMetadata};
 use super::response::{
     conflict_error, invalid_request, parse_body, session_not_found, unknown_error,
 };
-use super::session_row::{load_session, resolve_project, subpath_of};
+use super::session_row::{canonical_directory, load_session, subpath_of};
 use crate::api::state;
 
 // ---------------------------------------------------------------------------
@@ -106,6 +106,34 @@ struct ImportBody {
     location: Option<LocationRef>,
 }
 
+type ImportedRow = (String, String, i64, i64, String);
+
+fn imported_rows(messages: &[Value]) -> Result<Vec<ImportedRow>> {
+    let mut rows = Vec::new();
+    for value in messages.iter().filter(|message| settled(message)) {
+        let message = Message::from_merged_row(value.clone())
+            .map_err(|_| anyhow!("Invalid message in transcript"))?;
+        let seq = rows.len() as i64 + 1;
+        rows.push((
+            message.id().to_owned(),
+            message.kind().to_owned(),
+            seq,
+            message.time_created(),
+            message.to_row_data().to_string(),
+        ));
+    }
+    Ok(rows)
+}
+
+async fn cleanup_import(app: &crate::api::AppState, session_id: &str) -> Result<()> {
+    app.bus
+        .publish(SessionEventData::SessionDeleted {
+            session_id: session_id.to_owned(),
+        })
+        .await?;
+    app.bus.remove(session_id).await
+}
+
 /// `POST /api/experimental/session/import` — recreate an exported transcript at
 /// the requested location. A recorded id is a conflict; a parent must already
 /// exist. Message rows are inserted directly (upstream does the same inside the
@@ -148,20 +176,50 @@ pub(crate) async fn import(req: &mut Request, depot: &mut Depot, res: &mut Respo
         .get("parentID")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    if let Some(parent_id) = &parent_id
-        && !matches!(load_session(&app.db, parent_id).await, Ok(Some(_)))
-    {
-        session_not_found(res, parent_id);
-        return;
+    if let Some(parent_id) = &parent_id {
+        match load_session(&app.db, parent_id).await {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                session_not_found(res, parent_id);
+                return;
+            }
+            Err(error) => {
+                unknown_error(res, &error);
+                return;
+            }
+        }
     }
 
+    let rows = match imported_rows(&body.messages) {
+        Ok(rows) => rows,
+        Err(error) => {
+            invalid_request(res, &error.to_string());
+            return;
+        }
+    };
     let directory = body
         .location
         .as_ref()
         .map(|location| location.directory.clone())
         .or_else(|| crate::api::compat::request_directory(req))
         .unwrap_or_else(|| app.directory.to_string_lossy().into_owned());
-    let (project_id, project_directory) = resolve_project(&app.db, &directory).await;
+    let directory = match canonical_directory(&directory).await {
+        Ok(directory) => directory,
+        Err(error) => {
+            unknown_error(res, &error);
+            return;
+        }
+    };
+    let project =
+        match crate::project::resolve_project_canonical(&app.db, std::path::Path::new(&directory))
+            .await
+        {
+            Ok(project) => project,
+            Err(error) => {
+                unknown_error(res, &error);
+                return;
+            }
+        };
     let text = |key: &str| {
         body.info
             .get(key)
@@ -172,12 +230,12 @@ pub(crate) async fn import(req: &mut Request, depot: &mut Depot, res: &mut Respo
 
     let event = SessionEventData::SessionCreated {
         session_id: session_id.clone(),
-        project_id,
+        project_id: project.id.clone(),
         location: LocationRef {
             directory: directory.clone(),
             workspace_id: None,
         },
-        subpath: subpath_of(&directory, &project_directory),
+        subpath: subpath_of(&directory, &project.directory.to_string_lossy()),
         parent_id,
         slug: ox_schema::slug::create(),
         title: text("title"),
@@ -194,25 +252,12 @@ pub(crate) async fn import(req: &mut Request, depot: &mut Depot, res: &mut Respo
         return;
     }
 
-    let mut imported = 0i64;
-    let mut rows: Vec<(String, String, i64, i64, String)> = Vec::new();
-    for value in body.messages.iter().filter(|message| settled(message)) {
-        let Ok(message) = Message::from_merged_row(value.clone()) else {
-            invalid_request(res, "Invalid message in transcript");
-            return;
-        };
-        imported += 1;
-        rows.push((
-            message.id().to_owned(),
-            message.kind().to_owned(),
-            imported,
-            message.time_created(),
-            message.to_row_data().to_string(),
-        ));
-    }
     let tx = match app.db.begin().await {
         Ok(tx) => tx,
         Err(error) => {
+            if let Err(cleanup_error) = cleanup_import(app, &session_id).await {
+                tracing::error!(error = %cleanup_error, session = %session_id, "unable to clean up failed session import");
+            }
             unknown_error(res, &error);
             return;
         }
@@ -234,6 +279,13 @@ pub(crate) async fn import(req: &mut Request, depot: &mut Depot, res: &mut Respo
             )
             .await
         {
+            if let Err(rollback_error) = tx.rollback().await {
+                tracing::error!(error = %rollback_error, session = %session_id, "unable to roll back failed session import");
+            }
+            let cleanup_error = cleanup_import(app, &session_id).await.err();
+            if let Some(cleanup_error) = cleanup_error {
+                tracing::error!(error = %cleanup_error, session = %session_id, "unable to clean up failed session import");
+            }
             unknown_error(res, &anyhow!("{error}"));
             return;
         }
@@ -283,12 +335,33 @@ pub(crate) async fn import(req: &mut Request, depot: &mut Depot, res: &mut Respo
         )
         .await
     {
+        if let Err(rollback_error) = tx.rollback().await {
+            tracing::error!(error = %rollback_error, session = %session_id, "unable to roll back failed session import");
+        }
+        let cleanup_error = cleanup_import(app, &session_id).await.err();
+        if let Some(cleanup_error) = cleanup_error {
+            tracing::error!(error = %cleanup_error, session = %session_id, "unable to clean up failed session import");
+        }
         unknown_error(res, &anyhow!("{error}"));
         return;
     }
     if let Err(error) = tx.commit().await {
+        let cleanup_error = cleanup_import(app, &session_id).await.err();
+        if let Some(cleanup_error) = cleanup_error {
+            tracing::error!(error = %cleanup_error, session = %session_id, "unable to clean up failed session import");
+        }
         unknown_error(res, &anyhow!("{error}"));
         return;
+    }
+
+    if let Err(error) =
+        crate::project::activate_project(&app.db, &project.id, id::now_millis()).await
+    {
+        tracing::warn!(
+            error = %error,
+            project = %project.id,
+            "unable to record project activity after session import"
+        );
     }
 
     match load_session(&app.db, &session_id).await {
@@ -525,4 +598,17 @@ fn sanitize_tool_content(content: &mut Value, id: &str) {
     }
     redact_key(map, "uri", "tool-file-uri", id);
     redact_key(map, "name", "tool-file-name", id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::imported_rows;
+    use serde_json::json;
+
+    #[test]
+    fn imported_rows_rejects_invalid_messages_before_session_creation() {
+        let error = imported_rows(&[json!({ "id": "bad", "type": "unknown" })])
+            .expect_err("invalid transcript must fail validation");
+        assert_eq!(error.to_string(), "Invalid message in transcript");
+    }
 }

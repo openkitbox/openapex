@@ -29,6 +29,18 @@ struct SessionsPage {
     limit: i64,
 }
 
+fn validate_scope(
+    directory: Option<&str>,
+    project: Option<&str>,
+    subpath: Option<&str>,
+) -> Result<(), String> {
+    match (directory, project, subpath) {
+        (Some(_), None, None) | (None, Some(_), None | Some(_)) | (None, None, None) => Ok(()),
+        (Some(_), _, _) => Err("directory cannot be combined with project or subpath".to_owned()),
+        (None, None, Some(_)) => Err("subpath requires project".to_owned()),
+    }
+}
+
 async fn query_sessions(db: &Db, page: SessionsPage) -> Result<Vec<SessionRow>> {
     let SessionsPage {
         directory,
@@ -46,17 +58,19 @@ async fn query_sessions(db: &Db, page: SessionsPage) -> Result<Vec<SessionRow>> 
     let mut conds: Vec<String> = Vec::new();
     let mut params: Vec<SqlValue> = Vec::new();
 
+    // These are the three mutually exclusive upstream input shapes. In
+    // particular, a project query must not acquire a directory predicate from
+    // request headers or from the server's working directory.
     if let Some(directory) = directory {
         params.push(SqlValue::Text(directory));
         conds.push(format!("directory = ?{}", params.len()));
-    }
-    if let Some(project) = project {
+    } else if let Some(project) = project {
         params.push(SqlValue::Text(project));
         conds.push(format!("project_id = ?{}", params.len()));
-    }
-    if let Some(subpath) = subpath {
-        params.push(SqlValue::Text(subpath));
-        conds.push(format!("path = ?{}", params.len()));
+        if let Some(subpath) = subpath {
+            params.push(SqlValue::Text(subpath));
+            conds.push(format!("path = ?{}", params.len()));
+        }
     }
     if let Some(search) = search {
         params.push(SqlValue::Text(format!("%{search}%")));
@@ -152,16 +166,14 @@ pub(crate) async fn list(req: &mut Request, depot: &mut Depot, res: &mut Respons
     let (query, direction) = match &decoded {
         Some(cursor) => (cursor.query.clone(), cursor.anchor.direction),
         None => {
-            let query = match request_query(req) {
-                Ok(mut query) => {
-                    query.archived = archived;
-                    query
-                }
+            let mut query = match request_query(req) {
+                Ok(query) => query,
                 Err(message) => {
                     invalid_request(res, &message);
                     return;
                 }
             };
+            query.archived = archived;
             (query, Direction::Next)
         }
     };
@@ -178,6 +190,14 @@ pub(crate) async fn list(req: &mut Request, depot: &mut Depot, res: &mut Respons
         .as_ref()
         .map(|cursor| (cursor.anchor.time, cursor.anchor.id.clone()));
 
+    if let Err(message) = validate_scope(
+        query.directory.as_deref(),
+        query.project.as_deref(),
+        query.subpath.as_deref(),
+    ) {
+        invalid_request(res, &message);
+        return;
+    }
     let page = SessionsPage {
         directory: query.directory.clone(),
         project: query.project.clone(),
@@ -237,21 +257,40 @@ pub(crate) async fn list(req: &mut Request, depot: &mut Depot, res: &mut Respons
 
 /// Read the session-list filter query from the request.
 fn request_query(req: &Request) -> Result<CursorQuery, String> {
+    if let Some(raw) = req.query::<String>("directory")
+        && raw.is_empty()
+    {
+        return Err("Invalid directory: empty value".to_owned());
+    }
+    let directory = req.query("directory");
+    let project = req.query("project");
+    let subpath = req.query("subpath");
+    validate_scope(directory.as_deref(), project.as_deref(), subpath.as_deref())?;
     Ok(CursorQuery {
         order: resolve_order(req.query::<String>("order"))?,
         search: req.query("search"),
         parent_id: req.query("parentID"),
-        // ox maps every directory to one synthetic project, so a `project`
-        // filter (the TUI's `/sessions`) alone spans all directories. Scope it
-        // to the directory the client is working in unless `directory` is
-        // given explicitly.
-        directory: req.query("directory").or_else(|| {
-            req.query::<String>("project")
-                .and(crate::api::compat::request_directory(req))
-        }),
-        project: req.query("project"),
-        subpath: req.query("subpath"),
+        directory,
+        project,
+        subpath,
         // Filled in by `list` so it can be validated even with a cursor.
         archived: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_scope;
+
+    #[test]
+    fn session_list_scope_is_a_union_of_three_shapes() {
+        assert!(validate_scope(Some("/workspace"), None, None).is_ok());
+        assert!(validate_scope(None, Some("project"), None).is_ok());
+        assert!(validate_scope(None, Some("project"), Some("src")).is_ok());
+        assert!(validate_scope(None, None, None).is_ok());
+
+        assert!(validate_scope(Some("/workspace"), Some("project"), None).is_err());
+        assert!(validate_scope(Some("/workspace"), None, Some("src")).is_err());
+        assert!(validate_scope(None, None, Some("src")).is_err());
+    }
 }
