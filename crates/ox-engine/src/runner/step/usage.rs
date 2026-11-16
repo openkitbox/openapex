@@ -15,15 +15,81 @@ use ox_schema::support::{TokenCache, TokenUsage};
 
 use super::super::drain::DrainCtx;
 
+#[cfg(test)]
+mod tests {
+    use super::{prompt_split, usage_to_tokens};
+    use ox_llm::cardinal::wire::Usage;
+    use ox_schema::support::{TokenCache, TokenUsage};
+
+    #[test]
+    fn converts_reported_usage_to_session_tokens() {
+        let mut usage = Usage::default();
+        usage.prompt_tokens = 120;
+        usage.completion_tokens = 30;
+        usage.cached_tokens = Some(80);
+        usage.reasoning_tokens = Some(10);
+
+        assert_eq!(
+            usage_to_tokens(usage),
+            TokenUsage {
+                input: 40,
+                output: 30,
+                reasoning: 10,
+                cache: TokenCache { read: 80, write: 0 },
+                estimated: None,
+                reasoning_reported: Some(false),
+            }
+        );
+    }
+
+    #[test]
+    fn converts_cache_write_tokens_without_counting_them_as_input() {
+        let mut usage = Usage::default();
+        usage.prompt_tokens = 120;
+        usage.cached_tokens = Some(80);
+        usage.cache_write_tokens = Some(20);
+
+        assert_eq!(
+            usage_to_tokens(usage),
+            TokenUsage {
+                input: 20,
+                output: 0,
+                reasoning: 0,
+                cache: TokenCache {
+                    read: 80,
+                    write: 20
+                },
+                estimated: None,
+                reasoning_reported: Some(false),
+            }
+        );
+    }
+
+    #[test]
+    fn prompt_split_matches_token_usage_cache_accounting() {
+        let mut usage = Usage::default();
+        usage.prompt_tokens = 120;
+        usage.cached_tokens = Some(80);
+        usage.cache_write_tokens = Some(20);
+
+        assert_eq!(prompt_split(&usage), (80, 20));
+    }
+}
+
 /// The prompt split the provider reported: `(cache read, uncached input)`,
-/// where the uncached half is what it had to prefill. The token shape and the
+/// where cache reads and writes are excluded from the input half. The uncached
+/// half is what it had to prefill. The token shape and the
 /// session ledger both derive from this one place, so a reported prompt is
 /// accounted identically in the row and in the aggregate.
 fn prompt_split(usage: &Usage) -> (i64, i64) {
     let cached = usage.cached_tokens.unwrap_or(0);
+    let cache_write = usage.cache_write_tokens.unwrap_or(0);
     (
         cached as i64,
-        usage.prompt_tokens.saturating_sub(cached) as i64,
+        usage
+            .prompt_tokens
+            .saturating_sub(cached)
+            .saturating_sub(cache_write) as i64,
     )
 }
 
@@ -108,9 +174,6 @@ fn record_attempt(ledger: &CacheLedger, session: &str, usage: Option<Usage>) {
 /// prompt tokens, cache write is not reported by cardinal's OpenAI dialect.
 /// A stream that never carried usage stores `estimate()` as `input` and
 /// zeros elsewhere; the estimate is not evaluated when usage was reported.
-/// The estimate branch sets `estimated: Some(true)` so estimated rows can be
-/// told from reported ones (`json_extract(data, '$.tokens.estimated')`); the
-/// reported branch leaves it `None`.
 fn tokens_for(usage: Option<Usage>, estimate: impl FnOnce() -> i64) -> TokenUsage {
     let Some(usage) = usage else {
         return TokenUsage {
@@ -122,6 +185,11 @@ fn tokens_for(usage: Option<Usage>, estimate: impl FnOnce() -> i64) -> TokenUsag
             reasoning_reported: Some(false),
         };
     };
+    usage_to_tokens(usage)
+}
+
+/// Convert one provider usage report to the session's canonical token shape.
+pub(crate) fn usage_to_tokens(usage: Usage) -> TokenUsage {
     let (read, input) = prompt_split(&usage);
     let (output, reasoning, reasoning_reported) = match (
         usage.reasoning_tokens_included(),
@@ -149,15 +217,16 @@ fn tokens_for(usage: Option<Usage>, estimate: impl FnOnce() -> i64) -> TokenUsag
         input,
         output,
         reasoning,
-        cache: TokenCache { read, write: 0 },
+        cache: TokenCache {
+            read,
+            write: usage.cache_write_tokens.unwrap_or(0) as i64,
+        },
         estimated: None,
         reasoning_reported,
     }
 }
 
-/// Prompt-size estimate for a request body of `body_len` bytes:
-/// `ceil(bytes / 4 * ratio)`. A non-finite or negative `ratio` counts as 1.0;
-/// the product saturates at `i64::MAX`.
+/// Prompt-size estimate for a request body of `body_len` bytes.
 fn estimate_prompt_tokens(body_len: usize, ratio: f64) -> i64 {
     let ratio = if ratio.is_finite() && ratio >= 0.0 {
         ratio
@@ -165,8 +234,50 @@ fn estimate_prompt_tokens(body_len: usize, ratio: f64) -> i64 {
         1.0
     };
     let raw = crate::mctx::tokens::heuristic_bytes(body_len) as f64 * ratio;
-    // `as` saturates for out-of-range floats, so this clamps to i64::MAX.
     raw.ceil() as i64
+}
+
+/// Settled token usage for one request. When the stream carried no usage the
+/// prompt size is estimated from the request that was sent (its serialized
+/// length is measured, not built); a serialization failure falls back to 0.
+///
+/// The estimate branch sets `estimated: Some(true)` so estimated rows can be
+/// told from reported ones (`json_extract(data, '$.tokens.estimated')`); the
+/// reported branch leaves it `None`.
+pub(crate) fn tokens_for_request(
+    ctx: &DrainCtx,
+    provider_id: &str,
+    model_id: &str,
+    request: &ChatRequest,
+    usage: Option<Usage>,
+) -> TokenUsage {
+    tokens_for(usage, || {
+        estimate_request_tokens(ctx, provider_id, model_id, request)
+    })
+}
+
+/// Estimate input tokens using the exact request bytes and the session's
+/// provider/model calibration ratio.
+fn estimate_request_tokens(
+    ctx: &DrainCtx,
+    provider_id: &str,
+    model_id: &str,
+    request: &ChatRequest,
+) -> i64 {
+    let body_len = match ox_llm::cardinal::wire::serialized_len(request) {
+        Ok(len) => len,
+        Err(error) => {
+            tracing::warn!(session = %ctx.session_id, error = %error, "prompt estimate skipped");
+            return 0;
+        }
+    };
+    let ratio = crate::mctx::calibration::ratio_for(
+        &ctx.calibrations,
+        &ctx.session_id,
+        provider_id,
+        model_id,
+    );
+    estimate_prompt_tokens(body_len, ratio)
 }
 
 /// Settled token usage for one attempt. When the stream carried no usage the
@@ -183,22 +294,25 @@ pub(super) fn attempt_tokens(
     usage: Option<Usage>,
 ) -> TokenUsage {
     record_attempt(&ctx.cache_ledger, &ctx.session_id, usage);
-    tokens_for(usage, || {
-        let body_len = match ox_llm::cardinal::wire::serialized_len(request) {
-            Ok(len) => len,
-            Err(error) => {
-                tracing::warn!(session = %ctx.session_id, error = %error, "prompt estimate skipped");
-                return 0;
-            }
-        };
-        let ratio = crate::mctx::calibration::ratio_for(
-            &ctx.calibrations,
-            &ctx.session_id,
-            provider_id,
-            model_id,
-        );
-        estimate_prompt_tokens(body_len, ratio)
-    })
+    tokens_for_request(ctx, provider_id, model_id, request, usage)
+}
+
+/// Settle a successful generate request using the same usage owner as a normal
+/// attempt. Provider usage is recorded and calibrates once; estimated usage is
+/// intentionally neither recorded nor used as a calibration sample.
+pub(crate) fn generated_attempt_tokens(
+    ctx: &DrainCtx,
+    provider_id: &str,
+    model_id: &str,
+    request: &ChatRequest,
+    usage: Option<Usage>,
+) -> TokenUsage {
+    let tokens = tokens_for_request(ctx, provider_id, model_id, request, usage);
+    if let Some(reported) = usage {
+        record_attempt(&ctx.cache_ledger, &ctx.session_id, Some(reported));
+        observe_request_cost(ctx, provider_id, model_id, request, reported.prompt_tokens);
+    }
+    tokens
 }
 
 /// Fold the provider's own count for this request into the session's token

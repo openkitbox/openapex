@@ -15,6 +15,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use ox_schema::support::Finite;
+
 /// Tool schema types live in the contract crate; the chat request re-exports
 /// them so `cardinal::wire` stays the one place the wire shapes are read from.
 pub use ox_schema::wire::{FunctionDef, FunctionType, ToolDef};
@@ -360,15 +362,21 @@ impl ChatMessage {
 /// `completion_tokens_details.reasoning_tokens` vs bare `reasoning_tokens`).
 /// Deserialization goes through the Cardinal Chat stream decoder, not a derived
 /// impl — the vendor fallback keys cannot be expressed as plain fields.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct Usage {
     /// Prompt (input) tokens.
     pub prompt_tokens: u64,
     /// Completion (output) tokens.
     pub completion_tokens: u64,
+    /// Provider-reported cost in USD, when the endpoint supplies it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<Finite>,
     /// Prompt tokens served from cache, when the vendor reports them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_tokens: Option<u64>,
+    /// Prompt tokens written to cache, when the vendor reports them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
     /// Reasoning tokens, when the vendor reports them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u64>,
@@ -388,12 +396,15 @@ impl Usage {
         prompt_tokens: u64,
         completion_tokens: u64,
         cached_tokens: Option<u64>,
+        cache_write_tokens: Option<u64>,
         reasoning_tokens: Option<u64>,
     ) -> Self {
         Self {
             prompt_tokens,
             completion_tokens,
+            cost: None,
             cached_tokens,
+            cache_write_tokens,
             reasoning_tokens,
             reasoning_tokens_included: None,
         }
@@ -406,6 +417,7 @@ impl Usage {
     pub(crate) fn from_cardinal_chat(
         prompt_tokens: u64,
         completion_tokens: u64,
+        cost: Option<Finite>,
         cached_tokens: Option<u64>,
         reasoning_tokens: Option<u64>,
         reasoning_tokens_included: Option<bool>,
@@ -414,7 +426,9 @@ impl Usage {
         Self {
             prompt_tokens,
             completion_tokens,
+            cost,
             cached_tokens,
+            cache_write_tokens: None,
             reasoning_tokens,
             reasoning_tokens_included,
         }

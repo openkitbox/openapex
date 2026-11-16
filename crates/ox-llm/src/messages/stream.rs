@@ -22,6 +22,95 @@ use crate::cardinal::wire::Usage;
 use crate::error::ChatError;
 use crate::sse::SseDecoder;
 
+#[cfg(test)]
+mod tests {
+    use super::{MessagesDecoder, StreamEvent};
+    use crate::sse::SseDecoder;
+
+    #[test]
+    fn preserves_anthropic_cache_creation_as_cache_write() {
+        let mut decoder = MessagesDecoder::new();
+        let mut events = Vec::new();
+        decoder
+            .decode(
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":20,"cache_creation_input_tokens":30}}}"#,
+                &mut events,
+            )
+            .expect("message start should decode");
+        decoder
+            .decode(
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":4}}"#,
+                &mut events,
+            )
+            .expect("message delta should decode");
+
+        let usage = events.iter().find_map(|event| match event {
+            StreamEvent::Usage(usage) => Some(usage),
+            _ => None,
+        });
+        let Some(usage) = usage else {
+            panic!("expected usage event, got {events:?}");
+        };
+        assert_eq!(usage.prompt_tokens, 60);
+        assert_eq!(usage.cached_tokens, Some(20));
+        assert_eq!(usage.cache_write_tokens, Some(30));
+    }
+
+    #[test]
+    fn emits_final_cumulative_usage_at_terminal_message_delta() {
+        let mut decoder = MessagesDecoder::new();
+        let mut events = Vec::new();
+        for (output_tokens, stop_reason) in [(1, "null"), (2, "\"end_turn\"")] {
+            decoder
+                .decode(
+                    &format!(
+                        r#"{{"type":"message_delta","delta":{{"stop_reason":{stop_reason}}},"usage":{{"output_tokens":{output_tokens}}}}}"#
+                    ),
+                    &mut events,
+                )
+                .expect("message delta should decode");
+        }
+
+        let usages: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::Usage(usage) => Some(usage),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usages.len(), 1);
+        assert_eq!(usages[0].completion_tokens, 2);
+    }
+
+    #[test]
+    fn emits_usage_at_message_stop_when_no_terminal_delta_arrives() {
+        let mut decoder = MessagesDecoder::new();
+        let mut events = Vec::new();
+        decoder
+            .decode(
+                r#"{"type":"message_delta","delta":{"stop_reason":null},"usage":{"output_tokens":2}}"#,
+                &mut events,
+            )
+            .expect("message delta should decode");
+        decoder
+            .decode(r#"{"type":"message_stop"}"#, &mut events)
+            .expect("message stop should decode");
+        decoder
+            .decode(r#"{"type":"message_stop"}"#, &mut events)
+            .expect("duplicate message stop should decode");
+
+        let usages: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                StreamEvent::Usage(usage) => Some(usage),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(usages.len(), 1);
+        assert_eq!(usages[0].completion_tokens, 2);
+    }
+}
+
 /// The `anthropic-version` every Messages request declares.
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -70,7 +159,7 @@ impl UsageAccum {
 
     /// The ox usage view: prompt tokens include every input class (fresh,
     /// cache-read and cache-write), because that is what the context budget
-    /// counts. `None` until anything was reported.
+    /// counts. Cache-write tokens are preserved separately as well.
     fn merged(&self) -> Option<Usage> {
         if !self.seen {
             return None;
@@ -82,6 +171,7 @@ impl UsageAccum {
             prompt,
             self.output.unwrap_or(0),
             self.cache_read,
+            self.cache_creation,
             None,
         ))
     }
@@ -221,7 +311,15 @@ impl SseDecoder for MessagesDecoder {
                         reason: reason.to_owned(),
                     });
                 }
-                if let Some(usage) = self.usage.merged() {
+                let terminal = value
+                    .get("delta")
+                    .and_then(|delta| delta.get("stop_reason"))
+                    .and_then(Value::as_str)
+                    .is_some();
+                if terminal
+                    && !self.usage_emitted
+                    && let Some(usage) = self.usage.merged()
+                {
                     self.usage_emitted = true;
                     out.push(StreamEvent::Usage(usage));
                 }
@@ -230,6 +328,7 @@ impl SseDecoder for MessagesDecoder {
                 if !self.usage_emitted
                     && let Some(usage) = self.usage.merged()
                 {
+                    self.usage_emitted = true;
                     out.push(StreamEvent::Usage(usage));
                 }
                 out.push(StreamEvent::Done);

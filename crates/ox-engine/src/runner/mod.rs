@@ -23,6 +23,7 @@
 //! The [`Tool`] trait + [`ToolRegistry`] here are the seam task 7 fills with
 //! real tools; the registry ships empty until task 7 fills it.
 
+pub use generate::GenerateResult;
 pub use ox_llm::cardinal::chat::Chat;
 pub use services::{Live, ServiceSet, Services};
 pub use step::usage::SessionCache;
@@ -62,7 +63,7 @@ pub use ox_tools::contract::{Attachment, Tool, ToolContext, ToolOutput, ToolRegi
 use ox_core::config::Config;
 use ox_core::event_bus::EventBus;
 use ox_db::Db;
-use ox_schema::event::{InterruptReason, SessionEventData};
+use ox_schema::event::{InterruptReason, SessionEventData, UsageSource};
 use ox_schema::support::{ModelRef, SessionError};
 use ox_tools::agent;
 use ox_tools::agent::Agent;
@@ -639,24 +640,39 @@ impl Runner {
     }
 
     /// Answer `prompt` from the session's current context without mutating it
-    /// (upstream `session.generate`, the TUI's `/btw` dependency). Nothing is
-    /// persisted, no event is published and no tool loop runs.
-    pub async fn generate(&self, session_id: &str, prompt: &str) -> Result<String> {
+    /// (upstream `session.generate`, the TUI's `/btw` dependency). The
+    /// transient completion is accounted in session totals but never persisted
+    /// as an assistant message.
+    pub async fn generate(
+        &self,
+        session_id: &str,
+        prompt: &str,
+    ) -> Result<generate::GenerateResult> {
         let admission = self.try_admit()?;
         let inner = Arc::clone(&self.inner);
         let session_id = session_id.to_owned();
         let prompt = prompt.to_owned();
         let (reply, result) = tokio::sync::oneshot::channel();
+        let event_session_id = session_id.clone();
+        let worker_session_id = session_id.clone();
         self.inner.tasks.gate.register(|| {
             self.inner.tasks.auxiliary.spawn(async move {
                 let _admission = admission;
-                let answer = generate::run(&inner, &session_id, &prompt).await;
+                let answer = generate::run(&inner, &worker_session_id, &prompt).await;
                 let _ = reply.send(answer);
             })
         })??;
-        result
+        let generated = result
             .await
-            .map_err(|_| anyhow::anyhow!("generate task ended without an answer"))?
+            .map_err(|_| anyhow::anyhow!("generate task ended without an answer"))??;
+        let event = SessionEventData::SessionUsageRecorded {
+            session_id: event_session_id,
+            source: UsageSource::Generate,
+            cost: generated.cost,
+            tokens: generated.tokens,
+        };
+        self.inner.bus.publish(event).await?;
+        Ok(generated)
     }
 
     /// Cancel the session's in-flight busy period. Returns whether one was

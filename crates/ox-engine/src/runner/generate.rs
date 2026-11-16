@@ -7,8 +7,8 @@
 //! one-shot sibling of a step: the request carries the context layers a normal
 //! step sends (system[0] static, system[1] keyed instructions, the
 //! magic-context head, the wire tail) plus the caller's prompt as a final user
-//! message. Nothing is persisted and no event is published — the model answers
-//! from what is already there. No tool loop runs (upstream notes that a tool
+//! message. The answer is not persisted as a transcript message; its usage is
+//! recorded in the session totals. No tool loop runs (upstream notes that a tool
 //! call "would surface as an empty answer"). Deliberate safety deviation:
 //! tool calls and incomplete completions return an error rather than an empty
 //! or truncated answer.
@@ -23,14 +23,24 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use ox_llm::cardinal::wire::{ChatMessage, ChatRequest};
+use ox_schema::support::{Finite, MoneyUsd, TokenUsage};
 
 use super::Inner;
+
 use super::drain::DrainCtx;
 use super::instructions;
 
+/// The owned result of one transient session generation request.
+#[derive(Debug, PartialEq)]
+pub struct GenerateResult {
+    pub text: String,
+    pub tokens: TokenUsage,
+    pub cost: MoneyUsd,
+}
+
 /// Answer `prompt` from the session's current context. Read-only: the session
 /// transcript, the instruction baseline and the event log are untouched.
-pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result<String> {
+pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result<GenerateResult> {
     let svc = inner.live.current();
     let (_agent, model) =
         super::resolve_selection(&inner.db, session_id, &svc.config, &svc.model_catalog).await?;
@@ -101,5 +111,25 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
     request.tools = ctx.tools.definitions_shared();
     request.apply_reasoning_effort(model.variant.as_deref());
     super::request_budget::apply(&ctx, &mut request, &model.provider_id, layers)?;
-    crate::completion::collect_text(&ctx.chat, &request, Some(&model.provider_id), "generate").await
+    let completion = crate::completion::collect_with_deltas(
+        &ctx.chat,
+        &request,
+        Some(&model.provider_id),
+        |_| std::future::ready(Ok(())),
+    )
+    .await?;
+    let usage = completion.usage;
+    let tokens = crate::runner::step::usage::generated_attempt_tokens(
+        &ctx,
+        &model.provider_id,
+        &model.id,
+        &request,
+        usage,
+    );
+    let cost = usage.and_then(|usage| usage.cost).unwrap_or(Finite::Int(0));
+    Ok(GenerateResult {
+        text: completion.text,
+        tokens,
+        cost,
+    })
 }

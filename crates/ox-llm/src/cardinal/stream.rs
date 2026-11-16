@@ -27,6 +27,7 @@ use serde::Serialize;
 use super::ChatError;
 use crate::cardinal::wire::{CardinalChatUsageProof, Usage};
 use crate::sse::SseDecoder;
+use ox_schema::support::Finite;
 
 pub use crate::sse::SseFramer;
 
@@ -211,6 +212,9 @@ fn usage_from(value: &serde_json::Value) -> Option<Usage> {
         prompt_tokens,
         completion_tokens,
         usage
+            .get("cost")
+            .and_then(|cost| serde_json::from_value::<Finite>(cost.clone()).ok()),
+        usage
             .get("prompt_cache_hit_tokens")
             .or_else(|| {
                 usage
@@ -243,7 +247,7 @@ pub struct AssembledToolCall {
 }
 
 /// The assistant message a stream assembled into.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct AssembledMessage {
     /// The full text content.
     pub text: String,
@@ -316,5 +320,28 @@ impl Assembler {
     pub fn finish(mut self) -> AssembledMessage {
         self.message.tool_calls = self.tool_calls.into_values().collect();
         self.message
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ChunkDecoder, StreamEvent};
+
+    #[test]
+    fn decodes_provider_reported_usage_cost() {
+        let mut decoder = ChunkDecoder::new();
+        let mut events = Vec::new();
+
+        decoder
+            .decode(
+                r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"cost":0.0125}}"#,
+                &mut events,
+            )
+            .expect("usage chunk should decode");
+
+        let [StreamEvent::Usage(usage)] = events.as_slice() else {
+            panic!("expected one usage event, got {events:?}");
+        };
+        assert_eq!(usage.cost, Some(ox_schema::support::Finite::Float(0.0125)));
     }
 }
