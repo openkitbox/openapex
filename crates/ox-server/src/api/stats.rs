@@ -735,7 +735,7 @@ fn tokens_total(tokens: &TokenUsage) -> i64 {
 /// `YYYY-MM-DD` in the requested zone (upstream `makeDateKey`).
 fn date_key(timezone: &jiff::tz::TimeZone, millis: i64) -> String {
     let timestamp = jiff::Timestamp::from_millisecond(millis).unwrap_or_default();
-    let zoned = timestamp.to_zoned(timezone.clone());
+    let zoned = timestamp.to_zoned_datetime(timezone.clone());
     format!(
         "{:04}-{:02}-{:02}",
         zoned.year(),

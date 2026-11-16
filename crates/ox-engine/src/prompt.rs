@@ -1209,7 +1209,7 @@ fn env_block(directory: &Path, home: &Path) -> String {
 pub(crate) fn local_date(timestamp_ms: i64, zone: &jiff::tz::TimeZone) -> String {
     jiff::Timestamp::from_millisecond(timestamp_ms)
         .expect("timestamp out of range")
-        .to_zoned(zone.clone())
+        .to_zoned_datetime(zone.clone())
         .date()
         .to_string()
 }
