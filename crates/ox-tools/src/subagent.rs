@@ -425,7 +425,7 @@ impl Tool for SubagentTool {
                         "agent",
                         param(
                             "string",
-                            "Subagent profile: `general` (full toolkit) or `explore` (read-only search: no shell, write, edit, patch or nested subagent). Defaults to `general`. Only for a new subagent: a continued sessionID keeps the agent it started with.",
+                            "Subagent profile: `general` (full toolkit), `explore` (read-only search: no shell, write, edit, patch or nested subagent), or `review` (judges work it did not do; no write tools, but `shell` can still mutate the tree; a review dispatch must carry its own criteria). Defaults to `general`. Only for a new subagent: a continued sessionID keeps the agent it started with.",
                         ),
                     ),
                 ],

@@ -10,10 +10,9 @@
 //!   of the registered tools an agent sees. Every name listed here must exist in
 //!   the fully wired registry (the `ctx_*` tools join it at wiring time), and
 //!   [`Tools::Only`] is the agent's complete visible toolset, not an addition
-//!   to it. The engine's `runner::services` tests pin the built-in tool names,
-//!   so a typo in one of those fails a test; the `ctx_*` names cannot be
-//!   checked there (they join the registry at wiring time), so a typo in one of
-//!   them silently drops that tool.
+//!   to it. Nothing checks these names when the table is built, so a typo in one
+//!   of them silently drops that tool, while a call to a name outside the set
+//!   fails as an unavailable tool.
 //! - The first entry is the default agent ([`default_agent`]).
 //! - This table is the only authority on which agent ids exist; model catalogues
 //!   and configuration validate ids against it rather than keeping a list.
@@ -67,7 +66,8 @@ pub(crate) const READ_ONLY_AGENT: &str = "explore";
 /// whole registry, and therefore both direct implementation and dispatching.
 pub const APEX_ID: &str = "apex";
 /// The review agent (`subagent` with `agent: "review"`): it judges work it did
-/// not do and reports a verdict, and its toolset keeps it out of the workspace.
+/// not do and reports a verdict. See [`REVIEW_TOOLS`] for its toolset and the
+/// named gap in it.
 pub(crate) const REVIEW_AGENT: &str = "review";
 
 /// Tools a subagent session must not have. `question` opens a form only the
@@ -119,22 +119,37 @@ pub const EXPLORE_SYSTEM: &str = concat!(
 
 /// The toolset of the `review` agent (`subagent` with `agent: "review"`).
 ///
-/// Rule: the review toolset is [`READ_ONLY_TOOLS`] plus `shell`. A reviewer
-/// needs two things the read-only set cannot give it — reading a committed diff
-/// (`git show`, `git log`, `git diff`) and re-running the suite to check a claim
-/// instead of trusting it. `shell` is therefore a documented deviation from
-/// strict read-only: a review stays read-only by instruction (the layer says
-/// which commands) and by the absence of the structured writers (`write`,
-/// `edit`, `patch`), which fail here as unknown tools. Also excluded:
-/// `todowrite` (parent-facing plan state), `subagent` (a reviewer must not
-/// dispatch the work it is judging), `question` (no UI watches a child), and
-/// every MCP tool, whose side effects cannot be judged statically.
+/// Rule: the read paths ([`READ_ONLY_TOOLS`] without the three `ctx_*` writers)
+/// plus `shell`. A reviewer must read a committed diff (`git show`, `git log`,
+/// `git diff`) and re-run a suite to check a claim instead of trusting it, and
+/// that is all `shell` is for by instruction.
+///
+/// Keeping `shell` is a **named gap, not a guarantee**. `cargo test` compiles
+/// and executes code from the tree under review — build scripts, test bodies,
+/// procedural macros — so no command allowlist is a boundary, and a real
+/// read-only boundary needs a sandbox
+/// (`.ox/plans/2026-10-24-codex-sandboxing-port-analysis.md`). What this set
+/// does buy is a read constraint by instruction plus the absence of the
+/// structured writers: `write`, `edit`, and `patch` are not here, and neither
+/// are `ctx_memory`, `ctx_note`, `ctx_reduce` (the review agent must not write
+/// memories or notes), `todowrite` (parent-facing plan state), `subagent` (a
+/// reviewer must not dispatch the work it judges), `question` (no UI watches a
+/// child), or any MCP tool, whose side effects cannot be judged statically.
+///
+/// One side effect is left on purpose: `ctx_search` records `last_used_at` by
+/// calling `record_use`, the tool entry being
+/// `crates/ox-engine/src/mctx/search.rs` and the row UPDATE living in
+/// `crates/ox-engine/src/mctx/memory.rs`, whose `last_used_at` field is
+/// documented as "a selection tiebreak only: recording a use is neither a write
+/// nor a verification". It cannot change fact text, so the memory read path
+/// stays.
+///
+/// Enforcement is registry membership: `ToolRegistry::only`
+/// (`crates/ox-tools/src/contract.rs`) filters by name, and calling a name
+/// outside this set fails as an unknown tool.
 pub(crate) const REVIEW_TOOLS: &[&str] = &[
     "capability_search",
     "ctx_expand",
-    "ctx_memory",
-    "ctx_note",
-    "ctx_reduce",
     "ctx_search",
     "glob",
     "grep",
@@ -148,20 +163,20 @@ pub(crate) const REVIEW_TOOLS: &[&str] = &[
 ///
 /// Like [`EXPLORE_SYSTEM`] it replaces the assembled layer, so a reviewer never
 /// receives the implementing workflow it is supposed to judge, and it carries
-/// the review contract every dispatch would otherwise have to restate: verdict
-/// first, one evidence-bearing line per criterion, numbered must-fix items, and
-/// an explicit account of what was not verified.
+/// the review contract every dispatch would otherwise have to restate: a
+/// verdict with a version anchor it derived itself, one evidence-bearing line
+/// per criterion, numbered must-fix items, and an explicit account of what was
+/// not verified.
 pub const REVIEW_SYSTEM: &str = concat!(
     "You are a code reviewer in ox. You judge work you did not do, and your verdict is the only thing the caller reads. You change nothing.\n",
     "\n",
     "Rules:\n",
-    "- Read-only. You have no `write`, `edit`, or `patch`: do not commit, create a worktree, edit a plan, or adjust the code you are judging. `shell` is for read-only commands only — `git show`, `git log`, `git diff`, `rg`, `cargo test`, `cargo clippy`, `cargo fmt --check`. Never run a command that mutates the tree.\n",
-    "- Verdict first. Open with `APPROVED` or `NEEDS_FIX`, then one line per criterion: `PASS` or `FAIL` followed by half a sentence of evidence and `file_path:line_number`. A `FAIL` that names no location is not actionable.\n",
-    "- For `NEEDS_FIX`, list numbered must-fix items and separate them from optional ones. Do not re-emit the whole report and do not paste code blocks; the caller acts on the list.\n",
-    "- Judge against the criteria the dispatch gives you plus the design document it names. Do not invent criteria, and do not approve work because it looks plausible: cite the source that proves each claim.\n",
-    "- Report only what you verified in this session and close with what you did not verify, and why. \"The tests pass\" describes output you saw run; if you did not run it, say so.\n",
+    "- Tools. You have no `write`, `edit`, `patch`, `subagent`, `todowrite`, or `question`, and nothing that edits or adds memories or notes: do not commit, create a worktree, edit a plan, or adjust the code you are judging. That is not a guarantee: `shell` can still mutate the tree, so keep to read commands (`git show`, `git log`, `git diff`, `rg`, `cargo test`, `cargo clippy`, `cargo fmt --check`) by discipline.\n",
+    "- Criteria, in this order: the criterion lines this dispatch quotes; else the acceptance criteria of the plan document it names (criterion lines, test matrix, design constraints); a named plan you cannot read counts as absent; else emit `NEEDS_FIX: no criteria supplied` in place of the verdict and stop. Do not invent criteria, and do not approve work because it looks plausible.\n",
+    "- Verdict and anchor. Open with one line: `APPROVED` or `NEEDS_FIX`, the sha you reviewed, and the absolute worktree path, both derived yourself (`git rev-parse HEAD`, `git rev-parse --show-toplevel`), never relayed — the dispatch's sha only once you verified it is what you inspected. Then one line per criterion: `PASS` or `FAIL`, the criterion, the command you ran, and the result you saw (exit code or key output). A `FAIL` without a location is not actionable: cite `file_path:line_number`. Criteria you did not run are `UNVERIFIED`, listed at the end with why; \"the tests pass\" describes output you saw run.\n",
+    "- For `NEEDS_FIX`, list numbered must-fix items and separate them from optional ones. Do not re-emit the report or paste code blocks; the caller acts on the list.\n",
     "- When the source contradicts the task description or the plan, say so instead of assuming the description is right.\n",
-    "\nYour final message is the only thing the caller sees: put the verdict, the evidence, and the must-fix list in it.\n",
+    "\nYour final message is the only thing the caller sees: keep it near 15 lines.\n",
 );
 
 /// The built-in agents in display order. The first entry is the default agent.
@@ -257,4 +272,52 @@ pub fn read_only() -> &'static Agent {
 /// Look up an id the table is known to contain.
 fn builtin(id: &str) -> &'static Agent {
     get(id).expect("the built-in agent table always contains its named ids")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reviewer must not be able to write state: a check that can change what
+    /// it checks is not a check, and `subagent`/`question` would let it re-run
+    /// the work or block on a form instead of judging it. This guard exists
+    /// because the boundary is one constant edited in passing — dropping it is
+    /// silent otherwise, since a name outside the set only fails at call time.
+    #[test]
+    fn review_toolset_has_no_state_mutating_tools() {
+        let state_mutating: [&str; 9] = [
+            "write",
+            "edit",
+            "patch",
+            "subagent",
+            "todowrite",
+            "question",
+            "ctx_memory",
+            "ctx_note",
+            "ctx_reduce",
+        ];
+        for name in state_mutating {
+            assert!(
+                !REVIEW_TOOLS.contains(&name),
+                "`{name}` lets a reviewer change the work it is judging, so it must not be in REVIEW_TOOLS"
+            );
+        }
+        for name in ["shell", "read", "ctx_search", "ctx_expand"] {
+            assert!(
+                REVIEW_TOOLS.contains(&name),
+                "`{name}` is how a reviewer reads the tree and re-runs the claims it is checking, so REVIEW_TOOLS must keep it"
+            );
+        }
+        // The constant bounds a reviewer only through the table entry: retyping
+        // that entry as `Tools::All` would leave REVIEW_TOOLS untouched and
+        // still hand the reviewer every tool. A `const` slice gives no usable
+        // pointer identity here (its use sites do not share an address), so the
+        // entry is pinned by exact contents instead.
+        let entry = builtin(REVIEW_AGENT);
+        assert!(
+            matches!(entry.tools, Tools::Only(names) if names == REVIEW_TOOLS),
+            "the review entry must be `Tools::Only` over REVIEW_TOOLS itself, not {:?}: the constant only applies through that entry",
+            entry.tools
+        );
+    }
 }
