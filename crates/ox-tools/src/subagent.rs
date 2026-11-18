@@ -8,18 +8,15 @@
 //! how an HTTP prompt drives a session. The tool waits for the child to go
 //! idle and then reads its transcript back through the projector.
 //!
-//! A foreground wait registers as a job in the registry's
-//! [`crate::jobs::Jobs`] (id = child sessionID), so `session.background` can
-//! hand it to the background exactly as `background=true` would (upstream
-//! `subagent.ts` `jobs.block`).
+//! Completion watchers own child work after the tool returns and notify the
+//! parent through its inbox when each child goes idle.
 
 use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use crate::agent::{Agent, Mode, SUBAGENT_AGENT};
+use crate::agent::{Agent, Mode};
 use crate::contract::{Tool, ToolContext, ToolOutput};
-use crate::jobs::Jobs;
 use ox_core::text;
 use ox_schema::event::SessionEventData;
 use ox_schema::support::{LocationRef, ModelRef, SessionMetadata};
@@ -29,8 +26,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
-use std::time::Instant;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio::sync::TryAcquireError;
@@ -55,14 +50,6 @@ struct ResultBudget {
     /// keeps no tail at all, for a reader that wants the report from its start.
     head: usize,
 }
-
-/// Budget for the child's final message folded into a foreground parent's tool
-/// result: head-only, because that parent waited on this one report and reads it
-/// from the top.
-const FOLD_BUDGET: ResultBudget = ResultBudget {
-    cap: 16 * 1024,
-    head: 16 * 1024,
-};
 
 /// Budget for a background child's final message injected into the parent's
 /// inbox. A parent routing a dozen children must not have its context drowned
@@ -147,6 +134,8 @@ pub trait SubagentSpawner: Send + Sync {
     /// whole transcript: several children settling together must not hold
     /// several transcripts at once.
     fn settled_tail<'a>(&'a self, session_id: &'a str) -> SettledTail<'a>;
+    /// Resolve an explicit wire model against the engine's current catalogue.
+    fn resolve_model(&self, model: &ModelRef) -> Result<ModelRef, String>;
     /// The model a fresh child session of `agent` starts on, resolved by the
     /// engine from the agent's logical model preference.
     ///
@@ -181,8 +170,6 @@ pub struct SubagentHandle {
     /// child holds its permit from dispatch until it settles; tokio's
     /// semaphore wakes waiters in FIFO order.
     slots: Arc<Semaphore>,
-    /// The registry's job table; a foreground call blocks its parent on it.
-    jobs: Arc<Jobs>,
     /// The background children still in flight, shared by every clone.
     in_flight: Arc<InFlightRegistry>,
     stop: tokio_util::sync::CancellationToken,
@@ -318,15 +305,8 @@ impl SubagentHandle {
 
     /// `max_active` is the config's `[subagent] max_active`, validated `>= 1`
     /// at load; `0` would queue every call forever, so it is refused here too.
-    /// `jobs` is the registry's shared job table, so `session.background` can
-    /// hand a blocking foreground call to the background.
     #[must_use]
-    pub fn new(
-        db: ox_db::Db,
-        bus: ox_core::event_bus::EventBus,
-        max_active: usize,
-        jobs: Arc<Jobs>,
-    ) -> Self {
+    pub fn new(db: ox_db::Db, bus: ox_core::event_bus::EventBus, max_active: usize) -> Self {
         assert!(
             max_active >= 1,
             "subagent max_active must be at least 1, got {max_active}"
@@ -336,7 +316,6 @@ impl SubagentHandle {
             bus,
             spawner: std::sync::Arc::new(std::sync::OnceLock::new()),
             slots: Arc::new(Semaphore::new(max_active)),
-            jobs,
             in_flight: Arc::new(InFlightRegistry::default()),
             stop: tokio_util::sync::CancellationToken::new(),
             watchers: crate::contract::TaskOwner::default(),
@@ -384,54 +363,7 @@ impl Tool for SubagentTool {
     }
 
     fn definition(&self) -> ToolDef {
-        ToolDef::function(
-            "subagent",
-            "Spawn a child session, delegate a prompt to it, and wait for its final reply. The child has its own context window and transcript; only its final message returns to this conversation. The output includes a sessionID you can pass back later to continue that specific conversation with the subagent. New child sessions start with fresh context, so include all relevant context and instructions when you don't pass a sessionID.\n\n\
-             Foreground (default) runs the subagent to completion and returns its result. Background mode (background=true) launches it asynchronously and returns immediately; ox notifies you in this conversation when it finishes. Use background only for independent work that can run while you continue elsewhere.\n\n\
-             Several subagent calls in one turn run in parallel, up to a server-wide limit of active subagents. Root foreground calls wait FIFO for a free slot; nested foreground calls fail with Capacity when no slot is free, to avoid ancestors waiting on descendants that cannot start. Background calls may queue. Passing the sessionID of a subagent that is still running redirects it with the new prompt and returns its final reply. Set agent=\"explore\" for exploration or review that must not change anything; the child then cannot run shell or edit files.\n\n\
-             When to use: an isolated research or exploration burst whose intermediate steps would flood this context (read a broad area, then summarize), or an independent subtask that needs the full toolkit but not this conversation's history.\n\
-             When NOT to use: a question a single read or grep answers (do it directly), work that needs the parent's context, or several rounds of back-and-forth — the child gets one prompt and answers once.",
-            object_param(
-                vec![
-                    (
-                        "prompt",
-                        param(
-                            "string",
-                            "Complete, self-contained instructions for the child.",
-                        ),
-                    ),
-                    (
-                        "description",
-                        param(
-                            "string",
-                            "Short label for this delegation, shown in the transcript.",
-                        ),
-                    ),
-                    (
-                        "sessionID",
-                        param(
-                            "string",
-                            "Continue a specific previous subagent conversation by passing its sessionID. Calls without a sessionID start a new conversation.",
-                        ),
-                    ),
-                    (
-                        "background",
-                        param(
-                            "boolean",
-                            "Run the subagent in the background and return immediately. You will be notified when it completes. DO NOT sleep, poll, or proactively check on its progress.",
-                        ),
-                    ),
-                    (
-                        "agent",
-                        param(
-                            "string",
-                            "Subagent profile: `general` (full toolkit), `explore` (read-only search: no shell, write, edit, patch or nested subagent), or `review` (judges work it did not do; no write tools, but `shell` can still mutate the tree; a review dispatch must carry its own criteria). Defaults to `general`. Only for a new subagent: a continued sessionID keeps the agent it started with.",
-                        ),
-                    ),
-                ],
-                &["prompt", "description"],
-            ),
-        )
+        subagent_definition()
     }
 
     fn execute(
@@ -441,6 +373,57 @@ impl Tool for SubagentTool {
     ) -> std::pin::Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
         Box::pin(async move { run(self, &ctx, &input).await })
     }
+}
+
+fn subagent_definition() -> ToolDef {
+    ToolDef::function(
+        "subagent",
+        "Spawn a child session, delegate a prompt to it, and wait for its final reply. The child has its own context window and transcript; only its final message returns to this conversation. The output includes a sessionID you can pass back later to continue that specific conversation with the subagent. New child sessions start with fresh context, so include all relevant context and instructions when you don't pass a sessionID.\n\n\
+             Subagents always run in the background: the call returns immediately with a sessionID, and you receive a <subagent> message when it goes idle, including after later work. Do not sleep, poll, or proactively check on its progress.\n\n\
+             Several subagent calls in one turn run in parallel, up to a server-wide limit of active subagents. Passing the sessionID of a subagent that is still running joins its current run. Set agent=\"explore\" for exploration or review that must not change anything; the child then cannot run shell or edit files.\n\n\
+             When to use: an isolated research or exploration burst whose intermediate steps would flood this context (read a broad area, then summarize), or an independent subtask that needs the full toolkit but not this conversation's history.\n\
+             When NOT to use: a question a single read or grep answers (do it directly), work that needs the parent's context, or several rounds of back-and-forth — the child gets one prompt and answers once.",
+        object_param(
+            vec![
+                (
+                    "prompt",
+                    param(
+                        "string",
+                        "Complete, self-contained instructions for the child.",
+                    ),
+                ),
+                (
+                    "description",
+                    param(
+                        "string",
+                        "Short label for this delegation, shown in the transcript.",
+                    ),
+                ),
+                (
+                    "sessionID",
+                    param(
+                        "string",
+                        "Continue a specific previous subagent conversation by passing its sessionID. Calls without a sessionID start a new conversation.",
+                    ),
+                ),
+                (
+                    "agent",
+                    param(
+                        "string",
+                        "The type of specialized agent to use for this task. If the user asks for a subagent by a name that is not one of the available subagents, they most likely mean a model: pick a suitable agent and pass the name through the model parameter instead.",
+                    ),
+                ),
+                (
+                    "model",
+                    param(
+                        "string",
+                        "NEVER set this unless the user explicitly asks for a particular model or variant. It must be a chat model; image and decision models cannot run subagents. The value is written as `providerID/modelID`, or `providerID/modelID#variant` to include a variant. Do not guess the ID: look the model up with the models tool first.",
+                    ),
+                ),
+            ],
+            &["agent", "prompt", "description"],
+        ),
+    )
 }
 
 fn required(input: &Value, key: &str) -> Result<String, ToolOutput> {
@@ -459,11 +442,10 @@ fn required(input: &Value, key: &str) -> Result<String, ToolOutput> {
     }
 }
 
-/// The agent a new child runs as: the `agent` field's id, or `general` when
-/// none is given. Only built-in subagent-mode ids are accepted, and an explicit
-/// id is refused on a resumed call (the child keeps the agent it started with).
+/// The agent a child runs as. Only built-in subagent-mode ids are accepted.
+/// The `agent` field is required by the wire schema, including resumed calls.
 /// The removed `read_only` key fails loudly instead of being ignored.
-fn requested_agent(input: &Value, resumed: bool) -> Result<&'static Agent, ToolOutput> {
+fn requested_agent(input: &Value) -> Result<&'static Agent, ToolOutput> {
     let invalid = |key: &str, message: String| {
         Err(super::invalid_arguments(
             "subagent",
@@ -479,18 +461,13 @@ fn requested_agent(input: &Value, resumed: bool) -> Result<&'static Agent, ToolO
         );
     }
     let given = match input.get("agent") {
-        Some(Value::String(id)) if !id.trim().is_empty() => Some(id.trim()),
-        Some(Value::String(_) | Value::Null) | None => None,
+        Some(Value::String(id)) if !id.trim().is_empty() => id.trim(),
+        Some(Value::String(_) | Value::Null) | None => {
+            return invalid("agent", "Missing string field `agent`".to_owned());
+        }
         Some(other) => return invalid("agent", format!("Expected a string, got {other}")),
     };
-    if given.is_some() && resumed {
-        return invalid(
-            "agent",
-            "Cannot be combined with `sessionID`: a continued subagent keeps the agent it started with"
-                .to_owned(),
-        );
-    }
-    let id = given.unwrap_or(SUBAGENT_AGENT);
+    let id = given;
     let available = || {
         let ids: Vec<&str> = crate::agent::all()
             .iter()
@@ -513,6 +490,57 @@ fn requested_agent(input: &Value, resumed: bool) -> Result<&'static Agent, ToolO
             ),
         ),
     }
+}
+
+/// A validated `providerID/modelID[#variant]` reference from the subagent wire.
+fn parse_model_ref(raw: &str) -> Result<ModelRef, String> {
+    let (base, variant) = match raw.split_once('#') {
+        Some((base, variant))
+            if !base.is_empty() && !variant.is_empty() && !variant.contains('#') =>
+        {
+            (base, Some(variant.to_owned()))
+        }
+        Some(_) => {
+            return Err(
+                "Model must use `providerID/modelID#variant` with non-empty parts".to_owned(),
+            );
+        }
+        None => (raw, None),
+    };
+    let mut parts = base.split('/');
+    let provider_id = parts.next().unwrap_or_default();
+    let id = parts.next().unwrap_or_default();
+    if provider_id.is_empty() || id.is_empty() || parts.next().is_some() {
+        return Err("Model must use `providerID/modelID` with exactly one `/`".to_owned());
+    }
+    Ok(ModelRef {
+        id: id.to_owned(),
+        provider_id: provider_id.to_owned(),
+        variant,
+    })
+}
+
+fn requested_model(input: &Value) -> Result<Option<ModelRef>, ToolOutput> {
+    let Some(value) = input.get("model") else {
+        return Ok(None);
+    };
+    let Value::String(raw) = value else {
+        return Err(super::invalid_arguments(
+            "subagent",
+            &[("model", format!("Expected a string, got {value}"))],
+            input,
+        ));
+    };
+    if raw.trim().is_empty() {
+        return Err(super::invalid_arguments(
+            "subagent",
+            &[("model", "Missing string field `model`".to_owned())],
+            input,
+        ));
+    }
+    parse_model_ref(raw)
+        .map(Some)
+        .map_err(|message| super::invalid_arguments("subagent", &[("model", message)], input))
 }
 
 async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutput {
@@ -541,11 +569,13 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         }
     };
     let resumed = resume_id.is_some();
-    let agent = match requested_agent(input, resumed) {
+    let agent = match requested_agent(input) {
         Ok(agent) => agent,
         Err(output) => return output,
     };
-    let background = matches!(input.get("background"), Some(Value::Bool(true)));
+
+    // All invocations are detached; slot admission remains internal.
+    // Legacy fields are not part of the wire schema.
 
     // Nesting guard first, mirroring upstream's order: the parent's ancestor
     // count decides whether another delegation is allowed at all.
@@ -562,6 +592,17 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
 
     let Some(spawner) = tool.handle.spawner().cloned() else {
         return runner_missing();
+    };
+    let explicit_model = match requested_model(input) {
+        Ok(model) => model,
+        Err(output) => return output,
+    };
+    let explicit_model = match explicit_model {
+        Some(model) => match spawner.resolve_model(&model) {
+            Ok(model) => Some(model),
+            Err(message) => return fail(format!("Unable to resolve subagent model: {message}")),
+        },
+        None => None,
     };
 
     // The target child: a provided `sessionID` continues that conversation
@@ -594,34 +635,15 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
     };
     let wants_slot = needs_slot(resumed, active);
 
-    // Root foreground calls queue FIFO. Nested foreground calls must not
-    // wait while their ancestor holds a slot; background work may still queue.
+    // Every invocation returns immediately. A saturated slot pool is handled
+    // internally by the completion watcher and never appears in the schema.
     let mut permit: Option<OwnedSemaphorePermit> = None;
-    let mut queued_for: Option<Duration> = None;
-    let mut queued_in_background = false;
+    let mut queued = false;
     if wants_slot {
-        if background {
-            match try_slot(&tool.handle.slots, &ctx.cancellation) {
-                Ok(held) => permit = Some(held),
-                Err(SlotError::Capacity) => queued_in_background = true,
-                Err(error) => return slot_failure(error),
-            }
-        } else {
-            let acquired = if depth > 0 {
-                try_slot(&tool.handle.slots, &ctx.cancellation).map(|permit| Acquired {
-                    permit,
-                    queued: None,
-                })
-            } else {
-                acquire_slot(&tool.handle.slots, &ctx.cancellation).await
-            };
-            match acquired {
-                Ok(acquired) => {
-                    permit = Some(acquired.permit);
-                    queued_for = acquired.queued;
-                }
-                Err(error) => return slot_failure(error),
-            }
+        match try_slot(&tool.handle.slots, &ctx.cancellation) {
+            Ok(held) => permit = Some(held),
+            Err(SlotError::Capacity) => queued = true,
+            Err(error) => return slot_failure(error),
         }
     }
 
@@ -638,6 +660,7 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
                 &description,
                 parent,
                 agent.id,
+                explicit_model.clone(),
             )
             .await
             {
@@ -646,6 +669,54 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
             }
         }
     };
+
+    // A resumed child may switch its agent and/or model before this prompt,
+    // exactly like the session switch endpoints. New children persist their
+    // selections in SessionCreated instead.
+    if resumed {
+        let Some(config) = (match load_child_config(&tool.handle.db, &child_id).await {
+            Ok(config) => config,
+            Err(error) => return fail(format!("Unable to load subagent session: {error}")),
+        }) else {
+            return fail(format!("Subagent session not found: {child_id}"));
+        };
+        let switched = config.agent.as_deref() != Some(agent.id);
+        if switched
+            && let Err(error) = tool
+                .handle
+                .bus
+                .publish(SessionEventData::SessionAgentSelected {
+                    session_id: child_id.clone(),
+                    agent: agent.id.to_owned(),
+                    previous: config.agent.clone(),
+                })
+                .await
+        {
+            return fail(format!("Unable to select child agent: {error}"));
+        }
+        let selected_model = match explicit_model.clone() {
+            Some(model) => Some(model),
+            None if switched => match spawner.child_model(agent.id) {
+                Ok(model) => model,
+                Err(error) => return fail(error),
+            },
+            None => None,
+        };
+        if let Some(model) = selected_model
+            && config.model.as_ref() != Some(&model)
+            && let Err(error) = tool
+                .handle
+                .bus
+                .publish(SessionEventData::SessionModelSelected {
+                    session_id: child_id.clone(),
+                    model,
+                    previous: config.model.clone(),
+                })
+                .await
+        {
+            return fail(format!("Unable to select child model: {error}"));
+        }
+    }
 
     // Name the child on the running part before it can start (upstream
     // `ctx.metadata({ sessionId })`): the same bus orders this ahead of the
@@ -697,152 +768,35 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
     if let Err(error) = tool.handle.bus.publish(enqueued).await {
         return fail(format!("Unable to enqueue child prompt: {error}"));
     }
-    // A queued background child is dispatched by its watcher once a slot
-    // frees; everything else starts now.
-    if !queued_in_background && let Err(error) = spawner.dispatch(&child_id, &message_id).await {
+    // A queued child is dispatched by its watcher once a slot frees; an
+    // admitted child starts now. Both paths return the same running result.
+    if !queued && let Err(error) = spawner.dispatch(&child_id, &message_id).await {
         return fail(format!("Unable to start child session: {error}"));
     }
-
-    if background {
-        // The watcher outlives this turn by design: the child keeps working
-        // and the parent is woken when it settles.
-        let start = if queued_in_background {
-            WatcherStart::Queued {
-                inbox_id: message_id,
-            }
-        } else {
-            WatcherStart::Running(permit)
-        };
-        spawn_completion_watcher(
-            tool.handle.clone(),
-            ctx.session_id.clone(),
-            child_id.clone(),
-            description.clone(),
-            start,
-        );
-        return background_output(&child_id, &description, queued_in_background);
-    }
-
-    drop(_admission);
-    // `permit` is held until this function returns on any path, so the slot
-    // frees on success, failure, and cancellation alike, unless
-    // `session.background` hands it to a completion watcher below.
-    //
-    // The wait blocks the parent session as a job (upstream `jobs.block`,
-    // id = child sessionID), so `session.background` can turn this call
-    // into a background one.
-    let guard = tool
-        .handle
-        .jobs
-        .block(&child_id, "subagent", &description, &ctx.session_id);
-
-    // Wait for the child to settle (or the parent's turn to be interrupted —
-    // the child is cancelled with it, so nothing keeps running). Upstream has
-    // no timeout here: a foreground subagent waits indefinitely and only the
-    // user can stop it. A wedged child is visible to the user, who can
-    // interrupt the turn; killing healthy work on a wall clock is the worse
-    // failure mode.
-    tokio::select! {
-        () = spawner.wait_idle(&child_id) => {}
-        () = ctx.cancellation.cancelled() => {
-            spawner.interrupt(&child_id);
-            // Keep the foreground permit until actual child cleanup completes.
-            spawner.wait_idle(&child_id).await;
-            // The child is cancelled with the turn: the parent holds that
-            // outcome, so the startup replay must not report it again.
-            return fail(CANCELLED_SENTINEL)
-                .with_metadata(delivered_metadata(&child_id, STATUS_CANCELLED));
+    let start = if queued {
+        WatcherStart::Queued {
+            inbox_id: message_id,
         }
-        () = guard.backgrounded() => {
-            // Same hand-off as `background=true`: the watcher takes the slot
-            // and notifies the parent when the child settles. A child that
-            // settled at this instant is reported by the watcher, once.
-            drop(guard);
-            spawn_completion_watcher(
-                tool.handle.clone(),
-                ctx.session_id.clone(),
-                child_id.clone(),
-                description.clone(),
-                WatcherStart::Running(permit),
-            );
-            return background_output(&child_id, &description, false);
-        }
-    }
-    drop(guard);
-
-    let tail = match spawner.settled_tail(&child_id).await {
-        Ok(tail) => tail,
-        Err(error) => {
-            return fail(format!(
-                "Child session finished but its transcript is unreadable: {error}"
-            ));
-        }
-    };
-    match child_outcome(&tail) {
-        ChildOutcome::Completed => {
-            let fold = transcript_fold(&tail, &child_id, &output_dir());
-            let mut metadata = json!({
-                "sessionID": child_id,
-                "status": STATUS_COMPLETED,
-                "description": description,
-            });
-            if let (Some(queued), Some(map)) = (queued_for, metadata.as_object_mut()) {
-                map.insert(
-                    "queuedMs".to_owned(),
-                    json!(u64::try_from(queued.as_millis()).unwrap_or(u64::MAX)),
-                );
-            }
-            ok_text(envelope(&child_id, STATUS_COMPLETED, None, &fold)).with_metadata(metadata)
-        }
-        ChildOutcome::Failed(error) => {
-            // Keep the sessionID visible: the model can resume the child.
-            // Metadata marks the outcome as delivered, like the clean path.
-            fail(format!("Subagent failed (sessionID: {child_id}): {error}"))
-                .with_metadata(delivered_metadata(&child_id, STATUS_ERROR))
-        }
-        ChildOutcome::Interrupted => fail(format!("Subagent cancelled (sessionID: {child_id})"))
-            .with_metadata(delivered_metadata(&child_id, STATUS_CANCELLED)),
-    }
-}
-
-/// The `metadata` of a foreground result whose outcome the parent now holds,
-/// however it ended: the child's sessionID plus its terminal status. The
-/// startup replay reads this back to know the child was delivered, so no
-/// replay is manufactured for it.
-fn delivered_metadata(child_id: &str, status: &str) -> Value {
-    json!({ "sessionID": child_id, "status": status })
-}
-
-/// The tool result for a child handed to the background, by `background=true`
-/// or by `session.background`: `queued` when it still waits for a slot,
-/// otherwise `running`.
-fn background_output(child_id: &str, description: &str, queued: bool) -> ToolOutput {
-    let (status, lead) = if queued {
-        (
-            "queued",
-            format!(
-                "All subagent slots are busy, so the subagent is queued (sessionID: {child_id}) \
-                 and starts when a slot frees. "
-            ),
-        )
     } else {
-        (
-            "running",
-            format!("The subagent is working in the background (sessionID: {child_id}). "),
-        )
+        WatcherStart::Running(permit)
     };
+    drop(_admission);
+    spawn_completion_watcher(
+        tool.handle.clone(),
+        ctx.session_id.clone(),
+        child_id.clone(),
+        description,
+        start,
+    );
+    background_output(&child_id)
+}
+
+/// The fixed upstream result for every subagent invocation.
+fn background_output(child_id: &str) -> ToolOutput {
     ok_text(format!(
-        "{lead}You will be notified automatically when it finishes.\n\
-         DO NOT sleep, poll for progress, ask the subagent for status, or duplicate \
-         this subagent's work; avoid working with the same files or topics it is using.\n\
-         Work on non-overlapping tasks, or briefly tell the user what you launched and \
-         end your response."
+        "The subagent is working in the background (sessionID: {child_id}). You will receive a <subagent> message when it goes idle, and again after each later round of work.\nDO NOT sleep, poll, proactively check on its progress, or duplicate this subagent's work.\nWork on non-overlapping tasks, or briefly tell the user what you launched and end your response.\nTo send it follow-ups or change its instructions while it runs, call subagent again with this sessionID."
     ))
-    .with_metadata(json!({
-        "sessionID": child_id,
-        "status": status,
-        "description": description,
-    }))
+    .with_metadata(json!({ "sessionID": child_id, "status": "running" }))
 }
 
 /// What a call runs against once validated.
@@ -874,7 +828,7 @@ fn slot_failure(error: SlotError) -> ToolOutput {
         SlotError::Cancelled => fail(CANCELLED_SENTINEL),
         SlotError::Closed => fail("Subagent admission is closed; no child was started"),
         SlotError::Capacity => fail(
-            "Subagent Capacity exhausted: nested foreground calls cannot wait for a slot while ancestors hold slots. No child was started; use background=true for independent work or finish existing children first.",
+            "Subagent Capacity exhausted: nested subagent calls cannot wait for a slot while ancestors hold slots. No child was started.",
         ),
     }
 }
@@ -896,44 +850,6 @@ fn try_slot(
         })
 }
 
-/// A granted slot. Dropping `permit` frees it.
-struct Acquired {
-    permit: OwnedSemaphorePermit,
-    /// How long the call waited; `None` when a slot was free immediately.
-    queued: Option<Duration>,
-}
-
-/// Take a slot, queueing FIFO behind earlier callers. Cancellation wins over
-/// an available slot (a cancelled turn must not start a child) and ends a
-/// queued wait without leaking a permit.
-async fn acquire_slot(
-    slots: &Arc<Semaphore>,
-    cancellation: &CancellationToken,
-) -> Result<Acquired, SlotError> {
-    match try_slot(slots, cancellation) {
-        Ok(permit) => {
-            return Ok(Acquired {
-                permit,
-                queued: None,
-            });
-        }
-        Err(SlotError::Capacity) => {}
-        Err(error) => return Err(error),
-    }
-    let started = Instant::now();
-    tokio::select! {
-        biased;
-        () = cancellation.cancelled() => Err(SlotError::Cancelled),
-        acquired = slots.clone().acquire_owned() => match acquired {
-            Ok(permit) => Ok(Acquired {
-                permit,
-                queued: Some(started.elapsed()),
-            }),
-            Err(_closed) => Err(SlotError::Closed),
-        },
-    }
-}
-
 /// Create the child session row under `parent_session_id` through the same
 /// event as `POST /api/session {parentID}`. Delegation facts ride the title
 /// and the parent link; `metadata` stays empty (upstream keeps it
@@ -950,12 +866,15 @@ async fn create_child(
     description: &str,
     parent: ParentTuple,
     agent: &str,
+    explicit_model: Option<ModelRef>,
 ) -> Result<String, String> {
     let (project_id, directory, workspace_id, subpath, parent_model) = parent;
     let Some(spawner) = handle.spawner() else {
         return Err("Subagent runner is not attached; no child was started".to_owned());
     };
-    let model = spawner.child_model(agent)?.or(parent_model);
+    let model = explicit_model
+        .or(spawner.child_model(agent)?)
+        .or(parent_model);
     let child_id = ox_schema::id::id("ses");
     let created = SessionEventData::SessionCreated {
         session_id: child_id.clone(),
@@ -1626,6 +1545,47 @@ async fn load_parent(db: &ox_db::Db, session_id: &str) -> Result<Option<ParentTu
     )))
 }
 
+#[derive(Debug)]
+struct ChildConfig {
+    parent_id: Option<String>,
+    agent: Option<String>,
+    model: Option<ModelRef>,
+}
+
+/// The persisted agent and model of a resume target.
+async fn load_child_config(
+    db: &ox_db::Db,
+    session_id: &str,
+) -> Result<Option<ChildConfig>, String> {
+    let conn = db.acquire().await.map_err(|error| error.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT parent_id, agent, model FROM session_v2 WHERE id = ?1")
+        .await
+        .map_err(|error| error.to_string())?;
+    let row = ox_db::optional(&mut stmt, (session_id,))
+        .await
+        .map_err(|error| error.to_string())?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let model = row
+        .get::<Option<String>>(2)
+        .map_err(|error| error.to_string())?
+        .as_deref()
+        .map(serde_json::from_str::<ModelRef>)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    Ok(Some(ChildConfig {
+        parent_id: row
+            .get::<Option<String>>(0)
+            .map_err(|error| error.to_string())?,
+        agent: row
+            .get::<Option<String>>(1)
+            .map_err(|error| error.to_string())?,
+        model,
+    }))
+}
+
 /// The `parent_id` of a session row: the outer `None` means the session is
 /// unknown, the inner `None` that the row has no parent (a root session).
 /// A root must read as "known but parentless" so a resume target that is a
@@ -1634,21 +1594,9 @@ async fn load_child_parent(
     db: &ox_db::Db,
     session_id: &str,
 ) -> Result<Option<Option<String>>, String> {
-    let conn = db.acquire().await.map_err(|error| error.to_string())?;
-    let mut stmt = conn
-        .prepare("SELECT parent_id FROM session_v2 WHERE id = ?1")
-        .await
-        .map_err(|error| error.to_string())?;
-    let row = ox_db::optional(&mut stmt, (session_id,))
-        .await
-        .map_err(|error| error.to_string())?;
-    match row {
-        Some(row) => Ok(Some(
-            row.get::<Option<String>>(0)
-                .map_err(|error| error.to_string())?,
-        )),
-        None => Ok(None),
-    }
+    Ok(load_child_config(db, session_id)
+        .await?
+        .map(|config| config.parent_id))
 }
 
 /// The child's settle state, decided from persisted traces only — no new
@@ -1714,26 +1662,6 @@ fn reply_text(message: &ox_schema::message::Message) -> Option<String> {
 /// body for background completions, matching upstream's completion text.
 fn final_text(messages: &[ox_schema::message::Message]) -> Option<String> {
     messages.iter().rev().find_map(reply_text)
-}
-
-/// The child's reply for the parent: only the final assistant message, whole
-/// when it fits [`FOLD_BUDGET`]; otherwise its head plus a marker naming the
-/// full text spilled under `output_dir`. Pure over the child's settled tail
-/// apart from the spill, so the caller reads that tail once.
-fn transcript_fold(
-    messages: &[ox_schema::message::Message],
-    child_id: &str,
-    output_dir: &Path,
-) -> String {
-    let Some(final_reply) = final_text(messages) else {
-        return format!(
-            "Subagent finished without a final reply. Its transcript is on session {child_id}."
-        );
-    };
-    format!(
-        "Subagent report:\n\n{}",
-        child_view(&final_reply, child_id, output_dir, FOLD_BUDGET)
-    )
 }
 
 /// Where this process spills oversized child output. One directory for both
@@ -1910,4 +1838,259 @@ fn escape(raw: &str, needs_escape: fn(char) -> bool) -> Cow<'_, str> {
         }
     }
     Cow::Owned(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+
+    struct TestSpawner {
+        admission: crate::contract::AdmissionGate,
+        idle: Arc<Notify>,
+        dispatches: AtomicUsize,
+        waits: AtomicUsize,
+    }
+
+    impl TestSpawner {
+        fn new() -> Self {
+            Self {
+                admission: crate::contract::AdmissionGate::default(),
+                idle: Arc::new(Notify::new()),
+                dispatches: AtomicUsize::new(0),
+                waits: AtomicUsize::new(0),
+            }
+        }
+
+        async fn wait_for_waiters(&self, expected: usize) {
+            for _ in 0..1_000 {
+                if self.waits.load(Ordering::Acquire) >= expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(
+                self.waits.load(Ordering::Acquire),
+                expected,
+                "completion watchers did not register their idle waits"
+            );
+        }
+    }
+
+    impl SubagentSpawner for TestSpawner {
+        fn try_admit(
+            &self,
+        ) -> Result<crate::contract::ExecutionAdmission, crate::contract::Closing> {
+            self.admission.try_admit()
+        }
+
+        fn is_closing(&self) -> bool {
+            self.admission.is_closed()
+        }
+
+        fn dispatch<'a>(
+            &'a self,
+            _session_id: &'a str,
+            _inbox_id: &'a str,
+        ) -> std::pin::Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>> {
+            self.dispatches.fetch_add(1, Ordering::AcqRel);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn is_active(&self, _session_id: &str) -> bool {
+            false
+        }
+
+        fn interrupt(&self, _session_id: &str) -> bool {
+            false
+        }
+
+        fn wait_idle<'a>(&'a self, _session_id: &'a str) -> WaitIdle<'a> {
+            self.waits.fetch_add(1, Ordering::AcqRel);
+            let idle = Arc::clone(&self.idle);
+            Box::pin(async move { idle.notified().await })
+        }
+
+        fn settled_tail<'a>(&'a self, _session_id: &'a str) -> SettledTail<'a> {
+            Box::pin(async {
+                Ok(vec![
+                    serde_json::from_value(serde_json::json!({
+                        "type": "assistant",
+                        "id": "msg_assistant",
+                        "time": {"created": 2},
+                        "agent": "general",
+                        "model": {"id": "model", "providerID": "provider"},
+                        "content": [{"type": "text", "text": "child completed"}]
+                    }))?,
+                    serde_json::from_value(serde_json::json!({
+                        "type": "idle",
+                        "id": "msg_idle",
+                        "time": {"created": 3},
+                        "outcome": "succeeded"
+                    }))?,
+                ])
+            })
+        }
+
+        fn child_model(&self, _agent: &str) -> Result<Option<ModelRef>, String> {
+            Ok(None)
+        }
+
+        fn resolve_model(&self, model: &ModelRef) -> Result<ModelRef, String> {
+            Ok(model.clone())
+        }
+    }
+
+    async fn test_parent(db: &ox_db::Db, bus: &ox_core::event_bus::EventBus, session_id: &str) {
+        bus.publish(SessionEventData::SessionCreated {
+            session_id: session_id.to_owned(),
+            project_id: "project".to_owned(),
+            location: LocationRef {
+                directory: "/tmp/subagent-test".to_owned(),
+                workspace_id: None,
+            },
+            subpath: None,
+            parent_id: None,
+            slug: "parent".to_owned(),
+            title: Some("parent".to_owned()),
+            agent: None,
+            model: None,
+            metadata: Some(SessionMetadata::default()),
+            permissions: None,
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+        })
+        .await
+        .expect("create test parent");
+
+        let conn = db.acquire().await.expect("acquire test db");
+        let mut statement = conn
+            .prepare("SELECT id FROM session_v2 WHERE id = ?1")
+            .await
+            .expect("prepare parent query");
+        assert!(
+            ox_db::optional(&mut statement, (session_id,))
+                .await
+                .expect("query parent")
+                .is_some(),
+            "test parent must be projected before invoking the tool"
+        );
+    }
+
+    fn test_context(session_id: &str, call_id: &str) -> ToolContext {
+        ToolContext {
+            session_id: session_id.to_owned(),
+            directory: "/tmp/subagent-test".into(),
+            assistant_message_id: "msg_parent".to_owned(),
+            call_id: call_id.to_owned(),
+            cancellation: CancellationToken::new(),
+            registry: Arc::new(crate::contract::ToolRegistry::new()),
+        }
+    }
+
+    #[tokio::test]
+    async fn new_and_resumed_runs_return_immediately_and_register_completion_watchers() {
+        let db = ox_db::Db::open_in_memory().await.expect("open test db");
+        let bus = ox_core::event_bus::EventBus::new(db.clone());
+        let spawner = Arc::new(TestSpawner::new());
+        let handle = Arc::new(SubagentHandle::new(db.clone(), bus.clone(), 2));
+        handle.attach(spawner.clone());
+        let tool = SubagentTool::new(Arc::clone(&handle), 4);
+        test_parent(&db, &bus, "ses_parent").await;
+
+        let first = run(
+            &tool,
+            &test_context("ses_parent", "call_new"),
+            &json!({"prompt": "first", "description": "new child", "agent": "general"}),
+        )
+        .await;
+        let child_id = first
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("sessionID"))
+            .and_then(Value::as_str)
+            .expect("new run returns a child sessionID")
+            .to_owned();
+        assert!(first.error.is_none(), "new run should return immediately");
+        assert_eq!(
+            first.metadata,
+            Some(json!({"sessionID": child_id, "status": "running"}))
+        );
+
+        let second = run(
+            &tool,
+            &test_context("ses_parent", "call_resume"),
+            &json!({
+                "prompt": "follow-up",
+                "description": "continued child",
+                "agent": "general",
+                "sessionID": child_id
+            }),
+        )
+        .await;
+        assert!(
+            second.error.is_none(),
+            "resumed run should return immediately"
+        );
+        assert_eq!(
+            second.metadata,
+            Some(json!({"sessionID": child_id, "status": "running"}))
+        );
+        assert!(handle.owes_wakeup("ses_parent"));
+        spawner.wait_for_waiters(2).await;
+
+        spawner.idle.notify_waiters();
+        handle.join().await.expect("completion watchers join");
+
+        assert_eq!(spawner.waits.load(Ordering::Acquire), 2);
+        assert_eq!(
+            spawner.dispatches.load(Ordering::Acquire),
+            2,
+            "one dispatch for each prompt; completion dispatch is suppressed during join"
+        );
+        let conn = db.acquire().await.expect("acquire inbox db");
+        let mut statement = conn
+            .prepare(
+                "SELECT COUNT(*) FROM session_inbox
+                 WHERE session_id = ?1 AND type = 'synthetic'",
+            )
+            .await
+            .expect("prepare inbox query");
+        let row = ox_db::optional(&mut statement, ("ses_parent",))
+            .await
+            .expect("query completion inbox")
+            .expect("completion count row");
+        assert_eq!(row.get::<i64>(0).expect("completion count"), 2);
+    }
+
+    #[test]
+    fn schema_hides_internal_background_control() {
+        let definition = subagent_definition();
+        let schema = definition.function.parameters.to_string();
+
+        assert!(!schema.contains(concat!("back", "ground")));
+        assert!(
+            !definition
+                .function
+                .description
+                .contains(concat!("Fore", "ground (default)"))
+        );
+    }
+
+    #[test]
+    fn every_invocation_returns_the_upstream_running_result() {
+        let output = background_output("ses_child");
+
+        assert_eq!(
+            output.content,
+            Value::String(
+                "The subagent is working in the background (sessionID: ses_child). You will receive a <subagent> message when it goes idle, and again after each later round of work.\nDO NOT sleep, poll, proactively check on its progress, or duplicate this subagent's work.\nWork on non-overlapping tasks, or briefly tell the user what you launched and end your response.\nTo send it follow-ups or change its instructions while it runs, call subagent again with this sessionID."
+                    .to_owned()
+            )
+        );
+        assert_eq!(
+            output.metadata,
+            Some(json!({ "sessionID": "ses_child", "status": "running" }))
+        );
+    }
 }

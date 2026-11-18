@@ -107,12 +107,7 @@ impl ToolRegistry {
         depth_limit: usize,
         max_active: usize,
     ) {
-        let handle = std::sync::Arc::new(subagent::SubagentHandle::new(
-            db,
-            bus,
-            max_active,
-            Arc::clone(&self.jobs),
-        ));
+        let handle = std::sync::Arc::new(subagent::SubagentHandle::new(db, bus, max_active));
         // The runner looks the handle up here when it is built and attaches
         // itself; until then the tool reports the missing-runner condition.
         self.subagent_handle = Some(handle.clone());

@@ -113,6 +113,7 @@ pub(super) fn spawn(
     cwd: &Path,
     environment: Option<&HashMap<String, String>>,
     owned_session: bool,
+    session_id: Option<&str>,
 ) -> io::Result<Spawned> {
     let (read, write) = io::pipe()?;
     let write_err = write.try_clone()?;
@@ -138,6 +139,9 @@ pub(super) fn spawn(
         // has been configured.
         cmd.env("TERM", "xterm-256color");
         cmd.env("OPENCODE_TERMINAL", "1");
+        if let Some(session_id) = session_id {
+            cmd.env("OPENCODE_SESSION_ID", session_id);
+        }
     }
     for key in pane_identity_vars(std::env::vars_os()) {
         cmd.env_remove(key);

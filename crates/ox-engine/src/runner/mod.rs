@@ -1395,8 +1395,13 @@ impl ox_tools::subagent::SubagentSpawner for WeakRunner {
             crate::runner::step::settled_tail(&self.runner()?.inner.db, session_id).await
         })
     }
-    /// Forward to the live runner. A dropped engine refuses instead of
-    /// resolving against a catalogue it no longer has.
+    fn resolve_model(&self, model: &ModelRef) -> std::result::Result<ModelRef, String> {
+        let Some(inner) = self.0.upgrade() else {
+            return Err("Engine is shutting down; no subagent model was resolved".to_owned());
+        };
+        <Runner as ox_tools::subagent::SubagentSpawner>::resolve_model(&Runner { inner }, model)
+    }
+
     fn child_model(&self, agent: &str) -> std::result::Result<Option<ModelRef>, String> {
         let Some(inner) = self.0.upgrade() else {
             return Err("Engine is shutting down; no child model was resolved".to_owned());
@@ -1465,6 +1470,41 @@ impl ox_tools::subagent::SubagentSpawner for Runner {
     /// define, or one without a preference, inherits the parent's model; a
     /// preference the catalogue does not know refuses the spawn rather than
     /// quietly running the child on the parent's model.
+    fn resolve_model(&self, model: &ModelRef) -> std::result::Result<ModelRef, String> {
+        let services = self.inner.live.current();
+        let entries = services.model_catalog.cached();
+        let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.provider == model.provider_id && entry.id == model.id)
+        else {
+            return Err(format!(
+                "model `{}/{}` is not available",
+                model.provider_id, model.id
+            ));
+        };
+        if !matches!(
+            entry.model_type.as_deref().unwrap_or("chat"),
+            "chat" | "text"
+        ) {
+            return Err(format!(
+                "model `{}/{}` is not a chat model",
+                model.provider_id, model.id
+            ));
+        }
+        if let Some(variant) = model.variant.as_deref()
+            && !entry
+                .supported_reasoning_levels
+                .iter()
+                .any(|level| level.effort == variant)
+        {
+            return Err(format!(
+                "variant `{variant}` is not available for `{}/{}`",
+                model.provider_id, model.id
+            ));
+        }
+        Ok(model.clone())
+    }
+
     fn child_model(&self, agent_id: &str) -> std::result::Result<Option<ModelRef>, String> {
         let services = self.inner.live.current();
         let Some(profile) = agent::get(agent_id) else {

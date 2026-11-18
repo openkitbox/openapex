@@ -9,6 +9,7 @@ use ox_schema::event::SessionEventData;
 use ox_schema::id;
 use ox_schema::support::{ForkBoundary, LocationRef, ModelRef, Rule, SessionMetadata};
 
+use super::fork_notice::notice_event;
 use super::response::{
     invalid_request, invalid_request_kind, message_not_found, no_content, parse_body,
     session_not_found, unknown_error,
@@ -525,7 +526,11 @@ pub(crate) async fn fork(req: &mut Request, depot: &mut Depot, res: &mut Respons
         instruction_entries: None,
     };
 
-    if let Err(error) = app.bus.publish(event).await {
+    if let Err(error) = app
+        .bus
+        .publish_fork_with_notice(event, notice_event(&new_session_id))
+        .await
+    {
         unknown_error(res, &error);
         return;
     }

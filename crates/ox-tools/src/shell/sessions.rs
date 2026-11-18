@@ -23,7 +23,6 @@
 
 use std::collections::HashMap;
 use std::mem;
-use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -643,15 +642,13 @@ impl ShellSession {
 
     /// Report a lifecycle notice to the observer. Needs both an observer and
     /// an owner: the notice is stamped with the owner's directory.
+    ///
+    /// Observers are trusted in-process infrastructure. They must not panic;
+    /// a panic would abort the shell transition rather than being recoverable
+    /// at this boundary.
     fn notify(&self, notice: Notice) {
         if let (Some(observer), Some(owner)) = (&self.observer, &self.owner) {
-            // A panicking observer must not unwind through `drive` or a
-            // `remove`: the completion and every `stop` waiter still follow.
-            if std::panic::catch_unwind(AssertUnwindSafe(|| observer(&owner.directory, notice)))
-                .is_err()
-            {
-                tracing::error!(id = %self.id, "shell lifecycle observer panicked");
-            }
+            observer(&owner.directory, notice);
         }
     }
 
@@ -965,7 +962,12 @@ impl ShellSessions {
             &request.cwd,
             environment.as_ref(),
             request.owner.is_some(),
+            request
+                .owner
+                .as_ref()
+                .map(|owner| owner.session_id.as_str()),
         )?;
+        let foreground_has_completion = request.completion.is_some() && request.foreground;
         let session = Arc::new(ShellSession {
             id: ox_schema::id::id("sh"),
             command: request.command,
@@ -999,7 +1001,11 @@ impl ShellSessions {
                 .clone(),
             table: Arc::downgrade(self),
         });
-        if let Some(timeout) = request.timeout_ms.filter(|timeout| *timeout > 0) {
+        if let Some(timeout) = request
+            .timeout_ms
+            .filter(|timeout| *timeout > 0)
+            .filter(|_| !foreground_has_completion)
+        {
             let handle = self
                 .tasks
                 .spawn_with_handle(deadline_timer(
@@ -1452,6 +1458,19 @@ mod tests {
         }
     }
 
+    async fn wait_for_output(session: &ShellSession, expected: &str) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if session.recent(1024).contains(expected) {
+                    return;
+                }
+                session.wait_change(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("shell should produce the expected output");
+    }
+
     #[tokio::test]
     async fn session_environment_is_applied_to_owned_shells() {
         let sessions = Arc::new(ShellSessions::new());
@@ -1475,7 +1494,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owned_shells_receive_terminal_environment_variables() {
+    async fn shell_session_id_is_injected_for_owned_shells() {
         let sessions = Arc::new(ShellSessions::new());
         let shell = sessions
             .spawn(request(
@@ -1483,15 +1502,116 @@ mod tests {
                     session_id: String::from("session-1"),
                     directory: String::from("."),
                 }),
-                "printf '%s|%s' \"${TERM-absent}\" \"${OPENCODE_TERMINAL-absent}\"",
+                "printf '%s|%s|%s' \"${TERM-absent}\" \"${OPENCODE_TERMINAL-absent}\" \"${OPENCODE_SESSION_ID-absent}\"",
             ))
             .expect("owned shell should spawn");
         shell.wait_settled(Duration::from_secs(2)).await;
 
         assert_eq!(
             shell.poll(0, 1024).0.output,
-            "xterm-256color|1",
-            "owned shells must receive the upstream terminal environment"
+            "xterm-256color|1|session-1",
+            "owned shells must receive the upstream terminal and session environment"
+        );
+    }
+
+    #[tokio::test]
+    async fn unowned_shells_do_not_receive_a_fake_session_id() {
+        let sessions = Arc::new(ShellSessions::new());
+        let shell = sessions
+            .spawn(request(
+                None,
+                "printf '%s' \"${OPENCODE_SESSION_ID-absent}\"",
+            ))
+            .expect("shell should spawn");
+        shell.wait_settled(Duration::from_secs(2)).await;
+
+        assert_eq!(shell.poll(0, 1024).0.output, "absent");
+    }
+
+    #[tokio::test]
+    async fn foreground_timeout_hands_back_and_delivers_one_completion() {
+        let sessions = Arc::new(ShellSessions::new());
+        let completions = Arc::new(Mutex::new(Vec::new()));
+        let completion_done = Arc::new(tokio::sync::Notify::new());
+        let received = Arc::clone(&completions);
+        let notified = Arc::clone(&completion_done);
+        let callback: CompletionCallback = Arc::new(move |completion| {
+            received
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(completion);
+            notified.notify_one();
+            Box::pin(async {})
+        });
+        let shell = sessions
+            .spawn(SpawnRequest {
+                command: "printf ready; sleep 0.05; printf past; sleep 0.05; printf done"
+                    .to_owned(),
+                cwd: PathBuf::from("."),
+                timeout_ms: Some(10),
+                completion: Some(callback),
+                foreground: true,
+                owner: Some(Owner {
+                    session_id: String::from("session-1"),
+                    directory: String::from("."),
+                }),
+                metadata: Record::new(),
+            })
+            .expect("shell should spawn");
+
+        wait_for_output(&shell, "past").await;
+        assert!(
+            !shell.settled(),
+            "the yield window must keep the shell alive"
+        );
+        assert_eq!(shell.hand_back(), HandBack::Background);
+        assert!(shell.wait_settled(Duration::from_secs(2)).await);
+        completion_done.notified().await;
+        assert_eq!(shell.poll(0, 1024).0.output, "readypastdone");
+        assert_eq!(
+            completions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1,
+            "background hand-back must notify exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn hand_back_before_foreground_timeout_clears_the_deadline() {
+        let sessions = Arc::new(ShellSessions::new());
+        let completions = Arc::new(Mutex::new(Vec::new()));
+        let completion_done = Arc::new(tokio::sync::Notify::new());
+        let received = Arc::clone(&completions);
+        let notified = Arc::clone(&completion_done);
+        let shell = sessions
+            .spawn(SpawnRequest {
+                command: "printf ready; sleep 0.2; printf done".to_owned(),
+                cwd: PathBuf::from("."),
+                timeout_ms: Some(100),
+                completion: Some(Arc::new(move |completion| {
+                    received
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(completion);
+                    notified.notify_one();
+                    Box::pin(async {})
+                })),
+                foreground: true,
+                owner: None,
+                metadata: Record::new(),
+            })
+            .expect("shell should spawn");
+
+        wait_for_output(&shell, "ready").await;
+        assert_eq!(shell.hand_back(), HandBack::Background);
+        assert!(shell.wait_settled(Duration::from_secs(2)).await);
+        completion_done.notified().await;
+        assert_eq!(shell.poll(0, 1024).0.output, "readydone");
+        assert_eq!(
+            completions.lock().unwrap_or_else(|p| p.into_inner()).len(),
+            1
         );
     }
 

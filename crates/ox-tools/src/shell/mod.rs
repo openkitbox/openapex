@@ -413,12 +413,18 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
         let session_id = ctx.session_id.clone();
         Arc::new(move |completion| sink(&session_id, completion)) as sessions::CompletionCallback
     });
+    let foreground = yield_ms > 0;
     let session = match tool.sessions.spawn(sessions::SpawnRequest {
         command: to_run,
         cwd: workdir,
-        timeout_ms: Some(timeout_ms).filter(|timeout| *timeout > 0),
+        // Upstream keeps foreground model commands alive while the call's
+        // timeout moves them to the background. The session deadline remains
+        // for the no-sink fail-closed path and for explicit background runs.
+        timeout_ms: Some(timeout_ms)
+            .filter(|timeout| *timeout > 0)
+            .filter(|_| !(foreground && tool.completion.is_some())),
         completion,
-        foreground: yield_ms > 0,
+        foreground,
         owner: Some(sessions::Owner {
             session_id: ctx.session_id.clone(),
             directory: ctx.directory.to_string_lossy().into_owned(),
@@ -446,10 +452,18 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
                 None => std::future::pending::<()>().await,
             }
         };
+        let timed_out = async {
+            if tool.completion.is_some() && timeout_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
         tokio::select! {
             _ = session.wait_settled(Duration::from_millis(yield_ms)) => {}
             () = ctx.cancellation.cancelled() => {}
             () = backgrounded => {}
+            () = timed_out => {}
         }
     }
     if ctx.cancellation.is_cancelled() {

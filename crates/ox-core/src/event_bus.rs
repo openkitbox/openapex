@@ -1,20 +1,12 @@
-//! In-process event bus with in-transaction projection.
-//!
-//! Faithful port of upstream `packages/core/src/bus.ts` `commitDurableEvent`:
-//! allocate the next per-aggregate sequence, run the projector in the same
-//! transaction, upsert the `event_sequence` watermark, then insert the event
-//! row — all atomically. Ephemeral events skip persistence and only broadcast.
-//!
-//! Upstream uses Effect's `Effect.transaction` keyed by aggregate; here we
-//! serialize per-aggregate with a `DashMap<String, Arc<Mutex<()>>>` guard held
-//! across the whole `db.conn().call(...)` (which runs on a dedicated SQLite
-//! thread, so the lock is the only concurrency point).
+//! The projector runs inside the database writer transaction, which is the
+//! serialization boundary for durable event sequencing. Ephemeral events skip
+//! persistence and only broadcast.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use dashmap::DashMap;
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -164,7 +156,9 @@ fn now_millis() -> i64 {
 pub struct EventBus {
     db: Db,
     tx: broadcast::Sender<EventEnvelope>,
-    /// Per-aggregate serialization for durable commit.
+    /// Reserved for the ordinary durable publish path's in-process ordering.
+    /// The fork+notice path uses the database transaction directly because its
+    /// two-event atomicity must not hold an async guard across awaits.
     locks: DashMap<String, Arc<tokio::sync::Mutex<()>>>,
     /// Monotonic counter so `id::id("evt")` is strictly ascending within a
     /// process even when multiple events share the same millisecond. Shared
@@ -235,6 +229,141 @@ impl EventBus {
         self.publish_durable(data, true, Some(event_id), None)
             .await
             .map(|_| ())
+    }
+
+    /// Persist a fork and its synthetic notice in one transaction.
+    ///
+    /// Both events use the forked session as their aggregate, so their sequence
+    /// numbers are allocated consecutively inside one writer transaction. The
+    /// notice is deliberately a second durable event: its inbox projection must
+    /// commit or roll back with the fork projection, event rows, and sequence
+    /// watermark.
+    pub async fn publish_fork_with_notice(
+        &self,
+        fork: SessionEventData,
+        notice: SessionEventData,
+    ) -> Result<()> {
+        let aggregate_id = session_id_of(&fork)
+            .ok_or_else(|| anyhow!("fork event has no sessionID field"))?
+            .to_owned();
+        if session_id_of(&notice) != Some(aggregate_id.as_str()) {
+            bail!("fork notice must target the forked session");
+        }
+        if is_ephemeral(fork.kind()) || is_ephemeral(notice.kind()) {
+            bail!("fork and notice must be durable events");
+        }
+        // The transaction is the serialization boundary: Turso admits one
+        // writer transaction at a time, so sequence allocation and both
+        // projections observe one ordered snapshot without holding an async
+        // mutex across database awaits.
+        let tx = self.db.begin().await?;
+        let first_seq = {
+            let mut rows = tx
+                .query(
+                    "SELECT COALESCE((SELECT seq FROM event_sequence WHERE aggregate_id = ?1), -1)",
+                    [aggregate_id.as_str()],
+                )
+                .await?;
+            rows.next()
+                .await?
+                .context("fork sequence query returned no row")?
+                .get::<i64>(0)?
+                + 1
+        };
+        let fork_id = self.next_evt_id();
+        let notice_id = self.next_evt_id();
+        let fork_created = now_millis();
+        let notice_created = now_millis();
+        let notice_kind = notice.kind().to_owned();
+        let fork_env = EventEnvelope {
+            id: fork_id.clone(),
+            created: fork_created,
+            kind: fork.kind().to_owned(),
+            data: fork,
+            durable: Some(DurableEnvelope {
+                aggregate_id: aggregate_id.clone(),
+                seq: first_seq,
+                version: 2,
+            }),
+            location: None,
+            metadata: None,
+        };
+        let notice_env = EventEnvelope {
+            id: notice_id.clone(),
+            created: notice_created,
+            kind: notice_kind.clone(),
+            data: notice,
+            durable: Some(DurableEnvelope {
+                aggregate_id: aggregate_id.clone(),
+                seq: first_seq + 1,
+                version: durable_version(&notice_kind) as i64,
+            }),
+            location: None,
+            metadata: None,
+        };
+        let fork_data = fork_env.data.to_data();
+        let notice_data = notice_env.data.to_data();
+        let mut post_commit = project(&tx, &fork_env).await?;
+        post_commit.extend(project(&tx, &notice_env).await?);
+        tx.execute(
+            "INSERT INTO event_sequence (aggregate_id, seq) VALUES (?1, ?2)
+             ON CONFLICT(aggregate_id) DO UPDATE SET seq = max(seq, excluded.seq)",
+            (aggregate_id.as_str(), first_seq + 1),
+        )
+        .await
+        .context("commit fork events")?;
+        tx.execute(
+            "INSERT INTO event (id, aggregate_id, seq, created, type, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                fork_id.as_str(),
+                aggregate_id.as_str(),
+                first_seq,
+                fork_created,
+                "session.forked@v2",
+                fork_data.to_string(),
+            ),
+        )
+        .await
+        .context("commit fork events")?;
+        tx.execute(
+            "INSERT INTO event (id, aggregate_id, seq, created, type, data)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                notice_id.as_str(),
+                aggregate_id.as_str(),
+                first_seq + 1,
+                notice_created,
+                format!("{notice_kind}@v{}", durable_version(&notice_kind)),
+                notice_data.to_string(),
+            ),
+        )
+        .await
+        .context("commit fork events")?;
+        tx.commit().await.context("commit fork events")?;
+        let _ = self.tx.send(fork_env.into_generic());
+        let _ = self.tx.send(notice_env.into_generic());
+        for action in post_commit {
+            let PostCommit::PublishUsage { session_id } = action;
+            if let Ok((cost, tokens)) = self.read_usage(&session_id).await {
+                let usage = SessionEventData::SessionUsageUpdated {
+                    session_id,
+                    cost,
+                    tokens,
+                };
+                let uenv = EventEnvelope {
+                    id: self.next_evt_id(),
+                    created: now_millis(),
+                    kind: usage.kind().to_owned(),
+                    data: usage,
+                    durable: None,
+                    location: None,
+                    metadata: None,
+                };
+                let _ = self.tx.send(uenv.into_generic());
+            }
+        }
+        Ok(())
     }
 
     /// Publish an event without broadcasting it to live subscribers.
@@ -635,4 +764,81 @@ pub(crate) fn session_id_of(data: &SessionEventData) -> Option<&str> {
         | E::CompactionFailed { session_id, .. } => session_id,
         E::Unknown { .. } => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ox_db::Db;
+    use ox_schema::event::SessionEventData;
+    use ox_schema::inbox::{Delivery, Item, SyntheticPayload};
+    use ox_schema::support::ForkBoundary;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fork_notice_failure_rolls_back_the_fork() {
+        let db = Db::open_in_memory().await.expect("open test database");
+        let tx = db.begin().await.expect("begin setup transaction");
+        tx.execute(
+            "INSERT INTO session_v2
+             (id, project_id, slug, directory, version, time_created, time_updated)
+             VALUES ('parent', 'project', 'parent-slug', '/tmp', 'test', 1, 1)",
+            (),
+        )
+        .await
+        .expect("insert parent session");
+        tx.execute(
+            "INSERT INTO session_message
+             (id, session_id, type, seq, time_created, time_updated, data)
+             VALUES ('msg_fork_notice_child', 'parent', 'user', 0, 1, 1, '{}')",
+            (),
+        )
+        .await
+        .expect("insert fork boundary");
+        tx.commit().await.expect("commit setup transaction");
+
+        let bus = EventBus::new(db.clone());
+        let fork = SessionEventData::SessionForked {
+            session_id: "child".to_owned(),
+            parent_id: "parent".to_owned(),
+            boundary: ForkBoundary::Through {
+                message_id: "msg_fork_notice_child".to_owned(),
+            },
+            instructions: None,
+            instruction_entries: None,
+        };
+        let notice = SessionEventData::InboxEnqueued {
+            session_id: "child".to_owned(),
+            inbox_id: "msg_fork_notice_child".to_owned(),
+            item: Item::Synthetic {
+                payload: SyntheticPayload {
+                    text: "notice".to_owned(),
+                    description: Some("Fork notice".to_owned()),
+                    metadata: None,
+                },
+                delivery: Delivery::Steer,
+            },
+        };
+
+        assert!(bus.publish_fork_with_notice(fork, notice).await.is_err());
+
+        let conn = db.acquire().await.expect("acquire test connection");
+        let mut rows = conn
+            .query(
+                "SELECT
+                   (SELECT count(*) FROM session_v2 WHERE id = 'child'),
+                   (SELECT count(*) FROM event WHERE aggregate_id = 'child'),
+                   (SELECT count(*) FROM event_sequence WHERE aggregate_id = 'child')",
+                (),
+            )
+            .await
+            .expect("query rollback state");
+        let row = rows
+            .next()
+            .await
+            .expect("read rollback state")
+            .expect("state row");
+        assert_eq!(row.get::<i64>(0).expect("child count"), 0);
+        assert_eq!(row.get::<i64>(1).expect("event count"), 0);
+        assert_eq!(row.get::<i64>(2).expect("sequence count"), 0);
+    }
 }

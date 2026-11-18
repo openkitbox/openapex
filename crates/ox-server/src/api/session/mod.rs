@@ -19,6 +19,7 @@ mod compaction;
 mod control;
 mod cursor;
 mod environment;
+mod fork_notice;
 mod inbox;
 mod lifecycle;
 mod listing;

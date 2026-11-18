@@ -17,8 +17,8 @@ use rand::RngExt;
 use serde::{Deserialize, Serialize};
 use sha1::Digest;
 
-/// The OpenCode protocol version expected by the compatible client.
-pub const UPSTREAM_COMPAT_VERSION: &str = "2.2.0";
+/// The local service identity used by the native CLI's managed-service channel.
+pub const UPSTREAM_COMPAT_VERSION: &str = "local";
 /// OpenCode's default service port for the latest release channel (`0xc0de`).
 pub const DEFAULT_PORT: u16 = 49_374;
 const DEFAULT_HOSTNAME: &str = "127.0.0.1";
