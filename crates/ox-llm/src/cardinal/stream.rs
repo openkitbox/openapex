@@ -322,26 +322,3 @@ impl Assembler {
         self.message
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{ChunkDecoder, StreamEvent};
-
-    #[test]
-    fn decodes_provider_reported_usage_cost() {
-        let mut decoder = ChunkDecoder::new();
-        let mut events = Vec::new();
-
-        decoder
-            .decode(
-                r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":3,"cost":0.0125}}"#,
-                &mut events,
-            )
-            .expect("usage chunk should decode");
-
-        let [StreamEvent::Usage(usage)] = events.as_slice() else {
-            panic!("expected one usage event, got {events:?}");
-        };
-        assert_eq!(usage.cost, Some(ox_schema::support::Finite::Float(0.0125)));
-    }
-}

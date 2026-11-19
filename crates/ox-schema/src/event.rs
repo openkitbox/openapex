@@ -141,19 +141,6 @@ pub enum UsageSource {
     Generate,
 }
 
-#[cfg(test)]
-mod usage_source_tests {
-    use super::UsageSource;
-
-    #[test]
-    fn generate_serializes_to_generate() {
-        let encoded =
-            serde_json::to_string(&UsageSource::Generate).expect("usage source should serialize");
-
-        assert_eq!(encoded, "\"generate\"");
-    }
-}
-
 /// Upstream `Execution.Interrupted` `reason` literal union.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]

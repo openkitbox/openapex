@@ -35,7 +35,7 @@ OpenApex 使用 OpenCode 作为 UI。启动 OpenApex HTTP 服务端后，将 Ope
 | 模式 | 命令 | 行为 |
 |---|---|---|
 | 服务端 | `ox [flags]` 或 `ox serve [--stdout\|--no-stdout] [--log-file PATH] [--exit-when-idle]` | 跑 HTTP/SSE API 和会话引擎。每个 home 只允许一个服务端：它拿实例锁，并绑定私有 unix socket。`--exit-when-idle` 让它在没有任何客户端持 lease 后退出。 |
-| ACP agent | `ox acp [--server URL] [--log-file PATH] [--no-stdout]` | 在 stdin/stdout 上以换行分隔的 JSON-RPC 说 Agent Client Protocol。`GET /api/info` 有响应就挂到已在跑的服务端，否则在进程内用一个临时回环端口自托管服务端。stdout 专供协议用，所以日志走 stderr 或 `--log-file`。 |
+| ACP agent | `ox acp [--server URL] [--log-file PATH] [--no-stdout]` | 通过 stdio 使用 ACP v1。不指定 `--server` 时，先尝试本地 Unix socket，再尝试配置的 TCP 地址，最后才在进程内启动服务端。指定 `--server` 时只连接该地址。日志走 stderr 或 `--log-file`。 |
 
 ## 文件位置
 

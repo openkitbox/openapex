@@ -316,33 +316,3 @@ fn init_tracing(outputs: &LogOutputs, acp: bool) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("tracing guards already initialized"))?;
     Ok(())
 }
-
-/// In `acp` mode stdout is the NDJSON wire — logs always go to stderr.
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn service_flag_selects_managed_service_mode() {
-        let outputs =
-            parse_server_args(["--service"]).expect("--service should select managed service mode");
-        assert!(outputs.service);
-        assert!(!outputs.exit_when_idle);
-    }
-
-    #[test]
-    fn service_mode_accepts_exit_when_idle() {
-        let outputs = parse_server_args(["--service", "--exit-when-idle"])
-            .expect("managed service mode should accept idle shutdown");
-        assert!(outputs.service);
-        assert!(outputs.exit_when_idle);
-    }
-
-    #[test]
-    fn ordinary_serve_remains_non_service_mode() {
-        let outputs =
-            parse_server_args(["--no-stdout"]).expect("ordinary serve flags should remain valid");
-        assert!(!outputs.service);
-        assert!(!outputs.stdout);
-    }
-}

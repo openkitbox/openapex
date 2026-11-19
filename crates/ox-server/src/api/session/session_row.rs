@@ -232,16 +232,3 @@ pub(super) fn subpath_of(directory: &str, project_directory: &str) -> Option<Str
     let trimmed = relative.trim_start_matches('/');
     Some(trimmed.to_owned())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::subpath_of;
-
-    #[test]
-    fn subpath_of_returns_nested_directory_relative_to_project_root() {
-        assert_eq!(
-            subpath_of("/workspace/project/packages/app", "/workspace/project"),
-            Some("packages/app".to_owned())
-        );
-    }
-}

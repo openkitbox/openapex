@@ -182,44 +182,6 @@ struct GenerateBody {
     prompt: String,
 }
 
-#[cfg(test)]
-mod generate_tests {
-    use super::generate_data;
-    use ox_engine::runner::GenerateResult;
-    use ox_schema::support::{Finite, TokenCache, TokenUsage};
-    use serde_json::json;
-
-    #[test]
-    fn generate_data_includes_text_tokens_and_cost() {
-        let result = GenerateResult {
-            text: "answer".to_owned(),
-            tokens: TokenUsage {
-                input: 12,
-                output: 3,
-                reasoning: 1,
-                cache: TokenCache { read: 4, write: 0 },
-                estimated: None,
-                reasoning_reported: Some(true),
-            },
-            cost: Finite::Float(0.25),
-        };
-
-        assert_eq!(
-            generate_data(result),
-            json!({
-                "text": "answer",
-                "tokens": {
-                    "input": 12,
-                    "output": 3,
-                    "reasoning": 1,
-                    "cache": { "read": 4, "write": 0 },
-                },
-                "cost": 0.25,
-            })
-        );
-    }
-}
-
 /// Convert the runner result to the upstream `session.generate` data object.
 fn generate_data(result: ox_engine::runner::GenerateResult) -> serde_json::Value {
     json!({

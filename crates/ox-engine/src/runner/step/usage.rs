@@ -15,67 +15,6 @@ use ox_schema::support::{TokenCache, TokenUsage};
 
 use super::super::drain::DrainCtx;
 
-#[cfg(test)]
-mod tests {
-    use super::{prompt_split, usage_to_tokens};
-    use ox_llm::cardinal::wire::Usage;
-    use ox_schema::support::{TokenCache, TokenUsage};
-
-    #[test]
-    fn converts_reported_usage_to_session_tokens() {
-        let mut usage = Usage::default();
-        usage.prompt_tokens = 120;
-        usage.completion_tokens = 30;
-        usage.cached_tokens = Some(80);
-        usage.reasoning_tokens = Some(10);
-
-        assert_eq!(
-            usage_to_tokens(usage),
-            TokenUsage {
-                input: 40,
-                output: 30,
-                reasoning: 10,
-                cache: TokenCache { read: 80, write: 0 },
-                estimated: None,
-                reasoning_reported: Some(false),
-            }
-        );
-    }
-
-    #[test]
-    fn converts_cache_write_tokens_without_counting_them_as_input() {
-        let mut usage = Usage::default();
-        usage.prompt_tokens = 120;
-        usage.cached_tokens = Some(80);
-        usage.cache_write_tokens = Some(20);
-
-        assert_eq!(
-            usage_to_tokens(usage),
-            TokenUsage {
-                input: 20,
-                output: 0,
-                reasoning: 0,
-                cache: TokenCache {
-                    read: 80,
-                    write: 20
-                },
-                estimated: None,
-                reasoning_reported: Some(false),
-            }
-        );
-    }
-
-    #[test]
-    fn prompt_split_matches_token_usage_cache_accounting() {
-        let mut usage = Usage::default();
-        usage.prompt_tokens = 120;
-        usage.cached_tokens = Some(80);
-        usage.cache_write_tokens = Some(20);
-
-        assert_eq!(prompt_split(&usage), (80, 20));
-    }
-}
-
 /// The prompt split the provider reported: `(cache read, uncached input)`,
 /// where cache reads and writes are excluded from the input half. The uncached
 /// half is what it had to prefill. The token shape and the

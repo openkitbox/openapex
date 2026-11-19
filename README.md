@@ -39,7 +39,7 @@ at all, starts the HTTP server.
 | Mode | Command | Behaviour |
 |---|---|---|
 | Server | `ox [flags]` or `ox serve [--stdout\|--no-stdout] [--log-file PATH] [--exit-when-idle]` | Runs the HTTP/SSE API and the session engine. One server per home: it takes the instance lock and binds the private unix socket. `--exit-when-idle` makes it exit once no client holds a lease. |
-| ACP agent | `ox acp [--server URL] [--log-file PATH] [--no-stdout]` | Speaks the Agent Client Protocol on stdin/stdout as newline-delimited JSON-RPC. Attaches to a running server when `GET /api/info` answers, otherwise hosts the server in-process on an ephemeral loopback port. stdout is reserved for the wire, so logs go to stderr or `--log-file`. |
+| ACP agent | `ox acp [--server URL] [--log-file PATH] [--no-stdout]` | Speaks ACP v1 over stdio. Without `--server`, tries the local Unix socket, then the configured TCP address, then starts a server in-process. With `--server`, only the specified endpoint is used. Logs go to stderr or `--log-file`. |
 
 ## Files
 

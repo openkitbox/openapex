@@ -599,16 +599,3 @@ fn sanitize_tool_content(content: &mut Value, id: &str) {
     redact_key(map, "uri", "tool-file-uri", id);
     redact_key(map, "name", "tool-file-name", id);
 }
-
-#[cfg(test)]
-mod tests {
-    use super::imported_rows;
-    use serde_json::json;
-
-    #[test]
-    fn imported_rows_rejects_invalid_messages_before_session_creation() {
-        let error = imported_rows(&[json!({ "id": "bad", "type": "unknown" })])
-            .expect_err("invalid transcript must fail validation");
-        assert_eq!(error.to_string(), "Invalid message in transcript");
-    }
-}

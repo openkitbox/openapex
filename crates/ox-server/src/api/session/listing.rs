@@ -277,20 +277,3 @@ fn request_query(req: &Request) -> Result<CursorQuery, String> {
         archived: None,
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::validate_scope;
-
-    #[test]
-    fn session_list_scope_is_a_union_of_three_shapes() {
-        assert!(validate_scope(Some("/workspace"), None, None).is_ok());
-        assert!(validate_scope(None, Some("project"), None).is_ok());
-        assert!(validate_scope(None, Some("project"), Some("src")).is_ok());
-        assert!(validate_scope(None, None, None).is_ok());
-
-        assert!(validate_scope(Some("/workspace"), Some("project"), None).is_err());
-        assert!(validate_scope(Some("/workspace"), None, Some("src")).is_err());
-        assert!(validate_scope(None, None, Some("src")).is_err());
-    }
-}

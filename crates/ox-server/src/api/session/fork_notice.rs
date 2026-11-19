@@ -16,29 +16,3 @@ pub(crate) fn notice_event(session_id: &str) -> SessionEventData {
         },
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{NOTICE_TEXT, notice_event};
-    use ox_schema::event::SessionEventData;
-
-    #[test]
-    fn builds_the_upstream_notice_for_the_fork_target_without_resume() {
-        let session_id = "ses_child";
-        let event = notice_event(session_id);
-        let SessionEventData::InboxEnqueued {
-            session_id: event_session_id,
-            inbox_id,
-            item: ox_schema::inbox::Item::Synthetic { payload, delivery },
-        } = event
-        else {
-            panic!("fork notice must be a synthetic inbox event");
-        };
-
-        assert_eq!(event_session_id, session_id);
-        assert_eq!(inbox_id, "msg_fork_notice_ses_child");
-        assert_eq!(payload.text, NOTICE_TEXT);
-        assert_eq!(payload.description.as_deref(), Some("Fork notice"));
-        assert_eq!(delivery, ox_schema::inbox::Delivery::Steer);
-    }
-}

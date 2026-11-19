@@ -1,26 +1,17 @@
 //! `ox acp` — ACP (Agent Client Protocol) translator.
 //!
 //! The `acp` subcommand turns the ox HTTP/SSE API into an ACP stdio agent so
-//! editors (Zed, JetBrains, …) can drive ox directly. It is a pure translator:
-//! it depends only on ox's public wire contract (the same surface the
-//! opencode clients consume) plus the `agent-client-protocol` crate — never on
-//! the runner, the projector, or the database.
+//! editors (Zed, JetBrains, …) can drive ox directly. Session translation uses
+//! the public HTTP contract; only backend startup composes a local server.
 //!
-//! Topology: attach to an already-running ox server when one answers
-//! `GET /api/info`, otherwise own the server runtime in-process on an
-//! ephemeral loopback port (turso holds an exclusive lock on `ox.db`, so a
-//! spawned child server could never coexist with the user's server).
-//!
-//! Known limitation: the ACP probe checks the configured TCP endpoint only.
-//! A server reachable through another transport is not detected, so ACP falls
-//! through to own-mode; opening the shared database then fails closed rather
-//! than allowing two processes to use it concurrently.
+//! With no `--server`, attach through the local Unix socket or configured TCP
+//! address before falling back to an in-process server. An explicit URL
+//! selects only that endpoint, without a local fallback.
 
+mod backend;
 mod bridge;
 mod stream;
 mod translate;
-
-use std::time::Duration;
 
 use agent_client_protocol as acp;
 use agent_client_protocol::v1::schema::{
@@ -28,89 +19,21 @@ use agent_client_protocol::v1::schema::{
     NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SetSessionModeRequest,
     SetSessionModeResponse,
 };
-use anyhow::Context;
-
 use ox_core::config::Config;
+
+use self::backend::Backend;
 
 /// Entry point of `ox acp [--server <url>]`.
 ///
-/// `config` is loaded by `main.rs` (the translator itself never reads config
-/// files): the default base URL comes from its `listen` address, and the
-/// whole struct is needed only when owning the server runtime.
 pub async fn run(explicit_base: Option<String>, config: Config) -> anyhow::Result<()> {
-    let base = explicit_base.unwrap_or_else(|| format!("http://{}", config.listen));
-
-    let owned = if probe(&base).await {
-        None
-    } else {
-        // No server answered: own the runtime in-process on an ephemeral
-        // port. Bind first so a bind failure cannot leave a composed runtime
-        // (database, producers, MCP children) behind, then keep the serve
-        // handle and the composition: shutdown must be awaited, not left to
-        // process exit.
-        use salvo::conn::Listener as _;
-        let acceptor = salvo::conn::TcpListener::new("127.0.0.1:0")
-            .try_bind()
-            .await
-            .context("ox acp: binding an ephemeral port failed")?;
-        let addr = acceptor
-            .local_addr()
-            .context("ox acp: reading the bound port failed")?;
-        let (state, router) = ox_server::compose(config)
-            .await
-            .context("ox acp: composing the in-process server failed")?;
-        let served = tokio::spawn(ox_server::serve_on(acceptor, state.clone(), router));
-        tracing::info!(%addr, "ox acp owns an in-process server");
-        Some(Owned {
-            state,
-            served,
-            base: format!("http://{addr}"),
-        })
-    };
-    let base = owned
-        .as_ref()
-        .map_or_else(|| base.clone(), |owned| owned.base.clone());
-
-    let outcome = serve_stdio(base).await;
-    if let Some(owned) = owned {
-        // Own mode: the composition is ours, so close its admissions, stop its
-        // listeners and await its resources. Attach mode never reaches here —
-        // the remote server and its shells belong to someone else.
-        owned.shutdown().await;
-    }
+    let Backend {
+        http,
+        base,
+        lifetime,
+    } = Backend::connect(explicit_base, config).await?;
+    let outcome = serve_stdio(bridge::Bridge::new(http, base)).await;
+    lifetime.shutdown().await;
     outcome
-}
-
-/// The in-process server `ox acp` owns in own mode.
-struct Owned {
-    state: ox_server::api::AppState,
-    served: tokio::task::JoinHandle<anyhow::Result<()>>,
-    base: String,
-}
-
-impl Owned {
-    /// Stop the listener, then wait for the composition's own cleanup. A serve
-    /// task that failed on its own is reported, but cleanup still runs: a
-    /// listener error is not a reason to leave children or producers behind.
-    async fn shutdown(self) {
-        self.state.runtime.stop().cancel();
-        match self.served.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::error!(error = %error, "ox acp: in-process server failed"),
-            Err(error) => tracing::error!(error = %error, "ox acp: serve task did not finish"),
-        }
-    }
-}
-
-/// `GET {base}/api/info` with a short timeout decides attach vs own.
-async fn probe(base: &str) -> bool {
-    let url = format!("{base}/api/info");
-    reqwest::Client::new()
-        .get(&url)
-        .timeout(Duration::from_millis(500))
-        .send()
-        .await
-        .is_ok_and(|response| response.status().is_success())
 }
 
 /// The ACP loop over stdin/stdout NDJSON.
@@ -118,9 +41,7 @@ async fn probe(base: &str) -> bool {
 /// Each handler is a thin closure over [`bridge::Bridge`]; long-running work
 /// (a whole prompt turn) is spawned off the dispatch loop per the crate's
 /// ordering contract, and the deferred `Responder` settles when the turn does.
-async fn serve_stdio(base: String) -> anyhow::Result<()> {
-    let bridge = bridge::Bridge::new(base);
-
+async fn serve_stdio(bridge: bridge::Bridge) -> anyhow::Result<()> {
     acp::Agent
         .v1()
         .name("ox")

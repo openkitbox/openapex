@@ -9,12 +9,14 @@ anyhow.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 ox-core.workspace = true
+ox-schema.workspace = true
 ox-server.workspace = true
 ox-tools.workspace = true
 reqwest.workspace = true
 salvo = { workspace = true, features = ["server", "http1", "affix-state"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["full"] }
+tokio-util.workspace = true
 tracing.workspace = true
 
 [lints]

@@ -54,9 +54,9 @@ pub struct Bridge {
 }
 
 impl Bridge {
-    pub fn new(base: String) -> Self {
+    pub fn new(http: reqwest::Client, base: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http,
             base: base.into(),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             cancels: Arc::new(Mutex::new(HashMap::new())),
