@@ -10,14 +10,22 @@
 
 mod backend;
 mod bridge;
+mod client_requests;
+mod config_options;
+mod content;
+mod lifecycle;
+mod session;
 mod stream;
 mod translate;
+mod updates;
 
 use agent_client_protocol as acp;
 use agent_client_protocol::v1::schema::{
-    InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SetSessionModeRequest,
-    SetSessionModeResponse,
+    CloseSessionRequest, CloseSessionResponse, DeleteSessionRequest, DeleteSessionResponse,
+    InitializeRequest, InitializeResponse, ListSessionsRequest, ListSessionsResponse,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
+    PromptResponse, ResumeSessionRequest, ResumeSessionResponse, SetSessionConfigOptionRequest,
+    SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse,
 };
 use ox_core::config::Config;
 
@@ -31,7 +39,7 @@ pub async fn run(explicit_base: Option<String>, config: Config) -> anyhow::Resul
         base,
         lifetime,
     } = Backend::connect(explicit_base, config).await?;
-    let outcome = serve_stdio(bridge::Bridge::new(http, base)).await;
+    let outcome = serve(bridge::Bridge::new(http, base), acp::Stdio::new()).await;
     lifetime.shutdown().await;
     outcome
 }
@@ -41,7 +49,10 @@ pub async fn run(explicit_base: Option<String>, config: Config) -> anyhow::Resul
 /// Each handler is a thin closure over [`bridge::Bridge`]; long-running work
 /// (a whole prompt turn) is spawned off the dispatch loop per the crate's
 /// ordering contract, and the deferred `Responder` settles when the turn does.
-async fn serve_stdio(bridge: bridge::Bridge) -> anyhow::Result<()> {
+async fn serve(
+    bridge: bridge::Bridge,
+    transport: impl acp::ConnectTo<acp::Agent>,
+) -> anyhow::Result<()> {
     acp::Agent
         .v1()
         .name("ox")
@@ -59,6 +70,76 @@ async fn serve_stdio(bridge: bridge::Bridge) -> anyhow::Result<()> {
         .on_receive_request(
             {
                 let bridge = bridge.clone();
+                async move |request: ListSessionsRequest,
+                            responder: acp::v1::Responder<ListSessionsResponse>,
+                            _connection| {
+                    match bridge.list_sessions(request).await {
+                        Ok(response) => responder.respond(response),
+                        Err(error) => responder.respond_with_error(error),
+                    }
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let bridge = bridge.clone();
+                async move |request: DeleteSessionRequest,
+                            responder: acp::v1::Responder<DeleteSessionResponse>,
+                            _connection| {
+                    match bridge.delete_session(request).await {
+                        Ok(response) => responder.respond(response),
+                        Err(error) => responder.respond_with_error(error),
+                    }
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let bridge = bridge.clone();
+                async move |request: CloseSessionRequest,
+                            responder: acp::v1::Responder<CloseSessionResponse>,
+                            _connection| {
+                    match bridge.close_session(request).await {
+                        Ok(response) => responder.respond(response),
+                        Err(error) => responder.respond_with_error(error),
+                    }
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let bridge = bridge.clone();
+                async move |request: ResumeSessionRequest,
+                            responder: acp::v1::Responder<ResumeSessionResponse>,
+                            _connection| {
+                    match bridge.resume_session(request).await {
+                        Ok(response) => responder.respond(response),
+                        Err(error) => responder.respond_with_error(error),
+                    }
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let bridge = bridge.clone();
+                async move |request: SetSessionConfigOptionRequest,
+                            responder: acp::v1::Responder<SetSessionConfigOptionResponse>,
+                            _connection: acp::v1::ConnectionTo<acp::Client>| {
+                    match bridge.set_config_option(request).await {
+                        Ok(response) => responder.respond(response),
+                        Err(error) => responder.respond_with_error(error),
+                    }
+                }
+            },
+            acp::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let bridge = bridge.clone();
                 async move |request: NewSessionRequest,
                             responder: acp::v1::Responder<NewSessionResponse>,
                             connection: acp::v1::ConnectionTo<acp::Client>| {
@@ -68,7 +149,9 @@ async fn serve_stdio(bridge: bridge::Bridge) -> anyhow::Result<()> {
                             responder.respond(response)?;
                             // Slash-command support lights up from the
                             // catalogue push, even while ox's list is empty.
-                            bridge.send_available_commands(&session, &connection).await;
+                            bridge
+                                .send_available_commands(&session, &connection)
+                                .await?;
                             Ok(())
                         }
                         Err(error) => responder.respond_with_error(error),
@@ -138,7 +221,7 @@ async fn serve_stdio(bridge: bridge::Bridge) -> anyhow::Result<()> {
             },
             acp::on_receive_notification!(),
         )
-        .connect_to(acp::Stdio::new())
+        .connect_to(transport)
         .await
         .map_err(|error| anyhow::anyhow!("ox acp: stdio connection failed: {error}"))?;
     Ok(())
@@ -146,7 +229,10 @@ async fn serve_stdio(bridge: bridge::Bridge) -> anyhow::Result<()> {
 
 /// Build an ACP error from an ox HTTP failure, keeping ox's message verbatim.
 pub(crate) fn wire_error(status: u16, body: &str) -> acp::Error {
-    if status == 404 {
+    if status == 401 {
+        return acp::Error::auth_required();
+    }
+    if status == 400 || status == 404 {
         return acp::Error::invalid_params().data(body.to_string());
     }
     acp::Error::internal_error().data(format!("ox returned {status}: {body}"))
@@ -159,8 +245,5 @@ pub(crate) fn internal(error: impl std::fmt::Display) -> acp::Error {
 
 /// Refuse obviously malformed explicit URLs early with a named failure.
 pub fn validate_base(base: &str) -> anyhow::Result<()> {
-    if !base.starts_with("http://") && !base.starts_with("https://") {
-        anyhow::bail!("ox acp: --server must be an http(s) URL, got `{base}`");
-    }
-    Ok(())
+    backend::parse_url(base).map(|_| ())
 }

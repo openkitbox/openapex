@@ -24,6 +24,8 @@ pub struct Frame {
     /// Durable sequence number; `None` on ephemeral frames and on the
     /// initial `server.connected` frame.
     pub seq: Option<i64>,
+    /// Durable aggregate identity, when present.
+    pub aggregate_id: Option<String>,
     /// Event type name, e.g. `session.text.delta`.
     pub kind: String,
     /// The event payload.
@@ -61,7 +63,7 @@ pub async fn open(
     };
     if !response.status().is_success() {
         let status = response.status().as_u16();
-        let body = response.text().await.unwrap_or_default();
+        let body = response.text().await.map_err(internal)?;
         return Err(internal(format!(
             "event stream `{url}` answered {status}: {body}"
         )));
@@ -77,20 +79,16 @@ pub async fn open(
 }
 
 impl EventStream {
-    /// Next frame, or `None` when the stream ended or errored. Decode errors
-    /// are logged and skipped. The initial `server.connected` hello is
-    /// yielded like any other frame; consumers drop it (it carries no
-    /// `sessionID`).
-    pub async fn next(&mut self) -> Option<Frame> {
+    /// Next frame, or `Ok(None)` when the stream ended. Framing and JSON
+    /// errors are returned to the turn so it can fail closed rather than
+    /// reconnecting forever. The initial `server.connected` hello is yielded
+    /// like any other frame; consumers drop it (it carries no `sessionID`).
+    pub async fn next(&mut self) -> anyhow::Result<Option<Frame>> {
         use futures_util::StreamExt;
-        loop {
-            match self.inner.next().await {
-                Some(Ok(frame)) => return Some(frame),
-                Some(Err(error)) => {
-                    tracing::debug!(error = %error, "event stream decode error");
-                }
-                None => return None,
-            }
+        match self.inner.next().await {
+            Some(Ok(frame)) => Ok(Some(frame)),
+            Some(Err(error)) => Err(error),
+            None => Ok(None),
         }
     }
 }
@@ -101,12 +99,55 @@ fn find_boundary(buffer: &[u8]) -> Option<usize> {
 }
 
 /// Parse one framed SSE event body (`data:` lines joined by newlines).
-fn decode(body: &str) -> Option<Frame> {
-    let value: Value = serde_json::from_str(body).ok()?;
-    let kind = value.get("type")?.as_str()?.to_string();
-    let seq = value.get("id").and_then(Value::as_i64);
-    let data = value.get("data").cloned().unwrap_or(Value::Null);
-    Some(Frame { seq, kind, data })
+fn decode(body: &str) -> anyhow::Result<Frame> {
+    let mut value: Value = serde_json::from_str(body)
+        .map_err(|error| anyhow::anyhow!("malformed SSE data JSON: {error}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("malformed SSE data: expected a JSON object"))?;
+    let kind = object
+        .remove("type")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or_else(|| anyhow::anyhow!("malformed SSE data: missing string type"))?;
+    let seq = object
+        .get("durable")
+        .and_then(|durable| durable.get("seq"))
+        .and_then(Value::as_i64);
+    let aggregate_id = object
+        .get("durable")
+        .and_then(|durable| durable.get("aggregateID"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let data = object.remove("data").unwrap_or(Value::Null);
+    Ok(Frame {
+        seq,
+        aggregate_id,
+        kind,
+        data,
+    })
+}
+
+fn decode_event(event: &[u8]) -> anyhow::Result<Option<Frame>> {
+    let mut body = String::new();
+    let mut has_data = false;
+    for line in event.split(|byte| *byte == b'\n') {
+        let line = std::str::from_utf8(line)
+            .map_err(|error| anyhow::anyhow!("malformed SSE UTF-8: {error}"))?;
+        if let Some(data) = line
+            .strip_prefix("data: ")
+            .or_else(|| line.strip_prefix("data:"))
+        {
+            has_data = true;
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(data);
+        }
+    }
+    if !has_data {
+        return Ok(None);
+    }
+    decode(&body).map(Some)
 }
 
 /// SSE framing: events are separated by blank lines; `data:` lines carry the
@@ -132,24 +173,10 @@ impl Stream for FrameDecoder {
         loop {
             if let Some(boundary) = find_boundary(&this.buffer) {
                 let event: Vec<u8> = this.buffer.drain(..boundary + 2).collect();
-                let Ok(event) = std::str::from_utf8(&event) else {
-                    // A complete frame must be valid UTF-8; junk frames are
-                    // skipped like comments (the server only writes JSON).
-                    continue;
-                };
-                let body = event
-                    .lines()
-                    // Tolerate both `data: x` and `data:x`.
-                    .filter_map(|line| {
-                        line.strip_prefix("data: ")
-                            .or_else(|| line.strip_prefix("data:"))
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                return match decode(&body) {
-                    Some(frame) => std::task::Poll::Ready(Some(Ok(frame))),
-                    // Framed but not an event we understand (comment-only).
-                    None => continue,
+                return match decode_event(&event) {
+                    Ok(Some(frame)) => std::task::Poll::Ready(Some(Ok(frame))),
+                    Ok(None) => continue,
+                    Err(error) => std::task::Poll::Ready(Some(Err(error))),
                 };
             }
             if this.done {
@@ -164,6 +191,76 @@ impl Stream for FrameDecoder {
                     return std::task::Poll::Ready(Some(Err(error.into())));
                 }
             }
+            if this.done && !this.buffer.is_empty() {
+                let buffered = this.buffer.len();
+                this.buffer.clear();
+                return std::task::Poll::Ready(Some(Err(anyhow::anyhow!(
+                    "incomplete SSE frame at EOF ({buffered} bytes buffered)"
+                ))));
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+    use futures_util::StreamExt;
+
+    use super::{FrameDecoder, decode_event};
+
+    #[test]
+    fn comments_and_empty_frames_are_ignored() {
+        assert!(
+            decode_event(b": heartbeat\n\n")
+                .expect("comment is valid")
+                .is_none()
+        );
+        assert!(decode_event(b"\n").expect("empty frame is valid").is_none());
+    }
+
+    #[test]
+    fn malformed_data_is_a_decode_error() {
+        let error = decode_event(b"data: {not-json}\n\n").expect_err("bad JSON must fail");
+        assert!(error.to_string().contains("JSON"));
+    }
+
+    #[test]
+    fn only_durable_sequence_advances_the_reconnect_cursor() {
+        let durable = decode_event(
+            br#"data: {"id":"event-id","type":"session.text.delta","data":{"sessionID":"ses-1"},"durable":{"aggregateID":"ses-1","seq":42,"version":1}}
+
+"#,
+        )
+        .expect("durable frame decodes")
+        .expect("durable frame is not a comment");
+        assert_eq!(durable.seq, Some(42));
+
+        let ephemeral = decode_event(
+            br#"data: {"id":"event-id","type":"session.text.delta","data":{"sessionID":"ses-1"}}
+
+"#,
+        )
+        .expect("ephemeral frame decodes")
+        .expect("ephemeral frame is not a comment");
+        assert_eq!(ephemeral.seq, None);
+    }
+
+    #[tokio::test]
+    async fn eof_with_an_incomplete_frame_is_an_error() {
+        let mut decoder = FrameDecoder {
+            inner: Box::pin(futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(
+                Bytes::from_static(b"data: {\"type\":\"session.text.delta\"}"),
+            )])),
+            buffer: Vec::new(),
+            done: false,
+        };
+
+        let error = decoder
+            .next()
+            .await
+            .expect("decoder must report the incomplete frame")
+            .expect_err("EOF must not silently discard an incomplete frame");
+        assert!(error.to_string().contains("incomplete SSE frame"));
     }
 }

@@ -136,12 +136,48 @@ MCP 连接和工具注册表是进程级的，不按会话隔离。连接或断�
 编辑器按会话给出；ox 把 ACP 会话一对一映射到 ox 会话，把自己的 agent 作为 ACP
 模式暴露，并把助手正文、思考内容和工具调用作为 session update 流式推回去。
 
-有两处和普通 CLI 包装不同：
+和普通 CLI 包装不同，`session/load` 会重放已存的 transcript，包括 magic-context
+的丢弃内容覆盖层，所以编辑器看到的就是模型当时看到的那份。ox 无法保证隔离的
+会话设置会以 ACP invalid params 错误拒绝，且在创建或改动任何会话之前失败 ——
+绝不静默丢弃。MCP 服务器统一配在 `~/.ox/ox.toml` 的 `[mcp.servers.<名字>]` 里，
+属于进程级配置；编辑器不能按会话添加。
 
-- ACP 会话里请求的 MCP 服务器会被忽略并打一条警告 —— ox 的工具注册表是进程级的，
-  MCP 服务器统一配在 `~/.ox/ox.toml` 的 `[mcp.servers.<名字>]` 里。
-- `session/load` 会重放已存的 transcript，包括 magic-context 的丢弃内容覆盖层，
-  所以编辑器看到的就是模型当时看到的那份。
+### ACP v1 稳定能力矩阵
+
+`ox acp` 是走 stdio 的 ACP v1 agent。它的稳定 wire 面有意小于完整
+SDK schema。不启用、不协商任何 `unstable` ACP 能力；SDK 自身的传递
+`unstable_proxy_chains` schema feature 不代表 ox 的能力。
+
+**已实现**
+
+| 范围 | 稳定能力 |
+|---|---|
+| 初始化 | `initialize`；返回 ACP v1，声明 `session/load`，并声明会话 list、delete、resume、close 能力。 |
+| 会话生命周期 | `session/new`、`session/load`、`session/resume`、`session/list`、`session/delete`、`session/close`。 |
+| 会话控制 | `session/prompt`、`session/cancel`、`session/set_config_option`、`session/set_mode`。 |
+| 选择 | 模型、模式和思考强度的 `configOptions`；不实现 `session/set_model`。 |
+| Prompt 内容 | 文本、图片、文本型 embedded resource。二进制 embedded resource、音频和 resource-link prompt 会拒绝，不会隐式下载。 |
+| 会话更新 | `content/tool/update` 映射：助手正文和思考增量、用户消息重放、工具调用及工具进度/结果、工具输出中的 resource link、仅在上游给出真实 `used`/`size` 时的 `usage_update`，以及按能力门控的 notice/compaction 更新。 |
+| 客户端交互 | permission 请求会桥接到客户端。只有客户端声明稳定的 form elicitation 能力时才使用 elicitation；否则取消表单并 fail-closed。 |
+
+**Fail-closed（ox 无法兑现的请求设置）**
+
+| 请求 | 行为 |
+|---|---|
+| `session/new` / `session/load` / `session/resume` 上的 `systemPrompt`、`additionalDirectories` | 在任何 HTTP session 操作之前以 invalid params 拒绝，绝不静默丢弃。 |
+| 同样三个方法上的按会话 `mcpServers` | 在创建、加载或恢复任何 session 之前以 invalid params 拒绝：ox 无法证明工具注册表按会话隔离。 |
+| 客户端未声明 form elicitation 时的 elicitation | 取消待处理表单并 fail-closed，绝不自动放行。 |
+| 客户端 filesystem（`fs`）/ terminal 回调 | 不声明，ox 也不发起这类请求。 |
+
+**明确排除**
+
+- ACP v2，以及所有 `unstable` ACP 能力族（proxy chains、fork、archive/unarchive、
+  set_title、status 等）。
+- MCP-over-ACP 与 HTTP/SSE MCP；不声明 `mcpCapabilities.http`/`sse`/`acp`。
+  `~/.ox/ox.toml` 中配置的 MCP 仅是进程级能力。
+- HTTP/SSE ACP transport：`ox acp` 后端的 HTTP/SSE 服务是实现细节，不是 ACP transport。
+- provider/connect。
+- 二进制 embedded resource、音频和 resource-link prompt 会被拒绝，不会隐式下载。
 
 ## 仓库结构
 

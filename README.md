@@ -168,13 +168,52 @@ command. The editor supplies the working directory per session; ox maps ACP
 sessions one-to-one onto ox sessions, exposes its agents as ACP modes, and
 streams assistant text, reasoning and tool calls back as session updates.
 
-Two things differ from a plain CLI shim:
+Unlike a plain CLI shim, `session/load` replays the stored transcript, including
+the magic-context dropped-content overlay, so the editor shows what the model
+actually saw. Session setup ox cannot isolate is rejected with an ACP invalid
+params error before any session is created or touched — never silently omitted.
+MCP servers are configured process-wide under `[mcp.servers.<name>]` in
+`~/.ox/ox.toml`; an editor cannot add one per session.
 
-- MCP servers requested per ACP session are ignored with a warning — ox's tool
-  registry is process-global, so MCP servers come from `[mcp.servers.<name>]` in
-  `~/.ox/ox.toml` instead.
-- `session/load` replays the stored transcript, including the magic-context
-  dropped-content overlay, so the editor shows what the model actually saw.
+### ACP v1 stable capability matrix
+
+`ox acp` is a stdio ACP v1 agent. Its stable wire surface is deliberately
+smaller than the full SDK schema. No `unstable` ACP feature is enabled or
+negotiated; the SDK's own transitive `unstable_proxy_chains` schema feature is
+not an ox capability.
+
+**Implemented**
+
+| Area | Stable surface |
+|---|---|
+| Initialization | `initialize`; replies with ACP v1, advertises `session/load` and session listing, deletion, resumption and close capabilities. |
+| Session lifecycle | `session/new`, `session/load`, `session/resume`, `session/list`, `session/delete`, and `session/close`. |
+| Session control | `session/prompt`, `session/cancel`, `session/set_config_option`, and `session/set_mode`. |
+| Selection | `configOptions` for model, mode and thought level; `session/set_model` is not implemented. |
+| Prompt content | Text, images, and text embedded resources. Binary embedded resources, audio, and resource-link prompts are rejected rather than fetched implicitly. |
+| Session updates | `content/tool/update` mappings for assistant text and thought deltas, user-message replay, tool calls and tool progress/results, resource links in tool output, `usage_update` only when the upstream event supplies a real `used`/`size`, and capability-gated notice/compaction updates. |
+| Client interactions | Permission requests are bridged to the client. Elicitation is used only when the client advertises the stable form-elicitation capability; otherwise the form is cancelled and the request fails closed. |
+
+**Fail-closed (requested setup ox cannot honour)**
+
+| Request | Behaviour |
+|---|---|
+| `systemPrompt`, `additionalDirectories` on `session/new` / `session/load` / `session/resume` | Rejected with invalid params before any HTTP session work; never silently dropped. |
+| Per-session `mcpServers` on those same three methods | Rejected with invalid params before any session is created, loaded or resumed: ox cannot prove session-local tool isolation. |
+| Elicitation when the client did not advertise form elicitation | Pending form cancelled and request fails closed; never auto-approved. |
+| Client filesystem (`fs`) / terminal callbacks | Not advertised and never issued by ox. |
+
+**Explicitly excluded**
+
+- ACP v2 and all `unstable` ACP capability families (proxy chains, fork,
+  archive/unarchive, set_title, status, …).
+- MCP-over-ACP and HTTP/SSE MCP; `mcpCapabilities.http`/`sse`/`acp` are not
+  advertised. MCP configured in `~/.ox/ox.toml` is process-wide only.
+- HTTP/SSE ACP transports: the HTTP/SSE server behind `ox acp` is an
+  implementation detail, not an ACP transport.
+- provider/connect.
+- Binary embedded resources, audio and resource-link prompts are rejected,
+  not fetched implicitly.
 
 ## Repository layout
 

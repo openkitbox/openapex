@@ -2599,18 +2599,23 @@ version = "0.1.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
+ "base64 0.23.1",
  "bytes",
  "futures-util",
+ "jiff 1.0.1",
  "ox-core",
  "ox-schema",
  "ox-server",
  "ox-tools",
+ "percent-encoding",
  "reqwest",
  "salvo",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",
  "tracing",
+ "url",
 ]
 
 [[package]]
