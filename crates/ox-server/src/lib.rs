@@ -645,6 +645,110 @@ pub async fn compose_with_service_password(
     Ok((state, router))
 }
 
+/// Announce the final status of every server in an installed startup hub.
+fn announce_mcp_status_changes(bus: &EventBus, hub: &ox_mcp::Hub, directory: &std::path::Path) {
+    let directory = directory.to_string_lossy();
+    for server in hub.servers() {
+        bus.broadcast_ephemeral(
+            "mcp.status.changed",
+            serde_json::json!({ "server": server.name }),
+            Some(&directory),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use ox_core::config::{Config, McpLocalConfig, McpProtocol, McpServerConfig, McpTimeout};
+    use ox_db::Db;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn mcp_startup_broadcasts_status_for_each_server() {
+        let db = Db::open_in_memory().await.expect("test database");
+        let bus = EventBus::new(db.clone());
+        let mut events = bus.subscribe();
+        let mut config = Config::default();
+        config.mcp.servers = BTreeMap::from([
+            (
+                "alpha".to_owned(),
+                McpServerConfig::Local(McpLocalConfig {
+                    command: vec!["not-started-alpha".to_owned()],
+                    cwd: None,
+                    environment: None,
+                    disabled: true,
+                    protocol: McpProtocol::Legacy,
+                    timeout: McpTimeout {
+                        startup: 100,
+                        catalog: 100,
+                        execution: None,
+                    },
+                }),
+            ),
+            (
+                "beta".to_owned(),
+                McpServerConfig::Local(McpLocalConfig {
+                    command: vec!["not-started-beta".to_owned()],
+                    cwd: None,
+                    environment: None,
+                    disabled: true,
+                    protocol: McpProtocol::Legacy,
+                    timeout: McpTimeout {
+                        startup: 100,
+                        catalog: 100,
+                        execution: None,
+                    },
+                }),
+            ),
+        ]);
+        let chat =
+            Arc::new(CardinalClient::new("http://127.0.0.1:1", None).expect("test chat transport"));
+        let state = build_state_with_mode(
+            config,
+            chat,
+            runner::ToolRegistry::with_builtins(),
+            db,
+            bus,
+            std::env::temp_dir(),
+            McpStartup::Deferred,
+        )
+        .await
+        .expect("test state");
+
+        let startup = spawn_mcp_startup(&state).expect("startup task");
+        startup.await.expect("startup task join");
+
+        let mut seen = BTreeMap::new();
+        for _ in 0..2 {
+            let event = events.recv().await.expect("MCP status event");
+            assert_eq!(event.kind, "mcp.status.changed");
+            assert_eq!(
+                event
+                    .location
+                    .as_ref()
+                    .map(|location| location.directory.as_str()),
+                Some(state.directory.to_str().expect("UTF-8 test directory"))
+            );
+            seen.insert(
+                event.data["server"]
+                    .as_str()
+                    .expect("server name")
+                    .to_owned(),
+                event,
+            );
+        }
+        assert_eq!(
+            seen.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["alpha", "beta"]
+        );
+        assert_eq!(state.live.generation(), 1);
+        state.runtime.shutdown(&state).await.expect("shutdown");
+    }
+}
+
 /// Install the MCP tools after the listener is already serving.
 ///
 /// The runner snapshots its tool registry when it is built, so MCP tools can
@@ -659,6 +763,7 @@ pub async fn compose_with_service_password(
 fn spawn_mcp_startup(state: &AppState) -> Option<tokio::task::JoinHandle<()>> {
     let runtime = Arc::clone(&state.runtime);
     let live = Arc::clone(&state.live);
+    let bus = state.bus.clone();
     let directory = state.directory.clone();
     let servers = state.services().config.mcp.clone();
     Some(tokio::spawn(async move {
@@ -689,10 +794,13 @@ fn spawn_mcp_startup(state: &AppState) -> Option<tokio::task::JoinHandle<()>> {
             })
             .await;
         match installed {
-            Ok(_) => tracing::info!(
-                tools = registered,
-                "MCP servers connected; their tools are live"
-            ),
+            Ok(installed) => {
+                announce_mcp_status_changes(&bus, &installed.mcp, &directory);
+                tracing::info!(
+                    tools = registered,
+                    "MCP servers connected; their tools are live"
+                );
+            }
             Err(error) => tracing::info!(%error, "MCP startup left the current generation alone"),
         }
     }))
