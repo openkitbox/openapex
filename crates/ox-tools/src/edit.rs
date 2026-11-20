@@ -125,7 +125,11 @@ fn run(ctx: &ToolContext, input: &Value) -> ToolOutput {
     };
     let text = match String::from_utf8(bytes) {
         Ok(text) => text,
-        Err(_) => return fail(format!("Unable to edit {path}")),
+        Err(_) => {
+            return fail(format!(
+                "Unable to edit {path}: file is not valid UTF-8; file was left unchanged."
+            ));
+        }
     };
     let source: Chars = text.chars().collect();
 
@@ -702,4 +706,55 @@ fn hint_key(line: &[char]) -> Chars {
 /// `char::is_alphanumeric`).
 fn hint_distinct(key: &[char]) -> bool {
     key.iter().any(|c| c.is_alphanumeric())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+
+    use super::run;
+    use crate::contract::{ToolContext, ToolRegistry};
+
+    #[test]
+    fn invalid_utf8_is_reported_and_bytes_are_left_unchanged() {
+        let root = std::env::temp_dir().join(format!(
+            "ox-edit-invalid-utf8-{}-{}",
+            std::process::id(),
+            unique_suffix()
+        ));
+        std::fs::create_dir(&root).expect("create isolated edit fixture");
+        let path = root.join("invalid.txt");
+        let before = b"before\xffafter".to_vec();
+        std::fs::write(&path, &before).expect("write invalid UTF-8 fixture");
+        let ctx = ToolContext {
+            session_id: "invalid-utf8-edit".to_owned(),
+            directory: root.clone(),
+            assistant_message_id: "assistant".to_owned(),
+            call_id: "call".to_owned(),
+            cancellation: CancellationToken::new(),
+            registry: Arc::new(ToolRegistry::new()),
+        };
+
+        let output = run(
+            &ctx,
+            &json!({"path": "invalid.txt", "oldString": "before", "newString": "after"}),
+        );
+
+        assert_eq!(
+            output.error.as_deref(),
+            Some("Unable to edit invalid.txt: file is not valid UTF-8; file was left unchanged.")
+        );
+        assert_eq!(std::fs::read(&path).expect("read fixture back"), before);
+        std::fs::remove_dir_all(root).expect("remove isolated edit fixture");
+    }
+
+    fn unique_suffix() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the Unix epoch")
+            .as_nanos()
+    }
 }

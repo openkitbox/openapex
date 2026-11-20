@@ -15,6 +15,7 @@ use super::response::{
 };
 use super::session_row::load_session;
 use crate::api::state;
+use ox_tools::live_tool_metadata::LiveToolMetadata;
 
 // ---------------------------------------------------------------------------
 // session.message.list — GET /api/session/{sessionID}/message
@@ -29,7 +30,11 @@ struct MessagesPage {
     reverse: bool,
 }
 
-async fn query_messages(db: &Db, page: MessagesPage) -> Result<Vec<Message>> {
+async fn query_messages(
+    db: &Db,
+    live_tool_metadata: &LiveToolMetadata,
+    page: MessagesPage,
+) -> Result<Vec<Message>> {
     let MessagesPage {
         session_id,
         kind,
@@ -89,10 +94,12 @@ async fn query_messages(db: &Db, page: MessagesPage) -> Result<Vec<Message>> {
     if reverse {
         values.reverse();
     }
-    values
+    let mut messages: Vec<Message> = values
         .into_iter()
         .map(|value| Message::from_merged_row(value).context("decode session message row"))
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    live_tool_metadata.overlay(&mut messages);
+    Ok(messages)
 }
 
 async fn message_seq(db: &Db, session_id: &str, message_id: &str) -> Result<Option<i64>> {
@@ -195,7 +202,8 @@ pub(crate) async fn message_list(req: &mut Request, depot: &mut Depot, res: &mut
         limit,
         reverse: direction == Direction::Previous,
     };
-    let messages = match query_messages(&app.db, page).await {
+    let services = app.services();
+    let messages = match query_messages(&app.db, &services.tools.live_tool_metadata, page).await {
         Ok(messages) => messages,
         Err(error) => {
             unknown_error(res, &error);
@@ -326,7 +334,14 @@ pub(crate) async fn message_get(req: &mut Request, depot: &mut Depot, res: &mut 
     }
     let [value] = values;
     match Message::from_merged_row(value) {
-        Ok(message) => res.render(Json(json!({ "data": message }))),
+        Ok(mut message) => {
+            let services = app.services();
+            services
+                .tools
+                .live_tool_metadata
+                .overlay(std::slice::from_mut(&mut message));
+            res.render(Json(json!({ "data": message })))
+        }
         Err(error) => unknown_error(res, &anyhow::Error::from(error)),
     }
 }

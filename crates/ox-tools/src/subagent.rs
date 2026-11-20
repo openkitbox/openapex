@@ -174,6 +174,7 @@ pub struct SubagentHandle {
     in_flight: Arc<InFlightRegistry>,
     stop: tokio_util::sync::CancellationToken,
     watchers: crate::contract::TaskOwner,
+    jobs: Arc<crate::jobs::Jobs>,
 }
 
 /// One background child a live completion watcher is still responsible for.
@@ -306,7 +307,12 @@ impl SubagentHandle {
     /// `max_active` is the config's `[subagent] max_active`, validated `>= 1`
     /// at load; `0` would queue every call forever, so it is refused here too.
     #[must_use]
-    pub fn new(db: ox_db::Db, bus: ox_core::event_bus::EventBus, max_active: usize) -> Self {
+    pub fn new(
+        db: ox_db::Db,
+        bus: ox_core::event_bus::EventBus,
+        max_active: usize,
+        jobs: Arc<crate::jobs::Jobs>,
+    ) -> Self {
         assert!(
             max_active >= 1,
             "subagent max_active must be at least 1, got {max_active}"
@@ -319,6 +325,7 @@ impl SubagentHandle {
             in_flight: Arc::new(InFlightRegistry::default()),
             stop: tokio_util::sync::CancellationToken::new(),
             watchers: crate::contract::TaskOwner::default(),
+            jobs,
         }
     }
 
@@ -734,6 +741,28 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         .into_iter()
         .collect(),
     };
+    let job_generation = tool.handle.jobs.record_running(
+        &child_id,
+        &ctx.session_id,
+        "subagent",
+        &description,
+        Some(json!({ "parentSessionID": ctx.session_id })),
+    );
+    tool.handle
+        .jobs
+        .record_session_parent(&child_id, Some(&ctx.session_id));
+    tool.handle.jobs.register_cancel(&child_id, {
+        let spawner = Arc::clone(&spawner);
+        let child_id = child_id.clone();
+        Arc::new(move || spawner.interrupt(&child_id))
+    });
+    if let SessionEventData::ToolProgress { metadata, .. } = &progress {
+        ctx.registry.live_tool_metadata.record(
+            &ctx.assistant_message_id,
+            &ctx.call_id,
+            metadata.clone(),
+        );
+    }
     if let Err(error) = tool.handle.bus.publish(progress).await {
         tracing::warn!(%error, child = %child_id, "subagent progress failed to publish");
     }
@@ -766,11 +795,23 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         },
     };
     if let Err(error) = tool.handle.bus.publish(enqueued).await {
+        tool.handle.jobs.complete(
+            &child_id,
+            job_generation.generation,
+            crate::jobs::JobStatus::Error,
+            Some(&format!("Unable to enqueue child prompt: {error}")),
+        );
         return fail(format!("Unable to enqueue child prompt: {error}"));
     }
     // A queued child is dispatched by its watcher once a slot frees; an
     // admitted child starts now. Both paths return the same running result.
     if !queued && let Err(error) = spawner.dispatch(&child_id, &message_id).await {
+        tool.handle.jobs.complete(
+            &child_id,
+            job_generation.generation,
+            crate::jobs::JobStatus::Error,
+            Some(&format!("Unable to start child session: {error}")),
+        );
         return fail(format!("Unable to start child session: {error}"));
     }
     let start = if queued {
@@ -787,6 +828,7 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         child_id.clone(),
         description,
         start,
+        job_generation,
     );
     background_output(&child_id)
 }
@@ -942,6 +984,7 @@ fn spawn_completion_watcher(
     child_id: String,
     description: String,
     start: WatcherStart,
+    generation: crate::jobs::JobGeneration,
 ) {
     // Registered before the task starts, so a sibling call made later in this
     // same turn already sees this child as in flight. The guard rides the task
@@ -950,12 +993,23 @@ fn spawn_completion_watcher(
         .in_flight
         .register(&parent_id, &child_id, &description);
     let watchers = handle.watchers.clone();
-    if let Err(error) = watchers.spawn(async move {
+    let failed_jobs = Arc::clone(&handle.jobs);
+    let failed_child_id = child_id.clone();
+    if let Err(error) = watchers.spawn({
+        let handle = Arc::clone(&handle);
+        let child_id = child_id.clone();
+        async move {
         // Held for the whole task: the entry exists exactly as long as this
         // watcher does.
         let _in_flight = in_flight;
         let Some(spawner) = handle.spawner().cloned() else {
             tracing::warn!(child = %child_id, "subagent runner not attached; dropping completion");
+            handle.jobs.complete(
+                &child_id,
+                generation.generation,
+                crate::jobs::JobStatus::Error,
+                Some("subagent runner not attached"),
+            );
             return;
         };
         // A queued child that cannot start still owes the parent a notice:
@@ -966,14 +1020,36 @@ fn spawn_completion_watcher(
             WatcherStart::Queued { inbox_id } => {
                 let Ok(permit) = handle.slots.clone().acquire_owned().await else {
                     tracing::warn!(child = %child_id, "subagent slots closed; queued child never started");
+                    handle.jobs.complete(
+                        &child_id,
+                        generation.generation,
+                        crate::jobs::JobStatus::Error,
+                        Some("subagent slots closed"),
+                    );
                     return;
                 };
                 let _admission = match spawner.try_admit() {
                     Ok(admission) if !handle.stop.is_cancelled() => admission,
-                    _ => return,
+                    _ => {
+                        handle.jobs.complete(
+                            &child_id,
+                            generation.generation,
+                            crate::jobs::JobStatus::Cancelled,
+                            Some("subagent admission closed"),
+                        );
+                        return;
+                    }
                 };
                 if let Err(error) = spawner.dispatch(&child_id, &inbox_id).await {
-                    if handle.stop.is_cancelled() || spawner.is_closing() { return; }
+                    if handle.stop.is_cancelled() || spawner.is_closing() {
+                        handle.jobs.complete(
+                            &child_id,
+                            generation.generation,
+                            crate::jobs::JobStatus::Error,
+                            Some("subagent runner is closing"),
+                        );
+                        return;
+                    }
                     tracing::warn!(child = %child_id, error = %error, "unable to start queued subagent");
                     start_error = Some(format!("Subagent failed to start: {error}"));
                 }
@@ -988,6 +1064,12 @@ fn spawn_completion_watcher(
             spawner.wait_idle(&child_id).await;
             let Ok(tail) = spawner.settled_tail(&child_id).await else {
                 tracing::warn!(child = %child_id, "subagent finished but its transcript is unreadable; dropping notification");
+                handle.jobs.complete(
+                    &child_id,
+                    generation.generation,
+                    crate::jobs::JobStatus::Error,
+                    Some("subagent transcript is unreadable"),
+                );
                 return;
             };
             completion_state_text(&tail)
@@ -998,10 +1080,22 @@ fn spawn_completion_watcher(
             Ok(Some(_)) => {}
             Ok(None) => {
                 tracing::warn!(parent = %parent_id, child = %child_id, "parent session gone; dropping subagent completion");
+                handle.jobs.complete(
+                    &child_id,
+                    generation.generation,
+                    crate::jobs::JobStatus::Error,
+                    Some("parent session gone"),
+                );
                 return;
             }
             Err(error) => {
                 tracing::warn!(parent = %parent_id, error = %error, "unable to check parent session; dropping subagent completion");
+                handle.jobs.complete(
+                    &child_id,
+                    generation.generation,
+                    crate::jobs::JobStatus::Error,
+                    Some("unable to check parent session"),
+                );
                 return;
             }
         }
@@ -1015,11 +1109,34 @@ fn spawn_completion_watcher(
             &text,
             NoticeDelivery::Live(_in_flight.registration),
         );
-        // The watcher is the live path: nothing counts what it delivers, and
-        // `enqueue_completion` already warned if the notice did not land.
-        let _ = enqueue_completion(&handle, &spawner, &parent_id, &child_id, item).await;
+        if !enqueue_completion(&handle, &spawner, &parent_id, &child_id, item).await {
+            handle.jobs.complete(
+                &child_id,
+                generation.generation,
+                crate::jobs::JobStatus::Error,
+                Some("subagent completion delivery failed"),
+            );
+        } else {
+            handle.jobs.complete(
+                &child_id,
+                generation.generation,
+                match state {
+                    STATUS_COMPLETED => crate::jobs::JobStatus::Completed,
+                    STATUS_CANCELLED => crate::jobs::JobStatus::Cancelled,
+                    _ => crate::jobs::JobStatus::Error,
+                },
+                (state == STATUS_ERROR).then_some(text.as_str()),
+            );
+        }
+        }
     }) {
         tracing::error!(%error, "subagent cleanup watcher registration failed");
+        failed_jobs.complete(
+            &failed_child_id,
+            generation.generation,
+            crate::jobs::JobStatus::Error,
+            Some("subagent watcher registration failed"),
+        );
     }
 }
 
@@ -1120,10 +1237,11 @@ async fn enqueue_completion(
         return false;
     }
     if handle.stop.is_cancelled() || spawner.is_closing() {
-        return true;
+        return false;
     }
     if let Err(error) = spawner.dispatch(parent_id, &inbox_id).await {
         tracing::warn!(parent = %parent_id, child = %child_id, error = %error, "unable to wake parent for subagent completion");
+        return false;
     }
     true
 }

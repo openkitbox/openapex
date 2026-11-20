@@ -35,6 +35,36 @@ use tokio::task::AbortHandle;
 
 use super::process::{self, Signal, Spawned};
 
+/// Render captured bytes without dropping data. Valid UTF-8 remains text; bytes
+/// that cannot form a complete character in this page are escaped individually,
+/// which keeps byte-page cursors lossless even when a page splits a character.
+fn output_text(bytes: &[u8]) -> String {
+    let mut output = String::new();
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        match std::str::from_utf8(remaining) {
+            Ok(text) => {
+                output.push_str(text);
+                break;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                if valid > 0 {
+                    let text = std::str::from_utf8(&remaining[..valid])
+                        .expect("valid_up_to is a UTF-8 boundary");
+                    output.push_str(text);
+                    remaining = &remaining[valid..];
+                    continue;
+                }
+                let byte = remaining[0];
+                output.push_str(&format!("\\x{byte:02x}"));
+                remaining = &remaining[1..];
+            }
+        }
+    }
+    output
+}
+
 /// Newest bytes retained per session. Upstream keeps the whole capture in a
 /// file; the tail is what a client renders and what the model needs.
 pub const OUTPUT_CAPACITY: usize = 8 * 1024 * 1024;
@@ -153,7 +183,7 @@ impl OutputBuffer {
         let take = available.min(limit.max(1));
         let slice = &self.bytes[offset..offset + take];
         OutputPage {
-            output: String::from_utf8_lossy(slice).into_owned(),
+            output: output_text(slice),
             cursor: start + take as u64,
             size: self.total,
             truncated,
@@ -164,13 +194,13 @@ impl OutputBuffer {
     #[must_use]
     pub fn recent_text(&self, limit: usize) -> String {
         let start = self.bytes.len().saturating_sub(limit);
-        String::from_utf8_lossy(&self.bytes[start..]).into_owned()
+        output_text(&self.bytes[start..])
     }
 
     /// The whole retained tail, for the model-facing tool result.
     #[must_use]
     pub fn tail_text(&self) -> String {
-        String::from_utf8_lossy(&self.bytes).into_owned()
+        output_text(&self.bytes)
     }
 
     /// Bytes currently retained.
@@ -395,9 +425,15 @@ pub struct Completion {
     pub truncated: bool,
 }
 
+/// The completion work and the fallback used when its task cannot be registered.
+pub struct CompletionDelivery {
+    pub(crate) future: CompletionFuture,
+    pub(crate) on_registration_failure: Box<dyn FnOnce() + Send + 'static>,
+}
+
 /// Receives one completion for each session that reaches a terminal state.
 pub type CompletionFuture = std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-pub type CompletionCallback = Arc<dyn Fn(Completion) -> CompletionFuture + Send + Sync + 'static>;
+pub type CompletionCallback = Arc<dyn Fn(Completion) -> CompletionDelivery + Send + Sync + 'static>;
 
 /// The session a run belongs to (upstream stores `{ sessionID }` in
 /// `Shell.Info.metadata`; the directory is the location its events carry).
@@ -669,8 +705,13 @@ impl ShellSession {
         let gate = Arc::clone(&self.gate);
         let Some(table) = self.table.upgrade() else {
             tracing::error!(id = %self.id, "shell delivery lost its owner");
+            (delivery.on_registration_failure)();
             return;
         };
+        let CompletionDelivery {
+            future: delivery,
+            on_registration_failure,
+        } = delivery;
         if let Err(error) = table.deliveries.spawn(async move {
             // Drop also releases the obligation on explicit failure/cancellation.
             struct DeliveryGuard(Arc<Mutex<Gate>>);
@@ -682,6 +723,7 @@ impl ShellSession {
             let _guard = DeliveryGuard(gate);
             delivery.await;
         }) {
+            on_registration_failure();
             tracing::error!(%error, "shell delivery registration failed");
         }
     }

@@ -247,6 +247,24 @@ impl Runtime {
         if let Err(error) = maintenance_result {
             record(error);
         }
+        // The runner's actors and shell processes are now quiescent, so the
+        // completion watchers can finish without creating new wake work. Their
+        // owners are not part of the runner task sets: close them explicitly
+        // before draining the durable job writer they feed.
+        let tools = state.services().tools.clone();
+        if let Some(completion) = tools.shell_completion.clone()
+            && let Err(error) = completion.seal_and_join().await
+        {
+            record(error);
+        }
+        if let Some(subagent) = tools.subagent_handle.clone()
+            && let Err(error) = subagent.join().await
+        {
+            record(error);
+        }
+        if let Err(error) = tools.jobs.shutdown().await {
+            record(error);
+        }
         // 5. Every hub this composition created: current, retired and never
         // installed alike. Shutting them down awaits each transport's IO.
         let hubs: Vec<Arc<Hub>> = std::mem::take(

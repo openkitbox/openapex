@@ -306,6 +306,7 @@ fn spawn_tool_task(
         .magic_context
         .is_external_content_tool(tool.name());
     let db = ctx.db.clone();
+    let live_tool_metadata = Arc::clone(&registry.live_tool_metadata);
     tokio::spawn(async move {
         // The permission gate runs inside the task so an `ask` that waits on
         // the user neither stalls the stream nor the sibling calls.
@@ -313,7 +314,8 @@ fn spawn_tool_task(
             .authorize(&session_id, &directory, tool.name(), &input, &cancellation)
             .await
         {
-            let settlement_id = call_id.clone();
+            let assistant_message_id = message_id.clone();
+            let call_id_for_cleanup = call_id.clone();
             let event = SessionEventData::ToolFailed {
                 session_id,
                 assistant_message_id: message_id,
@@ -329,14 +331,13 @@ fn spawn_tool_task(
                 executed: false,
                 result_state: None,
             };
-            return bus
-                .publish(event)
-                .await
-                .map_err(|source| ToolSettlementError {
-                    call_id: settlement_id,
-                    stage: "permission settlement",
-                    source,
-                });
+            let publish_result = bus.publish(event).await;
+            live_tool_metadata.clear(&assistant_message_id, &call_id_for_cleanup);
+            return publish_result.map_err(|source| ToolSettlementError {
+                call_id: call_id_for_cleanup,
+                stage: "permission settlement",
+                source,
+            });
         }
         let output = if cancellation.is_cancelled() {
             ox_tools::contract::ToolOutput {
@@ -366,7 +367,8 @@ fn spawn_tool_task(
                 tracing::warn!(error = %error, tool = tool.name(), "could not mark session taint");
             }
         }
-        let settlement_id = call_id.clone();
+        let call_id_for_cleanup = call_id.clone();
+        let assistant_message_id_for_cleanup = message_id.clone();
         let event = match output.error {
             None => SessionEventData::ToolSuccess {
                 session_id,
@@ -407,13 +409,13 @@ fn spawn_tool_task(
                 result_state: None,
             },
         };
-        bus.publish(event)
-            .await
-            .map_err(|source| ToolSettlementError {
-                call_id: settlement_id,
-                stage: "result settlement",
-                source,
-            })
+        let publish_result = bus.publish(event).await;
+        live_tool_metadata.clear(&assistant_message_id_for_cleanup, &call_id_for_cleanup);
+        publish_result.map_err(|source| ToolSettlementError {
+            call_id: call_id_for_cleanup,
+            stage: "result settlement",
+            source,
+        })
     })
 }
 

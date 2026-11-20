@@ -545,6 +545,23 @@ CREATE TABLE IF NOT EXISTS project (
 );
 "#;
 
+/// V23: durable background jobs owned by the tools layer.
+const MIGRATION_V23: &str = r#"
+CREATE TABLE IF NOT EXISTS job (
+  id text PRIMARY KEY,
+  session_id text NOT NULL,
+  kind text NOT NULL,
+  title text NOT NULL,
+  status text NOT NULL,
+  started integer NOT NULL,
+  completed integer,
+  metadata text NOT NULL DEFAULT '{}',
+  generation integer NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS job_session_idx ON job (session_id, started);
+CREATE INDEX IF NOT EXISTS job_status_idx ON job (status, started);
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
@@ -571,6 +588,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (20, MIGRATION_V20),
     (21, MIGRATION_V21),
     (22, MIGRATION_V22),
+    (23, MIGRATION_V23),
 ];
 
 /// Async handle to the database.

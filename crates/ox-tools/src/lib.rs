@@ -33,6 +33,7 @@ pub mod form;
 pub mod glob;
 pub mod grep;
 pub mod jobs;
+pub mod live_tool_metadata;
 pub mod patch;
 pub mod question;
 pub mod read;
@@ -107,7 +108,12 @@ impl ToolRegistry {
         depth_limit: usize,
         max_active: usize,
     ) {
-        let handle = std::sync::Arc::new(subagent::SubagentHandle::new(db, bus, max_active));
+        let handle = std::sync::Arc::new(subagent::SubagentHandle::new(
+            db,
+            bus,
+            max_active,
+            std::sync::Arc::clone(&self.jobs),
+        ));
         // The runner looks the handle up here when it is built and attaches
         // itself; until then the tool reports the missing-runner condition.
         self.subagent_handle = Some(handle.clone());
@@ -126,7 +132,12 @@ impl ToolRegistry {
     /// with a warning. A registry that never calls this keeps a `shell` tool
     /// whose background requests fail closed.
     pub fn register_shell_completion(&mut self, db: ox_db::Db, bus: ox_core::event_bus::EventBus) {
-        let completion = Arc::new(shell::completion::ShellCompletion::new(db, bus));
+        self.jobs.attach_db(db.clone());
+        let completion = Arc::new(shell::completion::ShellCompletion::new(
+            db,
+            bus,
+            Arc::clone(&self.jobs),
+        ));
         self.remove("shell");
         self.register_all(vec![Arc::new(
             shell::ShellTool::with_sessions(Arc::clone(&self.shells))

@@ -74,9 +74,10 @@ impl TaskOwner {
         let sender = state.sender.as_ref().expect("supervisor initialized above");
         let handle = tokio::spawn(future);
         let abort = handle.abort_handle();
-        sender
-            .send(handle)
-            .map_err(|_| anyhow::anyhow!("task supervisor stopped"))?;
+        sender.send(handle).map_err(|error| {
+            error.0.abort();
+            anyhow::anyhow!("task supervisor stopped")
+        })?;
         Ok(abort)
     }
 
@@ -375,6 +376,8 @@ pub struct ToolRegistry {
     /// store per process, keyed by session, so a derived registry
     /// ([`ToolRegistry::without`] / [`ToolRegistry::only`]) shares it.
     pub files: Arc<crate::file_state::FileStates>,
+    /// Ephemeral metadata for tool calls currently executing in this process.
+    pub live_tool_metadata: Arc<crate::live_tool_metadata::LiveToolMetadata>,
 }
 
 impl ToolRegistry {
@@ -436,6 +439,7 @@ impl ToolRegistry {
             shells: Arc::clone(&self.shells),
             jobs: Arc::clone(&self.jobs),
             files: Arc::clone(&self.files),
+            live_tool_metadata: Arc::clone(&self.live_tool_metadata),
         }
     }
 
@@ -459,6 +463,7 @@ impl ToolRegistry {
             shells: Arc::clone(&self.shells),
             jobs: Arc::clone(&self.jobs),
             files: Arc::clone(&self.files),
+            live_tool_metadata: Arc::clone(&self.live_tool_metadata),
         }
     }
 

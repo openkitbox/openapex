@@ -496,6 +496,8 @@ pub async fn compose_with_service_password(
     // Background `shell` completions need the same db/bus; the runner attaches
     // its waker when it is built below.
     tools.register_shell_completion(db.clone(), bus.clone());
+    tools.jobs.load(&db).await?;
+    tools.jobs.load_session_parents(&db).await?;
     // Captured before the registry is handed to the runner: the completion
     // replay below runs on the same handle the `subagent` tool uses.
     let subagent = tools.subagent_handle.clone();

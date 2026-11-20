@@ -1,24 +1,83 @@
-//! Process-local registry of jobs that are blocking a session, so
-//! `session.background` can move them to the background.
+//! Process-local blocking registry plus durable snapshots for background jobs.
 //!
-//! Ports the blocking half of upstream `packages/core/src/job.ts`: `block`
-//! records that a session is waiting on a job, and `backgroundAll` releases
-//! every job blocking a session (only entries whose `blockingSessions`
-//! contains it and that are not already backgrounded).
-//!
-//! Deliberate deviations from upstream:
-//! - No durable SQLite job table and no restart recovery: entries live only
-//!   while a foreground tool call waits on them.
-//! - No wait / cancel / consume API: the `shell` and `subagent` tools own how
-//!   a job settles and how its completion is reported.
-//! - The registry tracks only blocking ↔ backgrounded; once no guard waits on
-//!   an entry, it is forgotten.
+//! `Jobs` owns the durable lifecycle boundary and the existing blocking registry;
+//! shell and subagent execution retain process control and completion delivery.
+//! Database writes are spawned after state locks are released, so synchronous
+//! registry guards never cross an await.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use ox_db::Db;
+use serde_json::Value;
+use tokio::sync::mpsc;
 use tokio::sync::watch;
+
+/// Durable job status exposed by the experimental job API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobStatus {
+    Running,
+    Completed,
+    Error,
+    Cancelled,
+}
+
+impl JobStatus {
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "running" => Self::Running,
+            "completed" => Self::Completed,
+            "error" => Self::Error,
+            "cancelled" => Self::Cancelled,
+            _ => return None,
+        })
+    }
+}
+
+impl JobStatus {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Error => "error",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Filters accepted by the experimental job list endpoint.
+#[derive(Debug, Clone, Default)]
+pub struct JobFilter<'a> {
+    pub session_id: Option<&'a str>,
+    pub kind: Option<&'a str>,
+    pub status: Option<JobStatus>,
+    pub descendants: bool,
+}
+
+/// A durable job snapshot. Output is intentionally absent: shell captures stay
+/// owned by `ShellSessions` and are not copied into the job table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobSnapshot {
+    pub id: String,
+    pub session_id: String,
+    pub kind: String,
+    pub title: String,
+    pub status: JobStatus,
+    pub started: i64,
+    pub completed: Option<i64>,
+    pub metadata: Value,
+    pub generation: i64,
+}
+
+/// Handle returned when a running row is registered. The generation prevents a
+/// late completion from settling a newer reuse of the same id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JobGeneration {
+    pub generation: i64,
+}
 
 /// Snapshot of one job moved to the background.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -29,15 +88,47 @@ pub struct JobInfo {
 }
 
 /// Shared registry of jobs that foreground tool calls are waiting on.
-#[derive(Default)]
+const MAX_RETAINED_TERMINAL_JOBS: usize = 4096;
+const MAX_SESSION_PARENTS: usize = 4096;
+const MAX_RETAINED_DATABASE_JOBS: usize = MAX_RETAINED_TERMINAL_JOBS;
+
 pub struct Jobs {
     state: Mutex<State>,
+    durable: Mutex<Option<Db>>,
+    persistence: Mutex<Option<Persistence>>,
+    persistence_error: Arc<Mutex<Option<String>>>,
+    persistence_owner: crate::contract::TaskOwner,
+}
+
+struct Persistence {
+    sender: mpsc::UnboundedSender<PersistCommand>,
+}
+
+enum PersistCommand {
+    Upsert(JobSnapshot),
+    Barrier(tokio::sync::oneshot::Sender<anyhow::Result<()>>),
+}
+
+impl Default for Jobs {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(State::default()),
+            durable: Mutex::new(None),
+            persistence: Mutex::new(None),
+            persistence_error: Arc::new(Mutex::new(None)),
+            persistence_owner: crate::contract::TaskOwner::default(),
+        }
+    }
 }
 
 #[derive(Default)]
 struct State {
     next_seq: u64,
     entries: HashMap<String, Entry>,
+    durable: HashMap<String, JobSnapshot>,
+    /// Session parent links used by the synchronous job-list snapshot filter.
+    session_parents: HashMap<String, String>,
+    cancel: HashMap<String, Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 struct Entry {
@@ -51,6 +142,344 @@ struct Entry {
 }
 
 impl Jobs {
+    /// Attach the database used for durable snapshots. This does not perform I/O.
+    pub fn attach_db(&self, db: Db) {
+        *self.durable.lock().unwrap_or_else(|p| p.into_inner()) = Some(db.clone());
+        let mut persistence = self.persistence.lock().unwrap_or_else(|p| p.into_inner());
+        if persistence.is_some() {
+            return;
+        }
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let error_slot = self.persistence_error.clone();
+        let registered = self.persistence_owner.spawn(async move {
+            while let Some(command) = receiver.recv().await {
+                match command {
+                    PersistCommand::Upsert(snapshot) => {
+                        if let Err(error) = persist_snapshot(&db, &snapshot).await {
+                            *error_slot.lock().unwrap_or_else(|p| p.into_inner()) =
+                                Some(error.to_string());
+                        }
+                    }
+                    PersistCommand::Barrier(reply) => {
+                        let result = error_slot
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .as_ref()
+                            .map_or(Ok(()), |error| Err(anyhow::anyhow!(error.clone())));
+                        let _ = reply.send(result);
+                    }
+                }
+            }
+        });
+        if registered.is_ok() {
+            *persistence = Some(Persistence { sender });
+        } else {
+            *self
+                .persistence_error
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) =
+                Some("job persistence task registration failed".to_owned());
+        }
+    }
+
+    /// Record a session's persisted parent link for descendant filtering.
+    pub fn record_session_parent(&self, session_id: &str, parent_id: Option<&str>) {
+        let mut state = self.lock();
+        if let Some(parent_id) = parent_id {
+            state
+                .session_parents
+                .insert(session_id.to_owned(), parent_id.to_owned());
+            trim_session_parents(&mut state.session_parents);
+        } else {
+            state.session_parents.remove(session_id);
+        }
+    }
+
+    /// Load persisted session parent links used by descendant filtering.
+    pub async fn load_session_parents(&self, db: &Db) -> anyhow::Result<()> {
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare("SELECT id, parent_id FROM session_v2 WHERE parent_id IS NOT NULL")
+            .await?;
+        let mut rows = stmt.query(()).await?;
+        let mut parents = Vec::new();
+        while let Some(row) = rows.next().await? {
+            parents.push((row.get::<String>(0)?, row.get::<String>(1)?));
+        }
+        let mut state = self.lock();
+        state.session_parents.extend(parents);
+        trim_session_parents(&mut state.session_parents);
+        Ok(())
+    }
+
+    /// Register a running job in the durable snapshot and return its generation.
+    pub fn record_running(
+        &self,
+        id: &str,
+        session_id: &str,
+        kind: &str,
+        title: &str,
+        metadata: Option<Value>,
+    ) -> JobGeneration {
+        let mut state = self.lock();
+        if let Some(job) = state.durable.get(id)
+            && job.status != JobStatus::Running
+            && job.metadata.get("execution_owned") == Some(&Value::Bool(true))
+            && job.session_id == session_id
+            && job.kind == kind
+            && job.title == title
+        {
+            return JobGeneration {
+                generation: job.generation,
+            };
+        }
+        let generation = state.durable.get(id).map_or(0, |job| job.generation + 1);
+        let snapshot = JobSnapshot {
+            id: id.to_owned(),
+            session_id: session_id.to_owned(),
+            kind: kind.to_owned(),
+            title: title.to_owned(),
+            status: JobStatus::Running,
+            started: chrono_millis(),
+            completed: None,
+            metadata: metadata.unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+            generation,
+        };
+        state.durable.insert(id.to_owned(), snapshot.clone());
+        trim_durable_jobs(&mut state.durable);
+        drop(state);
+        self.persist_upsert(&snapshot);
+        JobGeneration { generation }
+    }
+
+    /// Register a running job without replacing a terminal row created by an
+    /// execution callback that won the handoff race.
+    pub fn register_running(
+        &self,
+        id: &str,
+        session_id: &str,
+        kind: &str,
+        title: &str,
+        metadata: Option<Value>,
+    ) -> JobGeneration {
+        let mut state = self.lock();
+        if let Some(job) = state.durable.get(id) {
+            return JobGeneration {
+                generation: job.generation,
+            };
+        }
+        let generation = 0;
+        let snapshot = JobSnapshot {
+            id: id.to_owned(),
+            session_id: session_id.to_owned(),
+            kind: kind.to_owned(),
+            title: title.to_owned(),
+            status: JobStatus::Running,
+            started: chrono_millis(),
+            completed: None,
+            metadata: metadata.unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+            generation,
+        };
+        state.durable.insert(id.to_owned(), snapshot.clone());
+        trim_durable_jobs(&mut state.durable);
+        drop(state);
+        self.persist_upsert(&snapshot);
+        JobGeneration { generation }
+    }
+
+    /// Ensure a completion callback has a durable row before settling it. This
+    /// closes the process handoff race where a shell exits before its caller
+    /// registers the row.
+    pub fn ensure_running(
+        &self,
+        id: &str,
+        session_id: &str,
+        kind: &str,
+        title: &str,
+    ) -> JobGeneration {
+        let mut state = self.lock();
+        if let Some(job) = state.durable.get(id) {
+            return JobGeneration {
+                generation: job.generation,
+            };
+        }
+        let generation = 0;
+        let snapshot = JobSnapshot {
+            id: id.to_owned(),
+            session_id: session_id.to_owned(),
+            kind: kind.to_owned(),
+            title: title.to_owned(),
+            status: JobStatus::Running,
+            started: chrono_millis(),
+            completed: None,
+            metadata: serde_json::json!({ "execution_owned": true }),
+            generation,
+        };
+        state.durable.insert(id.to_owned(), snapshot.clone());
+        trim_durable_jobs(&mut state.durable);
+        drop(state);
+        self.persist_upsert(&snapshot);
+        JobGeneration { generation }
+    }
+
+    /// Settle a row only when its generation is still current.
+    pub fn complete(&self, id: &str, generation: i64, status: JobStatus, error: Option<&str>) {
+        let mut state = self.lock();
+        let Some(job) = state.durable.get_mut(id) else {
+            return;
+        };
+        if job.generation != generation || job.status != JobStatus::Running {
+            return;
+        }
+        job.status = status;
+        job.completed = Some(chrono_millis());
+        if let Some(error) = error
+            && let Some(object) = job.metadata.as_object_mut()
+        {
+            object.insert("error".to_owned(), Value::String(error.to_owned()));
+        }
+        let snapshot = job.clone();
+        state.cancel.remove(id);
+        drop(state);
+        self.persist_upsert(&snapshot);
+    }
+
+    /// Settle the current generation, used by completion sinks that only carry
+    /// the job id across the asynchronous process boundary.
+    pub fn complete_current(&self, id: &str, status: JobStatus, error: Option<&str>) {
+        let generation = self
+            .lock()
+            .durable
+            .get(id)
+            .filter(|job| job.status == JobStatus::Running)
+            .map(|job| job.generation);
+        if let Some(generation) = generation {
+            self.complete(id, generation, status, error);
+        }
+    }
+
+    /// Stop durable persistence after its queued snapshots have drained.
+    ///
+    /// Dropping the sender first lets the owned worker consume every queued
+    /// command before [`TaskOwner::seal_and_join`] observes its completion.
+    pub async fn shutdown(&self) -> anyhow::Result<()> {
+        self.persistence
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        self.persistence_owner.seal_and_join().await
+    }
+
+    /// Flush queued durable writes and refresh the process-local mirror from
+    /// the database. API reads use this boundary so an in-memory snapshot can
+    /// never outrun (or contradict) the authoritative job table.
+    pub async fn durable_snapshot(
+        &self,
+        filter: JobFilter<'_>,
+    ) -> anyhow::Result<Vec<JobSnapshot>> {
+        let db = self
+            .durable
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("durable job database is not attached"))?;
+        let persistence = self
+            .persistence
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|p| p.sender.clone());
+        if let Some(sender) = persistence {
+            let (reply, result) = tokio::sync::oneshot::channel();
+            sender
+                .send(PersistCommand::Barrier(reply))
+                .map_err(|_| anyhow::anyhow!("job persistence task stopped"))?;
+            result
+                .await
+                .map_err(|_| anyhow::anyhow!("job persistence barrier stopped"))??;
+        }
+        let loaded = load_rows(&db).await?;
+        let mut state = self.lock();
+        state
+            .durable
+            .extend(loaded.into_iter().map(|job| (job.id.clone(), job)));
+        trim_durable_jobs(&mut state.durable);
+        if let Some(error) = self
+            .persistence_error
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+        {
+            return Err(anyhow::anyhow!(error));
+        }
+        Ok(filter_snapshots(&state, filter))
+    }
+
+    /// Attach the process-specific cancellation action without exposing its
+    /// execution map to HTTP callers.
+    pub fn register_cancel(&self, id: &str, cancel: Arc<dyn Fn() -> bool + Send + Sync>) {
+        self.lock().cancel.insert(id.to_owned(), cancel);
+    }
+
+    /// Request cancellation of a currently running job. The callback is called
+    /// after releasing the registry lock; terminal settlement remains owned by
+    /// the shell/subagent lifecycle.
+    pub fn cancel(&self, id: &str) -> bool {
+        let action = {
+            let state = self.lock();
+            if state
+                .durable
+                .get(id)
+                .is_none_or(|job| job.status != JobStatus::Running)
+            {
+                return false;
+            }
+            state.cancel.get(id).cloned()
+        };
+        action.is_some_and(|action| action())
+    }
+
+    /// Return a bounded, process-local snapshot. Durable recovery is loaded by
+    /// `load`; this method never exposes private execution maps or output.
+    pub fn snapshot(&self, filter: JobFilter<'_>) -> Vec<JobSnapshot> {
+        let state = self.lock();
+        filter_snapshots(&state, filter)
+    }
+
+    /// Load durable rows on startup. Running rows remain queryable but no
+    /// process is invented to execute them.
+    pub async fn load(&self, db: &Db) -> anyhow::Result<()> {
+        let loaded = load_rows(db).await?;
+        let mut state = self.lock();
+        state
+            .durable
+            .extend(loaded.into_iter().map(|job| (job.id.clone(), job)));
+        trim_durable_jobs(&mut state.durable);
+        Ok(())
+    }
+
+    fn persist_upsert(&self, snapshot: &JobSnapshot) {
+        let sender = self
+            .persistence
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|p| p.sender.clone());
+        let Some(sender) = sender else {
+            return;
+        };
+        if sender
+            .send(PersistCommand::Upsert(snapshot.clone()))
+            .is_err()
+        {
+            *self
+                .persistence_error
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) =
+                Some("job persistence task stopped".to_owned());
+        }
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state
             .lock()
@@ -156,6 +585,135 @@ impl Jobs {
     }
 }
 
+fn chrono_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as i64)
+}
+
+async fn load_rows(db: &Db) -> anyhow::Result<Vec<JobSnapshot>> {
+    let conn = db.acquire().await?;
+    let mut loaded = load_running_rows(&conn).await?;
+    loaded.extend(load_terminal_rows(&conn).await?);
+    Ok(loaded)
+}
+
+async fn load_running_rows(conn: &ox_db::turso::Connection) -> anyhow::Result<Vec<JobSnapshot>> {
+    let mut stmt = conn
+        .prepare("SELECT id, session_id, kind, title, status, started, completed, metadata, generation FROM job WHERE status = 'running' ORDER BY started")
+        .await?;
+    let mut rows = stmt.query(()).await?;
+    decode_rows(&mut rows).await
+}
+
+async fn load_terminal_rows(conn: &ox_db::turso::Connection) -> anyhow::Result<Vec<JobSnapshot>> {
+    let mut stmt = conn
+        .prepare("SELECT id, session_id, kind, title, status, started, completed, metadata, generation FROM job WHERE status <> 'running' ORDER BY started DESC LIMIT ?1")
+        .await?;
+    let mut rows = stmt.query((MAX_RETAINED_TERMINAL_JOBS as i64,)).await?;
+    decode_rows(&mut rows).await
+}
+
+async fn decode_rows(rows: &mut ox_db::turso::Rows) -> anyhow::Result<Vec<JobSnapshot>> {
+    let mut loaded = Vec::new();
+    while let Some(row) = rows.next().await? {
+        let status = JobStatus::parse(&row.get::<String>(4)?).unwrap_or(JobStatus::Running);
+        loaded.push(JobSnapshot {
+            id: row.get(0)?,
+            session_id: row.get(1)?,
+            kind: row.get(2)?,
+            title: row.get(3)?,
+            status,
+            started: row.get(5)?,
+            completed: row.get(6)?,
+            metadata: serde_json::from_str(&row.get::<String>(7)?)
+                .unwrap_or(Value::Object(serde_json::Map::new())),
+            generation: row.get(8)?,
+        });
+    }
+    Ok(loaded)
+}
+
+fn filter_snapshots(state: &State, filter: JobFilter<'_>) -> Vec<JobSnapshot> {
+    let mut snapshots: Vec<JobSnapshot> = state
+        .durable
+        .values()
+        .filter(|job| job.kind == "shell" || job.kind == "subagent")
+        .filter(|job| filter.kind.is_none_or(|kind| job.kind == kind))
+        .filter(|job| filter.status.is_none_or(|status| job.status == status))
+        .filter(|job| {
+            filter.session_id.is_none_or(|session| {
+                job.session_id == session
+                    || filter.descendants
+                        && is_descendant(&state.session_parents, &job.session_id, session)
+            })
+        })
+        .cloned()
+        .collect();
+    snapshots.sort_by_key(|job| job.started);
+    snapshots
+}
+
+async fn persist_snapshot(db: &Db, snapshot: &JobSnapshot) -> anyhow::Result<()> {
+    let conn = db.acquire().await?;
+    let metadata = snapshot.metadata.to_string();
+    let params = (
+        snapshot.id.as_str(),
+        snapshot.session_id.as_str(),
+        snapshot.kind.as_str(),
+        snapshot.title.as_str(),
+        snapshot.status.as_str(),
+        snapshot.started,
+        snapshot.completed,
+        metadata.as_str(),
+        snapshot.generation,
+    );
+    conn.execute("INSERT INTO job (id, session_id, kind, title, status, started, completed, metadata, generation) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) ON CONFLICT(id) DO UPDATE SET session_id=excluded.session_id, kind=excluded.kind, title=excluded.title, status=excluded.status, started=excluded.started, completed=excluded.completed, metadata=excluded.metadata, generation=excluded.generation WHERE excluded.generation > job.generation OR (excluded.generation = job.generation AND job.status = 'running' AND excluded.status <> 'running')", params).await?;
+    conn.execute(
+        "DELETE FROM job WHERE status <> 'running' AND id NOT IN (SELECT id FROM job WHERE status <> 'running' ORDER BY started DESC LIMIT ?1)",
+        (MAX_RETAINED_DATABASE_JOBS as i64,),
+    )
+    .await?;
+    Ok(())
+}
+
+fn trim_durable_jobs(jobs: &mut HashMap<String, JobSnapshot>) {
+    while jobs.len() > MAX_RETAINED_TERMINAL_JOBS {
+        let Some(id) = jobs
+            .iter()
+            .filter(|(_, job)| job.status != JobStatus::Running)
+            .min_by_key(|(_, job)| job.completed.unwrap_or(job.started))
+            .map(|(id, _)| id.clone())
+        else {
+            break;
+        };
+        jobs.remove(&id);
+    }
+}
+
+fn trim_session_parents(parents: &mut HashMap<String, String>) {
+    while parents.len() > MAX_SESSION_PARENTS {
+        let Some(id) = parents.keys().next().cloned() else {
+            break;
+        };
+        parents.remove(&id);
+    }
+}
+fn is_descendant(parents: &HashMap<String, String>, session_id: &str, ancestor: &str) -> bool {
+    let mut current = session_id.to_owned();
+    let mut visited = std::collections::HashSet::new();
+    while let Some(parent) = parents.get(&current) {
+        if !visited.insert(current.clone()) {
+            return false;
+        }
+        if parent == ancestor {
+            return true;
+        }
+        current.clone_from(parent);
+    }
+    false
+}
+
 /// A session's registration as blocked on one job; dropping it releases the
 /// registration.
 #[must_use = "dropping the guard releases the blocking registration at once"]
@@ -192,5 +750,87 @@ impl BlockGuard {
 impl Drop for BlockGuard {
     fn drop(&mut self) {
         self.jobs.release(self);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_snapshot_filters_supported_jobs_and_descendants() {
+        let jobs = Jobs::default();
+        jobs.record_running("shell-1", "root", "shell", "echo hi", None);
+        jobs.record_session_parent("child", Some("root"));
+        jobs.record_running(
+            "child-1",
+            "child",
+            "subagent",
+            "review",
+            Some(serde_json::json!({ "parentSessionID": "root" })),
+        );
+        jobs.record_running("video-1", "root", "video", "not supported", None);
+
+        let jobs = jobs.snapshot(JobFilter {
+            session_id: Some("root"),
+            descendants: true,
+            ..JobFilter::default()
+        });
+
+        assert_eq!(jobs.len(), 2, "only shell and subagent jobs are exposed");
+        assert!(jobs.iter().any(|job| job.id == "shell-1"));
+        assert!(jobs.iter().any(|job| job.id == "child-1"));
+    }
+
+    #[test]
+    fn descendants_filter_transitive_session_hierarchy() {
+        let jobs = Jobs::default();
+        jobs.record_session_parent("child", Some("root"));
+        jobs.record_session_parent("grand", Some("child"));
+        jobs.record_running(
+            "root-child",
+            "child",
+            "subagent",
+            "child",
+            Some(serde_json::json!({
+                "parentSessionID": "root",
+            })),
+        );
+        jobs.record_running(
+            "grandchild",
+            "grand",
+            "subagent",
+            "grandchild",
+            Some(serde_json::json!({
+                "parentSessionID": "child",
+            })),
+        );
+        jobs.record_running("grand-shell", "grand", "shell", "echo nested", None);
+        jobs.record_running("unrelated", "other", "shell", "echo unrelated", None);
+
+        let snapshots = jobs.snapshot(JobFilter {
+            session_id: Some("root"),
+            descendants: true,
+            ..JobFilter::default()
+        });
+
+        let mut ids: Vec<&str> = snapshots.iter().map(|job| job.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["grand-shell", "grandchild", "root-child"]);
+    }
+
+    #[test]
+    fn stale_generation_cannot_settle_new_job() {
+        let jobs = Jobs::default();
+        let first = jobs.record_running("same", "session", "shell", "first", None);
+        jobs.complete("same", first.generation, JobStatus::Completed, None);
+        let second = jobs.record_running("same", "session", "shell", "second", None);
+        jobs.complete("same", first.generation, JobStatus::Error, Some("stale"));
+
+        let snapshot = jobs.snapshot(JobFilter::default());
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].title, "second");
+        assert_eq!(snapshot[0].status, JobStatus::Running);
+        assert_eq!(second.generation, snapshot[0].generation);
     }
 }

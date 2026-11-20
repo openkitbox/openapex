@@ -40,13 +40,12 @@ use ox_schema::inbox::{Delivery, Item, SyntheticPayload};
 use ox_schema::support::Record;
 use serde_json::json;
 
-use super::sessions::{Completion, Status};
+use super::sessions::{Completion, CompletionDelivery, Status};
 
 /// A completion sink that also learns which session the shell belongs to.
 /// The tool binds the session id per background call, so the shell session table
 /// stays unaware of sessions.
-pub type SessionSink =
-    Arc<dyn Fn(&str, Completion) -> super::sessions::CompletionFuture + Send + Sync + 'static>;
+pub type SessionSink = Arc<dyn Fn(&str, Completion) -> CompletionDelivery + Send + Sync + 'static>;
 
 /// Wakes a session for a newly enqueued inbox item. Implemented by the
 /// runner; a trait here keeps the shell session table from depending on it.
@@ -64,6 +63,7 @@ pub trait ShellWaker: Send + Sync {
 pub struct ShellCompletion {
     db: Db,
     bus: EventBus,
+    jobs: Arc<crate::jobs::Jobs>,
     /// `None` until the runner attaches; a completion without a waker is
     /// dropped (fail closed) rather than persisted and left undelivered.
     waker: OnceLock<Arc<dyn ShellWaker>>,
@@ -73,10 +73,11 @@ pub struct ShellCompletion {
 
 impl ShellCompletion {
     #[must_use]
-    pub fn new(db: Db, bus: EventBus) -> Self {
+    pub fn new(db: Db, bus: EventBus, jobs: Arc<crate::jobs::Jobs>) -> Self {
         Self {
             db,
             bus,
+            jobs,
             waker: OnceLock::new(),
             wakes_closed: std::sync::atomic::AtomicBool::new(false),
             deliveries: crate::contract::TaskOwner::default(),
@@ -107,43 +108,105 @@ impl ShellCompletion {
         Arc::new(move |session_id: &str, completion: Completion| {
             let this = Arc::clone(&this);
             let session_id = session_id.to_owned();
+            let shell_id = completion.id.clone();
+            let payload = payload(&completion);
+            let generation =
+                this.jobs
+                    .ensure_running(&shell_id, &session_id, "shell", &completion.command);
             let (reply, result) = tokio::sync::oneshot::channel();
             let owner = this.deliveries.clone();
             if this.wakes_closed.load(std::sync::atomic::Ordering::Acquire) {
-                return Box::pin(async {});
+                this.jobs.complete(
+                    &shell_id,
+                    generation.generation,
+                    crate::jobs::JobStatus::Error,
+                    Some("completion delivery is closed"),
+                );
+                return super::sessions::CompletionDelivery {
+                    future: Box::pin(async {}),
+                    on_registration_failure: Box::new(|| {}),
+                };
             }
+            let jobs = Arc::clone(&this.jobs);
+            let task_jobs = Arc::clone(&jobs);
+            let task_completion = Arc::clone(&this);
+            let task_shell_id = shell_id.clone();
+            let task_generation = generation;
             let registered = owner.spawn(async move {
-                let payload = payload(&completion);
-                this.enqueue_and_wake(&session_id, &completion.id, payload)
+                let (status, error) = completion_job_state(&payload);
+                let delivered = task_completion
+                    .enqueue_and_wake(&session_id, &task_shell_id, payload)
                     .await;
+                if delivered {
+                    task_jobs.complete(&task_shell_id, task_generation.generation, status, error);
+                } else {
+                    task_jobs.complete(
+                        &task_shell_id,
+                        task_generation.generation,
+                        crate::jobs::JobStatus::Error,
+                        Some("completion delivery failed"),
+                    );
+                }
                 let _ = reply.send(());
             });
-            Box::pin(async move {
-                if let Err(error) = registered {
-                    tracing::error!(%error, "shell completion registration closed");
-                    return;
-                }
-                if result.await.is_err() {
-                    tracing::error!("shell completion task failed");
-                }
-            })
+            let registration_error = registered.as_ref().err().map(ToString::to_string);
+            if let Some(error) = registration_error {
+                tracing::error!(%error, "shell completion registration closed");
+                this.jobs.complete(
+                    &shell_id,
+                    generation.generation,
+                    crate::jobs::JobStatus::Error,
+                    Some("completion task registration failed"),
+                );
+            }
+            let registration_jobs = Arc::clone(&this.jobs);
+            let registration_shell_id = shell_id.clone();
+            CompletionDelivery {
+                future: Box::pin(async move {
+                    if registered.is_err() {
+                        return;
+                    }
+                    if result.await.is_err() {
+                        tracing::error!("shell completion task failed");
+                        jobs.complete(
+                            &shell_id,
+                            generation.generation,
+                            crate::jobs::JobStatus::Error,
+                            Some("completion task failed"),
+                        );
+                    }
+                }),
+                on_registration_failure: Box::new(move || {
+                    registration_jobs.complete(
+                        &registration_shell_id,
+                        generation.generation,
+                        crate::jobs::JobStatus::Error,
+                        Some("completion task registration failed"),
+                    );
+                }),
+            }
         })
     }
 
-    async fn enqueue_and_wake(&self, session_id: &str, shell_id: &str, payload: SyntheticPayload) {
+    async fn enqueue_and_wake(
+        &self,
+        session_id: &str,
+        shell_id: &str,
+        payload: SyntheticPayload,
+    ) -> bool {
         let Some(waker) = self.waker.get() else {
             tracing::warn!(parent = %session_id, shell = %shell_id, "shell completion waker not attached; dropping completion");
-            return;
+            return false;
         };
         match parent_exists(&self.db, session_id).await {
             Ok(true) => {}
             Ok(false) => {
                 tracing::warn!(parent = %session_id, shell = %shell_id, "parent session gone; dropping shell completion");
-                return;
+                return false;
             }
             Err(error) => {
                 tracing::warn!(parent = %session_id, shell = %shell_id, error = %error, "unable to check parent session; dropping shell completion");
-                return;
+                return false;
             }
         }
         let inbox_id = ox_schema::id::id("msg");
@@ -157,14 +220,32 @@ impl ShellCompletion {
         };
         if let Err(error) = self.bus.publish(enqueued).await {
             tracing::warn!(parent = %session_id, shell = %shell_id, error = %error, "unable to enqueue shell completion");
-            return;
+            return false;
         }
         if self.wakes_closed.load(std::sync::atomic::Ordering::Acquire) {
-            return;
+            return false;
         }
         if let Err(error) = waker.dispatch(session_id, &inbox_id).await {
             tracing::warn!(parent = %session_id, shell = %shell_id, error = %error, "unable to wake parent for shell completion");
+            return false;
         }
+        true
+    }
+}
+
+/// Convert the synthetic state into the durable job terminal state.
+fn completion_job_state(
+    payload: &SyntheticPayload,
+) -> (crate::jobs::JobStatus, Option<&'static str>) {
+    match payload
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("state"))
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("completed") => (crate::jobs::JobStatus::Completed, None),
+        Some("cancelled") => (crate::jobs::JobStatus::Cancelled, None),
+        _ => (crate::jobs::JobStatus::Error, Some("completion failed")),
     }
 }
 

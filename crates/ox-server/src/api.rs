@@ -28,6 +28,7 @@ pub mod family;
 pub mod files;
 pub mod form;
 mod integration;
+pub(crate) mod job;
 pub mod lease;
 mod mcp;
 mod media;
@@ -1027,7 +1028,13 @@ pub fn build_router(state: AppState) -> Router {
                 .push(Router::with_path("form").get(form::list))
                 .push(Router::with_path("skill").get(skill::list))
                 .push(
+                    Router::with_path("experimental/job")
+                        .get(job::list)
+                        .push(Router::with_path("{id}/cancel").post(job::cancel)),
+                )
+                .push(
                     Router::with_path("shell")
+                        .post(shell::create)
                         .get(shell::list)
                         .push(
                             Router::with_path("{id}")

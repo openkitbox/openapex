@@ -434,6 +434,13 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
         Ok(session) => session,
         Err(_) => return wrap("spawn failed".to_owned()),
     };
+    let job_generation = if yield_ms == 0 {
+        tool.jobs
+            .as_ref()
+            .map(|jobs| register_shell_job(jobs, &session, &ctx.session_id, command))
+    } else {
+        None
+    };
     // A foreground run that can be notified blocks its session as a job, so
     // `session.background` can end the window early (upstream `jobs.block`,
     // titled with the command the model sent, before any RTK rewrite).
@@ -468,6 +475,16 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
     }
     if ctx.cancellation.is_cancelled() {
         session.stop(true).await;
+        if let Some(generation) = job_generation
+            && let Some(jobs) = &tool.jobs
+        {
+            jobs.complete(
+                &session.id,
+                generation.generation,
+                crate::jobs::JobStatus::Cancelled,
+                None,
+            );
+        }
         return wrap("command cancelled".to_owned());
     }
     if yield_ms == 0 {
@@ -482,9 +499,21 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
     // Without a sink there is nothing to notify through, so the run stays an
     // `interact`-addressed session.
     if tool.completion.is_some() && session.hand_back() == sessions::HandBack::Background {
+        if let Some(jobs) = &tool.jobs {
+            register_shell_job(jobs, &session, &ctx.session_id, command);
+        }
         return background_result(&session.id, rewritten);
     }
     let (page, exit) = session.poll(0, usize::MAX);
+    if let Some(generation) = job_generation
+        && let Some(jobs) = &tool.jobs
+    {
+        let status = match exit.status {
+            Some(sessions::Status::Killed) => crate::jobs::JobStatus::Cancelled,
+            _ => crate::jobs::JobStatus::Completed,
+        };
+        jobs.complete(&session.id, generation.generation, status, None);
+    }
     if exit
         .status
         .is_some_and(|status| status != sessions::Status::Running)
@@ -523,6 +552,32 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
         "status": "running",
         "shellID": session.id,
     }))
+}
+
+/// Register the durable row and cancellation hook for a shell that owns the
+/// background handoff. The callback stops the same session; no second
+/// execution registry is created.
+fn register_shell_job(
+    jobs: &Jobs,
+    session: &Arc<sessions::ShellSession>,
+    session_id: &str,
+    command: &str,
+) -> crate::jobs::JobGeneration {
+    let generation = jobs.register_running(&session.id, session_id, "shell", command, None);
+    let shell = Arc::clone(session);
+    jobs.register_cancel(
+        &session.id,
+        Arc::new(move || {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let shell = Arc::clone(&shell);
+                handle.spawn(async move { shell.stop(true).await });
+                true
+            } else {
+                false
+            }
+        }),
+    );
+    generation
 }
 
 /// The `running` response of a run handed back to the background (upstream
