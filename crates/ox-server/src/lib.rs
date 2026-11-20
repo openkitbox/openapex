@@ -4,6 +4,7 @@
 //! drive it over HTTP against an ephemeral port.
 
 pub mod api;
+pub(crate) mod config_watch;
 pub mod instance;
 pub mod lifecycle;
 pub mod project;
@@ -557,6 +558,7 @@ pub async fn compose_with_service_password(
     // here would keep clients from connecting for that entire window. Install
     // them after the listener is up instead.
     adopt(&state, spawn_mcp_startup(&state)).await;
+    adopt(&state, config_watch::spawn(&state, stop.clone())).await;
     // Background memory consolidation. Idle unless `[magic_context]` enables
     // it, and deliberately not part of `build_state_with`: tests must not
     // acquire a background loop that writes to their database.

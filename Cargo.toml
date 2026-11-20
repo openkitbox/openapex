@@ -32,6 +32,7 @@ globset = "0.4"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 ignore = "0.4"
+notify = "8.2"
 jiff = "1.0"
 libc = "0.2"
 # ox declares the global allocator itself (src/main.rs), so turso's default
