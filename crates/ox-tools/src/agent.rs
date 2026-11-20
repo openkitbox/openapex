@@ -139,7 +139,7 @@ pub const EXPLORE_SYSTEM: &str = concat!(
 /// One side effect is left on purpose: `ctx_search` records `last_used_at` by
 /// calling `record_use`, the tool entry being
 /// `crates/ox-engine/src/mctx/search.rs` and the row UPDATE living in
-/// `crates/ox-engine/src/mctx/memory.rs`, whose `last_used_at` field is
+/// `crates/ox-engine/src/mctx/memory/memories.rs`, whose `last_used_at` field is
 /// documented as "a selection tiebreak only: recording a use is neither a write
 /// nor a verification". It cannot change fact text, so the memory read path
 /// stays.
