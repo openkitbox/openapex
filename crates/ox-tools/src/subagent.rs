@@ -741,12 +741,18 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         .into_iter()
         .collect(),
     };
-    let job_generation = tool.handle.jobs.record_running(
+    let job_generation = tool.handle.jobs.record_running_at(
         &child_id,
         &ctx.session_id,
         "subagent",
         &description,
-        Some(json!({ "parentSessionID": ctx.session_id })),
+        Some(json!({
+            "parentSessionID": ctx.session_id.clone(),
+            "childSessionID": child_id.clone(),
+            "agent": agent.id,
+            "description": description.clone(),
+        })),
+        Some(ctx.directory.to_string_lossy().into_owned()),
     );
     tool.handle
         .jobs

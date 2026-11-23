@@ -415,6 +415,8 @@ pub enum HandBack {
 pub struct Completion {
     pub id: String,
     pub command: String,
+    /// Owning session directory used for job lifecycle event locations.
+    pub directory: Option<String>,
     pub status: Status,
     pub exit: Option<i32>,
     pub signal: Option<i32>,
@@ -695,6 +697,7 @@ impl ShellSession {
         let completion = Completion {
             id: self.id.clone(),
             command: self.command.clone(),
+            directory: self.owner.as_ref().map(|owner| owner.directory.clone()),
             status: exit.status.unwrap_or(Status::Exited),
             exit: exit.code,
             signal: exit.signal,

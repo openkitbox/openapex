@@ -69,7 +69,85 @@ pub struct JobSnapshot {
     pub started: i64,
     pub completed: Option<i64>,
     pub metadata: Value,
+    /// Owning session directory used to stamp ephemeral lifecycle frames.
+    pub directory: Option<String>,
     pub generation: i64,
+}
+
+impl JobSnapshot {
+    #[must_use]
+    pub fn event_directory(&self) -> Option<&str> {
+        self.directory.as_deref().or_else(|| {
+            self.metadata
+                .get("__ox_job_directory")
+                .and_then(Value::as_str)
+        })
+    }
+
+    /// Convert a durable snapshot to the public `Job.Info` wire object.
+    #[must_use]
+    pub fn to_info(&self) -> Option<Value> {
+        let mut info = serde_json::Map::new();
+        info.insert("id".to_owned(), Value::String(self.id.clone()));
+        info.insert(
+            "sessionID".to_owned(),
+            Value::String(self.session_id.clone()),
+        );
+        info.insert("kind".to_owned(), Value::String(self.kind.clone()));
+        info.insert(
+            "status".to_owned(),
+            Value::String(self.status.as_str().to_owned()),
+        );
+        if !self.title.is_empty() {
+            info.insert("title".to_owned(), Value::String(self.title.clone()));
+        }
+        let mut time = serde_json::Map::new();
+        time.insert("started".to_owned(), Value::from(self.started));
+        if let Some(completed) = self.completed {
+            time.insert("completed".to_owned(), Value::from(completed));
+        }
+        info.insert("time".to_owned(), Value::Object(time));
+
+        let metadata = self.metadata.as_object()?;
+        match self.kind.as_str() {
+            "shell" => {
+                insert_metadata_string(&mut info, metadata, "shellID")?;
+                insert_metadata_string(&mut info, metadata, "command")?;
+            }
+            "subagent" => {
+                insert_metadata_string(&mut info, metadata, "childSessionID")?;
+                insert_metadata_string(&mut info, metadata, "agent")?;
+                insert_metadata_string(&mut info, metadata, "description")?;
+            }
+            _ => return None,
+        }
+        Some(Value::Object(info))
+    }
+}
+
+fn metadata_with_directory(metadata: Option<Value>, directory: Option<&str>) -> Value {
+    let mut metadata = metadata.unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    if let Some(directory) = directory
+        && let Some(object) = metadata.as_object_mut()
+    {
+        object.insert(
+            "__ox_job_directory".to_owned(),
+            Value::String(directory.to_owned()),
+        );
+    }
+    metadata
+}
+
+fn insert_metadata_string(
+    info: &mut serde_json::Map<String, Value>,
+    metadata: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Option<()> {
+    info.insert(
+        key.to_owned(),
+        Value::String(metadata.get(key)?.as_str()?.to_owned()),
+    );
+    Some(())
 }
 
 /// Handle returned when a running row is registered. The generation prevents a
@@ -97,15 +175,18 @@ pub struct Jobs {
     durable: Mutex<Option<Db>>,
     persistence: Mutex<Option<Persistence>>,
     persistence_error: Arc<Mutex<Option<String>>>,
+    observer: Mutex<Option<JobObserver>>,
     persistence_owner: crate::contract::TaskOwner,
 }
+
+pub type JobObserver = Arc<dyn Fn(&JobSnapshot) + Send + Sync + 'static>;
 
 struct Persistence {
     sender: mpsc::UnboundedSender<PersistCommand>,
 }
 
 enum PersistCommand {
-    Upsert(JobSnapshot),
+    Upsert(Box<JobSnapshot>),
     Barrier(tokio::sync::oneshot::Sender<anyhow::Result<()>>),
 }
 
@@ -116,6 +197,7 @@ impl Default for Jobs {
             durable: Mutex::new(None),
             persistence: Mutex::new(None),
             persistence_error: Arc::new(Mutex::new(None)),
+            observer: Mutex::new(None),
             persistence_owner: crate::contract::TaskOwner::default(),
         }
     }
@@ -142,6 +224,11 @@ struct Entry {
 }
 
 impl Jobs {
+    /// Attach the synchronous observer used for live job lifecycle frames.
+    pub fn set_observer(&self, observer: Option<JobObserver>) {
+        *self.observer.lock().unwrap_or_else(|p| p.into_inner()) = observer;
+    }
+
     /// Attach the database used for durable snapshots. This does not perform I/O.
     pub fn attach_db(&self, db: Db) {
         *self.durable.lock().unwrap_or_else(|p| p.into_inner()) = Some(db.clone());
@@ -221,6 +308,18 @@ impl Jobs {
         title: &str,
         metadata: Option<Value>,
     ) -> JobGeneration {
+        self.record_running_at(id, session_id, kind, title, metadata, None)
+    }
+
+    pub fn record_running_at(
+        &self,
+        id: &str,
+        session_id: &str,
+        kind: &str,
+        title: &str,
+        metadata: Option<Value>,
+        directory: Option<String>,
+    ) -> JobGeneration {
         let mut state = self.lock();
         if let Some(job) = state.durable.get(id)
             && job.status != JobStatus::Running
@@ -242,13 +341,15 @@ impl Jobs {
             status: JobStatus::Running,
             started: chrono_millis(),
             completed: None,
-            metadata: metadata.unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+            metadata: metadata_with_directory(metadata, directory.as_deref()),
+            directory,
             generation,
         };
         state.durable.insert(id.to_owned(), snapshot.clone());
         trim_durable_jobs(&mut state.durable);
         drop(state);
         self.persist_upsert(&snapshot);
+        self.observe(&snapshot);
         JobGeneration { generation }
     }
 
@@ -262,40 +363,17 @@ impl Jobs {
         title: &str,
         metadata: Option<Value>,
     ) -> JobGeneration {
-        let mut state = self.lock();
-        if let Some(job) = state.durable.get(id) {
-            return JobGeneration {
-                generation: job.generation,
-            };
-        }
-        let generation = 0;
-        let snapshot = JobSnapshot {
-            id: id.to_owned(),
-            session_id: session_id.to_owned(),
-            kind: kind.to_owned(),
-            title: title.to_owned(),
-            status: JobStatus::Running,
-            started: chrono_millis(),
-            completed: None,
-            metadata: metadata.unwrap_or_else(|| Value::Object(serde_json::Map::new())),
-            generation,
-        };
-        state.durable.insert(id.to_owned(), snapshot.clone());
-        trim_durable_jobs(&mut state.durable);
-        drop(state);
-        self.persist_upsert(&snapshot);
-        JobGeneration { generation }
+        self.register_running_at(id, session_id, kind, title, metadata, None)
     }
 
-    /// Ensure a completion callback has a durable row before settling it. This
-    /// closes the process handoff race where a shell exits before its caller
-    /// registers the row.
-    pub fn ensure_running(
+    pub fn register_running_at(
         &self,
         id: &str,
         session_id: &str,
         kind: &str,
         title: &str,
+        metadata: Option<Value>,
+        directory: Option<String>,
     ) -> JobGeneration {
         let mut state = self.lock();
         if let Some(job) = state.durable.get(id) {
@@ -312,13 +390,65 @@ impl Jobs {
             status: JobStatus::Running,
             started: chrono_millis(),
             completed: None,
-            metadata: serde_json::json!({ "execution_owned": true }),
+            metadata: metadata_with_directory(metadata, directory.as_deref()),
+            directory,
             generation,
         };
         state.durable.insert(id.to_owned(), snapshot.clone());
         trim_durable_jobs(&mut state.durable);
         drop(state);
         self.persist_upsert(&snapshot);
+        self.observe(&snapshot);
+        JobGeneration { generation }
+    }
+
+    /// Ensure a completion callback has a durable row before settling it. This
+    /// closes the process handoff race where a shell exits before its caller
+    /// registers the row.
+    pub fn ensure_running(
+        &self,
+        id: &str,
+        session_id: &str,
+        kind: &str,
+        title: &str,
+        metadata: Option<Value>,
+    ) -> JobGeneration {
+        self.ensure_running_at(id, session_id, kind, title, metadata, None)
+    }
+
+    pub fn ensure_running_at(
+        &self,
+        id: &str,
+        session_id: &str,
+        kind: &str,
+        title: &str,
+        metadata: Option<Value>,
+        directory: Option<String>,
+    ) -> JobGeneration {
+        let mut state = self.lock();
+        if let Some(job) = state.durable.get(id) {
+            return JobGeneration {
+                generation: job.generation,
+            };
+        }
+        let generation = 0;
+        let snapshot = JobSnapshot {
+            id: id.to_owned(),
+            session_id: session_id.to_owned(),
+            kind: kind.to_owned(),
+            title: title.to_owned(),
+            status: JobStatus::Running,
+            started: chrono_millis(),
+            completed: None,
+            metadata: metadata_with_directory(metadata, directory.as_deref()),
+            directory,
+            generation,
+        };
+        state.durable.insert(id.to_owned(), snapshot.clone());
+        trim_durable_jobs(&mut state.durable);
+        drop(state);
+        self.persist_upsert(&snapshot);
+        self.observe(&snapshot);
         JobGeneration { generation }
     }
 
@@ -342,6 +472,7 @@ impl Jobs {
         state.cancel.remove(id);
         drop(state);
         self.persist_upsert(&snapshot);
+        self.observe(&snapshot);
     }
 
     /// Settle the current generation, used by completion sinks that only carry
@@ -469,7 +600,7 @@ impl Jobs {
             return;
         };
         if sender
-            .send(PersistCommand::Upsert(snapshot.clone()))
+            .send(PersistCommand::Upsert(Box::new(snapshot.clone())))
             .is_err()
         {
             *self
@@ -484,6 +615,25 @@ impl Jobs {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Publish the durable rows recovered during startup after an observer is installed.
+    pub fn observe_loaded(&self) {
+        let snapshots: Vec<JobSnapshot> = self.lock().durable.values().cloned().collect();
+        for snapshot in snapshots {
+            self.observe(&snapshot);
+        }
+    }
+
+    fn observe(&self, snapshot: &JobSnapshot) {
+        let observer = self
+            .observer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        if let Some(observer) = observer {
+            observer(snapshot);
+        }
     }
 
     /// Register `session_id` as blocked on job `id`. Creates the entry when
@@ -628,6 +778,7 @@ async fn decode_rows(rows: &mut ox_db::turso::Rows) -> anyhow::Result<Vec<JobSna
             completed: row.get(6)?,
             metadata: serde_json::from_str(&row.get::<String>(7)?)
                 .unwrap_or(Value::Object(serde_json::Map::new())),
+            directory: None,
             generation: row.get(8)?,
         });
     }
@@ -820,17 +971,126 @@ mod tests {
     }
 
     #[test]
-    fn stale_generation_cannot_settle_new_job() {
+    fn job_info_mapper_emits_exact_shell_wire_shape() {
+        let snapshot = JobSnapshot {
+            id: "job-shell".to_owned(),
+            session_id: "session-1".to_owned(),
+            kind: "shell".to_owned(),
+            title: "printf hi".to_owned(),
+            status: JobStatus::Completed,
+            started: 10,
+            completed: Some(20),
+            metadata: serde_json::json!({
+                "shellID": "shell-1",
+                "command": "printf hi",
+                "error": "must not leak",
+            }),
+            directory: None,
+            generation: 0,
+        };
+
+        assert_eq!(
+            snapshot.to_info(),
+            Some(serde_json::json!({
+                "id": "job-shell",
+                "sessionID": "session-1",
+                "kind": "shell",
+                "status": "completed",
+                "title": "printf hi",
+                "time": { "started": 10, "completed": 20 },
+                "shellID": "shell-1",
+                "command": "printf hi",
+            }))
+        );
+    }
+
+    #[test]
+    fn job_info_mapper_emits_exact_subagent_wire_shape() {
+        let snapshot = JobSnapshot {
+            id: "job-child".to_owned(),
+            session_id: "parent".to_owned(),
+            kind: "subagent".to_owned(),
+            title: "review".to_owned(),
+            status: JobStatus::Running,
+            started: 30,
+            completed: None,
+            metadata: serde_json::json!({
+                "parentSessionID": "parent",
+                "childSessionID": "child",
+                "agent": "review",
+                "description": "review",
+            }),
+            directory: None,
+            generation: 0,
+        };
+
+        assert_eq!(
+            snapshot.to_info(),
+            Some(serde_json::json!({
+                "id": "job-child",
+                "sessionID": "parent",
+                "kind": "subagent",
+                "status": "running",
+                "title": "review",
+                "time": { "started": 30 },
+                "childSessionID": "child",
+                "agent": "review",
+                "description": "review",
+            }))
+        );
+    }
+
+    #[test]
+    fn job_info_mapper_rejects_invalid_legacy_records() {
+        let snapshot = JobSnapshot {
+            id: "legacy".to_owned(),
+            session_id: "session".to_owned(),
+            kind: "shell".to_owned(),
+            title: "old".to_owned(),
+            status: JobStatus::Completed,
+            started: 1,
+            completed: Some(2),
+            metadata: serde_json::json!({ "name": "old", "time": { "created": 1 } }),
+            directory: None,
+            generation: 0,
+        };
+
+        assert_eq!(snapshot.to_info(), None);
+    }
+
+    #[test]
+    fn observer_receives_only_current_running_and_terminal_transitions() {
         let jobs = Jobs::default();
+        let observed = Arc::new(Mutex::new(Vec::<(String, JobStatus, i64)>::new()));
+        let sink = Arc::clone(&observed);
+        jobs.set_observer(Some(Arc::new(move |snapshot| {
+            sink.lock().expect("observer lock").push((
+                snapshot.id.clone(),
+                snapshot.status,
+                snapshot.generation,
+            ));
+        })));
+
         let first = jobs.record_running("same", "session", "shell", "first", None);
         jobs.complete("same", first.generation, JobStatus::Completed, None);
         let second = jobs.record_running("same", "session", "shell", "second", None);
         jobs.complete("same", first.generation, JobStatus::Error, Some("stale"));
+        jobs.complete("same", second.generation, JobStatus::Error, Some("current"));
+        jobs.complete(
+            "same",
+            second.generation,
+            JobStatus::Error,
+            Some("duplicate"),
+        );
 
-        let snapshot = jobs.snapshot(JobFilter::default());
-        assert_eq!(snapshot.len(), 1);
-        assert_eq!(snapshot[0].title, "second");
-        assert_eq!(snapshot[0].status, JobStatus::Running);
-        assert_eq!(second.generation, snapshot[0].generation);
+        assert_eq!(
+            *observed.lock().expect("observer lock"),
+            vec![
+                ("same".to_owned(), JobStatus::Running, first.generation),
+                ("same".to_owned(), JobStatus::Completed, first.generation),
+                ("same".to_owned(), JobStatus::Running, second.generation),
+                ("same".to_owned(), JobStatus::Error, second.generation),
+            ]
+        );
     }
 }

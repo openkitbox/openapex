@@ -2,9 +2,10 @@
 
 use salvo::http::StatusCode;
 use salvo::prelude::*;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde_json::Value;
 
-use ox_tools::jobs::{JobFilter, JobSnapshot, JobStatus};
+use ox_tools::jobs::{JobFilter, JobStatus};
 
 use super::state;
 
@@ -15,40 +16,6 @@ struct Query {
     kind: Option<String>,
     status: Option<String>,
     descendants: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct JobResponse {
-    id: String,
-    #[serde(rename = "sessionID")]
-    session_id: String,
-    name: String,
-    title: String,
-    status: String,
-    time: JobTime,
-    metadata: serde_json::Value,
-}
-
-#[derive(Debug, Serialize)]
-struct JobTime {
-    created: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    completed: Option<i64>,
-}
-
-fn response(job: JobSnapshot) -> JobResponse {
-    JobResponse {
-        id: job.id,
-        session_id: job.session_id,
-        name: job.kind,
-        title: job.title,
-        status: job.status.as_str().to_owned(),
-        time: JobTime {
-            created: job.started,
-            completed: job.completed,
-        },
-        metadata: job.metadata,
-    }
 }
 
 #[handler]
@@ -77,9 +44,17 @@ pub(crate) async fn list(req: &mut Request, depot: &mut Depot, res: &mut Respons
             return;
         }
     };
-    res.render(Json(
-        serde_json::json!({ "data": data.into_iter().map(response).collect::<Vec<_>>() }),
-    ));
+    let data = data
+        .into_iter()
+        .filter_map(|job| match job.to_info() {
+            Some(info) => Some(info),
+            None => {
+                tracing::warn!(job_id = %job.id, "skipping invalid durable job record");
+                None
+            }
+        })
+        .collect::<Vec<Value>>();
+    res.render(Json(serde_json::json!({ "data": data })));
 }
 
 #[handler]

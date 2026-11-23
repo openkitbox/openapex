@@ -110,9 +110,17 @@ impl ShellCompletion {
             let session_id = session_id.to_owned();
             let shell_id = completion.id.clone();
             let payload = payload(&completion);
-            let generation =
-                this.jobs
-                    .ensure_running(&shell_id, &session_id, "shell", &completion.command);
+            let generation = this.jobs.ensure_running_at(
+                &shell_id,
+                &session_id,
+                "shell",
+                &completion.command,
+                Some(json!({
+                    "shellID": shell_id.clone(),
+                    "command": completion.command.clone(),
+                })),
+                completion.directory,
+            );
             let (reply, result) = tokio::sync::oneshot::channel();
             let owner = this.deliveries.clone();
             if this.wakes_closed.load(std::sync::atomic::Ordering::Acquire) {

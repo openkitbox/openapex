@@ -434,10 +434,11 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
         Ok(session) => session,
         Err(_) => return wrap("spawn failed".to_owned()),
     };
+    let event_directory = ctx.directory.to_string_lossy().into_owned();
     let job_generation = if yield_ms == 0 {
-        tool.jobs
-            .as_ref()
-            .map(|jobs| register_shell_job(jobs, &session, &ctx.session_id, command))
+        tool.jobs.as_ref().map(|jobs| {
+            register_shell_job(jobs, &session, &ctx.session_id, command, &event_directory)
+        })
     } else {
         None
     };
@@ -500,7 +501,7 @@ async fn run_command(tool: &ShellTool, ctx: &ToolContext, input: &Value) -> Tool
     // `interact`-addressed session.
     if tool.completion.is_some() && session.hand_back() == sessions::HandBack::Background {
         if let Some(jobs) = &tool.jobs {
-            register_shell_job(jobs, &session, &ctx.session_id, command);
+            register_shell_job(jobs, &session, &ctx.session_id, command, &event_directory);
         }
         return background_result(&session.id, rewritten);
     }
@@ -562,8 +563,19 @@ fn register_shell_job(
     session: &Arc<sessions::ShellSession>,
     session_id: &str,
     command: &str,
+    directory: &str,
 ) -> crate::jobs::JobGeneration {
-    let generation = jobs.register_running(&session.id, session_id, "shell", command, None);
+    let generation = jobs.register_running_at(
+        &session.id,
+        session_id,
+        "shell",
+        command,
+        Some(json!({
+            "shellID": session.id.clone(),
+            "command": command,
+        })),
+        Some(directory.to_owned()),
+    );
     let shell = Arc::clone(session);
     jobs.register_cancel(
         &session.id,
