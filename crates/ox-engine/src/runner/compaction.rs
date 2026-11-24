@@ -29,6 +29,7 @@ use anyhow::Result;
 use ox_db::Db;
 use ox_llm::cardinal::wire::{ChatMessage, ChatRequest};
 use ox_schema::event::SessionEventData;
+use ox_schema::id::now_millis;
 use ox_schema::message::CompactionReason;
 use ox_schema::support::{ModelRef, SessionError};
 use tokio_util::sync::CancellationToken;
@@ -114,66 +115,94 @@ pub(crate) async fn has_running_compaction(db: &Db, session_id: &str) -> Result<
     Ok(row.get::<i64>(0)? > 0)
 }
 
+/// Three failed automatic compactions in this window mean the transcript
+/// keeps overflowing before a checkpoint can land: stop before opening
+/// another running row. The durable rows are the only state, so a restart
+/// cannot reset the count and no extra table or in-memory counter is needed.
+const LOOP_WINDOW_MILLIS: i64 = 30 * 60 * 1_000;
+const LOOP_FAILURE_LIMIT: i64 = 3;
+
+/// Failed automatic compactions for this session inside the loop window.
+async fn recent_auto_failures(db: &Db, session_id: &str) -> Result<i64> {
+    let conn = db.acquire().await?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT COUNT(*) FROM session_message
+             WHERE session_id = ?1 AND type = 'compaction'
+               AND json_extract(data, '$.status') = 'failed'
+               AND json_extract(data, '$.reason') = 'auto'
+               AND time_created >= ?2",
+        )
+        .await?;
+    let row = stmt
+        .query_row((session_id, now_millis() - LOOP_WINDOW_MILLIS))
+        .await?;
+    Ok(row.get::<i64>(0)?)
+}
+
+/// Fail closed before opening another compaction when the loop guard trips.
+async fn guard_compaction_loop(db: &Db, session_id: &str) -> std::result::Result<(), SessionError> {
+    let failures = recent_auto_failures(db, session_id)
+        .await
+        .map_err(|error| SessionError {
+            kind: "compaction.loop".to_owned(),
+            message: format!("compaction loop guard could not read failure history: {error:#}"),
+            status: None,
+            response: None,
+        })?;
+    if failures >= LOOP_FAILURE_LIMIT {
+        return Err(SessionError {
+            kind: "compaction.loop".to_owned(),
+            message: format!(
+                "compaction stopped after {failures} failed automatic compactions within 30 minutes"
+            ),
+            status: None,
+            response: None,
+        });
+    }
+    Ok(())
+}
+
+/// The loop guard is an automatic-compaction policy: after repeated automatic
+/// failures a user must still be able to compact manually.
+async fn guard_compaction_for(
+    db: &Db,
+    session_id: &str,
+    reason: CompactionReason,
+) -> std::result::Result<(), SessionError> {
+    if reason == CompactionReason::Auto {
+        guard_compaction_loop(db, session_id).await?;
+    }
+    Ok(())
+}
+
 /// Apply admission and output reservation to the actual compaction request.
 fn apply_compaction_budget(
     ctx: &DrainCtx,
     request: &mut ChatRequest,
     provider: &str,
     ladder: &mut OverflowLadder,
-) -> std::result::Result<(), SessionError> {
+) -> anyhow::Result<()> {
     let limits = ctx
         .model_catalog
-        .runtime_limits_for(Some(provider), &request.model)
-        .map_err(|error| SessionError {
-            kind: "compaction.admission".to_owned(),
-            message: format!("compaction request was not admitted: {error:#}"),
-            status: None,
-            response: None,
-        })?;
+        .runtime_limits_for(Some(provider), &request.model)?;
     if limits.stale {
-        return Err(SessionError {
-            kind: "compaction.admission".to_owned(),
-            message: "compaction request was not admitted: catalog limits are stale".to_owned(),
-            status: None,
-            response: None,
-        });
+        anyhow::bail!("catalog limits are stale");
     }
     if limits.shared_context.tokens().is_none() {
-        return Err(SessionError {
-            kind: "compaction.admission".to_owned(),
-            message: "compaction request was not admitted: shared context capacity is unknown"
-                .to_owned(),
-            status: None,
-            response: None,
-        });
+        anyhow::bail!("shared context capacity is unknown");
     }
-    let bill = super::request_budget::measure(request, 1.0).map_err(|error| SessionError {
-        kind: "compaction.admission".to_owned(),
-        message: format!("compaction request was not admitted: {error:#}"),
-        status: None,
-        response: None,
-    })?;
-    if bill.unsupported_media {
-        return Err(SessionError {
-            kind: "compaction.admission".to_owned(),
-            message: "compaction request was not admitted: media input cannot be estimated"
-                .to_owned(),
-            status: None,
-            response: None,
-        });
-    }
-    super::request_budget::apply(
+    // One measurement of the final request: `apply` owns admission and returns
+    // the same bill its decision used, so the media guard needs no second pass.
+    let bill = super::request_budget::apply(
         ctx,
         request,
         provider,
         super::request_budget::Layers::default(),
-    )
-    .map_err(|error| SessionError {
-        kind: "compaction.admission".to_owned(),
-        message: format!("compaction request was not admitted: {error:#}"),
-        status: None,
-        response: None,
-    })?;
+    )?;
+    if bill.unsupported_media {
+        anyhow::bail!("media input cannot be estimated");
+    }
     if ladder.base_max_tokens.is_none() && ladder.shrink_step == 0 {
         ladder.base_max_tokens = request.max_tokens;
     }
@@ -295,6 +324,7 @@ pub(crate) async fn compact(
     input_id: Option<String>,
     turn: Option<&ModelRef>,
 ) -> std::result::Result<String, SessionError> {
+    guard_compaction_for(&ctx.db, &ctx.session_id, reason).await?;
     let (_, session_model) =
         resolve_selection(&ctx.db, &ctx.session_id, &ctx.config, &ctx.model_catalog)
             .await
@@ -315,7 +345,15 @@ pub(crate) async fn compact(
             response: None,
         }),
     };
-    publish_outcome(ctx, reason, input_id, model, run, String::new()).await
+    let outcome = publish_outcome(ctx, reason, input_id, model, run, String::new()).await;
+    if outcome.is_err() {
+        // The running row is settled by `publish_outcome` before this point,
+        // so a recovery fold can land a quiet checkpoint without racing the
+        // failed lifecycle. The low usage that blocked the blocking path is
+        // exactly why the recovery fold must bypass the usage gate.
+        spawn_recovery_fold(ctx);
+    }
+    outcome
 }
 
 /// The read side of one compaction (upstream `summarize`): load the
@@ -327,7 +365,13 @@ pub(crate) async fn summarize(
     ctx: &DrainCtx,
     model: &ModelRef,
 ) -> std::result::Result<String, SessionError> {
-    let rows = super::step::load_history(&ctx.db, &ctx.session_id)
+    // Preview the same head and floor the live step would render, but on the
+    // compaction model and without committing any mctx cache/drop decision.
+    // The head stands in for everything at or below its floor, so only the
+    // tail above it is loaded — never the whole transcript.
+    let budget = ctx.budget_for(model, COMPACTION_SYSTEM.len());
+    let head = super::step::mctx_head_preview(ctx, budget, model).await;
+    let rows = super::step::load_history_after(&ctx.db, &ctx.session_id, head.floor)
         .await
         .map_err(|error| SessionError {
             kind: "unknown".to_owned(),
@@ -335,7 +379,15 @@ pub(crate) async fn summarize(
             status: None,
             response: None,
         })?;
-    summarize_transcript(ctx, model, &rows, true).await
+    summarize_transcript(
+        ctx,
+        model,
+        head.m0.as_deref(),
+        head.m1.as_deref(),
+        &rows,
+        true,
+    )
+    .await
 }
 
 /// The hidden-completion core every summarization shares (upstream
@@ -381,6 +433,14 @@ async fn summarized_reply(
 /// Stream `request` until it fits: on `compaction.overflow` give up the next
 /// rung of `ladder` and retry; any other error, or a ladder with nothing
 /// left, is returned as is.
+fn recoverable_admission(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<super::request_budget::NeedsCompaction>()
+        .is_some_and(|super::request_budget::NeedsCompaction(reason)| {
+            matches!(*reason, "input limit exceeded" | "no positive output room")
+        })
+}
+
 async fn stream_until_fits(
     ctx: &DrainCtx,
     request: &mut ChatRequest,
@@ -400,7 +460,21 @@ async fn stream_until_fits(
                 status: None,
                 response: None,
             })?;
-        apply_compaction_budget(ctx, request, provider, ladder)?;
+        if let Err(error) = apply_compaction_budget(ctx, request, provider, ladder) {
+            // A local guard rejection is a recoverable rung, not a dead end:
+            // elide tool outputs once, then re-admit the smaller request. The
+            // guard itself (1.15 / 99% room) is unchanged; neither the output
+            // cap nor the retry count is relaxed.
+            if recoverable_admission(&error) && !ladder.elided && ladder.elide(request) {
+                continue;
+            }
+            return Err(SessionError {
+                kind: "compaction.admission".to_owned(),
+                message: format!("compaction request was not admitted: {error:#}"),
+                status: None,
+                response: None,
+            });
+        }
         match stream_summary(ctx, request, provider, emit_deltas).await {
             Ok(summary) => return Ok(summary),
             Err(error) if error.kind == "compaction.overflow" && ladder.descend(request) => {}
@@ -482,10 +556,12 @@ impl OverflowLadder {
 async fn summarize_transcript(
     ctx: &DrainCtx,
     model: &ModelRef,
+    m0: Option<&str>,
+    m1: Option<&str>,
     rows: &[ox_schema::message::Message],
     emit_deltas: bool,
 ) -> std::result::Result<String, SessionError> {
-    let mut messages = super::step::build_chat_messages("", "", &[], rows);
+    let mut messages = super::step::build_chat_messages(COMPACTION_SYSTEM, "", &[m0, m1], rows);
     fold_input::tighten_tool_outputs(&mut messages);
     let request = summarization_request(model, &messages);
     summarized_reply(ctx, request, &model.provider_id, emit_deltas).await
@@ -544,12 +620,12 @@ async fn summarize_hierarchical(
     let chunks = chunk_rows(rows, count_tokens);
     if chunks.len() <= 1 {
         let messages = decode(chunks.first().copied().unwrap_or(&[]))?;
-        return summarize_transcript(ctx, model, &messages, false).await;
+        return summarize_transcript(ctx, model, None, None, &messages, false).await;
     }
     let mut segments: Vec<(i64, i64, String)> = Vec::with_capacity(chunks.len());
     for chunk in &chunks {
         let messages = decode(chunk)?;
-        let summary = summarize_transcript(ctx, model, &messages, false).await?;
+        let summary = summarize_transcript(ctx, model, None, None, &messages, false).await?;
         let start = chunk.first().map_or(0, |(seq, _)| *seq);
         let end = chunk.last().map_or(0, |(seq, _)| *seq);
         segments.push((start, end, summary));
@@ -666,11 +742,22 @@ const RECENT_KEEP_TOKENS: i64 = 15_000;
 /// verbatim cap inside the recent part.
 const RECENT_TOOL_OUTPUT_MAX_CHARS: usize = 1_250;
 
+/// Why a background fold was triggered. Recovery follows a failed blocking
+/// compaction: unlike pressure, it must land a checkpoint even when the usage
+/// gate reads low and no compaction row is running (the failed row is already
+/// settled by the time recovery spawns).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FoldTrigger {
+    Pressure,
+    Recovery,
+}
+
 /// Whether the busy period's end should fold the tail, as a pure decision
 /// over the gates (plan D1/D3/D6). Gate order is the contract: a running
 /// row wins first (someone else is compacting — D3), then mctx coverage
 /// (the historian already folded everything past the checkpoint — D6),
-/// then the usage threshold (D1).
+/// then the usage threshold (D1). Recovery skips the running and usage
+/// gates but keeps coverage, so it never re-summarizes folded history.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum FoldDecision {
     Fold,
@@ -679,14 +766,15 @@ pub(crate) enum FoldDecision {
     SkipUnderThreshold,
 }
 
-pub(crate) fn fold_decision(
+fn fold_decision(
+    trigger: FoldTrigger,
     mctx_enabled: bool,
     floor: i64,
     latest: i64,
     running: bool,
     usage_pct: Option<f64>,
 ) -> FoldDecision {
-    if running {
+    if trigger == FoldTrigger::Pressure && running {
         return FoldDecision::SkipInFlight;
     }
     // The floor is the transcript ordinal the mctx head stands in for; when
@@ -698,7 +786,9 @@ pub(crate) fn fold_decision(
     }
     // `usage_pct` is a percentage of the window (0-100, `usage_percentage`);
     // the threshold is a share (0.60), so the comparison scales it by 100.
-    if usage_pct.is_none_or(|pct| pct < FOLD_USAGE_THRESHOLD * 100.0) {
+    if trigger == FoldTrigger::Pressure
+        && usage_pct.is_none_or(|pct| pct < FOLD_USAGE_THRESHOLD * 100.0)
+    {
         return FoldDecision::SkipUnderThreshold;
     }
     FoldDecision::Fold
@@ -760,8 +850,19 @@ async fn last_checkpoint_seq(db: &Db, session_id: &str) -> Result<i64> {
 
 /// One tail row as the recent, verbatim part of a checkpoint shows it
 /// (upstream `messageToText`, recent-text.ts, over ox's row vocabulary).
-/// Empty for rows the checkpoint part leaves out.
+/// Empty for rows the checkpoint part leaves out. Tool results here are
+/// capped by the recent-text rule; the segment counter substitutes the
+/// summary request's own bound so it counts what the wire actually sends.
 fn recent_row_text(row: &serde_json::Value) -> String {
+    recent_row_text_with(row, |output| {
+        truncate_chars(output, RECENT_TOOL_OUTPUT_MAX_CHARS)
+    })
+}
+
+fn recent_row_text_with(
+    row: &serde_json::Value,
+    bound_tool_output: impl Fn(&str) -> String,
+) -> String {
     let kind = row.get("type").and_then(serde_json::Value::as_str);
     match kind {
         Some("user") => {
@@ -809,10 +910,8 @@ fn recent_row_text(row: &serde_json::Value) -> String {
                                         .unwrap_or(&serde_json::Value::Null),
                                 )
                                 .unwrap_or_default();
-                                parts.push(format!(
-                                    "[Tool result]: {}",
-                                    truncate_chars(&output, RECENT_TOOL_OUTPUT_MAX_CHARS)
-                                ));
+                                parts
+                                    .push(format!("[Tool result]: {}", bound_tool_output(&output)));
                             }
                             Some("error") => {
                                 let message = part
@@ -863,34 +962,20 @@ fn truncate_chars(value: &str, max: usize) -> String {
 /// render oldest-first; the budget is spent newest-first, dropping whole
 /// rows from the oldest end (upstream `oldestToDrop`). The budget is
 /// counted with the injected token counter — one over per row's trailing
-/// newline.
-///
-/// Two tiers (codex's evidence ordering, human first): once a row no longer
-/// fits, the walk goes on over the older rows admitting only the user's own
-/// turns. What the user said is the cheapest text in the tail and the one a
-/// summary paraphrases least faithfully, so it is kept verbatim as far back
-/// as the budget reaches; the assistant's and the tools' text stops at the
-/// first row that overflowed. Rows come out in transcript order.
+/// newline. Callers only take this path when [`tail_fits_recent`] has already
+/// verified that every row fits, so the walk has no partial/user-only tier.
 fn recent_text(tail: &[(i64, serde_json::Value)], count_tokens: &dyn Fn(&str) -> usize) -> String {
     let budget_tokens = RECENT_KEEP_TOKENS as usize;
     let mut kept: Vec<(i64, String)> = Vec::new();
     let mut spent = 0usize;
-    let mut users_only = false;
     for (seq, row) in tail.iter().rev() {
-        if users_only && !is_user_row(row) {
-            continue;
-        }
         let text = recent_row_text(row);
         if text.is_empty() {
             continue;
         }
         let cost = count_tokens(&text) + 1;
         if spent + cost > budget_tokens {
-            if users_only {
-                break;
-            }
-            users_only = true;
-            continue;
+            break;
         }
         spent += cost;
         kept.push((*seq, text));
@@ -900,11 +985,6 @@ fn recent_text(tail: &[(i64, serde_json::Value)], count_tokens: &dyn Fn(&str) ->
         .map(|(_, text)| text)
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// Whether a stored row is an authored user turn.
-fn is_user_row(row: &serde_json::Value) -> bool {
-    row.get("type").and_then(serde_json::Value::as_str) == Some("user")
 }
 
 /// Whether the recent budget carries the whole tail row-by-row (plan D6):
@@ -961,7 +1041,8 @@ fn head_recent(
 const SEGMENT_TOKENS: usize = 24_000;
 
 /// One fold row's contribution to a segment's cost: [`recent_row_text`] for
-/// the rows that render into `recent`, the checkpoint message for a compaction
+/// the rows that render into `recent` (with the same head/tail bound the
+/// summarization request applies), the checkpoint message for a compaction
 /// row. The compaction arm matters because the fold is incremental — the
 /// previous checkpoint is its first input row — and a checkpoint that cost
 /// nothing would ride a segment for free, letting one completion see far more
@@ -976,7 +1057,11 @@ fn fold_row_text(row: &serde_json::Value) -> String {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default(),
         ),
-        _ => recent_row_text(row),
+        // Segment accounting must not undercount the tool bytes the summary
+        // request actually sends: fold_input's bound is the wire's bound.
+        _ => recent_row_text_with(row, |output| {
+            fold_input::bound_for_summary(output).into_owned()
+        }),
     }
 }
 
@@ -1044,15 +1129,28 @@ enum CheckpointPlan {
 
 /// Spawn the background fold (plan D1/D2/D11): a detached, silent fold of
 /// the session tail — no wire events; the checkpoint lands as a quiet `idle`
-/// row. Triggers funnel into this one entry wherever the gate passes (the
-/// step boundary's refresh in step.rs, and the actor's `Complete` at a busy
-/// period's end), so nothing here may assume a turn just ended.
+/// row. Pressure triggers funnel into this wrapper wherever the gate passes
+/// (the step boundary's refresh in step.rs, and the actor's `Complete` at a
+/// busy period's end); a failed compaction uses [`spawn_recovery_fold`].
+/// Nothing here may assume a turn just ended.
 /// Detached on purpose — a fold is a full hidden completion, and the caller
 /// is not the one that must wait for it; the next turn's transcript simply
 /// starts at whatever checkpoint the fold published. Every failure logs and
 /// is swallowed: the overflow path stays as the blocking backstop, so a dead
 /// fold must never take a turn with it.
 pub(crate) fn spawn_background_fold(ctx: &DrainCtx) {
+    spawn_background_fold_for(ctx, FoldTrigger::Pressure);
+}
+
+/// Land a quiet checkpoint after a failed blocking compaction. The fold is
+/// detached and single-flight for the same reason as the pressure path; the
+/// caller's failed row is already settled, so the fold's version guard sees
+/// the post-failure watermark.
+fn spawn_recovery_fold(ctx: &DrainCtx) {
+    spawn_background_fold_for(ctx, FoldTrigger::Recovery);
+}
+
+fn spawn_background_fold_for(ctx: &DrainCtx, trigger: FoldTrigger) {
     // Single flight (plan D3): the flag closes the window between two folds
     // where neither's running row exists yet. Acquire-and-skip, never wait —
     // the next busy period's end re-runs the gate anyway.
@@ -1076,7 +1174,7 @@ pub(crate) fn spawn_background_fold(ctx: &DrainCtx) {
         // Cleared on every exit path — including a panic unwind, so a dead
         // fold can never wedge the gate shut.
         let _guard = FlagGuard(&ctx.fold_in_flight);
-        match run_background_fold(&ctx).await {
+        match run_background_fold(&ctx, trigger).await {
             Ok(Some(stats)) => tracing::info!(
                 session = %ctx.session_id,
                 source = ?stats.source,
@@ -1111,7 +1209,7 @@ impl Drop for FlagGuard<'_> {
 /// checkpoint lands through [`settle_quiet_outcome`] as a quiet `idle` row.
 /// A crash mid-fold loses only the fold itself — the next trigger re-runs
 /// the gate (plan D8).
-async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
+async fn run_background_fold(ctx: &DrainCtx, trigger: FoldTrigger) -> Result<Option<FoldStats>> {
     let started_at = std::time::Instant::now();
     let version = history_version(&ctx.db, &ctx.session_id).await?;
     let (_, session_model) =
@@ -1135,18 +1233,31 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
 
     let latest = latest_seq(&ctx.db, &ctx.session_id).await?;
     let checkpoint = last_checkpoint_seq(&ctx.db, &ctx.session_id).await?;
-    let running = has_running_compaction(&ctx.db, &ctx.session_id).await?;
+    let running = trigger == FoldTrigger::Pressure
+        && has_running_compaction(&ctx.db, &ctx.session_id).await?;
     // D1: the usage criterion reads the provider's own numbers — the newest
     // assistant turn past the checkpoint, measured exactly like the
     // historian trigger measures it. Both mctx modes need it, so the budget
-    // is derived unconditionally; the floor stays mctx-only.
+    // is derived unconditionally; the floor stays mctx-only. Recovery skips
+    // this read: a failed compaction is precisely the case where usage came
+    // in too low to trigger on its own.
     let system_static = ctx.system_static();
     let budget = ctx.budget_for(&session_model, system_static.len());
-    let usage_pct = {
+    let usage_pct = if trigger == FoldTrigger::Pressure {
         let tail = super::step::rows_after_with_seq(&ctx.db, &ctx.session_id, checkpoint).await?;
         let usage = tail.iter().rev().find_map(|(_, row)| prompt_tokens(row));
         usage.and_then(|tokens| budget.usage_percentage(tokens))
+    } else {
+        None
     };
+    // Cheap gate first: SkipInFlight and SkipUnderThreshold need no floor,
+    // so neither may pay for a full mctx pass. Coverage is unknown until the
+    // head exists, so that criterion is disabled here and re-checked below.
+    let cheap_decision = fold_decision(trigger, false, 0, latest, running, usage_pct);
+    if cheap_decision != FoldDecision::Fold {
+        tracing::debug!(session = %ctx.session_id, ?cheap_decision, "background fold skipped before mctx pass");
+        return Ok(None);
+    }
     // D6: the gate's pass is the fold's only pass — the head and floor are
     // both the coverage reading for the decision and the fast-path summary
     // candidate. It is never called a second time without a patch in between.
@@ -1160,6 +1271,7 @@ async fn run_background_fold(ctx: &DrainCtx) -> Result<Option<FoldStats>> {
         (None, 0)
     };
     let decision = fold_decision(
+        trigger,
         ctx.config.magic_context.enabled,
         head_floor,
         latest,

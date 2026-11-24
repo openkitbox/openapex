@@ -74,6 +74,15 @@ fn mctx_diagnostic(m0: Option<&str>, m1: Option<&str>, outcome: &'static str) ->
     }
 }
 
+/// How the head pass meets the step: a normal step commits it, while a consumer
+/// that needs the same head and floor later in the same turn only previews it so
+/// the cache, floor and drop lifecycle are not advanced twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Execution {
+    Commit,
+    Preview,
+}
+
 /// The magic-context head for one step: the frozen `m[0]`/`m[1]` halves plus
 /// the transcript floor they cover, or `(None, None, 0)` when the integration
 /// is off or the pass failed (the prompt then stays byte-identical to the
@@ -82,6 +91,25 @@ pub(crate) async fn mctx_head(
     ctx: &DrainCtx,
     budget: crate::mctx::budget::Budget,
     model: &ox_schema::support::ModelRef,
+) -> MctxHead {
+    mctx_head_with(ctx, budget, model, Execution::Commit).await
+}
+
+/// The same head and floor as [`mctx_head`], but computed with a preview pass:
+/// no cache write, no floor advance, no queued drop consumed.
+pub(crate) async fn mctx_head_preview(
+    ctx: &DrainCtx,
+    budget: crate::mctx::budget::Budget,
+    model: &ox_schema::support::ModelRef,
+) -> MctxHead {
+    mctx_head_with(ctx, budget, model, Execution::Preview).await
+}
+
+async fn mctx_head_with(
+    ctx: &DrainCtx,
+    budget: crate::mctx::budget::Budget,
+    model: &ox_schema::support::ModelRef,
+    execution: Execution,
 ) -> MctxHead {
     if !ctx.config.magic_context.enabled {
         return MctxHead {
@@ -123,7 +151,13 @@ pub(crate) async fn mctx_head(
         provider_id: &model.provider_id,
         model_id: &model.id,
     };
-    match crate::mctx::pass::run(request).await {
+    let result = match execution {
+        Execution::Commit => crate::mctx::pass::run(request).await,
+        Execution::Preview => crate::mctx::pass::preview(request)
+            .await
+            .map(|(result, _applied)| result),
+    };
+    match result {
         Ok(result) => {
             let diagnostic = mctx_diagnostic(
                 result.head_m0.as_deref(),

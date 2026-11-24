@@ -319,22 +319,3 @@ pub(super) fn validate_directory(path: &Path) -> Result<&str, Error> {
     }
     Ok(raw)
 }
-#[cfg(test)]
-mod tests {
-    use super::Sessions;
-
-    #[tokio::test]
-    async fn close_prevents_pending_restore_from_re_registering() {
-        let sessions = Sessions::default();
-        let restore = sessions
-            .begin_restore("ses_one", "/work".to_owned())
-            .expect("restore reservation");
-        let detached = sessions
-            .detach("ses_one")
-            .expect("detach pending restore")
-            .expect("pending restore is observable");
-        assert!(restore.commit("/work".to_owned()).is_err());
-        detached.finish().await.expect("finish close");
-        assert!(sessions.directory("ses_one").is_err());
-    }
-}

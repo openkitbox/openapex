@@ -218,7 +218,8 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
         apply_final_step(&mut request);
         layers.final_step = MAX_STEPS_PROMPT.len();
     }
-    super::super::request_budget::apply(ctx, &mut request, &params.model.provider_id, layers)?;
+    let _bill =
+        super::super::request_budget::apply(ctx, &mut request, &params.model.provider_id, layers)?;
     Ok(request)
 }
 

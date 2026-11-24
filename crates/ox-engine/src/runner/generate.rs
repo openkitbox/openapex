@@ -111,7 +111,7 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
     let mut request = ChatRequest::new(model.id.clone(), messages);
     request.tools = ctx.tools.definitions_shared();
     request.apply_reasoning_effort(model.variant.as_deref());
-    super::request_budget::apply(&ctx, &mut request, &model.provider_id, layers)?;
+    let _bill = super::request_budget::apply(&ctx, &mut request, &model.provider_id, layers)?;
     let completion = crate::completion::collect_with_deltas(
         &ctx.chat,
         &request,

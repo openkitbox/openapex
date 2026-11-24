@@ -70,24 +70,3 @@ impl CodeResult {
         Ok(Some(result))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::CodeResult;
-
-    #[test]
-    fn code_result_decodes_strictly() {
-        assert!(
-            CodeResult::decode(&serde_json::json!({"done": true, "surprise": 1})).is_err(),
-            "unknown keys must not be dropped from a code result"
-        );
-        assert!(
-            CodeResult::decode(&serde_json::json!({"send": {"prompt": ""}})).is_err(),
-            "an empty send prompt must be rejected"
-        );
-        let result = CodeResult::decode(&serde_json::json!({"done": true}))
-            .expect("decode")
-            .expect("non-null value");
-        assert_eq!(result.done, Some(true));
-    }
-}

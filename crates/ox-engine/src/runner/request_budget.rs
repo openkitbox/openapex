@@ -134,12 +134,14 @@ pub(crate) fn output(
     Ok(selected)
 }
 
+/// Applies the budget to `request`, returning the measurement behind the
+/// decision so callers that need the bill do not serialize the request twice.
 pub(crate) fn apply(
     ctx: &super::drain::DrainCtx,
     request: &mut ChatRequest,
     provider: &str,
     layers: Layers,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<RequestBill> {
     let limits = ctx
         .model_catalog
         .runtime_limits_for(Some(provider), &request.model)?;
@@ -166,5 +168,5 @@ pub(crate) fn apply(
         guarded_input = bill.guarded_input, unsupported_media = bill.unsupported_media,
         selected_output = ?selected, "request geometry estimate (not reported usage)");
     request.max_tokens = selected?;
-    Ok(())
+    Ok(bill)
 }

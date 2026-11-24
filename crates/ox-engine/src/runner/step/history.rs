@@ -2,11 +2,6 @@ use anyhow::{Context as _, Result};
 use serde_json::Value;
 
 use ox_schema::message::Message;
-/// The session transcript in `seq` order, decoded from `session_message`.
-pub(crate) async fn load_history(db: &ox_db::Db, session_id: &str) -> Result<Vec<Message>> {
-    load_history_after(db, session_id, i64::MIN).await
-}
-
 /// The text of the newest assistant row, if the transcript has one. Used by the
 /// todo reminder to tell a stop from a hand-off to the user. Reads the tail
 /// only: the reminder runs once per turn end, and a full transcript scan there

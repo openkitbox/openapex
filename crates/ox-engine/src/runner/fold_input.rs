@@ -67,8 +67,10 @@ pub(crate) fn elide_tool_outputs(messages: &mut [ChatMessage]) -> usize {
     elided
 }
 
-/// The head + marker + tail view of one result for a summary request.
-fn bound_for_summary(content: &str) -> Cow<'_, str> {
+/// The head + marker + tail view of one result for a summary request. Also
+/// the single bound the fold's segment accounting uses, so a segment's
+/// counted size cannot be smaller than the request actually sent.
+pub(crate) fn bound_for_summary(content: &str) -> Cow<'_, str> {
     text::bound_head_tail(
         content,
         SUMMARY_TOOL_OUTPUT_CAP_BYTES,

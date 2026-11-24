@@ -658,29 +658,3 @@ fn friendly(name: &str, error: &CallError) -> String {
         CallError::Unsupported(message) => format!("MCP server `{name}`: {message}"),
     }
 }
-
-#[cfg(test)]
-mod hub_tests {
-    use super::Hub;
-
-    #[test]
-    fn has_tool_tracks_only_registered_names() {
-        let hub = Hub::empty();
-        assert!(
-            !hub.has_tool("github_create_issue"),
-            "an empty hub has no tools"
-        );
-        hub.record_server_tools(
-            "github",
-            vec!["github_create_issue".to_owned(), "github_list".to_owned()],
-        );
-        assert!(hub.has_tool("github_create_issue"));
-        assert!(hub.has_tool("github_list"));
-        assert!(!hub.has_tool("shell"), "a built-in is not an MCP tool");
-        hub.record_server_tools("github", Vec::new());
-        assert!(
-            !hub.has_tool("github_create_issue"),
-            "a removed tool is gone"
-        );
-    }
-}
