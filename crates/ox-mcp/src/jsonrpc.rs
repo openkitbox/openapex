@@ -38,6 +38,8 @@ pub(crate) struct Incoming {
     #[serde(default)]
     pub method: Option<String>,
     #[serde(default)]
+    pub params: Option<Value>,
+    #[serde(default)]
     pub result: Option<Value>,
     #[serde(default)]
     pub error: Option<RpcError>,

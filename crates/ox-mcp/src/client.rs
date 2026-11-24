@@ -10,6 +10,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
+use super::events::{client_capabilities, supports_events};
 use super::transport::{CallError, ProtocolMode, RequestMetadata, Rpc};
 use ox_core::config::McpProtocol;
 
@@ -53,17 +54,21 @@ pub(crate) struct Client {
     pub tools: Vec<ToolInfo>,
     pub resources: Vec<ResourceEntry>,
     pub templates: Vec<TemplateEntry>,
+    /// Whether the modern server advertised the MCP Events extension.
+    pub events: bool,
 }
 
 impl Client {
-    /// `initialize` → `notifications/initialized` → discovery. Every request
-    /// uses `catalog` as its timeout; the caller bounds the whole startup
-    /// separately.
-    pub(crate) async fn connect(
+    /// `initialize` → `notifications/initialized` → discovery. The events flag
+    /// only advertises it: events are enabled when the server is modern and
+    /// advertises the same extension in return. Every request uses `catalog`
+    /// as its timeout; the caller bounds the whole startup separately.
+    pub(crate) async fn connect_events(
         rpc: Arc<dyn Rpc>,
         catalog: Duration,
         cancel: &CancellationToken,
         protocol: McpProtocol,
+        events_enabled: bool,
     ) -> Result<Self, CallError> {
         if matches!(protocol, McpProtocol::Modern | McpProtocol::Auto) {
             rpc.set_protocol(ProtocolMode::Modern);
@@ -74,18 +79,23 @@ impl Client {
                 legacy_initialize(Arc::clone(&rpc), catalog, cancel).await?
             }
             McpProtocol::Modern => {
-                rpc.set_protocol(ProtocolMode::Modern);
-                modern_discover(Arc::clone(&rpc), catalog, cancel).await?
+                modern_discover(Arc::clone(&rpc), catalog, cancel, events_enabled).await?
             }
-            McpProtocol::Auto => match modern_discover(Arc::clone(&rpc), catalog, cancel).await {
-                Ok(metadata) => metadata,
-                Err(error) if is_modern_unsupported(&error) => {
-                    rpc.set_protocol(ProtocolMode::Legacy);
-                    legacy_initialize(Arc::clone(&rpc), catalog, cancel).await?
+            McpProtocol::Auto => {
+                match modern_discover(Arc::clone(&rpc), catalog, cancel, events_enabled).await {
+                    Ok(metadata) => metadata,
+                    Err(error) if is_modern_unsupported(&error) => {
+                        rpc.set_protocol(ProtocolMode::Legacy);
+                        legacy_initialize(Arc::clone(&rpc), catalog, cancel).await?
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
-            },
+            }
         };
+
+        let events = events_enabled
+            && metadata.protocol == "modern"
+            && supports_events(&metadata.capabilities);
 
         if metadata.protocol == "legacy" {
             rpc.notify("notifications/initialized", None).await?;
@@ -112,6 +122,7 @@ impl Client {
             tools,
             resources,
             templates,
+            events,
         })
     }
 }
@@ -180,6 +191,7 @@ async fn modern_discover(
     rpc: Arc<dyn Rpc>,
     catalog: Duration,
     cancel: &CancellationToken,
+    events_enabled: bool,
 ) -> Result<Metadata, CallError> {
     let discovery = rpc
         .request(
@@ -191,7 +203,7 @@ async fn modern_discover(
                         "name": "ox",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
-                    "clientCapabilities": {},
+                    "clientCapabilities": client_capabilities(events_enabled),
                 },
             })),
             Some(catalog),

@@ -562,6 +562,45 @@ CREATE INDEX IF NOT EXISTS job_session_idx ON job (session_id, started);
 CREATE INDEX IF NOT EXISTS job_status_idx ON job (status, started);
 "#;
 
+/// V24: unattended automations and their cross-process scheduler lease.
+/// Columns mirror upstream `AutomationTable`; the lease is ox's SQLite
+/// compare-and-swap replacement for the upstream leader doorbell.
+const MIGRATION_V24: &str = r#"
+CREATE TABLE IF NOT EXISTS automation (
+  id text PRIMARY KEY,
+  project_id text NOT NULL,
+  session_id text,
+  directory text NOT NULL,
+  name text NOT NULL,
+  trigger text NOT NULL,
+  tz text NOT NULL,
+  action text NOT NULL,
+  status text NOT NULL DEFAULT 'active',
+  next_due_at integer,
+  expires_at integer,
+  run_count integer NOT NULL DEFAULT 0,
+  failures integer NOT NULL DEFAULT 0,
+  last_run_at integer,
+  last_message_id text,
+  last_outcome text,
+  last_output text,
+  retry_at integer,
+  state text,
+  event_position text,
+  time_created integer NOT NULL,
+  time_updated integer NOT NULL
+);
+CREATE INDEX IF NOT EXISTS automation_project_idx ON automation (project_id);
+CREATE INDEX IF NOT EXISTS automation_session_idx ON automation (session_id);
+CREATE INDEX IF NOT EXISTS automation_active_idx ON automation (next_due_at) WHERE status = 'active';
+CREATE TABLE IF NOT EXISTS automation_lease (
+  name text PRIMARY KEY,
+  owner text NOT NULL,
+  token text NOT NULL,
+  expires_at integer NOT NULL
+);
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
@@ -589,6 +628,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (21, MIGRATION_V21),
     (22, MIGRATION_V22),
     (23, MIGRATION_V23),
+    (24, MIGRATION_V24),
 ];
 
 /// Async handle to the database.
@@ -1047,5 +1087,64 @@ pub async fn optional(
         Ok(row) => Ok(Some(row)),
         Err(turso::Error::QueryReturnedNoRows) => Ok(None),
         Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod automation_migration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn automation_migration_creates_tables_on_empty_db() -> anyhow::Result<()> {
+        let db = Db::open_in_memory().await?;
+        assert_eq!(db.user_version().await?, 24);
+        assert!(db.table_exists("automation").await?);
+        assert!(db.table_exists("automation_lease").await?);
+
+        let tx = db.begin().await?;
+        tx.execute(
+            "INSERT INTO automation (id, project_id, directory, name, trigger, tz, action, time_created, time_updated)
+             VALUES ('aut_1', 'proj_1', '/work', 'nightly', '{}', 'UTC', '{}', 1, 1)",
+            (),
+        )
+        .await?;
+        tx.execute(
+            "INSERT INTO automation_lease (name, owner, token, expires_at)
+             VALUES ('scheduler', 'host_a', 'token_a', 10)",
+            (),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn automation_migration_upgrades_database_with_data() -> anyhow::Result<()> {
+        let db = Db::open_in_memory().await?;
+        let tx = db.begin().await?;
+        // Rewind a freshly migrated database to the previous level and remove
+        // V24's tables: reopening `migrate` must rebuild them without touching
+        // rows written by earlier migrations.
+        tx.pragma_update("user_version", 23).await?;
+        tx.execute("DROP TABLE automation", ()).await?;
+        tx.execute("DROP TABLE automation_lease", ()).await?;
+        tx.execute(
+            "INSERT INTO kv (key, value, time_created, time_updated) VALUES ('legacy', 'kept', 1, 1)",
+            (),
+        )
+        .await?;
+        tx.commit().await?;
+
+        db.migrate().await?;
+        assert_eq!(db.user_version().await?, 24);
+        assert!(db.table_exists("automation").await?);
+        assert!(db.table_exists("automation_lease").await?);
+
+        let conn = db.acquire().await?;
+        let mut stmt = conn
+            .prepare("SELECT value FROM kv WHERE key = 'legacy'")
+            .await?;
+        assert_eq!(stmt.query_row(()).await?.get::<String>(0)?, "kept");
+        Ok(())
     }
 }

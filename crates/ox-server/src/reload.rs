@@ -91,6 +91,9 @@ pub(crate) async fn run(state: &AppState, directory: &str) -> Result<()> {
         .await?;
 
     announce(state, directory, &was, &after);
+    if let Err(error) = crate::api::mcp_events::restart(state).await {
+        tracing::warn!(%error, "MCP event subscription rebuild failed");
+    }
     Ok(())
 }
 

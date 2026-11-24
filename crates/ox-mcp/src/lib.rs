@@ -8,6 +8,7 @@
 //! not supported).
 
 pub(crate) mod client;
+mod events;
 pub(crate) mod http;
 pub(crate) mod jsonrpc;
 pub(crate) mod stdio;
@@ -18,6 +19,7 @@ mod transports;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -31,6 +33,10 @@ use ox_tools::contract::Tool;
 use client::Client;
 use transport::{CallError, Rpc};
 
+pub use events::{
+    EventMessage, EventStream, EventType, EventsClient, EventsError, PollPage, PollRequest,
+    StreamRequest, SubscribeRequest, Subscription, SubscriptionState, UntrustedData,
+};
 pub use transports::Transports;
 
 /// Server status, serialized exactly as upstream `Mcp.Status` (a tagged
@@ -90,6 +96,11 @@ pub struct Hub {
     /// Names of the tools the owner registered from this hub, per server; see
     /// [`Hub::record_server_tools`].
     tool_names: RwLock<BTreeMap<String, Vec<String>>>,
+    /// One cancellation scope per connected server, used by its event streams.
+    event_tokens: RwLock<BTreeMap<String, CancellationToken>>,
+    /// Mirrors `[mcp.events].enabled` from the last `connect_all`; manual
+    /// `start` calls after a reload inherit the same gate.
+    events_enabled: AtomicBool,
     transports: Arc<Transports>,
 }
 
@@ -104,6 +115,8 @@ pub struct ServerTools {
 struct ConnectionMetadata {
     title: Option<String>,
     instructions: Option<String>,
+    events: bool,
+    catalog: Duration,
 }
 
 /// Appended after the upstream-rendered `<mcp_instructions>` block: upstream
@@ -129,6 +142,8 @@ impl Hub {
             resources: RwLock::new(Vec::new()),
             templates: RwLock::new(Vec::new()),
             tool_names: RwLock::new(BTreeMap::new()),
+            event_tokens: RwLock::new(BTreeMap::new()),
+            events_enabled: AtomicBool::new(false),
             transports,
         }
     }
@@ -154,6 +169,10 @@ impl Hub {
     /// after every hub is shut down, because a dropped hub may have handed it
     /// cleanup that no live hub accounts for.
     pub async fn shutdown(&self) -> Result<(), String> {
+        let tokens = std::mem::take(&mut *sync::write(&self.event_tokens));
+        for (_, token) in tokens {
+            token.cancel();
+        }
         let connections: Vec<Arc<dyn Rpc>> = std::mem::take(&mut *sync::write(&self.connections))
             .into_values()
             .collect();
@@ -184,9 +203,11 @@ impl Hub {
     /// Connect every configured server concurrently and return the tools to
     /// register. Failures become statuses; this function never returns Err.
     pub async fn connect_all(&self, config: &McpConfig, directory: &Path) -> Vec<ServerTools> {
+        self.events_enabled
+            .store(config.events.enabled, Ordering::Relaxed);
         let mut pending = FuturesUnordered::new();
         for (name, server) in &config.servers {
-            pending.push(connect_one(name, server, directory));
+            pending.push(connect_one(name, server, directory, config.events.enabled));
         }
         let mut outcomes = Vec::new();
         while let Some(outcome) = pending.next().await {
@@ -262,6 +283,9 @@ impl Hub {
     pub async fn stop(&self, server: &str) -> Option<Vec<String>> {
         let rpc = sync::write(&self.connections).remove(server);
         let rpc = rpc?;
+        if let Some(token) = sync::write(&self.event_tokens).remove(server) {
+            token.cancel();
+        }
         rpc.shutdown().await;
         sync::write(&self.metadata).remove(server);
         sync::write(&self.resources).retain(|entry| entry.server != server);
@@ -283,7 +307,13 @@ impl Hub {
         config: &McpServerConfig,
         directory: &Path,
     ) -> Option<Vec<Arc<dyn Tool>>> {
-        let outcome = connect_enabled(server, config, directory).await;
+        let outcome = connect_enabled(
+            server,
+            config,
+            directory,
+            self.events_enabled.load(Ordering::Relaxed),
+        )
+        .await;
         let connected = outcome.rpc.is_some();
         let tools = install(self, outcome);
         connected.then_some(tools)
@@ -310,6 +340,31 @@ impl Hub {
             sync::read(&self.resources).clone(),
             sync::read(&self.templates).clone(),
         )
+    }
+
+    /// The events surface of one server, available only when its handshake
+    /// advertised the MCP Events extension. `None` is fail-closed: no caller
+    /// can fall back to sending `events/*` to an unadvertised server.
+    #[must_use]
+    pub fn events(&self, server: &str) -> Option<EventsClient> {
+        let metadata = sync::read(&self.metadata);
+        let connections = sync::read(&self.connections);
+        let tokens = sync::write(&self.event_tokens);
+        let metadata = metadata.get(server)?;
+        if !metadata.events {
+            return None;
+        }
+        let rpc = connections.get(server)?;
+        let token = tokens.get(server)?;
+        if token.is_cancelled() {
+            return None;
+        }
+        Some(EventsClient::new(
+            Arc::clone(rpc),
+            metadata.catalog,
+            token.clone(),
+            true,
+        ))
     }
 
     /// `<mcp_instructions>` for the system prompt; `None` when no server
@@ -360,6 +415,13 @@ fn escape(text: &str) -> String {
 fn install(hub: &Hub, outcome: Connected) -> Vec<Arc<dyn Tool>> {
     let name = outcome.name.clone();
     sync::write(&hub.servers).insert(name.clone(), outcome.status);
+    let mut tokens = sync::write(&hub.event_tokens);
+    if outcome.rpc.is_some() {
+        tokens.insert(name.clone(), CancellationToken::new());
+    } else {
+        tokens.remove(&name);
+    }
+    drop(tokens);
     let mut metadata = sync::write(&hub.metadata);
     match outcome.metadata {
         Some(connection) => metadata.insert(name.clone(), connection),
@@ -412,7 +474,12 @@ impl Connected {
         }
     }
 
-    fn from_client(name: &str, client: Client, execution: Option<Duration>) -> Self {
+    fn from_client(
+        name: &str,
+        client: Client,
+        execution: Option<Duration>,
+        catalog: Duration,
+    ) -> Self {
         let Client {
             rpc,
             title,
@@ -420,11 +487,14 @@ impl Connected {
             tools,
             resources,
             templates,
+            events,
             ..
         } = client;
         let metadata = ConnectionMetadata {
             title,
             instructions,
+            events,
+            catalog,
         };
         let tools = tools
             .into_iter()
@@ -469,15 +539,25 @@ impl Connected {
     }
 }
 
-async fn connect_one(name: &str, server: &McpServerConfig, directory: &Path) -> Connected {
+async fn connect_one(
+    name: &str,
+    server: &McpServerConfig,
+    directory: &Path,
+    events_enabled: bool,
+) -> Connected {
     if server.disabled() {
         return Connected::disabled(name);
     }
-    connect_enabled(name, server, directory).await
+    connect_enabled(name, server, directory, events_enabled).await
 }
 
 /// Spawn or open the transport and handshake, ignoring the `disabled` flag.
-async fn connect_enabled(name: &str, server: &McpServerConfig, directory: &Path) -> Connected {
+async fn connect_enabled(
+    name: &str,
+    server: &McpServerConfig,
+    directory: &Path,
+    events_enabled: bool,
+) -> Connected {
     let timeout = server.timeout();
     match server {
         McpServerConfig::Local(local) => {
@@ -491,7 +571,16 @@ async fn connect_enabled(name: &str, server: &McpServerConfig, directory: &Path)
             });
             let environment = local.environment.clone().unwrap_or_default();
             match stdio::StdioRpc::spawn(&local.command, &environment, cwd.as_deref()) {
-                Ok(rpc) => handshake(name, Arc::new(rpc), timeout, server.protocol()).await,
+                Ok(rpc) => {
+                    handshake(
+                        name,
+                        Arc::new(rpc),
+                        timeout,
+                        server.protocol(),
+                        events_enabled,
+                    )
+                    .await
+                }
                 Err(error) => Connected::failed(
                     name,
                     format!("failed to start MCP server `{name}`: {error}"),
@@ -499,7 +588,16 @@ async fn connect_enabled(name: &str, server: &McpServerConfig, directory: &Path)
             }
         }
         McpServerConfig::Remote(remote) => match http::HttpRpc::new(remote) {
-            Ok(rpc) => handshake(name, Arc::new(rpc), timeout, server.protocol()).await,
+            Ok(rpc) => {
+                handshake(
+                    name,
+                    Arc::new(rpc),
+                    timeout,
+                    server.protocol(),
+                    events_enabled,
+                )
+                .await
+            }
             Err(error) => Connected::failed(name, error),
         },
     }
@@ -510,19 +608,23 @@ async fn handshake(
     rpc: Arc<dyn Rpc>,
     timeout: &McpTimeout,
     protocol: ox_core::config::McpProtocol,
+    events_enabled: bool,
 ) -> Connected {
     let cancel = CancellationToken::new();
     let catalog = Duration::from_millis(timeout.catalog);
     let startup = Duration::from_millis(timeout.startup);
     match tokio::time::timeout(
         startup,
-        Client::connect(Arc::clone(&rpc), catalog, &cancel, protocol),
+        Client::connect_events(Arc::clone(&rpc), catalog, &cancel, protocol, events_enabled),
     )
     .await
     {
-        Ok(Ok(client)) => {
-            Connected::from_client(name, client, timeout.execution.map(Duration::from_millis))
-        }
+        Ok(Ok(client)) => Connected::from_client(
+            name,
+            client,
+            timeout.execution.map(Duration::from_millis),
+            catalog,
+        ),
         Ok(Err(error)) => {
             rpc.shutdown().await;
             Connected::failed(name, friendly(name, &error))

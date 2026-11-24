@@ -1,0 +1,19 @@
+[package]
+name = "ox-codemode"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+oxc_allocator.workspace = true
+oxc_ast.workspace = true
+oxc_ast_visit.workspace = true
+oxc_parser.workspace = true
+oxc_semantic.workspace = true
+rquickjs.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -114,6 +114,17 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "webfetch",
 ];
 
+/// The complete toolset an automation-run child session may use. `Tools::Only`
+/// is an allow-list, not an addition: T8 wiring uses this to derive the
+/// unattended tool registry, so a script cannot reach the whole built-in set.
+pub const AUTOMATION_TOOLS: Tools = Tools::Only(&[
+    "automation.create",
+    "automation.list",
+    "automation.pause",
+    "automation.resume",
+    "automation.delete",
+]);
+
 /// The toolset of the `review` agent (`subagent` with `agent: "review"`).
 ///
 /// Rule: the read paths ([`READ_ONLY_TOOLS`] without the three `ctx_*` writers)

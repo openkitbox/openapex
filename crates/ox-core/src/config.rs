@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 
 pub use ox_llm::config::{
@@ -31,9 +31,101 @@ fn default_db_path() -> PathBuf {
 /// only used for display and as the tool-name prefix, never as a filesystem
 /// path.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct McpConfig {
     #[serde(default)]
     pub servers: BTreeMap<String, McpServerConfig>,
+    /// MCP event subscriptions (`[mcp.events]`). Off by default: an ox with no
+    /// event consumers behaves exactly as before.
+    #[serde(default)]
+    pub events: McpEventsConfig,
+}
+
+/// Delivery settings for MCP `events/*` subscriptions. `poll_interval` is in
+/// milliseconds; it bounds how often a polling client re-reads the event log.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpEventsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_mcp_poll_interval")]
+    pub poll_interval: u64,
+    #[serde(default)]
+    pub webhook: McpWebhookConfig,
+}
+
+fn default_mcp_poll_interval() -> u64 {
+    5_000
+}
+
+impl Default for McpEventsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval: default_mcp_poll_interval(),
+            webhook: McpWebhookConfig::default(),
+        }
+    }
+}
+
+impl McpEventsConfig {
+    /// Reject a polling interval that would spin on the event log.
+    pub fn validate(&self) -> Result<()> {
+        anyhow::ensure!(
+            self.poll_interval > 0,
+            "[mcp.events] poll_interval must be positive"
+        );
+        Ok(())
+    }
+}
+
+impl McpWebhookConfig {
+    /// The callback URL for one server. Both values are required before any
+    /// `events/subscribe` call is allowed: an unsigned webhook endpoint would
+    /// let any caller inject "MCP events" into the local event bus.
+    pub fn callback_url(&self, server: &str, name: &str) -> Result<String> {
+        ensure!(
+            self.secret
+                .as_deref()
+                .is_some_and(|secret| !secret.is_empty()),
+            "[mcp.events.webhook] secret is required for webhook subscriptions"
+        );
+        let base = self
+            .public_url
+            .as_deref()
+            .filter(|url| !url.is_empty())
+            .context("[mcp.events.webhook] public_url is required for webhook subscriptions")?;
+        let separator = if base.contains('?') { '&' } else { '?' };
+        Ok(format!(
+            "{base}{separator}server={}&name={}",
+            query_escape(server),
+            query_escape(name)
+        ))
+    }
+}
+
+fn query_escape(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            escaped.push(char::from(byte));
+        } else {
+            escaped.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    escaped
+}
+
+/// Public callback configuration for webhook delivery. The secret is required
+/// by the subscription endpoint, not by config parsing: a server without
+/// webhooks does not need one.
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct McpWebhookConfig {
+    #[serde(default)]
+    pub public_url: Option<String>,
+    #[serde(default)]
+    pub secret: Option<String>,
 }
 
 /// One MCP server. The wire shape mirrors upstream `Mcp.ServerConfig`
@@ -509,6 +601,14 @@ pub struct Config {
     /// configuration advertises the same toolset as before.
     #[serde(default)]
     pub mcp: McpConfig,
+    /// Whether automation tools, HTTP endpoints and the scheduler are live.
+    /// Off by default so an existing server gains no unattended execution path
+    /// just by upgrading.
+    #[serde(default)]
+    pub automations: bool,
+    /// Default IANA zone for wall-clock triggers that omit `tz`.
+    #[serde(default)]
+    pub timezone: Option<String>,
     /// Subagent behavior (`[subagent]` section).
     #[serde(default)]
     pub subagent: SubagentConfig,
@@ -551,6 +651,8 @@ impl Default for Config {
             event_heartbeat_ms: default_event_heartbeat_ms(),
             magic_context: MctxConfig::default(),
             mcp: McpConfig::default(),
+            automations: false,
+            timezone: None,
             subagent: SubagentConfig::default(),
             events: EventsConfig::default(),
             sessions: SessionsConfig::default(),
@@ -645,6 +747,13 @@ impl Config {
 
         config.magic_context = config.magic_context.validated();
         config.mcp.validate()?;
+        config.mcp.events.validate()?;
+        if let Some(timezone) = config.timezone.as_deref() {
+            anyhow::ensure!(
+                !timezone.trim().is_empty(),
+                "timezone must not be empty when set"
+            );
+        }
         config.llm.validate()?;
         config.subagent.validate()?;
         config.roles.validate()?;
@@ -1047,4 +1156,80 @@ pub enum EmbeddingProvider {
     /// split into `open-ai-compatible`.
     #[serde(rename = "openai-compatible")]
     OpenAiCompatible,
+}
+
+#[cfg(test)]
+mod automation_config_tests {
+    use super::{Config, McpConfig};
+
+    #[test]
+    fn automation_config_defaults() -> anyhow::Result<()> {
+        let config: Config = toml::from_str("")?;
+        assert!(!config.automations, "automations must default to disabled");
+        assert_eq!(config.timezone, None);
+        assert!(!config.mcp.events.enabled, "MCP events must default to off");
+        assert_eq!(config.mcp.events.poll_interval, 5_000);
+        assert_eq!(config.mcp.events.webhook.public_url, None);
+        assert_eq!(config.mcp.events.webhook.secret, None);
+
+        let parsed: Config = toml::from_str(
+            r#"
+automations = false
+timezone = "Asia/Tokyo"
+
+[mcp.events]
+enabled = true
+poll_interval = 1_000
+
+[mcp.events.webhook]
+public_url = "https://example.test/hook"
+secret = "shh"
+"#,
+        )?;
+        assert!(!parsed.automations);
+        assert_eq!(parsed.timezone.as_deref(), Some("Asia/Tokyo"));
+        assert!(parsed.mcp.events.enabled);
+        assert_eq!(parsed.mcp.events.poll_interval, 1_000);
+        assert_eq!(
+            parsed.mcp.events.webhook.public_url.as_deref(),
+            Some("https://example.test/hook")
+        );
+        assert_eq!(parsed.mcp.events.webhook.secret.as_deref(), Some("shh"));
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_events_reject_unknown_keys() {
+        let parsed = toml::from_str::<McpConfig>("[events]\npollInterval = 1000\n");
+        assert!(
+            parsed.is_err(),
+            "misspelled MCP event keys must not be silently dropped"
+        );
+    }
+
+    #[test]
+    fn webhook_callback_url_fails_closed_without_secret() {
+        use super::McpWebhookConfig;
+
+        let config = McpWebhookConfig {
+            public_url: Some("https://example.test/hook".to_owned()),
+            secret: None,
+        };
+        assert!(
+            config.callback_url("alpha", "build").is_err(),
+            "a webhook subscription without a secret must be refused"
+        );
+
+        let config = McpWebhookConfig {
+            secret: Some("shh".to_owned()),
+            ..config
+        };
+        assert_eq!(
+            config
+                .callback_url("alpha", "build")
+                .expect("callback URL")
+                .as_str(),
+            "https://example.test/hook?server=alpha&name=build"
+        );
+    }
 }

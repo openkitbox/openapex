@@ -15,18 +15,21 @@ use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::jsonrpc::{self, Incoming, Notification, Request};
 use super::sync;
-use super::transport::{CallError, ProtocolMode, RequestMetadata, Rpc, modern_params};
+use super::transport::{
+    CallError, ProtocolMode, RequestMetadata, Rpc, ServerNotification, modern_params,
+};
 
 type Pending = HashMap<u64, oneshot::Sender<Result<Value, CallError>>>;
 
 const WRITER_QUEUE_CAPACITY: usize = 64;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const NOTIFICATION_QUEUE_CAPACITY: usize = 256;
 
 fn writer_channel() -> (mpsc::Sender<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
     mpsc::channel(WRITER_QUEUE_CAPACITY)
@@ -69,6 +72,7 @@ pub(crate) struct StdioRpc {
     /// pipes and the process are gone.
     io: Arc<Mutex<Option<Io>>>,
     closed: Arc<AtomicBool>,
+    notifications: broadcast::Sender<ServerNotification>,
 }
 
 /// Everything one spawned child owns: the process and its pipe tasks.
@@ -124,6 +128,7 @@ impl StdioRpc {
         let (server_writer, server_writer_rx) = writer_channel();
         let pending: Arc<Mutex<Pending>> = Arc::new(Mutex::new(HashMap::new()));
         let closed = Arc::new(AtomicBool::new(false));
+        let (notifications, _) = broadcast::channel(NOTIFICATION_QUEUE_CAPACITY);
 
         let writer_pending = Arc::clone(&pending);
         let writer_closed = Arc::clone(&closed);
@@ -159,6 +164,7 @@ impl StdioRpc {
         let reader_bus = server_writer.clone();
         let reader_pending = Arc::clone(&pending);
         let reader_closed = Arc::clone(&closed);
+        let reader_notifications = notifications.clone();
         let reader = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
             while let Ok(Some(frame)) = read_frame(&mut reader).await {
@@ -178,6 +184,7 @@ impl StdioRpc {
                 let Incoming {
                     id,
                     method,
+                    params,
                     result,
                     error,
                 } = message;
@@ -201,10 +208,11 @@ impl StdioRpc {
                             );
                         }
                     }
-                    // Server notification (list_changed, logging, ...):
-                    // ignored in v1; the catalog is read at startup.
+                    // Server notification: published to event-stream
+                    // listeners; without any, `send` is a cheap no-op.
                     (Some(method), None) => {
                         tracing::trace!(method = %method, "MCP server notification");
+                        let _ = reader_notifications.send(ServerNotification { method, params });
                     }
                     // Response: correlate by numeric id.
                     (None, Some(id)) => {
@@ -245,6 +253,7 @@ impl StdioRpc {
                 stderr: stderr_task,
             }))),
             closed,
+            notifications,
         })
     }
 
@@ -284,8 +293,22 @@ impl Rpc for StdioRpc {
         timeout: Option<std::time::Duration>,
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<Value, CallError>> {
+        self.request_with_id(metadata, params, timeout, cancel, None)
+    }
+
+    fn request_with_id<'a>(
+        &'a self,
+        metadata: RequestMetadata<'a>,
+        params: Option<Value>,
+        timeout: Option<std::time::Duration>,
+        cancel: &'a CancellationToken,
+        observe_id: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+    ) -> BoxFuture<'a, Result<Value, CallError>> {
         Box::pin(async move {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            if let Some(observer) = observe_id {
+                observer(id);
+            }
             let (sender, receiver) = oneshot::channel();
             {
                 let mut pending = sync::lock(&self.pending);
@@ -347,6 +370,10 @@ impl Rpc for StdioRpc {
                 }
             }
         })
+    }
+
+    fn subscribe_notifications(&self) -> broadcast::Receiver<ServerNotification> {
+        self.notifications.subscribe()
     }
 
     fn notify<'a>(

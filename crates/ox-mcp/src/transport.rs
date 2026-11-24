@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use super::jsonrpc;
@@ -33,6 +34,15 @@ impl<'a> RequestMetadata<'a> {
         self.tool_name = Some(name);
         self
     }
+}
+
+/// A server → client notification, published by each transport to every
+/// event-stream listener. Payloads stay raw JSON: only the events layer
+/// interprets them, and its consumers treat all of it as untrusted input.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ServerNotification {
+    pub method: String,
+    pub params: Option<Value>,
 }
 
 pub(crate) fn modern_params(metadata: RequestMetadata<'_>, params: Option<Value>) -> Option<Value> {
@@ -112,11 +122,26 @@ pub(crate) trait Rpc: Send + Sync {
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<Value, CallError>>;
 
+    /// Same as [`Self::request`], but reports the allocated JSON-RPC id before
+    /// sending. SEP-3415 names a stream's notifications by this id.
+    fn request_with_id<'a>(
+        &'a self,
+        metadata: RequestMetadata<'a>,
+        params: Option<Value>,
+        timeout: Option<Duration>,
+        cancel: &'a CancellationToken,
+        observe_id: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+    ) -> BoxFuture<'a, Result<Value, CallError>>;
+
     fn notify<'a>(
         &'a self,
         method: &'a str,
         params: Option<Value>,
     ) -> BoxFuture<'a, Result<(), CallError>>;
+
+    /// A receiver of server notifications. Created per listener; a lagged
+    /// receiver signals that replay from a cursor is required.
+    fn subscribe_notifications(&self) -> broadcast::Receiver<ServerNotification>;
 
     /// Best-effort rejection of every in-flight call and teardown.
     fn shutdown<'a>(&'a self) -> BoxFuture<'a, ()>;

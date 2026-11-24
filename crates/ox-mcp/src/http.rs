@@ -12,17 +12,19 @@ use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use ox_core::config::McpRemoteConfig;
 
 use super::sync;
 use super::transport::modern_params;
-use super::transport::{CallError, ProtocolMode, RequestMetadata, Rpc};
+use super::transport::{CallError, ProtocolMode, RequestMetadata, Rpc, ServerNotification};
 
 /// A response larger than this is refused instead of buffered. MCP tool
 /// results are model input, so an unbounded body is a memory hazard.
 const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
+const NOTIFICATION_QUEUE_CAPACITY: usize = 256;
 
 pub(crate) struct HttpRpc {
     client: reqwest::Client,
@@ -31,6 +33,7 @@ pub(crate) struct HttpRpc {
     state: Mutex<ConnectionState>,
     next_id: AtomicU64,
     closed: AtomicBool,
+    notifications: broadcast::Sender<ServerNotification>,
 }
 
 struct ConnectionState {
@@ -61,6 +64,7 @@ impl HttpRpc {
             }),
             next_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
+            notifications: broadcast::channel(NOTIFICATION_QUEUE_CAPACITY).0,
         })
     }
 
@@ -198,6 +202,7 @@ async fn read_sse(
     id: u64,
     deadline: Option<tokio::time::Instant>,
     cancel: &CancellationToken,
+    notifications: &broadcast::Sender<ServerNotification>,
 ) -> Result<Value, CallError> {
     let mut buffer = String::new();
     loop {
@@ -232,6 +237,16 @@ async fn read_sse(
             let Ok(value) = serde_json::from_str::<Value>(&data) else {
                 continue;
             };
+            if value.get("method").is_some() && value.get("id").is_none() {
+                let Some(method) = value.get("method").and_then(Value::as_str) else {
+                    continue;
+                };
+                let _ = notifications.send(ServerNotification {
+                    method: method.to_owned(),
+                    params: value.get("params").cloned(),
+                });
+                continue;
+            }
             if value.get("id").and_then(Value::as_u64) == Some(id) {
                 return parse_response(value);
             }
@@ -255,11 +270,25 @@ impl Rpc for HttpRpc {
         timeout: Option<Duration>,
         cancel: &'a CancellationToken,
     ) -> BoxFuture<'a, Result<Value, CallError>> {
+        self.request_with_id(metadata, params, timeout, cancel, None)
+    }
+
+    fn request_with_id<'a>(
+        &'a self,
+        metadata: RequestMetadata<'a>,
+        params: Option<Value>,
+        timeout: Option<Duration>,
+        cancel: &'a CancellationToken,
+        observe_id: Option<&'a (dyn Fn(u64) + Send + Sync)>,
+    ) -> BoxFuture<'a, Result<Value, CallError>> {
         Box::pin(async move {
             if self.closed.load(Ordering::SeqCst) {
                 return Err(CallError::Closed);
             }
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            if let Some(observer) = observe_id {
+                observer(id);
+            }
             let protocol = sync::lock(&self.state).protocol;
             let params = match protocol {
                 ProtocolMode::Legacy => params,
@@ -294,7 +323,7 @@ impl Rpc for HttpRpc {
                 .unwrap_or_default()
                 .to_owned();
             if content_type.contains("text/event-stream") {
-                read_sse(response, id, deadline, cancel).await
+                read_sse(response, id, deadline, cancel, &self.notifications).await
             } else {
                 let bytes = read_body(response, deadline, cancel).await?;
                 let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
@@ -303,6 +332,10 @@ impl Rpc for HttpRpc {
                 parse_response(value)
             }
         })
+    }
+
+    fn subscribe_notifications(&self) -> broadcast::Receiver<ServerNotification> {
+        self.notifications.subscribe()
     }
 
     fn notify<'a>(

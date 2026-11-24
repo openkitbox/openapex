@@ -15,9 +15,10 @@
 //! 2. join the runner (actors and their auxiliary work);
 //! 3. stop and join the composition's shell domain (processes, pumps, sinks);
 //! 4. join the maintenance/startup producers;
-//! 5. shut every MCP hub this composition created down and join the transport
+//! 5. cancel and join every MCP event subscription task;
+//! 6. shut every MCP hub this composition created down and join the transport
 //!    cleanup they handed to [`Transports`];
-//! 6. await the database's own drop-time rollback cleanup, and only then
+//! 7. await the database's own drop-time rollback cleanup, and only then
 //!    report success.
 //!
 //! [`Runtime::shutdown`] is idempotent: every caller waits for the same
@@ -265,7 +266,11 @@ impl Runtime {
         if let Err(error) = tools.jobs.shutdown().await {
             record(error);
         }
-        // 5. Every hub this composition created: current, retired and never
+        // 5. Subscription tasks are owned by the process-wide registry, not by
+        // a hub's task set. Cancel and join them before their hub and database
+        // disappear; stop_all aborts a task that ignores cancellation.
+        crate::api::mcp_events::shared().stop_all().await;
+        // 6. Every hub this composition created: current, retired and never
         // installed alike. Shutting them down awaits each transport's IO.
         let hubs: Vec<Arc<Hub>> = std::mem::take(
             &mut *self
@@ -281,7 +286,7 @@ impl Runtime {
         if let Err(error) = self.transports.seal_and_join().await {
             record(anyhow::anyhow!(error));
         }
-        // 6. Drop-time rollback cleanup belongs to the database, and only now
+        // 7. Drop-time rollback cleanup belongs to the database, and only now
         // is every user of it gone.
         if let Err(error) = state.db.join_cleanup().await {
             record(error);
@@ -305,5 +310,60 @@ impl Default for Runtime {
             transports: Arc::new(Transports::new()),
             supervision: Supervision::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use ox_core::config::Config;
+    use ox_core::event_bus::EventBus;
+    use ox_db::Db;
+    use ox_engine::runner;
+    use ox_llm::cardinal::client::CardinalClient;
+    use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::api::mcp_events::{SubscriptionKey, shared};
+
+    #[tokio::test]
+    async fn shutdown_stops_and_joins_mcp_event_subscriptions() {
+        let db = Db::open_in_memory().await.expect("test database");
+        let bus = EventBus::new(db.clone());
+        let chat =
+            Arc::new(CardinalClient::new("http://127.0.0.1:1", None).expect("test chat transport"));
+        let state = crate::build_state_on_with_bus(
+            Config::default(),
+            chat,
+            runner::ToolRegistry::with_builtins(),
+            db,
+            bus,
+            std::env::temp_dir(),
+        )
+        .await
+        .expect("test state");
+
+        let registry = Arc::clone(shared());
+        assert_eq!(registry.len(), 0, "the shared registry starts empty");
+        let cancel = CancellationToken::new();
+        let (finished, joined) = oneshot::channel();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            task_cancel.cancelled().await;
+            let _ = finished.send(());
+        });
+        registry.insert(SubscriptionKey::new("alpha", "build"), cancel.clone(), task);
+        assert_eq!(registry.len(), 1, "a live subscription is registered");
+
+        state.runtime.shutdown(&state).await.expect("shutdown");
+
+        assert_eq!(registry.len(), 0, "shutdown removes every subscription");
+        assert!(cancel.is_cancelled(), "shutdown cancels the subscription");
+        tokio::time::timeout(Duration::from_secs(2), joined)
+            .await
+            .expect("shutdown joins the subscription task")
+            .expect("subscription task finished");
     }
 }

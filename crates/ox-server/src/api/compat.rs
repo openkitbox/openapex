@@ -99,7 +99,21 @@ pub(crate) async fn config_get(res: &mut Response) {
     res.render(Json(json!([])));
 }
 
-/// Empty catalog lists: command / reference / plugin.
+/// `GET /api/command` — upstream `command.list`. `/automation` is a static
+/// registry entry; `session.command` injects its prompt into the session.
+#[handler] // operation_id: command.list
+pub(crate) async fn command_list(req: &mut Request, res: &mut Response) {
+    let directory = directory_of(req);
+    res.render(Json(envelope(
+        &directory,
+        json!([{
+            "name": "/automation",
+            "description": "Manage scheduled and event-driven automations",
+        }]),
+    )));
+}
+
+/// Empty catalog lists: reference / plugin.
 /// (`provider` has a real handler in the parent module — the configured
 /// model catalog; `integration` lives in `src/integration`.)
 macro_rules! empty_catalog {
@@ -112,7 +126,6 @@ macro_rules! empty_catalog {
     };
 }
 
-empty_catalog!(command_list, "command.list");
 empty_catalog!(reference_list, "reference.list");
 empty_catalog!(plugin_list, "plugin.list");
 

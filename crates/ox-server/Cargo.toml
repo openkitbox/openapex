@@ -9,10 +9,13 @@ base64.workspace = true
 sha1.workspace = true
 dirs.workspace = true
 futures-core.workspace = true
+hmac.workspace = true
 jiff.workspace = true
 libc.workspace = true
 notify.workspace = true
 ox-core.workspace = true
+ox-automation.workspace = true
+ox-codemode = { path = "../ox-codemode" }
 ox-db.workspace = true
 ox-engine.workspace = true
 ox-llm.workspace = true
@@ -23,6 +26,7 @@ rand.workspace = true
 salvo = { workspace = true, features = ["server", "http1", "http2", "sse", "affix-state", "logging", "unix"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true

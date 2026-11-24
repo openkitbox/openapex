@@ -4,6 +4,7 @@
 //! drive it over HTTP against an ephemeral port.
 
 pub mod api;
+pub(crate) mod automation_wiring;
 pub(crate) mod config_watch;
 pub mod instance;
 pub mod lifecycle;
@@ -510,6 +511,10 @@ pub async fn compose_with_service_password(
     // Background `shell` completions need the same db/bus; the runner attaches
     // its waker when it is built below.
     tools.register_shell_completion(db.clone(), bus.clone());
+    let automation_grants = Arc::new(automation_wiring::GrantBook::default());
+    let (automation_host, automation_live) =
+        automation_wiring::AutomationHost::new(db.clone(), Arc::clone(&automation_grants));
+    tools.register_automations(automation_host);
     tools.jobs.load(&db).await?;
     tools.jobs.load_session_parents(&db).await?;
     // Captured before the registry is handed to the runner: the completion
@@ -527,6 +532,9 @@ pub async fn compose_with_service_password(
     )
     .await?;
     state.service_password = service_password;
+    // The tool service is built before the state exists; install its live
+    // config view once, so a reload can gate tool calls without a restart.
+    let _ = automation_live.set(Arc::clone(&state.live));
     let stop = state.runtime.stop().clone();
     // Startup producers are adopted before the listener exists: `compose`
     // never runs once shutdown has started, but an adopted handle that the
@@ -575,6 +583,9 @@ pub async fn compose_with_service_password(
     // them after the listener is up instead.
     adopt(&state, spawn_mcp_startup(&state)).await;
     adopt(&state, config_watch::spawn(&state, stop.clone())).await;
+    for task in automation_wiring::spawn_tasks(&state, Arc::clone(&automation_grants)) {
+        adopt(&state, Some(task)).await;
+    }
     // Background memory consolidation. Idle unless `[magic_context]` enables
     // it, and deliberately not part of `build_state_with`: tests must not
     // acquire a background loop that writes to their database.

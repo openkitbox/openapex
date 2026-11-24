@@ -78,14 +78,14 @@ const BODY_CHANNEL_CAPACITY: usize = 64;
 /// delivered by the replay and must be dropped.
 type ReplayCursor = (String, i64);
 
-struct StreamOptions {
-    period: Duration,
-    cursor: Option<ReplayCursor>,
-    only: Option<String>,
-    types: Option<Vec<String>>,
-    connected: bool,
-    follow: bool,
-    runtime: Arc<crate::runtime::Runtime>,
+pub(crate) struct StreamOptions {
+    pub(crate) period: Duration,
+    pub(crate) cursor: Option<ReplayCursor>,
+    pub(crate) only: Option<String>,
+    pub(crate) types: Option<Vec<String>>,
+    pub(crate) connected: bool,
+    pub(crate) follow: bool,
+    pub(crate) runtime: Arc<crate::runtime::Runtime>,
 }
 
 /// How many durable envelopes one replay query materializes at most. Frames
@@ -227,7 +227,7 @@ async fn session_exists(db: &ox_db::Db, session_id: &str) -> bool {
 
 /// Shared SSE plumbing: optional replay from `cursor`, then live forwarding
 /// (filtered to `only`'s aggregate when set) until the client goes away.
-async fn stream(res: &mut Response, bus: EventBus, options: StreamOptions) {
+pub(crate) async fn stream(res: &mut Response, bus: EventBus, options: StreamOptions) {
     let StreamOptions {
         period,
         cursor,

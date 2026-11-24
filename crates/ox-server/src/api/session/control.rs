@@ -356,18 +356,22 @@ pub(crate) async fn move_session(req: &mut Request, depot: &mut Depot, res: &mut
 // session.command — POST /api/session/{sessionID}/command
 // ---------------------------------------------------------------------------
 
-/// Upstream payload: `name` plus the prompt fields and `delivery`. ox
-/// registers no commands, so only `name` is read; unknown fields are ignored.
+/// Upstream payload: `name` plus the prompt fields and `delivery`. Only the
+/// static `/automation` command is registered; its `text` is the command's
+/// arguments, not the whole prompt.
 #[derive(Default, Deserialize)]
 struct CommandBody {
     name: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    delivery: Option<ox_schema::inbox::Delivery>,
 }
 
 /// Execute a slash command (upstream `session.command`). Handler order
-/// follows upstream: session lookup, then command lookup. `GET /api/command`
-/// lists no commands, so every name is unregistered and answers
-/// `CommandNotFoundError` (404) — the same reply upstream gives for a name
-/// that is not in its table.
+/// follows upstream: session lookup, then command lookup. The only registered
+/// command is `/automation`, whose prompt is injected as a user message; other
+/// names answer `CommandNotFoundError` (404).
 #[handler] // operation_id: session.command
 pub(crate) async fn command(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let Some(app) = state(depot, res) else {
@@ -395,12 +399,48 @@ pub(crate) async fn command(req: &mut Request, depot: &mut Depot, res: &mut Resp
             return;
         }
     }
-    res.status_code(StatusCode::NOT_FOUND);
-    res.render(Json(json!({
-        "_tag": "CommandNotFoundError",
-        "command": body.name,
-        "message": format!("Command not found: {}", body.name),
-    })));
+    if body.name != "/automation" {
+        res.status_code(StatusCode::NOT_FOUND);
+        res.render(Json(json!({
+            "_tag": "CommandNotFoundError",
+            "command": body.name,
+            "message": format!("Command not found: {}", body.name),
+        })));
+        return;
+    }
+    let text =
+        super::super::automation::AUTOMATION_COMMAND_PROMPT.replace("$ARGUMENTS", &body.text);
+    let payload = ox_schema::inbox::UserPayload {
+        prompt: ox_schema::support::Prompt {
+            text,
+            files: None,
+            agents: None,
+            skills: None,
+        },
+        metadata: None,
+    };
+    let message_id = id::id("msg");
+    let item = ox_schema::inbox::Item::User {
+        payload,
+        delivery: body.delivery.unwrap_or(ox_schema::inbox::Delivery::Steer),
+    };
+    if let Err(error) = app
+        .bus
+        .publish(SessionEventData::InboxEnqueued {
+            session_id: session_id.clone(),
+            inbox_id: message_id.clone(),
+            item,
+        })
+        .await
+    {
+        unknown_error(res, &error);
+        return;
+    }
+    if let Err(error) = app.runner.dispatch(&session_id, &message_id).await {
+        unknown_error(res, &error);
+        return;
+    }
+    no_content(res);
 }
 
 // ---------------------------------------------------------------------------

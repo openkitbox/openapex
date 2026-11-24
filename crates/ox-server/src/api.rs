@@ -22,6 +22,7 @@ use ox_llm::model_catalog::ModelCatalog;
 use ox_schema::id::now_millis;
 
 mod attachment;
+mod automation;
 pub mod compat;
 pub mod event;
 pub mod family;
@@ -31,6 +32,10 @@ mod integration;
 pub(crate) mod job;
 pub mod lease;
 mod mcp;
+// T7 owns this file; declared here so the module path stays inside the API.
+// T8 must not redeclare it at the crate root.
+#[path = "mcp_events.rs"]
+pub(crate) mod mcp_events;
 mod media;
 pub mod session;
 pub mod shell;
@@ -1009,6 +1014,11 @@ pub fn build_router(state: AppState) -> Router {
                 .push(Router::with_path("model/default").get(model_default))
                 .push(Router::with_path("agent").get(agent_list))
                 .push(Router::with_path("event").get(event::subscribe))
+                .push(
+                    Router::with_path("experimental/mcp/events")
+                        .post(mcp_events::subscribe)
+                        .push(Router::with_path("webhook").post(mcp_events::webhook)),
+                )
                 .push(Router::with_path("fs/read/{**path}").get(files::read))
                 .push(
                     Router::with_path("vcs")
@@ -1020,6 +1030,7 @@ pub fn build_router(state: AppState) -> Router {
                         .push(Router::with_path("init").post(vcs::init)),
                 )
                 .push(compat::mount(Router::new()))
+                .push(automation::mount(Router::new()))
                 .push(Router::with_path("integration").get(integration::list))
                 .push(
                     Router::with_path("integration/{integrationID}/connect/key")

@@ -24,6 +24,7 @@
 //!   guards (content-type, size, timeout) are exact.
 
 pub mod agent;
+pub mod automation;
 pub mod capability_search;
 pub mod contract;
 pub mod diff;
@@ -77,6 +78,14 @@ impl ToolRegistry {
             Arc::new(write::WriteTool),
         ]);
         registry
+    }
+}
+
+/// The automation tools, registered at app-wiring time: their host port owns a
+/// database handle that `with_builtins` does not have.
+impl ToolRegistry {
+    pub fn register_automations(&mut self, service: Arc<dyn automation::AutomationService>) {
+        automation::register(self, service);
     }
 }
 

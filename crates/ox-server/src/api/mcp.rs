@@ -185,5 +185,8 @@ async fn run(state: &AppState, directory: &str, server: &str, action: Action) ->
         emit("mcp.resources.changed");
     }
     emit("mcp.status.changed");
+    if let Err(error) = super::mcp_events::restart(state).await {
+        tracing::warn!(%error, "MCP event subscription rebuild failed");
+    }
     Ok(())
 }
