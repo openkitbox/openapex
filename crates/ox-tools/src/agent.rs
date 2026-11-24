@@ -20,7 +20,15 @@
 //!   and configuration validate ids against it rather than keeping a list.
 //! - Prompt bodies live in `ox-engine::prompt`; this table only selects a layer
 //!   through [`SystemLayer`], so a shared rule has a single text owner.
+//! - This table is also the only authority on an agent's static permission
+//!   rules. [`Agent::permissions`] is the exact slice `agent.list` publishes
+//!   and the engine evaluates; no second copy lives in the server. An id
+//!   outside the table resolves to [`permissions`]'s deny-all rules, so an
+//!   unknown agent can never gain a tool by being misspelled.
 
+use std::sync::LazyLock;
+
+use ox_schema::permission::{Effect, Rule};
 use ox_schema::support::SLIM;
 
 /// Whether the user drives the agent or `subagent` spawns it.
@@ -62,6 +70,9 @@ pub struct Agent {
     /// Selects the static system layer; the text lives in `ox-engine::prompt`.
     pub system: SystemLayer,
     pub tools: Tools,
+    /// Static upstream rule set, in evaluation order. Shared by the wire
+    /// surface and the engine; never copied into a second table.
+    pub permissions: &'static [Rule],
     /// The logical model id a *child* session of this agent prefers, or `None`
     /// to inherit the parent session's model.
     ///
@@ -174,55 +185,138 @@ pub(crate) const REVIEW_TOOLS: &[&str] = &[
     "webfetch",
 ];
 
-/// The built-in agents in display order. The first entry is the default agent.
-static AGENTS: [Agent; 5] = [
-    Agent {
-        id: APEX_ID,
-        mode: Mode::Primary,
-        system: SystemLayer::Default,
-        tools: Tools::All,
-        model: None,
-    },
-    Agent {
-        id: SUBAGENT_AGENT,
-        mode: Mode::Subagent,
-        system: SystemLayer::Default,
-        tools: Tools::Without(CHILD_EXCLUDED_TOOLS),
-        model: None,
-    },
-    Agent {
-        id: READ_ONLY_AGENT,
-        mode: Mode::Subagent,
-        system: SystemLayer::Explore,
-        tools: Tools::Only(READ_ONLY_TOOLS),
-        model: Some(SLIM),
-    },
-    Agent {
-        id: REVIEW_AGENT,
-        mode: Mode::Subagent,
-        system: SystemLayer::Review,
-        tools: Tools::Only(REVIEW_TOOLS),
-        model: None,
-    },
-    Agent {
-        id: RUST_EXPERT_AGENT,
-        mode: Mode::Subagent,
-        system: SystemLayer::RustExpert,
-        tools: Tools::Only(REVIEW_TOOLS),
-        model: None,
-    },
+/// Upstream's `Agent.Info.default` rules (`schema/src/agent.ts:38-52`).
+const BASE_RULES: &[(&str, &str, Effect)] = &[
+    ("*", "*", Effect::Allow),
+    ("read", "*.env", Effect::Ask),
+    ("read", "*.env.*", Effect::Ask),
+    ("read", "*.env.example", Effect::Allow),
 ];
+
+/// Build a rule set once; strings are owned because `Rule` is the wire type
+/// shared with the engine, but this runs only when the static table is first
+/// touched, never per request or per tool call.
+fn rules(entries: &[(&str, &str, Effect)]) -> Vec<Rule> {
+    entries
+        .iter()
+        .map(|&(action, resource, effect)| Rule {
+            action: action.into(),
+            resource: resource.into(),
+            effect,
+        })
+        .collect()
+}
+
+fn with_rules(base: &[(&str, &str, Effect)], extra: &[(&str, &str, Effect)]) -> Vec<Rule> {
+    let mut result = rules(base);
+    result.extend(rules(extra));
+    result
+}
+
+/// The primary agent: upstream's default rules plus `question` (`plugin/agent.ts:56-61`).
+static APEX_RULES: LazyLock<Vec<Rule>> =
+    LazyLock::new(|| with_rules(BASE_RULES, &[("question", "*", Effect::Allow)]));
+
+/// The general subagent: upstream's default rules minus forms and spawning
+/// children (`plugin/agent.ts:63-72`).
+static GENERAL_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
+    with_rules(
+        BASE_RULES,
+        &[
+            ("question", "*", Effect::Deny),
+            ("subagent", "*", Effect::Deny),
+        ],
+    )
+});
+
+/// Read-only agents: upstream's explore rules (`plugin/agent.ts:74-93`), with
+/// `skill` added for ox's own read-only skill loader. `review` and
+/// `rust-expert` use the same set: their toolsets are subsets of these
+/// capabilities plus `shell`, which upstream also allows for explore.
+static READ_ONLY_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| {
+    rules(&[
+        ("*", "*", Effect::Deny),
+        ("shell", "*", Effect::Allow),
+        ("grep", "*", Effect::Allow),
+        ("glob", "*", Effect::Allow),
+        ("webfetch", "*", Effect::Allow),
+        ("websearch", "*", Effect::Allow),
+        ("read", "*", Effect::Allow),
+        ("read", "*.env", Effect::Ask),
+        ("read", "*.env.*", Effect::Ask),
+        ("read", "*.env.example", Effect::Allow),
+        ("skill", "*", Effect::Allow),
+        ("subagent", "*", Effect::Deny),
+        ("external_directory", "*", Effect::Allow),
+    ])
+});
+
+/// No rule may ever match for an agent id outside the table.
+static UNKNOWN_RULES: LazyLock<Vec<Rule>> = LazyLock::new(|| rules(&[("*", "*", Effect::Deny)]));
+
+/// The built-in agents in display order. The first entry is the default agent.
+static AGENTS: LazyLock<[Agent; 5]> = LazyLock::new(|| {
+    [
+        Agent {
+            id: APEX_ID,
+            mode: Mode::Primary,
+            system: SystemLayer::Default,
+            tools: Tools::All,
+            permissions: &APEX_RULES,
+            model: None,
+        },
+        Agent {
+            id: SUBAGENT_AGENT,
+            mode: Mode::Subagent,
+            system: SystemLayer::Default,
+            tools: Tools::Without(CHILD_EXCLUDED_TOOLS),
+            permissions: &GENERAL_RULES,
+            model: None,
+        },
+        Agent {
+            id: READ_ONLY_AGENT,
+            mode: Mode::Subagent,
+            system: SystemLayer::Explore,
+            tools: Tools::Only(READ_ONLY_TOOLS),
+            permissions: &READ_ONLY_RULES,
+            model: Some(SLIM),
+        },
+        Agent {
+            id: REVIEW_AGENT,
+            mode: Mode::Subagent,
+            system: SystemLayer::Review,
+            tools: Tools::Only(REVIEW_TOOLS),
+            permissions: &READ_ONLY_RULES,
+            model: None,
+        },
+        Agent {
+            id: RUST_EXPERT_AGENT,
+            mode: Mode::Subagent,
+            system: SystemLayer::RustExpert,
+            tools: Tools::Only(REVIEW_TOOLS),
+            permissions: &READ_ONLY_RULES,
+            model: None,
+        },
+    ]
+});
 
 /// Every built-in agent, in display order.
 #[must_use]
 pub fn all() -> &'static [Agent] {
-    &AGENTS
+    &AGENTS[..]
 }
 
 /// The built-in agent with this id, if any.
 #[must_use]
 pub fn get(id: &str) -> Option<&'static Agent> {
     AGENTS.iter().find(|agent| agent.id == id)
+}
+
+/// The static rules for an agent id, or a deny-all rule set for an unknown id.
+/// This is the single source consumed by both `agent.list` and the engine.
+#[must_use]
+pub fn permissions(id: &str) -> &'static [Rule] {
+    get(id).map_or(&UNKNOWN_RULES[..], |agent| agent.permissions)
 }
 
 /// Reject `[agents.<id>]` ids that cannot take a model preference.

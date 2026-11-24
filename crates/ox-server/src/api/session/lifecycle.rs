@@ -7,7 +7,8 @@ use std::sync::Arc;
 use ox_db::Db;
 use ox_schema::event::SessionEventData;
 use ox_schema::id;
-use ox_schema::support::{ForkBoundary, LocationRef, ModelRef, Rule, SessionMetadata};
+use ox_schema::permission::Rule;
+use ox_schema::support::{ForkBoundary, LocationRef, ModelRef, SessionMetadata};
 
 use super::fork_notice::notice_event;
 use super::response::{

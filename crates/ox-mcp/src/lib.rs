@@ -264,6 +264,15 @@ impl Hub {
             .collect()
     }
 
+    /// Whether the owner actually registered this tool from this hub. Reads
+    /// the registration record directly, without copying the names.
+    #[must_use]
+    pub fn has_tool(&self, name: &str) -> bool {
+        sync::read(&self.tool_names)
+            .values()
+            .any(|names| names.iter().any(|registered| registered == name))
+    }
+
     /// Whether the hub tracks a server under this name, including disabled
     /// and failed ones.
     pub fn has_server(&self, server: &str) -> bool {
@@ -647,5 +656,31 @@ fn friendly(name: &str, error: &CallError) -> String {
         CallError::Rpc(error) => format!("MCP server `{name}` rejected the handshake: {error}"),
         CallError::Transport(message) => format!("MCP server `{name}`: {message}"),
         CallError::Unsupported(message) => format!("MCP server `{name}`: {message}"),
+    }
+}
+
+#[cfg(test)]
+mod hub_tests {
+    use super::Hub;
+
+    #[test]
+    fn has_tool_tracks_only_registered_names() {
+        let hub = Hub::empty();
+        assert!(
+            !hub.has_tool("github_create_issue"),
+            "an empty hub has no tools"
+        );
+        hub.record_server_tools(
+            "github",
+            vec!["github_create_issue".to_owned(), "github_list".to_owned()],
+        );
+        assert!(hub.has_tool("github_create_issue"));
+        assert!(hub.has_tool("github_list"));
+        assert!(!hub.has_tool("shell"), "a built-in is not an MCP tool");
+        hub.record_server_tools("github", Vec::new());
+        assert!(
+            !hub.has_tool("github_create_issue"),
+            "a removed tool is gone"
+        );
     }
 }

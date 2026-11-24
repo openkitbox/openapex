@@ -3,14 +3,15 @@
 //! (`packages/protocol/openapi.json`); semantics are the ox MVP subset —
 //! no plugins, commands, skills or forms exist (integrations are real:
 //! `src/integration`), MCP is real
-//! (src/mcp), and config is not yet modeled. Unlike upstream, these endpoints
+//! (src/mcp), and config exposes only the permission/agent rules clients need.
+//! Unlike upstream, these endpoints
 //! answer 200
 //! with empty data for unknown locations instead of 404
 //! `LocationNotFoundError` — an ox server owns its directory model, so
 //! keep that divergence here rather than "fixing" endpoints piecemeal.
 
 use salvo::prelude::*;
-use serde_json::json;
+use serde_json::{Map, json};
 
 /// The request's project directory (upstream `location.ts:73-75`):
 /// `location[directory]` query, then the percent-encoded
@@ -92,11 +93,38 @@ pub(crate) async fn usage_limits(req: &mut Request, res: &mut Response) {
     res.render(Json(envelope(&directory_of(req), serde_json::Value::Null)));
 }
 
-/// `GET /api/config` — upstream `config.get`. ox has no user config model;
-/// an empty entry list.
+/// `GET /api/config` — upstream `config.get`: a bare `Config.Entry[]`. The only
+/// document is ox's config file, and its `info` carries the permission rules
+/// clients need — never provider keys, db paths or other private config.
+/// Upstream's `Config.Entry` has no location field, so the requested directory
+/// is echoed as a response header instead of wrapping the array in an envelope.
 #[handler] // operation_id: config.get
-pub(crate) async fn config_get(res: &mut Response) {
-    res.render(Json(json!([])));
+pub(crate) async fn config_get(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(state) = super::state(depot, res) else {
+        return;
+    };
+    let directory = directory_of(req);
+    let _ = res.add_header("x-opencode-directory", directory.as_str(), true);
+
+    let services = state.services();
+    let configured = &services.config.permissions.rules;
+    let permissions = serde_json::to_value(configured).unwrap_or_else(|error| {
+        tracing::error!(%error, "failed to serialize permission rules");
+        json!([])
+    });
+    let mut agents = Map::new();
+    for agent in ox_tools::agent::all() {
+        let rules = serde_json::to_value(agent.permissions).unwrap_or_else(|error| {
+            tracing::error!(agent = agent.id, %error, "failed to serialize agent rules");
+            json!([])
+        });
+        agents.insert(agent.id.into(), json!({ "permissions": rules }));
+    }
+    res.render(Json(json!([{
+        "type": "document",
+        "path": state.config_path,
+        "info": { "permissions": permissions, "agents": agents },
+    }])));
 }
 
 /// `GET /api/command` — upstream `command.list`. `/automation` is a static

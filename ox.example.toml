@@ -137,14 +137,35 @@ poll_interval = 5_000
 public_url = "https://events.example.invalid/hook"
 secret = "replace-me"
 
-# Tool permissions: allow, ask, or deny. ask_if patterns only escalate allow.
+# Tool permissions: an ordered upstream ruleset, then an ox-specific floor.
+# Rules are grouped by layers (agent defaults, rules here, session rules); the
+# last matching rule wins and any deny short-circuits. Saved approvals only
+# settle an ask; they never override allow/deny. The fallback asks rather than
+# silently allowing. Built-in agents carry base rules that allow normal
+# reads/globs and ask only for .env files.
 [permissions]
-default = "allow"
+default = "ask"                    # ask | allow | deny
 
+# Permanent refusals live here; there is no always_deny reply. Both fields are
+# required, and a blank action/resource is rejected at load time.
+[[permissions.rules]]
+action = "shell"
+resource = "git push*"
+effect = "ask"                     # allow | ask | deny
+
+[[permissions.rules]]
+action = "edit"
+resource = "*.pem"
+effect = "deny"
+
+# An ask offers once (this call), always (persists an allow in the
+# project-scoped permission_saved table; DELETE the saved row to revoke), and
+# reject (this call fails, optionally with feedback to the model). No
+# session-scoped approval option. ask_if patterns only tighten an allow to ask;
+# MCP tools are keyed by their prefixed names. Unattended runs never prompt.
 [permissions.tools]
 webfetch = "ask"
-shell = { policy = "allow", ask_if = ["rm -rf", "git push", "sudo"] }
-write = "ask"
+shell = { ask_if = ["rm -rf", "git push", "sudo"] }
 
 # Child-session limits. max_active must be at least 1.
 [subagent]

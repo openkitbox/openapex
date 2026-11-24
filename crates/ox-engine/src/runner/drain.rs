@@ -39,8 +39,9 @@ use ox_db::Db;
 use ox_llm::cardinal::chat::Chat;
 use ox_schema::event::SessionEventData;
 use ox_schema::id;
-use ox_schema::inbox::{Delivery, Item};
+use ox_schema::inbox::{Delivery, Item, UNATTENDED_KEY, UNATTENDED_RULES_KEY};
 use ox_schema::message::{CompactionReason, Message};
+use ox_schema::permission::Rule;
 use ox_schema::support::{FinishReason, ModelRef, SessionError};
 use ox_tools::agent::Agent;
 
@@ -128,9 +129,12 @@ pub(crate) struct DrainCtx {
     /// Process-wide per-session prompt-cache accounting ([`CacheLedger`]):
     /// diagnostics only, never read on the request path.
     pub cache_ledger: Arc<CacheLedger>,
-    /// Per-session permission grants ("allow for this session"), read by the
-    /// tool gate before every execution.
-    pub grants: Arc<super::permissions::Grants>,
+    /// The one permission service: pending requests are shared with the HTTP
+    /// reply endpoints, saved rules live only in the DB.
+    pub permissions: Arc<crate::permission::PermissionService>,
+    /// Unattended rules for *this request only*. Set on the per-turn clone in
+    /// [`run_turn`], never on the busy-period context that outlives a turn.
+    pub unattended: Option<Vec<Rule>>,
     /// The session's cached git-toplevel anchor, cloned from the session
     /// handle so step and generate share the same per-directory slot.
     pub instruction_root: super::InstructionRootCache,
@@ -381,7 +385,12 @@ pub(crate) async fn drain(
                         .and_then(super::model_roles::override_id),
                     _ => None,
                 };
-                match run_turn(ctx, token, requested).await {
+                let unattended = match &next.item {
+                    Item::User { payload, .. } => unattended_of(payload.metadata.as_ref()),
+                    Item::Synthetic { payload, .. } => unattended_of(payload.metadata.as_ref()),
+                    _ => None,
+                };
+                match run_turn(ctx, token, requested, unattended.as_deref()).await {
                     Ok(TurnOutcome::Ended) => {
                         // The next scan re-opens the entry boundary when the
                         // head is a queued item (llm.ts:109-112), chaining
@@ -436,9 +445,13 @@ async fn run_turn(
     busy: &DrainCtx,
     token: &CancellationToken,
     requested: Option<&str>,
+    unattended: Option<&[Rule]>,
 ) -> Result<TurnOutcome> {
     let mut local = busy.clone();
     local.refresh();
+    // The marker belongs to one inbox item, so it rides on this turn's copy
+    // only. Later prompts in the same busy period start unmarked.
+    local.unattended = unattended.map(<[Rule]>::to_vec);
     let (agent, session_model) = match resolve_selection(
         &local.db,
         &local.session_id,
@@ -716,6 +729,22 @@ async fn deliver_pending_steers(
 // Inbox scanning + promotion (packages/core/src/session/inbox.ts)
 // ---------------------------------------------------------------------------
 
+/// Read the unattended marker and its rules from one inbox item's metadata.
+/// A malformed rule set becomes an *empty* set: the gate then denies every
+/// tool call rather than silently falling back to interactive asking.
+fn unattended_of(metadata: Option<&ox_schema::support::Record>) -> Option<Vec<Rule>> {
+    let metadata = metadata?;
+    if metadata.get(UNATTENDED_KEY).and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    Some(
+        metadata
+            .get(UNATTENDED_RULES_KEY)
+            .and_then(|value| serde_json::from_value(value.clone()).ok())
+            .unwrap_or_default(),
+    )
+}
+
 /// The wire literal of a delivery class, as stored in `session_inbox.delivery`.
 fn delivery_literal(delivery: Delivery) -> &'static str {
     match delivery {
@@ -992,4 +1021,45 @@ async fn settle_stale_compactions(bus: &EventBus, db: &Db, session_id: &str) -> 
         .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod permission_unattended_tests {
+    use ox_schema::permission::{Effect, Rule};
+    use ox_schema::support::Record;
+    use serde_json::json;
+
+    use super::unattended_of;
+
+    fn record(value: serde_json::Value) -> Record {
+        match value {
+            serde_json::Value::Object(map) => map.into_iter().collect(),
+            _ => panic!("metadata must be a record"),
+        }
+    }
+
+    #[test]
+    fn unattended_metadata_produces_rules_and_omits_the_marker_for_user_prompts() {
+        let rules = [Rule {
+            action: "shell".to_owned(),
+            resource: "git status".to_owned(),
+            effect: Effect::Allow,
+        }];
+        let marked = record(json!({
+            "unattended": true,
+            "unattendedRules": rules,
+        }));
+        assert_eq!(unattended_of(Some(&marked)), Some(rules.to_vec()));
+
+        let plain = record(json!({"model": "slim"}));
+        assert_eq!(unattended_of(Some(&plain)), None);
+        assert_eq!(unattended_of(None), None);
+
+        let malformed = record(json!({"unattended": true, "unattendedRules": "bad"}));
+        assert_eq!(
+            unattended_of(Some(&malformed)),
+            Some(Vec::new()),
+            "fail closed"
+        );
+    }
 }

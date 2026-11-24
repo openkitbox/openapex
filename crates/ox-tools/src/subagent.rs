@@ -19,6 +19,8 @@ use crate::agent::{Agent, Mode};
 use crate::contract::{Tool, ToolContext, ToolOutput};
 use ox_core::text;
 use ox_schema::event::SessionEventData;
+use ox_schema::inbox::{UNATTENDED_KEY, UNATTENDED_RULES_KEY};
+use ox_schema::permission::Rule;
 use ox_schema::support::{LocationRef, ModelRef, SessionMetadata};
 use ox_schema::wire::ToolDef;
 use std::path::Path;
@@ -175,6 +177,11 @@ pub struct SubagentHandle {
     stop: tokio_util::sync::CancellationToken,
     watchers: crate::contract::TaskOwner,
     jobs: Arc<crate::jobs::Jobs>,
+    /// Unattended rules for tool calls in flight, keyed by the parent call id.
+    /// The engine marks a `subagent` call before execution and this tool takes
+    /// the entry once when it enqueues the child's prompt. A deny or a failed
+    /// enqueue lets the engine's cleanup take it, so no entry survives a call.
+    unattended_calls: Arc<Mutex<HashMap<String, Vec<Rule>>>>,
 }
 
 /// One background child a live completion watcher is still responsible for.
@@ -326,7 +333,26 @@ impl SubagentHandle {
             stop: tokio_util::sync::CancellationToken::new(),
             watchers: crate::contract::TaskOwner::default(),
             jobs,
+            unattended_calls: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Mark one call as unattended; the rules are the parent turn's allow set.
+    pub fn mark_unattended(&self, call_id: &str, rules: &[Rule]) {
+        self.unattended_calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(call_id.to_owned(), rules.to_vec());
+    }
+
+    /// Consume the marker once, so a later call with the same id cannot
+    /// inherit an earlier turn's authority.
+    #[must_use]
+    pub fn take_unattended(&self, call_id: &str) -> Option<Vec<Rule>> {
+        self.unattended_calls
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(call_id)
     }
 
     /// The spawner connecting child dispatches. Registering twice keeps the
@@ -551,6 +577,10 @@ fn requested_model(input: &Value) -> Result<Option<ModelRef>, ToolOutput> {
 }
 
 async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutput {
+    // Inherited from the parent turn's unattended marker. Taking it here makes
+    // the child's inbox item carry the same authority (or fail closed with an
+    // empty rule set if the marker was malformed).
+    let unattended = tool.handle.take_unattended(&ctx.call_id);
     let runner_missing =
         || fail("The subagent runner is not attached; the server is mis-configured".to_owned());
     let prompt = match required(input, "prompt") {
@@ -783,6 +813,11 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
     } else {
         format!("{SPAWN_PREFIX}{prompt}")
     };
+    let mut metadata = ox_schema::support::Record::new();
+    if let Some(rules) = unattended {
+        metadata.insert(UNATTENDED_KEY.to_owned(), json!(true));
+        metadata.insert(UNATTENDED_RULES_KEY.to_owned(), json!(rules));
+    }
     let payload = ox_schema::inbox::UserPayload {
         prompt: ox_schema::support::Prompt {
             text,
@@ -790,7 +825,7 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
             agents: None,
             skills: None,
         },
-        metadata: None,
+        metadata: (!metadata.is_empty()).then_some(metadata),
     };
     let enqueued = SessionEventData::InboxEnqueued {
         session_id: child_id.clone(),

@@ -168,25 +168,56 @@ they do not require a restart.
 
 ### Permissions
 
-Every tool call passes a policy check before it runs. The default is `allow`;
-`[permissions]` tightens it per tool:
+Every tool call — built-in, `ctx_*` or MCP — is checked before it runs. Rules
+are grouped by layers (built-in agent defaults, `[permissions.rules]`, session
+rules); within and across those layers the **last** matching rule wins, and a
+`deny` short-circuits. Saved approvals are consulted only when a rule asks —
+they never override an `allow` or `deny`. `[permissions] default` is `ask`, not
+`allow`. Built-in agents seed upstream's base rules (`*/*` allow, `read *.env`
+and `read *.env.*` ask, `read *.env.example` allow), so ordinary reads/globs
+run without a prompt while `.env` files ask.
 
 ```toml
 [permissions]
-default = "allow"                 # allow | ask | deny
+default = "ask"                    # ask | allow | deny
 
-[permissions.tools]
+[[permissions.rules]]
+action = "shell"
+resource = "git push*"
+effect = "ask"                     # allow | ask | deny
+
+[[permissions.rules]]             # permanent refusal; there is no always_deny
+action = "edit"
+resource = "*.pem"
+effect = "deny"
+
+[permissions.tools]                # ox-specific floor; only tightens results
 shell = { ask_if = ["rm -rf", "git push", "sudo"] }
-webfetch = "ask"                  # ask every time
-write = "deny"                    # refuse outright
+webfetch = "ask"
 ```
 
-`ask_if` holds regular expressions matched against the call's arguments (the
-command text for `shell`, compact JSON otherwise). An `ask` opens a form on the
-user's root session; subagent calls surface there too. The choices are *allow
-once*, *allow for this session* and *deny*. No answer within five minutes, or an
-interrupt, counts as a denial. Session grants live in process memory and reset
-on restart. MCP tools use their prefixed names.
+`action` and `resource` are required: a blank value is rejected when the
+config is loaded. `ask_if` holds regular expressions matched against the call
+arguments (command text for `shell`, compact JSON otherwise); a match can only
+escalate `allow` to `ask`, never relax a policy. MCP tools use their prefixed
+names.
+
+An `ask` opens a `permission.asked` request. The three replies are `once`
+(this call only), `always` (persist an allow rule in the project-scoped
+`permission_saved` table in `ox.db`; delete the saved row to revoke it, and
+same-session/same-project pending requests are re-evaluated against the new
+rule) and `reject` (fail only this call; an optional message is returned to
+the model). Session-scoped grants are not offered. A child session's
+request uses its own session ID plus `metadata.parentID` so the parent can
+display it. No answer within 300 seconds, an interrupt or a disconnect counts
+as a rejection. Automation/unattended sessions never wait: rules are settled
+and only `allow` proceeds; anything else is denied.
+
+Clients can read and manage permissions through `/api/config` (permissions and
+agents), `GET /api/permission/request`, `GET /api/permission/saved`,
+`PATCH`/`DELETE /api/permission/saved/{id}`,
+`GET /api/session/{id}/permission[/{requestID}]` and
+`POST /api/session/{id}/permission/{requestID}/reply`.
 
 ### Environment variables
 

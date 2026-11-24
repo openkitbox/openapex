@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use ox_core::event_bus::EventBus;
 use ox_db::Db;
 use ox_engine::mctx::embed::Embedder;
+use ox_engine::permission::PermissionService;
 use ox_engine::runner::{Live, Runner, Services};
 use ox_llm::model_catalog::ModelCatalog;
 use ox_schema::id::now_millis;
@@ -37,6 +38,7 @@ mod mcp;
 #[path = "mcp_events.rs"]
 pub(crate) mod mcp_events;
 mod media;
+pub(crate) mod permission;
 pub mod session;
 pub mod shell;
 pub mod skill;
@@ -53,6 +55,9 @@ pub struct AppState {
     pub directory: PathBuf,
     /// Per-session execution actor registry (task 6).
     pub runner: Runner,
+    /// The runner's permission gate, shared by every V2 HTTP handler. This is
+    /// the only pending registry; handlers never build a second one.
+    pub permissions: Arc<PermissionService>,
     /// Config-derived services (config, model catalogue, MCP hub, toolset),
     /// shared with `Runner`; read through [`AppState::services`].
     pub live: Arc<Live>,
@@ -931,7 +936,8 @@ struct AgentInfo {
     request: AgentRequest,
     mode: &'static str,
     hidden: bool,
-    permissions: Vec<serde_json::Value>,
+    /// Static rules from the agent table — the same slice the engine evaluates.
+    permissions: &'static [ox_schema::permission::Rule],
 }
 
 #[derive(Serialize)]
@@ -956,8 +962,7 @@ async fn agent_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
 }
 
 /// The wire shape of one agent record. `name` is the id: clients capitalize
-/// it for display. ox has no permission rule sets yet, so `permissions` is
-/// always empty.
+/// it for display. `permissions` comes straight from the built-in agent table.
 fn agent_info(agent: &'static ox_tools::agent::Agent) -> AgentInfo {
     AgentInfo {
         id: agent.id,
@@ -972,7 +977,7 @@ fn agent_info(agent: &'static ox_tools::agent::Agent) -> AgentInfo {
             ox_tools::agent::Mode::Subagent => "subagent",
         },
         hidden: false,
-        permissions: Vec::new(),
+        permissions: agent.permissions,
     }
 }
 
@@ -1037,6 +1042,17 @@ pub fn build_router(state: AppState) -> Router {
                         .post(integration::connect_key),
                 )
                 .push(Router::with_path("form").get(form::list))
+                .push(
+                    Router::with_path("permission")
+                        .push(Router::with_path("request").get(permission::request_list))
+                        .push(
+                            Router::with_path("saved").get(permission::saved_list).push(
+                                Router::with_path("{id}")
+                                    .patch(permission::saved_update)
+                                    .delete(permission::saved_delete),
+                            ),
+                        ),
+                )
                 .push(Router::with_path("skill").get(skill::list))
                 .push(
                     Router::with_path("experimental/job")
@@ -1114,7 +1130,18 @@ pub fn build_router(state: AppState) -> Router {
                                 )
                                 .push(Router::with_path("interrupt").post(session::interrupt))
                                 .push(Router::with_path("background").post(session::background))
-                                .push(Router::with_path("permission").get(session::permission_list))
+                                .push(
+                                    Router::with_path("permission")
+                                        .get(session::permission_list)
+                                        .push(
+                                            Router::with_path("{requestID}")
+                                                .get(session::permission_get)
+                                                .push(
+                                                    Router::with_path("reply")
+                                                        .post(session::permission_reply),
+                                                ),
+                                        ),
+                                )
                                 .push(
                                     Router::with_path("form")
                                         .get(form::session_list)
@@ -1130,6 +1157,142 @@ pub fn build_router(state: AppState) -> Router {
                 ),
         )
         .push(Router::with_path("{**rest}").goal(unmatched))
+}
+
+#[cfg(test)]
+mod permission_tests {
+    use std::sync::Arc;
+
+    use ox_core::config::{Config, PermissionsConfig};
+    use ox_db::Db;
+    use ox_schema::{Effect, Rule};
+    use salvo::test::{ResponseExt, TestClient};
+    use serde_json::{Value, json};
+
+    use super::build_router;
+    use crate::cardinal::client::CardinalClient;
+    use crate::{EventBus, McpStartup, build_state_with_mode, runner};
+
+    async fn router(config: Config) -> Arc<salvo::Router> {
+        let db = Db::open_in_memory().await.expect("test database");
+        let bus = EventBus::new(db.clone());
+        let chat =
+            Arc::new(CardinalClient::new("http://127.0.0.1:1", None).expect("test chat transport"))
+                as Arc<dyn runner::Chat>;
+        let state = build_state_with_mode(
+            config,
+            chat,
+            runner::ToolRegistry::with_builtins(),
+            db,
+            bus,
+            std::env::temp_dir(),
+            McpStartup::Deferred,
+        )
+        .await
+        .expect("test state");
+        Arc::new(build_router(state))
+    }
+
+    /// `/tmp` is a symlink on macOS; `directory_of` canonicalizes it.
+    fn requested_directory() -> String {
+        std::path::Path::new("/tmp")
+            .canonicalize()
+            .unwrap_or_else(|_| std::path::PathBuf::from("/tmp"))
+            .display()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn agent_permissions_endpoint_publishes_the_static_rules() {
+        let router = router(Config::default()).await;
+        let mut response =
+            TestClient::get("http://localhost/api/agent?location%5Bdirectory%5D=%2Ftmp")
+                .send(router)
+                .await;
+        let body: Value = response.take_json().await.expect("agent list JSON");
+        assert_eq!(body["location"]["directory"], requested_directory());
+
+        let entries = body["data"].as_array().expect("agent list data");
+        let agents = ox_tools::agent::all();
+        assert_eq!(entries.len(), agents.len());
+        for (entry, agent) in entries.iter().zip(agents) {
+            assert_eq!(
+                entry["permissions"],
+                serde_json::to_value(agent.permissions).expect("serialize static rules"),
+                "{} must publish the same rules the engine evaluates",
+                agent.id
+            );
+        }
+
+        let explore = entries
+            .iter()
+            .find(|entry| entry["id"] == "explore")
+            .expect("explore agent");
+        assert_eq!(
+            explore["permissions"][0],
+            json!({ "action": "*", "resource": "*", "effect": "deny" }),
+            "read-only agents must start from a deny-all baseline"
+        );
+        let unknown = ox_tools::agent::permissions("does-not-exist");
+        assert_eq!(
+            unknown,
+            &[Rule {
+                action: "*".into(),
+                resource: "*".into(),
+                effect: Effect::Deny,
+            }][..],
+            "an unknown agent must have no allowed action"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_permissions_returns_a_document_without_private_config() {
+        let config = Config {
+            permissions: PermissionsConfig {
+                rules: vec![Rule {
+                    action: "shell".into(),
+                    resource: "rm -rf*".into(),
+                    effect: Effect::Deny,
+                }],
+                ..PermissionsConfig::default()
+            },
+            ..Config::default()
+        };
+        let router = router(config).await;
+        let mut response =
+            TestClient::get("http://localhost/api/config?location%5Bdirectory%5D=%2Ftmp")
+                .send(router)
+                .await;
+        assert_eq!(
+            response
+                .headers()
+                .get("x-opencode-directory")
+                .and_then(|value| value.to_str().ok()),
+            Some(requested_directory().as_str()),
+            "config.get must echo the requested directory"
+        );
+        let body: Value = response.take_json().await.expect("config JSON");
+        let entries = body.as_array().expect("upstream Config.Entry[]");
+        let document = &entries[0];
+        assert_eq!(document["type"], "document");
+        assert!(
+            document["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with("ox.toml"))
+        );
+        assert_eq!(
+            document["info"]["permissions"],
+            json!([{ "action": "shell", "resource": "rm -rf*", "effect": "deny" }])
+        );
+        assert_eq!(
+            document["info"]["agents"]["explore"]["permissions"][0],
+            json!({ "action": "*", "resource": "*", "effect": "deny" })
+        );
+        let raw = body.to_string();
+        for secret in ["db_path", "api_key", "secret", "credential"] {
+            assert!(!raw.contains(secret), "config.get leaked {secret}");
+        }
+    }
 }
 
 /// Fallback for unmatched routes: upstream's Effect HttpApi always answers

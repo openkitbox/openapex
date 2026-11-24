@@ -244,11 +244,13 @@ async fn build_state_with_mode(
         mcp,
         home,
     );
+    let permissions = runner.permission_service();
     Ok(AppState {
         db: db_handle,
         bus: bus_handle,
         directory,
         live: runner.live(),
+        permissions,
         runner,
         config_path: ox_core::config::Config::default_path(),
         lifecycle: lifecycle::Lifecycle::new(std::time::Instant::now()),

@@ -7,7 +7,8 @@ use ox_db::Db;
 use ox_schema::event::SessionEventData;
 use ox_schema::id;
 use ox_schema::message::Message;
-use ox_schema::support::{LocationRef, ModelRef, Rule, SessionMetadata};
+use ox_schema::permission::Rule;
+use ox_schema::support::{LocationRef, ModelRef, SessionMetadata};
 
 use super::response::{
     conflict_error, invalid_request, parse_body, session_not_found, unknown_error,

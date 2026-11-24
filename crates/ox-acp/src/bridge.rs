@@ -16,11 +16,13 @@ use agent_client_protocol::v1::schema::{
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest,
     SetSessionConfigOptionResponse, SetSessionModeRequest, SetSessionModeResponse, StopReason,
 };
+use ox_schema::permission::Asked;
 use ox_schema::support::ModelRef;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::client_requests;
+use super::client_requests::PermissionCall;
 use super::config_options::{Catalog, Change};
 use super::internal;
 use super::session::{SessionInfo, Sessions, Turn, setup_directory, validate_id};
@@ -453,60 +455,67 @@ impl Bridge {
                             stream = stream::open(&self.http, &self.base, Some(session), last_seq).await?;
                         }
                         Ok(Some(frame)) => {
+                            // A reply settled elsewhere (including a 300s server
+                            // timeout) withdraws the matching ACP dialog. Handle
+                            // it before `accept_frame`: child replies carry only
+                            // their own session ID, not the parent's.
+                            if frame.kind == "permission.replied" {
+                                if let Some(request_id) = frame
+                                    .data
+                                    .get("requestID")
+                                    .and_then(Value::as_str)
+                                {
+                                    self.client_requests.cancel_permission(request_id);
+                                }
+                                continue;
+                            }
                             if !accept_frame(&mut last_seq, &frame, session) {
                                 continue;
                             }
-                            if frame.kind == "form.created"
-                                && frame.data.pointer("/form/fields").is_some()
-                            {
-                                let form = frame.data.get("form").cloned().unwrap_or(Value::Null);
-                                let requests = self.client_requests.clone();
-                                let http = self.http.clone();
-                                let base = self.base.clone();
-                                let connection = connection.clone();
-                                let directory = directory.to_owned();
-                                let cancellation = turn_token.clone();
-                                let connection_for_task = connection.clone();
-                                let form_for_cleanup = form.clone();
-                                let directory_for_task = directory.clone();
-                                let spawn_result = connection.clone().spawn(async move {
-                                    let result = requests
-                                        .request_permission(
-                                            &http,
-                                            &base,
-                                            &form,
-                                            &connection_for_task,
-                                            &cancellation,
-                                            &directory_for_task,
-                                        )
-                                        .await;
-                                    if let Err(error) = result {
-                                        if let Err(settle_error) = client_requests::ClientRequests::settle_form_for_task(
-                                            &http,
-                                            &base,
-                                            &form,
-                                            &directory_for_task,
-                                        )
-                                        .await
-                                        {
-                                            tracing::warn!(error = %settle_error, "permission form cleanup failed");
-                                        }
-                                        tracing::debug!(error = %error, "ACP permission request failed closed");
+                            if frame.kind == "permission.asked" {
+                                match serde_json::from_value::<Asked>(frame.data.clone()) {
+                                    Ok(asked) => {
+                                        let Some(settled) =
+                                            self.client_requests.begin_permission(&asked.id)
+                                        else {
+                                            continue;
+                                        };
+                                        let requests = self.client_requests.clone();
+                                        let http = self.http.clone();
+                                        let base = self.base.clone();
+                                        let connection_for_task = connection.clone();
+                                        let directory_for_task = directory.to_owned();
+                                        let cancellation = turn_token.clone();
+                                        let requested = asked.clone();
+                                        let client_session = session.to_owned();
+                                        // Use a runtime task, not `ConnectionTo::spawn`:
+                                        // an editor disconnect must not abort the
+                                        // fail-closed rejection POST.
+                                        tokio::spawn(async move {
+                                            let result = requests
+                                                .request_permission(
+                                                    &http,
+                                                    &base,
+                                                    PermissionCall {
+                                                        asked: &requested,
+                                                        client_session: &client_session,
+                                                        connection: &connection_for_task,
+                                                        cancellation: &cancellation,
+                                                        directory: &directory_for_task,
+                                                        settled: &settled,
+                                                    },
+                                                )
+                                                .await;
+                                            requests.finish_permission(&requested.id);
+                                            if let Err(error) = result {
+                                                tracing::debug!(error = %error, "ACP permission request failed closed");
+                                            }
+                                            Ok::<(), acp::Error>(())
+                                        });
                                     }
-                                    Ok(())
-                                });
-                                if let Err(error) = spawn_result {
-                                    if let Err(settle_error) = client_requests::ClientRequests::settle_form_for_task(
-                                        &self.http,
-                                        &self.base,
-                                        &form_for_cleanup,
-                                        &directory,
-                                    )
-                                    .await
-                                    {
-                                        tracing::warn!(error = %settle_error, "permission form cleanup after spawn failure failed");
+                                    Err(error) => {
+                                        tracing::warn!(error = %error, "invalid permission.asked event");
                                     }
-                                    tracing::debug!(error = %error, "ACP permission task failed to spawn");
                                 }
                             }
                             if frame.kind == "form.created"
@@ -723,7 +732,15 @@ fn accept_frame(last_seq: &mut Option<i64>, frame: &Frame, session: &str) -> boo
                 .pointer("/form/sessionID")
                 .and_then(Value::as_str)
         });
-    if frame_session != Some(session) {
+    // V2 child asks carry the child session ID and the calling family's ID in
+    // `metadata.parentID`; dropping them would hang the parent's approval.
+    let child_of = frame.kind == "permission.asked"
+        && frame
+            .data
+            .pointer("/metadata/parentID")
+            .and_then(Value::as_str)
+            == Some(session);
+    if frame_session != Some(session) && !child_of {
         return false;
     }
     match (frame.seq, frame.aggregate_id.as_deref()) {
@@ -736,14 +753,17 @@ fn accept_frame(last_seq: &mut Option<i64>, frame: &Frame, session: &str) -> boo
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     };
+    use std::task::{Context, Poll};
 
     use salvo::conn::Listener as _;
     use salvo::prelude::{Depot, Json, Request, Response, Router, Server, StatusCode};
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+    use tokio::sync::{mpsc, oneshot};
     use tokio_util::compat::{TokioAsyncReadCompatExt as _, TokioAsyncWriteCompatExt as _};
 
     use super::{
@@ -1460,5 +1480,526 @@ mod tests {
         );
         let error = prompt_body(&request).expect_err("resource links are not safe file inputs");
         assert!(error.to_string().contains("resource link"));
+    }
+
+    #[test]
+    fn child_permission_frame_is_accepted_without_advancing_cursor() {
+        let mut last_seq = Some(7);
+        let child = Frame {
+            seq: None,
+            aggregate_id: None,
+            kind: "permission.asked".to_owned(),
+            data: json!({
+                "id": "per_child",
+                "sessionID": "ses_child",
+                "metadata": {"parentID": "ses_root"}
+            }),
+        };
+        assert!(accept_frame(&mut last_seq, &child, "ses_root"));
+        assert_eq!(
+            last_seq,
+            Some(7),
+            "an ephemeral child ask must not move the cursor"
+        );
+
+        let unrelated = Frame {
+            seq: None,
+            aggregate_id: None,
+            kind: "permission.asked".to_owned(),
+            data: json!({
+                "id": "per_other",
+                "sessionID": "ses_other",
+                "metadata": {"parentID": "ses_unrelated"}
+            }),
+        };
+        assert!(!accept_frame(&mut last_seq, &unrelated, "ses_root"));
+    }
+
+    struct PermissionState {
+        frames: Vec<Value>,
+        immediate_terminal: bool,
+        writes: Mutex<Vec<Value>>,
+        paths: Mutex<Vec<String>>,
+        event_tx: Mutex<Option<mpsc::UnboundedSender<String>>>,
+        reply_done: Mutex<Option<oneshot::Sender<()>>>,
+        control_rx: Mutex<Option<mpsc::UnboundedReceiver<Value>>>,
+    }
+
+    struct PermissionBody {
+        rx: mpsc::UnboundedReceiver<String>,
+    }
+
+    impl futures_util::Stream for PermissionBody {
+        type Item = Result<String, std::convert::Infallible>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            Pin::new(&mut self.rx)
+                .poll_recv(cx)
+                .map(|item| item.map(Ok))
+        }
+    }
+
+    struct PermissionHarness {
+        base: String,
+        state: Arc<PermissionState>,
+        reply_done: oneshot::Receiver<()>,
+        control: mpsc::UnboundedSender<Value>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    fn sse_line(frame: &Value) -> String {
+        format!("data: {frame}\n\n")
+    }
+
+    fn terminal_frame(owner: &str) -> Value {
+        json!({"type": "session.execution.succeeded", "data": {"sessionID": owner}})
+    }
+
+    fn permission_frame(id: &str, owner: &str, parent: Option<&str>) -> Value {
+        let mut metadata = serde_json::Map::new();
+        if let Some(parent) = parent {
+            metadata.insert("parentID".to_owned(), json!(parent));
+        }
+        json!({
+            "type": "permission.asked",
+            "data": {
+                "id": id,
+                "sessionID": owner,
+                "action": "shell",
+                "resources": ["git status"],
+                "save": ["git status"],
+                "metadata": metadata,
+                "source": {"type": "tool", "messageID": "msg_one", "id": "call_one"},
+                "message": null
+            }
+        })
+    }
+
+    #[salvo::handler]
+    async fn permission_stream(depot: &mut Depot, res: &mut Response) {
+        let state = depot
+            .get_typed::<Arc<PermissionState>>()
+            .expect("permission state");
+        let (tx, rx) = mpsc::unbounded_channel();
+        *state.event_tx.lock().expect("event sender") = Some(tx.clone());
+        tx.send(sse_line(&json!({"type": "server.connected", "data": {}})))
+            .expect("send connected frame");
+        for frame in &state.frames {
+            tx.send(sse_line(frame)).expect("send initial frame");
+        }
+        if state.immediate_terminal {
+            tx.send(sse_line(&terminal_frame("ses_root")))
+                .expect("send immediate terminal frame");
+        }
+        let mut control = state
+            .control_rx
+            .lock()
+            .expect("control receiver")
+            .take()
+            .expect("control receiver");
+        tokio::spawn(async move {
+            while let Some(frame) = control.recv().await {
+                if tx.send(sse_line(&frame)).is_err() {
+                    break;
+                }
+            }
+        });
+        res.stream(PermissionBody { rx });
+    }
+
+    #[salvo::handler]
+    async fn permission_prompt(res: &mut Response) {
+        res.status_code(StatusCode::NO_CONTENT);
+    }
+
+    #[salvo::handler]
+    async fn permission_interrupt(depot: &mut Depot, res: &mut Response) {
+        let state = depot
+            .get_typed::<Arc<PermissionState>>()
+            .expect("permission state");
+        if let Some(tx) = state.event_tx.lock().expect("event sender").as_ref() {
+            let _ = tx.send(sse_line(&terminal_frame("ses_root")));
+        }
+        res.status_code(StatusCode::NO_CONTENT);
+    }
+
+    #[salvo::handler]
+    async fn permission_reply(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+        let state = depot
+            .get_typed::<Arc<PermissionState>>()
+            .expect("permission state");
+        assert_eq!(req.headers()["x-opencode-directory"], "/work");
+        let body: Value = req.parse_json().await.expect("permission reply body");
+        state.writes.lock().expect("permission writes").push(body);
+        state
+            .paths
+            .lock()
+            .expect("permission paths")
+            .push(req.uri().path().to_owned());
+        if let Some(tx) = state.event_tx.lock().expect("event sender").as_ref() {
+            let _ = tx.send(sse_line(&terminal_frame("ses_root")));
+        }
+        if let Some(done) = state.reply_done.lock().expect("reply signal").take() {
+            done.send(()).expect("notify permission reply");
+        }
+        res.status_code(StatusCode::NO_CONTENT);
+    }
+
+    async fn start_permission_harness(
+        frames: Vec<Value>,
+        immediate_terminal: bool,
+    ) -> anyhow::Result<PermissionHarness> {
+        let acceptor = salvo::conn::TcpListener::new("127.0.0.1:0")
+            .try_bind()
+            .await?;
+        let addr = acceptor.local_addr()?;
+        let (control, control_rx) = mpsc::unbounded_channel();
+        let (reply_done, reply_rx) = oneshot::channel();
+        let state = Arc::new(PermissionState {
+            frames,
+            immediate_terminal,
+            writes: Mutex::new(Vec::new()),
+            paths: Mutex::new(Vec::new()),
+            event_tx: Mutex::new(None),
+            reply_done: Mutex::new(Some(reply_done)),
+            control_rx: Mutex::new(Some(control_rx)),
+        });
+        let router = Router::with_path("api")
+            .hoop(salvo::affix_state::inject(state.clone()))
+            .push(Router::with_path("event").get(permission_stream))
+            .push(Router::with_path("session/ses_root/prompt").post(permission_prompt))
+            .push(Router::with_path("session/ses_root/interrupt").post(permission_interrupt))
+            .push(
+                Router::with_path("session/{sessionID}/permission/{requestID}/reply")
+                    .post(permission_reply),
+            );
+        let server = tokio::spawn(Server::new(acceptor).serve(router));
+        Ok(PermissionHarness {
+            base: format!("http://{addr}"),
+            state,
+            reply_done: reply_rx,
+            control,
+            server,
+        })
+    }
+
+    async fn permission_connection(
+        harness: &PermissionHarness,
+    ) -> anyhow::Result<(
+        BufReader<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    )> {
+        let bridge = Bridge::new(reqwest::Client::new(), harness.base.clone());
+        bridge
+            .sessions
+            .bind("ses_root".to_owned(), "/work".to_owned())?;
+        let (agent, client) = tokio::io::duplex(8192);
+        let (read, write) = tokio::io::split(agent);
+        let agent = tokio::spawn(crate::serve(
+            bridge,
+            acp::ByteStreams::new(write.compat_write(), read.compat()),
+        ));
+        let mut io = BufReader::new(client);
+        let (init, _) = request(&mut io, "initialize", json!({"protocolVersion": 1})).await?;
+        assert_eq!(init["result"]["protocolVersion"], 1);
+        Ok((io, agent))
+    }
+
+    async fn begin_permission_prompt(
+        io: &mut BufReader<tokio::io::DuplexStream>,
+    ) -> anyhow::Result<()> {
+        io.write_all(
+            format!(
+                "{}\n",
+                json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "session/prompt",
+                    "params": {
+                        "sessionId": "ses_root",
+                        "prompt": [{"type": "text", "text": "inspect"}]
+                    }
+                })
+            )
+            .as_bytes(),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn next_permission_message(
+        io: &mut BufReader<tokio::io::DuplexStream>,
+    ) -> anyhow::Result<Value> {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut line = String::new();
+            anyhow::ensure!(io.read_line(&mut line).await? != 0, "ACP connection closed");
+            Ok(serde_json::from_str(&line)?)
+        })
+        .await?
+    }
+
+    async fn wait_for_permission_request(
+        io: &mut BufReader<tokio::io::DuplexStream>,
+    ) -> anyhow::Result<Value> {
+        loop {
+            let message = next_permission_message(io).await?;
+            if message["method"] == "session/request_permission" {
+                return Ok(message);
+            }
+            anyhow::ensure!(
+                message["id"] != 1,
+                "prompt ended before the permission request: {message}"
+            );
+        }
+    }
+
+    async fn answer_permission(
+        io: &mut BufReader<tokio::io::DuplexStream>,
+        request: &Value,
+        outcome: Value,
+    ) -> anyhow::Result<()> {
+        let response =
+            json!({"jsonrpc": "2.0", "id": request["id"], "result": {"outcome": outcome}});
+        io.write_all(format!("{response}\n").as_bytes()).await?;
+        Ok(())
+    }
+
+    async fn wait_for_prompt_response(
+        io: &mut BufReader<tokio::io::DuplexStream>,
+    ) -> anyhow::Result<Vec<Value>> {
+        let mut messages = Vec::new();
+        loop {
+            let message = next_permission_message(io).await?;
+            if message["id"] == 1 {
+                return Ok(messages);
+            }
+            messages.push(message);
+        }
+    }
+
+    fn selected(option: &str, message: Option<&str>) -> Value {
+        let mut outcome = json!({"outcome": "selected", "optionId": option});
+        if let Some(message) = message {
+            outcome["_meta"] = json!({"message": message});
+        }
+        outcome
+    }
+
+    #[tokio::test]
+    async fn permission_v2_ask_forwards_all_three_replies() -> anyhow::Result<()> {
+        for decision in ["once", "always", "reject"] {
+            let harness = start_permission_harness(
+                vec![permission_frame("per_one", "ses_root", None)],
+                false,
+            )
+            .await?;
+            let (mut io, agent) = permission_connection(&harness).await?;
+            begin_permission_prompt(&mut io).await?;
+            let permission = wait_for_permission_request(&mut io).await?;
+            assert_eq!(permission["params"]["sessionId"], "ses_root");
+            assert_eq!(permission["params"]["toolCall"]["toolCallId"], "call_one");
+            assert_eq!(
+                permission["params"]["options"],
+                json!([
+                    {"optionId": "once", "kind": "allow_once", "name": "Allow once"},
+                    {"optionId": "always", "kind": "allow_always", "name": "Always allow"},
+                    {"optionId": "reject", "kind": "reject_once", "name": "Reject"}
+                ])
+            );
+            answer_permission(&mut io, &permission, selected(decision, None)).await?;
+            let messages = wait_for_prompt_response(&mut io).await?;
+            assert!(
+                messages
+                    .iter()
+                    .all(|message| message["method"] != "session/request_permission")
+            );
+            assert_eq!(
+                *harness.state.writes.lock().expect("permission writes"),
+                [json!({"decision": decision})]
+            );
+            assert_eq!(
+                *harness.state.paths.lock().expect("permission paths"),
+                ["/api/session/ses_root/permission/per_one/reply"]
+            );
+            drop(io);
+            agent.await??;
+            harness.server.abort();
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permission_reject_forwards_feedback_as_message() -> anyhow::Result<()> {
+        let harness =
+            start_permission_harness(vec![permission_frame("per_one", "ses_root", None)], false)
+                .await?;
+        let (mut io, agent) = permission_connection(&harness).await?;
+        begin_permission_prompt(&mut io).await?;
+        let permission = wait_for_permission_request(&mut io).await?;
+        answer_permission(
+            &mut io,
+            &permission,
+            selected("reject", Some("try a safer command")),
+        )
+        .await?;
+        wait_for_prompt_response(&mut io).await?;
+        assert_eq!(
+            *harness.state.writes.lock().expect("permission writes"),
+            [json!({"decision": "reject", "message": "try a safer command"})]
+        );
+        drop(io);
+        agent.await??;
+        harness.server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn child_permission_ask_reaches_acp_and_replies_to_child_session() -> anyhow::Result<()> {
+        let harness = start_permission_harness(
+            vec![permission_frame("per_child", "ses_child", Some("ses_root"))],
+            false,
+        )
+        .await?;
+        let (mut io, agent) = permission_connection(&harness).await?;
+        begin_permission_prompt(&mut io).await?;
+        let permission = wait_for_permission_request(&mut io).await?;
+        assert_eq!(permission["params"]["sessionId"], "ses_root");
+        answer_permission(&mut io, &permission, selected("once", None)).await?;
+        wait_for_prompt_response(&mut io).await?;
+        assert_eq!(
+            *harness.state.paths.lock().expect("permission paths"),
+            ["/api/session/ses_child/permission/per_child/reply"]
+        );
+        drop(io);
+        agent.await??;
+        harness.server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permission_client_disconnect_rejects_without_allowing() -> anyhow::Result<()> {
+        let harness =
+            start_permission_harness(vec![permission_frame("per_one", "ses_root", None)], false)
+                .await?;
+        let (mut io, agent) = permission_connection(&harness).await?;
+        begin_permission_prompt(&mut io).await?;
+        let _permission = wait_for_permission_request(&mut io).await?;
+        drop(io);
+        tokio::time::timeout(std::time::Duration::from_secs(5), harness.reply_done).await??;
+        assert_eq!(
+            *harness.state.writes.lock().expect("permission writes"),
+            [json!({"decision": "reject"})]
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), agent).await???;
+        harness.server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permission_turn_cancellation_rejects_without_allowing() -> anyhow::Result<()> {
+        let harness =
+            start_permission_harness(vec![permission_frame("per_one", "ses_root", None)], false)
+                .await?;
+        let (mut io, agent) = permission_connection(&harness).await?;
+        begin_permission_prompt(&mut io).await?;
+        let _permission = wait_for_permission_request(&mut io).await?;
+        let cancel = json!({
+            "jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "ses_root"}
+        });
+        io.write_all(format!("{cancel}\n").as_bytes()).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), harness.reply_done).await??;
+        assert_eq!(
+            *harness.state.writes.lock().expect("permission writes"),
+            [json!({"decision": "reject"})]
+        );
+        drop(io);
+        agent.await??;
+        harness.server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permission_server_timeout_settlement_cancels_acp_dialog() -> anyhow::Result<()> {
+        let harness =
+            start_permission_harness(vec![permission_frame("per_one", "ses_root", None)], false)
+                .await?;
+        let (mut io, agent) = permission_connection(&harness).await?;
+        begin_permission_prompt(&mut io).await?;
+        let permission = wait_for_permission_request(&mut io).await?;
+        harness.control.send(json!({
+            "type": "permission.replied",
+            "data": {"sessionID": "ses_root", "requestID": "per_one", "reply": "reject"}
+        }))?;
+        let mut cancelled = false;
+        for _ in 0..8 {
+            let message = next_permission_message(&mut io).await?;
+            if message["method"] == "$/cancel_request"
+                && message["params"]["requestId"] == permission["id"]
+            {
+                cancelled = true;
+                break;
+            }
+        }
+        assert!(
+            cancelled,
+            "a server-timeout reply must cancel the pending ACP dialog"
+        );
+        assert!(
+            harness
+                .state
+                .writes
+                .lock()
+                .expect("permission writes")
+                .iter()
+                .all(|body| {
+                    !matches!(
+                        body.get("decision").and_then(Value::as_str),
+                        Some("once" | "always")
+                    )
+                })
+        );
+        harness.control.send(terminal_frame("ses_root"))?;
+        wait_for_prompt_response(&mut io).await?;
+        drop(io);
+        agent.await??;
+        harness.server.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_permission_form_is_not_used_for_acp_approval() -> anyhow::Result<()> {
+        let harness = start_permission_harness(
+            vec![json!({
+                "type": "form.created",
+                "data": {"form": {
+                    "id": "form_one", "sessionID": "ses_root",
+                    "fields": [{"type": "string", "key": "decision", "options": [
+                        {"value": "once", "label": "Allow once"},
+                        {"value": "reject", "label": "Reject"}
+                    ]}]
+                }}
+            })],
+            true,
+        )
+        .await?;
+        let (mut io, agent) = permission_connection(&harness).await?;
+        begin_permission_prompt(&mut io).await?;
+        let messages = wait_for_prompt_response(&mut io).await?;
+        assert!(
+            messages
+                .iter()
+                .all(|message| message["method"] != "session/request_permission"),
+            "form.created must remain elicitation-only: {messages:?}"
+        );
+        assert!(
+            harness
+                .state
+                .writes
+                .lock()
+                .expect("permission writes")
+                .is_empty()
+        );
+        drop(io);
+        agent.await??;
+        harness.server.abort();
+        Ok(())
     }
 }

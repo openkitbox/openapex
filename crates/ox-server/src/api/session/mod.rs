@@ -34,7 +34,8 @@ mod user_shell;
 
 pub(crate) use compaction::compact;
 pub(crate) use control::{
-    background, command, generate, interrupt, move_session, permission_list, synthetic, wait_idle,
+    background, command, generate, interrupt, move_session, permission_get, permission_list,
+    permission_reply, synthetic, wait_idle,
 };
 pub(crate) use environment::set as set_environment;
 pub(crate) use inbox::{inbox_cancel, inbox_list, inbox_update};

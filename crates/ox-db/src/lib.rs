@@ -601,6 +601,22 @@ CREATE TABLE IF NOT EXISTS automation_lease (
 );
 "#;
 
+/// V25: project-scoped saved permission approvals. Only `allow` is stored;
+/// `action`/`resource` are the rule's matcher pair, and the uniqueness
+/// constraint makes a repeated "always" an idempotent upsert.
+const MIGRATION_V25: &str = r#"
+CREATE TABLE IF NOT EXISTS permission_saved (
+  id text PRIMARY KEY,
+  project_id text NOT NULL,
+  action text NOT NULL,
+  resource text NOT NULL,
+  time_created integer NOT NULL,
+  time_updated integer NOT NULL,
+  UNIQUE (project_id, action, resource)
+);
+CREATE INDEX IF NOT EXISTS permission_saved_project_idx ON permission_saved (project_id, action);
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
@@ -629,6 +645,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (22, MIGRATION_V22),
     (23, MIGRATION_V23),
     (24, MIGRATION_V24),
+    (25, MIGRATION_V25),
 ];
 
 /// Async handle to the database.
@@ -1097,9 +1114,10 @@ mod automation_migration_tests {
     #[tokio::test]
     async fn automation_migration_creates_tables_on_empty_db() -> anyhow::Result<()> {
         let db = Db::open_in_memory().await?;
-        assert_eq!(db.user_version().await?, 24);
+        assert_eq!(db.user_version().await?, 25);
         assert!(db.table_exists("automation").await?);
         assert!(db.table_exists("automation_lease").await?);
+        assert!(db.table_exists("permission_saved").await?);
 
         let tx = db.begin().await?;
         tx.execute(
@@ -1111,6 +1129,13 @@ mod automation_migration_tests {
         tx.execute(
             "INSERT INTO automation_lease (name, owner, token, expires_at)
              VALUES ('scheduler', 'host_a', 'token_a', 10)",
+            (),
+        )
+        .await?;
+        tx.execute(
+            "INSERT INTO permission_saved
+             (id, project_id, action, resource, time_created, time_updated)
+             VALUES ('psv_1', 'proj_1', 'shell', 'git status', 1, 2)",
             (),
         )
         .await?;
@@ -1133,18 +1158,31 @@ mod automation_migration_tests {
             (),
         )
         .await?;
+        tx.execute(
+            "INSERT INTO permission_saved
+             (id, project_id, action, resource, time_created, time_updated)
+             VALUES ('psv_2', 'proj_1', 'shell', 'git status', 1, 2)",
+            (),
+        )
+        .await?;
         tx.commit().await?;
 
         db.migrate().await?;
-        assert_eq!(db.user_version().await?, 24);
+        assert_eq!(db.user_version().await?, 25);
         assert!(db.table_exists("automation").await?);
         assert!(db.table_exists("automation_lease").await?);
+        assert!(db.table_exists("permission_saved").await?);
 
         let conn = db.acquire().await?;
         let mut stmt = conn
             .prepare("SELECT value FROM kv WHERE key = 'legacy'")
             .await?;
         assert_eq!(stmt.query_row(()).await?.get::<String>(0)?, "kept");
+        let mut stmt = conn
+            .prepare("SELECT id, action, resource FROM permission_saved WHERE project_id = ?1")
+            .await?;
+        let row = optional(&mut stmt, ("proj_1",)).await?;
+        assert!(row.is_some(), "V25 must not drop saved rows on upgrade");
         Ok(())
     }
 }

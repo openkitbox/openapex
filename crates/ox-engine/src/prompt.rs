@@ -1309,6 +1309,7 @@ mod tests {
             mode,
             system,
             tools: Tools::All,
+            permissions: &[],
             model: None,
         };
         system_static(&[], &agent)

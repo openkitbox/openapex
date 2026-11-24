@@ -23,6 +23,16 @@ use crate::support::{LocationRef, Prompt, Record};
 /// a session-wide model switch.
 pub const TURN_MODEL_KEY: &str = "model";
 
+/// The `metadata` key marking an inbox item delivered by an automation. Its
+/// presence means the turn must never create a permission request: the gate
+/// settles every tool call by rule and fails closed.
+pub const UNATTENDED_KEY: &str = "unattended";
+
+/// The `metadata` key carrying the unattended rule set derived from the
+/// automation's creation-time grants. The value is a JSON array of
+/// `ox_schema::permission::Rule`.
+pub const UNATTENDED_RULES_KEY: &str = "unattendedRules";
+
 /// Upstream `SessionInbox.Delivery` literal union.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]

@@ -11,7 +11,7 @@
 //! - `prompt-input.ts`   -> [`FileInput`]
 //! - `location.ts`       -> [`LocationRef`]
 //! - `session-fork.ts`   -> [`ForkBoundary`]
-//! - `permission.ts`     -> [`Rule`], [`Effect`]
+//! - `permission.ts`     -> [`crate::permission`]
 //! - `shell.ts`          -> [`ShellStatus`], [`ShellOutput`], [`ShellInfo`]
 //! - `session-metadata.ts` -> [`SessionMetadata`]
 //!
@@ -28,6 +28,11 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// `Effect` and `Rule` live in [`crate::permission`] now. This re-export keeps
+/// existing `support::{Effect, Rule}` imports working without a second
+/// definition.
+pub use crate::permission::{Effect, Rule};
 
 /// The `kv` key for a session's memory participation marker.
 /// The engine owns its meaning; fork projection preserves the stored marker.
@@ -343,27 +348,6 @@ pub enum ForkBoundary {
         #[serde(rename = "messageID")]
         message_id: String,
     },
-}
-
-// ---------------------------------------------------------------------------
-// permission.ts — Rule / Effect
-// ---------------------------------------------------------------------------
-
-/// Upstream `Permission.Effect` literal union.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Effect {
-    Allow,
-    Deny,
-    Ask,
-}
-
-/// Upstream `Permission.Rule` (`Permission.Ruleset` is `Vec<Rule>`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Rule {
-    pub action: String,
-    pub resource: String,
-    pub effect: Effect,
 }
 
 // ---------------------------------------------------------------------------

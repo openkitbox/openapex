@@ -294,24 +294,48 @@ fn spawn_tool_task(
     // The session's live toolset rides in the context: `capability_search`
     // indexes its catalog from here.
     let registry = ctx.tools.clone();
+    let subagent_handle = registry.subagent_handle.clone();
     let gate = super::super::permissions::Gate {
+        service: Arc::clone(&ctx.permissions),
         config: Arc::clone(&ctx.config),
-        db: ctx.db.clone(),
-        grants: Arc::clone(&ctx.grants),
+        agent: ctx.agent,
+        unattended: ctx.unattended.clone(),
+        source: Some(super::super::permissions::SourceRef {
+            message_id: message_id.clone(),
+            call_id: call_id.clone(),
+        }),
     };
+    // The child session inherits the parent's unattended marker. The registry
+    // owns this per-call side table, so `ToolContext` stays unchanged and the
+    // marker is consumed exactly once by the subagent tool.
+    if tool.name() == "subagent"
+        && let (Some(handle), Some(rules)) = (&subagent_handle, &ctx.unattended)
+    {
+        handle.mark_unattended(&call_id, rules);
+    }
     // Decided here, on the name alone, so the task needs no config handle:
     // a successful run of an external-content tool taints the session.
     let external_content = ctx
         .config
         .magic_context
         .is_external_content_tool(tool.name());
+    // The hub's registered names are authoritative: only tools it handed to
+    // the registry use the `mcp` permission action. Borrowed check, no clone.
+    let is_mcp = ctx.mcp.has_tool(tool.name());
     let db = ctx.db.clone();
     let live_tool_metadata = Arc::clone(&registry.live_tool_metadata);
     tokio::spawn(async move {
         // The permission gate runs inside the task so an `ask` that waits on
         // the user neither stalls the stream nor the sibling calls.
         if let Decision::Deny(reason) = gate
-            .authorize(&session_id, &directory, tool.name(), &input, &cancellation)
+            .authorize(
+                &session_id,
+                &directory,
+                tool.name(),
+                &input,
+                is_mcp,
+                &cancellation,
+            )
             .await
         {
             let assistant_message_id = message_id.clone();
@@ -333,6 +357,9 @@ fn spawn_tool_task(
             };
             let publish_result = bus.publish(event).await;
             live_tool_metadata.clear(&assistant_message_id, &call_id_for_cleanup);
+            if let Some(handle) = &subagent_handle {
+                let _ = handle.take_unattended(&call_id_for_cleanup);
+            }
             return publish_result.map_err(|source| ToolSettlementError {
                 call_id: call_id_for_cleanup,
                 stage: "permission settlement",
@@ -360,6 +387,9 @@ fn spawn_tool_task(
             )
             .await
         };
+        if let Some(handle) = &subagent_handle {
+            let _ = handle.take_unattended(&call_id);
+        }
         if external_content && output.error.is_none() {
             // Marked before the success is published, so a fold triggered by
             // this very step already sees the session as tainted.

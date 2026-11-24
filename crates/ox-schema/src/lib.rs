@@ -8,6 +8,9 @@ pub mod id;
 pub mod inbox;
 pub mod message;
 pub mod paths;
+pub mod permission;
 pub mod slug;
 pub mod support;
 pub mod wire;
+
+pub use permission::{Effect, Rule};

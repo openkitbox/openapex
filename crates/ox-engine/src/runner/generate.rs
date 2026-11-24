@@ -63,7 +63,8 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
         instruction_baselines: Arc::clone(&inner.instruction_baselines),
         calibrations: Arc::clone(&inner.calibrations),
         cache_ledger: Arc::clone(&inner.cache_ledger),
-        grants: Arc::clone(&inner.grants),
+        permissions: Arc::clone(&inner.permissions),
+        unattended: None,
         // The session handle's cached git-toplevel anchor (the same slot the
         // busy period's steps use); no live registry entry keeps a fresh,
         // unused cache.

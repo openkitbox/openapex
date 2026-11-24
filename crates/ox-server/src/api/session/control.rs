@@ -5,6 +5,7 @@ use serde_json::json;
 
 use ox_schema::event::SessionEventData;
 use ox_schema::id;
+use ox_schema::permission::Reply;
 use ox_schema::support::LocationRef;
 
 use super::inbox::load_inbox_row;
@@ -12,6 +13,7 @@ use super::response::{
     conflict_error, invalid_request, no_content, parse_body, session_not_found, unknown_error,
 };
 use super::session_row::{load_session, subpath_of};
+use crate::api::permission::{echo_location, permission_not_found};
 use crate::api::state;
 
 // ---------------------------------------------------------------------------
@@ -127,8 +129,7 @@ fn background_notice(moved: &[ox_tools::jobs::JobInfo]) -> String {
 // ---------------------------------------------------------------------------
 
 /// `GET /api/session/{sessionID}/permission` — upstream `session.permission.list`.
-/// ox executes tools without an approval flow, so no permission request is
-/// ever pending and the list is always empty.
+/// The list is derived from the runner's gate, never from a second store.
 #[handler]
 pub(crate) async fn permission_list(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     let Some(app) = state(depot, res) else {
@@ -138,10 +139,95 @@ pub(crate) async fn permission_list(req: &mut Request, depot: &mut Depot, res: &
         invalid_request(res, "Missing sessionID");
         return;
     };
+    echo_location(req, res);
     match load_session(&app.db, &session_id).await {
-        Ok(Some(_)) => res.render(Json(json!({ "data": [] }))),
+        Ok(Some(_)) => {
+            let requests = app
+                .permissions
+                .pending()
+                .iter()
+                .filter(|request| request.session_id == session_id)
+                .map(|request| serde_json::to_value(request.as_ref()))
+                .collect::<Result<Vec<_>, _>>();
+            match requests {
+                Ok(requests) => res.render(Json(json!({ "data": requests }))),
+                Err(error) => unknown_error(res, &anyhow::anyhow!("{error}")),
+            }
+        }
         Ok(None) => session_not_found(res, &session_id),
         Err(error) => unknown_error(res, &error),
+    }
+}
+
+/// `GET /api/session/{sessionID}/permission/{requestID}` — upstream
+/// `session.permission.get`. A request owned by another session is missing.
+#[handler]
+pub(crate) async fn permission_get(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(app) = state(depot, res) else {
+        return;
+    };
+    let Some(session_id) = req.param::<String>("sessionID") else {
+        invalid_request(res, "Missing sessionID");
+        return;
+    };
+    let Some(request_id) = req.param::<String>("requestID") else {
+        invalid_request(res, "Missing requestID");
+        return;
+    };
+    echo_location(req, res);
+    match app.permissions.pending_one(&request_id) {
+        Some(request) if request.session_id == session_id => {
+            match serde_json::to_value(request.as_ref()) {
+                Ok(data) => res.render(Json(json!({ "data": data }))),
+                Err(error) => unknown_error(res, &anyhow::anyhow!("{error}")),
+            }
+        }
+        _ => permission_not_found(res, &request_id),
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct ReplyBody {
+    #[serde(default)]
+    decision: Option<Reply>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// `POST /api/session/{sessionID}/permission/{requestID}/reply` — upstream
+/// `session.permission.reply`. The gate consumes a successful reply exactly
+/// once, so a repeated POST sees 404.
+#[handler]
+pub(crate) async fn permission_reply(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let Some(app) = state(depot, res) else {
+        return;
+    };
+    let Some(session_id) = req.param::<String>("sessionID") else {
+        invalid_request(res, "Missing sessionID");
+        return;
+    };
+    let Some(request_id) = req.param::<String>("requestID") else {
+        invalid_request(res, "Missing requestID");
+        return;
+    };
+    echo_location(req, res);
+    let Some(body) = parse_body::<ReplyBody>(req, res).await else {
+        return;
+    };
+    let Some(decision) = body.decision else {
+        invalid_request(res, "Missing decision");
+        return;
+    };
+    match app
+        .permissions
+        .reply(&session_id, &request_id, decision, body.message)
+        .await
+    {
+        Ok(()) => no_content(res),
+        Err(ox_engine::permission::ReplyError::NotFound) => permission_not_found(res, &request_id),
+        Err(ox_engine::permission::ReplyError::Invalid(message)) => {
+            invalid_request(res, &message);
+        }
     }
 }
 

@@ -122,9 +122,8 @@ struct Inner {
     /// Per-session prompt-cache accounting, reported per attempt and read only
     /// by diagnostics ([`Runner::diagnostic_cache_ledger`]).
     cache_ledger: Arc<CacheLedger>,
-    /// Per-session "allow for this session" permission grants (process
-    /// memory; a restart asks again).
-    grants: Arc<permissions::Grants>,
+    /// The one permission service, shared with the HTTP reply endpoints.
+    permissions: Arc<crate::permission::PermissionService>,
     /// Serializes registry replacement with process-table cleanup. Never held
     /// across Activity, admission, DB access or await; shard guards are dropped
     /// before the attached tables are locked.
@@ -366,7 +365,6 @@ impl Inner {
         lock(&self.instruction_baselines).remove(session_id);
         crate::mctx::calibration::forget(&self.calibrations, session_id);
         self.cache_ledger.forget(session_id);
-        self.grants.forget(session_id);
     }
 }
 
@@ -445,20 +443,25 @@ impl Runner {
             mcp,
             tools,
         }));
+        let stop = CancellationToken::new();
         let inner = Arc::new(Inner {
             directory,
             home,
+            permissions: Arc::new(crate::permission::PermissionService::new(
+                db.clone(),
+                bus.clone(),
+                stop.child_token(),
+            )),
             db,
             bus,
             live,
             instruction_baselines: Default::default(),
             calibrations: Default::default(),
             cache_ledger: Default::default(),
-            grants: Default::default(),
             registry_lifecycle: Mutex::new(()),
             sessions: DashMap::new(),
             tasks: tasks::Tasks::default(),
-            stop: CancellationToken::new(),
+            stop,
         });
         let tools = inner.live.current().tools.clone();
         if let Some(handle) = tools.subagent_handle.clone() {
@@ -482,6 +485,13 @@ impl Runner {
     #[must_use]
     pub fn live(&self) -> Arc<Live> {
         Arc::clone(&self.inner.live)
+    }
+
+    /// The shared pending-request authority. HTTP handlers (task T5) use this
+    /// exact handle; they never keep a second pending map.
+    #[must_use]
+    pub fn permission_service(&self) -> Arc<crate::permission::PermissionService> {
+        Arc::clone(&self.inner.permissions)
     }
 
     #[must_use]
@@ -958,7 +968,8 @@ impl ActorTask {
                 instruction_baselines: self.inner.instruction_baselines.clone(),
                 calibrations: self.inner.calibrations.clone(),
                 cache_ledger: Arc::clone(&self.inner.cache_ledger),
-                grants: Arc::clone(&self.inner.grants),
+                permissions: Arc::clone(&self.inner.permissions),
+                unattended: None,
                 instruction_root: self.handle.instruction_root.clone(),
                 fold_in_flight: Arc::clone(&self.handle.fold_in_flight),
                 tasks: self.inner.tasks.clone(),

@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 
+use ox_schema::permission::Rule;
+
 pub use ox_llm::config::{
     CandidateConfig, DEFAULT_LIMITED_STALL, DEFAULT_PROVIDER_NAME, EndpointLimits, LlmConfig,
     ModelRouteConfig, ProviderConfig,
@@ -460,51 +462,89 @@ where
         .collect()
 }
 
+fn default_permission_ask() -> Permission {
+    Permission::Ask
+}
+
 /// Tool permissions (`[permissions]` section). Every tool call — built-in,
-/// `ctx_*` or MCP — is checked against this table before it runs. The
-/// default is `allow` for everything, which is the pre-permission behaviour;
-/// a user opts into prompting or blocking per tool:
+/// `ctx_*` or MCP — is checked against the ordered upstream `rules` and this
+/// table before it runs. With no matching rule the fallback is upstream's
+/// `ask` rather than a silent allow:
 ///
 /// ```toml
 /// [permissions]
-/// default = "allow"
+/// default = "ask"
 ///
-/// [permissions.tools]
-/// shell = { ask_if = ["rm -rf", "git push", "sudo"] }
-/// webfetch = "ask"
-/// write = "deny"
+/// [[permissions.rules]]
+/// action = "shell"
+/// resource = "git push*"
+/// effect = "ask"
+///
+/// [permissions.tools] # ox-specific floor; no rule can relax it
+/// shell = { ask_if = ["sudo"] }
 /// ```
 ///
-/// An `ask` prompt is a form on the session's root (the window the user is
-/// looking at), with "allow once" / "allow for this session" / "deny". A
-/// child session's call therefore asks on its parent's screen rather than
-/// hanging on a form no client shows.
-#[derive(Debug, Clone, Deserialize, Default)]
+/// An `ask` is an ephemeral `permission.asked` request on the **calling**
+/// session; a child session uses its own `sessionID` plus
+/// `metadata.parentID` so the parent can display it. Replies are
+/// `once` / `always` / `reject`; a permanent refusal is a `deny` rule.
+#[derive(Debug, Clone, Deserialize)]
 pub struct PermissionsConfig {
-    /// Policy for a tool with no entry under `tools`.
-    #[serde(default)]
+    /// Fallback for a call no rule matches. `ask` here, unlike
+    /// [`Permission`]'s own `allow` default used by `[permissions.tools]`.
+    #[serde(default = "default_permission_ask")]
     pub default: Permission,
+    /// Upstream ruleset, evaluated in declaration order.
+    #[serde(default)]
+    pub rules: Vec<Rule>,
     /// Per-tool policies, keyed by the advertised tool name (an MCP tool by
     /// its prefixed name, e.g. `github_create_issue`).
     #[serde(default)]
     pub tools: BTreeMap<String, ToolPermission>,
 }
 
+impl Default for PermissionsConfig {
+    fn default() -> Self {
+        Self {
+            default: Permission::Ask,
+            rules: Vec::new(),
+            tools: BTreeMap::new(),
+        }
+    }
+}
+
 impl PermissionsConfig {
-    /// The policy for one call: the tool's entry (or `default`), escalated to
+    /// Reject malformed rules at load/reload time: a blank action or resource
+    /// cannot be matched and must never silently widen the ruleset.
+    pub fn validate(&self) -> Result<()> {
+        for (index, rule) in self.rules.iter().enumerate() {
+            ensure!(
+                !rule.action.trim().is_empty(),
+                "[[permissions.rules]] action must not be empty (rule {index})"
+            );
+            ensure!(
+                !rule.resource.trim().is_empty(),
+                "[[permissions.rules]] resource must not be empty (rule {index})"
+            );
+        }
+        Ok(())
+    }
+
+    /// The explicitly configured floor for one tool, escalated to
     /// [`Permission::Ask`] when the entry's `ask_if` matches `arguments`.
+    /// `None` means no floor was configured: the ordered rules decide the
+    /// call, and `default` remains their fallback rather than a floor.
     #[must_use]
-    pub fn policy_for(&self, tool: &str, arguments: &str) -> Permission {
-        match self.tools.get(tool) {
-            None => self.default,
-            Some(ToolPermission::Policy(policy)) => *policy,
-            Some(ToolPermission::Rule(rule)) => match rule.policy {
+    pub fn tool_floor(&self, tool: &str, arguments: &str) -> Option<Permission> {
+        self.tools.get(tool).map(|entry| match entry {
+            ToolPermission::Policy(policy) => *policy,
+            ToolPermission::Rule(rule) => match rule.policy {
                 Permission::Allow if rule.ask_if.iter().any(|re| re.is_match(arguments)) => {
                     Permission::Ask
                 }
                 policy => policy,
             },
-        }
+        })
     }
 
     /// Whether any call could ever prompt or be refused — `false` for the
@@ -512,6 +552,7 @@ impl PermissionsConfig {
     #[must_use]
     pub fn is_permissive(&self) -> bool {
         self.default == Permission::Allow
+            && self.rules.is_empty()
             && self.tools.values().all(|entry| match entry {
                 ToolPermission::Policy(policy) => *policy == Permission::Allow,
                 ToolPermission::Rule(rule) => {
@@ -624,7 +665,7 @@ pub struct Config {
     /// Per-turn step cap (`[turn]` section).
     #[serde(default)]
     pub turn: TurnConfig,
-    /// Tool permissions (`[permissions]` section). Allow-all by default.
+    /// Tool permissions (`[permissions]` section). Ask by default.
     #[serde(default)]
     pub permissions: PermissionsConfig,
     /// Auxiliary-request model roles (`[roles]` section). Absent means title
@@ -753,6 +794,7 @@ impl Config {
         self.magic_context = std::mem::take(&mut self.magic_context).validated();
         self.mcp.validate()?;
         self.mcp.events.validate()?;
+        self.permissions.validate()?;
         if let Some(timezone) = self.timezone.as_deref() {
             anyhow::ensure!(
                 !timezone.trim().is_empty(),
@@ -1272,6 +1314,81 @@ mod example_config_tests {
                 "example MCP server `{name}` must stay disabled"
             );
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod permissions_config_tests {
+    use ox_schema::permission::Effect;
+
+    use super::{Config, Permission, PermissionsConfig};
+
+    fn load_raw(raw: &str, name: &str) -> anyhow::Result<Config> {
+        let path = std::env::temp_dir().join(format!(
+            "ox-permissions-config-{}-{name}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, raw)?;
+        let result = Config::load_from(path.clone());
+        let _ = std::fs::remove_file(&path);
+        result
+    }
+
+    #[test]
+    fn permissions_default_is_ask() -> anyhow::Result<()> {
+        assert_eq!(PermissionsConfig::default().default, Permission::Ask);
+        let config: Config = toml::from_str("")?;
+        assert_eq!(config.permissions.default, Permission::Ask);
+        assert!(config.permissions.rules.is_empty());
+        assert!(!config.permissions.is_permissive());
+        let loaded = load_raw("", "empty")?;
+        assert_eq!(loaded.permissions.default, Permission::Ask);
+        Ok(())
+    }
+
+    #[test]
+    fn permissions_invalid_rules_fail_load() {
+        for (field, action, resource) in [
+            ("action", "", "shell git push*"),
+            ("resource", "shell", ""),
+            ("resource", "shell", "   "),
+        ] {
+            let raw = format!(
+                "[[permissions.rules]]\naction = \"{action}\"\nresource = \"{resource}\"\neffect = \"deny\"\n"
+            );
+            let error = load_raw(&raw, field).expect_err("empty rule field must fail config load");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(field),
+                "error must name the invalid `{field}` field: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn permissions_rules_keep_configured_order() -> anyhow::Result<()> {
+        let loaded = load_raw(
+            r#"
+[permissions]
+default = "ask"
+
+[[permissions.rules]]
+action = "shell"
+resource = "git push*"
+effect = "ask"
+
+[[permissions.rules]]
+action = "read"
+resource = "*.env"
+effect = "deny"
+"#,
+            "order",
+        )?;
+        assert_eq!(loaded.permissions.rules.len(), 2);
+        assert_eq!(loaded.permissions.rules[0].action, "shell");
+        assert_eq!(loaded.permissions.rules[1].action, "read");
+        assert_eq!(loaded.permissions.rules[1].effect, Effect::Deny);
         Ok(())
     }
 }

@@ -15,7 +15,7 @@ use std::time::Duration;
 use anyhow::{Result, bail, ensure};
 use futures_core::future::BoxFuture;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
@@ -42,7 +42,8 @@ use ox_db::Db;
 use ox_engine::runner::{Live, Runner, ToolRegistry};
 use ox_schema::event::SessionEventData;
 use ox_schema::id::now_millis;
-use ox_schema::inbox::{Delivery, Item, UserPayload};
+use ox_schema::inbox::{Delivery, Item, UNATTENDED_KEY, UNATTENDED_RULES_KEY, UserPayload};
+use ox_schema::permission::{Effect, Rule};
 use ox_schema::support::{LocationRef, Prompt as PromptPayload, Record, SessionMetadata};
 use ox_tools::automation::AutomationService;
 
@@ -369,6 +370,31 @@ fn grants_for(action: &Action, owner: &str) -> Grants {
     grants
 }
 
+/// Translate the same creation-time grants into the rule set the permission
+/// gate consults for an unattended turn. A grant that was never approved
+/// produces no allow rule, so the gate denies the call instead of asking.
+fn unattended_rules_for(action: &Action, owner: &str) -> Vec<Rule> {
+    let allow = |action: &str, resource: &str| Rule {
+        action: action.to_owned(),
+        resource: resource.to_owned(),
+        effect: Effect::Allow,
+    };
+    match action {
+        Action::Shell { command } => vec![allow("shell", command)],
+        Action::Code { .. } => match ox_tools::agent::AUTOMATION_TOOLS {
+            ox_tools::agent::Tools::Only(names) => {
+                names.iter().map(|name| allow("unknown", name)).collect()
+            }
+            _ => Vec::new(),
+        },
+        Action::Prompt { to, .. } => match to {
+            Some(Target::Subagent { subagent }) => vec![allow("subagent", subagent)],
+            Some(Target::Session { session }) => vec![allow("session", session)],
+            None => vec![allow("session", owner)],
+        },
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateInput {
@@ -640,7 +666,19 @@ impl ServerPrompt {
         Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
     }
 
-    async fn enqueue(&self, session_id: &str, message_id: &str, text: &str) -> Result<()> {
+    async fn enqueue(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        text: &str,
+        unattended_rules: Option<&[Rule]>,
+    ) -> Result<()> {
+        let metadata = unattended_rules.map(|rules| {
+            let mut metadata = Record::default();
+            metadata.insert(UNATTENDED_KEY.to_owned(), json!(true));
+            metadata.insert(UNATTENDED_RULES_KEY.to_owned(), json!(rules));
+            metadata
+        });
         self.bus
             .publish(SessionEventData::InboxEnqueued {
                 session_id: session_id.to_owned(),
@@ -653,7 +691,7 @@ impl ServerPrompt {
                             agents: None,
                             skills: None,
                         },
-                        metadata: Some(Record::default()),
+                        metadata: Some(metadata.unwrap_or_default()),
                     },
                     delivery: Delivery::Steer,
                 },
@@ -673,7 +711,9 @@ impl PromptPort for ServerPrompt {
                 "target session {} left the automation's project",
                 req.session_id
             );
-            self.enqueue(req.session_id, &req.message_id, req.text)
+            let rules = unattended_rules_for(&automation.action, req.session_id);
+            let rules = req.unattended.then_some(rules.as_slice());
+            self.enqueue(req.session_id, &req.message_id, req.text, rules)
                 .await
         })
     }
@@ -713,7 +753,10 @@ impl PromptPort for ServerPrompt {
                     version: env!("CARGO_PKG_VERSION").to_owned(),
                 })
                 .await?;
-            self.enqueue(&req.child_id, &req.message_id, req.text).await
+            let rules = unattended_rules_for(&automation.action, req.parent_id);
+            let rules = req.unattended.then_some(rules.as_slice());
+            self.enqueue(&req.child_id, &req.message_id, req.text, rules)
+                .await
         })
     }
 }

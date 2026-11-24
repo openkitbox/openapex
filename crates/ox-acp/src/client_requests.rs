@@ -1,6 +1,7 @@
 //! Negotiated ACP client capabilities and owned client interactions.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol::v1::ConnectionTo;
@@ -8,17 +9,29 @@ use agent_client_protocol::v1::schema::{
     CreateElicitationRequest, ElicitationAcceptAction, ElicitationAction, ElicitationContentValue,
     ElicitationFormMode, ElicitationSchema, ElicitationSessionScope, PermissionOption,
     PermissionOptionKind, RequestPermissionOutcome, RequestPermissionRequest, SessionId,
-    ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::{Client, Error};
+use ox_schema::permission::Asked;
 use serde_json::{Value, json};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use super::internal;
 
+pub(crate) struct PermissionCall<'a> {
+    pub(crate) asked: &'a Asked,
+    pub(crate) client_session: &'a str,
+    pub(crate) connection: &'a ConnectionTo<Client>,
+    pub(crate) cancellation: &'a CancellationToken,
+    pub(crate) directory: &'a str,
+    pub(crate) settled: &'a Notify,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct ClientRequests {
     capabilities: Arc<Mutex<agent_client_protocol::v1::schema::ClientCapabilities>>,
+    pending_permissions: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
 }
 
 impl ClientRequests {
@@ -81,75 +94,123 @@ impl ClientRequests {
         CancellationToken::new()
     }
 
+    pub(crate) fn begin_permission(&self, request_id: &str) -> Option<Arc<Notify>> {
+        let mut pending = self
+            .pending_permissions
+            .lock()
+            .expect("permission registry poisoned");
+        if pending.contains_key(request_id) {
+            return None;
+        }
+        let notification = Arc::new(Notify::new());
+        pending.insert(request_id.to_owned(), notification.clone());
+        Some(notification)
+    }
+
+    pub(crate) fn finish_permission(&self, request_id: &str) {
+        self.pending_permissions
+            .lock()
+            .expect("permission registry poisoned")
+            .remove(request_id);
+    }
+
+    pub(crate) fn cancel_permission(&self, request_id: &str) -> bool {
+        let notification = self
+            .pending_permissions
+            .lock()
+            .expect("permission registry poisoned")
+            .remove(request_id);
+        let Some(notification) = notification else {
+            return false;
+        };
+        notification.notify_one();
+        true
+    }
+
     pub(crate) async fn request_permission(
         &self,
         http: &reqwest::Client,
         base: &str,
-        form: &Value,
-        connection: &ConnectionTo<Client>,
-        cancellation: &CancellationToken,
-        directory: &str,
+        call: PermissionCall<'_>,
     ) -> Result<PermissionResult, Error> {
-        let (session_id, form_id) = form_identity(form)?;
-        let field = form
-            .pointer("/fields")
-            .and_then(Value::as_array)
-            .and_then(|fields| {
-                fields.iter().find(|field| {
-                    field.get("type").and_then(Value::as_str) == Some("string")
-                        && field.get("key").and_then(Value::as_str) == Some("decision")
-                })
-            })
-            .ok_or_else(|| internal("unsupported form interaction"))?;
-        let options = field
-            .get("options")
-            .and_then(Value::as_array)
-            .ok_or_else(|| internal("permission form has no options"))?
-            .iter()
-            .filter_map(|option| {
-                Some(PermissionOption::new(
-                    option.get("value")?.as_str()?.to_owned(),
-                    option.get("label")?.as_str()?.to_owned(),
-                    permission_kind(option.get("value")?.as_str()?),
-                ))
-            })
-            .collect::<Vec<_>>();
-        if options.is_empty() {
-            return Err(internal("permission form has no valid options"));
+        let PermissionCall {
+            asked,
+            client_session,
+            connection,
+            cancellation,
+            directory,
+            settled,
+        } = call;
+        let tool_call_id = asked
+            .source
+            .as_ref()
+            .and_then(|source| serde_json::to_value(source).ok())
+            .and_then(|source| source.get("id").and_then(Value::as_str).map(str::to_owned))
+            .unwrap_or_else(|| asked.id.clone());
+        let mut fields = ToolCallUpdateFields::new()
+            .title(asked.message.as_deref().unwrap_or(&asked.action))
+            .status(ToolCallStatus::Pending)
+            .locations(permission_locations(&asked.resources));
+        if let Some(metadata) = &asked.metadata {
+            fields = fields.raw_input(Value::Object(metadata.clone()));
         }
         let request = RequestPermissionRequest::new(
-            SessionId::new(session_id.clone()),
-            ToolCallUpdate::new(
-                ToolCallId::new(form_id.clone()),
-                ToolCallUpdateFields::new()
-                    .title("Permission required")
-                    .status(ToolCallStatus::Pending),
-            ),
-            options,
+            SessionId::new(client_session),
+            ToolCallUpdate::new(ToolCallId::new(tool_call_id), fields),
+            permission_options(asked.save.as_deref()),
         );
         let sent = connection.send_request(request);
         let cancellation_handle = sent.cancellation_handle();
         let response = tokio::select! {
-            result = sent.block_task() => result?,
+            result = sent.block_task() => {
+                match result {
+                    Ok(response) => response,
+                    Err(error) => {
+                        let _ = cancellation_handle.cancel();
+                        reply_permission(http, base, asked, directory, "reject", None).await?;
+                        return Err(error);
+                    }
+                }
+            }
             () = cancellation.cancelled() => {
                 let _ = cancellation_handle.cancel();
-                settle_form_cancel(http, base, &session_id, &form_id, directory).await?;
+                reply_permission(http, base, asked, directory, "reject", None).await?;
+                return Ok(PermissionResult::Cancelled);
+            }
+            () = settled.notified() => {
+                let _ = cancellation_handle.cancel();
+                reply_permission(http, base, asked, directory, "reject", None).await?;
                 return Ok(PermissionResult::Cancelled);
             }
         };
         match response.outcome {
             RequestPermissionOutcome::Cancelled => {
-                settle_form_cancel(http, base, &session_id, &form_id, directory).await?;
+                reply_permission(http, base, asked, directory, "reject", None).await?;
                 Ok(PermissionResult::Cancelled)
             }
             RequestPermissionOutcome::Selected(selected) => {
-                let value = selected.option_id.0.as_ref();
-                settle_form_answer(http, base, &session_id, &form_id, directory, json!(value))
+                let option = selected.option_id.0.as_ref();
+                let decision = match option {
+                    "once" => "once",
+                    "always" => "always",
+                    _ => "reject",
+                };
+                let message = if decision == "reject" {
+                    selected
+                        .meta
+                        .as_ref()
+                        .and_then(|meta| meta.get("message"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                } else {
+                    None
+                };
+                reply_permission(http, base, asked, directory, decision, message.as_deref())
                     .await?;
-                Ok(PermissionResult::Selected(value.to_owned()))
+                Ok(PermissionResult::Selected(decision.to_owned()))
             }
             _ => {
-                settle_form_cancel(http, base, &session_id, &form_id, directory).await?;
+                reply_permission(http, base, asked, directory, "reject", None).await?;
                 Err(internal("unsupported permission response"))
             }
         }
@@ -240,6 +301,66 @@ pub(crate) enum ElicitationResult {
     Cancelled,
 }
 
+fn permission_locations(resources: &[String]) -> Vec<ToolCallLocation> {
+    resources
+        .iter()
+        .filter(|resource| Path::new(resource).is_absolute())
+        .map(ToolCallLocation::new)
+        .collect()
+}
+
+fn permission_options(save: Option<&[String]>) -> Vec<PermissionOption> {
+    let mut options = vec![PermissionOption::new(
+        "once",
+        "Allow once",
+        PermissionOptionKind::AllowOnce,
+    )];
+    if save.is_some_and(|save| !save.is_empty()) {
+        options.push(PermissionOption::new(
+            "always",
+            "Always allow",
+            PermissionOptionKind::AllowAlways,
+        ));
+    }
+    options.push(PermissionOption::new(
+        "reject",
+        "Reject",
+        PermissionOptionKind::RejectOnce,
+    ));
+    options
+}
+
+async fn reply_permission(
+    http: &reqwest::Client,
+    base: &str,
+    asked: &Asked,
+    directory: &str,
+    decision: &str,
+    message: Option<&str>,
+) -> Result<(), Error> {
+    let mut body = json!({"decision": decision});
+    if let Some(message) = message {
+        body["message"] = json!(message);
+    }
+    let response = http
+        .post(format!(
+            "{base}/api/session/{}/permission/{}/reply",
+            asked.session_id, asked.id
+        ))
+        .header("x-opencode-directory", directory)
+        .json(&body)
+        .send()
+        .await
+        .map_err(internal)?;
+    if response.status().is_success() || response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(());
+    }
+    Err(internal(format!(
+        "permission reply returned {}",
+        response.status()
+    )))
+}
+
 fn form_identity(form: &Value) -> Result<(String, String), Error> {
     let form_id = form
         .get("id")
@@ -269,14 +390,6 @@ fn elicitation_answer(content: &BTreeMap<String, ElicitationContentValue>) -> Re
         answer.insert(key.clone(), value);
     }
     Ok(Value::Object(answer))
-}
-
-fn permission_kind(value: &str) -> PermissionOptionKind {
-    match value {
-        "once" => PermissionOptionKind::AllowOnce,
-        "session" => PermissionOptionKind::AllowAlways,
-        _ => PermissionOptionKind::RejectOnce,
-    }
 }
 
 async fn settle_form_cancel(
@@ -342,6 +455,34 @@ mod tests {
     use agent_client_protocol::v1::schema::{
         ClientCapabilities, ElicitationCapabilities, ElicitationFormCapabilities,
     };
+
+    #[test]
+    fn permission_options_hide_always_without_save_targets() {
+        let ids = |save: Option<&[String]>| -> Vec<String> {
+            super::permission_options(save)
+                .into_iter()
+                .map(|option| option.option_id.0.to_string())
+                .collect()
+        };
+        assert_eq!(
+            ids(None),
+            ["once", "reject"],
+            "save=None has no Always option"
+        );
+
+        assert_eq!(
+            ids(Some(&[])),
+            ["once", "reject"],
+            "empty save has no Always option"
+        );
+
+        let save = ["git status".to_owned()];
+        assert_eq!(
+            ids(Some(&save)),
+            ["once", "always", "reject"],
+            "save targets allow Always"
+        );
+    }
 
     #[test]
     fn negotiated_capabilities_gate_elicitation_modes() {

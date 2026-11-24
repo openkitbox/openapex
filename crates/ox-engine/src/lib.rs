@@ -7,5 +7,6 @@
 
 mod completion;
 pub mod mctx;
+pub mod permission;
 pub mod prompt;
 pub mod runner;

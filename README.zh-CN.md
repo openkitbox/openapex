@@ -163,23 +163,48 @@ MCP 连接和工具注册表是进程级的，不按会话隔离。连接或断�
 
 ### 权限
 
-每个工具调用在执行前都会经过权限检查。默认策略是 `allow`，可通过 `[permissions]`
-按工具收紧：
+每次工具调用（内置工具、`ctx_*` 或 MCP）执行前都会检查权限。规则按层叠加
+（内置 agent 基础规则 → `[permissions.rules]` → session 规则）；这些规则层内及
+跨层都以**最后一条**匹配规则为准，`deny` 立即短路。已保存的授权只在规则要求
+询问时参与结算，不覆盖 `allow`/`deny`。
+`[permissions] default` 是 `ask` 而不是 `allow`。内置 agent 带有上游基础规则
+（`*/*` allow、`read *.env` 与 `read *.env.*` ask、`read *.env.example` allow），
+所以普通读取/glob 不会弹窗，读取 `.env` 才会。
 
 ```toml
 [permissions]
-default = "allow"  # allow | ask | deny
+default = "ask"                    # ask | allow | deny
 
-[permissions.tools]
+[[permissions.rules]]
+action = "shell"
+resource = "git push*"
+effect = "ask"                     # allow | ask | deny
+
+[[permissions.rules]]             # 永久拒绝；没有 always_deny
+action = "edit"
+resource = "*.pem"
+effect = "deny"
+
+[permissions.tools]                # ox 专有下限，只能收紧结果
 shell = { ask_if = ["rm -rf", "git push", "sudo"] }
 webfetch = "ask"
-write = "deny"
 ```
 
-`ask_if` 是匹配调用参数的正则；`shell` 匹配命令文本，其他工具匹配紧凑 JSON。
-`ask` 会在用户的 root session 中提问，子 agent 的请求也会转达到这里；拒绝、
-五分钟内未回答或中断都视为拒绝。
-会话级授权只保存在进程内，重启后重置。MCP 工具使用带服务器前缀的名称。
+`action` 和 `resource` 必填，留空会在加载配置时被拒绝。`ask_if` 是匹配调用参数的
+正则（`shell` 匹配命令文本，其他工具匹配紧凑 JSON）；命中只能把 `allow` 升级为
+`ask`，不能放宽策略。MCP 工具使用带服务器前缀的名称。
+
+`ask` 会发出 `permission.asked` 请求，答复三选：`once`（仅当前调用）、`always`
+（把 allow 规则写入 `ox.db` 中项目级的 `permission_saved` 表；删除该记录即撤销，
+同一 session/项目的 pending 请求会按新规则重评）和 `reject`（仅当前调用失败，
+可附带消息反馈给模型）。没有「本次会话一直允许」选项。子会话的请求使用自己的
+session ID 加 `metadata.parentID` 呈现给父会话。300 秒未答复、中断或断线均按拒绝
+处理。自动化/unattended 会话永不等待：规则结算后只有 `allow` 放行，其余一律拒绝。
+
+客户端可通过 `/api/config`（permissions 与 agents）、`GET /api/permission/request`、
+`GET /api/permission/saved`、`PATCH`/`DELETE /api/permission/saved/{id}`、
+`GET /api/session/{id}/permission[/{requestID}]` 和
+`POST /api/session/{id}/permission/{requestID}/reply` 读取与管理权限。
 
 ## OpenCode 集成
 
