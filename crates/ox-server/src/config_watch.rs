@@ -135,7 +135,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use notify::event::{CreateKind, ModifyKind, RenameMode};
+    use notify::event::{CreateKind, Flag, ModifyKind, RemoveKind, RenameMode};
 
     #[test]
     fn source_only_rename_in_parent_is_a_reload_candidate() {
@@ -197,6 +197,79 @@ mod tests {
             config.parent().expect("config parent"),
             &config
         ));
+    }
+
+    #[test]
+    fn relative_watched_root_paths_are_compared_in_the_reported_form() {
+        // notify 9 reports event paths with the same root representation passed to watch.
+        let parent = Path::new("config");
+        let config = parent.join("ox.toml");
+        let modify = Event {
+            kind: EventKind::Modify(ModifyKind::Any),
+            paths: vec![parent.join("ox.toml")],
+            attrs: Default::default(),
+        };
+        let rename = Event {
+            kind: EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+            paths: vec![parent.join(".ox.toml.tmp"), parent.join("ox.toml")],
+            attrs: Default::default(),
+        };
+        let nested = Event {
+            kind: EventKind::Create(CreateKind::File),
+            paths: vec![parent.join("nested/ox.toml")],
+            attrs: Default::default(),
+        };
+
+        assert!(event_targets_config(&modify, parent, &config));
+        assert!(event_targets_config(&rename, parent, &config));
+        assert!(!event_targets_config(&nested, parent, &config));
+    }
+
+    #[test]
+    fn remove_targets_only_the_config_path() {
+        let parent = Path::new("/tmp/project");
+        let config = parent.join("ox.toml");
+        let matching = Event {
+            kind: EventKind::Remove(RemoveKind::File),
+            paths: vec![config.clone()],
+            attrs: Default::default(),
+        };
+        let sibling = Event {
+            kind: EventKind::Remove(RemoveKind::File),
+            paths: vec![parent.join("other.toml")],
+            attrs: Default::default(),
+        };
+
+        assert!(event_targets_config(&matching, parent, &config));
+        assert!(!event_targets_config(&sibling, parent, &config));
+    }
+
+    #[test]
+    fn rescan_is_a_candidate_even_with_unrelated_paths() {
+        let parent = Path::new("/tmp/project");
+        let config = parent.join("ox.toml");
+        let rescan = Event::new(EventKind::Other)
+            .set_flag(Flag::Rescan)
+            .add_path(parent.join("other.toml"));
+
+        assert!(rescan.need_rescan());
+        assert!(event_targets_config(&rescan, parent, &config));
+    }
+
+    #[test]
+    fn rename_candidate_with_unchanged_bytes_is_suppressed() {
+        let parent = Path::new("config");
+        let config = parent.join("ox.toml");
+        let rename = Event {
+            kind: EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            paths: vec![parent.join(".ox.toml.tmp")],
+            attrs: Default::default(),
+        };
+        let mut contents = ContentTracker::new(Some(b"a = 1".to_vec()));
+
+        assert!(event_targets_config(&rename, parent, &config));
+        assert!(!contents.update(Ok(b"a = 1".to_vec())));
+        assert!(contents.update(Ok(b"a = 2".to_vec())));
     }
 
     #[test]

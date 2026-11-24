@@ -35,12 +35,15 @@ pub fn scan(source: &str) -> Result<Scan> {
     let wrapped = wrap(source);
     let allocator = Allocator::default();
     let parsed = Parser::new(&allocator, &wrapped, Default::default()).parse();
+    ensure!(!parsed.fatal_error, "code has a fatal parse error");
     ensure!(
         parsed.diagnostics.is_empty(),
         "code has syntax errors: {:?}",
         parsed.diagnostics.first()
     );
-    let built = SemanticBuilder::new().build(&parsed.program);
+    let built = SemanticBuilder::new()
+        .with_check_syntax_error(true)
+        .build(&parsed.program);
     ensure!(
         built.diagnostics.is_empty(),
         "code is not valid JavaScript: {:?}",
@@ -233,6 +236,22 @@ mod tests {
                 path: "ns.first".to_owned()
             }]
         );
+    }
+
+    #[test]
+    fn scan_rejects_syntax_errors() {
+        let rejected = [
+            // Parse-level syntax error: ASI cannot insert a semicolon here.
+            "const x = 1 y = 2; tools.ns.go({});",
+            // Duplicate private class elements are checked semantically.
+            "class A { #x; #x; } tools.ns.go({});",
+        ];
+        for source in rejected {
+            assert!(
+                scan(source).is_err(),
+                "scanner must reject invalid JavaScript: {source}"
+            );
+        }
     }
 
     #[test]
