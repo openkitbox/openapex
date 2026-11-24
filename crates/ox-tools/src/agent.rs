@@ -1,4 +1,4 @@
-//! The built-in agent records.
+//! The built-in agent records, including the strict Rust code-review agent.
 //!
 //! Each record decides what a session created with its id gets: the static
 //! system prompt layer (replaced when [`Agent::system`] is set), the visible
@@ -14,6 +14,8 @@
 //!   of them silently drops that tool, while a call to a name outside the set
 //!   fails as an unavailable tool.
 //! - The first entry is the default agent ([`default_agent`]).
+//! - `rust-expert` is the strict Rust code-review agent: a read-only subagent
+//!   using the review toolset with a Rust-specific system layer.
 //! - This table is the only authority on which agent ids exist; model catalogues
 //!   and configuration validate ids against it rather than keeping a list.
 //! - Prompt bodies live in `ox-engine::prompt`; this table only selects a layer
@@ -37,6 +39,8 @@ pub enum SystemLayer {
     Explore,
     /// The read-only reviewer's contract and engineering lens.
     Review,
+    /// The strict Rust code-review lens, built on the reviewer's contract.
+    RustExpert,
 }
 
 /// Which registered tools an agent sees.
@@ -82,6 +86,9 @@ pub const APEX_ID: &str = "apex";
 /// not do and reports a verdict. See [`REVIEW_TOOLS`] for its toolset and the
 /// named gap in it.
 pub(crate) const REVIEW_AGENT: &str = "review";
+/// The strict Rust code-review agent (`subagent` with `agent: "rust-expert"`):
+/// it applies a Rust-specific review lens with the same read-only toolset.
+pub(crate) const RUST_EXPERT_AGENT: &str = "rust-expert";
 
 /// Tools a subagent session must not have. `question` opens a form only the
 /// user can answer; no UI watches a child session and a foreground tool call
@@ -125,7 +132,7 @@ pub const AUTOMATION_TOOLS: Tools = Tools::Only(&[
     "automation.delete",
 ]);
 
-/// The toolset of the `review` agent (`subagent` with `agent: "review"`).
+/// The toolset of the `review` and `rust-expert` agents.
 ///
 /// Rule: the read paths ([`READ_ONLY_TOOLS`] without the three `ctx_*` writers)
 /// plus `shell`. A reviewer must read a committed diff (`git show`, `git log`,
@@ -168,7 +175,7 @@ pub(crate) const REVIEW_TOOLS: &[&str] = &[
 ];
 
 /// The built-in agents in display order. The first entry is the default agent.
-static AGENTS: [Agent; 4] = [
+static AGENTS: [Agent; 5] = [
     Agent {
         id: APEX_ID,
         mode: Mode::Primary,
@@ -194,6 +201,13 @@ static AGENTS: [Agent; 4] = [
         id: REVIEW_AGENT,
         mode: Mode::Subagent,
         system: SystemLayer::Review,
+        tools: Tools::Only(REVIEW_TOOLS),
+        model: None,
+    },
+    Agent {
+        id: RUST_EXPERT_AGENT,
+        mode: Mode::Subagent,
+        system: SystemLayer::RustExpert,
         tools: Tools::Only(REVIEW_TOOLS),
         model: None,
     },
@@ -260,4 +274,65 @@ pub fn read_only() -> &'static Agent {
 /// Look up an id the table is known to contain.
 fn builtin(id: &str) -> &'static Agent {
     get(id).expect("the built-in agent table always contains its named ids")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_rust_expert_agent_is_a_read_only_review_subagent() {
+        assert_eq!(RUST_EXPERT_AGENT, "rust-expert");
+        let agent = get(RUST_EXPERT_AGENT).expect("rust-expert must be a built-in agent");
+        assert_eq!(
+            agent.mode,
+            Mode::Subagent,
+            "rust-expert must be selectable as a subagent"
+        );
+        assert_eq!(
+            agent.system,
+            SystemLayer::RustExpert,
+            "rust-expert must use the strict Rust review layer"
+        );
+        assert_eq!(
+            agent.tools,
+            Tools::Only(REVIEW_TOOLS),
+            "rust-expert must see exactly the read-only review toolset"
+        );
+        assert_eq!(
+            agent.model, None,
+            "rust-expert must inherit the parent session's model"
+        );
+        assert!(
+            all()
+                .iter()
+                .any(|candidate| candidate.mode == Mode::Subagent
+                    && candidate.id == RUST_EXPERT_AGENT),
+            "subagent selection must list rust-expert"
+        );
+    }
+
+    #[test]
+    fn builtin_rust_expert_agent_preserves_defaults() {
+        assert_eq!(
+            default_agent().id,
+            "apex",
+            "the first entry must remain the default agent"
+        );
+        assert_eq!(all().first().map(|agent| agent.id), Some("apex"));
+        assert_eq!(
+            subagent_default().id,
+            "general",
+            "the default subagent must not change"
+        );
+    }
+
+    #[test]
+    fn builtin_rust_expert_agent_id_passes_config_validation() {
+        validate_ids(["rust-expert"]).expect("[agents.rust-expert] must be a valid config id");
+        assert!(
+            validate_ids(["rust-expertt"]).is_err(),
+            "an unknown agent id must still be rejected"
+        );
+    }
 }

@@ -114,6 +114,19 @@ const REVIEW_SYSTEM_PREFIX: &str = concat!(
 const REVIEW_SYSTEM_FOOTER: &str =
     "\nYour final message is the only thing the caller sees: keep it near 15 lines.\n";
 
+/// Rust-only additions to the shared reviewer contract. `Review` and
+/// `RustExpert` render the same prefix, [`ENGINEERING_RULES`], and footer; this
+/// lens only adds language-specific instructions, so the verdict format has a
+/// single owner and cannot drift between the two reviewers.
+const RUST_EXPERT_LENS: &str = concat!(
+    "\n# Rust expert lens\n",
+    "- First load the `rust-expert` skill with the `skill` tool and follow it. If loading fails, say so and mark the affected criteria UNVERIFIED instead of guessing at its rules.\n",
+    "- For grounding, read every judged file in full before judging it. When a file is too large, state the smallest containing scope you read and confine the verdict to that scope. Cite `file_path:line_number` for every finding; a claim without a location is not a finding.\n",
+    "- Rust checks: low coupling and high cohesion; no over-engineering; explicit module boundaries with no duplicated authoritative state; minimal deep copies, justifying every remaining copy with a borrow/move/`Arc`/`mem::take` ownership argument; ownership and borrowing; no locks held across `await`; cancellation safety; `unsafe` isolated behind a safe wrapper with a `// SAFETY:` comment; no `catch_unwind`; no `#[allow(...)]` except generated-code exceptions documented with crate/version and removal condition; `#[expect(...)]` only with the narrowest scope and a `reason`; edition 2024; zero warnings; idiomatic Rust error handling (`Result`, no sentinel values) and API style (borrowed inputs, standard trait impls, `#[must_use]` where warranted).\n",
+    "- Verify Rust claims with `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --all -- --check` when the diff affects Rust; report the command and the result you actually saw.\n",
+    "- Keep the verdict contract above: `APPROVED` or `NEEDS_FIX`, a sha and absolute path you derived yourself, one `PASS`/`FAIL` line per quoted criterion, numbered must-fix items separated from optional ones. This Rust review targets near 20 lines, superseding the footer's near 15, and ends with `未确认` followed by what you could not verify and why.\n",
+);
+
 /// The built-in multi-task development workflow. It owns orchestration
 /// whenever a skill or instruction file would have proposed a different
 /// execution/landing/delivery flow; explicit user instructions still win.
@@ -129,10 +142,10 @@ const DEVELOPMENT_WORKFLOW: &str = concat!(
     "\nFor implementation work that needs multiple todo items or tasks, follow this built-in workflow. A small coherent fix remains single-step even when it touches several files. This workflow owns orchestration when a skill or an external instruction file suggests a different execution, landing, or delivery flow; explicit user instructions still take precedence, and non-workflow project rules continue to apply.\n",
     "\nMaintain the conversation's native todo list through `todowrite`. Create it when the workflow starts, and refine it after the plan is approved so it covers the plan's tasks plus review and landing. Mark every item the current batch is working on `in_progress` (several at once when they run in parallel) and an item `completed` as soon as it is actually done; after every completed step or task, call `todowrite` with the full updated list. The tool call is the user-facing progress surface: a prose status message or a subagent's own list does not replace it.\n",
     "1. Analyze first. Inspect requirements and code, cite file:line evidence, and make no edits.\n",
-    "2. Write one document at `.ox/plans/YYYY-MM-DD-<topic>.md` with `## 分析与方案` (decisions, evidence, rejected alternatives) followed by `## 实施任务` (self-contained tasks with exact files, tests, commands). Record each task's files and the tasks it depends on: those file sets and dependency edges are what decide the parallel batches. Treat four items as core, non-negotiable design requirements, not preferences: low coupling and high cohesion (one responsibility and reason to change per module, dependencies one way); no over-engineering (the smallest satisfying design, every abstraction justified by a present requirement); clear module boundaries (state each module's ownership, inputs, outputs, and invariants; no reaching across or duplicating authoritative state); and minimal deep copies (a borrow/move/`Arc`/`mem::take` strategy per hot path, with every remaining copy justified). In `## 分析与方案` give each of the four an explicit decision or a file:line-grounded justification for any deviation; a design missing them is not ready for approval. Each task in `## 实施任务` carries its criteria as lines of the form `- <criterion> — verify: <command> → <expected>`, written before the implementation so review can reuse them verbatim. Obtain user approval before implementation unless it was already given.\n",
+    "2. Write one document at `.ox/plans/YYYY-MM-DD-<topic>.md` with `## 分析与方案` (decisions, evidence, rejected alternatives) followed by `## 实施任务` (self-contained tasks with exact files, tests, commands). Record each task's files and the tasks it depends on: those file sets and dependency edges are what decide the parallel batches. This is a mandatory planning constraint: prefer parallel tasks; serialize only on real dependencies or file conflicts — serialization without either reason is a planning defect. Treat four items as core, non-negotiable design requirements, not preferences: low coupling and high cohesion (one responsibility and reason to change per module, dependencies one way); no over-engineering (the smallest satisfying design, every abstraction justified by a present requirement); clear module boundaries (state each module's ownership, inputs, outputs, and invariants; no reaching across or duplicating authoritative state); and minimal deep copies (a borrow/move/`Arc`/`mem::take` strategy per hot path, with every remaining copy justified). In `## 分析与方案` give each of the four an explicit decision or a file:line-grounded justification for any deviation; a design missing them is not ready for approval. Each task in `## 实施任务` carries its criteria as lines of the form `- <criterion> — verify: <command> → <expected>`, written before the implementation so review can reuse them verbatim. Obtain user approval before implementation unless it was already given.\n",
     "3. Before the first edit, create `.ox/worktrees/<branch>` from the default branch. Keep the main checkout clean. Do not use codegraph in a worktree; use absolute paths with rg/read/git. Run Rust tests and builds with `CARGO_TARGET_DIR=<worktree>/target`: the target directory must live inside the worktree so removing the worktree removes its artifacts; never use a shared host target directory.\n",
-    "4. Execute todo items in parallel batches, one fresh subagent per item. A batch holds every ready item whose dependencies are done and whose files are disjoint from every other item in the batch; items that share a file or need another's result wait for a later batch. Give each subagent the full task text, context, worktree path, and the files it owns. It implements, tests, runs fmt/clippy, and commits only its own files with `git commit -m <message> -- <its files>` so a sibling's staged files never ride along; it retries when `index.lock` is held, and a build failure in a sibling's file is a reason to rerun, not to edit that file. After each task, dispatch its spec-compliance and code-quality reviews in parallel as `subagent` calls with `agent: \"review\"`. A review may run alongside the next batch when its files are disjoint from it and it does not depend on that batch's results; independent read-only work can overlap. A task's findings are fixed before landing, and before any later batch that touches the files it failed on. Each review dispatch quotes that task's criterion lines verbatim together with the task's file set and names the commit under review as an anchor to check against the reviewer's own `HEAD`, not a value to take on trust; a reviewer may fall back to the acceptance criteria of the plan document the dispatch names, and only when neither exists does it refuse, in which case do not resend the same dispatch.\n",
-    "5. After all tasks, review the whole diff with a general code reviewer plus the matching domain expert (`rust-expert` for Rust), both as `review` subagents running in parallel. Fix and re-review until clean. If the expert is unavailable, automatically fall back to the general review and disclose that no domain-expert review occurred. The whole-diff dispatch uses the same criterion format: the dispatcher reuses the task criteria and adds cross-task invariants.\n",
+    "4. Execute todo items in parallel batches, one fresh subagent per item. A batch holds every ready item whose dependencies are done and whose files are disjoint from every other item in the batch; items that share a file or need another's result wait for a later batch. Give each subagent the full task text, context, worktree path, and the files it owns. It implements, tests, runs fmt/clippy, and commits only its own files with `git commit -m <message> -- <its files>` so a sibling's staged files never ride along; it retries when `index.lock` is held, and a build failure in a sibling's file is a reason to rerun, not to edit that file. After each task, dispatch its spec-compliance and code-quality reviews in parallel as `subagent` calls. A task is Rust when any of its files ends in `.rs` or is named `Cargo.toml`, `clippy.toml`, `rustfmt.toml`, or `.cargo/config.toml`; dispatch its reviews with `agent: \"rust-expert\"`, and every other task's with `agent: \"review\"`. A review may run alongside the next batch when its files are disjoint from it and it does not depend on that batch's results; independent read-only work can overlap. A task's findings are fixed before landing, and before any later batch that touches the files it failed on. Each review dispatch quotes that task's criterion lines verbatim together with the task's file set and names the commit under review as an anchor to check against the reviewer's own `HEAD`, not a value to take on trust; a reviewer may fall back to the acceptance criteria of the plan document the dispatch names, and only when neither exists does it refuse, in which case do not resend the same dispatch.\n",
+    "5. After all tasks, review the whole diff with a general code reviewer and a domain reviewer in parallel: a Rust diff — any changed file ending in `.rs` or named `Cargo.toml`, `clippy.toml`, `rustfmt.toml`, or `.cargo/config.toml` — dispatches the domain reviewer with `agent: \"rust-expert\"`; a non-Rust diff dispatches a second general reviewer with `agent: \"review\"`. Fix and re-review until clean. If the expert is unavailable, automatically fall back to the general review and disclose that no domain-expert review occurred. The whole-diff dispatch uses the same criterion format: the dispatcher reuses the task criteria and adds cross-task invariants.\n",
     "6. Land only when green: run the full suite in the worktree, rebase onto the default branch, squash-merge as one conventional commit, rerun the suite on the merged result, remove the worktree, and delete the branch with `git branch -D`. If the main checkout has unrelated uncommitted changes, stop and ask; never stash, overwrite, or discard them. Do not present merge/PR/keep menus; those happen only on explicit request. The workflow ends here: do not run extra release builds, deploy, sync binaries, or restart services unless the user separately requests it. Verification compilation, tests, and clippy are required.\n",
     "\nSubagents execute only their assigned task. They do not create worktrees, change the plan, or restart this orchestration. Read-only questions need no pipeline. Single-step or simple changes may edit the main checkout directly and remain uncommitted unless the user asks for a commit.\n",
 );
@@ -146,13 +159,21 @@ const SUBAGENT_WORKFLOW: &str = concat!(
 );
 
 /// Compose a layer around the shared engineering rules. `concat!` cannot take a
-/// constant operand, so the single copy of the rules is appended at assembly.
-fn with_engineering_rules(prefix: &str, suffix: &str) -> String {
-    let mut text = String::with_capacity(prefix.len() + ENGINEERING_RULES.len() + suffix.len());
+/// constant operand, so the single copy of the rules is appended at assembly;
+/// `lens` is optional language-specific text between the rules and `suffix`.
+fn with_engineering_rules(prefix: &str, lens: &str, suffix: &str) -> String {
+    let mut text =
+        String::with_capacity(prefix.len() + ENGINEERING_RULES.len() + lens.len() + suffix.len());
     text.push_str(prefix);
     text.push_str(ENGINEERING_RULES);
+    text.push_str(lens);
     text.push_str(suffix);
     text
+}
+
+/// Both reviewers render one contract; only the Rust lens differs.
+fn with_review_lens(lens: &str) -> String {
+    with_engineering_rules(REVIEW_SYSTEM_PREFIX, lens, REVIEW_SYSTEM_FOOTER)
 }
 
 /// Build the static system layer for one agent. A dedicated layer
@@ -166,11 +187,16 @@ fn with_engineering_rules(prefix: &str, suffix: &str) -> String {
 pub fn system_static(tools: &[(&str, Option<&'static str>)], agent: &Agent) -> String {
     match agent.system {
         SystemLayer::Explore => EXPLORE_SYSTEM.to_owned(),
-        SystemLayer::Review => with_engineering_rules(REVIEW_SYSTEM_PREFIX, REVIEW_SYSTEM_FOOTER),
+        SystemLayer::Review => with_review_lens(""),
+        SystemLayer::RustExpert => with_review_lens(RUST_EXPERT_LENS),
         SystemLayer::Default => {
             let mut static_layer =
                 HARNESS_TEMPLATE.replace("${OPENCODE_TOOL_GUIDANCE}", &tool_guidance(tools));
-            static_layer.push_str(&with_engineering_rules(ENGINEERING_STANDARDS_PREFIX, ""));
+            static_layer.push_str(&with_engineering_rules(
+                ENGINEERING_STANDARDS_PREFIX,
+                "",
+                "",
+            ));
             static_layer.push_str(match agent.mode {
                 Mode::Primary => DEVELOPMENT_WORKFLOW,
                 Mode::Subagent => SUBAGENT_WORKFLOW,
@@ -1269,4 +1295,122 @@ pub(crate) fn local_date(timestamp_ms: i64, zone: &jiff::tz::TimeZone) -> String
         .to_zoned_datetime(zone.clone())
         .date()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use ox_tools::agent::Tools;
+
+    fn layer(system: SystemLayer, mode: Mode) -> String {
+        let agent = Agent {
+            id: "test",
+            mode,
+            system,
+            tools: Tools::All,
+            model: None,
+        };
+        system_static(&[], &agent)
+    }
+
+    #[test]
+    fn rust_expert_review_layer_loads_skill_and_enforces_rust_checks() {
+        let text = layer(SystemLayer::RustExpert, Mode::Subagent);
+        for needle in [
+            "load the `rust-expert` skill with the `skill` tool",
+            "read every judged file",
+            "file_path:line_number",
+            "low coupling",
+            "high cohesion",
+            "over-engineering",
+            "module boundaries",
+            "authoritative state",
+            "deep copies",
+            "borrow",
+            "mem::take",
+            "ownership",
+            "await",
+            "cancellation",
+            "unsafe",
+            "catch_unwind",
+            "#[allow(",
+            "#[expect(",
+            "edition 2024",
+            "zero warnings",
+            "APPROVED",
+            "NEEDS_FIX",
+            "near 20 lines",
+            "未确认",
+        ] {
+            assert!(
+                text.contains(needle),
+                "rust-expert layer missing {needle:?}"
+            );
+        }
+        for contract in [
+            REVIEW_SYSTEM_PREFIX,
+            ENGINEERING_RULES,
+            REVIEW_SYSTEM_FOOTER,
+        ] {
+            assert!(
+                text.contains(contract),
+                "rust-expert layer must reuse the shared review contract"
+            );
+        }
+        for needle in [
+            "no `#[allow(...)]` except generated-code exceptions",
+            "`#[expect(...)]` only with the narrowest scope and a `reason`",
+        ] {
+            assert!(
+                RUST_EXPERT_LENS.contains(needle),
+                "rust-expert lens itself must carry the strict lint policy {needle:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_expert_review_layer_does_not_leak_into_general_review() {
+        let review = layer(SystemLayer::Review, Mode::Subagent);
+        let rust = layer(SystemLayer::RustExpert, Mode::Subagent);
+        assert_eq!(review, with_review_lens(""));
+        for contract in [
+            REVIEW_SYSTEM_PREFIX,
+            ENGINEERING_RULES,
+            REVIEW_SYSTEM_FOOTER,
+        ] {
+            assert_eq!(review.matches(contract).count(), 1);
+            assert_eq!(rust.matches(contract).count(), 1);
+        }
+        for needle in [
+            "load the `rust-expert` skill with the `skill` tool",
+            "edition 2024",
+            "catch_unwind",
+            "未确认",
+        ] {
+            assert!(
+                !review.contains(needle),
+                "general review must not carry the Rust lens: {needle:?}"
+            );
+        }
+        assert!(rust.len() > review.len());
+    }
+
+    #[test]
+    fn rust_expert_review_layer_workflow_routes_by_language_and_requires_parallel() {
+        let workflow = layer(SystemLayer::Default, Mode::Primary);
+        for needle in [
+            "prefer parallel tasks; serialize only on real dependencies or file conflicts",
+            "mandatory",
+            r#"agent: "rust-expert""#,
+            r#"agent: "review""#,
+            ".rs",
+            "Cargo.toml",
+            "clippy.toml",
+            "rustfmt.toml",
+            ".cargo/config.toml",
+        ] {
+            assert!(workflow.contains(needle), "workflow missing {needle:?}");
+        }
+    }
 }
