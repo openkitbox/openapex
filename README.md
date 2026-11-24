@@ -2,117 +2,144 @@
 
 **English** · [简体中文](README.zh-CN.md)
 
-OpenApex is an independent agent implementation for the opencode v2 chat
-protocol. It uses OpenCode as its UI: OpenCode handles the user-facing
-conversation, while OpenApex provides the agent runtime, session engine, tools,
-and provider integration. One binary provides the HTTP/SSE **server** and an
-**ACP agent** for editor integrations.
+## Overview
 
-ox keeps its own database and configuration under `~/.ox`; it never reads or
-writes the Bun implementation's files.
+ox is an independent, pure-Rust **opencode v2 compatible agent runtime**. It
+implements the API OpenCode uses rather than reusing the Bun implementation:
+OpenCode provides the user-facing conversation, while ox owns the agent
+runtime, sessions, tools and provider access.
+
+One binary provides both:
+
+- an **HTTP/SSE server** for OpenCode-compatible clients, listening on
+  `127.0.0.1:8787` by default; and
+- an **ACP agent** over stdio for editor integrations.
+
+ox keeps its database and configuration under `~/.ox`; it does not read or write
+the Bun implementation's files.
+
+## Features
+
+- **Native provider routing:** `[providers.<name>]` defines endpoints and
+  `[models.<id>]` defines ordered candidates. Transport and retryable HTTP
+  failures can fail over before a stream opens; an established stream is never
+  retried mid-turn.
+- **MCP:** process-wide local stdio and remote MCP servers expose resources and
+  namespaced tools.
+- **Automations and MCP Events:** scheduled, cron and MCP-event triggers can run
+  prompt, Code Mode or shell actions. MCP Events supports push, poll and signed
+  webhook delivery.
+- **Magic context:** durable project memories, searchable notes, transcript
+  compartments, context folding and background consolidation through the
+  `ctx_*` tools.
+- **Built-in agents:** `apex`, `general`, `explore`, `review` and `rust-expert`,
+  with explicit tool boundaries and child-session model preferences.
+- **Editor integration:** ACP session creation, replay, listing, cancellation
+  and tool updates, with unsupported setup rejected fail-closed.
+- **Safety controls:** per-tool allow/ask/deny policies and invalid-config reloads
+  that preserve the running generation.
 
 ## Requirements
 
-- Rust with edition 2024 support (1.85 or newer)
-- macOS or Linux (the server binds a unix socket, so Windows is not supported)
+- A Rust toolchain with edition 2024 support (Rust 1.85 or newer) to build.
+- macOS or Linux. The server binds a private Unix socket, so Windows is not
+  supported.
+- A configured model provider for real model turns.
+- OpenCode, if you want to use it as the UI; an ACP-capable editor, if you want
+  editor integration.
 
 ## Quick start
 
 ```bash
 cargo build --release
 
-./target/release/ox          # HTTP server on 127.0.0.1:8787 by default
-./target/release/ox serve    # HTTP server on 127.0.0.1:8787 by default
-./target/release/ox acp      # ACP agent over stdio, for editors
+./target/release/ox          # HTTP/SSE server on 127.0.0.1:8787 by default
+./target/release/ox serve    # explicit server mode, same default
+./target/release/ox acp      # ACP v1 agent over stdio
 ```
 
-## OpenCode integration
+Copy [ox.example.toml](ox.example.toml) to `~/.ox/ox.toml`, replace the provider
+placeholders and select a model before starting the server. The config file is
+optional: ox starts with defaults when it is absent.
 
-OpenApex is designed to use OpenCode as its UI. Run the OpenApex HTTP server,
-then point OpenCode at its compatible API endpoint; OpenCode owns the
-conversation and presentation while OpenApex owns agent execution, sessions,
-tools and provider access.
-
-The first argument picks the mode. Anything starting with `-`, or no argument
-at all, starts the HTTP server.
-
-| Mode | Command | Behaviour |
-|---|---|---|
-| Server | `ox [flags]` or `ox serve [--stdout\|--no-stdout] [--log-file PATH] [--exit-when-idle]` | Runs the HTTP/SSE API and the session engine. One server per home: it takes the instance lock and binds the private unix socket. `--exit-when-idle` makes it exit once no client holds a lease. |
-| ACP agent | `ox acp [--server URL] [--log-file PATH] [--no-stdout]` | Speaks ACP v1 over stdio. Without `--server`, tries the local Unix socket, then the configured TCP address, then starts a server in-process. With `--server`, only the specified endpoint is used. Logs go to stderr or `--log-file`. |
+The first argument selects the mode. No argument, or an argument beginning with
+`-`, starts the HTTP server.
 
 ## Files
 
 | Path | Purpose |
 |---|---|
-| `~/.ox/ox.toml` | Configuration |
-| `~/.ox/ox.db` | Database (turso, SQLite-compatible) |
-| `~/.ox/ox.log` | Log of a detached server |
-| `~/.ox/run/ox.sock` | Private unix socket (0600) |
+| `~/.ox/ox.toml` | Optional TOML configuration |
+| `~/.ox/ox.db` | Turso database (SQLite-compatible) |
+| `~/.ox/ox.log` | Log file for a detached server |
+| `~/.ox/run/ox.sock` | Private Unix socket (`0600`) |
 | `~/.ox/run/ox.lock` | Single-instance lock |
+| `~/.ox/tmp/` | Scratch files and other temporary working data |
 
 ## Configuration
 
-`~/.ox/ox.toml` is optional; every section has a default. `OX_DB_PATH`,
-`OX_LISTEN` and `OX_SUBAGENT_DEPTH` override the matching settings.
+The complete commented reference is [ox.example.toml](ox.example.toml).
+`~/.ox/ox.toml` is optional; every section has a default. Top-level keys such as
+`listen`, `db_path` and `default_model` sit beside `[providers]`, `[models]`,
+`[context_caps]`, `[roles]`, `[agents]`, `[magic_context]`, `[mcp]`,
+`[permissions]`, `[subagent]`, `[events]`, `[sessions]`, `[tmp]` and `[turn]`.
 
-Top-level keys such as `listen`, `db_path` and `default_model` sit next to the
-sections `[providers]`, `[models]`, `[context_caps]`, `[roles]`, `[agents]`,
-`[magic_context]`, `[mcp]`, `[permissions]`, `[subagent]`, `[events]`,
-`[sessions]`, `[tmp]` and `[turn]`.
+### Provider and model routing
 
-### Provider
-
-A provider is an outbound endpoint plus a key. `base_url` is the part **before**
-the version suffix — ox appends the protocol's path (`/v1/chat/completions` for
-Chat Completions, `/v1/messages` for the Anthropic Messages protocol):
+Native routing starts with an endpoint under `[providers.<name>]` and a logical
+model under `[models.<id>]`:
 
 ```toml
-default_model = "my-gateway/some-model"
+default_model = "fast"
 
-[providers.my-gateway]
+[providers.primary]
 base_url = "https://gateway.example.com"
-api_key = "…"
-# protocol = "chat_completions"   # or "messages"; defaults to chat_completions
-```
+api_key = "REPLACE_WITH_KEY"
+protocol = "chat_completions" # or "messages"
 
-Model ids are whatever the endpoint reports from its model list, qualified as
-`provider/id`. A small built-in table supplies an endpoint and protocol for a
-few vendors, so a `[providers.<vendor>]` section may state only `api_key`.
+[providers.backup]
+base_url = "https://backup.example.com"
+api_key = "REPLACE_WITH_BACKUP_KEY"
+protocol = "chat_completions"
 
-`[models.<id>] candidates` turns one logical model into an ordered failover
-list; the first endpoint whose stream opens serves the turn:
-
-```toml
 [models.fast]
 candidates = [
-  { provider = "my-gateway", model = "some-model" },
+  { provider = "primary", model = "some-model" },
   { provider = "backup", model = "some-model" },
 ]
 ```
 
-The older `cardinal_url` / `cardinal_key` keys still describe the implicit
-default endpoint, which routes may reference by its provider name.
+`base_url` is the part **before** the protocol's version suffix. ox appends
+`/v1/chat/completions` for Chat Completions and `/v1/messages` for the Anthropic
+Messages protocol. Candidates are tried in order; the first endpoint whose
+stream opens serves the turn. Model ids in a candidate are the wire ids reported
+by that endpoint. A single-endpoint model may instead use `provider/id`.
+
+A small built-in table supplies endpoints and protocols for known vendors, so a
+section such as `[providers.deepseek]` may state only `api_key`. Built-in
+providers appear only after a key resolves.
+
+`cardinal_url` and `cardinal_key` are legacy compatibility keys for the implicit
+`cardinal` endpoint. They remain available, but new configurations should prefer
+`[providers.<name>]` and `[models.<id>]`.
 
 ### Model roles
 
-Three requests are not the session's own turn, so each can name its own logical
-model. Values are logical ids the model catalogue knows (`[models.<id>]` route
-keys, or the wire id in single-endpoint mode):
+Auxiliary requests can use their own logical models:
 
 ```toml
 [roles]
 title = "slim"        # default: the logical model `slim`
-# compaction = "big"  # default: the session's model (or a /slim turn's)
+# compaction = "big"  # default: the session's model (or a /slim turn's model)
 
 [agents.explore]
-model = "slim"        # default comes from the built-in agent table
+model = "slim"        # child-session preference; default comes from the agent table
 ```
 
-Title generation falls back to the session model when `slim` is missing, and a
-`/slim` prompt asks for one turn on `slim` without changing the session. A
-subagent whose agent names a model refuses to start when that model is not in
-the catalogue, instead of silently running on the parent's model.
+Title generation falls back to the session model when `slim` is missing. A
+`/slim` prompt runs one turn on `slim` without changing the session's selected
+model. A subagent whose configured model is absent from the catalogue refuses
+to start instead of silently using its parent's model.
 
 ### MCP
 
@@ -130,50 +157,97 @@ url = "https://mcp.example.com/mcp"
 disabled = true
 ```
 
-`disabled` defaults to `false`. A disabled server is skipped at startup and on
-configuration reload. A manual connection is a temporary override; the next
-successful reload or server restart applies the configured value again. After
-editing the configuration, restart the server to apply it.
+`disabled` defaults to `false`. Disabled servers are skipped at startup and on
+reload. A manual connection is a temporary override; the next successful reload
+or server restart reapplies the configured value.
 
 MCP connections and the tool registry are process-wide, not session-specific.
-Connecting or disconnecting a server affects every session. Its tools are exposed
-under the server name as a prefix.
+Connecting or disconnecting a server affects every session. Tools are exposed
+under their server name as a prefix. MCP configuration changes are hot-reloaded;
+they do not require a restart.
 
 ### Permissions
 
-Every tool call passes a policy check before it runs. The default is
-`allow`; `[permissions]` tightens it per tool:
+Every tool call passes a policy check before it runs. The default is `allow`;
+`[permissions]` tightens it per tool:
 
 ```toml
 [permissions]
 default = "allow"                 # allow | ask | deny
 
 [permissions.tools]
-shell = { ask_if = ["rm -rf", "git push", "sudo"] }   # ask only on a match
+shell = { ask_if = ["rm -rf", "git push", "sudo"] }
 webfetch = "ask"                  # ask every time
 write = "deny"                    # refuse outright
 ```
 
-`ask_if` holds regexes matched against the call's arguments (the `command`
-for `shell`, compact JSON otherwise). An `ask` opens a question on the
-user's root session — subagent calls surface there too — with the answers
-*once*, *for this session* and *deny*; no answer within five minutes, or an
-interrupt, counts as a denial. Session grants live in process memory and
-reset on restart. MCP tools are addressed by their prefixed name.
+`ask_if` holds regular expressions matched against the call's arguments (the
+command text for `shell`, compact JSON otherwise). An `ask` opens a form on the
+user's root session; subagent calls surface there too. The choices are *allow
+once*, *allow for this session* and *deny*. No answer within five minutes, or an
+interrupt, counts as a denial. Session grants live in process memory and reset
+on restart. MCP tools use their prefixed names.
 
-## Editor integration
+### Environment variables
 
-Point an ACP-capable editor (Zed, JetBrains, …) at `ox acp` as its agent
-command. The editor supplies the working directory per session; ox maps ACP
-sessions one-to-one onto ox sessions, exposes its agents as ACP modes, and
-streams assistant text, reasoning and tool calls back as session updates.
+| Variable | Effect |
+|---|---|
+| `OX_DB_PATH` | Overrides the database file path. |
+| `OX_LISTEN` | Overrides the HTTP server listen address. |
+| `OX_SUBAGENT_DEPTH` | Overrides `[subagent].depth`; invalid values are ignored with a warning. |
+| `OX_CARDINAL_URL` | Overrides the legacy implicit `cardinal` endpoint URL. |
+| `OX_CARDINAL_KEY` | Supplies the legacy implicit `cardinal` endpoint key. |
+| `OX_DEFAULT_MODEL` | Overrides `default_model`. |
+| `DEEPSEEK_API_KEY` | Supplies the built-in DeepSeek provider key when no configured or stored key is present. |
+
+### Hot reload and restart-only keys
+
+ox watches the config file's directory and reloads when the config content
+changes; it does not poll. A valid edit rebuilds hot-swappable services,
+including providers, model routes, model roles, permissions, agents and MCP.
+
+An invalid TOML document or a reload that cannot initialize its services leaves
+the previous running configuration in place. The automatic file watcher also
+keeps the current configuration when the file is missing or unreadable. A manual
+`POST /api/location/reload` with a missing config file loads the default
+configuration.
+
+The following values are pinned to their running generation and require a
+server restart to change:
+
+- `listen`
+- `db_path`
+- `event_heartbeat_ms`
+- `[events]`
+- `[sessions]`
+- `[tmp]`
+- `[turn]`
+- `[subagent]`
+- `[magic_context]`
+
+## OpenCode integration
+
+Start the ox server, then point your OpenCode-compatible client at
+`http://127.0.0.1:8787`. OpenCode owns conversation presentation; ox serves the
+opencode v2 HTTP/SSE API and owns execution, persistence, tools and provider
+routing.
+
+| Mode | Command | Behaviour |
+|---|---|---|
+| Server | `ox [flags]` or `ox serve [--stdout\|--no-stdout] [--log-file PATH] [--service] [--exit-when-idle]` | Runs the HTTP/SSE API and session engine. One server per home takes the instance lock and binds the private Unix socket. `--exit-when-idle` exits once no client holds a lease. |
+| ACP agent | `ox acp [--server URL] [--log-file PATH] [--no-stdout]` | Speaks ACP v1 over stdio. Without `--server`, tries the local Unix socket, then the configured TCP address, then starts a server in-process. With `--server`, only that endpoint is used. Logs go to stderr or `--log-file`. |
+
+## ACP integration
+
+Point an ACP-capable editor (Zed, JetBrains, …) at `ox acp` as its agent command.
+The editor supplies the working directory per session; ox maps ACP sessions
+one-to-one onto ox sessions, exposes its agents as ACP modes, and streams
+assistant text, reasoning and tool calls back as session updates.
 
 Unlike a plain CLI shim, `session/load` replays the stored transcript, including
 the magic-context dropped-content overlay, so the editor shows what the model
-actually saw. Session setup ox cannot isolate is rejected with an ACP invalid
-params error before any session is created or touched — never silently omitted.
-MCP servers are configured process-wide under `[mcp.servers.<name>]` in
-`~/.ox/ox.toml`; an editor cannot add one per session.
+actually saw. MCP servers are configured process-wide under
+`[mcp.servers.<name>]`; an editor cannot add one per session.
 
 ### ACP v1 stable capability matrix
 
@@ -215,38 +289,108 @@ not an ox capability.
 - Binary embedded resources, audio and resource-link prompts are rejected,
   not fetched implicitly.
 
+## Automations and MCP Events
+
+Both features are **disabled by default**. Enable automations with the top-level
+`automations` key. Use `timezone` for a default IANA zone for wall-clock
+triggers:
+
+```toml
+automations = true
+timezone = "UTC" # optional; UTC is used when no zone is configured
+```
+
+An automation combines one trigger with one action:
+
+- **Triggers:** `at` for a one-shot time, `every` for an interval, `cron` for a
+  cron expression, or `event` for an event from a connected MCP server. Cron
+  triggers require a timezone.
+- **Actions:** `prompt` for a model turn, `code` for a resource-limited Code Mode
+  JavaScript program, or `shell` for a command.
+
+Manage automations through the OpenCode `/automation` command, the HTTP API at
+`/api/experimental/automation` (list, create, get, delete, pause and resume), or
+the `automation.create`, `automation.list`, `automation.pause`,
+`automation.resume` and `automation.delete` tools. The HTTP create path accepts
+scheduled prompt actions; event triggers and unattended shell/code actions must
+be created through a tool call in a local session so ox can obtain an interactive
+permission grant. Unsupported or unauthorized setup fails closed.
+
+MCP Events bridges event types exposed by connected MCP servers into ox's event
+bus, where they can drive automation event triggers. Enable it separately:
+
+```toml
+[mcp.events]
+enabled = true
+poll_interval = 5000 # milliseconds; must be positive
+```
+
+For each advertised event type, ox uses the first delivery mode offered by the
+server in this order: **push**, **poll**, then **webhook**. Polling re-reads the
+event log no more often than `poll_interval`. Webhook subscriptions additionally
+require a public callback URL and signing secret:
+
+```toml
+[mcp.events.webhook]
+public_url = "https://example.com/ox/mcp-events"
+secret = "REPLACE_WITH_A_LONG_RANDOM_SECRET"
+```
+
+Webhook subscriptions fail closed without both values. Incoming webhook bodies
+must carry a valid signature; rejected deliveries are not published as MCP
+events.
+
+## Built-in agents
+
+| Agent | Mode | Responsibility and tool boundary |
+|---|---|---|
+| `apex` | Primary, default | General implementation and orchestration with the full registered toolset. Uses the session's persisted model. |
+| `general` | Subagent, default | General delegated work with all registered tools except `question`; inherits the parent model unless configured otherwise. |
+| `explore` | Subagent | Read-only codebase and web exploration with context search; no shell, structured writers, subagents or MCP tools. Prefers `slim`. |
+| `review` | Subagent | Reviews work it did not perform using read/search tools plus shell for verification. Structured writers, context writers, subagents and MCP tools are absent. |
+| `rust-expert` | Subagent | Applies a strict Rust review lens with the same review toolset as `review`. |
+
+The review toolset is read-constrained, not sandboxed: shell can execute build
+scripts or tests from the tree under review. A hard read-only boundary requires
+a sandbox. Model preferences under `[agents.<id>]` apply only to child sessions;
+primary sessions use their persisted model.
+
 ## Repository layout
 
 | Crate | Responsibility |
 |---|---|
-| `ox` (root) | The `ox` binary and a façade re-exporting every crate |
-| `ox-schema` | Serde models for the opencode v2 wire protocol and shared paths |
-| `ox-db` | Storage: turso connection, pragmas, versioned schema, single-writer gate |
-| `ox-llm` | Endpoints, credentials, model catalogue, the two chat protocols and SSE framing |
-| `ox-core` | Configuration, the event bus and its projector |
-| `ox-engine` | Per-session runner, magic context and the system prompt |
-| `ox-tools` | Built-in toolset: file and shell tools ported from upstream, plus subagents, todos, skills and search |
-| `ox-mcp` | MCP client hub |
-| `ox-server` | HTTP API, instance lock and lifecycle |
-| `ox-acp` | ACP translator for editors |
-
-Dependencies point one way. `ox-schema` is the contract everything shares;
-`ox-llm` depends on it and nothing else of ox's; `ox-core` adds storage and the
-event bus; the engine and the toolset sit above that; `ox-server` composes them.
-`ox-acp` is a client — it speaks the public HTTP contract rather than reaching
-into the runner.
+| `ox` (root) | The `ox` binary and an integration-test façade re-exporting the assembled runtime. |
+| `ox-schema` | Serde models for the opencode v2 wire protocol and shared paths. |
+| `ox-db` | Turso storage, pragmas, versioned schema and the single-writer gate. |
+| `ox-llm` | Provider configuration, endpoints, credentials, model catalogue, Chat Completions/Messages clients and SSE framing. |
+| `ox-core` | Configuration, credential storage, the event bus and its projector. |
+| `ox-engine` | Per-session runner, magic context and system-prompt composition. |
+| `ox-tools` | Built-in file, shell and web tools plus subagents, todos, skills, automation and context tools. |
+| `ox-mcp` | MCP client hub and MCP Events protocol client. |
+| `ox-server` | HTTP API, hot reload, automation scheduling, ACP endpoint discovery, instance lock and lifecycle. |
+| `ox-acp` | ACP v1 translator for editors. |
+| `ox-automation` | Automation triggers/actions, cron and due-time decisions, durable storage, leasing and scheduler. |
+| `ox-codemode` | Static JavaScript/tool scanning and a resource-limited QuickJS execution runtime. |
 
 ## Development
 
+Run all four gates from the repository root:
+
 ```bash
-cargo fmt --all
-cargo clippy --workspace --all-targets
+cargo fmt --all -- --check
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets -- -D warnings
 cargo build --release
 ```
 
-`cargo clippy --workspace --all-targets` is the quality gate: the tree carries
-no automated test suite by design, so treat a clean clippy run as the bar.
+The workspace has automated unit and integration tests. `cargo test` covers
+configuration, routing, protocol behavior and runtime services; formatting,
+tests, warning-free clippy and the release build are all required before
+submitting changes.
 
 ## Docs
 
-- [Skills](skills/README.md) — loading project skills
+- [Skills](skills/README.md) — project skill layout and loading.
+- [Local evaluation](tools/local-eval/README.md) — auditable ACP runner and
+  smoke harness.
+- [简体中文](README.zh-CN.md) — Chinese project guide.

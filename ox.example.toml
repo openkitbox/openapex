@@ -1,0 +1,167 @@
+# Copy this file to ~/.ox/ox.toml and replace the example values.
+# Native providers are the primary configuration. External MCP examples,
+# webhook delivery, embeddings, automations, and the dreamer are disabled.
+
+# HTTP server and local database.
+listen = "127.0.0.1:8787"
+# Default: ~/.ox/ox.db. Relative paths resolve from the server's working directory.
+# db_path = "/absolute/path/to/ox.db"
+# SSE event.subscribe heartbeat in milliseconds (default: 15000).
+event_heartbeat_ms = 15_000
+
+# Keep unattended automation disabled. Set an IANA timezone for wall-clock jobs.
+automations = false
+timezone = "Etc/UTC"
+
+# Optional legacy Cardinal compatibility. Native providers above are preferred.
+# cardinal_url = "http://127.0.0.1:10202"
+# cardinal_key = "replace-me"
+# A route may reference the implicit provider as: { provider = "cardinal", model = "example-model" }
+
+# A logical default model. It must match a model id exposed by the catalogue.
+default_model = "example"
+
+# Native provider configuration. base_url excludes the protocol suffix; ox
+# appends /v1/chat/completions or /v1/messages according to protocol.
+[providers.example]
+base_url = "https://llm.example.invalid"
+api_key = "replace-me"
+protocol = "chat_completions"
+# Alternative: protocol = "messages" for an Anthropic Messages endpoint.
+# Optional traffic limits. Both values must be positive integers.
+max_concurrent = 2
+stall_timeout_secs = 600
+
+# Logical model routes map catalogue ids to ordered provider candidates.
+# Add more candidates to enable stream-open failover.
+[models.example]
+candidates = [
+  { provider = "example", model = "example-model" },
+]
+
+# A small logical model can back titles, exploration, and similar requests.
+[models.slim]
+candidates = [
+  { provider = "example", model = "example-small-model" },
+]
+
+# Values are token limits and may only lower an advertised context window.
+[context_caps]
+example = 128_000
+slim = 32_000
+
+# Auxiliary model roles. Values are logical model ids, not endpoint URLs.
+[roles]
+title = "slim"
+compaction = "example"
+
+# Per-agent model preferences apply to child sessions. Valid subagent ids are
+# general, explore, review, and rust-expert; apex is a primary agent.
+[agents.general]
+model = "example"
+
+[agents.explore]
+model = "slim"
+
+[agents.review]
+model = "example"
+
+[agents.rust-expert]
+model = "example"
+
+# Magic-context memory assembly and context folding.
+[magic_context]
+enabled = true
+# historian_model = "example/example-model"
+# Percent of the model context window used to trigger a fold (20..=90).
+execute_threshold_percentage = 55.0
+# Low-water fold target as a percentage of the model window (5..=80).
+fold_target_percentage = 28.0
+# Share of the usable window available to assembled history (0.05..=0.5).
+history_budget_percentage = 0.15
+# Scheduled memory maintenance is off in this copy-safe example.
+dreamer_enabled = false
+dreamer_interval_minutes = 15
+# Useful for prefix-only provider caches; off by default.
+historian_prefix_cache = false
+# Exact tool names or prefixes ending in * whose output must not promote facts.
+external_content_tools = ["webfetch", "docs_*"]
+
+# Semantic memory search is optional and disabled here.
+[magic_context.embedding]
+provider = "off"
+# To enable it, use provider = "openai-compatible" and fill every placeholder.
+# endpoint = "https://embeddings.example.invalid/v1"
+# api_key = "replace-me"
+# model = "example-embedding-model"
+# query_instruction = "Represent this search query:"
+# document_prefix = "Represent this project memory:"
+
+# Local MCP server example. command is argv, never a shell command.
+[mcp.servers.local-example]
+type = "local"
+command = ["example-mcp-server", "--stdio"]
+cwd = "/absolute/path/to/mcp-server"
+environment = { EXAMPLE_API_KEY = "replace-me" }
+disabled = true
+protocol = "auto"
+
+[mcp.servers.local-example.timeout]
+# Whole startup budget and per-catalogue request timeout, in milliseconds.
+startup = 30_000
+catalog = 30_000
+# Omit execution for no wall-clock limit; cancellation still applies.
+execution = 120_000
+
+# Remote MCP server example. Keep disabled until its URL and credentials are real.
+[mcp.servers.remote-example]
+type = "remote"
+url = "https://mcp.example.invalid/mcp"
+headers = { Authorization = "Bearer replace-me" }
+disabled = true
+protocol = "auto"
+
+[mcp.servers.remote-example.timeout]
+startup = 30_000
+catalog = 30_000
+execution = 120_000
+
+# MCP event subscriptions are off. Enabling them is an explicit opt-in.
+# poll_interval is in milliseconds.
+[mcp.events]
+enabled = false
+poll_interval = 5_000
+
+# Webhook values are placeholders and unused while MCP events are disabled.
+[mcp.events.webhook]
+public_url = "https://events.example.invalid/hook"
+secret = "replace-me"
+
+# Tool permissions: allow, ask, or deny. ask_if patterns only escalate allow.
+[permissions]
+default = "allow"
+
+[permissions.tools]
+webfetch = "ask"
+shell = { policy = "allow", ask_if = ["rm -rf", "git push", "sudo"] }
+write = "ask"
+
+# Child-session limits. max_active must be at least 1.
+[subagent]
+depth = 1
+max_active = 5
+
+# Retention windows use days. Zero deletes nothing for events/sessions and
+# disables scratch-directory cleanup for tmp.
+[events]
+retention_days = 7
+
+[sessions]
+retention_days = 30
+
+[tmp]
+retention_days = 7
+
+# Consecutive model calls allowed in one turn; 0 means unlimited.
+[turn]
+max_steps = 500

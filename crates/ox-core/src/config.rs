@@ -745,25 +745,30 @@ impl Config {
             }
         }
 
-        config.magic_context = config.magic_context.validated();
-        config.mcp.validate()?;
-        config.mcp.events.validate()?;
-        if let Some(timezone) = config.timezone.as_deref() {
+        config.validate()?;
+        Ok(config)
+    }
+
+    fn validate(&mut self) -> Result<()> {
+        self.magic_context = std::mem::take(&mut self.magic_context).validated();
+        self.mcp.validate()?;
+        self.mcp.events.validate()?;
+        if let Some(timezone) = self.timezone.as_deref() {
             anyhow::ensure!(
                 !timezone.trim().is_empty(),
                 "timezone must not be empty when set"
             );
         }
-        config.llm.validate()?;
-        config.subagent.validate()?;
-        config.roles.validate()?;
-        for (id, agent) in &config.agents {
+        self.llm.validate()?;
+        self.subagent.validate()?;
+        self.roles.validate()?;
+        for (id, agent) in &self.agents {
             anyhow::ensure!(!id.trim().is_empty(), "[agents] ids must not be empty");
             if let Err(error) = agent.validate() {
                 anyhow::bail!("[agents.{id}]: {error}");
             }
         }
-        Ok(config)
+        Ok(())
     }
 
     /// Restore every key that cannot be hot-swapped to its running value; return the
@@ -1231,5 +1236,42 @@ secret = "shh"
                 .as_str(),
             "https://example.test/hook?server=alpha&name=build"
         );
+    }
+}
+
+#[cfg(test)]
+mod example_config_tests {
+    use super::Config;
+
+    #[test]
+    fn example_config_parses() -> anyhow::Result<()> {
+        let mut config: Config = toml::from_str(include_str!("../../../ox.example.toml"))?;
+        config.validate()?;
+
+        assert_eq!(
+            config.timezone.as_deref(),
+            Some("Etc/UTC"),
+            "example timezone must remain a top-level key"
+        );
+        assert!(
+            !config.automations,
+            "example automations must stay disabled"
+        );
+        assert!(
+            !config.mcp.events.enabled,
+            "example MCP events must stay disabled"
+        );
+        assert!(
+            !config.magic_context.embedding.is_enabled(),
+            "example embeddings must stay disabled"
+        );
+        assert_eq!(config.mcp.servers.len(), 2, "show local and remote MCP");
+        for (name, server) in &config.mcp.servers {
+            assert!(
+                server.disabled(),
+                "example MCP server `{name}` must stay disabled"
+            );
+        }
+        Ok(())
     }
 }
