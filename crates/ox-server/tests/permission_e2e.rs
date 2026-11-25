@@ -13,7 +13,7 @@ use ox_core::config::{
 };
 use ox_core::event_bus::EventBus;
 use ox_db::Db;
-use ox_llm::cardinal::router::EndpointRouter;
+use ox_llm::chat_completions::router::EndpointRouter;
 use ox_schema::event::EventEnvelope;
 use ox_schema::permission::{Effect, Rule};
 use salvo::http::Body;

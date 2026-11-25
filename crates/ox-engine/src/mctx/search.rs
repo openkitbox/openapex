@@ -145,7 +145,7 @@ use serde_json::{Value, json};
 
 use crate::runner::{Tool, ToolContext, ToolOutput};
 use ox_db::Db;
-use ox_llm::cardinal::wire::ToolDef;
+use ox_llm::chat_completions::wire::ToolDef;
 use ox_schema::id::now_millis;
 use ox_tools::{object_param, ok_text};
 

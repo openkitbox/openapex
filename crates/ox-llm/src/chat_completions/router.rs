@@ -17,7 +17,7 @@ use crate::config::{EndpointLimits, LlmConfig, Protocol, ProviderConfig};
 
 use super::ChatError;
 use super::chat::{Chat, ChatFuture};
-use super::client::CardinalClient;
+use super::client::ChatCompletionsClient;
 use super::limit::LimitedChat;
 use super::wire::ChatRequest;
 use crate::messages::client::MessagesClient;
@@ -197,7 +197,7 @@ impl Chat for EndpointRouter {
 fn client_for(name: &str, provider: &ProviderConfig) -> Result<Arc<dyn Chat>, ChatError> {
     let stall = provider.limits.stall_timeout();
     Ok(match provider.protocol() {
-        Protocol::ChatCompletions => Arc::new(CardinalClient::with_stall_timeout(
+        Protocol::ChatCompletions => Arc::new(ChatCompletionsClient::with_stall_timeout(
             provider.base_url.clone(),
             provider.api_key.clone(),
             stall,

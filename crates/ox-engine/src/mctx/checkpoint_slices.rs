@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use ox_llm::cardinal::chat::Chat;
-use ox_llm::cardinal::wire::{ChatMessage, ChatRequest};
+use ox_llm::chat_completions::chat::Chat;
+use ox_llm::chat_completions::wire::{ChatMessage, ChatRequest};
 use ox_llm::model_catalog::{Limit, RuntimeLimits};
 use ox_schema::support::ModelRef;
 

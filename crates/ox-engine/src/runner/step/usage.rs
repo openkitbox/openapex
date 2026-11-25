@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
 
-use ox_llm::cardinal::wire::{ChatRequest, Usage};
+use ox_llm::chat_completions::wire::{ChatRequest, Usage};
 use ox_schema::support::{TokenCache, TokenUsage};
 
 use super::super::drain::DrainCtx;
@@ -110,7 +110,7 @@ fn record_attempt(ledger: &CacheLedger, session: &str, usage: Option<Usage>) {
 }
 
 /// Upstream token shape (`SessionUsage.tokens`): input excludes cached
-/// prompt tokens, cache write is not reported by cardinal's OpenAI dialect.
+/// prompt tokens, cache write is not reported by the Chat Completions dialect.
 /// A stream that never carried usage stores `estimate()` as `input` and
 /// zeros elsewhere; the estimate is not evaluated when usage was reported.
 fn tokens_for(usage: Option<Usage>, estimate: impl FnOnce() -> i64) -> TokenUsage {
@@ -141,7 +141,7 @@ pub(crate) fn usage_to_tokens(usage: Usage) -> TokenUsage {
         ),
         (Some(true), Some(_)) => {
             tracing::warn!(
-                "cardinal reported reasoning tokens greater than completion tokens; ignoring reasoning"
+                "endpoint reported reasoning tokens greater than completion tokens; ignoring reasoning"
             );
             (usage.completion_tokens as i64, 0, Some(false))
         }
@@ -203,7 +203,7 @@ fn estimate_request_tokens(
     model_id: &str,
     request: &ChatRequest,
 ) -> i64 {
-    let body_len = match ox_llm::cardinal::wire::serialized_len(request) {
+    let body_len = match ox_llm::chat_completions::wire::serialized_len(request) {
         Ok(len) => len,
         Err(error) => {
             tracing::warn!(session = %ctx.session_id, error = %error, "prompt estimate skipped");
@@ -285,7 +285,7 @@ pub(super) fn observe_request_cost(
     }
     // Only the body's size is needed, so it is measured rather than built: a
     // transcript-sized copy per sampled step buys nothing here.
-    let Ok(body_len) = ox_llm::cardinal::wire::serialized_len(request) else {
+    let Ok(body_len) = ox_llm::chat_completions::wire::serialized_len(request) else {
         return;
     };
     crate::mctx::calibration::observe(

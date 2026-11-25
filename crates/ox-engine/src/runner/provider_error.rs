@@ -20,7 +20,7 @@
 use regex::Regex;
 use std::sync::OnceLock;
 
-use ox_llm::cardinal::ChatError;
+use ox_llm::chat_completions::ChatError;
 
 /// Upstream `patterns`: one [`Regex`] source per line, all case-insensitive.
 const PATTERN_SOURCES: &[&str] = &[
@@ -134,7 +134,7 @@ pub(crate) fn is_payload_too_large(message: &str) -> bool {
         .any(|pattern| pattern.is_match(message))
 }
 
-/// Whether a cardinal error is the context-overflow (or payload-too-large)
+/// Whether a Chat Completions error is the context-overflow (or payload-too-large)
 /// rejection the step recovers from by compacting (upstream
 /// `classifyProviderFailure`: the overflow classification is scoped to
 /// client-side 4xx rejections; an in-band upstream failure carries no status

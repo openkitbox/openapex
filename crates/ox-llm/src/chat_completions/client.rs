@@ -1,16 +1,16 @@
-//! HTTP client for cardinal's `/v1/chat/completions` streaming endpoint.
+//! HTTP client for a `/v1/chat/completions` streaming endpoint.
 //!
-//! [`CardinalClient::stream_chat`] POSTs a [`ChatRequest`] and returns a
+//! [`ChatCompletionsClient::stream_chat`] POSTs a [`ChatRequest`] and returns a
 //! [`ChatStream`] — a [`Stream`] of [`StreamEvent`]s that:
 //!
 //! - yields text / reasoning / tool-call deltas, then `Finish`, then `Usage`
-//!   (cardinal sends usage in a trailing chunk whose `choices` array is
+//!   (endpoints send usage in a trailing chunk whose `choices` array is
 //!   empty), then `Done` for `data: [DONE]`;
 //! - maps a non-2xx response to [`ChatError::Http`] with a body snippet;
 //! - maps an in-band chunk `error` object to [`ChatError::Upstream`];
 //! - reports a connection closed before any terminal signal as
 //!   [`ChatError::EarlyClose`] (the turn is incomplete). A seen
-//!   `finish_reason` *is* a terminal for cardinal's verdict even when
+//!   `finish_reason` *is* terminal for the protocol even when
 //!   `[DONE]` never arrives, so an EOF after `Finish` ends the stream
 //!   cleanly with a synthetic `Done` — assembled content is kept.
 //!
@@ -33,20 +33,20 @@ use crate::sse::{SseChatStream, streaming_http_client};
 /// A live streaming chat response, decoded as chat-completions chunks.
 pub type ChatStream = SseChatStream<ChunkDecoder>;
 
-/// Cardinal's chat completions route, appended to the configured base URL.
+/// The Chat Completions route, appended to the configured base URL.
 pub const CHAT_COMPLETIONS_PATH: &str = "/v1/chat/completions";
 
-/// A cardinal gateway client.
+/// A Chat Completions endpoint client.
 #[derive(Debug, Clone)]
-pub struct CardinalClient {
+pub struct ChatCompletionsClient {
     http: reqwest::Client,
     base_url: String,
     api_key: Option<String>,
 }
 
-impl CardinalClient {
-    /// A client for the gateway at `base_url`, authenticated with
-    /// `api_key` when present (cardinal expects `Authorization: Bearer`).
+impl ChatCompletionsClient {
+    /// A client for the endpoint at `base_url`, authenticated with
+    /// `api_key` when present (the endpoint expects `Authorization: Bearer`).
     pub fn new(base_url: impl Into<String>, api_key: Option<String>) -> Result<Self, ChatError> {
         Self::with_stall_timeout(base_url, api_key, None)
     }

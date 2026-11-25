@@ -24,7 +24,7 @@
 //! real tools; the registry ships empty until task 7 fills it.
 
 pub use generate::GenerateResult;
-pub use ox_llm::cardinal::chat::Chat;
+pub use ox_llm::chat_completions::chat::Chat;
 pub use services::{Live, ServiceSet, Services};
 pub use step::usage::SessionCache;
 

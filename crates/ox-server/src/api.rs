@@ -663,7 +663,7 @@ async fn worktree_directory(state: &AppState, req: &mut Request, requested: &str
 
 /// Upstream `Model.Info` envelope: `{ location: { directory }, data: [...] }`.
 /// NOTE (Task 5): this will be replaced by a live model catalogue from the
-/// cardinal gateway; for now it serves the statically configured `models`.
+/// configured providers; for now it serves the statically configured `models`.
 #[derive(Serialize)]
 struct ModelList {
     location: LocationRef,
@@ -760,11 +760,12 @@ fn model_type_matches(entry: &ox_llm::model_catalog::ModelEntry, types: Option<&
 }
 
 /// The `Model.Info` projection of a configured model (required upstream
-/// fields; limits default to zero — cardinal owns the real routing). `id`
+/// fields; limits default to zero — the endpoint router owns the real
+/// routing). `id`
 /// and `modelID` are both the bare model id, matching upstream's
 /// `Model.Info.default` — clients use `id` as the model identifier when
 /// selecting, so a qualified value would leak into requests. The reasoning
-/// levels cardinal advertises become `{id}` variants in catalog order
+/// levels the endpoint advertises become `{id}` variants in catalog order
 /// (upstream `Model.Variant` is `{id}` on the wire); a model without
 /// advertised levels gets none.
 ///
@@ -890,7 +891,7 @@ async fn provider_list(req: &mut Request, depot: &mut Depot, res: &mut Response)
         }
         // Display name: the builtin's own label when there is one
         // ("deepseek" → "DeepSeek"), else the capitalized id
-        // ("cardinal" → "Cardinal").
+        // ("moonshot" → "Moonshot").
         let name = match ox_llm::config::builtin(&m.provider) {
             Some(builtin) => builtin.label.to_owned(),
             None => {

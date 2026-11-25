@@ -23,7 +23,7 @@
 use std::borrow::Cow;
 
 use ox_core::text;
-use ox_llm::cardinal::wire::ChatMessage;
+use ox_llm::chat_completions::wire::ChatMessage;
 
 /// One tool result's cap inside a summarization request. The live request's
 /// cap is 32 KiB; a summary reads the shape of a result, not its body.

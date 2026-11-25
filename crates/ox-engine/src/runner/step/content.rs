@@ -1,4 +1,4 @@
-use ox_llm::cardinal::wire::{ImageUrl, UserContent, UserPart};
+use ox_llm::chat_completions::wire::{ImageUrl, UserContent, UserPart};
 use ox_schema::support::{FileAttachment, FileSource, Prompt};
 /// A user prompt's wire text: the typed text plus attachment markers.
 /// (Upstream `SessionPrompt.prepare` inlines resolved file content; 6a

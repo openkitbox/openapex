@@ -17,8 +17,8 @@ use std::time::Duration;
 
 use super::stream::{ANTHROPIC_VERSION, MessagesDecoder};
 use super::wire::{MessagesPolicy, build_request};
-use crate::cardinal::chat::{Chat, ChatFuture};
-use crate::cardinal::wire::ChatRequest;
+use crate::chat_completions::chat::{Chat, ChatFuture};
+use crate::chat_completions::wire::ChatRequest;
 use crate::error::ChatError;
 use crate::sse::{SseChatStream, streaming_http_client};
 
@@ -104,7 +104,7 @@ impl Chat for MessagesClient {
         Box::pin(async move {
             MessagesClient::stream_chat(self, request)
                 .await
-                .map(|stream| Box::pin(stream) as crate::cardinal::chat::BoxChatStream)
+                .map(|stream| Box::pin(stream) as crate::chat_completions::chat::BoxChatStream)
         })
     }
 }

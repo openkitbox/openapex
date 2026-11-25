@@ -5,9 +5,9 @@ use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use ox_llm::cardinal::chat::Chat;
-use ox_llm::cardinal::stream::StreamEvent;
-use ox_llm::cardinal::wire::{ChatRequest, Usage};
+use ox_llm::chat_completions::chat::Chat;
+use ox_llm::chat_completions::stream::StreamEvent;
+use ox_llm::chat_completions::wire::{ChatRequest, Usage};
 use ox_schema::id::now_millis;
 
 /// Successful text-only finishes supported by the current two wire protocols.

@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use ox_llm::cardinal::wire::{ChatMessage, ChatRequest};
+use ox_llm::chat_completions::wire::{ChatMessage, ChatRequest};
 use ox_schema::support::{Finite, MoneyUsd, TokenUsage};
 
 use super::Inner;

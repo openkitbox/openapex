@@ -9,7 +9,7 @@ pub use ox_core::{USER_AGENT, config, event_bus, projector};
 pub use ox_db as db;
 pub use ox_engine::{mctx, prompt, runner};
 pub use ox_llm as llm;
-pub use ox_llm::cardinal;
+pub use ox_llm::chat_completions;
 pub use ox_llm::model_catalog;
 pub use ox_mcp as mcp;
 pub use ox_schema as schema;

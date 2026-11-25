@@ -17,8 +17,8 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use crate::cardinal::stream::StreamEvent;
-use crate::cardinal::wire::Usage;
+use crate::chat_completions::stream::StreamEvent;
+use crate::chat_completions::wire::Usage;
 use crate::error::ChatError;
 use crate::sse::SseDecoder;
 

@@ -1,15 +1,16 @@
 //! LLM endpoint access for ox: the endpoint configuration schema
 //! ([`config`]), provider credentials ([`credentials`]), the model catalogue
-//! ([`model_catalog`]), the two streaming chat protocols ([`cardinal`] for
-//! OpenAI chat completions, [`messages`] for Anthropic Messages), their shared
-//! SSE framing ([`sse`]) and error type ([`error`]), and the outbound HTTP
-//! identity ([`http_client`]).
+//! ([`model_catalog`]), the two streaming chat protocols
+//! ([`chat_completions`] for OpenAI chat completions, [`messages`] for
+//! Anthropic Messages), their shared SSE framing ([`sse`]) and error type
+//! ([`error`]), and the outbound HTTP identity ([`http_client`]).
 //!
 //! Depends only on the contract crate (`ox-schema`) — never on `ox-core`,
 //! `ox-db` or the engine. `ox-core` embeds [`config::LlmConfig`] in its
-//! `Config`; the engine and server consume the [`cardinal::chat::Chat`] seam.
+//! `Config`; the engine and server consume the
+//! [`chat_completions::chat::Chat`] seam.
 
-pub mod cardinal;
+pub mod chat_completions;
 pub mod config;
 pub mod credentials;
 pub mod error;

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use crate::mctx::memory::{self, MemoryRow};
-use ox_llm::cardinal::wire::{ChatMessage, ChatRequest, ToolChoice, ToolDef};
+use ox_llm::chat_completions::wire::{ChatMessage, ChatRequest, ToolChoice, ToolDef};
 use ox_schema::message::Message;
 
 use super::chunk::ChunkBlock;

@@ -1,4 +1,4 @@
-//! Mockable streaming-chat port over [`CardinalClient::stream_chat`].
+//! Mockable streaming-chat port over [`ChatCompletionsClient::stream_chat`].
 //!
 //! The runner depends on this object-safe trait (`Arc<dyn Chat>`) instead of
 //! the concrete client so tests can substitute a scripted transport. The
@@ -18,7 +18,7 @@ use std::pin::Pin;
 use futures_core::Stream;
 
 use super::ChatError;
-use super::client::CardinalClient;
+use super::client::ChatCompletionsClient;
 use super::stream::StreamEvent;
 use super::wire::ChatRequest;
 
@@ -47,10 +47,10 @@ pub trait Chat: Send + Sync {
     }
 }
 
-impl Chat for CardinalClient {
+impl Chat for ChatCompletionsClient {
     fn stream_chat<'a>(&'a self, request: &'a ChatRequest) -> ChatFuture<'a> {
         Box::pin(async move {
-            CardinalClient::stream_chat(self, request)
+            ChatCompletionsClient::stream_chat(self, request)
                 .await
                 .map(|stream| Box::pin(stream) as BoxChatStream)
         })

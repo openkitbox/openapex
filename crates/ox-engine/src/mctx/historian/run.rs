@@ -8,8 +8,8 @@ use crate::mctx::compartments::{self, NewCompartment, Tiers};
 use crate::mctx::historian_validate::{self, ValidateOptions};
 use crate::mctx::promotion;
 use ox_core::config::Config;
-use ox_llm::cardinal::chat::Chat;
-use ox_llm::cardinal::wire::{ChatRequest, ToolDef};
+use ox_llm::chat_completions::chat::Chat;
+use ox_llm::chat_completions::wire::{ChatRequest, ToolDef};
 use ox_schema::id::{id, now_millis};
 use ox_schema::message::{Compaction, Message};
 

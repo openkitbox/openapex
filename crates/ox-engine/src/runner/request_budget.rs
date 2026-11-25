@@ -2,7 +2,7 @@
 //! Pure measurement borrows the final paired request. `apply` owns logging and
 //! wiring; unsupported media disables input admission, never output limits.
 
-use ox_llm::cardinal::wire::{ChatMessage, ChatRequest, UserContent, UserPart};
+use ox_llm::chat_completions::wire::{ChatMessage, ChatRequest, UserContent, UserPart};
 use ox_llm::model_catalog::RuntimeLimits;
 
 /// Assembler-owned content attribution; history is the remainder after pairing.

@@ -1,5 +1,5 @@
-use ox_llm::cardinal::ChatError;
-use ox_llm::cardinal::wire::{ChatMessage, ChatRequest};
+use ox_llm::chat_completions::ChatError;
+use ox_llm::chat_completions::wire::{ChatMessage, ChatRequest};
 use ox_schema::support::{SessionError, SessionErrorResponse};
 /// Upstream `TOOLS_INTERRUPTED` as an `aborted` session error.
 pub(super) fn aborted_error(message: &str) -> SessionError {
@@ -33,7 +33,7 @@ pub(super) fn pairing_rejection_ids(body: &str) -> Option<Vec<String>> {
     let rest = body[at + MARKER.len()..].lines().next().unwrap_or("");
     // The listed ids end where the enclosing JSON string does — a backslash
     // begins the escaped closing quote (verbatim upstream body, or wrapped
-    // by cardinal into `\",\"`); provider ids never carry one, so cutting at
+    // by the transport into `\",\"`); provider ids never carry one, so cutting at
     // the first is safe. The plain `","` shape covers a non-escaped tail.
     let end = rest.find('\\').unwrap_or(rest.len());
     let rest = rest[..end].split("\",\"").next().unwrap_or(rest);
@@ -75,7 +75,7 @@ pub(super) fn tool_call_digest(request: &ChatRequest) -> String {
     ids.join(",")
 }
 
-/// Map a cardinal failure to a session error (upstream `toSessionError`):
+/// Map a Chat Completions failure to a session error (upstream `toSessionError`):
 /// the provider taxonomy for HTTP/stream failures, upstream's transport
 /// family for connection-level faults.
 pub(super) fn to_session_error(error: &ChatError) -> SessionError {
@@ -92,7 +92,7 @@ pub(super) fn to_session_error(error: &ChatError) -> SessionError {
             Some(SessionErrorResponse { body: body.clone() }),
         ),
         ChatError::Upstream(body) => (
-            // An in-band provider failure forwarded by cardinal.
+            // An in-band provider failure forwarded by the endpoint.
             "provider.unknown",
             None,
             Some(SessionErrorResponse { body: body.clone() }),

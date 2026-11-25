@@ -13,7 +13,7 @@
 //!   `StreamEvent::ToolCallDelta` fragments: `session.tool.input.started`
 //!   fires once the call is identified (id + name known), `*.input.delta`
 //!   per fragment (ephemeral), `*.input.ended` when the arguments complete.
-//!   Cardinal completes a call's arguments at `finish_reason`, so the
+//!   The endpoint completes a call's arguments at `finish_reason`, so the
 //!   settlement — `session.tool.called` plus the spawned execution — runs
 //!   at `Finish` while the stream may still be open (upstream: tool
 //!   execution is concurrent with the stream, llm.ts + step.ts).

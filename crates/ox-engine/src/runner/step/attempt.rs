@@ -3,8 +3,8 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
-use ox_llm::cardinal::ChatError;
-use ox_llm::cardinal::wire::ChatRequest;
+use ox_llm::chat_completions::ChatError;
+use ox_llm::chat_completions::wire::ChatRequest;
 use ox_schema::event::SessionEventData;
 use ox_schema::id;
 use ox_schema::support::{FinishReason, ModelRef, SessionError, TokenUsage};

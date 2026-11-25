@@ -3,7 +3,7 @@ use std::borrow::Cow;
 use anyhow::Result;
 
 use crate::mctx::temporal;
-use ox_llm::cardinal::wire::{
+use ox_llm::chat_completions::wire::{
     ChatMessage, FunctionCall, FunctionType, ImageUrl, ToolCall, UserPart,
 };
 use ox_schema::message::{
@@ -453,7 +453,7 @@ pub(crate) fn build_chat_messages(
                         // joined text). Replayed regardless of the row's model
                         // — upstream degrades cross-model reasoning to text
                         // (to-llm-message.ts `sameModel`); ox has no
-                        // per-provider gate, cardinal owns dialects.
+                        // per-provider gate; the endpoint owns dialects.
                         AssistantContent::Reasoning { text, .. } if text.is_empty() => {}
                         AssistantContent::Reasoning { text, .. } if replay_reasoning => {
                             reasoning.push_str(text)

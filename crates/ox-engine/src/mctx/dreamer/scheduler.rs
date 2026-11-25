@@ -9,8 +9,8 @@ use crate::mctx::historian::{HISTORIAN_COMPLETION_TIMEOUT, ModelChain};
 use crate::mctx::memory;
 use ox_core::config::Config;
 use ox_db::Db;
-use ox_llm::cardinal::chat::Chat;
-use ox_llm::cardinal::wire::{ChatMessage, ChatRequest};
+use ox_llm::chat_completions::chat::Chat;
+use ox_llm::chat_completions::wire::{ChatMessage, ChatRequest};
 use ox_schema::id::now_millis;
 
 use super::classify::{

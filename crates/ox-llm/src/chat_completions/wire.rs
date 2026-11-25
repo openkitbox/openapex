@@ -1,14 +1,13 @@
 //! Wire-exact OpenAI Chat Completions request types.
 //!
-//! Cardinal's chat kernel (`cardinal/src/protocol/openai_chat.rs`) validates
-//! only `model` (string) and a non-empty `messages` array, then forwards every
-//! other field through verbatim — so the structs here serialize the canonical
-//! OpenAI shapes and nothing provider-specific:
+//! The OpenAI Chat Completions protocol requires only `model` (string) and a
+//! non-empty `messages` array; every other field passes through verbatim — so
+//! the structs here serialize the canonical OpenAI shapes and nothing
+//! provider-specific:
 //!
 //! - [`ChatRequest`] always carries `"stream": true` and
-//!   `"stream_options": {"include_usage": true}` (cardinal pins the same flag
-//!   on its side; sending it explicitly keeps ox compatible with any
-//!   OpenAI-compatible relay).
+//!   `"stream_options": {"include_usage": true}` (sending it explicitly keeps
+//!   ox compatible with any endpoint implementing the protocol).
 //! - [`ChatMessage::Assistant`] serializes `content` as an explicit `null`
 //!   when the message carries only tool calls (the canonical OpenAI history
 //!   form providers expect for follow-up `role: "tool"` messages).
@@ -18,15 +17,16 @@ use serde::{Deserialize, Serialize};
 use ox_schema::support::Finite;
 
 /// Tool schema types live in the contract crate; the chat request re-exports
-/// them so `cardinal::wire` stays the one place the wire shapes are read from.
+/// them so `chat_completions::wire` stays the one place wire shapes are read
+/// from.
 pub use ox_schema::wire::{FunctionDef, FunctionType, ToolDef};
 
 /// A streaming chat completion request.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ChatRequest {
-    /// Model identifier as cardinal exposes it (`model.list`).
+    /// Model identifier as the endpoint exposes it in `model.list`.
     pub model: String,
-    /// Conversation history; must be non-empty (cardinal rejects empty).
+    /// Conversation history; must be non-empty (endpoints reject empty).
     pub messages: Vec<ChatMessage>,
     /// Tools the model may call; omitted from the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -39,11 +39,11 @@ pub struct ChatRequest {
     /// Sampling temperature; omitted when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
-    /// Completion token cap; omitted when unset (cardinal requires > 0).
+    /// Completion token cap; omitted when unset (the protocol requires > 0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
-    /// Reasoning effort for the turn; cardinal parses it from the body and
-    /// re-emits it per provider dialect. Derived from the session's model
+    /// Reasoning effort for the turn; endpoints parse it from the body and
+    /// re-emit it per provider dialect. Derived from the session's model
     /// variant at [`reasoning_effort_of`] — omitted when there is no
     /// selection, so unselected turns stay byte-identical to before.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -219,7 +219,7 @@ pub enum ToolChoice {
     Required,
 }
 
-/// One part of a user message that is not plain text. Cardinal forwards
+/// One part of a user message that is not plain text. Endpoints forward
 /// `content` verbatim, so an image reaches the provider as the standard
 /// `image_url` part.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -355,13 +355,13 @@ impl ChatMessage {
     }
 }
 
-/// Token usage as reported by cardinal in the final chunk. The two counts
-/// are what cardinal's own decoder treats as mandatory; the optional details
+/// Token usage as reported by the endpoint in the final chunk. The two counts
+/// are mandatory in the Chat Completions protocol; the optional details
 /// mirror its vendor-shape fallbacks (DeepSeek's flat `prompt_cache_hit_tokens`
 /// vs OpenAI's `prompt_tokens_details.cached_tokens`, and
 /// `completion_tokens_details.reasoning_tokens` vs bare `reasoning_tokens`).
-/// Deserialization goes through the Cardinal Chat stream decoder, not a derived
-/// impl — the vendor fallback keys cannot be expressed as plain fields.
+/// Deserialization goes through the Chat Completions stream decoder, not a
+/// derived impl — the vendor fallback keys cannot be expressed as plain fields.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
 pub struct Usage {
     /// Prompt (input) tokens.
@@ -380,8 +380,8 @@ pub struct Usage {
     /// Reasoning tokens, when the vendor reports them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_tokens: Option<u64>,
-    /// Whether Cardinal Chat verified that reasoning is included in completion
-    /// tokens. This is private so only the Cardinal Chat decoder can accept the
+    /// Whether the Chat Completions decoder verified that reasoning is included
+    /// in completion tokens. This is private so only that decoder can accept the
     /// upstream marker; other protocol decoders construct unmarked usage. It is
     /// internal metadata and never appears in serialized usage or stream events.
     #[serde(skip)]
@@ -410,18 +410,18 @@ impl Usage {
         }
     }
 
-    /// Construct usage after the Cardinal Chat decoder accepted its inclusion
+    /// Construct usage after the Chat Completions decoder accepted its inclusion
     /// marker. Kept crate-private so arbitrary protocol decoders cannot assert
     /// this trust boundary.
     #[must_use]
-    pub(crate) fn from_cardinal_chat(
+    pub(crate) fn from_chat_completions(
         prompt_tokens: u64,
         completion_tokens: u64,
         cost: Option<Finite>,
         cached_tokens: Option<u64>,
         reasoning_tokens: Option<u64>,
         reasoning_tokens_included: Option<bool>,
-        _proof: CardinalChatUsageProof,
+        _proof: ChatCompletionsUsageProof,
     ) -> Self {
         Self {
             prompt_tokens,
@@ -434,7 +434,7 @@ impl Usage {
         }
     }
 
-    /// Whether the Cardinal Chat decoder proved that reasoning is included in
+    /// Whether the Chat Completions decoder proved that reasoning is included in
     /// completion tokens.
     #[must_use]
     pub fn reasoning_tokens_included(&self) -> Option<bool> {
@@ -442,12 +442,12 @@ impl Usage {
     }
 }
 
-/// Proof that usage was decoded by the Cardinal Chat path. Its private field
+/// Proof that usage was decoded by the Chat Completions path. Its private field
 /// prevents other protocol implementations from manufacturing the trust token.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CardinalChatUsageProof(());
+pub(crate) struct ChatCompletionsUsageProof(());
 
-impl CardinalChatUsageProof {
+impl ChatCompletionsUsageProof {
     pub(crate) fn new() -> Self {
         Self(())
     }

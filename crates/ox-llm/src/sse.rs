@@ -30,7 +30,7 @@ use std::time::Duration;
 use futures_core::Stream;
 use tokio_util::sync::CancellationToken;
 
-use crate::cardinal::stream::StreamEvent;
+use crate::chat_completions::stream::StreamEvent;
 use crate::error::ChatError;
 
 /// Maximum bytes in one SSE line.
@@ -215,11 +215,13 @@ impl<D: SseDecoder + Unpin> SseChatStream<D> {
         std::future::poll_fn(|cx| Pin::new(&mut *self).poll_next(cx)).await
     }
 
-    /// Drain the whole stream into an [`crate::cardinal::stream::AssembledMessage`].
+    /// Drain the whole stream into an [`crate::chat_completions::stream::AssembledMessage`].
     /// The first error aborts; `Ok` with `done == false` only happens when the
     /// stream was cancelled or dropped early.
-    pub async fn collect(mut self) -> Result<crate::cardinal::stream::AssembledMessage, ChatError> {
-        let mut assembler = crate::cardinal::stream::Assembler::new();
+    pub async fn collect(
+        mut self,
+    ) -> Result<crate::chat_completions::stream::AssembledMessage, ChatError> {
+        let mut assembler = crate::chat_completions::stream::Assembler::new();
         while let Some(event) = self.next_event().await {
             assembler.push(&event?);
         }

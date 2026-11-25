@@ -1,21 +1,21 @@
-//! SSE framing, chunk decoding and delta assembly for cardinal's streaming
-//! Chat responses.
+//! SSE framing, chunk decoding and delta assembly for streaming Chat
+//! Completions responses.
 //!
 //! Three layers, each independently testable:
 //!
-//! 1. [`SseFramer`] — bytes to `data:` payloads. A port of cardinal's own
-//!    framer (`cardinal/src/protocol/sse.rs`): UTF-8 BOM stripped, `\n` /
+//! 1. [`SseFramer`] — bytes to `data:` payloads, Chat Completions framing:
+//!    UTF-8 BOM stripped, `\n` /
 //!    `\r\n` / bare `\r` line endings, `:`-prefixed comment (keep-alive)
 //!    lines ignored, multi-line `data` values joined with `\n`, and the same
 //!    line/event size limits.
-//! 2. [`ChunkDecoder`] — one payload to zero or more [`StreamEvent`]s, the
-//!    similar vocabulary to cardinal's `StreamDecoder::observe_raw` (both the
+//! 2. [`ChunkDecoder`] — one payload to zero or more [`StreamEvent`]s with the
+//!    vocabulary of Chat Completions stream decoders (both the
 //!    DeepSeek `reasoning_content` and OpenRouter `reasoning` field names,
 //!    the running tool-call index fallback, and usage-only chunks with an
 //!    empty `choices` array that do not terminate the stream). Deliberate
 //!    deviations: refusal deltas are surfaced as text; `finish_reason: error`
-//!    is an upstream error rather than a successful finish; and Cardinal's
-//!    in-band error object is checked before any event is emitted.
+//!    is an upstream error rather than a successful finish; and in-band error
+//!    objects are checked before any event is emitted.
 //! 3. [`Assembler`] — the deltas folded back into a final assistant message:
 //!    text, reasoning, and tool calls keyed by index with concatenated
 //!    argument fragments.
@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 
 use super::ChatError;
-use crate::cardinal::wire::{CardinalChatUsageProof, Usage};
+use crate::chat_completions::wire::{ChatCompletionsUsageProof, Usage};
 use crate::sse::SseDecoder;
 use ox_schema::support::Finite;
 
@@ -53,7 +53,7 @@ pub enum StreamEvent {
     /// `choices[0].finish_reason`, preserved raw (`stop`, `tool_calls`,
     /// `length`, `content_filter`, ...).
     Finish {
-        /// The reason string exactly as cardinal sent it.
+        /// The reason string exactly as the endpoint sent it.
         reason: String,
     },
     /// Token usage, usually in the trailing chunk with empty `choices`.
@@ -62,9 +62,9 @@ pub enum StreamEvent {
     Done,
 }
 
-/// Decodes cardinal's Chat SSE payloads into [`StreamEvent`]s.
+/// Decodes Chat Completions SSE payloads into [`StreamEvent`]s.
 ///
-/// Mirrors `cardinal/src/protocol/openai_chat.rs`'s `StreamDecoder`: text and
+/// Mirrors the Chat Completions `StreamDecoder` vocabulary: text and
 /// reasoning deltas, `tool_calls` fragments (with a running index for vendors
 /// that omit `index`), `finish_reason`, usage (including usage-only chunks
 /// with an empty `choices` array), and in-band `error` objects.
@@ -89,8 +89,8 @@ impl ChunkDecoder {
     /// Decode one `data:` payload, appending events to `out`.
     ///
     /// `[DONE]` yields [`StreamEvent::Done`]; an empty payload yields nothing.
-    /// A payload that is not valid JSON is fatal (cardinal returns a failed
-    /// turn for it too); an in-band `error` object becomes
+    /// A payload that is not valid JSON is fatal (a malformed payload fails the
+    /// turn); an in-band `error` object becomes
     /// [`ChatError::Upstream`].
     pub fn decode(&mut self, payload: &str, out: &mut Vec<StreamEvent>) -> Result<(), ChatError> {
         let data = payload.trim();
@@ -197,7 +197,7 @@ fn describe_error(error: &serde_json::Value) -> String {
     error.to_string()
 }
 
-/// Extract usage exactly like cardinal's chat kernel: both `prompt_tokens`
+/// Extract usage from the Chat Completions chunk shape: both `prompt_tokens`
 /// and `completion_tokens` must be present, then the optional cache-hit and
 /// reasoning details are picked up from either vendor shape.
 fn usage_from(value: &serde_json::Value) -> Option<Usage> {
@@ -208,7 +208,7 @@ fn usage_from(value: &serde_json::Value) -> Option<Usage> {
     let completion_tokens = usage
         .get("completion_tokens")
         .and_then(serde_json::Value::as_u64)?;
-    Some(Usage::from_cardinal_chat(
+    Some(Usage::from_chat_completions(
         prompt_tokens,
         completion_tokens,
         usage
@@ -231,7 +231,7 @@ fn usage_from(value: &serde_json::Value) -> Option<Usage> {
             .get("completion_tokens_details")
             .and_then(|details| details.get("reasoning_tokens_included"))
             .and_then(serde_json::Value::as_bool),
-        CardinalChatUsageProof::new(),
+        ChatCompletionsUsageProof::new(),
     ))
 }
 

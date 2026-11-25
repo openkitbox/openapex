@@ -5,10 +5,10 @@ use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
 use ox_core::copied_tags::strip_copied_tag_notation;
-use ox_llm::cardinal::ChatError;
-use ox_llm::cardinal::chat::BoxChatStream;
-use ox_llm::cardinal::stream::StreamEvent;
-use ox_llm::cardinal::wire::{ChatRequest, Usage};
+use ox_llm::chat_completions::ChatError;
+use ox_llm::chat_completions::chat::BoxChatStream;
+use ox_llm::chat_completions::stream::StreamEvent;
+use ox_llm::chat_completions::wire::{ChatRequest, Usage};
 use ox_schema::event::SessionEventData;
 use ox_schema::support::FinishReason;
 
@@ -284,7 +284,7 @@ async fn consume_owned(
                 StreamEvent::Finish { reason } => {
                     let mapped = map_finish(&reason);
                     finish = Some((mapped, reason));
-                    // Cardinal completes a tool call's arguments at the
+                    // The endpoint completes a tool call's arguments at the
                     // finish chunk, so the calls settle — input ended,
                     // `tool.called`, execution spawned — while the stream is
                     // still open (usage / `[DONE]` may follow). Upstream

@@ -1,14 +1,11 @@
-//! cardinal LLM gateway client: a standard OpenAI Chat Completions *streaming*
-//! client.
+//! OpenAI Chat Completions *streaming* client.
 //!
-//! Cardinal normalizes providers behind its `/v1/chat/completions` route and
-//! forwards chat-protocol bytes verbatim, so this module contains zero
-//! provider-specific logic — the wire shapes here were verified against
-//! cardinal's own kernel (`cardinal/src/protocol/openai_chat.rs`) and its SSE
-//! framer (`cardinal/src/protocol/sse.rs`):
+//! Endpoints expose the `/v1/chat/completions` route and forward the protocol
+//! bytes, so this module contains no provider-specific logic — the wire shapes
+//! here are the canonical Chat Completions request/chunk forms and SSE framing:
 //!
-//! - **Request**: cardinal validates only `model` (string) and a non-empty
-//!   `messages` array, then passes every other field through verbatim — so
+//! - **Request**: the protocol requires only `model` (string) and a non-empty
+//!   `messages` array; every other field passes through verbatim — so
 //!   [`wire::ChatRequest`] serializes canonical OpenAI fields
 //!   (`tool_choice`, `stream: true`, `stream_options.include_usage: true`).
 //! - **Chunks**: `data: {...}` lines carry `choices[0].delta.{content,
@@ -16,7 +13,7 @@
 //!   final `usage` (often in a trailing chunk whose `choices` array is empty —
 //!   that chunk does *not* terminate the stream; only `data: [DONE]` does).
 //! - **Usage**: `prompt_tokens` / `completion_tokens` plus optional cached /
-//!   reasoning token details, extracted exactly like cardinal's decoder.
+//!   reasoning token details, extracted from the vendor shapes in use.
 //!
 //! Layout: [`wire`] (request types), [`stream`] (SSE framing, chunk decoding,
 //! delta assembly), [`client`] (HTTP + the [`client::ChatStream`]), [`chat`]
@@ -25,8 +22,8 @@
 //!
 //! Errors: [`ChatError`] — an HTTP error carries the status and a body
 //! snippet; framing-level junk lines are skipped per the SSE spec, while a
-//! `data:` payload that is not valid JSON is fatal (matching cardinal's own
-//! verdict on a misbehaving upstream).
+//! `data:` payload that is not valid JSON is fatal (a misbehaving upstream
+//! fails the turn).
 
 pub mod chat;
 pub mod client;
@@ -35,7 +32,7 @@ pub mod router;
 pub mod stream;
 pub mod wire;
 
-pub use client::{CardinalClient, ChatStream};
+pub use client::{ChatCompletionsClient, ChatStream};
 pub use router::EndpointRouter;
 pub use stream::{AssembledMessage, AssembledToolCall, Assembler, ChunkDecoder, StreamEvent};
 pub use wire::{ChatMessage, ChatRequest, ToolCall, ToolDef, Usage};

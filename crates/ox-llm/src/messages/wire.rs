@@ -28,7 +28,7 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::cardinal::wire::{ChatMessage, ChatRequest, ToolChoice, UserContent, UserPart};
+use crate::chat_completions::wire::{ChatMessage, ChatRequest, ToolChoice, UserContent, UserPart};
 use crate::error::ChatError;
 
 /// Which Messages dialect the endpoint speaks.

@@ -11,7 +11,7 @@
 
 use std::time::Duration;
 
-use ox_llm::cardinal::ChatError;
+use ox_llm::chat_completions::ChatError;
 
 pub(crate) const MAX_BOUNDED_RETRIES: usize = 10;
 pub(crate) const MAX_CONTINUATIONS: usize = 10;

@@ -1,10 +1,11 @@
 //! The one error type every chat transport returns.
 //!
-//! Two protocols share this enum ([`crate::cardinal`]'s chat completions and
-//! [`crate::messages`]'s Messages): the [`crate::cardinal::chat::Chat`] seam
-//! erases the transport, so the runner cannot (and must not) know which wire
-//! protocol produced a failure. The messages here are therefore
-//! provider-neutral — they name what happened, not which gateway said it.
+//! Two protocols share this enum (chat completions in
+//! [`crate::chat_completions`] and Messages in [`crate::messages`]): the
+//! [`crate::chat_completions::chat::Chat`] seam erases the transport, so the
+//! runner cannot (and must not) know which wire protocol produced a failure.
+//! The messages here are therefore provider-neutral — they name what happened,
+//! not which gateway said it.
 
 use std::time::Duration;
 

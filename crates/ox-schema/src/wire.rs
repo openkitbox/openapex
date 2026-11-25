@@ -1,8 +1,9 @@
 //! Tool-schema wire types: the OpenAI `tools` array shapes.
 //!
 //! These live in the contract layer rather than in the engine's
-//! `cardinal::wire` so a tool crate can describe itself without depending on
-//! the engine. `cardinal::wire` re-exports them for the chat request.
+//! `chat_completions::wire` so a tool crate can describe itself without
+//! depending on the engine. `chat_completions::wire` re-exports them for the
+//! chat request.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

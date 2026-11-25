@@ -21,7 +21,7 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
-use ox_llm::cardinal::ChatError;
+use ox_llm::chat_completions::ChatError;
 
 /// How long after a throttle the dreamer starts nothing new.
 pub const COOLDOWN: Duration = Duration::from_secs(10 * 60);

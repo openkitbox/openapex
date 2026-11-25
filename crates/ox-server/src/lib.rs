@@ -20,7 +20,7 @@ pub(crate) mod worktree;
 pub use ox_core::{USER_AGENT, config, event_bus, projector};
 pub use ox_db as db;
 pub use ox_engine::{mctx, prompt, runner};
-pub use ox_llm::cardinal;
+pub use ox_llm::chat_completions;
 pub use ox_llm::model_catalog;
 pub use ox_mcp as mcp;
 pub use ox_schema::{id, slug};
@@ -39,7 +39,7 @@ use ox_core::config::Config;
 use ox_core::event_bus::EventBus;
 use ox_db::Db;
 use ox_engine::runner::{Runner, ServiceSet, ToolRegistryExt};
-use ox_llm::cardinal::router::EndpointRouter;
+use ox_llm::chat_completions::router::EndpointRouter;
 
 /// One transport constructor shared by [`build_state`] and [`run`], so both
 /// map init failures identically. Every endpoint comes from `[providers.<name>]`

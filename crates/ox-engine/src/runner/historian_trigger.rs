@@ -48,8 +48,8 @@ use crate::runner::step::{
 };
 use ox_core::config::Config;
 use ox_db::Db;
-use ox_llm::cardinal::chat::Chat;
-use ox_llm::cardinal::wire::ToolDef;
+use ox_llm::chat_completions::chat::Chat;
+use ox_llm::chat_completions::wire::ToolDef;
 use ox_schema::message::Message;
 use ox_schema::support::ModelRef;
 

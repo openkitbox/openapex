@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::mctx::search;
 use crate::prompt;
 use ox_core::copied_tags::strip_copied_tag_notation;
-use ox_llm::cardinal::wire::{ChatMessage, ChatRequest, ToolChoice, UserContent};
+use ox_llm::chat_completions::wire::{ChatMessage, ChatRequest, ToolChoice, UserContent};
 use ox_schema::event::SessionEventData;
 use ox_schema::message::Message;
 
@@ -204,9 +204,9 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
         }
     }
     let mut request = ChatRequest::new(
-        // cardinal routes on the bare model id; the providerID/modelID
+        // The router resolves the bare model id; the providerID/modelID
         // qualified form is upstream's provider-adapter vocabulary and
-        // cardinal answers "no route for model cardinal/<id>" to it.
+        // has no route here.
         params.model.id.clone(),
         chat_messages,
     );

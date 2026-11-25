@@ -724,7 +724,7 @@ pub fn ox_home() -> PathBuf {
     user_home().join(".ox")
 }
 
-/// Root-level settings removed with the implicit cardinal endpoint. Serde
+/// Legacy root-level settings removed from the configuration schema. Serde
 /// ignores unknown keys, so leaving one in `ox.toml` would load a server that
 /// answers every request with `NoRoute`.
 const REMOVED_KEYS: [&str; 3] = ["cardinal_url", "cardinal_key", "cardinal_limits"];
@@ -777,7 +777,7 @@ fn reject_removed_keys(raw: &str, path: &Path) -> Result<()> {
         let key = root_key(text);
         if REMOVED_KEYS.contains(&key) && (is_header || at_root) {
             bail!(
-                "config file {}: removed cardinal setting `{key}`; {MIGRATION_HINT}",
+                "config file {}: removed legacy setting `{key}`; {MIGRATION_HINT}",
                 path.display()
             );
         }

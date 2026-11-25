@@ -100,7 +100,7 @@ pub mod pass;
 /// Checkpoint slice request preparation and model execution.
 pub mod checkpoint_slices;
 
-/// Historian: triggering, chunking, prompt, cardinal execution, validation
+/// Historian: triggering, chunking, prompt, completion execution, validation
 /// and publication of compartments.
 pub mod historian;
 

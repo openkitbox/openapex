@@ -1,4 +1,4 @@
-//! Historian — Tasks 6a/6b: trigger, chunk, prompt, cardinal execution, the
+//! Historian — Tasks 6a/6b: trigger, chunk, prompt, completion execution, the
 //! durable run half, validation and publication.
 //!
 //! 1. [`trigger`] — may a run start at all, judged by tail pressure.
@@ -12,7 +12,7 @@
 //!    a completion that does not validate.
 //! 4. [`run`] — the orchestration: a durable `mc_historian_run` row is written
 //!    `running` *before* the completion starts, a hidden (session-less,
-//!    tool-less) completion is driven through [`ox_llm::cardinal::chat::Chat`], the raw text is
+//!    tool-less) completion is driven through [`ox_llm::chat_completions::chat::Chat`], the raw text is
 //!    validated and published as compartments
 //!    ([`crate::mctx::historian_validate`]), and the row settles
 //!    `completed`/`failed` with the attempt recorded.

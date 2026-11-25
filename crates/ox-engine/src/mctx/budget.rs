@@ -15,7 +15,7 @@
 //! Ported from the reference `boundary.rs` and its escalation bands, collapsed
 //! to what ox can know: the catalogue reports no output reservation
 //! (`ModelEntry::output` is always `None`), so the usable window is the window
-//! itself, and cardinal being the only gateway leaves the provider-geometry
+//! itself, and using a single gateway abstraction leaves the provider-geometry
 //! table (`separate` / `shared_truncating` / `shared_upfront`) nothing to
 //! select between. Both constants are documented below so the omission is a
 //! decision, not a gap.

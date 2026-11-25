@@ -210,10 +210,10 @@ pub(crate) fn preview(
 /// Insert an update before the trailing user prompt, or after tool output.
 /// Shared by live assembly and read-only generate; never writes a row.
 pub(crate) fn insert_update(
-    messages: &mut Vec<ox_llm::cardinal::wire::ChatMessage>,
+    messages: &mut Vec<ox_llm::chat_completions::wire::ChatMessage>,
     text: Option<String>,
 ) {
-    use ox_llm::cardinal::wire::ChatMessage;
+    use ox_llm::chat_completions::wire::ChatMessage;
     if let Some(text) = text {
         let at = if matches!(messages.last(), Some(ChatMessage::User { .. })) {
             messages.len() - 1

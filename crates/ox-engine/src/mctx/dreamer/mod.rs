@@ -105,7 +105,7 @@
 //!   `unknown`), reduced to [`FailureClass`].
 //! - **Transport** — the hidden sub-completion is
 //!   [`crate::mctx::historian`]'s pair (`historian_model` + `collect_completion`)
-//!   on ox's existing cardinal client; no second transport is added. The
+//!   on ox's existing Chat Completions client; no second transport is added. The
 //!   reference's dreamer also shares the historian's provider-output path.
 //!
 //! # Deviations from the reference (documented, not accidental)

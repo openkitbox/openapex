@@ -64,12 +64,13 @@ pub struct ModelEntry {
     #[serde(default)]
     pub reasoning: bool,
     /// Advertised levels, each as `{ "effort": "<name>" }` in catalog order
-    /// (cardinal `models.rs` row shape). Empty unless [`ModelEntry::reasoning`].
+    /// (the Chat Completions model-list row shape). Empty unless
+    /// [`ModelEntry::reasoning`].
     #[serde(default)]
     pub supported_reasoning_levels: Vec<ReasoningLevel>,
 }
 
-/// One entry of cardinal's `supported_reasoning_levels` (`{effort}` only).
+/// One entry of an endpoint's `supported_reasoning_levels` (`{effort}` only).
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct ReasoningLevel {
     /// The level name as the chat wire accepts it (`low`, `high`, …).
@@ -906,7 +907,7 @@ fn parse_list(body: &str) -> Result<Vec<ModelRow>> {
     Ok(decoded)
 }
 
-/// One entry of cardinal's model list. Every field but `id` is optional: a
+/// One entry of the endpoint's model list. Every field but `id` is optional: a
 /// gateway that reports less must not make the list unusable.
 #[derive(Deserialize)]
 struct ModelRow {
@@ -915,7 +916,7 @@ struct ModelRow {
     model_type: Option<String>,
     #[serde(default)]
     owned_by: Option<String>,
-    /// cardinal reports all three; other gateways may report one.
+    /// Some endpoints report all three; others report one.
     #[serde(default)]
     context_length: Option<i64>,
     #[serde(default)]
@@ -933,14 +934,14 @@ struct ModelRow {
     input_modalities: Vec<String>,
     #[serde(default)]
     output_modalities: Vec<String>,
-    /// DeepSeek states effort levels in one object; cardinal states them in
-    /// `supported_reasoning_levels`. Both are read.
+    /// DeepSeek states effort levels in one object; other endpoints may state
+    /// them in `supported_reasoning_levels`. Both are read.
     #[serde(default)]
     effort: Option<ModelEffort>,
     #[serde(default)]
     temperature: Option<bool>,
     /// Reasoning metadata, present only on rows whose upstream members
-    /// advertise effort levels (cardinal `models.rs`).
+    /// advertise effort levels (the `supported_reasoning_levels` row field).
     #[serde(default)]
     reasoning: bool,
     #[serde(default)]

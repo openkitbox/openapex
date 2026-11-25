@@ -36,7 +36,7 @@ use tokio_util::sync::CancellationToken;
 use ox_core::config::Config;
 use ox_core::event_bus::EventBus;
 use ox_db::Db;
-use ox_llm::cardinal::chat::Chat;
+use ox_llm::chat_completions::chat::Chat;
 use ox_schema::event::SessionEventData;
 use ox_schema::id;
 use ox_schema::inbox::{Delivery, Item, UNATTENDED_KEY, UNATTENDED_RULES_KEY};

@@ -27,7 +27,7 @@
 
 use anyhow::Result;
 use ox_db::Db;
-use ox_llm::cardinal::wire::{ChatMessage, ChatRequest};
+use ox_llm::chat_completions::wire::{ChatMessage, ChatRequest};
 use ox_schema::event::SessionEventData;
 use ox_schema::id::now_millis;
 use ox_schema::message::CompactionReason;
