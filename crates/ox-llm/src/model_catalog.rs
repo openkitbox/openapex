@@ -21,9 +21,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use serde::Deserialize;
 
-use crate::config::{
-    BuiltinProvider, CandidateConfig, DEFAULT_PROVIDER_NAME, LlmConfig, SeedModel,
-};
+use crate::config::{BuiltinProvider, CandidateConfig, LlmConfig, SeedModel};
 
 /// One model as the client sees it, built from the gateway's model list
 /// ([`crate::model_catalog`]).
@@ -160,7 +158,7 @@ struct CandidateLimits {
 pub struct ModelCatalog {
     resolver: crate::config::Routes,
     client: reqwest::Client,
-    /// The implicit `cardinal_url` endpoint plus every `[providers]` entry.
+    /// Every configured `[providers]` entry and credential-resolved builtin.
     endpoints: Vec<CatalogEndpoint>,
     /// `[models]` route table; non-empty switches the served surface from the
     /// endpoints' raw lists to the route keys.
@@ -192,18 +190,6 @@ impl ModelCatalog {
             .build()
             .unwrap_or_default();
         let mut endpoints: BTreeMap<String, CatalogEndpoint> = BTreeMap::new();
-        endpoints.insert(
-            DEFAULT_PROVIDER_NAME.to_owned(),
-            CatalogEndpoint {
-                name: DEFAULT_PROVIDER_NAME.to_owned(),
-                base_url: config.cardinal_url.trim_end_matches('/').to_owned(),
-                api_key: config.cardinal_key.clone().filter(|key| !key.is_empty()),
-                models_path: MODELS_PATH,
-                seeds: &[],
-                builtin: None,
-            },
-        );
-        // A [providers.cardinal] section overrides the implicit endpoint.
         for (name, provider) in &config.providers {
             endpoints.insert(
                 name.clone(),
@@ -321,10 +307,9 @@ impl ModelCatalog {
     }
 
     /// The model backing sessions without an explicit selection:
-    /// `config.default_model` when it names a model the gateway reports, the
-    /// configured reference verbatim when the catalogue does not know it (the
-    /// gateway decides), else the first model by id. `None` only when the
-    /// catalogue is empty and nothing is configured.
+    /// `config.default_model` when it names a chat entry in the catalogue (a
+    /// bare id or `provider/id`), else the first chat-capable entry. `None`
+    /// when a configured name is unknown or the catalogue has no chat entry.
     pub fn default_entry(&self, config: &LlmConfig) -> Option<ModelEntry> {
         pick_default(&self.cached(), config)
     }
@@ -438,8 +423,8 @@ impl ModelCatalog {
     /// Fetch `GET /v1/models` from every endpoint and replace the snapshot.
     /// One failing endpoint only warns; the others still serve. When every
     /// endpoint fails the refresh errors, so the previous list is kept
-    /// (legacy single-endpoint behavior included). A catalogue with no
-    /// endpoints (the [`Self::from_entries`] seed) is returned untouched.
+    /// A catalogue with no endpoints (the [`Self::from_entries`] seed) is
+    /// returned untouched.
     /// Reload calls this to pre-warm a new catalogue before installing it.
     pub async fn refresh(&self) -> Result<()> {
         if self.endpoints.is_empty() {
@@ -613,17 +598,17 @@ impl ModelCatalog {
                 .collect()
         };
         for (id, route) in routes {
-            let first = route.first();
-            let donor = first.and_then(|candidate| {
-                let mut matches = donors.iter().filter(|entry| entry.id == candidate.model);
-                let first_match = matches.next()?;
-                matches.next().is_none().then_some(first_match)
-            });
+            let Some(first) = route.first() else {
+                continue;
+            };
+            let mut matches = donors.iter().filter(|entry| entry.id == first.model);
+            let donor = match (matches.next(), matches.next()) {
+                (Some(only), None) => Some(only),
+                _ => None,
+            };
             let projection = ModelEntry {
                 id: id.clone(),
-                provider: first
-                    .map(|candidate| candidate.provider.clone())
-                    .unwrap_or_else(|| DEFAULT_PROVIDER_NAME.to_owned()),
+                provider: first.provider.clone(),
                 context: donor.and_then(|entry| entry.context),
                 input: donor.and_then(|entry| entry.input),
                 output: donor.and_then(|entry| entry.output),
@@ -774,18 +759,20 @@ fn record_seed_limits(
 /// The default-model decision over one catalogue snapshot.
 ///
 /// Pure — no cache and no IO — so the rule can be exercised without a gateway:
-/// `config.default_model` when the snapshot reports it, the configured
-/// reference verbatim when it does not (the endpoint decides), a materialized
-/// builtin's first model when nothing is pinned, else the first chat-capable
-/// entry.
+/// `config.default_model` only when the snapshot reports a matching chat entry
+/// (bare id or `provider/id`), a materialized builtin's first model when
+/// nothing is pinned, else the first chat-capable entry. An unknown configured
+/// name has no default; no endpoint is invented for it.
 fn pick_default(entries: &[ModelEntry], config: &LlmConfig) -> Option<ModelEntry> {
     if let Some(qualified) = &config.default_model {
         let (provider, id) = qualified
             .split_once('/')
-            .unwrap_or((DEFAULT_PROVIDER_NAME, qualified.as_str()));
+            .map_or((None, qualified.as_str()), |(provider, id)| {
+                (Some(provider), id)
+            });
         if let Some(found) = entries
             .iter()
-            .find(|entry| entry.id == id && entry.provider == provider)
+            .find(|entry| entry.id == id && provider.is_none_or(|name| entry.provider == name))
         {
             if ModelCatalog::is_chat_compatible(found) {
                 return Some(found.clone());
@@ -795,24 +782,11 @@ fn pick_default(entries: &[ModelEntry], config: &LlmConfig) -> Option<ModelEntry
                 .find(|entry| ModelCatalog::is_chat_compatible(entry))
                 .cloned();
         }
-        return Some(ModelEntry {
-            provider: provider.to_owned(),
-            id: id.to_owned(),
-            name: None,
-            model_type: None,
-            context: None,
-            input: None,
-            output: None,
-            input_modalities: Vec::new(),
-            output_modalities: Vec::new(),
-            temperature: None,
-            reasoning: false,
-            supported_reasoning_levels: Vec::new(),
-        });
+        return None;
     }
     // A materialized builtin exists only because the operator supplied a
-    // credential for it, which is a stronger statement of intent than the
-    // implicit gateway: its first model wins when nothing is pinned.
+    // credential for it, which is a stronger statement of intent than an
+    // arbitrary catalogue entry: its first model wins when nothing is pinned.
     entries
         .iter()
         .find(|entry| ModelCatalog::is_chat_compatible(entry) && config.is_builtin(&entry.provider))

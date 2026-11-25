@@ -39,17 +39,14 @@ use ox_core::config::Config;
 use ox_core::event_bus::EventBus;
 use ox_db::Db;
 use ox_engine::runner::{Runner, ServiceSet, ToolRegistryExt};
-use ox_llm::cardinal::client::CardinalClient;
 use ox_llm::cardinal::router::EndpointRouter;
 
 /// One transport constructor shared by [`build_state`] and [`run`], so both
-/// map init failures identically. `[models.<id>]` routes through ordered
-/// candidates; with no `[providers]`/`[models]` configured the router is a
-/// pass-through to the `cardinal_url` endpoint (previous behavior).
+/// map init failures identically. Every endpoint comes from `[providers.<name>]`
+/// or a credential-resolved builtin; `[models.<id>]` routes through ordered
+/// candidates. With no endpoint configured, requests fail closed with `NoRoute`.
 fn chat_transport(config: &Config) -> Result<Arc<dyn runner::Chat>> {
-    let cardinal = CardinalClient::from_config(&config.llm)
-        .map_err(|error| anyhow::anyhow!("cardinal client init failed: {error}"))?;
-    let router = EndpointRouter::from_config(&config.llm, cardinal)
+    let router = EndpointRouter::from_config(&config.llm)
         .map_err(|error| anyhow::anyhow!("chat endpoint router init failed: {error}"))?;
     Ok(Arc::new(router))
 }

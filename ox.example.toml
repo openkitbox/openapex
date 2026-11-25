@@ -13,13 +13,9 @@ event_heartbeat_ms = 15_000
 automations = false
 timezone = "Etc/UTC"
 
-# Optional legacy Cardinal compatibility. Native providers above are preferred.
-# cardinal_url = "http://127.0.0.1:10202"
-# cardinal_key = "replace-me"
-# A route may reference the implicit provider as: { provider = "cardinal", model = "example-model" }
-
-# A logical default model. It must match a model id exposed by the catalogue.
-default_model = "example"
+# A logical default model. Use provider/route-id from the catalogue, or a bare
+# route id that is present in the catalogue.
+default_model = "example/example"
 
 # Native provider configuration. base_url excludes the protocol suffix; ox
 # appends /v1/chat/completions or /v1/messages according to protocol.

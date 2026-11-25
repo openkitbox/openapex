@@ -60,7 +60,8 @@ cargo build --release
 
 Copy [ox.example.toml](ox.example.toml) to `~/.ox/ox.toml`, replace the provider
 placeholders and select a model before starting the server. The config file is
-optional: ox starts with defaults when it is absent.
+optional for startup; real model turns need at least one configured provider or
+a built-in provider whose credential has resolved.
 
 The first argument selects the mode. No argument, or an argument beginning with
 `-`, starts the HTTP server.
@@ -79,15 +80,18 @@ The first argument selects the mode. No argument, or an argument beginning with
 ## Configuration
 
 The complete commented reference is [ox.example.toml](ox.example.toml).
-`~/.ox/ox.toml` is optional; every section has a default. Top-level keys such as
-`listen`, `db_path` and `default_model` sit beside `[providers]`, `[models]`,
+`~/.ox/ox.toml` is optional and sections have defaults where applicable, but
+there is no implicit provider. Top-level keys such as `listen`, `db_path` and
+`default_model` sit beside `[providers]`, `[models]`,
 `[context_caps]`, `[roles]`, `[agents]`, `[magic_context]`, `[mcp]`,
 `[permissions]`, `[subagent]`, `[events]`, `[sessions]`, `[tmp]` and `[turn]`.
 
 ### Provider and model routing
 
-Native routing starts with an endpoint under `[providers.<name>]` and a logical
-model under `[models.<id>]`:
+Real model turns need at least one configured `[providers.<name>]` or a built-in
+provider with a resolved credential. `[models.<id>]` is only needed for logical
+routes (aliases and ordered candidate chains); there is no implicit default
+provider. Native routing starts with:
 
 ```toml
 default_model = "fast"
@@ -115,13 +119,14 @@ Messages protocol. Candidates are tried in order; the first endpoint whose
 stream opens serves the turn. Model ids in a candidate are the wire ids reported
 by that endpoint. A single-endpoint model may instead use `provider/id`.
 
+`default_model` should be written as `provider/route-id` (for example
+`primary/fast`) to name a route explicitly, or as a bare route id that exists in
+the model catalogue. An unknown name fails closed instead of selecting an
+arbitrary endpoint.
+
 A small built-in table supplies endpoints and protocols for known vendors, so a
 section such as `[providers.deepseek]` may state only `api_key`. Built-in
 providers appear only after a key resolves.
-
-`cardinal_url` and `cardinal_key` are legacy compatibility keys for the implicit
-`cardinal` endpoint. They remain available, but new configurations should prefer
-`[providers.<name>]` and `[models.<id>]`.
 
 ### Model roles
 
@@ -226,8 +231,6 @@ agents), `GET /api/permission/request`, `GET /api/permission/saved`,
 | `OX_DB_PATH` | Overrides the database file path. |
 | `OX_LISTEN` | Overrides the HTTP server listen address. |
 | `OX_SUBAGENT_DEPTH` | Overrides `[subagent].depth`; invalid values are ignored with a warning. |
-| `OX_CARDINAL_URL` | Overrides the legacy implicit `cardinal` endpoint URL. |
-| `OX_CARDINAL_KEY` | Supplies the legacy implicit `cardinal` endpoint key. |
 | `OX_DEFAULT_MODEL` | Overrides `default_model`. |
 | `DEEPSEEK_API_KEY` | Supplies the built-in DeepSeek provider key when no configured or stored key is present. |
 

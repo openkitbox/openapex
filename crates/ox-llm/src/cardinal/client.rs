@@ -28,7 +28,6 @@ use std::time::Duration;
 use super::ChatError;
 use super::stream::ChunkDecoder;
 use super::wire::ChatRequest;
-use crate::config::LlmConfig;
 use crate::sse::{SseChatStream, streaming_http_client};
 
 /// A live streaming chat response, decoded as chat-completions chunks.
@@ -66,15 +65,6 @@ impl CardinalClient {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             api_key,
         })
-    }
-
-    /// A client configured from ox's config (`cardinal_url` + `cardinal_key`).
-    pub fn from_config(config: &LlmConfig) -> Result<Self, ChatError> {
-        Self::with_stall_timeout(
-            config.cardinal_url.clone(),
-            config.cardinal_key.clone(),
-            config.cardinal_limits.stall_timeout(),
-        )
     }
 
     /// Start a streaming chat completion. The request is sent wire-exact as

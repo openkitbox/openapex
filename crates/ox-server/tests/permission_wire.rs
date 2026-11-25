@@ -7,10 +7,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use ox_core::config::{Config, Permission, PermissionsConfig};
+use ox_core::config::{
+    CandidateConfig, Config, ModelRouteConfig, Permission, PermissionsConfig, ProviderConfig,
+};
 use ox_core::event_bus::EventBus;
 use ox_db::Db;
-use ox_llm::cardinal::CardinalClient;
+use ox_llm::cardinal::router::EndpointRouter;
 use ox_schema::permission::{Effect, Rule};
 use salvo::http::StatusCode;
 use salvo::prelude::*;
@@ -37,6 +39,8 @@ const TEXT_CHUNKS: &str = concat!(
     "data: {\"id\":\"chatcmpl-wire\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"mock\",\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":2,\"total_tokens\":14}}\n\n",
     "data: [DONE]\n\n",
 );
+
+const MODEL_LIST: &str = r#"{"data":[{"id":"mock","owned_by":"mock"}]}"#;
 
 /// A tiny chat-completions SSE endpoint: the first turn of a session asks for
 /// `shell`, the follow-up after the tool result finishes the turn.
@@ -74,6 +78,19 @@ async fn spawn_llm() -> (String, JoinHandle<()>) {
                         })
                     })
                     .unwrap_or_default();
+                if buffer.starts_with(b"GET /v1/models") {
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        MODEL_LIST.len(),
+                        MODEL_LIST
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .await
+                        .expect("write model list");
+                    let _ = stream.shutdown().await;
+                    return;
+                }
                 while buffer.len() < body_start + content_length {
                     let read = stream.read(&mut chunk).await.expect("read LLM body");
                     if read == 0 {
@@ -126,7 +143,24 @@ impl Fixture {
         let mut config = Config::default();
         config.magic_context.enabled = false;
         config.magic_context.dreamer_enabled = false;
-        config.llm.cardinal_url = base_url;
+        config.llm.providers.insert(
+            "mock".to_owned(),
+            ProviderConfig {
+                base_url,
+                api_key: None,
+                protocol: None,
+                limits: Default::default(),
+            },
+        );
+        config.llm.models.insert(
+            "mock".to_owned(),
+            ModelRouteConfig {
+                candidates: vec![CandidateConfig {
+                    provider: "mock".to_owned(),
+                    model: "mock".to_owned(),
+                }],
+            },
+        );
         config.llm.default_model = Some("mock".to_owned());
         config.permissions = PermissionsConfig {
             default: Permission::Ask,
@@ -139,7 +173,7 @@ impl Fixture {
         };
         let db = Db::open_in_memory().await.expect("in-memory database");
         let bus = EventBus::new(db.clone());
-        let chat = Arc::new(CardinalClient::new(&config.llm.cardinal_url, None).expect("mock chat"))
+        let chat = Arc::new(EndpointRouter::from_config(&config.llm).expect("mock chat router"))
             as Arc<dyn runner::Chat>;
         let state = build_state_on_with_bus(
             config,
@@ -151,6 +185,13 @@ impl Fixture {
         )
         .await
         .expect("test state");
+        state
+            .live
+            .current()
+            .model_catalog
+            .refresh()
+            .await
+            .expect("mock model catalogue");
         let project_id = project::resolve_project(&state.db, Path::new(&directory))
             .await
             .expect("resolve requested directory")

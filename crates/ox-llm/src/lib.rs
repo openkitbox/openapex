@@ -19,7 +19,7 @@ pub mod sse;
 
 use std::time::Duration;
 
-/// How ox identifies itself to everything it calls: the LLM gateway, the model
+/// How ox identifies itself to everything it calls: LLM endpoints, the model
 /// catalogue, the embeddings endpoint. One value, because a request's origin
 /// must be unambiguous at the far end, and `ox/<version>` is what tells two ox
 /// builds apart in a gateway's logs.

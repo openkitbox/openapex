@@ -43,8 +43,7 @@ pub enum ChatError {
     #[error("transport error: {0}")]
     Transport(#[from] reqwest::Error),
     /// The requested model has no candidates: no `[models]` route names it
-    /// and `[providers]` is configured, so the implicit passthrough endpoint
-    /// is disabled.
+    /// and no configured endpoint or builtin matches the selected provider.
     #[error("no candidates configured for model `{model}`: add a [models.\"{model}\"] route")]
     NoRoute {
         /// The logical model id ox could not route.

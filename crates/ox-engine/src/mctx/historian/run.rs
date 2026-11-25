@@ -1082,9 +1082,11 @@ pub struct SideChannels {
     pub events: Vec<historian_validate::ParsedEvent>,
 }
 
-/// The model the historian completion routes to. Cardinal routes on the BARE
-/// model id, so a qualified `provider/id` config reference is reduced to its id
-/// half; an unset reference falls back to ox's default model resolution.
+/// The model the historian completion routes to. A bare `historian_model`
+/// reference resolves its provider from the model catalogue; a qualified
+/// `provider/id` must name the same catalogue entry. An unset reference falls
+/// back to ox's default model resolution. A reference that matches no catalogue
+/// entry is an error, not a placeholder identity.
 ///
 /// `pub(crate)` because the dreamer runs its hidden completions through the
 /// same resolution and the same transport ([`collect_text`]): one route
@@ -1094,13 +1096,22 @@ pub(crate) fn historian_model(
     catalog: &ox_llm::model_catalog::ModelCatalog,
 ) -> Result<ox_schema::support::ModelRef> {
     if let Some(qualified) = &config.magic_context.historian_model {
-        let (provider_id, id) = qualified.rsplit_once('/').map_or(
-            (ox_llm::config::DEFAULT_PROVIDER_NAME, qualified.as_str()),
-            |(provider, id)| (provider, id),
-        );
+        let (provider, id) = qualified
+            .split_once('/')
+            .map_or((None, qualified.as_str()), |(provider, id)| {
+                (Some(provider), id)
+            });
+        let entries = catalog.cached();
+        let Some(entry) = entries.iter().find(|entry| {
+            entry.id == id && provider.is_none_or(|selected| entry.provider == selected)
+        }) else {
+            anyhow::bail!(
+                "magic_context.historian_model `{qualified}` does not match a model in the catalogue"
+            );
+        };
         return Ok(ox_schema::support::ModelRef {
-            id: id.to_owned(),
-            provider_id: provider_id.to_owned(),
+            id: entry.id.clone(),
+            provider_id: entry.provider.clone(),
             variant: None,
         });
     }

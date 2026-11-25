@@ -30,21 +30,14 @@ record.
 ### Supplying a custom gateway
 
 `OX_CONFIG_FILE` must point to a complete, readable ox configuration, not merely
-to a file containing a key. For a custom gateway, either use the implicit
-`cardinal_url` endpoint:
+to a file containing a key. Real model turns need at least one configured
+`[providers.<name>]` or a built-in provider with a resolved credential;
+`[models.<id>]` is only needed for logical routes. For a custom gateway, define
+an explicit provider and route:
 
 ```toml
 # ox-local.toml — use placeholders; do not commit a real key
-cardinal_url = "https://gateway.example.invalid"
-cardinal_key = "REPLACE_WITH_PROVIDER_KEY"
-default_model = "cardinal/kimi-k3-placeholder"
-```
-
-or define an explicit provider and model route:
-
-```toml
-# ox-local.toml — use placeholders; do not commit a real key
-default_model = "kimi-k3"
+default_model = "kimi/kimi-k3" # provider/route-id; a bare catalogue route id also works
 
 [providers.kimi]
 base_url = "https://gateway.example.invalid"

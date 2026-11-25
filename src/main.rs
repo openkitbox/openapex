@@ -270,7 +270,8 @@ async fn main() -> Result<()> {
             tracing::info!(
                 listen = %config.listen,
                 db = %config.db_path.display(),
-                cardinal_url = %config.llm.cardinal_url,
+                providers = config.llm.providers.len(),
+                models = config.llm.models.len(),
                 "starting ox"
             );
             ox::run_with(config, serve_options(&outputs)).await

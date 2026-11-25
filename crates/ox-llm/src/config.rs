@@ -1,5 +1,5 @@
-//! LLM endpoint configuration: the implicit `cardinal_url` endpoint, extra
-//! `[providers]`, `[models]` routes, `[context_caps]` and the default model.
+//! LLM endpoint configuration: `[providers]`, `[models]` routes,
+//! `[context_caps]` and the default model.
 //!
 //! [`LlmConfig`] is flattened into `ox-core`'s `Config`, so the TOML keys stay
 //! at the top level of `ox.toml`.
@@ -13,21 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::credentials::Credentials;
 
-const DEFAULT_CARDINAL_URL: &str = "http://127.0.0.1:10202";
-
 /// Environment variable overrides.
-pub const ENV_CARDINAL_URL: &str = "OX_CARDINAL_URL";
-pub const ENV_CARDINAL_KEY: &str = "OX_CARDINAL_KEY";
 pub const ENV_DEFAULT_MODEL: &str = "OX_DEFAULT_MODEL";
-
-fn default_cardinal_url() -> String {
-    DEFAULT_CARDINAL_URL.to_owned()
-}
-
-/// The name of the implicit endpoint built from `cardinal_url`/`cardinal_key`.
-/// Route candidates may reference it like any `[providers]` name; a
-/// `[providers.cardinal]` section overrides the implicit endpoint.
-pub const DEFAULT_PROVIDER_NAME: &str = "cardinal";
 
 /// The stall timeout applied to an endpoint that sets `max_concurrent` but no
 /// `stall_timeout_secs`: a concurrency limit without a liveness bound lets a
@@ -36,9 +23,7 @@ pub const DEFAULT_PROVIDER_NAME: &str = "cardinal";
 pub const DEFAULT_LIMITED_STALL: Duration = Duration::from_secs(600);
 
 /// Per-endpoint traffic limits, shared by `[providers.<name>]` (flattened
-/// into [`ProviderConfig`]) and `[cardinal_limits]` (the implicit
-/// `cardinal_url` endpoint, which `[providers.cardinal]` cannot configure
-/// without replacing it).
+/// into [`ProviderConfig`]).
 ///
 /// Both keys are optional and, when present, must be integers `>= 1`
 /// (`0`, negatives and non-integers fail at load). With neither set the
@@ -190,8 +175,7 @@ pub struct SeedModel {
 /// Unlike `[providers.<name>]` (the operator's own endpoints), a builtin is
 /// only materialized when it has a credential — from `ox.toml`, the
 /// credential file, or its environment variable. A builtin without one does
-/// not exist at all, so it cannot shadow the implicit `cardinal_url` endpoint
-/// or advertise models that cannot answer.
+/// not exist at all, so it cannot advertise models that cannot answer.
 #[derive(Debug, Clone, Copy)]
 pub struct BuiltinProvider {
     /// Provider id (`deepseek`); also the `[providers.<id>]` key that
@@ -301,8 +285,7 @@ pub struct ResolvedBuiltin {
 /// One ordered fallback target inside a `[models.<id>]` route.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct CandidateConfig {
-    /// A `[providers]` key, or [`DEFAULT_PROVIDER_NAME`] for the implicit
-    /// `cardinal_url` endpoint.
+    /// A configured `[providers]` key or a credential-resolved builtin id.
     pub provider: String,
     /// The wire model id to request on that endpoint.
     pub model: String,
@@ -322,7 +305,6 @@ pub struct Routes {
     explicit: BTreeMap<String, ModelRouteConfig>,
     providers: Vec<String>,
     builtins: Vec<(&'static str, &'static BuiltinProvider)>,
-    passthrough: bool,
 }
 
 /// Borrowed routing decision in actual transport order.
@@ -343,7 +325,6 @@ impl Routes {
                 .values()
                 .map(|resolved| (resolved.builtin.id, resolved.builtin))
                 .collect(),
-            passthrough: config.providers.is_empty(),
         }
     }
 
@@ -364,8 +345,7 @@ impl Routes {
             };
         }
         if let Some(selected) = provider {
-            return if selected == DEFAULT_PROVIDER_NAME
-                || self.providers.iter().any(|name| name == selected)
+            return if self.providers.iter().any(|name| name == selected)
                 || self.builtins.iter().any(|(name, _)| *name == selected)
             {
                 Targets::Endpoint {
@@ -383,35 +363,16 @@ impl Routes {
         {
             return Targets::Endpoint { provider, model };
         }
-        if self.passthrough {
-            Targets::Endpoint {
-                provider: DEFAULT_PROVIDER_NAME,
-                model,
-            }
-        } else {
-            Targets::NoRoute
-        }
+        Targets::NoRoute
     }
 }
 
 /// The LLM-endpoint slice of `ox.toml`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct LlmConfig {
-    /// Base URL of the cardinal LLM gateway (cardinal's `listen`, e.g.
-    /// `http://127.0.0.1:10202`).
-    #[serde(default = "default_cardinal_url")]
-    pub cardinal_url: String,
-    /// API key for the cardinal gateway (its `gateway_key`). Required unless
-    /// cardinal runs with auth disabled.
-    #[serde(default)]
-    pub cardinal_key: Option<String>,
-    /// `max_concurrent` / `stall_timeout_secs` for the implicit
-    /// `cardinal_url` endpoint (`[cardinal_limits]` table); see
-    /// [`EndpointLimits`].
-    #[serde(default)]
-    pub cardinal_limits: EndpointLimits,
-    /// Additional OpenAI-compatible endpoints (`[providers.<name>]`). Empty:
-    /// the implicit `cardinal_url` endpoint serves everything (legacy mode).
+    /// Outbound endpoints (`[providers.<name>]`) and credential-resolved
+    /// builtins. With none, every request fails closed with
+    /// [`crate::error::ChatError::NoRoute`].
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     /// Builtin providers whose credentials resolved at load time (see
@@ -420,9 +381,8 @@ pub struct LlmConfig {
     #[serde(skip)]
     pub builtins: BTreeMap<String, ResolvedBuiltin>,
     /// ox's logical model surface with ordered candidate routes
-    /// (`[models.<id>]`). Explicit candidates win over the implicit
-    /// endpoint; once `[providers]` is non-empty, unrouted models are
-    /// refused (`NoRoute`) instead of silently hitting it.
+    /// (`[models.<id>]`). Explicit candidates win over direct endpoint
+    /// requests; an unrouted model needs an explicitly selected provider.
     #[serde(default)]
     pub models: BTreeMap<String, ModelRouteConfig>,
     /// Per-model context-window caps (`[context_caps]`, `model id = tokens`).
@@ -433,29 +393,12 @@ pub struct LlmConfig {
     /// stands); inert or unknown caps warn at catalogue refresh.
     #[serde(default)]
     pub context_caps: BTreeMap<String, u32>,
-    /// Qualified model reference (`provider/id`, e.g. `cardinal/k3-256k`)
-    /// backing sessions without an explicit selection. The catalogue itself is
-    /// fetched from the gateway (`GET /v1/models`); this pins only which entry
-    /// to use by default, and a name the gateway does not report is sent
-    /// verbatim rather than rejected. When unset the first catalogue entry is
-    /// the default.
+    /// Model backing sessions without an explicit selection: either a
+    /// qualified reference (`provider/id`) or a bare id that names a catalogue
+    /// entry. An unknown name has no default rather than inventing an endpoint.
+    /// When unset the first chat-capable catalogue entry is the default.
     #[serde(default)]
     pub default_model: Option<String>,
-}
-
-impl Default for LlmConfig {
-    fn default() -> Self {
-        Self {
-            cardinal_url: default_cardinal_url(),
-            cardinal_key: None,
-            cardinal_limits: EndpointLimits::default(),
-            providers: BTreeMap::new(),
-            builtins: BTreeMap::new(),
-            models: BTreeMap::new(),
-            context_caps: BTreeMap::new(),
-            default_model: None,
-        }
-    }
 }
 
 impl LlmConfig {
@@ -465,11 +408,11 @@ impl LlmConfig {
     /// Precedence for a builtin: a `[providers.<id>] api_key` in `ox.toml`,
     /// then the credential file (`/connect`'s store), then the provider's
     /// environment variable. A builtin with no key is *not* materialized at
-    /// all — it cannot shadow the implicit `cardinal_url` endpoint, cannot
-    /// advertise models that would 401, and never turns a missing key into a
-    /// silent fallback. A `[providers.<id>]` section that exists but has no key
-    /// gets the same resolution, so `[providers.deepseek] base_url = "…"`
-    /// alone still works with `DEEPSEEK_API_KEY` set.
+    /// all — it cannot advertise models that would 401, and never turns a
+    /// missing key into a silent fallback. A `[providers.<id>]` section that
+    /// exists but has no key gets the same resolution, so
+    /// `[providers.deepseek] base_url = "…"` alone still works with
+    /// `DEEPSEEK_API_KEY` set.
     pub fn apply_credentials(&mut self, credentials: &Credentials) {
         for builtin in BUILTINS {
             if let Some(provider) = self.providers.get_mut(builtin.id) {
@@ -539,15 +482,8 @@ impl LlmConfig {
         endpoints
     }
 
-    /// Apply the `OX_CARDINAL_URL`, `OX_CARDINAL_KEY` and `OX_DEFAULT_MODEL`
-    /// environment overrides.
+    /// Apply the `OX_DEFAULT_MODEL` environment override.
     pub fn apply_env(&mut self) {
-        if let Ok(url) = std::env::var(ENV_CARDINAL_URL) {
-            self.cardinal_url = url;
-        }
-        if let Ok(key) = std::env::var(ENV_CARDINAL_KEY) {
-            self.cardinal_key = Some(key);
-        }
         if let Ok(model) = std::env::var(ENV_DEFAULT_MODEL) {
             self.default_model = Some(model);
         }
@@ -591,9 +527,7 @@ impl LlmConfig {
                 if candidate.model.is_empty() {
                     anyhow::bail!("models.{id}: candidate model must not be empty");
                 }
-                if candidate.provider != DEFAULT_PROVIDER_NAME
-                    && self.provider(&candidate.provider).is_none()
-                {
+                if self.provider(&candidate.provider).is_none() {
                     anyhow::bail!(
                         "models.{id}: candidate provider `{}` is neither under [providers] nor a \
                          credential-resolved builtin",

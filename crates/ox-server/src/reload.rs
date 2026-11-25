@@ -2,8 +2,7 @@
 //! derived from it (upstream `location.reload`).
 //!
 //! **Hot keys** (rebuilt on every reload): the whole LLM section
-//! (`cardinal_url`, `cardinal_key`, `cardinal_limits`, `[providers]`,
-//! `[models]`, `context_caps`, `default_model`) becomes a new
+//! (`[providers]`, `[models]`, `context_caps`, `default_model`) becomes a new
 //! `EndpointRouter` plus a pre-warmed `ModelCatalog`; `[mcp]` becomes a new
 //! `Hub` plus the MCP tools in a rebuilt `ToolRegistry`.
 //!

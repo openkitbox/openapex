@@ -42,7 +42,8 @@ cargo build --release
 ```
 
 可将 [ox.example.toml](ox.example.toml) 复制为 `~/.ox/ox.toml`，替换 provider
-占位值并选择模型。配置文件本身是可选的：文件不存在时 ox 使用默认值启动。
+占位值并选择模型。配置文件可缺省启动，但真实模型调用至少需要已配置的 provider
+或凭证已解析的内置 provider。
 
 第一个参数决定模式。没有参数，或者第一个参数以 `-` 开头，都会启动 HTTP 服务端。
 启动服务端后，可让 OpenCode 连接 `http://127.0.0.1:8787`；如果改了 `listen`，
@@ -66,8 +67,9 @@ cargo build --release
 
 ### 原生 Provider 与模型路由
 
-原生配置从 `[providers.<name>]` 和 `[models.<id>]` 开始：前者定义出站端点，后者把
-逻辑模型映射到有序候选链。最小示例：
+真实模型调用至少需要已配置的 `[providers.<name>]`，或凭证已解析的内置 provider；
+`[models.<id>]` 仅在需要逻辑路由（别名或有序候选链）时才需要；不存在隐式默认
+provider。最小示例：
 
 ```toml
 default_model = "fast"
@@ -89,12 +91,11 @@ candidates = [
   省略 `base_url`，由 ox 使用其内置端点和协议。
 - 逻辑模型按 `candidates` 顺序尝试，第一个成功打开流的端点服务本轮。传输错误和
   HTTP 401/403/408/429/5xx 会触发下一候选；流打开后不在中途切换。
-- 配置 `[providers]` 后，未出现在 `[models.<id>]` 中、未显式指定 provider 且不被内置
-  provider 拥有的模型会以 `NoRoute` 失败，不会静默回退到隐式默认端点；显式指定
-  provider 的模型和内置 provider 拥有的模型仍可路由。
-
-`cardinal_url` 和 `cardinal_key` 是旧版兼容设置，描述名为 `cardinal` 的隐式端点；
-新配置应优先使用 `[providers.<name>]` 与 `[models.<id>]`。
+- 未出现在 `[models.<id>]` 中、未显式指定 provider 且不被内置 provider 拥有的模型
+  会以 `NoRoute` 失败，不会静默回退到默认端点；显式指定 provider 的模型和内置
+  provider 拥有的模型仍可路由。
+- `default_model` 推荐写成 `provider/route-id`（例如 `example/fast`），明确指向路由；
+  也可以写模型目录中存在的裸 route id。未知名称不会回退到隐式端点。
 
 ### 环境变量
 
@@ -103,8 +104,6 @@ candidates = [
 | `OX_DB_PATH` | 覆盖 `db_path`；默认 `~/.ox/ox.db`。 |
 | `OX_LISTEN` | 覆盖 `listen`；默认 `127.0.0.1:8787`。 |
 | `OX_SUBAGENT_DEPTH` | 覆盖 `subagent.depth`；默认 `1`，`0` 禁用子 agent。非法整数会告警并保留配置值。 |
-| `OX_CARDINAL_URL` | 覆盖兼容端点 `cardinal_url`；默认 `http://127.0.0.1:10202`。 |
-| `OX_CARDINAL_KEY` | 覆盖兼容端点 `cardinal_key`，作为其 Bearer 密钥。 |
 | `OX_DEFAULT_MODEL` | 覆盖 `default_model`；两者都未设置时，依次优先选择已配置的内置 provider 的第一个可聊天模型，再选择模型目录的第一个可聊天条目。 |
 | `DEEPSEEK_API_KEY` | 为内置 DeepSeek provider 提供密钥；显式配置的密钥优先。 |
 

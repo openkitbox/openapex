@@ -1,11 +1,9 @@
 //! Multi-endpoint chat routing over the [`Chat`] seam.
 //!
-//! `cardinal_url`/`cardinal_key` stay the implicit endpoint (named
-//! [`crate::config::DEFAULT_PROVIDER_NAME`]); `[providers.<name>]` adds
-//! more, `[models.<id>]` gives a logical model an ordered candidate list.
-//! Routing is explicit: once `[providers]` is configured, unrouted models
-//! are [`ChatError::NoRoute`] instead of silently hitting the implicit
-//! endpoint.
+//! Every endpoint comes from `[providers.<name>]` or a credential-resolved
+//! builtin; `[models.<id>]` gives a logical model an ordered candidate list.
+//! Routing is explicit: an unrouted model without a selected provider is
+//! [`ChatError::NoRoute`] — there is no implicit endpoint to fall back to.
 //!
 //! The decisions are pure ([`should_failover`], candidate lookup); the
 //! [`Chat`] impl only drives the attempt loop. The wire is untouched:
@@ -15,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::config::{DEFAULT_PROVIDER_NAME, EndpointLimits, LlmConfig, Protocol, ProviderConfig};
+use crate::config::{EndpointLimits, LlmConfig, Protocol, ProviderConfig};
 
 use super::ChatError;
 use super::chat::{Chat, ChatFuture};
@@ -32,7 +30,7 @@ pub(crate) struct Candidate {
     /// Wire model id; `None` passes the logical id through unchanged.
     model: Option<String>,
     /// Which configured endpoint serves this candidate: the `[providers]`
-    /// key, or `cardinal` for the implicit one. Carried for the attempt log.
+    /// key or the builtin id. Carried for the attempt log.
     provider: String,
 }
 
@@ -42,25 +40,16 @@ pub struct EndpointRouter {
     resolver: crate::config::Routes,
     /// `[models.<id>]` candidates in configured order.
     routes: BTreeMap<String, Vec<Candidate>>,
-    /// One direct candidate per configured endpoint, including the implicit
-    /// cardinal endpoint and credential-resolved builtins.
+    /// One direct candidate per configured endpoint, including credential-
+    /// resolved builtins.
     direct: BTreeMap<String, Candidate>,
 }
 
 impl EndpointRouter {
-    /// Build the router from config. `cardinal` is the implicit endpoint
-    /// client (from `cardinal_url`/`cardinal_key`), built by the caller so
-    /// init failures surface at the composition root with one message.
-    pub fn from_config(config: &LlmConfig, cardinal: CardinalClient) -> Result<Self, ChatError> {
+    /// Build one client per configured endpoint. Client construction errors
+    /// surface here, at the composition root.
+    pub fn from_config(config: &LlmConfig) -> Result<Self, ChatError> {
         let mut clients: BTreeMap<String, Arc<dyn Chat>> = BTreeMap::new();
-        clients.insert(
-            DEFAULT_PROVIDER_NAME.to_owned(),
-            gated(
-                Arc::new(cardinal),
-                &config.cardinal_limits,
-                DEFAULT_PROVIDER_NAME,
-            ),
-        );
         for (name, provider) in &config.providers {
             clients.insert(
                 name.clone(),
@@ -118,7 +107,8 @@ impl EndpointRouter {
     }
 
     /// The candidates serving `model`: the explicit route, else the builtin
-    /// that owns its namespace, else the passthrough endpoint, else `NoRoute`.
+    /// that owns its namespace, else the explicitly selected endpoint, else
+    /// `NoRoute`.
     /// Never returns an empty list.
     pub(crate) fn candidates_for(
         &self,

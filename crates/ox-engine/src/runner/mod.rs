@@ -1237,8 +1237,8 @@ fn agent_of(parent_id: Option<&str>, agent: Option<&str>) -> &'static Agent {
 
 /// Resolve the session's agent + model (`context.resolveModel`): the projected
 /// selection when set, else the config's default model (`default_model`,
-/// falling back to the first `[[models]]` entry), else the cardinal
-/// placeholder id.
+/// falling back to the first catalogue entry). A catalogue with no resolvable
+/// entry is an error, not a placeholder identity.
 ///
 /// Shared state, shared reader: the turn loop, compaction and title
 /// generation all ask the same question, so the resolver lives here rather
@@ -1272,11 +1272,9 @@ pub(crate) async fn resolve_selection(
                 provider_id: configured.provider.clone(),
                 variant: None,
             },
-            None => ox_schema::support::ModelRef {
-                id: "default".to_owned(),
-                provider_id: ox_llm::config::DEFAULT_PROVIDER_NAME.to_owned(),
-                variant: None,
-            },
+            None => bail!(
+                "no model in the catalogue for session `{session_id}`; configure [providers] and [models]"
+            ),
         },
     };
     Ok((

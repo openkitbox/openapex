@@ -3,14 +3,14 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 
 use ox_schema::permission::Rule;
 
 pub use ox_llm::config::{
-    CandidateConfig, DEFAULT_LIMITED_STALL, DEFAULT_PROVIDER_NAME, EndpointLimits, LlmConfig,
-    ModelRouteConfig, ProviderConfig,
+    CandidateConfig, DEFAULT_LIMITED_STALL, EndpointLimits, LlmConfig, ModelRouteConfig,
+    ProviderConfig,
 };
 pub use ox_llm::model_catalog::{ModelEntry, ReasoningLevel};
 
@@ -616,9 +616,9 @@ impl AgentConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    /// LLM endpoint configuration. Flattened: its keys (`cardinal_url`,
-    /// `[providers]`, `[models]`, `[context_caps]`, `default_model`, …) stay
-    /// at the top level of `ox.toml`.
+    /// LLM endpoint configuration. Flattened: its keys (`[providers]`,
+    /// `[models]`, `[context_caps]`, `default_model`, …) stay at the top level
+    /// of `ox.toml`.
     #[serde(flatten)]
     pub llm: LlmConfig,
     /// Path to the SQLite database file.
@@ -724,8 +724,86 @@ pub fn ox_home() -> PathBuf {
     user_home().join(".ox")
 }
 
+/// Root-level settings removed with the implicit cardinal endpoint. Serde
+/// ignores unknown keys, so leaving one in `ox.toml` would load a server that
+/// answers every request with `NoRoute`.
+const REMOVED_KEYS: [&str; 3] = ["cardinal_url", "cardinal_key", "cardinal_limits"];
+const REMOVED_ENV_VARS: [&str; 2] = ["OX_CARDINAL_URL", "OX_CARDINAL_KEY"];
+const MIGRATION_HINT: &str =
+    "migrate to [providers] (an OpenAI-compatible endpoint) and [models] (its routes)";
+
+/// The first segment of a TOML key or table header, ignoring dotted suffixes
+/// and both quoted key spellings.
+fn root_key(entry: &str) -> &str {
+    let entry = entry.trim();
+    if let Some(rest) = entry.strip_prefix('"') {
+        rest.split_once('"').map_or(rest, |(key, _)| key)
+    } else if let Some(rest) = entry.strip_prefix('\'') {
+        rest.split_once('\'').map_or(rest, |(key, _)| key)
+    } else {
+        entry
+            .split_once('.')
+            .map_or(entry, |(key, _)| key.trim_end())
+    }
+}
+
+/// Reject removed root keys before the schema parse. This is a lexical scan of
+/// the raw text, not a second TOML parse; only key names are echoed in errors,
+/// never values, which may contain credentials.
+fn reject_removed_keys(raw: &str, path: &Path) -> Result<()> {
+    let mut at_root = true;
+    let mut in_multiline = false;
+    for line in raw.lines() {
+        let delimiters = line.matches("\"\"\"").count() + line.matches("'''").count();
+        if in_multiline {
+            if delimiters % 2 == 1 {
+                in_multiline = false;
+            }
+            continue;
+        }
+        let line = line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let header = line.strip_prefix("[[").or_else(|| line.strip_prefix('['));
+        let (entry, is_header) = match header {
+            Some(rest) => (rest, true),
+            None => match line.split_once('=') {
+                Some((key, _)) => (key, false),
+                None => continue,
+            },
+        };
+        let text = entry.split_once(']').map_or(entry, |(name, _)| name);
+        let key = root_key(text);
+        if REMOVED_KEYS.contains(&key) && (is_header || at_root) {
+            bail!(
+                "config file {}: removed cardinal setting `{key}`; {MIGRATION_HINT}",
+                path.display()
+            );
+        }
+        if is_header {
+            at_root = false;
+        }
+        if delimiters % 2 == 1 {
+            in_multiline = true;
+        }
+    }
+    Ok(())
+}
+
+/// The environment overrides were removed along with the config keys.
+fn reject_removed_env() -> Result<()> {
+    for name in REMOVED_ENV_VARS {
+        ensure!(
+            std::env::var_os(name).is_none(),
+            "removed environment variable `{name}`; {MIGRATION_HINT}"
+        );
+    }
+    Ok(())
+}
+
 /// A parse failure naming the file, the toml message and the line/column,
-/// without toml's source-line snippet (the line could hold `cardinal_key`).
+/// without toml's source-line snippet (it could hold a secret).
 fn parse_error(path: &Path, raw: &str, error: &toml::de::Error) -> anyhow::Error {
     let at = error.span().map_or(String::new(), |span| {
         let before = &raw.as_bytes()[..span.start.min(raw.len())];
@@ -761,9 +839,11 @@ impl Config {
     /// `LlmConfig::apply_credentials` itself once the DB is open. Until then a
     /// builtin provider with only a stored key is intentionally absent.
     pub fn load_from(path: PathBuf) -> Result<Self> {
+        reject_removed_env()?;
         let mut config = if path.exists() {
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("failed to read config file {}", path.display()))?;
+            reject_removed_keys(&raw, &path)?;
             toml::from_str(&raw).map_err(|error| parse_error(&path, &raw, &error))?
         } else {
             Config::default()
