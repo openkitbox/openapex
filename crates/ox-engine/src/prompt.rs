@@ -6,8 +6,9 @@
 //! Admission belongs here: raw reads are cap+1 bounded, rendered AGENTS and
 //! skills have independent limits, and errors stop assembly before delivery.
 //! Reads own one byte buffer moved into UTF-8 text; measurements borrow source
-//! strings. MCP instructions and tool schemas are neither trimmed nor charged
-//! against AGENTS limits.
+//! strings. Code Mode guidance is rendered before MCP, matching upstream order;
+//! MCP instructions and tool schemas are neither trimmed nor charged against
+//! AGENTS limits.
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -245,11 +246,36 @@ fn tool_guidance(tools: &[(&str, Option<&'static str>)]) -> String {
     rendered
 }
 
+/// Upstream `core/codemode` (`packages/core/src/codemode/instructions.ts`):
+/// first in combine order so catalog guidance stays a shared prompt-cache
+/// prefix ahead of MCP and skill guidance.
+pub(crate) const KEY_CODEMODE: &str = "core/codemode";
 pub(crate) const KEY_MCP: &str = "core/mcp-guidance";
 pub(crate) const KEY_SKILLS: &str = "core/skill-guidance";
 pub(crate) const KEY_INSTRUCTIONS: &str = "core/instructions";
 pub(crate) const KEY_DATE: &str = "core/date";
 pub(crate) const KEY_ENVIRONMENT: &str = "core/environment";
+
+/// Upstream-invariant guidance for the default (non-`full_codemode`) `execute`
+/// tool, adapted to ox: there is no `fetch`, so HTTP goes through the catalog's
+/// `webfetch` tool. The catalog itself is supplied by the caller from the live
+/// tool registry and is never cached here.
+const CODE_MODE_INSTRUCTIONS: &str = concat!(
+    "# Code Mode\n\n",
+    "The tools listed below cannot be called directly: they only work as JavaScript inside the `execute` tool. Every other tool you have is a normal tool call: call it directly, never inside `execute`.\n\n",
+    "The catalog is complete. Do not guess tool names.\n\n",
+    "Write plain JavaScript and send it exactly as written: no code fence, and no JSON or other wrapper around it.\n",
+    "Each call is a fresh program; nothing carries over from earlier calls.\n",
+    "`fetch` is unavailable in ox; use the catalog's `webfetch` tool for HTTP requests. Imports, direct filesystem access, and timers are unavailable: there is no `setTimeout` or sleep. All other external access goes through `tools`.\n",
+    "Call tools through `tools` using only exact paths and signatures from the catalog: `tools.name(...)` or `tools[\"name\"](...)`. Keep those paths static; do not infer, normalize, or build tool names dynamically.\n",
+    "Prefer an explicit `return`; if omitted, the final top-level expression becomes the result.\n",
+    "Await every call whose completion matters; pending calls are interrupted when execution ends. Run independent calls concurrently with `Promise.allSettled`.\n\n",
+    "## Code Mode tools (call only inside `execute`)",
+);
+
+fn render_code_mode(catalog: &str) -> String {
+    format!("{CODE_MODE_INSTRUCTIONS}\n\n{catalog}")
+}
 
 /// How the skills catalog renders at its current byte size against
 /// [`SKILLS_CATALOG_BUDGET_BYTES`]: description tiers, graded after the mainstream
@@ -484,6 +510,11 @@ fn catalog_bytes(skills: &[SkillSummary]) -> usize {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum SourceValue {
+    /// The default Code Mode catalog: invariant instructions plus one line per
+    /// scriptable tool, derived from the live registry on every observation.
+    CodeMode {
+        catalog: String,
+    },
     /// The instruction file list (global first, then project), upstream
     /// `instruction-discovery.ts`.
     Files {
@@ -547,7 +578,9 @@ pub(crate) struct Observed {
 }
 
 /// Gather this step's sources in upstream combine order
-/// (`session/context.ts:155`): MCP, skills, AGENTS.md, date, environment.
+/// (`session/context.ts:211`): Code Mode, MCP, skills, AGENTS.md, date,
+/// environment. An empty or absent catalog means Code Mode is not available;
+/// a pure text source has no transient failure, so it is never `Unavailable`.
 ///
 /// `project_root` bounds the AGENTS.md ancestor walk (global, then the
 /// session directory nearest → farthest up to the root); `None` degenerates
@@ -556,6 +589,7 @@ pub(crate) fn gather(
     directory: &Path,
     home: &Path,
     project_root: Option<&Path>,
+    codemode_catalog: Option<&str>,
     mcp_instructions: Option<&str>,
     discovery: bool,
 ) -> Result<Vec<Observed>, BudgetExceeded> {
@@ -570,6 +604,15 @@ pub(crate) fn gather(
     let agents = observed_instructions(directory, home, project_root)?;
     let policy = admit_catalog(&skills, discovery)?;
     let sources = vec![
+        Observed {
+            key: KEY_CODEMODE,
+            value: match codemode_catalog.filter(|catalog| !catalog.trim().is_empty()) {
+                Some(catalog) => ObservedValue::Present(SourceValue::CodeMode {
+                    catalog: catalog.to_owned(),
+                }),
+                None => ObservedValue::Removed,
+            },
+        },
         Observed {
             key: KEY_MCP,
             value: match mcp_instructions {
@@ -783,6 +826,7 @@ pub(crate) fn render_initial(sources: &[Observed]) -> String {
 /// Upstream per-source `initial` renderers.
 pub(crate) fn initial_text(value: &SourceValue) -> String {
     match value {
+        SourceValue::CodeMode { catalog } => render_code_mode(catalog),
         SourceValue::Mcp { block } => block.clone(),
         SourceValue::Skills { skills, policy } => render_skills(skills, *policy),
         SourceValue::Files { files } => render_instruction_files(files),
@@ -800,6 +844,7 @@ pub(crate) fn initial_text(value: &SourceValue) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InjectionSizes {
     pub system0_bytes: usize,
+    pub codemode_bytes: usize,
     pub mcp_bytes: usize,
     pub skills_bytes: usize,
     pub instructions_bytes: usize,
@@ -820,8 +865,8 @@ pub(crate) struct InjectionSizes {
 /// Measure this step's injection surface. Each source is measured by the
 /// length of the bytes its own renderer emits ([`initial_text`]), i.e. exactly
 /// what system[1] shows for it; bytes are never re-serialized separately. The
-/// five named fields cover the five keyed sources; a source added later
-/// without a field still counts toward `total_bytes`.
+/// six named fields cover the six keyed sources; a source added later without
+/// a field still counts toward `total_bytes`.
 pub(crate) fn injection_sizes(
     observed: &[Observed],
     system_static_len: usize,
@@ -829,6 +874,7 @@ pub(crate) fn injection_sizes(
 ) -> InjectionSizes {
     let mut sizes = InjectionSizes {
         system0_bytes: system_static_len,
+        codemode_bytes: 0,
         mcp_bytes: 0,
         skills_bytes: 0,
         instructions_bytes: 0,
@@ -854,6 +900,7 @@ pub(crate) fn injection_sizes(
             ObservedValue::Removed | ObservedValue::Unavailable => 0,
         };
         match source.key {
+            KEY_CODEMODE => sizes.codemode_bytes = bytes,
             KEY_MCP => sizes.mcp_bytes = bytes,
             KEY_SKILLS => sizes.skills_bytes = bytes,
             KEY_INSTRUCTIONS => sizes.instructions_bytes = bytes,
@@ -912,6 +959,10 @@ pub(crate) fn changed_text(value: &SourceValue, previous: Option<&SourceValue>) 
 /// not deliverable (date/env are always present).
 pub(crate) fn removed_text(key: &str) -> Option<String> {
     match key {
+        KEY_CODEMODE => Some(
+            "The Code Mode catalog is no longer available. Permitted tools are available as direct tool calls."
+                .to_owned(),
+        ),
         KEY_MCP => Some("MCP server instructions are no longer available.".to_owned()),
         KEY_SKILLS => Some(
             "Skill guidance is no longer available. Do not use any previously listed skill."
@@ -1295,4 +1346,110 @@ pub(crate) fn local_date(timestamp_ms: i64, zone: &jiff::tz::TimeZone) -> String
         .to_zoned_datetime(zone.clone())
         .date()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{
+        CODE_MODE_INSTRUCTIONS, KEY_CODEMODE, KEY_MCP, Observed, ObservedValue, SourceValue,
+        gather, injection_sizes, render_initial,
+    };
+
+    /// Neither skills nor AGENTS.md exist here, so only the sources under test
+    /// contribute to the rendered system[1] body.
+    fn absent_dir() -> &'static Path {
+        Path::new("/nonexistent/ox-prompt-codemode-test")
+    }
+
+    #[test]
+    fn codemode_source_renders_ahead_of_mcp_with_invariants_and_catalog() {
+        let catalog = "- webfetch: Fetch a URL";
+        let observed = gather(
+            absent_dir(),
+            absent_dir(),
+            None,
+            Some(catalog),
+            Some("<mcp_instructions>"),
+            true,
+        )
+        .expect("gather succeeds when instruction files are absent");
+        assert_eq!(observed[0].key, KEY_CODEMODE, "Code Mode must come first");
+        assert_eq!(observed[1].key, KEY_MCP, "MCP must follow Code Mode");
+        let ObservedValue::Present(SourceValue::CodeMode { catalog: shown }) = &observed[0].value
+        else {
+            panic!("a non-empty catalog must be present");
+        };
+        assert_eq!(shown, catalog, "the caller's catalog must render verbatim");
+
+        let rendered = render_initial(&observed);
+        let code_at = rendered
+            .find("# Code Mode")
+            .expect("Code Mode heading must render");
+        let mcp_at = rendered
+            .find("<mcp_instructions>")
+            .expect("MCP block must render");
+        assert!(code_at < mcp_at, "Code Mode must precede MCP in system[1]");
+        assert!(
+            rendered.contains("- webfetch: Fetch a URL"),
+            "the catalog line must reach system[1]"
+        );
+        for invariant in [
+            "no code fence",
+            "Each call is a fresh program",
+            "`fetch` is unavailable in ox",
+            "`webfetch` tool for HTTP requests",
+            "`tools.name(...)` or `tools[\"name\"](...)`",
+            "Await every call",
+            "cannot be called directly",
+        ] {
+            assert!(
+                CODE_MODE_INSTRUCTIONS.contains(invariant),
+                "missing Code Mode invariant: {invariant}"
+            );
+        }
+    }
+
+    #[test]
+    fn codemode_source_is_absent_without_a_catalog() {
+        for catalog in [None, Some(""), Some(" \n")] {
+            let observed = gather(absent_dir(), absent_dir(), None, catalog, None, true)
+                .expect("gather succeeds with no instructions");
+            assert_eq!(observed[0].key, KEY_CODEMODE, "key stays present");
+            assert!(
+                matches!(&observed[0].value, ObservedValue::Removed),
+                "empty or absent catalog must not inject a block"
+            );
+            assert!(
+                !render_initial(&observed).contains("# Code Mode"),
+                "no empty Code Mode block may reach system[1]"
+            );
+        }
+    }
+
+    #[test]
+    fn codemode_bytes_count_toward_total() {
+        let observed = vec![
+            Observed {
+                key: KEY_CODEMODE,
+                value: ObservedValue::Present(SourceValue::CodeMode {
+                    catalog: "- read: Read a file".to_owned(),
+                }),
+            },
+            Observed {
+                key: KEY_MCP,
+                value: ObservedValue::Present(SourceValue::Mcp {
+                    block: "mcp block".to_owned(),
+                }),
+            },
+        ];
+        let sizes = injection_sizes(&observed, 100, 2);
+        assert!(sizes.codemode_bytes > 0, "Code Mode text has bytes");
+        assert_eq!(
+            sizes.total_bytes,
+            100 + render_initial(&observed).len(),
+            "total must include the Code Mode source and its separator"
+        );
+    }
 }

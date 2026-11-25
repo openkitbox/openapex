@@ -15,7 +15,7 @@ pub mod tools;
 pub use limits::Limits;
 pub use runtime::{CodeOutput, ExecutionError, execute, execute_scoped};
 pub use scan::{PermissionAction, Scan};
-pub use tools::ToolInvoker;
+pub use tools::{CallEvent, CallStatus, ToolCallRecord, ToolInvoker};
 
 /// One optional hand-off from a code program. Mirrors the automation domain
 /// shape without making this crate depend on the automation crate (that

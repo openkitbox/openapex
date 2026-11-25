@@ -12,6 +12,7 @@ grep-searcher.workspace = true
 ignore.workspace = true
 libc.workspace = true
 ox-core.workspace = true
+ox-codemode = { path = "../ox-codemode" }
 ox-db.workspace = true
 ox-schema.workspace = true
 reqwest.workspace = true

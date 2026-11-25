@@ -29,6 +29,7 @@ pub mod capability_search;
 pub mod contract;
 pub mod diff;
 pub mod edit;
+pub mod execute;
 pub mod file_state;
 pub mod form;
 pub mod glob;
@@ -64,6 +65,7 @@ impl ToolRegistry {
         let mut registry = Self::new();
         registry.register_all([
             Arc::new(edit::EditTool) as Arc<dyn Tool>,
+            Arc::new(execute::ExecuteTool),
             Arc::new(glob::GlobTool),
             Arc::new(grep::GrepTool),
             Arc::new(patch::PatchTool),

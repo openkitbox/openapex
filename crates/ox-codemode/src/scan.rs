@@ -1,8 +1,9 @@
 //! Static scanner for Code Mode programs.
 //!
 //! Scanning is the authorization gate: a program is executed only if every
-//! reference to the host `tools` object is a static dot path. The runtime gets
-//! exactly those paths and nothing else.
+//! reference to the host `tools` object is a static dot path or a path built
+//! from string-literal computed members. The runtime gets exactly those paths
+//! and nothing else.
 
 use std::collections::{BTreeSet, HashSet};
 
@@ -85,9 +86,11 @@ pub(crate) fn wrap(source: &str) -> String {
     format!("(function () {{\n\"use strict\";\n{source}\n}})")
 }
 
-/// A tool call is only a direct `tools.ns.name(...)` chain. Every root `tools`
-/// reference must be consumed by exactly one such call; this rules out
-/// aliases, computed access, passing the object around and method extraction.
+/// A tool call is only a direct `tools.ns.name(...)` or
+/// `tools["ns"]["name"](...)` chain, mixing dot and string-literal members.
+/// Every root `tools` reference must be consumed by exactly one such call;
+/// this rules out aliases, dynamic computed access, passing the object around
+/// and method extraction.
 fn static_tool_path<'a>(
     expr: &'a Expression<'a>,
     semantic: &Semantic<'a>,
@@ -98,6 +101,17 @@ fn static_tool_path<'a>(
         match current {
             Expression::StaticMemberExpression(member) if !member.optional => {
                 segments.push(member.property.name.as_str().to_owned());
+                current = &member.object;
+            }
+            Expression::ComputedMemberExpression(member) if !member.optional => {
+                let Expression::StringLiteral(key) = &member.expression else {
+                    return None;
+                };
+                let key = key.value.as_str()?;
+                if key.is_empty() {
+                    return None;
+                }
+                segments.push(key.to_owned());
                 current = &member.object;
             }
             Expression::Identifier(ident) => {

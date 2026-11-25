@@ -6,6 +6,7 @@
 pub mod api;
 pub(crate) mod automation_wiring;
 pub(crate) mod config_watch;
+mod execute_wiring;
 pub mod instance;
 pub mod lifecycle;
 pub mod project;
@@ -236,11 +237,14 @@ async fn build_state_with_mode(
         db,
         bus,
         chat,
-        tools,
+        Arc::clone(&tools),
         model_catalog,
         mcp,
         home,
     );
+    // `Runner::new` installed its permission-only host; replace it with the
+    // composite so nested calls stream progress to this same bus and overlay.
+    execute_wiring::install(&tools, runner.nested_tool_host(), bus_handle.clone());
     let permissions = runner.permission_service();
     Ok(AppState {
         db: db_handle,

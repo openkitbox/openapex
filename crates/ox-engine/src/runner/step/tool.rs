@@ -11,7 +11,7 @@ use ox_schema::support::{Content, Record, SessionError};
 
 use super::super::ToolContext;
 use super::super::drain::DrainCtx;
-use super::super::permissions::Decision;
+use super::super::permissions::{Decision, tool_output_text};
 use super::attempt::StepParams;
 use super::stream::ToolAccum;
 /// Execution output belongs to the tool; this error only describes a failed
@@ -447,15 +447,6 @@ fn spawn_tool_task(
             source,
         })
     })
-}
-
-/// A tool output's model-facing text: strings verbatim, anything else as
-/// compact JSON.
-fn tool_output_text(value: Value) -> String {
-    match value {
-        Value::String(text) => text,
-        other => other.to_string(),
-    }
 }
 
 /// Client-facing `metadata` for a tool event. A JSON object becomes the

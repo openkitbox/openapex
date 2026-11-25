@@ -3021,6 +3021,7 @@ dependencies = [
  "grep-searcher",
  "ignore",
  "libc",
+ "ox-codemode",
  "ox-core",
  "ox-db",
  "ox-schema",

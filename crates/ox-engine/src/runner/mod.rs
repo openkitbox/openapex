@@ -60,6 +60,8 @@ use tokio_util::sync::CancellationToken;
 
 pub use ox_tools::contract::{Attachment, Tool, ToolContext, ToolOutput, ToolRegistry};
 
+use ox_tools::contract::ExecuteHost;
+
 use ox_core::config::Config;
 use ox_core::event_bus::EventBus;
 use ox_db::Db;
@@ -124,6 +126,8 @@ struct Inner {
     cache_ledger: Arc<CacheLedger>,
     /// The one permission service, shared with the HTTP reply endpoints.
     permissions: Arc<crate::permission::PermissionService>,
+    /// The engine half of the nested-call host, shared with the registry slot.
+    execute_host: Arc<dyn ExecuteHost>,
     /// Serializes registry replacement with process-table cleanup. Never held
     /// across Activity, admission, DB access or await; shard guards are dropped
     /// before the attached tables are locked.
@@ -444,14 +448,21 @@ impl Runner {
             tools,
         }));
         let stop = CancellationToken::new();
+        let permissions = Arc::new(crate::permission::PermissionService::new(
+            db.clone(),
+            bus.clone(),
+            stop.child_token(),
+        ));
+        let execute_host: Arc<dyn ExecuteHost> = Arc::new(permissions::NestedToolRunner::new(
+            db.clone(),
+            Arc::clone(&permissions),
+            Arc::clone(&live),
+        ));
         let inner = Arc::new(Inner {
             directory,
             home,
-            permissions: Arc::new(crate::permission::PermissionService::new(
-                db.clone(),
-                bus.clone(),
-                stop.child_token(),
-            )),
+            permissions,
+            execute_host,
             db,
             bus,
             live,
@@ -469,6 +480,9 @@ impl Runner {
         }
         if let Some(completion) = tools.shell_completion.clone() {
             completion.attach(Arc::new(WeakRunner(Arc::downgrade(&inner))));
+        }
+        if tools.execute_host().is_none() {
+            tools.set_execute_host(Arc::clone(&inner.execute_host));
         }
         Self { inner }
     }
@@ -492,6 +506,14 @@ impl Runner {
     #[must_use]
     pub fn permission_service(&self) -> Arc<crate::permission::PermissionService> {
         Arc::clone(&self.inner.permissions)
+    }
+
+    /// The permission-checking half of nested tool calls. The server composes
+    /// its progress publisher around this and installs the composite in the
+    /// registry's shared host slot; both halves keep this one authority.
+    #[must_use]
+    pub fn nested_tool_host(&self) -> Arc<dyn ExecuteHost> {
+        Arc::clone(&self.inner.execute_host)
     }
 
     #[must_use]

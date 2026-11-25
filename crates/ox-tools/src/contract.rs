@@ -4,7 +4,7 @@
 //! depending on each other.
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -213,6 +213,63 @@ impl Drop for ExecutionAdmission {
 /// [`crate::register_subagent`] ran (see [`crate::subagent::SubagentHandle`]).
 pub type SubagentSlot = Option<std::sync::Arc<crate::subagent::SubagentHandle>>;
 
+/// The session facts a scripted `execute` call passes to its host for one
+/// nested tool call. The host owns permission decisions, so tools never see
+/// the engine or its gate directly.
+pub struct NestedCallContext<'a> {
+    pub session_id: &'a str,
+    pub directory: &'a Path,
+    pub assistant_message_id: &'a str,
+    pub parent_call_id: &'a str,
+    pub cancellation: CancellationToken,
+}
+
+/// The narrow seam between a scriptable tool and the host that runs its
+/// nested calls. Implemented in `ox-engine` (authorize + execute) and composed
+/// in `ox-server` (progress); `ox-tools` depends on neither.
+pub trait ExecuteHost: Send + Sync {
+    /// Authorize and run one nested tool, returning its model-facing text or
+    /// the failure reason. The parent call's cancellation is in `ctx`.
+    fn run_nested<'a>(
+        &'a self,
+        ctx: NestedCallContext<'a>,
+        path: &'a str,
+        input: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
+
+    /// Publish one throttled `{toolCalls: [...]}` progress update for the
+    /// running parent tool part. No-op until the server composes it.
+    fn publish_progress(
+        &self,
+        session_id: &str,
+        assistant_message_id: &str,
+        call_id: &str,
+        metadata: serde_json::Value,
+    );
+}
+
+/// One shared cell for the optional host: derived registries clone the cell,
+/// not its current value, so installing the host after derivation still
+/// reaches every toolset with a single authority.
+#[derive(Clone, Default)]
+struct ExecuteHostSlot(Arc<std::sync::RwLock<Option<Arc<dyn ExecuteHost>>>>);
+
+impl ExecuteHostSlot {
+    fn get(&self) -> Option<Arc<dyn ExecuteHost>> {
+        self.0
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set(&self, host: Arc<dyn ExecuteHost>) {
+        *self
+            .0
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(host);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tools (registry filled by task 7; exercised by tests)
 // ---------------------------------------------------------------------------
@@ -378,9 +435,24 @@ pub struct ToolRegistry {
     pub files: Arc<crate::file_state::FileStates>,
     /// Ephemeral metadata for tool calls currently executing in this process.
     pub live_tool_metadata: Arc<crate::live_tool_metadata::LiveToolMetadata>,
+    /// Optional host for nested `execute` calls, shared with every derived
+    /// registry through the slot below.
+    execute_host: ExecuteHostSlot,
 }
 
 impl ToolRegistry {
+    /// The host currently installed for scripted nested calls, if any.
+    /// Callers without one must fail closed rather than create their own.
+    #[must_use]
+    pub fn execute_host(&self) -> Option<Arc<dyn ExecuteHost>> {
+        self.execute_host.get()
+    }
+
+    /// Install (or replace) the one host every derived registry shares.
+    pub fn set_execute_host(&self, host: Arc<dyn ExecuteHost>) {
+        self.execute_host.set(host);
+    }
+
     /// Read live owners before the caller reads durable pending completions.
     pub fn owes_wakeup(&self, session: &str) -> bool {
         self.subagent_handle
@@ -440,6 +512,7 @@ impl ToolRegistry {
             jobs: Arc::clone(&self.jobs),
             files: Arc::clone(&self.files),
             live_tool_metadata: Arc::clone(&self.live_tool_metadata),
+            execute_host: self.execute_host.clone(),
         }
     }
 
@@ -464,6 +537,7 @@ impl ToolRegistry {
             jobs: Arc::clone(&self.jobs),
             files: Arc::clone(&self.files),
             live_tool_metadata: Arc::clone(&self.live_tool_metadata),
+            execute_host: self.execute_host.clone(),
         }
     }
 
@@ -529,5 +603,62 @@ impl ToolRegistry {
             .into_iter()
             .map(|def| (def.function.name, def.function.description))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct StubHost;
+
+    impl ExecuteHost for StubHost {
+        fn run_nested<'a>(
+            &'a self,
+            _ctx: NestedCallContext<'a>,
+            _path: &'a str,
+            _input: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>> {
+            Box::pin(async { Err("unused".to_owned()) })
+        }
+
+        fn publish_progress(
+            &self,
+            _session_id: &str,
+            _assistant_message_id: &str,
+            _call_id: &str,
+            _metadata: Value,
+        ) {
+        }
+    }
+
+    #[test]
+    fn execute_host_slot_is_shared_and_fails_closed() {
+        let registry = ToolRegistry::new();
+        assert!(
+            registry.execute_host().is_none(),
+            "an unassembled registry has no host to bypass permissions"
+        );
+
+        let host: Arc<dyn ExecuteHost> = Arc::new(StubHost);
+        registry.set_execute_host(Arc::clone(&host));
+        let filtered = registry.without(&["read"]);
+        let allowed = registry.only(&["read"]);
+        for derived in [&filtered, &allowed] {
+            let seen = derived
+                .execute_host()
+                .expect("derived registries share the installed host");
+            assert!(Arc::ptr_eq(&seen, &host), "no second host authority");
+        }
+
+        let replacement: Arc<dyn ExecuteHost> = Arc::new(StubHost);
+        filtered.set_execute_host(Arc::clone(&replacement));
+        let seen = registry
+            .execute_host()
+            .expect("the slot is shared, not copied");
+        assert!(
+            Arc::ptr_eq(&seen, &replacement),
+            "replacement reaches source"
+        );
     }
 }

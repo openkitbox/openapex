@@ -44,6 +44,7 @@ use ox_schema::message::{CompactionReason, Message};
 use ox_schema::permission::Rule;
 use ox_schema::support::{FinishReason, ModelRef, SessionError};
 use ox_tools::agent::Agent;
+use ox_tools::execute;
 
 use super::ToolRegistry;
 use super::compaction;
@@ -207,6 +208,9 @@ impl DrainCtx {
     /// large skills tree must stall this turn, not every actor sharing the
     /// worker thread. The MCP block is read first, on the executor: it is a
     /// memory snapshot, and the hub is not `'static`-movable.
+    /// The Code Mode catalog is read from the same registry that supplies this
+    /// step's tool definitions, before the blocking move, so it is one snapshot
+    /// and never a cached second list.
     ///
     /// The gather runs on the anchor's canonical directory, not
     /// `self.directory`: the instruction chain and the repository root share
@@ -216,6 +220,7 @@ impl DrainCtx {
         let directory = self.directory.clone();
         let home = self.home.clone();
         let anchor = self.instruction_root.clone();
+        let catalog = code_mode_catalog(&self.tools);
         let mcp_instructions = self.mcp.instructions_block();
         let discovery = self.tools.get("capability_search").is_some();
         tokio::task::spawn_blocking(move || {
@@ -224,6 +229,7 @@ impl DrainCtx {
                 &directory,
                 &home,
                 project_root.as_deref(),
+                catalog.as_deref(),
                 mcp_instructions.as_deref(),
                 discovery,
             )
@@ -232,6 +238,32 @@ impl DrainCtx {
         .map_err(|error| anyhow::anyhow!("instruction observation task failed: {error}"))?
         .map_err(Into::into)
     }
+}
+
+/// An agent that cannot call `execute` must not be told to route tools through it.
+fn code_mode_catalog(tools: &ToolRegistry) -> Option<String> {
+    tools
+        .get("execute")
+        .map(|_| codemode_catalog_lines(tools.catalog()))
+}
+
+/// Format one registry listing as the Code Mode catalog: one `- name:
+/// description` line per scriptable tool, with multiline descriptions flattened
+/// to one line. Takes the listing by value because `ToolRegistry::catalog`
+/// already builds an owned snapshot for each observation.
+fn codemode_catalog_lines(entries: Vec<(String, String)>) -> String {
+    let mut catalog = String::new();
+    for (name, description) in entries {
+        if execute::is_codemode_denied(&name) {
+            continue;
+        }
+        if !catalog.is_empty() {
+            catalog.push('\n');
+        }
+        let flat = description.lines().collect::<Vec<_>>().join(" ");
+        catalog.push_str(&format!("- {name}: {flat}"));
+    }
+    catalog
 }
 
 /// Run drains until the inbox is quiet, a control interrupts, or a turn
@@ -1021,4 +1053,121 @@ async fn settle_stale_compactions(bus: &EventBus, db: &Db, session_id: &str) -> 
         .await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::path::Path;
+    use std::pin::Pin;
+
+    use ox_schema::wire::ToolDef;
+    use ox_tools::contract::{Tool, ToolContext, ToolOutput, ToolRegistry};
+
+    use super::{code_mode_catalog, codemode_catalog_lines};
+    use crate::prompt::{ObservedValue, SourceValue, gather};
+
+    struct NamedTool {
+        name: &'static str,
+        description: &'static str,
+    }
+
+    impl Tool for NamedTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn definition(&self) -> ToolDef {
+            ToolDef::function(
+                self.name,
+                self.description,
+                serde_json::json!({"type": "object"}),
+            )
+        }
+
+        fn execute(
+            &self,
+            _ctx: ToolContext,
+            _input: serde_json::Value,
+        ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
+            Box::pin(async { ox_tools::fail("not called by this test") })
+        }
+    }
+
+    fn registry(names: &[(&'static str, &'static str)]) -> ToolRegistry {
+        let mut tools = ToolRegistry::new();
+        for &(name, description) in names {
+            tools
+                .register(std::sync::Arc::new(NamedTool { name, description })
+                    as std::sync::Arc<dyn Tool>)
+                .expect("register test tool");
+        }
+        tools
+    }
+
+    #[test]
+    fn codemode_catalog_excludes_denied_tools_and_flattens_descriptions() {
+        let entries = vec![
+            ("alpha".to_owned(), "First line\nsecond line".to_owned()),
+            ("execute".to_owned(), "Recursive".to_owned()),
+            ("shell".to_owned(), "Denied".to_owned()),
+            ("subagent".to_owned(), "Denied".to_owned()),
+            ("question".to_owned(), "Denied".to_owned()),
+            ("automation_list".to_owned(), "Denied".to_owned()),
+            ("webfetch".to_owned(), "Fetch a URL".to_owned()),
+        ];
+        assert_eq!(
+            codemode_catalog_lines(entries),
+            "- alpha: First line second line\n- webfetch: Fetch a URL"
+        );
+        assert!(
+            codemode_catalog_lines(vec![("execute".to_owned(), "no".to_owned())]).is_empty(),
+            "an all-denied registry must not produce a catalog block"
+        );
+    }
+
+    #[test]
+    fn denied_shell_is_absent_from_catalog_and_runtime_allowlist() {
+        assert!(
+            ox_tools::execute::is_codemode_denied("shell"),
+            "the shared runtime predicate denies shell"
+        );
+        let catalog = codemode_catalog_lines(vec![
+            ("shell".to_owned(), "Denied".to_owned()),
+            ("read".to_owned(), "Read a file".to_owned()),
+        ]);
+        assert_eq!(
+            catalog, "- read: Read a file",
+            "the catalog denies shell too"
+        );
+    }
+
+    #[test]
+    fn code_mode_source_tracks_execute_availability() {
+        let tool = ("read", "Read a file");
+        let without_execute = registry(&[tool]);
+        assert!(
+            code_mode_catalog(&without_execute).is_none(),
+            "no execute tool means no catalog"
+        );
+        let with_execute = registry(&[("execute", "Run code"), tool]);
+        let catalog = code_mode_catalog(&with_execute).expect("execute tool enables the catalog");
+        assert_eq!(catalog, "- read: Read a file");
+
+        let dir = Path::new("/nonexistent/ox-prompt-codemode-test");
+        let observed = gather(dir, dir, None, None, None, true).expect("gather without catalog");
+        assert!(
+            matches!(observed[0].value, ObservedValue::Removed),
+            "no Code Mode source without execute"
+        );
+        let observed =
+            gather(dir, dir, None, Some(&catalog), None, true).expect("gather with catalog");
+        assert!(
+            matches!(
+                &observed[0].value,
+                ObservedValue::Present(SourceValue::CodeMode { .. })
+            ),
+            "Code Mode source present when execute is available"
+        );
+    }
 }

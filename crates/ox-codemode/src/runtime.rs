@@ -2,6 +2,7 @@
 
 use std::{
     collections::BTreeSet,
+    mem,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -12,7 +13,7 @@ use std::{
 use anyhow::Result as AnyResult;
 use rquickjs::{Context as QContext, Ctx, Error as JsError, Function, Runtime, Value};
 
-use crate::{CodeResult, Limits, ToolInvoker, scan};
+use crate::{CallEvent, CallStatus, CodeResult, Limits, ToolCallRecord, ToolInvoker, scan};
 
 /// Strip every route from source text to executable code and lock down the
 /// prototypes shared by built-ins. Adapted from the sandbox hardening used by
@@ -105,6 +106,8 @@ pub struct CodeOutput {
     pub truncated: bool,
     /// Strictly decoded program result.
     pub result: Option<CodeResult>,
+    /// Final record for each tool call, in invocation order.
+    pub calls: Vec<ToolCallRecord>,
 }
 
 /// Scan then execute `code` in a fresh QuickJS runtime.
@@ -165,10 +168,18 @@ fn execute_impl(
     let context = QContext::full(&runtime)
         .map_err(|err| ExecutionError::Runtime(format!("create context: {err}")))?;
     let logs = Arc::new(Mutex::new(String::new()));
+    let calls = Arc::new(Mutex::new(Vec::new()));
 
     let outcome: AnyResult<Option<CodeResult>> = context.with(|ctx| {
         install_bindings(&ctx, bindings)?;
-        install_globals(&ctx, &scanned, invoker, logs.clone(), limits.output_bytes)?;
+        install_globals(
+            &ctx,
+            &scanned,
+            invoker,
+            logs.clone(),
+            calls.clone(),
+            limits.output_bytes,
+        )?;
         ctx.eval::<(), _>(HARDEN)?;
 
         let program: Function<'_> = ctx.eval(scan::wrap(code))?;
@@ -184,10 +195,12 @@ fn execute_impl(
     let result = outcome.map_err(|err| ExecutionError::Runtime(err.to_string()))?;
     let (kept_logs, truncated) =
         truncate_logs(&logs.lock().expect("log lock"), limits.output_bytes);
+    let recorded_calls = mem::take(&mut *calls.lock().expect("call record lock"));
     Ok(CodeOutput {
         logs: kept_logs,
         truncated,
         result,
+        calls: recorded_calls,
     })
 }
 
@@ -209,17 +222,40 @@ fn install_globals<'js>(
     scanned: &scan::Scan,
     invoker: Arc<dyn ToolInvoker>,
     buffer: Arc<Mutex<String>>,
+    calls: Arc<Mutex<Vec<ToolCallRecord>>>,
     output_bytes: usize,
 ) -> AnyResult<()> {
     let tool_bridge = Function::new(
         ctx.clone(),
         move |path: String, args: String| -> rquickjs::Result<String> {
-            invoker
-                .invoke(&path, &args)
-                .map_err(|err| JsError::InvalidClass {
-                    class: "ToolInvoker",
-                    message: err.to_string(),
-                })
+            invoker.on_call(CallEvent {
+                path: &path,
+                status: CallStatus::Running,
+                input: Some(&args),
+            });
+            let invoked = invoker.invoke(&path, &args);
+            let status = if invoked.is_ok() {
+                CallStatus::Completed
+            } else {
+                CallStatus::Error
+            };
+            invoker.on_call(CallEvent {
+                path: &path,
+                status,
+                input: Some(&args),
+            });
+            calls
+                .lock()
+                .expect("call record lock")
+                .push(ToolCallRecord {
+                    path,
+                    status,
+                    input: Some(args),
+                });
+            invoked.map_err(|err| JsError::InvalidClass {
+                class: "ToolInvoker",
+                message: err.to_string(),
+            })
         },
     )
     .map_err(|err| anyhow::anyhow!("tool bridge: {err}"))?;

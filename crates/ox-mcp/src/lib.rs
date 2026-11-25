@@ -123,10 +123,12 @@ struct ConnectionMetadata {
 /// `mcp/instructions.ts:22` names each server's tools per server ("through
 /// `execute` under `tools[\"<server>\"]`"), but that is the codemode bridge —
 /// ox registers MCP tools directly under their qualified `<server>_<tool>`
-/// names (`crate::tool::qualified_name`). The line is the ox adaptation of
-/// that naming guidance; the upstream bytes before it are untouched (batch I,
-/// recorded as a deviation in `tests/fixtures/prompt/PROVENANCE.md`).
-const TOOL_NAMING_LINE: &str = "Use tools from these servers directly by their `<server>_<tool>` names (sanitized server name, underscore, sanitized tool name).";
+/// names (`crate::tool::qualified_name`) and lists those same names in the
+/// Code Mode catalog, where they are callable inside `execute`. The line is
+/// the ox adaptation of upstream's naming guidance; the upstream bytes before
+/// it are untouched (batch I, recorded as a deviation in
+/// `tests/fixtures/prompt/PROVENANCE.md`).
+const TOOL_NAMING_LINE: &str = "MCP tools are registered directly under their `<server>_<tool>` names (sanitized server name, underscore, sanitized tool name) and are also available in the `execute` catalog by the same name.";
 
 impl Hub {
     /// A hub with no servers, whose transport cleanup belongs to
@@ -379,7 +381,8 @@ impl Hub {
     /// `<mcp_instructions>` for the system prompt; `None` when no server
     /// supplied instructions, so the zero-server prompt stays byte-identical.
     /// The upstream block bytes are a strict prefix; [`TOOL_NAMING_LINE`]
-    /// follows as the one documented deviation.
+    /// follows as the one documented deviation, adding the direct qualified
+    /// name and the Code Mode catalog name for each MCP tool.
     pub fn instructions_block(&self) -> Option<String> {
         let metadata = sync::read(&self.metadata);
         let instructions = metadata.iter().filter_map(|(name, connection)| {
@@ -656,5 +659,47 @@ fn friendly(name: &str, error: &CallError) -> String {
         CallError::Rpc(error) => format!("MCP server `{name}` rejected the handshake: {error}"),
         CallError::Transport(message) => format!("MCP server `{name}`: {message}"),
         CallError::Unsupported(message) => format!("MCP server `{name}`: {message}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sync;
+    use super::{ConnectionMetadata, Hub, TOOL_NAMING_LINE};
+    use std::time::Duration;
+
+    #[test]
+    fn instructions_block_states_both_direct_and_codemode_names() {
+        let hub = Hub::empty();
+        sync::write(&hub.metadata).insert(
+            "srv".to_owned(),
+            ConnectionMetadata {
+                title: None,
+                instructions: Some("Server guidance".to_owned()),
+                events: false,
+                catalog: Duration::from_secs(1),
+            },
+        );
+        let block = hub
+            .instructions_block()
+            .expect("a server with instructions produces a block");
+        assert!(
+            block.starts_with("<mcp_instructions>"),
+            "upstream bytes stay the prefix: {block}"
+        );
+        assert!(
+            block.contains("Server guidance"),
+            "upstream instructions are preserved: {block}"
+        );
+        assert!(
+            TOOL_NAMING_LINE.contains("`<server>_<tool>`")
+                && TOOL_NAMING_LINE.contains("`execute` catalog")
+                && TOOL_NAMING_LINE.contains("same name"),
+            "naming line must cover both paths: {TOOL_NAMING_LINE}"
+        );
+        assert!(
+            block.ends_with(TOOL_NAMING_LINE),
+            "the naming line follows the upstream block: {block}"
+        );
     }
 }
