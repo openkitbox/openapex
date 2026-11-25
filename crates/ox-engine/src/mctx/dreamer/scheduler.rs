@@ -24,7 +24,7 @@ use super::curate::{
 use super::expire::run_expire;
 use super::retrospective::{
     RETROSPECTIVE_SYSTEM_PROMPT, parse_retrospective, render_retrospective_prompt,
-    validate_retrospective_lesson,
+    validate_retrospective_lesson, worth_retrospective_completion,
 };
 use super::schedule::{
     DreamState, is_due, load_state, settle_failure, settle_skip, settle_success,
@@ -627,9 +627,12 @@ impl Dreamer {
     /// `retrospective`: the user's own turns since the last successful sweep,
     /// distilled into at most one durable memory.
     ///
-    /// "No recent user messages" is a skip: it is decided before the hidden
-    /// completion, so the tick has spent nothing and the slot can be retired
-    /// without moving the watermark.
+    /// Two cheap gates run before the completion is paid for: no eligible user
+    /// turns at all, and a window too small to be worth a completion — fewer
+    /// than two non-empty turns or under 200 characters of user text. Both are
+    /// skips: nothing was spent, and the watermark stays where it was, so the
+    /// old turns are re-read with the next tick's new turns. This defers a
+    /// single long correction by at most one tick (plan deviation ledger T2).
     ///
     /// "Nothing durable" and "already recorded" are completed, not skipped: the
     /// completion has already been paid for, and a skip would leave
@@ -653,8 +656,10 @@ impl Dreamer {
                 return TaskOutcome::Failed(TaskFailure::host("read recent user turns", &error));
             }
         };
-        if turns.is_empty() {
-            return TaskOutcome::skipped("no recent user messages".to_owned());
+        if !worth_retrospective_completion(&turns) {
+            return TaskOutcome::skipped(
+                "fewer than two substantial user turns in the unswept window".to_owned(),
+            );
         }
         let (prompt, source_sessions) = render_retrospective_prompt(project, &turns);
         let text = match self.complete(RETROSPECTIVE_SYSTEM_PROMPT, &prompt).await {

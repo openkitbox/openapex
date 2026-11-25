@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -19,9 +20,17 @@ use super::load_overlaid_tail;
 /// Candidates fetched for one turn's recall: the renderer still caps the hint
 /// at three lines, so a few extra hits let dedup fill those lines.
 const RECALL_CANDIDATE_LIMIT: usize = 9;
-/// Shortest typed prompt worth searching. A greeting or a `/clear` retrieves
-/// nothing, and every turn that clears this bar pays one indexed query.
+/// Shortest joined query worth searching: the current prompt plus up to two
+/// earlier user turns, separators included. A greeting without useful recent
+/// history retrieves nothing, and every turn that clears this bar pays one
+/// indexed query.
 const RECALL_MIN_QUERY_CHARS: usize = 8;
+/// The current prompt plus up to two earlier user turns; older turns are
+/// already covered by the historian and would only dilute the query.
+const RECALL_TURN_LIMIT: usize = 3;
+/// Caps in characters, applied per turn and then to the joined query.
+const RECALL_TURN_CHARS: usize = 200;
+const RECALL_QUERY_CHARS: usize = 600;
 /// Upstream `MAX_STEPS_PROMPT` (runner/max-steps.ts): the trailing assistant
 /// message of a final step. Never persisted.
 const MAX_STEPS_PROMPT: &str = "The maximum number of steps allowed for this task has been reached. Tools are disabled until next user input. Respond with text only.";
@@ -246,23 +255,78 @@ fn apply_final_step(request: &mut ChatRequest) {
     });
 }
 
-/// The typed text that opens the current turn, when this request is that
-/// turn's opening request: `None` unless the transcript's trailing row is the
-/// user prompt (a later step trails tool output) and it carries enough text to
-/// retrieve anything.
+/// The typed text of the current turn plus up to two preceding user turns,
+/// when this request is that turn's opening request: `None` unless the
+/// transcript's trailing row is the user prompt (a later step trails tool
+/// output) and the joined text carries enough characters to retrieve anything.
 ///
 /// The rows are the request *view*, so their text carries the overlay's `§N§`
 /// prefix. That prefix is not something the user typed: leaving it in would
 /// make its number a query token (the tagger's `§1§` becomes the word `1`) and
 /// every turn would match whatever the corpus says about that number. The same
-/// strip the persistence boundary applies removes it.
+/// strip the persistence boundary applies removes it on every included turn.
+/// The final query is the only owned `String` kept; per-turn views borrow from
+/// the stripped text, but `strip_copied_tag_notation` may return `Cow::Owned`
+/// when it removes an overlay tag (up to `RECALL_TURN_LIMIT` buffers).
 fn recall_query(rows: &[Message]) -> Option<String> {
-    let Some(Message::User { prompt, .. }) = rows.last() else {
+    if !matches!(rows.last(), Some(Message::User { .. })) {
         return None;
-    };
-    let typed = strip_copied_tag_notation(&prompt.text);
-    let text = typed.trim();
-    (text.chars().count() >= RECALL_MIN_QUERY_CHARS).then(|| text.to_owned())
+    }
+    // `strip_copied_tag_notation` returns an owned value when it removes a
+    // tag, so keep every view alive until the query has been assembled.
+    let mut stripped: [Cow<'_, str>; RECALL_TURN_LIMIT] = Default::default();
+    let mut found = 0;
+    for message in rows.iter().rev() {
+        let Message::User { prompt, .. } = message else {
+            continue;
+        };
+        stripped[found] = strip_copied_tag_notation(&prompt.text);
+        found += 1;
+        if found == RECALL_TURN_LIMIT {
+            break;
+        }
+    }
+
+    let mut selected: [&str; RECALL_TURN_LIMIT] = ["", "", ""];
+    let mut selected_count = 0;
+    let mut used_chars = 0;
+    for text in stripped.iter().take(found) {
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        let separator = usize::from(selected_count > 0);
+        let budget = (RECALL_QUERY_CHARS - used_chars - separator).min(RECALL_TURN_CHARS);
+        if budget == 0 {
+            break;
+        }
+        let end: usize = text.chars().take(budget).map(char::len_utf8).sum();
+        let piece = &text[..end];
+        if selected[..selected_count].contains(&piece) {
+            continue;
+        }
+        used_chars += piece.chars().count() + separator;
+        selected[selected_count] = piece;
+        selected_count += 1;
+    }
+    if used_chars < RECALL_MIN_QUERY_CHARS {
+        return None;
+    }
+
+    let capacity: usize = selected[..selected_count]
+        .iter()
+        .map(|piece| piece.len())
+        .sum::<usize>()
+        + selected_count
+        - 1;
+    let mut query = String::with_capacity(capacity);
+    for piece in selected.iter().take(selected_count) {
+        if !query.is_empty() {
+            query.push(' ');
+        }
+        query.push_str(piece);
+    }
+    Some(query)
 }
 
 /// Append the recall block to a user message's content: one blank line between

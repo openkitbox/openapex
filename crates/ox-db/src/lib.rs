@@ -617,6 +617,14 @@ CREATE TABLE IF NOT EXISTS permission_saved (
 CREATE INDEX IF NOT EXISTS permission_saved_project_idx ON permission_saved (project_id, action);
 "#;
 
+/// V26: supersession lineage for retired memories. `NULL` means the row was
+/// not replaced; otherwise it holds the id of the memory that replaced it.
+/// Purely additive: existing rows and read paths that do not select the
+/// column are unchanged.
+const MIGRATION_V26: &str = r#"
+ALTER TABLE mc_memory ADD COLUMN superseded_by text;
+"#;
+
 /// Versioned migrations, applied in order. `PRAGMA user_version` tracks how
 /// far the database has been migrated; each migration runs in a transaction
 /// that bumps `user_version` to its own version number.
@@ -646,6 +654,7 @@ const MIGRATIONS: &[(u32, &str)] = &[
     (23, MIGRATION_V23),
     (24, MIGRATION_V24),
     (25, MIGRATION_V25),
+    (26, MIGRATION_V26),
 ];
 
 /// Async handle to the database.

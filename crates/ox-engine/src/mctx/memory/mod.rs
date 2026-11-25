@@ -38,9 +38,11 @@
 //! casts to `INTEGER`.
 //!
 //! Memories: `active` → `archived` (retirable, still `get`-able; the
-//! optional archive reason is kept). Notes: `active`, `pending` (a smart
-//! note parked on a `surface_condition`), `ready` (the condition holds; it is
-//! in the pinboard) and `dismissed`.
+//! optional archive reason is kept). A merged or superseded row also keeps
+//! the id of the memory that replaced it (`superseded_by`), which `ctx_memory
+//! get` renders as `archived -> #N`; archiving is terminal, with no restore.
+//! Notes: `active`, `pending` (a smart note parked on a `surface_condition`),
+//! `ready` (the condition holds; it is in the pinboard) and `dismissed`.
 //!
 //! # Deviations from the reference (documented, not accidental)
 //!
@@ -63,7 +65,8 @@
 //!   nor loser (its archive reason would be overwritten), so a merge needs
 //!   at least two *active* rows among the ids; repeats are rejected. The
 //!   survivor is the lowest id (the oldest row), which is updated to the
-//!   merged content; the other rows are archived with reason `"merged"`.
+//!   merged content; the other rows are archived with reason `"merged"` and
+//!   `superseded_by = survivor`.
 //! - **Age and staleness come from the last touch** (`updated_at`, falling
 //!   back to `created_at` — the reference's `note_touched_at`), so editing a
 //!   stale note clears its marker.

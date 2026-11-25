@@ -72,6 +72,9 @@ pub(crate) struct MemoryDetail {
     pub content: String,
     /// `active` or `archived`.
     pub status: String,
+    /// `#N` handle of the memory that replaced this row. `None` unless the
+    /// row was archived by a merge or supersede.
+    pub superseded_by: Option<String>,
 }
 
 /// Write a new memory; returns its `#N` handle body. The row's owner follows
@@ -443,15 +446,7 @@ pub(crate) async fn merge_memories(
                 .await?;
             }
         }
-        for id in losers {
-            tx.execute(
-                "UPDATE mc_memory SET status = 'archived', archive_reason = 'merged',
-                     updated_at = ?3
-                 WHERE project = ?1 AND id = ?2",
-                (project, id.as_str(), now),
-            )
-            .await?;
-        }
+        archive_superseded(&tx, project, losers, survivor.as_str(), "merged", now).await?;
         tx.commit().await?;
         Ok(Some(Merged {
             survivor: survivor.clone(),
@@ -495,6 +490,31 @@ async fn live_rows_of_one_owner(
     Ok(owner.map(|owner| (owner, live)))
 }
 
+/// Archive active rows of `owner` as replaced by `survivor`, inside `tx`.
+/// Eligibility is the caller's job; the `status = 'active'` guard keeps an
+/// archived row a terminal state.
+async fn archive_superseded(
+    tx: &WriteTx<'_>,
+    owner: &str,
+    ids: &[String],
+    survivor: &str,
+    reason: &str,
+    now: i64,
+) -> Result<()> {
+    let mut stmt = tx
+        .prepare(
+            "UPDATE mc_memory SET status = 'archived', archive_reason = ?3,
+                 superseded_by = ?4, updated_at = ?5
+             WHERE project = ?1 AND id = ?2 AND status = 'active'",
+        )
+        .await?;
+    for id in ids {
+        stmt.execute((owner, id.as_str(), reason, survivor, now))
+            .await?;
+    }
+    Ok(())
+}
+
 /// Fetch memories by id in every status, in the requested order (unknown
 /// ids are skipped).
 pub(crate) async fn get_memories(
@@ -509,7 +529,7 @@ pub(crate) async fn get_memories(
         let mut out = Vec::new();
         let mut stmt = conn
             .prepare(
-                "SELECT id, category, content, status FROM mc_memory
+                "SELECT id, category, content, status, superseded_by FROM mc_memory
                  WHERE id = ?2 AND project IN (?1, ?3)",
             )
             .await?;
@@ -521,6 +541,7 @@ pub(crate) async fn get_memories(
             let category: String = row.get(1)?;
             let content: String = row.get(2)?;
             let status: String = row.get(3)?;
+            let superseded_by: Option<String> = row.get(4)?;
             // The row's own handle: a repeated request id must not
             // print the same memory twice.
             if !out.iter().any(|row: &MemoryDetail| row.id == id) {
@@ -529,6 +550,7 @@ pub(crate) async fn get_memories(
                     category,
                     content,
                     status,
+                    superseded_by,
                 });
             }
         }

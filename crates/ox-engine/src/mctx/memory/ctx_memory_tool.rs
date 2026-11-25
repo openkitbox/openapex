@@ -264,12 +264,18 @@ async fn run_memory(
                     }
                     let lines: Vec<String> = rows
                         .iter()
-                        .map(|row| {
-                            format!(
-                                "#{} [{} {}]\n{}",
-                                row.id, row.category, row.status, row.content
-                            )
-                        })
+                        .map(
+                            |row| match (row.status.as_str(), row.superseded_by.as_deref()) {
+                                ("archived", Some(replacement)) => format!(
+                                    "#{} [{} {} -> #{}]\n{}",
+                                    row.id, row.category, row.status, replacement, row.content
+                                ),
+                                _ => format!(
+                                    "#{} [{} {}]\n{}",
+                                    row.id, row.category, row.status, row.content
+                                ),
+                            },
+                        )
                         .collect();
                     ok_text(lines.join("\n\n"))
                 }

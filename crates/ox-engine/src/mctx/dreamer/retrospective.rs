@@ -44,6 +44,37 @@ const RETROSPECTIVE_TOTAL_CHARS: usize = 8_000;
 /// request, so a chatty lesson must not become a wall of text.
 const RETROSPECTIVE_MAX_CHARS: usize = 2_000;
 
+/// Minimum evidence before paying for a hidden retrospective completion.
+const RETROSPECTIVE_MIN_TURNS: usize = 2;
+const RETROSPECTIVE_MIN_TEXT_CHARS: usize = 200;
+
+/// Whether the unswept window justifies the cost of a hidden completion.
+///
+/// Pure by design: it reads the turns and nothing else — no clock, no store, no
+/// allocation. Too little evidence is a skip, not a completed sweep: the
+/// watermark stays put, so a later tick re-reads these turns together with the
+/// new ones. A single long correction is therefore delayed until a second
+/// substantive turn arrives (the accepted cost/latency trade-off in the plan's
+/// deviation ledger).
+pub(super) fn worth_retrospective_completion(turns: &[EligibleTurn]) -> bool {
+    let mut non_empty_turns = 0usize;
+    let mut meaningful_chars = 0usize;
+    for turn in turns {
+        let text = turn.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        non_empty_turns += 1;
+        meaningful_chars += text.chars().count();
+        if non_empty_turns >= RETROSPECTIVE_MIN_TURNS
+            && meaningful_chars >= RETROSPECTIVE_MIN_TEXT_CHARS
+        {
+            return true;
+        }
+    }
+    false
+}
+
 // ---------------------------------------------------------------------------
 // retrospective
 // ---------------------------------------------------------------------------
