@@ -163,7 +163,6 @@ pub struct ModelCatalog {
     /// `[models]` route table; non-empty switches the served surface from the
     /// endpoints' raw lists to the route keys.
     routes: BTreeMap<String, Vec<CandidateConfig>>,
-    preserve_unrouted: bool,
     /// `[context_caps]` by model id. Applied where the window is read
     /// ([`Self::window_of`]) as `min(reported, cap)` — a cap lowers, never
     /// raises. Inert or unsatisfiable caps warn once per refresh.
@@ -236,7 +235,6 @@ impl ModelCatalog {
                 .iter()
                 .map(|(id, route)| (id.clone(), route.candidates.clone()))
                 .collect(),
-            preserve_unrouted: config.providers.is_empty(),
             context_caps: config.context_caps.clone(),
             cache: RwLock::new(Snapshot::default()),
         })
@@ -251,7 +249,6 @@ impl ModelCatalog {
             client: crate::http_client().build().unwrap_or_default(),
             endpoints: Vec::new(),
             routes: BTreeMap::new(),
-            preserve_unrouted: true,
             context_caps: BTreeMap::new(),
             cache: RwLock::new(Snapshot {
                 limits: BTreeMap::new(),
@@ -473,12 +470,7 @@ impl ModelCatalog {
             .iter()
             .filter_map(|endpoint| endpoint.builtin)
             .collect();
-        entries = Self::merge_entries(
-            &self.routes,
-            entries,
-            self.preserve_unrouted,
-            &builtin_providers,
-        );
+        entries = Self::merge_entries(&self.routes, entries, &builtin_providers);
         // Caps that cannot bite are configuration drift the operator should
         // see: at or over the reported window (inert), or on a model with no
         // reported context at all (inactive — the unknown-window fallback
@@ -555,7 +547,6 @@ impl ModelCatalog {
     fn merge_entries(
         routes: &BTreeMap<String, Vec<CandidateConfig>>,
         mut entries: Vec<ModelEntry>,
-        preserve_unrouted: bool,
         builtin_providers: &[&BuiltinProvider],
     ) -> Vec<ModelEntry> {
         entries.sort_by(|left, right| {
@@ -565,13 +556,9 @@ impl ModelCatalog {
         });
         entries.dedup_by(|left, right| left.id == right.id && left.provider == right.provider);
         if routes.is_empty() {
-            if preserve_unrouted {
-                return entries;
-            }
-            entries.retain(|entry| is_builtin_entry(entry, builtin_providers));
             return entries;
         }
-        Self::project_routes(routes, entries, preserve_unrouted, builtin_providers)
+        Self::project_routes(routes, entries, builtin_providers)
     }
 
     /// The served model face when `[models]` is configured: one entry per
@@ -584,19 +571,14 @@ impl ModelCatalog {
     fn project_routes(
         routes: &BTreeMap<String, Vec<CandidateConfig>>,
         raw: Vec<ModelEntry>,
-        preserve_unrouted: bool,
         builtin_providers: &[&BuiltinProvider],
     ) -> Vec<ModelEntry> {
         let donors = raw;
-        let mut entries = if preserve_unrouted {
-            donors.clone()
-        } else {
-            donors
-                .iter()
-                .filter(|entry| is_builtin_entry(entry, builtin_providers))
-                .cloned()
-                .collect()
-        };
+        let mut entries: Vec<ModelEntry> = donors
+            .iter()
+            .filter(|entry| is_builtin_entry(entry, builtin_providers))
+            .cloned()
+            .collect();
         for (id, route) in routes {
             let Some(first) = route.first() else {
                 continue;
@@ -630,16 +612,14 @@ impl ModelCatalog {
                 .retain(|entry| entry.id != projection.id || entry.provider != projection.provider);
             entries.push(projection);
         }
-        if !preserve_unrouted {
-            entries.retain(|entry| {
-                is_builtin_entry(entry, builtin_providers)
-                    || routes.get(&entry.id).is_some_and(|route| {
-                        route
-                            .first()
-                            .is_some_and(|candidate| candidate.provider == entry.provider)
-                    })
-            });
-        }
+        entries.retain(|entry| {
+            is_builtin_entry(entry, builtin_providers)
+                || routes.get(&entry.id).is_some_and(|route| {
+                    route
+                        .first()
+                        .is_some_and(|candidate| candidate.provider == entry.provider)
+                })
+        });
         entries.sort_by(|left, right| {
             left.id
                 .cmp(&right.id)

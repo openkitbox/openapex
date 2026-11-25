@@ -96,6 +96,9 @@ candidates = [
   provider 拥有的模型仍可路由。
 - `default_model` 推荐写成 `provider/route-id`（例如 `example/fast`），明确指向路由；
   也可以写模型目录中存在的裸 route id。未知名称不会回退到隐式端点。
+- 不写 `[models]` 时，模型目录直接展示已配置 provider 上报的全部模型，可在客户端
+  手动选择；`default_model` 可写 `provider/wire-id`，也可写目录中存在的裸 wire id。
+  一旦写了 `[models]`，可见模型面就只剩路由键（以及凭证已解析的内置 provider 模型）。
 
 ### 环境变量
 
@@ -137,6 +140,8 @@ model = "slim"
 
 目录里没有 `slim` 时，标题生成回退到会话模型；`/slim` 只让下一条请求走 `slim`，
 不改变会话模型。子 agent 指定的模型不在目录中时会直接报错，而不是静默使用父会话模型。
+角色 id 是逻辑名：`/slim` 和 `explore` agent 都需要目录里有名为 `slim` 的条目；
+除非 provider 本身就上报了这个 id，否则应保留 `[models.slim]` 路由。
 
 ### MCP
 

@@ -119,6 +119,12 @@ Messages protocol. Candidates are tried in order; the first endpoint whose
 stream opens serves the turn. Model ids in a candidate are the wire ids reported
 by that endpoint. A single-endpoint model may instead use `provider/id`.
 
+Without `[models]`, the catalogue shows every model reported by the configured
+providers: those ids can be selected directly in the client, and `default_model`
+may be `provider/wire-id` or a bare wire id present in the catalogue. Once
+`[models]` is configured, the served surface is only the route keys (plus any
+credential-resolved built-in provider models).
+
 `default_model` should be written as `provider/route-id` (for example
 `primary/fast`) to name a route explicitly, or as a bare route id that exists in
 the model catalogue. An unknown name fails closed instead of selecting an
@@ -144,7 +150,9 @@ model = "slim"        # child-session preference; default comes from the agent t
 Title generation falls back to the session model when `slim` is missing. A
 `/slim` prompt runs one turn on `slim` without changing the session's selected
 model. A subagent whose configured model is absent from the catalogue refuses
-to start instead of silently using its parent's model.
+to start instead of silently using its parent's model. Role ids are logical, so
+`/slim` and the `explore` agent need a catalogue entry named `slim`: keep a
+`[models.slim]` route unless the provider itself reports a model with that id.
 
 ### MCP
 

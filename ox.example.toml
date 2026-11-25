@@ -29,7 +29,8 @@ max_concurrent = 2
 stall_timeout_secs = 600
 
 # Logical model routes map catalogue ids to ordered provider candidates.
-# Add more candidates to enable stream-open failover.
+# Add more candidates to enable stream-open failover. Omit [models] entirely to
+# expose every model reported by the providers and select the wire ids directly.
 [models.example]
 candidates = [
   { provider = "example", model = "example-model" },
