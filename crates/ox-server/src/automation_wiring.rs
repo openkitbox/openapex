@@ -36,6 +36,7 @@ use ox_automation::scheduler::{
 };
 use ox_automation::store::AutomationStore;
 use ox_automation::types::{Action, Info, Status, Target, TimeInfo, Trigger};
+use ox_codemode::Completion;
 use ox_core::config::Config;
 use ox_core::event_bus::EventBus;
 use ox_db::Db;
@@ -794,9 +795,10 @@ impl ShellJob for ServerShell {
     }
 }
 
-/// Bridge a scanned tool path to the live tool registry. `ToolInvoker` is
-/// synchronous because it runs inside the JS blocking task; the async tool
-/// contract is driven to completion on the composition's runtime handle.
+/// Bridge a scanned tool path to the live tool registry. `invoke` is the
+/// synchronous fallback; `start` moves the call onto the composition runtime so
+/// several tools can be in flight while the QuickJS task awaits them. The
+/// `Tools::Only` filter is applied by `ServerActions::new`, never here.
 struct RegistryInvoker {
     tools: Arc<ToolRegistry>,
     directory: PathBuf,
@@ -830,6 +832,44 @@ impl ox_codemode::ToolInvoker for RegistryInvoker {
             }
             Ok(output.content.to_string())
         })
+    }
+
+    fn start(&self, path: &str, args: &str, done: Completion) -> Result<()> {
+        // No runtime means no place to drive the tool; returning `Err` lets the
+        // runtime settle the call with an error instead of leaving it pending.
+        let handle = tokio::runtime::Handle::try_current()?;
+        let path = path.to_owned();
+        let arguments: Value = serde_json::from_str(args)?;
+        let tools = Arc::clone(&self.tools);
+        let directory = self.directory.clone();
+        let call_id = format!("automation_{path}");
+        handle.spawn(async move {
+            let result: Result<String, String> = async {
+                let tool = tools
+                    .get(&path)
+                    .ok_or_else(|| format!("tool {path} is not registered"))?;
+                let output = tool
+                    .execute(
+                        ox_tools::contract::ToolContext {
+                            session_id: "automation".to_owned(),
+                            directory,
+                            assistant_message_id: call_id.clone(),
+                            call_id,
+                            cancellation: CancellationToken::new(),
+                            registry: Arc::clone(&tools),
+                        },
+                        arguments,
+                    )
+                    .await;
+                match output.error {
+                    Some(error) => Err(error),
+                    None => Ok(output.content.to_string()),
+                }
+            }
+            .await;
+            done(result);
+        });
+        Ok(())
     }
 }
 
@@ -927,4 +967,120 @@ pub(crate) fn spawn_tasks(
         scheduler,
         spawn_event_bridge(state.db.clone(), state.bus.clone(), stop),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use ox_codemode::ToolInvoker;
+    use ox_schema::wire::ToolDef;
+    use ox_tools::contract::{Tool, ToolOutput, ToolRegistry};
+    use tokio::sync::{Semaphore, oneshot};
+    use tokio::time::timeout;
+
+    use super::*;
+
+    /// Both calls must be in flight before either returns; a synchronous host
+    /// bridge would deadlock here instead of settling the second call.
+    struct RendezvousTool {
+        arrived: AtomicUsize,
+        permits: Semaphore,
+    }
+
+    impl Default for RendezvousTool {
+        fn default() -> Self {
+            Self {
+                arrived: AtomicUsize::new(0),
+                permits: Semaphore::new(0),
+            }
+        }
+    }
+
+    impl Tool for RendezvousTool {
+        fn name(&self) -> &str {
+            "probe"
+        }
+
+        fn definition(&self) -> ToolDef {
+            ToolDef::function("probe", "probe", json!({ "type": "object" }))
+        }
+
+        fn execute(
+            &self,
+            _ctx: ox_tools::contract::ToolContext,
+            _input: Value,
+        ) -> Pin<Box<dyn Future<Output = ToolOutput> + Send + '_>> {
+            let arrived = &self.arrived;
+            let permits = &self.permits;
+            Box::pin(async move {
+                if arrived.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                    permits.add_permits(2);
+                }
+                let _permit = permits.acquire().await.expect("rendezvous permit");
+                ox_tools::ok_text("done")
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn registry_invoker_start_runs_tools_concurrently_and_replies_once() {
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(Arc::new(RendezvousTool::default()))
+            .expect("register probe");
+        let invoker = RegistryInvoker {
+            tools: Arc::new(registry),
+            directory: PathBuf::from("."),
+        };
+        let (first_tx, first_rx) = oneshot::channel();
+        let (second_tx, second_rx) = oneshot::channel();
+        invoker
+            .start(
+                "probe",
+                "{}",
+                Box::new(move |result| {
+                    let _ = first_tx.send(result);
+                }),
+            )
+            .expect("start first call");
+        invoker
+            .start(
+                "probe",
+                "{}",
+                Box::new(move |result| {
+                    let _ = second_tx.send(result);
+                }),
+            )
+            .expect("start second call");
+        for reply in [first_rx, second_rx] {
+            let result = timeout(Duration::from_secs(5), reply)
+                .await
+                .expect("concurrent calls settle")
+                .expect("completion is delivered");
+            assert_eq!(result, Ok("\"done\"".to_owned()));
+        }
+
+        let (missing_tx, missing_rx) = oneshot::channel();
+        invoker
+            .start(
+                "unknown",
+                "{}",
+                Box::new(move |result| {
+                    let _ = missing_tx.send(result);
+                }),
+            )
+            .expect("start unknown tool");
+        let error = timeout(Duration::from_secs(5), missing_rx)
+            .await
+            .expect("missing tool settles")
+            .expect("completion is delivered");
+        assert_eq!(error, Err("tool unknown is not registered".to_owned()));
+        assert!(
+            invoker
+                .start("probe", "not json", Box::new(|_| {}))
+                .is_err(),
+            "malformed arguments fail closed"
+        );
+    }
 }

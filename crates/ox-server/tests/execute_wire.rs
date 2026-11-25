@@ -442,8 +442,8 @@ fn assert_no_synthetic_codemode(frames: &[Value]) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn execute_progress_and_terminal_metadata_match_the_wire_shape() {
     let code = concat!(
-        "tools.read({ path: \"first.txt\" });",
-        "tools.read({ path: \"second.txt\" });",
+        "await tools.read({ path: \"first.txt\" });",
+        "await tools.read({ path: \"second.txt\" });",
         "return { done: true };"
     );
     let fix = Fixture::new(code, permissions(false)).await;
@@ -534,8 +534,72 @@ async fn execute_progress_and_terminal_metadata_match_the_wire_shape() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn awaited_tool_promises_keep_the_execute_wire_shape() {
+    let code = concat!(
+        "const results = await Promise.all([",
+        "tools.read({ path: \"first.txt\" }),",
+        "tools.read({ path: \"second.txt\" }),",
+        "]);",
+        "return { state: { count: results.length } };"
+    );
+    let fix = Fixture::new(code, permissions(false)).await;
+    fix.write_work_file("first.txt", "one\n");
+    fix.write_work_file("second.txt", "two\n");
+    fix.create_session("ses_await").await;
+
+    let mut events = fix.bus.subscribe();
+    fix.prompt("ses_await").await;
+    fix.settle("ses_await").await;
+    let mut observed = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        observed.push(event);
+    }
+
+    assert_eq!(
+        scripted_code(&fix.requests.lock().expect("capture lock").clone()),
+        code,
+        "the model sees the top-level await script"
+    );
+    let progress = progress_events(&observed, "ses_await");
+    let running = progress
+        .iter()
+        .flat_map(|event| tool_rows(&event.data["metadata"]))
+        .filter(|row| row["status"] == json!("running"))
+        .count();
+    assert!(
+        running >= 1,
+        "a promised call is observed running: {progress:?}"
+    );
+
+    let frames = fix.durable_frames("ses_await").await;
+    assert_no_synthetic_codemode(&frames);
+    let success = frames
+        .iter()
+        .find(|frame| {
+            frame["type"] == json!("session.tool.success")
+                && frame["data"]["id"] == json!(TOOL_CALL_ID)
+        })
+        .expect("the awaited script settles execute successfully");
+    let rows = tool_rows(&terminal(success, "session.tool.success"));
+    assert_eq!(rows.len(), 2, "both awaited calls have terminal rows");
+    for row in &rows {
+        assert_eq!(row["status"], json!("completed"), "promise settled: {row}");
+    }
+    let inputs: Vec<&str> = rows
+        .iter()
+        .map(|row| row["input"]["path"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        inputs.contains(&"first.txt") && inputs.contains(&"second.txt"),
+        "both awaited calls settle, in either completion order: {inputs:?}"
+    );
+
+    fix.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn denied_nested_call_flags_execute_without_failing_the_server() {
-    let code = "tools.grep({ pattern: \"needle\" }); return { done: true };";
+    let code = "await tools.grep({ pattern: \"needle\" }); return { done: true };";
     let fix = Fixture::new(code, permissions(true)).await;
     fix.create_session("ses_denied").await;
 

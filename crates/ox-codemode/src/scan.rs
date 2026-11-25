@@ -81,9 +81,10 @@ pub fn scan(source: &str) -> Result<Scan> {
 }
 
 /// Both scanner and runtime analyze the same function body, so a top-level
-/// `return` means the same thing in both places.
+/// `return` and `await` mean the same thing in both places. The wrapper is
+/// async: the runtime drives its promise and the QuickJS job queue together.
 pub(crate) fn wrap(source: &str) -> String {
-    format!("(function () {{\n\"use strict\";\n{source}\n}})")
+    format!("(async function () {{\n\"use strict\";\n{source}\n}})")
 }
 
 /// A tool call is only a direct `tools.ns.name(...)` or

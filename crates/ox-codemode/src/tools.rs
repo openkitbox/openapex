@@ -1,5 +1,9 @@
 //! Bridge from scanned tool paths to host capabilities.
 
+/// One-shot reply from an asynchronous tool invocation. `Ok` carries the
+/// tool's JSON result text; `Err` carries a host-facing failure reason.
+pub type Completion = Box<dyn FnOnce(Result<String, String>) + Send + 'static>;
+
 /// Lifecycle state of one nested tool invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallStatus {
@@ -41,6 +45,19 @@ pub struct ToolCallRecord {
 pub trait ToolInvoker: Send + Sync {
     /// Call one tool and return its JSON result.
     fn invoke(&self, path: &str, args: &str) -> anyhow::Result<String>;
+
+    /// Start one tool call and reply through `done` when it settles. The
+    /// default keeps synchronous implementations working by calling `invoke`
+    /// and completing immediately. An implementation overriding this method
+    /// must call `done` exactly once; if it returns `Err` without calling
+    /// `done`, the runtime supplies an error completion itself.
+    fn start(&self, path: &str, args: &str, done: Completion) -> anyhow::Result<()> {
+        match self.invoke(path, args) {
+            Ok(result) => done(Ok(result)),
+            Err(error) => done(Err(error.to_string())),
+        }
+        Ok(())
+    }
 
     /// Observe a call's lifecycle. Hosts that only need `invoke` need not
     /// implement this; events are delivered before and after each invocation.

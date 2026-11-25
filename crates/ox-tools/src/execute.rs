@@ -18,7 +18,9 @@ use anyhow::anyhow;
 use serde_json::{Map, Value, json};
 use tokio_util::sync::CancellationToken;
 
-use ox_codemode::{CallEvent, CallStatus, CodeOutput, Limits, ToolInvoker, execute_scoped};
+use ox_codemode::{
+    CallEvent, CallStatus, CodeOutput, Completion, Limits, ToolInvoker, execute_scoped,
+};
 use ox_schema::wire::ToolDef;
 
 use crate::contract::{ExecuteHost, NestedCallContext, Tool, ToolContext, ToolOutput};
@@ -34,6 +36,8 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 /// runtime authorization both consult this one list.
 const CODEMODE_DENIED_TOOLS: [&str; 4] = ["execute", "shell", "subagent", "question"];
 
+const INTERRUPTED: &str = "Tool execution interrupted";
+
 /// Whether `name` must not be callable from a Code Mode script.
 #[must_use]
 pub fn is_codemode_denied(name: &str) -> bool {
@@ -46,11 +50,11 @@ const DESCRIPTION: &str = concat!(
     "Run JavaScript in a confined Code Mode runtime to script tool calls and HTTP requests and compose their results.\n",
     "Write plain JavaScript and send it exactly as written: no code fence, and no JSON or other wrapper around it.\n",
     "Each call is a fresh program; nothing carries over from earlier calls.\n",
+    "Top-level `await` and async functions are supported. Tool calls return a Promise: await each call whose completion matters and run independent calls concurrently with `Promise.allSettled`.\n",
+    "Always return an explicit result, e.g. `return { state: ... }`; omitting `return` does not make the final expression the result.\n",
     "`fetch` is unavailable in ox; use the catalog's `webfetch` tool for HTTP requests. Imports, direct filesystem access, and timers are unavailable: there is no `setTimeout` or sleep. All other external access goes through `tools`.\n",
     "Inside `execute`, the only callable tools are those explicitly listed in the Code Mode catalog instructions. Ignore tools shown outside the Code Mode catalog. They are not available in the Code Mode runtime.\n",
-    "Call tools through `tools` using only exact paths and signatures from the catalog: `tools.name(...)` or `tools[\"name\"](...)`. Keep those paths static; do not infer, normalize, or build tool names dynamically.\n",
-    "Prefer an explicit `return`; if omitted, the final top-level expression becomes the result.\n",
-    "Await every call whose completion matters; pending calls are interrupted when execution ends. Run independent calls concurrently with `Promise.allSettled`.",
+    "Call tools through `tools` using only exact paths and signatures from the catalog: `tools.name(...)` or `tools[\"name\"](...)`. Keep those paths static; do not infer, normalize, or build tool names dynamically. Pending calls are interrupted when execution ends.",
 );
 
 pub struct ExecuteTool;
@@ -119,7 +123,7 @@ impl Tool for ExecuteTool {
                     directory,
                     cancellation,
                     progress: Arc::clone(&progress),
-                    last_error: Mutex::new(None),
+                    last_error: Arc::new(Mutex::new(None)),
                 });
                 let limits = Limits::default();
                 let bridge: Arc<dyn ToolInvoker> = invoker.clone();
@@ -209,13 +213,14 @@ fn parse_code(input: &Value) -> Result<&str, ToolOutput> {
 /// Session identity for progress and nested calls. The nested tool gets its
 /// own call ID from the host; progress always addresses the parent `execute`
 /// call so the client can attach rows to the running tool part.
+#[derive(Clone)]
 struct CallIds {
     session_id: String,
     assistant_message_id: String,
     parent_call_id: String,
 }
 
-/// Synchronous bridge from the QuickJS blocking task to the async host.
+/// Bridge from the QuickJS blocking task to the async host.
 struct HostInvoker {
     host: Arc<dyn ExecuteHost>,
     handle: tokio::runtime::Handle,
@@ -223,31 +228,48 @@ struct HostInvoker {
     directory: PathBuf,
     cancellation: CancellationToken,
     progress: Arc<Progress>,
-    last_error: Mutex<Option<String>>,
+    last_error: Arc<Mutex<Option<String>>>,
 }
 
 impl ToolInvoker for HostInvoker {
-    fn invoke(&self, path: &str, args: &str) -> anyhow::Result<String> {
-        let nested = NestedCallContext {
-            session_id: &self.ids.session_id,
-            directory: &self.directory,
-            assistant_message_id: &self.ids.assistant_message_id,
-            parent_call_id: &self.ids.parent_call_id,
-            cancellation: self.cancellation.clone(),
+    fn invoke(&self, _path: &str, _args: &str) -> anyhow::Result<String> {
+        Err(anyhow!(
+            "execute nested calls must be started asynchronously"
+        ))
+    }
+
+    fn start(&self, path: &str, args: &str, done: Completion) -> anyhow::Result<()> {
+        // Own everything the task needs: the VM thread must not lend a borrow
+        // to a task that outlives the call that submitted it.
+        let path = path.to_owned();
+        let args = args.to_owned();
+        let host = Arc::clone(&self.host);
+        let ids = self.ids.clone();
+        let directory = self.directory.clone();
+        let cancellation = self.cancellation.clone();
+        let mut guard = CompletionGuard {
+            done: Some(done),
+            last_error: Arc::clone(&self.last_error),
         };
-        match self
-            .handle
-            .block_on(self.host.run_nested(nested, path, args))
-        {
-            // The JS wrapper JSON-parses the bridge result. The host returns
-            // model-facing text, so quote it as a JSON string here rather than
-            // letting a plain word fail the script at the wrapper boundary.
-            Ok(text) => serde_json::to_string(&text).map_err(|error| anyhow!(error.to_string())),
-            Err(message) => {
-                *self.last_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(message.clone());
-                Err(anyhow!(message))
+        self.handle.spawn(async move {
+            if cancellation.is_cancelled() {
+                guard.settle(Err(INTERRUPTED.to_owned()));
+                return;
             }
-        }
+            let nested = NestedCallContext {
+                session_id: &ids.session_id,
+                directory: &directory,
+                assistant_message_id: &ids.assistant_message_id,
+                parent_call_id: &ids.parent_call_id,
+                cancellation: cancellation.clone(),
+            };
+            let result = tokio::select! {
+                result = host.run_nested(nested, &path, &args) => result,
+                () = cancellation.cancelled() => Err(INTERRUPTED.to_owned()),
+            };
+            guard.settle(result);
+        });
+        Ok(())
     }
 
     fn on_call(&self, event: CallEvent<'_>) {
@@ -261,6 +283,39 @@ impl HostInvoker {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+}
+
+/// Guarantees one reply even if the spawned task is dropped before it settles
+/// (runtime shutdown or abort). The runtime's own completion gate drops a
+/// duplicate, so a late reply cannot add a second lifecycle row.
+struct CompletionGuard {
+    done: Option<Completion>,
+    last_error: Arc<Mutex<Option<String>>>,
+}
+
+impl CompletionGuard {
+    fn settle(&mut self, result: Result<String, String>) {
+        let Some(done) = self.done.take() else {
+            return;
+        };
+        // The JS wrapper JSON-parses the bridge result. The host returns
+        // model-facing text, so quote it instead of letting a plain word fail
+        // the script at the wrapper boundary.
+        let result = match result {
+            Ok(text) => serde_json::to_string(&text).map_err(|error| error.to_string()),
+            Err(reason) => Err(reason),
+        };
+        if let Err(reason) = &result {
+            *self.last_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(reason.clone());
+        }
+        done(result);
+    }
+}
+
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        self.settle(Err("nested call did not settle".to_owned()));
     }
 }
 
@@ -367,17 +422,10 @@ fn display_input(input: Value) -> Option<Value> {
 /// Upstream `formatResult`: the script result first, then captured console
 /// logs. Both stay inside the runtime's output budget.
 fn format_output(output: &CodeOutput) -> String {
-    let result = output
-        .result
-        .as_ref()
-        .and_then(|result| match &result.state {
-            Some(Value::String(text)) => Some(text.clone()),
-            Some(value) => serde_json::to_string(value).ok(),
-            None if result.done.is_some() || result.send.is_some() => {
-                serde_json::to_string(result).ok()
-            }
-            None => None,
-        });
+    let result = output.result.as_ref().map(|value| match value {
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    });
     let logs = (!output.logs.is_empty()).then(|| format!("Logs:\n{}", output.logs));
     [result, logs]
         .into_iter()
@@ -405,6 +453,7 @@ fn bounded(text: String, limit: usize) -> String {
 #[cfg(test)]
 mod tests {
     use std::pin::Pin;
+    use std::sync::mpsc;
 
     use serde_json::{Value, json};
 
@@ -416,6 +465,7 @@ mod tests {
         nested: Mutex<Vec<(String, String)>>,
         publishes: Mutex<Vec<Value>>,
         fail_nested: Mutex<bool>,
+        cancellations: Mutex<Vec<CancellationToken>>,
     }
 
     impl FakeHost {
@@ -424,6 +474,7 @@ mod tests {
                 nested: Mutex::new(Vec::new()),
                 publishes: Mutex::new(Vec::new()),
                 fail_nested: Mutex::new(false),
+                cancellations: Mutex::new(Vec::new()),
             }
         }
 
@@ -450,6 +501,10 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .push((path.to_owned(), input.to_owned()));
+            self.cancellations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(ctx.cancellation.clone());
             let failed = *self.fail_nested.lock().unwrap_or_else(|p| p.into_inner());
             let parent = ctx.parent_call_id.to_owned();
             Box::pin(async move {
@@ -549,6 +604,31 @@ mod tests {
             .await
     }
 
+    #[tokio::test]
+    async fn top_level_await_returns_an_arbitrary_json_value() {
+        let host = Arc::new(FakeHost::new());
+        let output = run(
+            &host,
+            "const value = await Promise.resolve(7); return { value };",
+        )
+        .await;
+
+        assert!(output.error.is_none(), "awaiting does not fail the script");
+        assert_eq!(
+            output.content["output"].as_str().expect("output string"),
+            "{\"value\":7}",
+            "arbitrary JSON results are returned verbatim"
+        );
+        assert!(
+            output
+                .metadata
+                .expect("terminal metadata")
+                .get("error")
+                .is_none(),
+            "a successful script is not flagged as failed"
+        );
+    }
+
     #[test]
     fn codemode_denylist_is_exact() {
         for name in [
@@ -592,6 +672,23 @@ mod tests {
             definition.function.parameters["required"][0], "code",
             "the schema has one required code field"
         );
+        let description = &definition.function.description;
+        for phrase in [
+            "async function",
+            "Top-level `await`",
+            "Promise",
+            "Promise.allSettled",
+            "return { state: ... }",
+        ] {
+            assert!(
+                description.contains(phrase),
+                "description must explain {phrase}: {description}"
+            );
+        }
+        assert!(
+            !description.contains("final top-level expression becomes the result"),
+            "implicit expression results are not supported: {description}"
+        );
 
         assert_eq!(
             parse_code(&json!({ "code": "return 1;" })).expect("object input"),
@@ -618,12 +715,103 @@ mod tests {
         assert!(output.metadata.is_none());
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn host_invoker_dispatches_async_and_forwards_cancellation() {
+        let host = Arc::new(FakeHost::new());
+        let cancellation = CancellationToken::new();
+        let invoker = HostInvoker {
+            host: Arc::clone(&host) as Arc<dyn ExecuteHost>,
+            handle: tokio::runtime::Handle::current(),
+            ids: CallIds {
+                session_id: "ses_test".to_owned(),
+                assistant_message_id: "msg_test".to_owned(),
+                parent_call_id: "call_parent".to_owned(),
+            },
+            directory: PathBuf::from("/tmp"),
+            cancellation: cancellation.clone(),
+            progress: Arc::new(Progress::new(PROGRESS_INTERVAL)),
+            last_error: Arc::new(Mutex::new(None)),
+        };
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        invoker
+            .start(
+                "probe",
+                "{}",
+                Box::new(move |result| {
+                    let _ = done_tx.send(result);
+                }),
+            )
+            .expect("start submits the nested call");
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the spawned task completes");
+        assert_eq!(result.expect("nested text"), "\"nested result\"");
+        let captured = host
+            .cancellations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        assert_eq!(captured.len(), 1, "exactly one nested call ran");
+        cancellation.cancel();
+        assert!(
+            captured[0].is_cancelled(),
+            "the nested call holds the parent's token"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_nested_call_completes_once_without_reaching_the_host() {
+        let host = Arc::new(FakeHost::new());
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let invoker = HostInvoker {
+            host: Arc::clone(&host) as Arc<dyn ExecuteHost>,
+            handle: tokio::runtime::Handle::current(),
+            ids: CallIds {
+                session_id: "ses_test".to_owned(),
+                assistant_message_id: "msg_test".to_owned(),
+                parent_call_id: "call_parent".to_owned(),
+            },
+            directory: PathBuf::from("/tmp"),
+            cancellation,
+            progress: Arc::new(Progress::new(PROGRESS_INTERVAL)),
+            last_error: Arc::new(Mutex::new(None)),
+        };
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        invoker
+            .start(
+                "probe",
+                "{}",
+                Box::new(move |result| {
+                    let _ = done_tx.send(result);
+                }),
+            )
+            .expect("start submits the nested call");
+        let error = done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("cancellation completes the call")
+            .expect_err("cancelled calls fail");
+        assert!(error.contains("interrupted"), "{error}");
+        assert_eq!(
+            invoker.last_error().as_deref(),
+            Some(error.as_str()),
+            "the failure reason stays visible in the output"
+        );
+        assert!(
+            host.cancellations
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "a cancelled call never reaches the permission gate"
+        );
+    }
+
     #[tokio::test]
     async fn success_rows_are_complete_in_terminal_metadata() {
         let host = Arc::new(FakeHost::new());
         let output = run(
             &host,
-            "tools.probe({ n: 1 }); tools.probe({ n: 2 }); return { done: true, state: { ok: 1 } };",
+            "await tools.probe({ n: 1 }); await tools.probe({ n: 2 }); return { done: true, state: { ok: 1 } };",
         )
         .await;
 
@@ -659,7 +847,7 @@ mod tests {
     async fn failed_script_flags_error_and_keeps_error_row() {
         let host = Arc::new(FakeHost::new());
         host.fail_nested();
-        let output = run(&host, "tools.probe({ n: 3 }); return { done: true };").await;
+        let output = run(&host, "await tools.probe({ n: 3 }); return { done: true };").await;
 
         assert!(
             output.error.is_none(),

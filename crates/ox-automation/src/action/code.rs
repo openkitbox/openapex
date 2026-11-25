@@ -125,7 +125,12 @@ impl<P: PromptPort> CodeExecutor<P> {
         match output {
             Ok(output) => {
                 let logs = bounded_output(&output.logs, ctx.limits.output_bytes).into_owned();
-                let Some(decoded) = output.result else {
+                let decoded = match output.result {
+                    None => None,
+                    Some(value) => ox_codemode::CodeResult::decode(&value)
+                        .map_err(|err| anyhow::anyhow!("invalid code result: {err}"))?,
+                };
+                let Some(decoded) = decoded else {
                     return Ok(ProgramResult {
                         result: RunResult::success(Some(logs)),
                         send: None,

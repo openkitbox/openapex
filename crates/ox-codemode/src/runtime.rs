@@ -1,19 +1,38 @@
 //! Sandboxed execution of a scanned Code Mode program.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     mem,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::{self, RecvTimeoutError, Sender},
     },
     time::{Duration, Instant},
 };
 
-use anyhow::Result as AnyResult;
-use rquickjs::{Context as QContext, Ctx, Error as JsError, Function, Runtime, Value};
+use anyhow::{Result as AnyResult, anyhow};
+use rquickjs::{
+    Coerced, Context as QContext, Ctx, FromJs, Function, Runtime, Value,
+    promise::{MaybePromise, PromiseState},
+};
 
-use crate::{CallEvent, CallStatus, CodeResult, Limits, ToolCallRecord, ToolInvoker, scan};
+use crate::{CallEvent, CallStatus, Completion, Limits, ToolCallRecord, ToolInvoker, scan};
+
+/// One completion delivered from a host task to the VM thread.
+type CompletionMessage = (u64, Result<String, String>);
+
+/// Bookkeeping for a tool call whose promise has not been settled yet.
+struct PendingCall {
+    path: String,
+    args: String,
+}
+
+type PendingCalls = Mutex<BTreeMap<u64, PendingCall>>;
+
+/// A bounded wait slice: the host may stay in flight indefinitely, so the VM
+/// must wake often enough to re-check its wall-clock deadline.
+const WAIT_SLICE: Duration = Duration::from_millis(25);
 
 /// Strip every route from source text to executable code and lock down the
 /// prototypes shared by built-ins. Adapted from the sandbox hardening used by
@@ -104,8 +123,8 @@ pub struct CodeOutput {
     pub logs: String,
     /// Whether log output was cut to fit the budget.
     pub truncated: bool,
-    /// Strictly decoded program result.
-    pub result: Option<CodeResult>,
+    /// JSON program result, decoded without imposing an automation contract.
+    pub result: Option<serde_json::Value>,
     /// Final record for each tool call, in invocation order.
     pub calls: Vec<ToolCallRecord>,
 }
@@ -169,30 +188,120 @@ fn execute_impl(
         .map_err(|err| ExecutionError::Runtime(format!("create context: {err}")))?;
     let logs = Arc::new(Mutex::new(String::new()));
     let calls = Arc::new(Mutex::new(Vec::new()));
+    let pending: Arc<PendingCalls> = Arc::new(Mutex::new(BTreeMap::new()));
+    let (tx, rx) = mpsc::channel::<CompletionMessage>();
 
-    let outcome: AnyResult<Option<CodeResult>> = context.with(|ctx| {
-        install_bindings(&ctx, bindings)?;
-        install_globals(
+    let outcome: Result<Option<serde_json::Value>, ExecutionError> = context.with(|ctx| {
+        install_bindings(&ctx, bindings).map_err(|err| ExecutionError::Runtime(err.to_string()))?;
+        let settle = install_globals(
             &ctx,
             &scanned,
-            invoker,
-            logs.clone(),
-            calls.clone(),
+            invoker.clone(),
+            Arc::clone(&logs),
             limits.output_bytes,
-        )?;
-        ctx.eval::<(), _>(HARDEN)?;
+            tx.clone(),
+            Arc::clone(&pending),
+        )
+        .map_err(|err| ExecutionError::Runtime(err.to_string()))?;
+        ctx.eval::<(), _>(HARDEN)
+            .map_err(|err| ExecutionError::Runtime(format!("harden globals: {err}")))?;
 
-        let program: Function<'_> = ctx.eval(scan::wrap(code))?;
-        let value: Value<'_> = program.call(())?;
-        if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline {
-            return Ok(None);
+        let program: Function<'_> = ctx
+            .eval(scan::wrap(code))
+            .map_err(|err| ExecutionError::Runtime(format!("compile program: {err}")))?;
+        let returned: Value<'_> = program
+            .call(())
+            .map_err(|err| ExecutionError::Runtime(format!("start program: {err}")))?;
+        let promise = MaybePromise::from_value(returned);
+        let mut tool_error: Option<String> = None;
+
+        loop {
+            if expired(&interrupted, deadline) {
+                abandon_pending(&pending, invoker.as_ref(), &calls);
+                return Err(ExecutionError::Timeout(limits.timeout));
+            }
+            while ctx.execute_pending_job() {
+                if expired(&interrupted, deadline) {
+                    abandon_pending(&pending, invoker.as_ref(), &calls);
+                    return Err(ExecutionError::Timeout(limits.timeout));
+                }
+            }
+            while let Ok(message) = rx.try_recv() {
+                if let Some(error) =
+                    settle_message(&settle, &pending, invoker.as_ref(), &calls, message)
+                        .map_err(|err| ExecutionError::Runtime(err.to_string()))?
+                    && tool_error.is_none()
+                {
+                    tool_error = Some(error);
+                }
+                if expired(&interrupted, deadline) {
+                    abandon_pending(&pending, invoker.as_ref(), &calls);
+                    return Err(ExecutionError::Timeout(limits.timeout));
+                }
+            }
+            match promise.state() {
+                PromiseState::Pending => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        abandon_pending(&pending, invoker.as_ref(), &calls);
+                        return Err(ExecutionError::Timeout(limits.timeout));
+                    }
+                    match rx.recv_timeout(remaining.min(WAIT_SLICE)) {
+                        Ok(message) => {
+                            if let Some(error) =
+                                settle_message(&settle, &pending, invoker.as_ref(), &calls, message)
+                                    .map_err(|err| ExecutionError::Runtime(err.to_string()))?
+                                && tool_error.is_none()
+                            {
+                                tool_error = Some(error);
+                            }
+                        }
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Disconnected) => {
+                            abandon_pending(&pending, invoker.as_ref(), &calls);
+                            return Err(ExecutionError::Runtime(
+                                "tool completion channel closed while the program was pending"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
+                }
+                PromiseState::Rejected => {
+                    let reason = rejection_message(&ctx, &promise);
+                    abandon_pending(&pending, invoker.as_ref(), &calls);
+                    return Err(ExecutionError::Runtime(reason));
+                }
+                PromiseState::Resolved => {
+                    let value: Value<'_> = match promise.finish() {
+                        Ok(value) => value,
+                        Err(err) => {
+                            abandon_pending(&pending, invoker.as_ref(), &calls);
+                            return Err(ExecutionError::Runtime(format!("resolve program: {err}")));
+                        }
+                    };
+                    if expired(&interrupted, deadline) {
+                        abandon_pending(&pending, invoker.as_ref(), &calls);
+                        return Err(ExecutionError::Timeout(limits.timeout));
+                    }
+                    if let Some(error) = tool_error {
+                        abandon_pending(&pending, invoker.as_ref(), &calls);
+                        return Err(ExecutionError::Runtime(error));
+                    }
+                    let decoded = decode_result(&ctx, value)
+                        .map_err(|err| ExecutionError::Runtime(err.to_string()));
+                    // A script need not await every call it starts. Close any
+                    // still-in-flight ticket before returning, on both the
+                    // success and the decode-failure path.
+                    abandon_pending(&pending, invoker.as_ref(), &calls);
+                    return decoded;
+                }
+            }
         }
-        decode_result(&ctx, value)
     });
-    if interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline {
+    if expired(&interrupted, deadline) {
         return Err(ExecutionError::Timeout(limits.timeout));
     }
-    let result = outcome.map_err(|err| ExecutionError::Runtime(err.to_string()))?;
+    let result = outcome?;
     let (kept_logs, truncated) =
         truncate_logs(&logs.lock().expect("log lock"), limits.output_bytes);
     let recorded_calls = mem::take(&mut *calls.lock().expect("call record lock"));
@@ -217,45 +326,44 @@ fn install_bindings<'js>(ctx: &Ctx<'js>, bindings: &str) -> AnyResult<()> {
 /// Install only scanned tool paths. The Rust bridge functions take owned
 /// strings, so no JS value escapes the closure; the JS wrapper is the only
 /// place that can name a path, and it is built from the scan result.
+///
+/// Returns the `settle` function kept private by the installer. It is called
+/// only from the VM thread, so no JS object crosses a thread boundary.
 fn install_globals<'js>(
     ctx: &Ctx<'js>,
     scanned: &scan::Scan,
     invoker: Arc<dyn ToolInvoker>,
     buffer: Arc<Mutex<String>>,
-    calls: Arc<Mutex<Vec<ToolCallRecord>>>,
     output_bytes: usize,
-) -> AnyResult<()> {
+    tx: Sender<CompletionMessage>,
+    pending: Arc<PendingCalls>,
+) -> AnyResult<Function<'js>> {
+    let next_ticket = Arc::new(AtomicU64::new(1));
     let tool_bridge = Function::new(
         ctx.clone(),
-        move |path: String, args: String| -> rquickjs::Result<String> {
+        move |path: String, args: String| -> rquickjs::Result<u64> {
             invoker.on_call(CallEvent {
                 path: &path,
                 status: CallStatus::Running,
                 input: Some(&args),
             });
-            let invoked = invoker.invoke(&path, &args);
-            let status = if invoked.is_ok() {
-                CallStatus::Completed
-            } else {
-                CallStatus::Error
-            };
-            invoker.on_call(CallEvent {
-                path: &path,
-                status,
-                input: Some(&args),
-            });
-            calls
-                .lock()
-                .expect("call record lock")
-                .push(ToolCallRecord {
-                    path,
-                    status,
-                    input: Some(args),
-                });
-            invoked.map_err(|err| JsError::InvalidClass {
-                class: "ToolInvoker",
-                message: err.to_string(),
-            })
+            let ticket = next_ticket.fetch_add(1, Ordering::Relaxed);
+            let claimed = Arc::new(AtomicBool::new(false));
+            {
+                let mut waiting = pending.lock().expect("pending lock");
+                waiting.insert(ticket, PendingCall { path, args });
+                // Borrow both owned strings from the single table entry; a
+                // host that completes synchronously only claims its flag and
+                // sends to the std channel — it never re-enters `pending` or
+                // awaits, so holding this lock across `start` cannot deadlock.
+                if let Some(call) = waiting.get(&ticket) {
+                    let done = completion(ticket, tx.clone(), Arc::clone(&claimed));
+                    if let Err(error) = invoker.start(&call.path, &call.args, done) {
+                        send_error(&tx, ticket, &claimed, error.to_string());
+                    }
+                }
+            }
+            Ok(ticket)
         },
     )
     .map_err(|err| anyhow::anyhow!("tool bridge: {err}"))?;
@@ -270,16 +378,124 @@ fn install_globals<'js>(
     let installer: Function<'_> = ctx
         .eval(GLOBALS_INSTALLER)
         .map_err(|err| anyhow::anyhow!("globals installer: {err}"))?;
-    let _: () = installer
+    let settle: Function<'_> = installer
         .call((tool_bridge, paths, log_bridge))
         .map_err(|err| anyhow::anyhow!("install globals: {err}"))?;
-    Ok(())
+    Ok(settle)
+}
+
+/// Build the one-shot reply handed to a host invoker. A duplicate reply is
+/// dropped here, before it can reach the JS resolver map.
+fn completion(ticket: u64, tx: Sender<CompletionMessage>, claimed: Arc<AtomicBool>) -> Completion {
+    Box::new(move |result| {
+        if claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+            .is_ok()
+        {
+            let _ = tx.send((ticket, result));
+        }
+    })
+}
+
+fn send_error(tx: &Sender<CompletionMessage>, ticket: u64, claimed: &AtomicBool, error: String) {
+    if claimed
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+    {
+        let _ = tx.send((ticket, Err(error)));
+    }
+}
+
+fn expired(interrupted: &AtomicBool, deadline: Instant) -> bool {
+    interrupted.load(Ordering::Relaxed) || Instant::now() >= deadline
+}
+
+/// Resolve or reject one JS promise and publish its terminal record. The
+/// returned text is a tool failure the program did not itself reject with.
+fn settle_message<'js>(
+    settle: &Function<'js>,
+    pending: &PendingCalls,
+    invoker: &dyn ToolInvoker,
+    records: &Mutex<Vec<ToolCallRecord>>,
+    message: CompletionMessage,
+) -> AnyResult<Option<String>> {
+    let (ticket, result) = message;
+    let Some(call) = pending.lock().expect("pending lock").remove(&ticket) else {
+        return Ok(None);
+    };
+    let status = if result.is_ok() {
+        CallStatus::Completed
+    } else {
+        CallStatus::Error
+    };
+    let (ok, payload) = match result {
+        Ok(text) => (true, text),
+        Err(text) => (false, text),
+    };
+    invoker.on_call(CallEvent {
+        path: &call.path,
+        status,
+        input: Some(&call.args),
+    });
+    records
+        .lock()
+        .expect("call record lock")
+        .push(ToolCallRecord {
+            path: call.path,
+            status,
+            input: Some(call.args),
+        });
+    let settled: bool = settle
+        .call((ticket, ok, payload.as_str()))
+        .map_err(|err| anyhow!("settle tool call {ticket}: {err}"))?;
+    if !settled {
+        anyhow::bail!("tool completion {ticket} had no waiting promise");
+    }
+    Ok((status == CallStatus::Error).then_some(payload))
+}
+
+/// A run that ends before its tools do still has to close their host-side
+/// lifecycle rows. Removing the entries also makes late replies no-ops.
+fn abandon_pending(
+    pending: &PendingCalls,
+    invoker: &dyn ToolInvoker,
+    records: &Mutex<Vec<ToolCallRecord>>,
+) {
+    let left = mem::take(&mut *pending.lock().expect("pending lock"));
+    for (_, call) in left {
+        invoker.on_call(CallEvent {
+            path: &call.path,
+            status: CallStatus::Error,
+            input: Some(&call.args),
+        });
+        records
+            .lock()
+            .expect("call record lock")
+            .push(ToolCallRecord {
+                path: call.path,
+                status: CallStatus::Error,
+                input: Some(call.args),
+            });
+    }
+}
+
+fn rejection_message<'js>(ctx: &Ctx<'js>, promise: &MaybePromise<'js>) -> String {
+    // `result` throws the rejection reason into the context; `catch` takes it
+    // back out. Never call `finish` on a rejected promise.
+    let _: Option<rquickjs::Result<Value<'js>>> = promise.result();
+    let reason = ctx.catch();
+    Coerced::<String>::from_js(ctx, reason)
+        .map(|text| text.0)
+        .unwrap_or_else(|_| "promise rejected".to_owned())
 }
 
 const GLOBALS_INSTALLER: &str = r#"
-(function (invoke, pathsJson, log) {
+(function (start, pathsJson, log) {
   const paths = JSON.parse(pathsJson);
   const tools = {};
+  // Resolvers stay in this closure: the script can never reach a ticket or
+  // settle somebody else's pending call.
+  const pending = new Map();
   for (const path of paths) {
     const parts = path.split(".");
     let target = tools;
@@ -294,7 +510,10 @@ const GLOBALS_INSTALLER: &str = r#"
       value: function () {
         const args = Array.prototype.slice.call(arguments);
         const encoded = JSON.stringify(args.length === 1 ? args[0] : args) || "{}";
-        return JSON.parse(invoke(path, encoded));
+        return new Promise(function (resolve, reject) {
+          const ticket = start(path, encoded);
+          pending.set(ticket, { resolve: resolve, reject: reject });
+        });
       },
     });
   }
@@ -311,6 +530,14 @@ const GLOBALS_INSTALLER: &str = r#"
       const args = Array.prototype.slice.call(arguments);
       log(args.map((x) => typeof x === "string" ? x : JSON.stringify(x)).join(" "));
     },
+  };
+  return function settle(ticket, ok, payload) {
+    const entry = pending.get(ticket);
+    if (entry === undefined) return false;
+    pending.delete(ticket);
+    if (ok) entry.resolve(JSON.parse(payload));
+    else entry.reject(new Error(payload));
+    return true;
   };
 })
 "#;
@@ -340,7 +567,7 @@ fn append_log(buffer: &Mutex<String>, line: &str, output_bytes: usize) {
     }
 }
 
-fn decode_result<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> AnyResult<Option<CodeResult>> {
+fn decode_result<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> AnyResult<Option<serde_json::Value>> {
     if value.is_null() || value.is_undefined() {
         return Ok(None);
     }
@@ -350,9 +577,7 @@ fn decode_result<'js>(ctx: &Ctx<'js>, value: Value<'js>) -> AnyResult<Option<Cod
         .ok_or_else(|| anyhow::anyhow!("result has no JSON representation"))?
         .to_string()
         .map_err(|err| anyhow::anyhow!("stringify result: {err}"))?;
-    let value: serde_json::Value =
-        serde_json::from_str(&json).map_err(|err| anyhow::anyhow!("decode result: {err}"))?;
-    CodeResult::decode(&value).map_err(|err| anyhow::anyhow!("decode result: {err}"))
+    serde_json::from_str(&json).map_err(|err| anyhow::anyhow!("decode result: {err}"))
 }
 
 /// Keep the head of the log: delivery information printed first survives a

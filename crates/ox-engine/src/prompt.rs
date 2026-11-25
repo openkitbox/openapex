@@ -268,7 +268,7 @@ const CODE_MODE_INSTRUCTIONS: &str = concat!(
     "Each call is a fresh program; nothing carries over from earlier calls.\n",
     "`fetch` is unavailable in ox; use the catalog's `webfetch` tool for HTTP requests. Imports, direct filesystem access, and timers are unavailable: there is no `setTimeout` or sleep. All other external access goes through `tools`.\n",
     "Call tools through `tools` using only exact paths and signatures from the catalog: `tools.name(...)` or `tools[\"name\"](...)`. Keep those paths static; do not infer, normalize, or build tool names dynamically.\n",
-    "Prefer an explicit `return`; if omitted, the final top-level expression becomes the result.\n",
+    "Top-level `await` and `async` functions are available; tool calls return Promises. Always `return` an explicit result such as `{ state: ... }`; omitting `return` does not make the final expression the result.\n",
     "Await every call whose completion matters; pending calls are interrupted when execution ends. Run independent calls concurrently with `Promise.allSettled`.\n\n",
     "## Code Mode tools (call only inside `execute`)",
 );
