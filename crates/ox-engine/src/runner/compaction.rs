@@ -25,6 +25,8 @@
 //! `SessionHistory` boundary), so later requests open with the checkpoint
 //! user message instead of the compacted transcript.
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 use ox_db::Db;
 use ox_llm::chat_completions::wire::{ChatMessage, ChatRequest};
@@ -83,6 +85,114 @@ pub(crate) fn checkpoint_message(summary: &str, recent: &str) -> String {
         ));
     }
     out.push_str("\n</conversation-checkpoint>");
+    out
+}
+
+// ---------------------------------------------------------------------------
+// Durable checkpoint constraints (Task A): only constraints that stay true
+// across turns are carried; volatile Blocked / Next Move state is not.
+// ---------------------------------------------------------------------------
+
+const DURABLE_SUMMARY_SECTIONS: [&str; 3] = ["Requirements", "Decisions", "Important Context"];
+
+/// The name of a level-two `## name` heading, or `None` for every other line
+/// (including `###` subheadings).
+fn summary_section(line: &str) -> Option<&str> {
+    line.strip_prefix("## ")
+        .map(|name| name.trim_end_matches(['\r', '\n']).trim())
+}
+
+/// Level-two sections and their bullet lines, borrowed from `summary`.
+fn summary_sections(summary: &str) -> HashMap<&str, Vec<&str>> {
+    let mut sections: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut section: Option<&str> = None;
+    for line in summary.lines() {
+        if let Some(name) = summary_section(line) {
+            section = Some(name);
+            continue;
+        }
+        if (line.starts_with("- ") || line.starts_with("* "))
+            && let Some(name) = section
+        {
+            sections.entry(name).or_default().push(line);
+        }
+    }
+    sections
+}
+
+fn append_bullets(out: &mut String, lines: &[&str]) {
+    for line in lines {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+}
+
+/// Append missing durable bullets from `previous_summary` under their
+/// matching headings in `new_summary`, creating a heading when it is absent.
+/// New text stays byte-for-byte where it is and wins on identical lines;
+/// exact lines are de-duplicated, so a repeated checkpoint never grows.
+#[must_use]
+fn carry_forward_sections(new_summary: &str, previous_summary: &str) -> String {
+    let previous = summary_sections(previous_summary);
+    let current = summary_sections(new_summary);
+    let mut missing: HashMap<&'static str, Vec<&str>> = HashMap::new();
+    for section in DURABLE_SUMMARY_SECTIONS {
+        let Some(old_lines) = previous.get(section) else {
+            continue;
+        };
+        let present: &[&str] = current.get(section).map_or(&[], |lines| lines.as_slice());
+        let mut carried: Vec<&str> = Vec::new();
+        for line in old_lines {
+            if !present.contains(line) && !carried.contains(line) {
+                carried.push(line);
+            }
+        }
+        if !carried.is_empty() {
+            missing.insert(section, carried);
+        }
+    }
+    if missing.is_empty() {
+        return new_summary.to_owned();
+    }
+
+    let mut out = String::with_capacity(new_summary.len());
+    // A section's carried bullets belong at the end of that section, just
+    // before the next heading (or at the end of the summary).
+    let mut pending: Option<Vec<&str>> = None;
+    for segment in new_summary.split_inclusive('\n') {
+        if let Some(name) = summary_section(segment) {
+            if let Some(lines) = pending.take() {
+                append_bullets(&mut out, &lines);
+            }
+            out.push_str(segment);
+            if let Some(lines) = missing.remove(name) {
+                pending = Some(lines);
+            }
+        } else {
+            out.push_str(segment);
+        }
+    }
+    if let Some(lines) = pending {
+        append_bullets(&mut out, &lines);
+    }
+    for section in DURABLE_SUMMARY_SECTIONS {
+        let Some(lines) = missing.remove(section) else {
+            continue;
+        };
+        if !out.is_empty() {
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push('\n');
+        }
+        out.push_str("## ");
+        out.push_str(section);
+        out.push('\n');
+        append_bullets(&mut out, &lines);
+    }
     out
 }
 
@@ -681,8 +791,8 @@ pub(crate) async fn publish_started(
 
 /// The lifecycle tail of one compaction: the summarized outcome settles the
 /// running row — `session.compaction.ended {text}` flips it to `completed`,
-/// `session.compaction.failed` to `failed`. Returns the outcome unchanged
-/// once the row settled.
+/// `session.compaction.failed` to `failed`. On success the summary carries
+/// durable constraints forward from the previous checkpoint before it lands.
 pub(crate) async fn publish_outcome(
     ctx: &DrainCtx,
     reason: CompactionReason,
@@ -693,6 +803,10 @@ pub(crate) async fn publish_outcome(
 ) -> std::result::Result<String, SessionError> {
     match run {
         Ok(summary) => {
+            let previous = previous_summary(ctx)
+                .await
+                .map_err(|error| unknown_error(error.to_string()))?;
+            let summary = carry_forward_sections(&summary, &previous);
             ctx.bus
                 .publish(SessionEventData::CompactionEnded {
                     session_id: ctx.session_id.clone(),
@@ -846,6 +960,29 @@ async fn last_checkpoint_seq(db: &Db, session_id: &str) -> Result<i64> {
         .await?
         .ok_or_else(|| anyhow::anyhow!("no row"))?;
     Ok(row.get::<i64>(0)?)
+}
+
+/// The summary of the newest settled checkpoint, or an empty string when the
+/// session has none — the baseline for durable carry-forward. Uses the same
+/// completed-row identity as [`last_checkpoint_seq`] and `mctx::pass`.
+async fn previous_summary(ctx: &DrainCtx) -> Result<String> {
+    let conn = ctx.db.acquire().await?;
+    let mut rows = conn
+        .query(
+            "SELECT json_extract(data, '$.summary') FROM session_message
+             WHERE session_id = ?1 AND type = 'compaction'
+               AND json_extract(data, '$.status') = 'completed'
+             ORDER BY seq DESC, id DESC LIMIT 1",
+            [ctx.session_id.as_str()],
+        )
+        .await?;
+    Ok(rows
+        .next()
+        .await?
+        .map(|row| row.get::<Option<String>>(0))
+        .transpose()?
+        .flatten()
+        .unwrap_or_default())
 }
 
 /// One tail row as the recent, verbatim part of a checkpoint shows it
@@ -1505,24 +1642,27 @@ async fn settle_quiet_outcome(
     version: i64,
 ) -> Result<bool> {
     match run {
-        Ok(summary) => ctx
-            .bus
-            .publish_quiet_checkpoint(
-                SessionEventData::CompactionEnded {
-                    session_id: ctx.session_id.clone(),
-                    reason: CompactionReason::Idle,
-                    model: Some(model),
-                    provider_state: None,
-                    provider_context: None,
-                    text: summary,
-                    recent,
-                    cost: None,
-                    tokens: None,
-                },
-                version,
-            )
-            .await
-            .map_err(|error| anyhow::anyhow!(error.to_string())),
+        Ok(summary) => {
+            let previous = previous_summary(ctx).await?;
+            let summary = carry_forward_sections(&summary, &previous);
+            ctx.bus
+                .publish_quiet_checkpoint(
+                    SessionEventData::CompactionEnded {
+                        session_id: ctx.session_id.clone(),
+                        reason: CompactionReason::Idle,
+                        model: Some(model),
+                        provider_state: None,
+                        provider_context: None,
+                        text: summary,
+                        recent,
+                        cost: None,
+                        tokens: None,
+                    },
+                    version,
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!(error.to_string()))
+        }
         Err(error) => {
             // Silent by design (plan D4): no `compaction.failed` event — the
             // log line is the failure's only trace.
@@ -1533,5 +1673,70 @@ async fn settle_quiet_outcome(
             );
             Ok(false)
         }
+    }
+}
+
+#[cfg(test)]
+mod carry_forward_tests {
+    use super::*;
+
+    #[test]
+    fn carries_missing_durable_bullet_and_creates_heading() {
+        let previous = "## Objective\n- old objective\n\n## Requirements\n- keep checkpoints small\n\n## Decisions\n- use system allocator on macOS\n\n## Blocked\n- upstream rate limit\n\n## Important Context\n- production listens on 14090\n";
+        let new = "## Objective\n- new objective\n\n## Requirements\n- keep checkpoints small\n";
+        let merged = carry_forward_sections(new, previous);
+        assert!(
+            merged.starts_with("## Objective\n- new objective\n"),
+            "new text must stay first: {merged}"
+        );
+        assert!(
+            merged.contains("## Decisions\n- use system allocator on macOS\n"),
+            "missing durable section must be created: {merged}"
+        );
+        assert!(
+            merged.contains("## Important Context\n- production listens on 14090\n"),
+            "durable context must be carried: {merged}"
+        );
+        assert!(
+            !merged.contains("old objective"),
+            "objective is not durable"
+        );
+        assert!(
+            !merged.contains("upstream rate limit"),
+            "blocked state is not durable"
+        );
+    }
+
+    #[test]
+    fn identical_bullet_is_not_duplicated() {
+        let previous = "## Requirements\n- exact line\n- other line\n";
+        let new = "## Requirements\n- exact line\n";
+        let merged = carry_forward_sections(new, previous);
+        assert_eq!(
+            merged.matches("- exact line").count(),
+            1,
+            "exact line must appear once: {merged}"
+        );
+        assert!(
+            merged.contains("- other line\n"),
+            "still missing durable lines must be carried: {merged}"
+        );
+    }
+
+    #[test]
+    fn does_not_carry_blocked_or_next_move() {
+        let previous = "## Work State\n### Blocked\n- nested blocker\n\n## Blocked\n- rate limited\n\n## Next Move\n1. restart the server\n";
+        let new = "## Objective\n- done\n";
+        assert_eq!(
+            carry_forward_sections(new, previous),
+            new,
+            "volatile status must not be carried"
+        );
+    }
+
+    #[test]
+    fn no_previous_summary_leaves_bytes_unchanged() {
+        let new = "## Requirements  \n- keep  trailing spaces\n\n## Notes\n";
+        assert_eq!(carry_forward_sections(new, ""), new);
     }
 }

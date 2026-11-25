@@ -15,7 +15,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.3"
 edition = "2024"
 
 # Single source of truth for third-party versions. Members inherit with

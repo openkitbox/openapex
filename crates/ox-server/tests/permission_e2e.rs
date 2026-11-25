@@ -438,6 +438,39 @@ impl Fixture {
     }
 }
 
+/// A wire-level check: the request that carries a tool result still has one
+/// result for every call the assistant made, with the original ids. The
+/// aggregate output budget may replace content, never pairing.
+fn assert_wire_tool_pairing(body: &str) {
+    let request: Value = serde_json::from_str(body).expect("captured request is JSON");
+    let messages = request["messages"].as_array().expect("wire messages");
+    let mut pending: Vec<&str> = Vec::new();
+    for message in messages {
+        match message["role"].as_str() {
+            Some("assistant") => {
+                if let Some(calls) = message["tool_calls"].as_array() {
+                    pending.extend(calls.iter().filter_map(|call| call["id"].as_str()));
+                }
+            }
+            Some("tool") => {
+                let id = message["tool_call_id"]
+                    .as_str()
+                    .expect("tool result keeps its call id");
+                assert!(
+                    pending.contains(&id),
+                    "tool result {id} answers a prior call"
+                );
+                pending.retain(|earlier| *earlier != id);
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        pending.is_empty(),
+        "every assistant call still has its tool result after the aggregate budget pass"
+    );
+}
+
 async fn sse_frame(body: &mut ResBody) -> Value {
     let frame = timeout(
         Duration::from_secs(10),
@@ -555,6 +588,7 @@ async fn once_reply_runs_tool_after_sse_ask_without_persisting_frames() {
         result.contains(TOOL_CALL_ID),
         "the result is paired with its call"
     );
+    assert_wire_tool_pairing(&result);
     let frames = fix.durable_frames("ses_once").await;
     assert_no_permission_frames(&frames);
     assert!(

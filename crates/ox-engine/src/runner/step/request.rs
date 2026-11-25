@@ -11,12 +11,14 @@ use ox_schema::message::Message;
 
 use super::super::drain::DrainCtx;
 use super::super::instructions;
+use super::super::output_budget::bound_aggregate_tool_outputs;
 use super::attempt::StepParams;
 use super::context::{assistant_tokens, build_chat_messages, mctx_head};
 use super::history::load_history_after;
 use super::load_overlaid_tail;
-/// Hits automatic recall may attach to one turn (the hint's line budget).
-const RECALL_LIMIT: usize = 3;
+/// Candidates fetched for one turn's recall: the renderer still caps the hint
+/// at three lines, so a few extra hits let dedup fill those lines.
+const RECALL_CANDIDATE_LIMIT: usize = 9;
 /// Shortest typed prompt worth searching. A greeting or a `/clear` retrieves
 /// nothing, and every turn that clears this bar pays one indexed query.
 const RECALL_MIN_QUERY_CHARS: usize = 8;
@@ -100,6 +102,9 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
         &[head_m0.as_deref(), head_m1.as_deref()],
         &rows,
     );
+    // Only the live request is bounded: the historian prefix and the fold's
+    // 4 KiB tier keep their own bytes (and the m[0] cache anchor).
+    bound_aggregate_tool_outputs(&mut chat_messages);
     let mut layers = super::super::request_budget::Layers {
         system_static: system_static.len(),
         frozen: instructions_initial.len(),
@@ -108,33 +113,6 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
         delta: instruction_update.as_ref().map_or(0, String::len),
         ..Default::default()
     };
-    // Pressure is checked after the pass: the floor it reports is what the
-    // live tail is measured above. Both windows were resolved once, when the
-    // budget was derived. The trigger is called here rather than next to
-    // `mctx_head`, because the historian's prefix-reusing request continues
-    // *this* request: it reuses the frozen head, the static system layer and
-    // the session's initial instruction render, so the bytes it sends are the
-    // bytes this step sends. The head halves and the two static layers are
-    // handed over by move / `Arc<str>` clone, so a step that fires no fold pays
-    // no copy of the prefix it just rendered.
-    super::super::historian_trigger::mctx_historian(
-        ctx,
-        budget,
-        floor,
-        params.model.variant.clone(),
-        super::super::historian_trigger::PrefixContext {
-            system_static: Arc::clone(&system_static),
-            instructions: Arc::clone(&instructions_initial),
-            head_m0,
-            head_m1,
-            model_id: params.model.id.clone(),
-            provider_id: params.model.provider_id.clone(),
-            // The same `Arc` the request below advertises, by refcount: providers
-            // render the tools array *before* the system prompt, so a fold that
-            // offered none would share no cached prefix at all.
-            tools: ctx.tools.definitions_shared(),
-        },
-    );
     // The delta row is durable for future steps; this step's already-loaded
     // rows predate it, so the text rides this request in memory (upstream
     // `generate.ts:55` places `Message.system(instructionUpdate)` after the
@@ -174,7 +152,7 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
             compartment_scope: search::CompartmentScope::Session,
             query: &query,
             sources,
-            limit: RECALL_LIMIT,
+            limit: RECALL_CANDIDATE_LIMIT,
             from_ms: None,
             to_ms: None,
         };
@@ -183,7 +161,11 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
         // never stall or fail because a hint could not be retrieved, and the
         // request is still well-formed without it.
         match search::search(&ctx.db, None, &request).await {
-            Ok(hits) => {
+            Ok(mut hits) => {
+                // m[1] may already show these handles; drop them before the
+                // renderer spends its three-line budget. This borrows m[1]
+                // before the historian trigger moves it below.
+                search::retain_visible_recall(&mut hits, head_m1.as_deref());
                 if let Some(block) = search::render_recall_block(&hits)
                     && let Some(ChatMessage::User {
                         content: UserContent::Text(text),
@@ -203,6 +185,33 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
             }
         }
     }
+    // Pressure is checked after the pass: the floor it reports is what the
+    // live tail is measured above. Both windows were resolved once, when the
+    // budget was derived. The trigger is called here rather than next to
+    // `mctx_head`, because the historian's prefix-reusing request continues
+    // *this* request: it reuses the frozen head, the static system layer and
+    // the session's initial instruction render, so the bytes it sends are the
+    // bytes this step sends. The head halves and the two static layers are
+    // handed over by move / `Arc<str>` clone, so a step that fires no fold pays
+    // no copy of the prefix it just rendered.
+    super::super::historian_trigger::mctx_historian(
+        ctx,
+        budget,
+        floor,
+        params.model.variant.clone(),
+        super::super::historian_trigger::PrefixContext {
+            system_static: Arc::clone(&system_static),
+            instructions: Arc::clone(&instructions_initial),
+            head_m0,
+            head_m1,
+            model_id: params.model.id.clone(),
+            provider_id: params.model.provider_id.clone(),
+            // The same `Arc` the request below advertises, by refcount: providers
+            // render the tools array *before* the system prompt, so a fold that
+            // offered none would share no cached prefix at all.
+            tools: ctx.tools.definitions_shared(),
+        },
+    );
     let mut request = ChatRequest::new(
         // The router resolves the bare model id; the providerID/modelID
         // qualified form is upstream's provider-adapter vocabulary and

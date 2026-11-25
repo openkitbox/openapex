@@ -114,9 +114,11 @@
 //!   a schema and a re-embedding path for a corpus that is already on disk.
 //!   The cost is the bound itself: a commit older than the window is not
 //!   found, and branches other than the checked-out one are not searched.
-//! - **No result suppression.** The reference hides memories already visible
-//!   in `<project-memory>` and messages still in the live tail; ox returns
-//!   every match with its id so the model can decide.
+//! - **No result suppression in `ctx_search`.** The tool returns every match
+//!   with its id so the model can decide; only automatic recall drops memory
+//!   and note handles already rendered in m[1] ([`retain_visible_recall`]).
+//!   Messages still in the live tail are not suppressed: no comparable id is
+//!   available there.
 //! - **Compartments are scanned, not indexed, and can span the project.**
 //!   The reference also scans them (a session-scoped `LIKE`) but ranks by hit
 //!   count; ox ranks by BM25 over the scanned rows. `ctx_search` takes
@@ -187,7 +189,7 @@ const RRF_K: f64 = 60.0;
 // ---------------------------------------------------------------------------
 
 /// Which corpus a hit came from. The discriminant indexes [`SourceFilter`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Source {
     /// Durable project facts (`mc_memory`).
     Memory,
@@ -1476,6 +1478,48 @@ fn recall_snippet(snippet: &str) -> String {
     super::historian::escape_xml_content(&capped)
 }
 
+/// Remove recall hits whose handle is already visible in m[1].
+///
+/// m[1] renders memories under `<project-memory>` / `<user-profile>` and
+/// surfaced notes under `<ready-notes>`, both as `#N:` at the start of a line
+/// (memory continuations are indented, so they cannot forge a handle). A hit is
+/// suppressed only by the same source *and* id: memory and note ids come from
+/// separate tables, so `#3` in one does not hide `#3` in the other.
+/// Compartments, transcript rows and commits have no comparable m[1] handle —
+/// m[0] prints folded compartments without ids and the live tail holds raw
+/// messages — so those hits are left alone. Nothing else about a hit changes.
+pub(crate) fn retain_visible_recall(hits: &mut Vec<SearchHit>, m1: Option<&str>) {
+    let Some(m1) = m1 else {
+        return;
+    };
+    let mut visible: HashSet<(Source, &str)> = HashSet::new();
+    let mut block: Option<Source> = None;
+    for line in m1.lines() {
+        match line {
+            "<project-memory>" | "<user-profile>" => block = Some(Source::Memory),
+            "<ready-notes>" => block = Some(Source::Note),
+            "</project-memory>" | "</user-profile>" | "</ready-notes>" => block = None,
+            _ => {}
+        }
+        let Some(source) = block else {
+            continue;
+        };
+        let Some((id, _)) = line.strip_prefix('#').and_then(|rest| rest.split_once(':')) else {
+            continue;
+        };
+        if !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()) {
+            visible.insert((source, id));
+        }
+    }
+    if visible.is_empty() {
+        return;
+    }
+    hits.retain(|hit| match hit.source {
+        Source::Memory | Source::Note => !visible.contains(&(hit.source, hit.id.as_str())),
+        _ => true,
+    });
+}
+
 // ---------------------------------------------------------------------------
 // ctx_search
 // ---------------------------------------------------------------------------
@@ -1822,4 +1866,114 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
         month_prime - 9
     };
     (year + i64::from(month <= 2), month, day)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit(source: Source, id: &str) -> SearchHit {
+        SearchHit {
+            source,
+            id: id.to_owned(),
+            snippet: String::new(),
+            score: 0,
+            scope: String::new(),
+            category: None,
+            status: None,
+            title: None,
+            range: None,
+            ordinal: None,
+        }
+    }
+
+    fn handles(hits: &[SearchHit]) -> Vec<(Source, &str)> {
+        hits.iter()
+            .map(|hit| (hit.source, hit.id.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn recall_drops_memory_handles_rendered_in_m1() {
+        let m1 = [
+            "<project-memory>",
+            "<PROJECT_RULES>",
+            "#7: durable fact",
+            "  wrapped continuation",
+            "</PROJECT_RULES>",
+            "</project-memory>",
+            "<user-profile>",
+            "#9: user fact",
+            "</user-profile>",
+        ]
+        .join("\n");
+        let mut hits = vec![
+            hit(Source::Memory, "7"),
+            hit(Source::Memory, "9"),
+            hit(Source::Memory, "10"),
+        ];
+        retain_visible_recall(&mut hits, Some(&m1));
+        assert_eq!(
+            handles(&hits),
+            vec![(Source::Memory, "10")],
+            "both rendered memory tiers are hidden, the unseen one stays"
+        );
+    }
+
+    #[test]
+    fn recall_drops_note_handles_rendered_in_m1() {
+        let m1 = "<ready-notes>\n#4: a parked task — body\n</ready-notes>";
+        let mut hits = vec![hit(Source::Note, "4"), hit(Source::Note, "5")];
+        retain_visible_recall(&mut hits, Some(m1));
+        assert_eq!(
+            handles(&hits),
+            vec![(Source::Note, "5")],
+            "only the note already in m[1] is hidden"
+        );
+    }
+
+    #[test]
+    fn recall_keeps_same_id_across_sources() {
+        let m1 = "<project-memory>\n#3: rendered memory\n</project-memory>";
+        let mut hits = vec![hit(Source::Note, "3"), hit(Source::Memory, "3")];
+        retain_visible_recall(&mut hits, Some(m1));
+        assert_eq!(
+            handles(&hits),
+            vec![(Source::Note, "3")],
+            "note ids and memory ids are independent"
+        );
+    }
+
+    #[test]
+    fn recall_leaves_other_sources_untouched() {
+        let m1 = [
+            "<project-memory>",
+            "#3: rendered memory",
+            "</project-memory>",
+            "<ready-notes>",
+            "#4: rendered note",
+            "</ready-notes>",
+            "<memory-index>",
+            "#5: not a rendered handle",
+            "</memory-index>",
+        ]
+        .join("\n");
+        let mut hits = vec![
+            hit(Source::Compartment, "3"),
+            hit(Source::Transcript, "3"),
+            hit(Source::Commit, "abc1234"),
+            hit(Source::Memory, "5"),
+        ];
+        let expected = hits.clone();
+        retain_visible_recall(&mut hits, Some(&m1));
+        assert_eq!(hits, expected, "unfilterable sources and other blocks stay");
+    }
+
+    #[test]
+    fn recall_without_m1_keeps_all_hits() {
+        let mut hits = vec![hit(Source::Memory, "1"), hit(Source::Note, "1")];
+        let expected = hits.clone();
+        retain_visible_recall(&mut hits, None);
+        assert_eq!(hits, expected, "no rendered head means nothing to compare");
+    }
 }

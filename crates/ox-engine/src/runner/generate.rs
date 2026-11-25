@@ -29,6 +29,7 @@ use super::Inner;
 
 use super::drain::DrainCtx;
 use super::instructions;
+use super::output_budget::bound_aggregate_tool_outputs;
 
 /// The owned result of one transient session generation request.
 #[derive(Debug, PartialEq)]
@@ -95,6 +96,7 @@ pub(super) async fn run(inner: &Inner, session_id: &str, prompt: &str) -> Result
         &[head_m0.as_deref(), head_m1.as_deref()],
         &rows,
     );
+    bound_aggregate_tool_outputs(&mut messages);
     let update =
         (!preview.deltas.is_empty()).then(|| instructions::render_updates(&preview.deltas));
     let layers = super::request_budget::Layers {
