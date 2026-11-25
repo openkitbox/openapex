@@ -36,7 +36,7 @@ candidates = [
   { provider = "example", model = "example-model" },
 ]
 
-# A small logical model can back titles, exploration, and similar requests.
+# A small logical model can back titles, `/slim` turns, and similar requests.
 [models.slim]
 candidates = [
   { provider = "example", model = "example-small-model" },
@@ -51,20 +51,6 @@ slim = 32_000
 [roles]
 title = "slim"
 compaction = "example"
-
-# Per-agent model preferences apply to child sessions. Valid subagent ids are
-# general, explore, review, and rust-expert; apex is a primary agent.
-[agents.general]
-model = "example"
-
-[agents.explore]
-model = "slim"
-
-[agents.review]
-model = "example"
-
-[agents.rust-expert]
-model = "example"
 
 # Magic-context memory assembly and context folding.
 [magic_context]

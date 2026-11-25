@@ -211,7 +211,7 @@ pub struct ModelRef {
 }
 
 /// The product-reserved logical model id for cheap auxiliary work: session
-/// title generation, `explore` subagents, and the one-turn `/slim` override.
+/// title generation and the one-turn `/slim` override.
 ///
 /// It is a logical id, so the wire model behind it is decided by `[models.slim]`
 /// routes or by a catalogue entry named `slim` — never by a value hardcoded

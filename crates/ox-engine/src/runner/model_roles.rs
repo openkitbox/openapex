@@ -4,7 +4,7 @@
 //! function over a [`Config`], the cached model catalogue and an already
 //! resolved session model: no IO, no cache, no lock, no database. Callers pass
 //! logical model ids in and get a [`ModelRef`] out, which is what the turn
-//! loop, the subagent seam and compaction persist or send.
+//! loop, title generation and compaction persist or send.
 //!
 //! Precedence, highest first:
 //!
@@ -13,7 +13,7 @@
 //! | title        | `[roles].title` (default [`SLIM`]) → the session model on a miss    |
 //! | turn         | the one-turn override of this prompt → the session model            |
 //! | compaction   | `[roles].compaction` → this turn's snapshot → the session model     |
-//! | child session| `[agents.<id>].model` → the built-in agent preference → inherit     |
+//! | child session| an explicit model → the parent session model                        |
 //!
 //! An explicit `[roles].compaction` outranks the turn snapshot because it is an
 //! operator policy: compaction quality is load-bearing and its request size is
@@ -25,16 +25,14 @@
 //!   lists and failover state stay in the catalogue and router; nothing here
 //!   copies or caches routing state.
 //! - A miss on the catalogue is not fatal for title/turn/compaction: those fall
-//!   back so the request still runs. A miss for a child session is fatal at the
-//!   call site ([`logical`] returns `None` and the spawner refuses), because
-//!   silently inheriting the parent's model would defeat a cost policy.
+//!   back so the request still runs. A child session has no preference to
+//!   resolve here: its caller uses an explicit model or the parent's.
 //! - Resolution reads `ModelCatalog::cached()` only, never `entries()`, so no
 //!   request waits on the network to pick a model.
 
 use ox_core::config::Config;
 use ox_llm::model_catalog::ModelCatalog;
 use ox_schema::support::{ModelRef, Record, SLIM};
-use ox_tools::agent::Agent;
 
 /// The [`ModelRef`] a logical model id resolves to, or `None` when the cached
 /// catalogue does not know it.
@@ -53,17 +51,6 @@ pub(crate) fn logical(catalog: &ModelCatalog, id: &str) -> Option<ModelRef> {
             provider_id: entry.provider.clone(),
             variant: None,
         })
-}
-
-/// The logical model a child session of `agent` prefers: `[agents.<id>].model`
-/// outranks the built-in table, so an operator can retarget a role without a
-/// rebuild. `None` means inherit the parent session's model.
-pub(crate) fn agent_model<'a>(config: &'a Config, agent: &'a Agent) -> Option<&'a str> {
-    config
-        .agents
-        .get(agent.id)
-        .and_then(|configured| configured.model.as_deref())
-        .or(agent.model)
 }
 
 /// The model for a session title: `[roles].title`, defaulting to [`SLIM`], and

@@ -33,7 +33,7 @@ the Bun implementation's files.
   compartments, context folding and background consolidation through the
   `ctx_*` tools.
 - **Built-in agents:** `apex`, `general`, `explore`, `review` and `rust-expert`,
-  with explicit tool boundaries and child-session model preferences.
+  with explicit tool boundaries.
 - **Editor integration:** ACP session creation, replay, listing, cancellation
   and tool updates, with unsupported setup rejected fail-closed.
 - **Safety controls:** per-tool allow/ask/deny policies and invalid-config reloads
@@ -83,7 +83,7 @@ The complete commented reference is [ox.example.toml](ox.example.toml).
 `~/.ox/ox.toml` is optional and sections have defaults where applicable, but
 there is no implicit provider. Top-level keys such as `listen`, `db_path` and
 `default_model` sit beside `[providers]`, `[models]`,
-`[context_caps]`, `[roles]`, `[agents]`, `[magic_context]`, `[mcp]`,
+`[context_caps]`, `[roles]`, `[magic_context]`, `[mcp]`,
 `[permissions]`, `[subagent]`, `[events]`, `[sessions]`, `[tmp]` and `[turn]`.
 
 ### Provider and model routing
@@ -142,17 +142,12 @@ Auxiliary requests can use their own logical models:
 [roles]
 title = "slim"        # default: the logical model `slim`
 # compaction = "big"  # default: the session's model (or a /slim turn's model)
-
-[agents.explore]
-model = "slim"        # child-session preference; default comes from the agent table
 ```
 
 Title generation falls back to the session model when `slim` is missing. A
 `/slim` prompt runs one turn on `slim` without changing the session's selected
-model. A subagent whose configured model is absent from the catalogue refuses
-to start instead of silently using its parent's model. Role ids are logical, so
-`/slim` and the `explore` agent need a catalogue entry named `slim`: keep a
-`[models.slim]` route unless the provider itself reports a model with that id.
+model. Role ids are logical, so `/slim` needs a catalogue entry named `slim`:
+keep a `[models.slim]` route unless the provider itself reports a model with that id.
 
 ### MCP
 
@@ -387,15 +382,14 @@ events.
 | Agent | Mode | Responsibility and tool boundary |
 |---|---|---|
 | `apex` | Primary, default | General implementation and orchestration with the full registered toolset. Uses the session's persisted model. |
-| `general` | Subagent, default | General delegated work with all registered tools except `question`; inherits the parent model unless configured otherwise. |
-| `explore` | Subagent | Read-only codebase and web exploration with context search; no shell, structured writers, subagents or MCP tools. Prefers `slim`. |
+| `general` | Subagent, default | General delegated work with all registered tools except `question`; inherits the parent model. |
+| `explore` | Subagent | Read-only codebase and web exploration with context search; no shell, structured writers, subagents or MCP tools. |
 | `review` | Subagent | Reviews work it did not perform using read/search tools plus shell for verification. Structured writers, context writers, subagents and MCP tools are absent. |
 | `rust-expert` | Subagent | Applies a strict Rust review lens with the same review toolset as `review`. |
 
 The review toolset is read-constrained, not sandboxed: shell can execute build
 scripts or tests from the tree under review. A hard read-only boundary requires
-a sandbox. Model preferences under `[agents.<id>]` apply only to child sessions;
-primary sessions use their persisted model.
+a sandbox.
 
 ## Repository layout
 

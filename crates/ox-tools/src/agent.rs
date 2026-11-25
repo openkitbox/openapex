@@ -1,9 +1,8 @@
 //! The built-in agent records, including the strict Rust code-review agent.
 //!
 //! Each record decides what a session created with its id gets: the static
-//! system prompt layer (replaced when [`Agent::system`] is set), the visible
-//! toolset ([`Agent::tools`], applied over the registered tools), and the
-//! child-session model preference ([`Agent::model`]).
+//! system prompt layer (replaced when [`Agent::system`] is set) and the visible
+//! toolset ([`Agent::tools`], applied over the registered tools).
 //!
 //! Invariants:
 //! - Tool registries own whether a tool name exists; this table only names which
@@ -16,8 +15,8 @@
 //! - The first entry is the default agent ([`default_agent`]).
 //! - `rust-expert` is the strict Rust code-review agent: a read-only subagent
 //!   using the review toolset with a Rust-specific system layer.
-//! - This table is the only authority on which agent ids exist; model catalogues
-//!   and configuration validate ids against it rather than keeping a list.
+//! - This table is the only authority on which agent ids exist; no other layer
+//!   keeps a second list.
 //! - Prompt bodies live in `ox-engine::prompt`; this table only selects a layer
 //!   through [`SystemLayer`], so a shared rule has a single text owner.
 //! - This table is also the only authority on an agent's static permission
@@ -29,7 +28,6 @@
 use std::sync::LazyLock;
 
 use ox_schema::permission::{Effect, Rule};
-use ox_schema::support::SLIM;
 
 /// Whether the user drives the agent or `subagent` spawns it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,13 +71,6 @@ pub struct Agent {
     /// Static upstream rule set, in evaluation order. Shared by the wire
     /// surface and the engine; never copied into a second table.
     pub permissions: &'static [Rule],
-    /// The logical model id a *child* session of this agent prefers, or `None`
-    /// to inherit the parent session's model.
-    ///
-    /// A logical id (`slim`), never a provider endpoint: the model catalogue and
-    /// router decide the wire model. Ignored for primary agents, whose persisted
-    /// `session.model` is authoritative.
-    pub model: Option<&'static str>,
 }
 
 /// The agent a session uses when none is named.
@@ -263,7 +254,6 @@ static AGENTS: LazyLock<[Agent; 5]> = LazyLock::new(|| {
             system: SystemLayer::Default,
             tools: Tools::All,
             permissions: &APEX_RULES,
-            model: None,
         },
         Agent {
             id: SUBAGENT_AGENT,
@@ -271,7 +261,6 @@ static AGENTS: LazyLock<[Agent; 5]> = LazyLock::new(|| {
             system: SystemLayer::Default,
             tools: Tools::Without(CHILD_EXCLUDED_TOOLS),
             permissions: &GENERAL_RULES,
-            model: None,
         },
         Agent {
             id: READ_ONLY_AGENT,
@@ -279,7 +268,6 @@ static AGENTS: LazyLock<[Agent; 5]> = LazyLock::new(|| {
             system: SystemLayer::Explore,
             tools: Tools::Only(READ_ONLY_TOOLS),
             permissions: &READ_ONLY_RULES,
-            model: Some(SLIM),
         },
         Agent {
             id: REVIEW_AGENT,
@@ -287,7 +275,6 @@ static AGENTS: LazyLock<[Agent; 5]> = LazyLock::new(|| {
             system: SystemLayer::Review,
             tools: Tools::Only(REVIEW_TOOLS),
             permissions: &READ_ONLY_RULES,
-            model: None,
         },
         Agent {
             id: RUST_EXPERT_AGENT,
@@ -295,7 +282,6 @@ static AGENTS: LazyLock<[Agent; 5]> = LazyLock::new(|| {
             system: SystemLayer::RustExpert,
             tools: Tools::Only(REVIEW_TOOLS),
             permissions: &READ_ONLY_RULES,
-            model: None,
         },
     ]
 });
@@ -317,33 +303,6 @@ pub fn get(id: &str) -> Option<&'static Agent> {
 #[must_use]
 pub fn permissions(id: &str) -> &'static [Rule] {
     get(id).map_or(&UNKNOWN_RULES[..], |agent| agent.permissions)
-}
-
-/// Reject `[agents.<id>]` ids that cannot take a model preference.
-///
-/// This table is the only authority on which ids exist and what they do, but the
-/// `[agents]` config table lives in `ox-core`, which this crate depends on and
-/// which therefore cannot see this module: the check runs at whichever layer
-/// owns both, which passes the ids it read from `ox.toml`. Fail closed — a
-/// misspelled id, or one on a primary agent (whose sessions run on their
-/// persisted model), would otherwise sit in the config and do nothing.
-pub fn validate_ids<'id>(ids: impl IntoIterator<Item = &'id str>) -> anyhow::Result<()> {
-    for id in ids {
-        let Some(agent) = get(id) else {
-            let mut valid: Vec<&str> = AGENTS.iter().map(|agent| agent.id).collect();
-            valid.sort_unstable();
-            anyhow::bail!(
-                "[agents.{id}] is not a built-in agent (valid ids: {})",
-                valid.join(", ")
-            );
-        };
-        if agent.mode == Mode::Primary {
-            anyhow::bail!(
-                "[agents.{id}] cannot set a model: {id} is a primary agent, whose sessions run on their persisted model (only subagent agents spawn children)"
-            );
-        }
-    }
-    Ok(())
 }
 
 /// The agent a session uses when none is named (`apex`).

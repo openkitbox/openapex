@@ -138,14 +138,6 @@ pub trait SubagentSpawner: Send + Sync {
     fn settled_tail<'a>(&'a self, session_id: &'a str) -> SettledTail<'a>;
     /// Resolve an explicit wire model against the engine's current catalogue.
     fn resolve_model(&self, model: &ModelRef) -> Result<ModelRef, String>;
-    /// The model a fresh child session of `agent` starts on, resolved by the
-    /// engine from the agent's logical model preference.
-    ///
-    /// `Ok(None)` means inherit the parent session's model. `Err` is a
-    /// fail-closed refusal: the preference names a model the engine cannot
-    /// resolve, and silently starting the child on the parent's model would
-    /// defeat the cost policy the caller asked for.
-    fn child_model(&self, agent: &str) -> Result<Option<ModelRef>, String>;
 }
 
 /// The boxed future [`SubagentSpawner::wait_idle`] answers with.
@@ -475,53 +467,33 @@ fn required(input: &Value, key: &str) -> Result<String, ToolOutput> {
     }
 }
 
-/// The agent a child runs as. Only built-in subagent-mode ids are accepted.
-/// The `agent` field is required by the wire schema, including resumed calls.
-/// The removed `read_only` key fails loudly instead of being ignored.
-fn requested_agent(input: &Value) -> Result<&'static Agent, ToolOutput> {
-    let invalid = |key: &str, message: String| {
-        Err(super::invalid_arguments(
-            "subagent",
-            &[(key, message)],
-            input,
-        ))
+/// The agent a child runs as. A bad `agent` value (including the removed
+/// `read_only` key) is warned about and normalized to `general`; the other
+/// fields keep their strict validation. This is a deliberate deviation from
+/// failing closed: a caller asking for a read-only child gets general's
+/// toolset, which must not be relied on as a permission boundary.
+#[must_use]
+fn requested_agent(input: &Value) -> &'static Agent {
+    let fallback = |reason: &str| {
+        tracing::warn!(reason = %reason, "invalid subagent agent; using general");
+        crate::agent::subagent_default()
     };
     if input.get("read_only").is_some() {
-        return invalid(
-            "read_only",
-            "`read_only` was removed; pass `agent: \"explore\"` for a read-only subagent"
-                .to_owned(),
+        return fallback(
+            "`read_only` was removed; pass `agent: \"explore\"` for a read-only subagent",
         );
     }
     let given = match input.get("agent") {
         Some(Value::String(id)) if !id.trim().is_empty() => id.trim(),
         Some(Value::String(_) | Value::Null) | None => {
-            return invalid("agent", "Missing string field `agent`".to_owned());
+            return fallback("missing string field `agent`");
         }
-        Some(other) => return invalid("agent", format!("Expected a string, got {other}")),
+        Some(other) => return fallback(&format!("expected a string for `agent`, got {other}")),
     };
-    let id = given;
-    let available = || {
-        let ids: Vec<&str> = crate::agent::all()
-            .iter()
-            .filter(|agent| agent.mode == Mode::Subagent)
-            .map(|agent| agent.id)
-            .collect();
-        ids.join(", ")
-    };
-    match crate::agent::get(id) {
-        None => invalid(
-            "agent",
-            format!("Unknown agent `{id}`; available: {}", available()),
-        ),
-        Some(agent) if agent.mode == Mode::Subagent => Ok(agent),
-        Some(_) => invalid(
-            "agent",
-            format!(
-                "Agent `{id}` cannot run as a subagent; available: {}",
-                available()
-            ),
-        ),
+    match crate::agent::get(given) {
+        Some(agent) if agent.mode == Mode::Subagent => agent,
+        Some(_) => fallback(&format!("agent `{given}` cannot run as a subagent")),
+        None => fallback(&format!("unknown agent `{given}`")),
     }
 }
 
@@ -606,10 +578,7 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         }
     };
     let resumed = resume_id.is_some();
-    let agent = match requested_agent(input) {
-        Ok(agent) => agent,
-        Err(output) => return output,
-    };
+    let agent = requested_agent(input);
 
     // All invocations are detached; slot admission remains internal.
     // Legacy fields are not part of the wire schema.
@@ -709,7 +678,8 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
 
     // A resumed child may switch its agent and/or model before this prompt,
     // exactly like the session switch endpoints. New children persist their
-    // selections in SessionCreated instead.
+    // selections in SessionCreated instead. Switching the agent alone never
+    // changes the model; only an explicit `model` does.
     if resumed {
         let Some(config) = (match load_child_config(&tool.handle.db, &child_id).await {
             Ok(config) => config,
@@ -731,15 +701,7 @@ async fn run(tool: &SubagentTool, ctx: &ToolContext, input: &Value) -> ToolOutpu
         {
             return fail(format!("Unable to select child agent: {error}"));
         }
-        let selected_model = match explicit_model.clone() {
-            Some(model) => Some(model),
-            None if switched => match spawner.child_model(agent.id) {
-                Ok(model) => model,
-                Err(error) => return fail(error),
-            },
-            None => None,
-        };
-        if let Some(model) = selected_model
+        if let Some(model) = explicit_model
             && config.model.as_ref() != Some(&model)
             && let Err(error) = tool
                 .handle
@@ -939,10 +901,9 @@ fn try_slot(
 /// host-owned). `agent` is the child's agent id; the engine picks the child's
 /// system prompt and toolset from it.
 ///
-/// The model is resolved once, here: the engine answers the agent's logical
-/// preference through [`SubagentSpawner::child_model`], and an agent without a
-/// preference inherits the parent session's model. A resume never reaches this
-/// function, so a resumed child keeps the model persisted on its row.
+/// An explicit model is already resolved by the caller; otherwise the child
+/// inherits the parent session's model. A resume never reaches this function,
+/// so a resumed child keeps the model persisted on its row.
 async fn create_child(
     handle: &SubagentHandle,
     parent_session_id: &str,
@@ -952,12 +913,7 @@ async fn create_child(
     explicit_model: Option<ModelRef>,
 ) -> Result<String, String> {
     let (project_id, directory, workspace_id, subpath, parent_model) = parent;
-    let Some(spawner) = handle.spawner() else {
-        return Err("Subagent runner is not attached; no child was started".to_owned());
-    };
-    let model = explicit_model
-        .or(spawner.child_model(agent)?)
-        .or(parent_model);
+    let model = explicit_model.or(parent_model);
     let child_id = ox_schema::id::id("ses");
     let created = SessionEventData::SessionCreated {
         session_id: child_id.clone(),
@@ -1997,4 +1953,53 @@ fn escape(raw: &str, needs_escape: fn(char) -> bool) -> Cow<'_, str> {
         }
     }
     Cow::Owned(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::{Value, json};
+
+    use super::requested_agent;
+
+    fn agent_id(input: Value) -> &'static str {
+        requested_agent(&input).id
+    }
+
+    #[test]
+    fn requested_agent_keeps_valid_subagent_ids() {
+        assert_eq!(agent_id(json!({ "agent": "general" })), "general");
+        assert_eq!(agent_id(json!({ "agent": "rust-expert" })), "rust-expert");
+        assert_eq!(agent_id(json!({ "agent": " review " })), "review");
+    }
+
+    #[test]
+    fn requested_agent_falls_back_to_general_for_bad_values() {
+        assert_eq!(agent_id(json!({})), "general", "missing agent");
+        assert_eq!(agent_id(json!({ "agent": "" })), "general", "empty agent");
+        assert_eq!(
+            agent_id(json!({ "agent": "   " })),
+            "general",
+            "blank agent"
+        );
+        assert_eq!(
+            agent_id(json!({ "agent": 7 })),
+            "general",
+            "non-string agent"
+        );
+        assert_eq!(
+            agent_id(json!({ "agent": "unknown.agent" })),
+            "general",
+            "unknown dotted agent"
+        );
+        assert_eq!(
+            agent_id(json!({ "agent": "apex" })),
+            "general",
+            "primary agent"
+        );
+        assert_eq!(
+            agent_id(json!({ "agent": "explore", "read_only": true })),
+            "general",
+            "removed read_only key"
+        );
+    }
 }

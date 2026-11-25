@@ -596,24 +596,6 @@ impl RolesConfig {
     }
 }
 
-/// One agent's model preference (`[agents.<id>]` section). The id is a built-in
-/// agent id; `ox_tools::agent::get` is the authority on the valid set.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
-pub struct AgentConfig {
-    /// Logical model for that agent's child sessions. `None` keeps the built-in
-    /// preference from the agent table.
-    #[serde(default)]
-    pub model: Option<String>,
-}
-
-impl AgentConfig {
-    /// Reject a blank model id. The `[agents.<id>]` key lives in the owning map,
-    /// so the load path adds it to the message.
-    pub fn validate(&self) -> anyhow::Result<()> {
-        validate_model_id("model", self.model.as_deref())
-    }
-}
-
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     /// LLM endpoint configuration. Flattened: its keys (`[providers]`,
@@ -673,10 +655,6 @@ pub struct Config {
     /// session model.
     #[serde(default)]
     pub roles: RolesConfig,
-    /// Per-agent model overrides (`[agents.<id>]` sections), keyed by built-in
-    /// agent id. Absent means each agent keeps its built-in preference.
-    #[serde(default)]
-    pub agents: BTreeMap<String, AgentConfig>,
 }
 
 fn default_event_heartbeat_ms() -> u64 {
@@ -701,7 +679,6 @@ impl Default for Config {
             turn: TurnConfig::default(),
             permissions: PermissionsConfig::default(),
             roles: RolesConfig::default(),
-            agents: BTreeMap::new(),
         }
     }
 }
@@ -884,12 +861,6 @@ impl Config {
         self.llm.validate()?;
         self.subagent.validate()?;
         self.roles.validate()?;
-        for (id, agent) in &self.agents {
-            anyhow::ensure!(!id.trim().is_empty(), "[agents] ids must not be empty");
-            if let Err(error) = agent.validate() {
-                anyhow::bail!("[agents.{id}]: {error}");
-            }
-        }
         Ok(())
     }
 

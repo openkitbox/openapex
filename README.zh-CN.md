@@ -133,14 +133,10 @@ provider 的模型列表端点不可达时，仍可使用其内置种子模型�
 [roles]
 title = "slim"
 # compaction = "big"  # 默认跟随会话模型；/slim 那一轮使用该轮模型
-
-[agents.explore]
-model = "slim"
 ```
 
 目录里没有 `slim` 时，标题生成回退到会话模型；`/slim` 只让下一条请求走 `slim`，
-不改变会话模型。子 agent 指定的模型不在目录中时会直接报错，而不是静默使用父会话模型。
-角色 id 是逻辑名：`/slim` 和 `explore` agent 都需要目录里有名为 `slim` 的条目；
+不改变会话模型。角色 id 是逻辑名：`/slim` 需要目录里有名为 `slim` 的条目；
 除非 provider 本身就上报了这个 id，否则应保留 `[models.slim]` 路由。
 
 ### MCP
@@ -314,14 +310,13 @@ MCP Events 实现 MCP Events beta 扩展。服务器必须声明该扩展，ox �
 | Agent | 模式 | 职责与工具范围 |
 |---|---|---|
 | `apex` | Primary，默认 | 面向用户的默认 agent，可使用完整工具注册表。 |
-| `general` | Subagent，默认 | 通用子 agent，使用除 `question` 外的已注册工具；默认继承父会话模型。 |
-| `explore` | Subagent | 只读代码库和网页探索，可使用上下文检索；没有 shell、结构化写入工具、子 agent 或 MCP 工具；优先使用 `slim`，也是 agent 无法读取时的 fail-closed 回退。 |
+| `general` | Subagent，默认 | 通用子 agent，使用除 `question` 外的已注册工具；继承父会话模型。 |
+| `explore` | Subagent | 只读代码库和网页探索，可使用上下文检索；没有 shell、结构化写入工具、子 agent 或 MCP 工具；也是 agent 无法读取时的 fail-closed 回退。 |
 | `review` | Subagent | 评审不是自己完成的工作；使用读取/检索工具和为 git、验证保留的 `shell`，不含结构化写入工具。 |
 | `rust-expert` | Subagent | 使用 Rust 专用评审提示层和同一套评审工具，进行严格 Rust 代码审查。 |
 
 评审 agent 的 `shell` 用于查看 diff 和运行验证，不是沙箱边界；真正需要隔离的代码
-仍应放在沙箱中执行。子会话模型可通过 `[agents.<id>]` 覆盖；primary agent 使用其
-持久化的会话模型。
+仍应放在沙箱中执行。primary agent 使用其持久化的会话模型，子会话继承父会话模型。
 
 ## 仓库结构
 
@@ -363,5 +358,5 @@ cargo build --release
 - [skills/README.md](skills/README.md) —— 项目 skill 的加载与软链接方式
 - [tools/local-eval/README.md](tools/local-eval/README.md) —— 可审计的本地 ACP runner 与冒烟测试
 - [ACP v1 稳定能力矩阵](#acp-v1-稳定能力矩阵) —— ACP 的稳定接口、fail-closed 行为和排除项
-- [内置 agent 定义](crates/ox-tools/src/agent.rs) —— agent、工具范围和模型偏好的权威来源
+- [内置 agent 定义](crates/ox-tools/src/agent.rs) —— agent 与工具范围的权威来源
 - [ACP 入口](crates/ox-acp/src/lib.rs) —— stdio ACP v1 服务与请求分发
