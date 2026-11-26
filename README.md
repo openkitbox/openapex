@@ -347,8 +347,8 @@ An automation combines one trigger with one action:
 
 Manage automations through the OpenCode `/automation` command, the HTTP API at
 `/api/experimental/automation` (list, create, get, delete, pause and resume), or
-the `automation.create`, `automation.list`, `automation.pause`,
-`automation.resume` and `automation.delete` tools. The HTTP create path accepts
+the `automation_create`, `automation_list`, `automation_pause`,
+`automation_resume` and `automation_delete` tools. The HTTP create path accepts
 scheduled prompt actions; event triggers and unattended shell/code actions must
 be created through a tool call in a local session so ox can obtain an interactive
 permission grant. Unsupported or unauthorized setup fails closed.

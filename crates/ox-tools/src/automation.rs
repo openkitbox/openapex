@@ -77,11 +77,11 @@ impl Operation {
 
     fn name(self) -> &'static str {
         match self {
-            Self::Create => "automation.create",
-            Self::List => "automation.list",
-            Self::Pause => "automation.pause",
-            Self::Resume => "automation.resume",
-            Self::Delete => "automation.delete",
+            Self::Create => "automation_create",
+            Self::List => "automation_list",
+            Self::Pause => "automation_pause",
+            Self::Resume => "automation_resume",
+            Self::Delete => "automation_delete",
         }
     }
 

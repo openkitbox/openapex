@@ -43,7 +43,7 @@ pub(crate) fn mount(api: Router) -> Router {
 /// `packages/core/src/plugin/command/automation.txt` (reference @ 4d5965762).
 pub(crate) const AUTOMATION_COMMAND_PROMPT: &str = "Manage this project's automations.\n\n\
 Request: $ARGUMENTS\n\n\
-Use the `automation` tools: `tools.automation.create` to add one, and `list`, `pause`, `resume` or `delete` to manage them (find ids with `list`). Their descriptions explain triggers and actions. If the request is empty, list the automations with their name, trigger, status and next run.\n\n\
+Use the `automation` tools: `tools.automation_create` to add one, and `automation_list`, `automation_pause`, `automation_resume` or `automation_delete` to manage them (find ids with `automation_list`). Their descriptions explain triggers and actions. If the request is empty, list the automations with their name, trigger, status and next run.\n\n\
 Reply in one line: what changed and when it runs.";
 
 /// Public snapshot in upstream wire spelling. The domain type spells the
