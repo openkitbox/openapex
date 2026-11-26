@@ -158,9 +158,20 @@ fn execute_impl(
     invoker: Arc<dyn ToolInvoker>,
     limits: &Limits,
 ) -> Result<CodeOutput, ExecutionError> {
-    let mut scanned = scan::scan(code).map_err(|err| ExecutionError::Scan(err.to_string()))?;
+    let scanned = scan::scan(code).map_err(|err| ExecutionError::Scan(err.to_string()))?;
     if let Some(allowed) = allowed {
-        scanned.tools.retain(|path| allowed.contains(path));
+        let unavailable = scanned
+            .tools
+            .iter()
+            .filter(|path| !allowed.contains(*path))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !unavailable.is_empty() {
+            return Err(ExecutionError::Scan(format!(
+                "tool(s) not callable inside `execute`: {}; call them as direct tool calls instead",
+                unavailable.join(", ")
+            )));
+        }
     }
     let parsed_bindings: serde_json::Value =
         serde_json::from_str(bindings).map_err(|err| ExecutionError::Runtime(err.to_string()))?;

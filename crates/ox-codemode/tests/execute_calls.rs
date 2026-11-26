@@ -1,6 +1,7 @@
 //! Static tool paths and nested-call lifecycle events at the public API.
 
 use std::{
+    collections::BTreeSet,
     sync::{
         Arc, Barrier, Mutex,
         mpsc::{self, Receiver, Sender},
@@ -10,6 +11,7 @@ use std::{
 
 use ox_codemode::{
     CallEvent, CallStatus, ExecutionError, Limits, ToolCallRecord, ToolInvoker, execute,
+    execute_scoped,
 };
 use serde_json::{Value, json};
 
@@ -292,6 +294,24 @@ fn execute_calls_reject_dynamic_and_indirect_access() {
         );
         assert!(invoker.events().is_empty(), "nothing ran: {code}");
     }
+}
+
+#[test]
+fn execute_scoped_unavailable_tool_is_rejected_before_running() {
+    let invoker = Arc::new(RecordingInvoker::new(false));
+    let error = execute_scoped(
+        "tools.shell({ command: 'echo hi' }); return 1;",
+        &BTreeSet::new(),
+        "{}",
+        invoker.clone(),
+        &Limits::default(),
+    )
+    .expect_err("an unavailable tool must be rejected");
+    assert!(
+        matches!(&error, ExecutionError::Scan(text) if text.contains("shell") && text.contains("direct tool calls")),
+        "the error names the tool and the alternative: {error:?}"
+    );
+    assert!(invoker.events().is_empty(), "nothing ran: {error:?}");
 }
 
 #[test]

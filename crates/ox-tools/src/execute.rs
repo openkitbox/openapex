@@ -54,6 +54,7 @@ const DESCRIPTION: &str = concat!(
     "Always return an explicit result, e.g. `return { state: ... }`; omitting `return` does not make the final expression the result.\n",
     "`fetch` is unavailable in ox; use the catalog's `webfetch` tool for HTTP requests. Imports, direct filesystem access, and timers are unavailable: there is no `setTimeout` or sleep. All other external access goes through `tools`.\n",
     "Inside `execute`, the only callable tools are those explicitly listed in the Code Mode catalog instructions. Ignore tools shown outside the Code Mode catalog. They are not available in the Code Mode runtime.\n",
+    "Calling a tool outside the Code Mode catalog is rejected before execution; call it directly instead.\n",
     "Call tools through `tools` using only exact paths and signatures from the catalog: `tools.name(...)` or `tools[\"name\"](...)`. Keep those paths static; do not infer, normalize, or build tool names dynamically. Pending calls are interrupted when execution ends.",
 );
 
@@ -653,6 +654,13 @@ mod tests {
             output.content["error"],
             json!(true),
             "a denied tool cannot be called by a script"
+        );
+        let text = output.content["output"]
+            .as_str()
+            .expect("the output names the denied tool");
+        assert!(
+            text.contains("shell") && text.contains("direct tool calls"),
+            "the failure names the tool and the alternative: {text}"
         );
         assert!(
             host.nested

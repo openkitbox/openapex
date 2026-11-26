@@ -264,6 +264,7 @@ const CODE_MODE_INSTRUCTIONS: &str = concat!(
     "# Code Mode\n\n",
     "The tools listed below cannot be called directly: they only work as JavaScript inside the `execute` tool. Every other tool you have is a normal tool call: call it directly, never inside `execute`.\n\n",
     "The catalog is complete. Do not guess tool names.\n\n",
+    "Calling a tool absent from this catalog is rejected before the program runs; do not assume upstream Code Mode examples apply — call such tools directly, never inside `execute`.\n",
     "Write plain JavaScript and send it exactly as written: no code fence, and no JSON or other wrapper around it.\n",
     "Each call is a fresh program; nothing carries over from earlier calls.\n",
     "`fetch` is unavailable in ox; use the catalog's `webfetch` tool for HTTP requests. Imports, direct filesystem access, and timers are unavailable: there is no `setTimeout` or sleep. All other external access goes through `tools`.\n",
@@ -1398,6 +1399,7 @@ mod tests {
         for invariant in [
             "no code fence",
             "Each call is a fresh program",
+            "is rejected before the program runs",
             "`fetch` is unavailable in ox",
             "`webfetch` tool for HTTP requests",
             "`tools.name(...)` or `tools[\"name\"](...)`",
