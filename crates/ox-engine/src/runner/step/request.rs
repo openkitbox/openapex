@@ -252,6 +252,7 @@ fn apply_final_step(request: &mut ChatRequest) {
         content: Some(MAX_STEPS_PROMPT.to_owned()),
         tool_calls: None,
         reasoning_content: None,
+        replay_state: None,
     });
 }
 

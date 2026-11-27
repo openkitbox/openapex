@@ -35,6 +35,7 @@ pub(crate) struct NeedsCompaction(pub &'static str);
 
 pub(crate) fn measure(request: &ChatRequest, ratio: f64) -> Result<RequestBill, serde_json::Error> {
     let mut content_bytes = 0usize;
+    let mut replay_bytes = 0usize;
     let mut unsupported_media = false;
     for message in &request.messages {
         match message {
@@ -56,15 +57,26 @@ pub(crate) fn measure(request: &ChatRequest, ratio: f64) -> Result<RequestBill, 
                 content,
                 reasoning_content,
                 tool_calls,
+                replay_state,
             } => {
                 content_bytes += content.as_ref().map_or(0, String::len);
                 content_bytes += reasoning_content.as_ref().map_or(0, String::len);
+                // serde skips this internal field, but the Messages writer
+                // adds the blocks to the real request. Count them so input
+                // admission can never budget less than the wire carries.
+                replay_bytes += replay_state
+                    .as_deref()
+                    .map_or(0, |state| state.extra_wire_bytes());
                 for call in tool_calls.iter().flatten() {
                     content_bytes += call.function.name.len() + call.function.arguments.len();
                 }
             }
         }
     }
+    // serde skips the native state but the Messages writer emits its blocks.
+    // Count them once in content bytes and mirror them into the serialized
+    // total, leaving the framing remainder unchanged.
+    content_bytes += replay_bytes;
     struct Counter(usize);
     impl std::io::Write for Counter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -81,7 +93,9 @@ pub(crate) fn measure(request: &ChatRequest, ratio: f64) -> Result<RequestBill, 
     }
     let mut serialized = Counter(0);
     serde_json::to_writer(&mut serialized, request)?;
-    let serialized_bytes = serialized.0;
+    // `replay_bytes` is already in `content_bytes`; mirrored into the
+    // serialized total because the actual wire includes what serde skipped.
+    let serialized_bytes = serialized.0 + replay_bytes;
     let local_tokens = crate::mctx::tokens::heuristic_bytes(serialized_bytes);
     let ratio = if ratio.is_finite() && ratio > 0.0 {
         ratio
@@ -169,4 +183,45 @@ pub(crate) fn apply(
         selected_output = ?selected, "request geometry estimate (not reported usage)");
     request.max_tokens = selected?;
     Ok(bill)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use ox_llm::messages::replay::{MessagesReplayState, ReplayBlock};
+
+    use super::{ChatMessage, ChatRequest, measure};
+
+    #[test]
+    fn native_replay_bytes_are_budgeted() {
+        let replay = MessagesReplayState::new(
+            "provider",
+            "https://messages.example/v1/messages",
+            "model",
+            vec![ReplayBlock::Thinking {
+                index: 0,
+                thinking: "secret thought".to_owned(),
+                signature: "signed".to_owned(),
+            }],
+            Some(1),
+            None,
+        );
+        let extra = replay.extra_wire_bytes();
+        let assistant = |replay_state| ChatMessage::Assistant {
+            content: Some("answer".to_owned()),
+            tool_calls: None,
+            reasoning_content: Some("secret thought".to_owned()),
+            replay_state,
+        };
+        let plain = measure(&ChatRequest::new("model", vec![assistant(None)]), 1.0)
+            .expect("plain request measures");
+        let native = measure(
+            &ChatRequest::new("model", vec![assistant(Some(Arc::new(replay)))]),
+            1.0,
+        )
+        .expect("native request measures");
+        assert_eq!(native.content_bytes - plain.content_bytes, extra);
+        assert_eq!(native.serialized_bytes - plain.serialized_bytes, extra);
+    }
 }

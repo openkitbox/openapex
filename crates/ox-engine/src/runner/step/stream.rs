@@ -98,6 +98,9 @@ async fn consume_owned(
     let mut next_reasoning_ordinal: i64 = 0;
     let mut finish: Option<(FinishReason, String)> = None;
     let mut usage: Option<Usage> = None;
+    // Opaque native state is held only in memory until a clean finish; a
+    // cancelled or failed attempt never reaches the durable settlement below.
+    let mut provider_state: Option<ox_schema::support::Record> = None;
     // Tool-call fragments by stream index.
     let mut tool_acc: BTreeMap<u32, ToolAccum> = BTreeMap::new();
     // Model output was received in this attempt (unlike `started`, which a
@@ -311,6 +314,9 @@ async fn consume_owned(
                         seen.prompt_tokens,
                     );
                 }
+                StreamEvent::ProviderState(state) => {
+                    provider_state = Some(state);
+                }
                 StreamEvent::Done => break,
             },
         }
@@ -405,7 +411,7 @@ async fn consume_owned(
             assistant_message_id: params.assistant_message_id.clone(),
             finish: mapped_finish,
             raw_finish: Some(raw_finish),
-            provider_state: None,
+            provider_state,
             cost: ox_schema::support::Finite::Int(0),
             tokens: attempt_tokens(
                 ctx,

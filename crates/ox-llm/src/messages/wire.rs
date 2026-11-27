@@ -28,6 +28,7 @@
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use super::replay::{MessagesOrigin, ReplayBlock};
 use crate::chat_completions::wire::{ChatMessage, ChatRequest, ToolChoice, UserContent, UserPart};
 use crate::error::ChatError;
 
@@ -253,6 +254,11 @@ pub enum WireBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         signature: Option<String>,
     },
+    /// `{"type":"redacted_thinking","data":…}` — opaque provider bytes.
+    RedactedThinking {
+        /// The provider's original opaque payload.
+        data: String,
+    },
 }
 
 /// An image source: inline base64 or a URL.
@@ -333,6 +339,7 @@ const NO_RESULT_CONTENT: &str = "[no result recorded: interrupted or folded]";
 pub fn build_request(
     request: &ChatRequest,
     policy: &MessagesPolicy,
+    origin: &MessagesOrigin<'_>,
 ) -> Result<MessagesRequest, ChatError> {
     let mut system = Vec::new();
     let mut messages: Vec<WireMessage> = Vec::new();
@@ -408,10 +415,19 @@ pub fn build_request(
                 content,
                 tool_calls,
                 reasoning_content,
+                replay_state,
             } => {
                 flush_results(&mut messages, &mut pending_results);
                 let mut blocks = Vec::new();
-                if let Some(reasoning) = reasoning_content
+                let native = replay_state
+                    .as_deref()
+                    .filter(|replay| replay.matches(origin, &request.model));
+                // Native blocks carry their original content-block positions;
+                // text and tool calls are reconstructed at the positions the
+                // decoder saw, so replay keeps their relative order.
+                let mut positioned: Vec<(u64, WireBlock)> = Vec::new();
+                if native.is_none()
+                    && let Some(reasoning) = reasoning_content
                     && !reasoning.is_empty()
                     && policy.replays_unsigned_thinking()
                 {
@@ -423,17 +439,59 @@ pub fn build_request(
                         signature: None,
                     });
                 }
+                if let Some(replay) = native {
+                    for block in &replay.blocks {
+                        match block {
+                            ReplayBlock::Thinking {
+                                index,
+                                thinking,
+                                signature,
+                            } => positioned.push((
+                                *index,
+                                WireBlock::Thinking {
+                                    thinking: thinking.clone(),
+                                    signature: Some(signature.clone()),
+                                },
+                            )),
+                            ReplayBlock::RedactedThinking { index, data } => {
+                                positioned.push((
+                                    *index,
+                                    WireBlock::RedactedThinking { data: data.clone() },
+                                ));
+                            }
+                        }
+                    }
+                }
                 if let Some(text) = content
                     && !text.is_empty()
                 {
-                    blocks.push(WireBlock::Text { text: text.clone() });
+                    let text_block = WireBlock::Text { text: text.clone() };
+                    match native {
+                        Some(replay) => {
+                            positioned.push((replay.text_index.unwrap_or(0), text_block))
+                        }
+                        None => blocks.push(text_block),
+                    }
                 }
-                for call in tool_calls.iter().flatten() {
-                    blocks.push(WireBlock::ToolUse {
+                for (call_index, call) in tool_calls.iter().flatten().enumerate() {
+                    let tool_block = WireBlock::ToolUse {
                         id: call.id.clone(),
                         name: call.function.name.clone(),
                         input: parse_arguments(&call.function.arguments),
-                    });
+                    };
+                    match native {
+                        Some(replay) => positioned.push((
+                            replay
+                                .tool_index
+                                .map_or(u64::MAX, |index| index.saturating_add(call_index as u64)),
+                            tool_block,
+                        )),
+                        None => blocks.push(tool_block),
+                    }
+                }
+                if native.is_some() {
+                    positioned.sort_by_key(|(index, _)| *index);
+                    blocks.extend(positioned.into_iter().map(|(_, block)| block));
                 }
                 if blocks.is_empty() {
                     continue;

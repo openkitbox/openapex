@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
+use super::replay::{MessagesReplayState, ReplayBlock};
 use crate::chat_completions::stream::StreamEvent;
 use crate::chat_completions::wire::Usage;
 use crate::error::ChatError;
@@ -36,6 +37,89 @@ pub struct MessagesDecoder {
     usage: UsageAccum,
     /// Whether a usage event was already emitted for this stream.
     usage_emitted: bool,
+    /// Identity of the endpoint producing this response, when it can be
+    /// trusted for a native thinking replay.
+    replay_identity: Option<(String, String, String)>,
+    /// Thinking blocks by Messages content-block index, in wire order.
+    replay_blocks: BTreeMap<u64, PendingBlock>,
+    /// Where text and tool calls sat relative to those blocks.
+    replay_text_index: Option<u64>,
+    replay_tool_index: Option<u64>,
+    /// Whether a replay state was already emitted for this stream.
+    replay_emitted: bool,
+}
+
+/// One thinking block under assembly. Only a stopped block with the opaque
+/// bytes the endpoint needs is ever emitted for replay.
+#[derive(Debug)]
+enum PendingBlock {
+    Thinking {
+        text: String,
+        signature: String,
+        done: bool,
+    },
+    RedactedThinking {
+        data: String,
+        done: bool,
+    },
+}
+
+impl PendingBlock {
+    fn thinking() -> Self {
+        Self::Thinking {
+            text: String::new(),
+            signature: String::new(),
+            done: false,
+        }
+    }
+
+    fn append_thinking(&mut self, text: &str) {
+        if let Self::Thinking { text: into, .. } = self {
+            into.push_str(text);
+        }
+    }
+
+    fn append_signature(&mut self, signature: &str) {
+        if let Self::Thinking {
+            signature: into, ..
+        } = self
+        {
+            into.push_str(signature);
+        }
+    }
+
+    fn append_redacted(&mut self, data: &str) {
+        if let Self::RedactedThinking { data: into, .. } = self {
+            into.push_str(data);
+        }
+    }
+
+    fn stop(&mut self) {
+        match self {
+            Self::Thinking { done, .. } | Self::RedactedThinking { done, .. } => *done = true,
+        }
+    }
+
+    fn finish(&self, index: u64) -> Option<ReplayBlock> {
+        match self {
+            Self::Thinking {
+                text,
+                signature,
+                done: true,
+            } if !text.is_empty() && !signature.is_empty() => Some(ReplayBlock::Thinking {
+                index,
+                thinking: text.clone(),
+                signature: signature.clone(),
+            }),
+            Self::RedactedThinking { data, done: true } if !data.is_empty() => {
+                Some(ReplayBlock::RedactedThinking {
+                    index,
+                    data: data.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
 }
 
 /// The running usage total. Messages splits it: `message_start` reports the
@@ -95,6 +179,19 @@ impl MessagesDecoder {
         Self::default()
     }
 
+    /// Bind decoding to the endpoint that produced the response. Without a
+    /// binding no signatures or opaque blocks are retained.
+    #[must_use]
+    pub fn with_replay(
+        mut self,
+        provider: impl Into<String>,
+        endpoint: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        self.replay_identity = Some((provider.into(), endpoint.into(), model.into()));
+        self
+    }
+
     /// The tool ordinal for a content-block index, allocating one if the block
     /// was never announced.
     fn tool_ordinal(&mut self, block: u64) -> u32 {
@@ -135,24 +232,61 @@ impl SseDecoder for MessagesDecoder {
                     .and_then(|block| block.get("type"))
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if block_type != "tool_use" {
-                    return Ok(());
+                match block_type {
+                    "tool_use" => {
+                        if self.replay_identity.is_some() && self.replay_tool_index.is_none() {
+                            self.replay_tool_index = Some(index);
+                        }
+                        let ordinal = self.tool_ordinal(index);
+                        out.push(StreamEvent::ToolCallDelta {
+                            index: ordinal,
+                            id: block
+                                .and_then(|block| block.get("id"))
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            name: block
+                                .and_then(|block| block.get("name"))
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            // The initial `input` is `{}` for every real call;
+                            // arguments arrive as `input_json_delta` fragments.
+                            arguments: String::new(),
+                        });
+                    }
+                    "thinking" if self.replay_identity.is_some() => {
+                        self.replay_blocks.insert(
+                            index,
+                            PendingBlock::Thinking {
+                                text: block
+                                    .and_then(|block| block.get("thinking"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                                signature: String::new(),
+                                done: false,
+                            },
+                        );
+                    }
+                    "redacted_thinking" if self.replay_identity.is_some() => {
+                        self.replay_blocks.insert(
+                            index,
+                            PendingBlock::RedactedThinking {
+                                data: block
+                                    .and_then(|block| block.get("data"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_owned(),
+                                done: false,
+                            },
+                        );
+                    }
+                    "text"
+                        if self.replay_identity.is_some() && self.replay_text_index.is_none() =>
+                    {
+                        self.replay_text_index = Some(index);
+                    }
+                    _ => {}
                 }
-                let ordinal = self.tool_ordinal(index);
-                out.push(StreamEvent::ToolCallDelta {
-                    index: ordinal,
-                    id: block
-                        .and_then(|block| block.get("id"))
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    name: block
-                        .and_then(|block| block.get("name"))
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    // The initial `input` is `{}` for every real call; the
-                    // arguments arrive as `input_json_delta` fragments.
-                    arguments: String::new(),
-                });
             }
             "content_block_delta" => {
                 let index = value.get("index").and_then(Value::as_u64).unwrap_or(0);
@@ -175,22 +309,39 @@ impl SseDecoder for MessagesDecoder {
                         if let Some(thinking) = delta.get("thinking").and_then(Value::as_str)
                             && !thinking.is_empty()
                         {
+                            if self.replay_identity.is_some() {
+                                self.replay_blocks
+                                    .entry(index)
+                                    .or_insert_with(PendingBlock::thinking)
+                                    .append_thinking(thinking);
+                            }
                             out.push(StreamEvent::ReasoningDelta(thinking.to_owned()));
                         }
                     }
                     "signature_delta" => {
-                        // A signature authenticates this exact thinking block
-                        // for replay. ox does not store one yet (rows carry no
-                        // opaque provider metadata), so it is dropped rather
-                        // than kept for the life of one process.
-                        let signature_bytes = delta
-                            .get("signature")
-                            .and_then(|signature| signature.as_str())
-                            .map_or(0, str::len);
-                        tracing::debug!(
-                            signature_bytes,
-                            "messages thinking signature is not persisted; the block replays unsigned"
-                        );
+                        if self.replay_identity.is_some()
+                            && let Some(signature) = delta.get("signature").and_then(Value::as_str)
+                            && !signature.is_empty()
+                        {
+                            self.replay_blocks
+                                .entry(index)
+                                .or_insert_with(PendingBlock::thinking)
+                                .append_signature(signature);
+                        }
+                    }
+                    "redacted_thinking" => {
+                        if self.replay_identity.is_some()
+                            && let Some(data) = delta.get("data").and_then(Value::as_str)
+                            && !data.is_empty()
+                        {
+                            self.replay_blocks
+                                .entry(index)
+                                .or_insert_with(|| PendingBlock::RedactedThinking {
+                                    data: String::new(),
+                                    done: false,
+                                })
+                                .append_redacted(data);
+                        }
                     }
                     "input_json_delta" => {
                         let ordinal = self.tool_ordinal(index);
@@ -207,6 +358,13 @@ impl SseDecoder for MessagesDecoder {
                     }
                     // `citations_delta` and anything newer: not modelled.
                     _ => {}
+                }
+            }
+            "content_block_stop" => {
+                if let Some(index) = value.get("index").and_then(Value::as_u64)
+                    && let Some(pending) = self.replay_blocks.get_mut(&index)
+                {
+                    pending.stop();
                 }
             }
             "message_delta" => {
@@ -241,6 +399,30 @@ impl SseDecoder for MessagesDecoder {
                 {
                     self.usage_emitted = true;
                     out.push(StreamEvent::Usage(usage));
+                }
+                if !self.replay_emitted
+                    && let Some((provider, endpoint, model)) = self.replay_identity.clone()
+                {
+                    let blocks: Vec<ReplayBlock> = self
+                        .replay_blocks
+                        .iter()
+                        .filter_map(|(index, block)| block.finish(*index))
+                        .collect();
+                    if !blocks.is_empty() {
+                        let state = MessagesReplayState::new(
+                            provider,
+                            endpoint,
+                            model,
+                            blocks,
+                            self.replay_text_index,
+                            self.replay_tool_index,
+                        );
+                        let record = state
+                            .into_provider_state()
+                            .map_err(|error| ChatError::Sse(format!("replay state: {error}")))?;
+                        self.replay_emitted = true;
+                        out.push(StreamEvent::ProviderState(record));
+                    }
                 }
                 out.push(StreamEvent::Done);
             }

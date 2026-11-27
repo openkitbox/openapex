@@ -14,10 +14,12 @@
 //! [`client::MessagesClient`]).
 
 pub mod client;
+pub mod replay;
 pub mod stream;
 pub mod wire;
 
 pub use client::{MessagesClient, MessagesStream, messages_url};
+pub use replay::{MessagesOrigin, MessagesReplayState, ReplayBlock, from_provider_state};
 pub use stream::{ANTHROPIC_VERSION, MessagesDecoder};
 pub use wire::{
     ImageSource, MessagesPolicy, MessagesRequest, OutputConfig, Thinking, WireBlock, WireMessage,

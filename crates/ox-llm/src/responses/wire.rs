@@ -147,6 +147,7 @@ pub fn build_request(request: &ChatRequest) -> ResponsesRequest<'_> {
                 content,
                 tool_calls,
                 reasoning_content,
+                replay_state: _,
             } => {
                 if let Some(reasoning) = reasoning_content
                     && !reasoning.is_empty()
@@ -330,6 +331,7 @@ mod tests {
                     },
                 }]),
                 reasoning_content: Some("must not be replayed".to_owned()),
+                replay_state: None,
             },
             ChatMessage::tool("call-1", "contents"),
         ]);

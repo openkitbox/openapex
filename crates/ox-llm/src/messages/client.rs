@@ -15,6 +15,7 @@
 
 use std::time::Duration;
 
+use super::replay::MessagesOrigin;
 use super::stream::{ANTHROPIC_VERSION, MessagesDecoder};
 use super::wire::{MessagesPolicy, build_request};
 use crate::chat_completions::chat::{Chat, ChatFuture};
@@ -76,10 +77,28 @@ impl MessagesClient {
 
     /// Start a streaming Messages turn.
     pub async fn stream_chat(&self, request: &ChatRequest) -> Result<MessagesStream, ChatError> {
-        let body = build_request(request, &self.policy)?;
+        let url = messages_url(&self.base_url);
+        self.stream_chat_with(
+            request,
+            MessagesOrigin::new("", &url),
+            MessagesDecoder::new(),
+        )
+        .await
+    }
+
+    /// One request to one known endpoint. The decoder is bound to that
+    /// endpoint's identity so its completed thinking blocks can be replayed on
+    /// a later turn through the same route.
+    async fn stream_chat_with(
+        &self,
+        request: &ChatRequest,
+        origin: MessagesOrigin<'_>,
+        decoder: MessagesDecoder,
+    ) -> Result<MessagesStream, ChatError> {
+        let body = build_request(request, &self.policy, &origin)?;
         let mut builder = self
             .http
-            .post(messages_url(&self.base_url))
+            .post(origin.endpoint)
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .header("anthropic-version", ANTHROPIC_VERSION)
             .json(&body);
@@ -95,7 +114,7 @@ impl MessagesClient {
         if !status.is_success() {
             return Err(ChatError::from_response(response).await);
         }
-        Ok(SseChatStream::new(response, MessagesDecoder::new()))
+        Ok(SseChatStream::new(response, decoder))
     }
 }
 
@@ -103,6 +122,28 @@ impl Chat for MessagesClient {
     fn stream_chat<'a>(&'a self, request: &'a ChatRequest) -> ChatFuture<'a> {
         Box::pin(async move {
             MessagesClient::stream_chat(self, request)
+                .await
+                .map(|stream| Box::pin(stream) as crate::chat_completions::chat::BoxChatStream)
+        })
+    }
+
+    fn stream_chat_for<'a>(
+        &'a self,
+        request: &'a ChatRequest,
+        provider: Option<&'a str>,
+    ) -> ChatFuture<'a> {
+        Box::pin(async move {
+            let url = messages_url(&self.base_url);
+            let decoder = match provider {
+                Some(provider) => MessagesDecoder::new().with_replay(
+                    provider,
+                    url.as_str(),
+                    request.model.as_str(),
+                ),
+                None => MessagesDecoder::new(),
+            };
+            let origin = MessagesOrigin::new(provider.unwrap_or_default(), &url);
+            self.stream_chat_with(request, origin, decoder)
                 .await
                 .map(|stream| Box::pin(stream) as crate::chat_completions::chat::BoxChatStream)
         })

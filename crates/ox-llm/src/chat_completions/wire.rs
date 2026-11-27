@@ -14,6 +14,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::messages::replay::MessagesReplayState;
 use ox_schema::support::Finite;
 
 /// Tool schema types live in the contract crate; the chat request re-exports
@@ -304,6 +305,10 @@ pub enum ChatMessage {
         /// none — plain-chat providers must not see the key at all.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_content: Option<String>,
+        /// Opaque native Messages replay state restored from the durable row.
+        /// Internal only: never serialized onto the internal Chat wire.
+        #[serde(default, skip)]
+        replay_state: Option<std::sync::Arc<MessagesReplayState>>,
     },
     /// A tool result for a prior [`ToolCall::id`].
     Tool {
@@ -333,6 +338,7 @@ impl ChatMessage {
             content: Some(content.into()),
             tool_calls: None,
             reasoning_content: None,
+            replay_state: None,
         }
     }
 
@@ -343,6 +349,7 @@ impl ChatMessage {
             content: None,
             tool_calls: Some(tool_calls),
             reasoning_content: None,
+            replay_state: None,
         }
     }
 

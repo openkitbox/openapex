@@ -27,7 +27,7 @@ use serde::Serialize;
 use super::ChatError;
 use crate::chat_completions::wire::{ChatCompletionsUsageProof, Usage};
 use crate::sse::SseDecoder;
-use ox_schema::support::Finite;
+use ox_schema::support::{Finite, Record};
 
 pub use crate::sse::SseFramer;
 
@@ -58,6 +58,10 @@ pub enum StreamEvent {
     },
     /// Token usage, usually in the trailing chunk with empty `choices`.
     Usage(Usage),
+    /// Opaque provider round-trip state, emitted only by a decoder that owns
+    /// wire data the engine cannot reconstruct (native Messages thinking
+    /// signatures). The engine persists it only after a successful finish.
+    ProviderState(Record),
     /// The `data: [DONE]` terminator.
     Done,
 }
@@ -303,6 +307,7 @@ impl Assembler {
             }
             StreamEvent::Finish { reason } => self.message.finish_reason = Some(reason.clone()),
             StreamEvent::Usage(usage) => self.message.usage = Some(*usage),
+            StreamEvent::ProviderState(_) => {}
             StreamEvent::Done => self.message.done = true,
         }
     }

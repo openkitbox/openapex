@@ -6,6 +6,7 @@ use crate::mctx::temporal;
 use ox_llm::chat_completions::wire::{
     ChatMessage, FunctionCall, FunctionType, ImageUrl, ToolCall, UserPart,
 };
+use ox_llm::messages::replay::from_provider_state;
 use ox_schema::message::{
     AssistantContent, Compaction, CompactionCompleted, CompactionMessage, Message, ToolState,
 };
@@ -439,6 +440,11 @@ pub(crate) fn build_chat_messages(
                 // interrupted/failed one to readable text
                 // (to-llm-message.ts:174-184).
                 let replay_reasoning = assistant.error.is_none() && !reasoning_interrupted;
+                // Native state is proof from this exact turn only. A failed or
+                // interrupted row keeps the old reasoning-as-text fallback.
+                let replay_state = replay_reasoning
+                    .then(|| from_provider_state(assistant.provider_state.as_ref()))
+                    .flatten();
                 for content in &assistant.content {
                     match content {
                         // Upstream `meaningful`: an empty text part carries
@@ -504,7 +510,7 @@ pub(crate) fn build_chat_messages(
                 if parts.is_empty() && tool_calls.is_empty() && !reasoning.is_empty() {
                     parts = std::mem::take(&mut reasoning);
                 }
-                if parts.is_empty() && tool_calls.is_empty() {
+                if parts.is_empty() && tool_calls.is_empty() && replay_state.is_none() {
                     continue;
                 }
                 out.push(ChatMessage::Assistant {
@@ -522,6 +528,7 @@ pub(crate) fn build_chat_messages(
                     } else {
                         Some(reasoning)
                     },
+                    replay_state,
                 });
                 out.extend(tool_results);
             }
@@ -644,4 +651,386 @@ struct ToolOutput<'a> {
 #[derive(serde::Serialize)]
 struct ToolError<'a> {
     error: &'a SessionError,
+}
+
+#[cfg(test)]
+mod messages_replay_tests {
+    use ox_core::projector;
+    use ox_db::Db;
+    use ox_llm::chat_completions::stream::StreamEvent;
+    use ox_llm::chat_completions::wire::{ChatMessage, ChatRequest};
+    use ox_llm::messages::replay::{MessagesOrigin, MessagesReplayState, ReplayBlock};
+    use ox_llm::messages::stream::MessagesDecoder;
+    use ox_llm::messages::wire::{MessagesPolicy, WireBlock, build_request};
+    use ox_llm::sse::SseDecoder;
+    use ox_schema::event::{DurableEnvelope, EventEnvelope, SessionEventData};
+    use ox_schema::message::{AssistantContent, Message, ToolState};
+    use ox_schema::support::{
+        Content as SchemaContent, FinishReason, LocationRef, ModelRef, MoneyUsd, Record,
+        TokenCache, TokenUsage,
+    };
+    use serde_json::{Value, json};
+
+    use super::build_chat_messages;
+
+    const PROVIDER: &str = "anthropic-native";
+    const ENDPOINT: &str = "https://messages.example/v1/messages";
+    const MODEL: &str = "claude-test";
+    const SESSION: &str = "session-replay";
+
+    fn replay_state() -> MessagesReplayState {
+        MessagesReplayState::new(
+            PROVIDER,
+            ENDPOINT,
+            MODEL,
+            vec![
+                ReplayBlock::Thinking {
+                    index: 0,
+                    thinking: "first thought".to_owned(),
+                    signature: "sig-alpha".to_owned(),
+                },
+                ReplayBlock::RedactedThinking {
+                    index: 1,
+                    data: "opaque-tail".to_owned(),
+                },
+            ],
+            Some(2),
+            Some(3),
+        )
+    }
+
+    fn row_with_replay(replay: MessagesReplayState) -> Message {
+        Message::Assistant(Box::new(ox_schema::message::AssistantMessage {
+            id: "assistant-1".to_owned(),
+            metadata: None,
+            time: ox_schema::message::AssistantTime {
+                created: 1,
+                streamed: None,
+                completed: Some(2),
+            },
+            agent: "apex".to_owned(),
+            model: ModelRef {
+                id: MODEL.to_owned(),
+                provider_id: PROVIDER.to_owned(),
+                variant: None,
+            },
+            content: vec![
+                AssistantContent::Reasoning {
+                    text: "first thought".to_owned(),
+                    state: None,
+                    time: None,
+                },
+                AssistantContent::Text {
+                    text: "answer".to_owned(),
+                    state: None,
+                },
+            ],
+            snapshot: None,
+            finish: None,
+            raw_finish: None,
+            provider_state: Some(replay.into_provider_state().expect("state serializes")),
+            cost: None,
+            tokens: None,
+            error: None,
+            retry: None,
+        }))
+    }
+
+    #[test]
+    fn replay_row_keeps_reasoning_text_when_the_current_route_cannot_replay() {
+        let messages = build_chat_messages("", "", &[], &[row_with_replay(replay_state())]);
+        let ChatMessage::Assistant {
+            reasoning_content,
+            replay_state,
+            ..
+        } = &messages[1]
+        else {
+            panic!("assistant row must render as an assistant message");
+        };
+        assert!(
+            replay_state.is_some(),
+            "the state stays attached for the endpoint that can use it"
+        );
+        assert_eq!(
+            reasoning_content.as_deref(),
+            Some("first thought"),
+            "a route that cannot replay native blocks must keep the old reasoning text"
+        );
+    }
+
+    fn envelope(seq: i64, kind: &str, data: SessionEventData) -> EventEnvelope<SessionEventData> {
+        EventEnvelope {
+            id: format!("event-{seq}"),
+            created: seq,
+            kind: kind.to_owned(),
+            data,
+            durable: Some(DurableEnvelope {
+                aggregate_id: SESSION.to_owned(),
+                seq,
+                version: 1,
+            }),
+            location: None,
+            metadata: None,
+        }
+    }
+
+    async fn project(db: &Db, seq: i64, kind: &str, data: SessionEventData) {
+        let event = envelope(seq, kind, data);
+        let tx = db.begin().await.expect("write transaction");
+        projector::project(&tx, &event)
+            .await
+            .expect("durable event projects");
+        tx.commit().await.expect("commit projection");
+    }
+
+    async fn reread(db: &Db) -> Vec<Message> {
+        let conn = db.acquire().await.expect("read connection");
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, type, data FROM session_message WHERE session_id = ?1 ORDER BY seq",
+            )
+            .await
+            .expect("session message query");
+        let mut rows = stmt.query([SESSION]).await.expect("rows");
+        let mut messages = Vec::new();
+        while let Some(row) = rows.next().await.expect("next row") {
+            let id = row.get::<String>(0).expect("id");
+            let kind = row.get::<String>(1).expect("kind");
+            let data = row.get::<String>(2).expect("data");
+            let mut value: Value = serde_json::from_str(&data).expect("row JSON");
+            Message::merge_row_columns(&id, &kind, &mut value);
+            messages.push(serde_json::from_value(value).expect("message"));
+        }
+        messages
+    }
+
+    fn first_turn_events() -> Vec<StreamEvent> {
+        let mut decoder = MessagesDecoder::new().with_replay(PROVIDER, ENDPOINT, MODEL);
+        let mut events = Vec::new();
+        for line in [
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":9}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"first thought"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"alpha"}}"#,
+            r#"{"type":"content_block_stop","index":0}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"opaque"}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"redacted_thinking","data":"-tail"}}"#,
+            r#"{"type":"content_block_stop","index":1}"#,
+            r#"{"type":"content_block_start","index":2,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"answer"}}"#,
+            r#"{"type":"content_block_stop","index":2}"#,
+            r#"{"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"call-1","name":"read","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"x\"}"}}"#,
+            r#"{"type":"content_block_stop","index":3}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":11}}"#,
+            r#"{"type":"message_stop"}"#,
+        ] {
+            decoder.decode(line, &mut events).expect("first-turn SSE");
+        }
+        events
+    }
+
+    #[tokio::test]
+    async fn two_round_messages_replay_survives_durable_rows() {
+        let events = first_turn_events();
+        let provider_state = events
+            .iter()
+            .find_map(|event| match event {
+                StreamEvent::ProviderState(state) => Some(state.clone()),
+                _ => None,
+            })
+            .expect("completed thinking blocks produce a provider state");
+        let mut reasoning = String::new();
+        let mut text = String::new();
+        let mut arguments = String::new();
+        let mut tool_id = None;
+        let mut tool_name = None;
+        for event in &events {
+            match event {
+                StreamEvent::ReasoningDelta(delta) => reasoning.push_str(delta),
+                StreamEvent::TextDelta(delta) => text.push_str(delta),
+                StreamEvent::ToolCallDelta {
+                    id,
+                    name,
+                    arguments: fragment,
+                    ..
+                } => {
+                    if let Some(id) = id {
+                        tool_id = Some(id.clone());
+                    }
+                    if let Some(name) = name {
+                        tool_name = Some(name.clone());
+                    }
+                    arguments.push_str(fragment);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(reasoning, "first thought");
+        assert_eq!(text, "answer");
+
+        let db = Db::open_in_memory().await.expect("ephemeral database");
+        project(
+            &db,
+            1,
+            "session.created",
+            SessionEventData::SessionCreated {
+                session_id: SESSION.to_owned(),
+                project_id: "project-1".to_owned(),
+                location: LocationRef {
+                    directory: "/work".to_owned(),
+                    workspace_id: None,
+                },
+                subpath: None,
+                parent_id: None,
+                slug: "replay".to_owned(),
+                title: None,
+                agent: None,
+                model: None,
+                metadata: None,
+                permissions: None,
+                version: "test".to_owned(),
+            },
+        )
+        .await;
+        project(
+            &db,
+            2,
+            "session.step.started",
+            SessionEventData::StepStarted {
+                session_id: SESSION.to_owned(),
+                assistant_message_id: "assistant-1".to_owned(),
+                agent: "apex".to_owned(),
+                model: ModelRef {
+                    id: MODEL.to_owned(),
+                    provider_id: PROVIDER.to_owned(),
+                    variant: None,
+                },
+                snapshot: None,
+                started: 1,
+            },
+        )
+        .await;
+        let tool_id = tool_id.expect("tool id from SSE");
+        let tool_name = tool_name.expect("tool name from SSE");
+        let tool_input: Record =
+            serde_json::from_value(serde_json::from_str(&arguments).expect("tool arguments"))
+                .expect("tool input record");
+        project(
+            &db,
+            3,
+            "session.message.content.updated",
+            SessionEventData::SessionMessageContentUpdated {
+                session_id: SESSION.to_owned(),
+                message_id: "assistant-1".to_owned(),
+                content: vec![
+                    AssistantContent::Reasoning {
+                        text: reasoning,
+                        state: None,
+                        time: None,
+                    },
+                    AssistantContent::Text { text, state: None },
+                    AssistantContent::Tool {
+                        id: tool_id.clone(),
+                        name: tool_name.clone(),
+                        executed: None,
+                        provider_state: None,
+                        provider_result_state: None,
+                        time: ox_schema::message::ToolTime {
+                            created: 1,
+                            ran: Some(2),
+                            completed: Some(3),
+                        },
+                        state: Box::new(ToolState::Completed {
+                            input: tool_input,
+                            content: vec![SchemaContent::Text {
+                                text: "done".to_owned(),
+                            }],
+                            metadata: None,
+                        }),
+                    },
+                ],
+            },
+        )
+        .await;
+        project(
+            &db,
+            4,
+            "session.step.ended",
+            SessionEventData::StepEnded {
+                session_id: SESSION.to_owned(),
+                assistant_message_id: "assistant-1".to_owned(),
+                finish: FinishReason::ToolCalls,
+                raw_finish: None,
+                provider_state: Some(provider_state),
+                cost: MoneyUsd::Int(0),
+                tokens: TokenUsage {
+                    input: 9,
+                    output: 11,
+                    reasoning: 3,
+                    cache: TokenCache { read: 0, write: 0 },
+                    estimated: None,
+                    reasoning_reported: None,
+                },
+                snapshot: None,
+                files: None,
+            },
+        )
+        .await;
+
+        let rows = reread(&db).await;
+        assert!(
+            rows.iter().any(|row| matches!(row, Message::Assistant(_))),
+            "session reread sees the assistant row"
+        );
+        let mut chat = build_chat_messages("", "", &[], &rows);
+        chat.push(ChatMessage::user("continue"));
+        let request = ChatRequest::new(MODEL, chat);
+        let body = build_request(
+            &request,
+            &MessagesPolicy::anthropic(),
+            &MessagesOrigin::new(PROVIDER, ENDPOINT),
+        )
+        .expect("second native Messages request");
+        let assistant = body
+            .messages
+            .iter()
+            .find(|message| message.role == "assistant")
+            .expect("replayed assistant message");
+        assert_eq!(
+            assistant.content,
+            vec![
+                WireBlock::Thinking {
+                    thinking: "first thought".to_owned(),
+                    signature: Some("sig-alpha".to_owned()),
+                },
+                WireBlock::RedactedThinking {
+                    data: "opaque-tail".to_owned(),
+                },
+                WireBlock::Text {
+                    text: "answer".to_owned(),
+                },
+                WireBlock::ToolUse {
+                    id: tool_id.clone(),
+                    name: tool_name,
+                    input: json!({"path": "x"}),
+                },
+            ],
+            "second turn carries the original signed/redacted blocks in order"
+        );
+        let result = body
+            .messages
+            .iter()
+            .find(|message| message.role == "user")
+            .expect("tool result turn");
+        assert!(
+            result.content.iter().any(|block| matches!(
+                block,
+                WireBlock::ToolResult { tool_use_id, content, .. }
+                    if tool_use_id == &tool_id && content.contains("done")
+            )),
+            "tool result matches the replayed tool_use"
+        );
+    }
 }

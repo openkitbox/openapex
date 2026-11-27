@@ -95,6 +95,7 @@ where
                 anyhow::bail!("hidden completion returned a tool call");
             }
             StreamEvent::Usage(reported) => usage = Some(reported),
+            StreamEvent::ProviderState(_) => {}
             StreamEvent::ReasoningDelta(_) | StreamEvent::Done => {}
         }
     }
