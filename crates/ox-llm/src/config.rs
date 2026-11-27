@@ -80,6 +80,7 @@ impl EndpointLimits {
 /// |---|---|
 /// | [`Protocol::ChatCompletions`] | `/v1/chat/completions` (and `/v1/models`) |
 /// | [`Protocol::Messages`] | `/v1/messages` (and `/v1/models`) |
+/// | [`Protocol::Responses`] | `/v1/responses` (and `/v1/models`) |
 ///
 /// `base_url` is still "the part before the version suffix": for a Messages
 /// endpoint that already carries its own path prefix (DeepSeek publishes
@@ -94,6 +95,9 @@ pub enum Protocol {
     /// Anthropic Messages (also served by DeepSeek under `/anthropic`).
     #[serde(rename = "messages")]
     Messages,
+    /// OpenAI Responses — a native wire shape, not Chat Completions.
+    #[serde(rename = "responses")]
+    Responses,
 }
 
 impl Protocol {
@@ -104,6 +108,7 @@ impl Protocol {
         match self {
             Self::ChatCompletions => "/v1/chat/completions",
             Self::Messages => "/v1/messages",
+            Self::Responses => "/v1/responses",
         }
     }
 
@@ -207,6 +212,9 @@ impl BuiltinProvider {
         match protocol {
             Protocol::ChatCompletions => self.completions_base_url,
             Protocol::Messages => self.messages_base_url,
+            // No builtin ships a Responses endpoint; an explicit base URL is
+            // required, so this empty value fails `LlmConfig::validate`.
+            Protocol::Responses => "",
         }
     }
 
@@ -506,11 +514,13 @@ impl LlmConfig {
                      `api_key` to use the builtin provider of that id"
                 );
             }
-            if provider.protocol() == Protocol::ChatCompletions
+            let protocol = provider.protocol();
+            if matches!(protocol, Protocol::ChatCompletions | Protocol::Responses)
                 && provider.base_url.ends_with("/v1")
             {
                 anyhow::bail!(
-                    "providers.{name}.base_url must not end with /v1: ox appends /v1/chat/completions itself"
+                    "providers.{name}.base_url must not end with /v1: ox appends {} itself",
+                    protocol.chat_path()
                 );
             }
             if !provider.base_url.starts_with("http://")
@@ -547,5 +557,74 @@ impl LlmConfig {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protocol_responses() {
+        let responses: Protocol =
+            serde_json::from_str("\"responses\"").expect("responses is a valid protocol name");
+        assert_eq!(responses, Protocol::Responses);
+        assert_eq!(responses.chat_path(), "/v1/responses");
+        assert_eq!(responses.models_path(), "/v1/models");
+
+        let builtin = builtin(DEEPSEEK).expect("the deepseek builtin exists");
+        assert_eq!(builtin.base_url(Protocol::Responses), "");
+        assert_eq!(
+            builtin.base_url(Protocol::ChatCompletions),
+            "https://api.deepseek.com"
+        );
+        assert_eq!(
+            builtin.base_url(Protocol::Messages),
+            "https://api.deepseek.com/anthropic"
+        );
+
+        let mut credentials = Credentials::default();
+        credentials.set(DEEPSEEK, "test-key");
+        let mut config = LlmConfig::default();
+        let section: ProviderConfig = serde_json::from_str(r#"{"protocol": "responses"}"#)
+            .expect("a builtin override only needs a protocol");
+        config.providers.insert(DEEPSEEK.to_owned(), section);
+        config.apply_credentials(&credentials);
+        let error = config
+            .validate()
+            .expect_err("a builtin-derived Responses endpoint has no base URL");
+        assert!(
+            error.to_string().contains("base_url is empty"),
+            "expected the empty base URL to be rejected, got {error}"
+        );
+
+        let mut config = LlmConfig::default();
+        let versioned: ProviderConfig = serde_json::from_str(
+            r#"{"base_url": "https://example.com/v1", "protocol": "responses"}"#,
+        )
+        .expect("a Responses endpoint with an explicit base URL");
+        config.providers.insert("responses".to_owned(), versioned);
+        let error = config
+            .validate()
+            .expect_err("a /v1 base URL would duplicate the Responses path");
+        assert!(
+            error.to_string().contains("/v1/responses"),
+            "expected the /v1 guard to name the Responses path, got {error}"
+        );
+
+        let chat: Protocol =
+            serde_json::from_str("\"chat_completions\"").expect("chat_completions stays valid");
+        assert_eq!(chat.chat_path(), "/v1/chat/completions");
+        let messages: Protocol =
+            serde_json::from_str("\"messages\"").expect("messages stays valid");
+        assert_eq!(messages.chat_path(), "/v1/messages");
+
+        let mut config = LlmConfig::default();
+        let plain: ProviderConfig = serde_json::from_str(r#"{"base_url": "https://example.com"}"#)
+            .expect("a plain Chat Completions endpoint");
+        config.providers.insert("plain".to_owned(), plain);
+        config
+            .validate()
+            .expect("a plain Chat Completions endpoint stays valid");
     }
 }

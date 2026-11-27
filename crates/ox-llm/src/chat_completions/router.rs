@@ -22,6 +22,7 @@ use super::limit::LimitedChat;
 use super::wire::ChatRequest;
 use crate::messages::client::MessagesClient;
 use crate::messages::wire::MessagesPolicy;
+use crate::responses::client::ResponsesClient;
 
 /// One resolved fallback target: a chat transport plus the wire model to
 /// request on it.
@@ -208,6 +209,11 @@ fn client_for(name: &str, provider: &ProviderConfig) -> Result<Arc<dyn Chat>, Ch
             MessagesPolicy::for_provider(name),
             stall,
         )?),
+        Protocol::Responses => Arc::new(ResponsesClient::new(
+            provider.base_url.clone(),
+            provider.api_key.clone(),
+            stall,
+        )?),
     })
 }
 
@@ -253,5 +259,38 @@ pub(crate) fn should_failover(error: &ChatError) -> bool {
         | ChatError::Upstream(_)
         | ChatError::EarlyClose
         | ChatError::Sse(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::client_for;
+    use crate::config::{EndpointLimits, LlmConfig, Protocol, ProviderConfig};
+
+    fn provider(protocol: Protocol) -> ProviderConfig {
+        ProviderConfig {
+            base_url: "https://api.openai.com".to_owned(),
+            api_key: Some("test-key".to_owned()),
+            protocol: Some(protocol),
+            limits: EndpointLimits::default(),
+        }
+    }
+
+    #[test]
+    fn protocol_responses_selects_client() {
+        assert!(client_for("responses", &provider(Protocol::Responses)).is_ok());
+        assert!(client_for("chat", &provider(Protocol::ChatCompletions)).is_ok());
+        assert!(client_for("messages", &provider(Protocol::Messages)).is_ok());
+
+        // Existing config validation rejects an empty Responses base URL.
+        let mut config = LlmConfig::default();
+        config.providers.insert(
+            "responses".to_owned(),
+            ProviderConfig {
+                base_url: String::new(),
+                ..provider(Protocol::Responses)
+            },
+        );
+        assert!(config.validate().is_err());
     }
 }
