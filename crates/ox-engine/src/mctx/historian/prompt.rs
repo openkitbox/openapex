@@ -611,6 +611,21 @@ fn ordinal_index(blocks: &[ChunkBlock]) -> String {
     lines.join("\n")
 }
 
+/// The already-rendered prefix fragments a hidden request reuses, plus the
+/// hidden call's own role prompt and task instruction. Every field is a borrow:
+/// the constructor never re-renders the transcript or copies tool schemas.
+pub struct PrefixRequest<'a> {
+    pub model: &'a ox_schema::support::ModelRef,
+    pub system_static: &'a str,
+    pub instructions: &'a str,
+    pub head: &'a [Option<&'a str>],
+    pub region: &'a [Message],
+    pub tools: &'a Arc<Vec<ToolDef>>,
+    pub role_prompt: &'a str,
+    pub instruction: &'a str,
+    pub reasoning_effort: Option<&'a str>,
+}
+
 /// The task **instruction** for the prefix-reusing shape
 /// ([`prefixed_request`]): the conversation above the instruction *is* the
 /// segment to fold, so the tail only has to say what the input is, which ordinals
@@ -704,21 +719,14 @@ pub fn build_prefixed_instruction(
 /// call still running at the cut gets the same synthesized placeholder in both
 /// lists. `prefixed_request_stays_a_prefix_across_a_tool_call_cut` pins both
 /// shapes on the serialized Messages body.
-#[allow(clippy::too_many_arguments)] // `build_chat_messages`' four inputs, plus the historian's own four.
 #[must_use]
-pub fn prefixed_request(
-    model: &ox_schema::support::ModelRef,
-    system_static: &str,
-    instructions: &str,
-    head: &[Option<&str>],
-    region: &[Message],
-    tools: &Arc<Vec<ToolDef>>,
-    historian_system: &str,
-    instruction: &str,
-    reasoning_effort: Option<&str>,
-) -> ChatRequest {
-    let mut messages =
-        crate::runner::step::build_chat_messages(system_static, instructions, head, region);
+pub fn prefixed_request(input: PrefixRequest<'_>) -> ChatRequest {
+    let mut messages = crate::runner::step::build_chat_messages(
+        input.system_static,
+        input.instructions,
+        input.head,
+        input.region,
+    );
     // The task rides *after* the prefix as a single user turn, carrying the
     // historian's role prompt in its text. It must not be an interleaved
     // `System` message: a Messages endpoint reads an in-history system as the
@@ -727,12 +735,12 @@ pub fn prefixed_request(
     // cached prefix. Measured on DeepSeek with the interleaved shape: 1,920 of
     // 26,275 prompt tokens served from cache, i.e. only the tools block.
     messages.push(ChatMessage::User {
-        content: format!("{historian_system}\n\n{instruction}").into(),
+        content: format!("{}\n\n{}", input.role_prompt, input.instruction).into(),
     });
-    let mut request = ChatRequest::new(model.id.clone(), messages);
-    request.tools = Arc::clone(tools);
+    let mut request = ChatRequest::new(input.model.id.clone(), messages);
+    request.tools = Arc::clone(input.tools);
     request.tool_choice = ToolChoice::None;
-    request.apply_reasoning_effort(reasoning_effort);
+    request.apply_reasoning_effort(input.reasoning_effort);
     request
 }
 
@@ -808,4 +816,66 @@ pub fn build_historian_repair_prompt(
         previous_output,
     ]
     .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ox_schema::message::{Message, TimeCreated};
+    use ox_schema::support::ModelRef;
+
+    #[test]
+    fn prefixed_request_reuses_the_live_builder() {
+        let model = ModelRef {
+            id: "model".to_owned(),
+            provider_id: "provider".to_owned(),
+            variant: None,
+        };
+        let system_static = "STATIC";
+        let instructions = "INSTRUCTIONS";
+        let head = [Some("M0"), Some("M1")];
+        let rows = [Message::Synthetic {
+            id: "row".to_owned(),
+            metadata: None,
+            time: TimeCreated { created: 0 },
+            text: "transcript".to_owned(),
+            description: None,
+        }];
+        let tools = Arc::new(vec![ToolDef::function(
+            "read",
+            "read files",
+            serde_json::json!({"type": "object"}),
+        )]);
+        let live =
+            crate::runner::step::build_chat_messages(system_static, instructions, &head, &rows);
+        let request = prefixed_request(PrefixRequest {
+            model: &model,
+            system_static,
+            instructions,
+            head: &head,
+            region: &rows,
+            tools: &tools,
+            role_prompt: "ROLE",
+            instruction: "INSTRUCTION",
+            reasoning_effort: None,
+        });
+        assert_eq!(
+            request.messages.len(),
+            live.len() + 1,
+            "the hidden call adds exactly one tail turn"
+        );
+        assert_eq!(
+            &request.messages[..live.len()],
+            live.as_slice(),
+            "the prefix must be the live renderer's bytes"
+        );
+        match request.messages.last() {
+            Some(ChatMessage::User { content }) => {
+                assert_eq!(content.as_str(), "ROLE\n\nINSTRUCTION")
+            }
+            other => panic!("unexpected tail message: {other:?}"),
+        }
+        assert!(!request.tools.is_empty(), "tools must stay in the prefix");
+        assert_eq!(request.tool_choice, ToolChoice::None);
+    }
 }

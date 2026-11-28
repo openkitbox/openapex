@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
+use crate::mctx::cache::{CacheBustReason, PassOutcome};
 use crate::mctx::temporal;
 use ox_llm::chat_completions::wire::{
     ChatMessage, FunctionCall, FunctionType, ImageUrl, ToolCall, UserPart,
@@ -33,6 +34,8 @@ pub(crate) struct MctxDiagnostic {
     pub m0_hash: u64,
     pub m1_hash: u64,
     pub mctx_head_hash: u64,
+    pub bust_reason: Option<CacheBustReason>,
+    pub bust_hard: bool,
 }
 
 #[cfg(test)]
@@ -175,7 +178,12 @@ fn hash_head(m0: Option<&str>, m1: Option<&str>) -> u64 {
     hash
 }
 
-fn mctx_diagnostic(m0: Option<&str>, m1: Option<&str>, outcome: &'static str) -> MctxDiagnostic {
+fn mctx_diagnostic(
+    m0: Option<&str>,
+    m1: Option<&str>,
+    outcome: &'static str,
+    bust: Option<(CacheBustReason, bool)>,
+) -> MctxDiagnostic {
     let m0_bytes = m0.map_or(0, str::len);
     let m1_bytes = m1.map_or(0, str::len);
     MctxDiagnostic {
@@ -186,6 +194,8 @@ fn mctx_diagnostic(m0: Option<&str>, m1: Option<&str>, outcome: &'static str) ->
         m0_hash: hash_bytes(m0.unwrap_or("").as_bytes()),
         m1_hash: hash_bytes(m1.unwrap_or("").as_bytes()),
         mctx_head_hash: hash_head(m0, m1),
+        bust_reason: bust.map(|(reason, _)| reason),
+        bust_hard: bust.is_some_and(|(_, hard)| hard),
     }
 }
 
@@ -231,7 +241,7 @@ async fn mctx_head_with(
             m0: None,
             m1: None,
             floor: 0,
-            diagnostic: mctx_diagnostic(None, None, "disabled"),
+            diagnostic: mctx_diagnostic(None, None, "disabled", None),
         };
     }
     let last_seq = match latest_seq(&ctx.db, &ctx.session_id).await {
@@ -242,11 +252,12 @@ async fn mctx_head_with(
                 m0: None,
                 m1: None,
                 floor: 0,
-                diagnostic: mctx_diagnostic(None, None, "failed"),
+                diagnostic: mctx_diagnostic(None, None, "failed", None),
             };
         }
     };
     let project = ctx.directory.to_string_lossy().into_owned();
+    let tools = ctx.tools.definitions_shared();
     let request = crate::mctx::pass::PassRequest {
         db: &ctx.db,
         session_id: &ctx.session_id,
@@ -265,6 +276,7 @@ async fn mctx_head_with(
         ),
         provider_id: &model.provider_id,
         model_id: &model.id,
+        tools: &tools,
     };
     let result = match execution {
         Execution::Commit => crate::mctx::pass::run(request).await,
@@ -274,13 +286,25 @@ async fn mctx_head_with(
     };
     match result {
         Ok(result) => {
+            let bust = match &result.outcome {
+                PassOutcome::DeferReplayed { .. } => None,
+                PassOutcome::BustApplied { hard, reason, .. } => Some((*reason, *hard)),
+            };
+            // The commit pass is the only writer: a preview must not count a
+            // bust that the pass itself did not apply.
+            if execution == Execution::Commit
+                && let Some((reason, hard)) = bust
+            {
+                ctx.cache_ledger.record_bust(&ctx.session_id, reason, hard);
+            }
             let diagnostic = mctx_diagnostic(
                 result.head_m0.as_deref(),
                 result.head_m1.as_deref(),
                 match &result.outcome {
-                    crate::mctx::cache::PassOutcome::DeferReplayed { .. } => "defer_replayed",
-                    crate::mctx::cache::PassOutcome::BustApplied { .. } => "bust_applied",
+                    PassOutcome::DeferReplayed { .. } => "defer_replayed",
+                    PassOutcome::BustApplied { .. } => "bust_applied",
                 },
+                bust,
             );
             MctxHead {
                 m0: result.head_m0,
@@ -299,7 +323,7 @@ async fn mctx_head_with(
                 m0: None,
                 m1: None,
                 floor: 0,
-                diagnostic: mctx_diagnostic(None, None, "failed"),
+                diagnostic: mctx_diagnostic(None, None, "failed", None),
             }
         }
     }
@@ -321,6 +345,7 @@ impl DrainCtx {
             return Ok((None, None, rows));
         }
         let project = self.directory.to_string_lossy();
+        let tools = self.tools.definitions_shared();
         let request = crate::mctx::pass::PassRequest {
             db: &self.db,
             session_id: &self.session_id,
@@ -337,6 +362,7 @@ impl DrainCtx {
             ),
             provider_id: &model.provider_id,
             model_id: &model.id,
+            tools: &tools,
         };
         let (m0, m1, floor, applied) = match crate::mctx::pass::preview(request).await {
             Ok((head, applied)) => (head.head_m0, head.head_m1, head.floor, applied),

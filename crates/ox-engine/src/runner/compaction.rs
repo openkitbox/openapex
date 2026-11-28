@@ -8,10 +8,10 @@
 //! 1. `session.compaction.started` → the projector appends a `running`
 //!    compaction row (also the background-fold in-flight marker).
 //! 2. The session transcript (from the latest completed compaction onward)
-//!    becomes a tools-free chat request: a fixed summarization system
-//!    prompt, the transcript as user/assistant messages, then the summary
-//!    instruction as the final user turn (upstream appends the same prompt
-//!    user message in `summarize`). The reply streams as ephemeral
+//!    becomes a cache-safe chat request: the live system layers, head and tool
+//!    definitions are reused, and the summary instruction rides as the final
+//!    user turn. Off-boundary hierarchical segments stay flat (their bytes
+//!    cannot match the live prefix). The reply streams as ephemeral
 //!    `session.compaction.delta` events.
 //! 3. `session.compaction.ended {text}` settles the running row to
 //!    `completed` with the summary (on failure `session.compaction.failed`
@@ -32,15 +32,17 @@ use ox_db::Db;
 use ox_llm::chat_completions::wire::{ChatMessage, ChatRequest};
 use ox_schema::event::SessionEventData;
 use ox_schema::id::now_millis;
-use ox_schema::message::CompactionReason;
+use ox_schema::message::{Compaction, CompactionReason, Message, TimeCreated};
 use ox_schema::support::{ModelRef, Record, SessionError};
 use tokio_util::sync::CancellationToken;
 
 use super::drain::DrainCtx;
 use super::fold_input;
 use super::historian_trigger::prompt_tokens;
+use super::instructions;
 use super::resolve_selection;
 use super::unknown_error;
+use crate::mctx::historian::{PrefixRequest, prefixed_request};
 
 /// The compaction request's system prompt. Upstream routes the summarization
 /// through a dedicated `compaction` agent whose system prompt is exactly
@@ -79,6 +81,26 @@ fn summary_prompt_for(transcript: &[ChatMessage]) -> &'static str {
     let has_checkpoint = transcript.iter().any(|message| {
         matches!(message, ChatMessage::User { content }
             if content.as_str().starts_with("<conversation-checkpoint>"))
+    });
+    if has_checkpoint {
+        UPDATE_PROMPT
+    } else {
+        SUMMARY_PROMPT
+    }
+}
+
+/// The same choice from the unrendered rows, so the cache-safe path renders
+/// the transcript exactly once. The builder drops rows before the latest
+/// completed checkpoint, so only rows at or after that boundary can put a
+/// checkpoint in the request — the same rows this check inspects.
+#[must_use]
+fn summary_prompt_for_rows(rows: &[Message]) -> &'static str {
+    let boundary = super::step::compaction_boundary(rows.iter());
+    let has_checkpoint = rows.iter().skip(boundary).any(|message| {
+        matches!(
+            message,
+            Message::Compaction(message) if matches!(&message.compaction, Compaction::Completed(_))
+        )
     });
     if has_checkpoint {
         UPDATE_PROMPT
@@ -302,6 +324,28 @@ async fn guard_compaction_for(
     Ok(())
 }
 
+/// Reserve at least this many output tokens before admission: a summary that
+/// gets no room cannot fill the template, so retrying it only burns a prefix.
+const SUMMARY_RESERVE_FLOOR: u64 = 16_000;
+/// Fraction of the physical shared window held back for the summary reply.
+const SUMMARY_RESERVE_RATIO: u64 = 15; // percent
+
+/// Pure output reservation for a summary: `ceil(window * 15%)`, never below
+/// [`SUMMARY_RESERVE_FLOOR`], capped by the caller's own limit. `None` window
+/// fails closed — no invented output budget when the provider did not declare
+/// one.
+#[must_use]
+fn summary_reserve(window: Option<u64>, requested: Option<u64>) -> Option<u64> {
+    let window = window?;
+    let ratio = ((u128::from(window) * u128::from(SUMMARY_RESERVE_RATIO)).div_ceil(100))
+        .min(u128::from(u64::MAX)) as u64;
+    Some(
+        ratio
+            .max(SUMMARY_RESERVE_FLOOR)
+            .min(requested.unwrap_or(u64::MAX)),
+    )
+}
+
 /// Apply admission and output reservation to the actual compaction request.
 fn apply_compaction_budget(
     ctx: &DrainCtx,
@@ -315,8 +359,21 @@ fn apply_compaction_budget(
     if limits.stale {
         anyhow::bail!("catalog limits are stale");
     }
-    if limits.shared_context.tokens().is_none() {
+    let window = limits.shared_context.tokens();
+    if window.is_none() {
         anyhow::bail!("shared context capacity is unknown");
+    }
+    // Reserve the summary's reply before admission so the guarded input fits
+    // *with* that reply. An existing cap from a previous rung is a requested
+    // limit too: taking the minimum keeps the overflow ladder's shrink instead
+    // of restoring the original reserve on every retry.
+    let requested = match (request.max_tokens, limits.output.tokens()) {
+        (Some(current), Some(output)) => Some(current.min(output)),
+        (Some(current), None) | (None, Some(current)) => Some(current),
+        (None, None) => None,
+    };
+    if let Some(reserve) = summary_reserve(window, requested) {
+        request.max_tokens = Some(reserve);
     }
     // One measurement of the final request: `apply` owns admission and returns
     // the same bill its decision used, so the media guard needs no second pass.
@@ -429,6 +486,11 @@ async fn stream_summary(
         };
         failure(kind, format!("compaction completion failed: {error:#}"))
     })?;
+    // Hidden callers have no session usage ledger; the shared logger records
+    // provider-reported cache reads/writes for the prefix this request reused.
+    if let Some(usage) = completion.usage {
+        crate::completion::log_hidden_usage("compaction", &usage);
+    }
     Ok(completion.text)
 }
 
@@ -670,7 +732,57 @@ impl OverflowLadder {
     }
 }
 
-/// The summarization proper over a given transcript: build the request,
+/// The session's frozen instruction render, reused byte-for-byte as system[1]
+/// of a cache-safe summary. A compaction can run in a fresh process where no
+/// step has baselined the session yet; in that case observe the sources and
+/// install the same baseline the next step would use (fails closed if the
+/// observations cannot be read).
+async fn summary_instructions(ctx: &DrainCtx) -> anyhow::Result<std::sync::Arc<str>> {
+    if let Some(baseline) = super::lock(&ctx.instruction_baselines).get(&ctx.session_id) {
+        return Ok(std::sync::Arc::clone(&baseline.initial_render));
+    }
+    let observed = ctx.observe_sources().await?;
+    let mut baselines = super::lock(&ctx.instruction_baselines);
+    Ok(std::sync::Arc::clone(
+        &baselines
+            .entry(ctx.session_id.clone())
+            .or_insert_with(|| instructions::baseline(&observed))
+            .initial_render,
+    ))
+}
+
+/// The cache-safe summarization request: the same system layers, head and
+/// tools the live step sent, followed by the role-scoped summary instruction
+/// as one user turn. The region is the already-loaded transcript; the shared
+/// builder renders it exactly once here, and tool outputs are tiered in place
+/// on the finished request. The instruction is chosen from the raw rows, so
+/// a completed checkpoint cannot be missed by skipping the render.
+async fn prefixed_summary_request(
+    ctx: &DrainCtx,
+    model: &ModelRef,
+    m0: Option<&str>,
+    m1: Option<&str>,
+    rows: &[Message],
+) -> anyhow::Result<ChatRequest> {
+    let system_static = ctx.system_static();
+    let instructions = summary_instructions(ctx).await?;
+    let tools = ctx.tools.definitions_shared();
+    let mut request = prefixed_request(PrefixRequest {
+        model,
+        system_static: &system_static,
+        instructions: &instructions,
+        head: &[m0, m1],
+        region: rows,
+        tools: &tools,
+        role_prompt: COMPACTION_SYSTEM,
+        instruction: summary_prompt_for_rows(rows),
+        reasoning_effort: model.variant.as_deref(),
+    });
+    fold_input::tighten_tool_outputs(&mut request.messages);
+    Ok(request)
+}
+
+/// The summarization proper over a given transcript: reuse the live prefix,
 /// stream it, re-ask once when the reply skipped the template. Split from
 /// [`summarize`] so the background fold can feed its snapshot (plan D4).
 /// `emit_deltas` is the blocking path's wire contract (`started → delta →
@@ -684,13 +796,37 @@ async fn summarize_transcript(
     model: &ModelRef,
     m0: Option<&str>,
     m1: Option<&str>,
-    rows: &[ox_schema::message::Message],
+    rows: &[Message],
     emit_deltas: bool,
 ) -> std::result::Result<String, SessionError> {
-    let mut messages = super::step::build_chat_messages(COMPACTION_SYSTEM, "", &[m0, m1], rows);
-    fold_input::tighten_tool_outputs(&mut messages);
-    let request = summarization_request(model, &messages);
+    let request = prefixed_summary_request(ctx, model, m0, m1, rows)
+        .await
+        .map_err(|error| unknown_error(error.to_string()))?;
     summarized_reply(ctx, request, &model.provider_id, emit_deltas).await
+}
+
+/// The flat fallback for one off-boundary chunk: the transcript is rendered
+/// under the compaction system prompt alone, with no tools. A segment starts
+/// at an arbitrary row, not at the live head boundary, so its bytes cannot
+/// match the live prefix — pretending otherwise would only produce a full
+/// miss. The blocking path and the final consolidation use
+/// [`summarize_transcript`] instead.
+async fn summarize_flat(
+    ctx: &DrainCtx,
+    model: &ModelRef,
+    messages: &[ChatMessage],
+    emit_deltas: bool,
+) -> std::result::Result<String, SessionError> {
+    let request = summarization_request(model, messages);
+    summarized_reply(ctx, request, &model.provider_id, emit_deltas).await
+}
+
+/// Render one off-boundary chunk the flat way: summary system prompt, no
+/// working layers, tiered tool outputs.
+fn flat_summary_input(rows: &[Message]) -> Vec<ChatMessage> {
+    let mut messages = super::step::build_chat_messages(COMPACTION_SYSTEM, "", &[], rows);
+    fold_input::tighten_tool_outputs(&mut messages);
+    messages
 }
 
 /// The global pass's input: every segment's summary under one `[seq a..b]`
@@ -746,27 +882,34 @@ async fn summarize_hierarchical(
     let chunks = chunk_rows(rows, count_tokens);
     if chunks.len() <= 1 {
         let messages = decode(chunks.first().copied().unwrap_or(&[]))?;
-        return summarize_transcript(ctx, model, None, None, &messages, false).await;
+        return summarize_flat(ctx, model, &flat_summary_input(&messages), false).await;
     }
     let mut segments: Vec<(i64, i64, String)> = Vec::with_capacity(chunks.len());
     for chunk in &chunks {
         let messages = decode(chunk)?;
-        let summary = summarize_transcript(ctx, model, None, None, &messages, false).await?;
+        let summary = summarize_flat(ctx, model, &flat_summary_input(&messages), false).await?;
         let start = chunk.first().map_or(0, |(seq, _)| *seq);
         let end = chunk.last().map_or(0, |(seq, _)| *seq);
         segments.push((start, end, summary));
     }
     let input = segment_details(&segments);
     let segment_tokens = count_tokens(&input);
-    // The global pass: the segment summaries are the transcript; the summary
-    // instruction is the same verbatim SUMMARY_PROMPT the flat path asks.
-    let request = summarization_request(
-        model,
-        &[ChatMessage::User {
-            content: input.into(),
-        }],
-    );
-    let global = summarized_reply(ctx, request, &model.provider_id, false).await?;
+    // The global pass: the segment summaries are the transcript. The blocking
+    // path picks UPDATE_PROMPT when its rows carry a completed checkpoint;
+    // these segment rows are plain text with no checkpoint, so the final
+    // consolidation asks the first-time SUMMARY_PROMPT.
+    // No head preview exists on this background path, so the prefix ends at
+    // system[1]. The segment text rides as one synthetic user row — the
+    // builder renders it as the region before the instruction tail, with the
+    // session's live system layers and tools intact.
+    let region = [Message::Synthetic {
+        id: "hierarchical-summary-input".to_owned(),
+        metadata: None,
+        time: TimeCreated { created: 0 },
+        text: input,
+        description: None,
+    }];
+    let global = summarize_transcript(ctx, model, None, None, &region, false).await?;
     // The consolidation is the checkpoint. The segment count is the one number
     // that says whether the fold's input range was right: an incremental fold
     // sees one or two segments, and a rising count means it is re-reading rows
@@ -1754,5 +1897,62 @@ mod carry_forward_tests {
     fn no_previous_summary_leaves_bytes_unchanged() {
         let new = "## Requirements  \n- keep  trailing spaces\n\n## Notes\n";
         assert_eq!(carry_forward_sections(new, ""), new);
+    }
+}
+
+#[cfg(test)]
+mod reserve_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_window_fails_closed() {
+        assert_eq!(summary_reserve(None, Some(1_000)), None);
+    }
+
+    #[test]
+    fn small_window_uses_the_floor() {
+        assert_eq!(
+            summary_reserve(Some(10_000), None),
+            Some(SUMMARY_RESERVE_FLOOR)
+        );
+    }
+
+    #[test]
+    fn large_window_uses_the_ceilinged_ratio() {
+        assert_eq!(summary_reserve(Some(200_001), None), Some(30_001));
+    }
+
+    #[test]
+    fn requested_limit_caps_the_reserve() {
+        assert_eq!(summary_reserve(Some(200_000), Some(1_000)), Some(1_000));
+    }
+
+    #[test]
+    fn raw_rows_with_completed_checkpoint_select_update_prompt() {
+        use ox_schema::message::{CompactionCompleted, CompactionMessage};
+
+        let rows = [Message::Compaction(CompactionMessage {
+            id: "cp".to_owned(),
+            metadata: None,
+            time: TimeCreated { created: 1 },
+            compaction: Compaction::Completed(Box::new(CompactionCompleted {
+                reason: CompactionReason::Manual,
+                model: None,
+                provider_state: None,
+                summary: "## Objective\n- done".to_owned(),
+                recent: String::new(),
+                provider_context: None,
+                cost: None,
+                tokens: None,
+            })),
+        })];
+        let rendered = crate::runner::step::build_chat_messages("", "", &[], &rows);
+        assert_eq!(
+            summary_prompt_for_rows(&rows),
+            summary_prompt_for(&rendered),
+            "raw-row choice must match the rendered transcript's choice"
+        );
+        assert_eq!(summary_prompt_for_rows(&rows), UPDATE_PROMPT);
+        assert_eq!(summary_prompt_for_rows(&[]), SUMMARY_PROMPT);
     }
 }

@@ -5,10 +5,10 @@
 //! each pass into an [`Action`] and renders byte-complete units; the kernel
 //! owns freeze/replay/coordinator/durability/version.** This module provides:
 //!
-//! - [`classify`] — the signal → Action table (MVP: Hard on the first pass,
-//!   on boundary loss, or on an explicit forced request; SoftPlus otherwise;
-//!   the compartment/coverage `Soft` classifier arrives with the render
-//!   tasks).
+//! - [`classify`] — the signal → Action table (Hard on the first pass, on
+//!   boundary loss, or on an explicit forced request; Soft when the delta
+//!   changed; SoftPlus otherwise). A bust also carries the reason it was
+//!   chosen for ([`CacheBustReason`]) and whether it was Hard.
 //! - [`HeadRenderer`] — the render handoff seam (the real prompt renderer
 //!   lands with the m[0]/m[1] tasks; [`TrivialRenderer`] keeps the state
 //!   machine exercisable end-to-end until then).
@@ -24,6 +24,62 @@ use super::cache_core::{
 use anyhow::Context as _;
 
 use ox_db::{Db, optional};
+
+/// Why a pass busted the cached prefix, in the order the diagnostics count it.
+///
+/// Public only because it appears in [`Signals`] and [`PassOutcome`] fields;
+/// the reason is still produced and consumed entirely inside ox-engine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CacheBustReason {
+    FirstPass,
+    Forced,
+    Reconcile,
+    Checkpoint,
+    Identity,
+    CalibrationPressure,
+    Pressure,
+    Delta,
+    #[default]
+    Other,
+}
+
+/// Labels for every [`CacheBustReason`], indexed by [`bust_reason_index`].
+pub const BUST_REASON_LABELS: [&str; 9] = [
+    "first_pass",
+    "forced",
+    "reconcile",
+    "checkpoint",
+    "identity",
+    "calibration_pressure",
+    "pressure",
+    "delta",
+    "other",
+];
+
+/// Number of counted bust reasons (the width of the ledger's reason array).
+pub(crate) const BUST_REASON_COUNT: usize = BUST_REASON_LABELS.len();
+
+/// The ledger slot for one reason. Pure: no I/O and no global state.
+#[must_use]
+pub(crate) fn bust_reason_index(reason: CacheBustReason) -> usize {
+    match reason {
+        CacheBustReason::FirstPass => 0,
+        CacheBustReason::Forced => 1,
+        CacheBustReason::Reconcile => 2,
+        CacheBustReason::Checkpoint => 3,
+        CacheBustReason::Identity => 4,
+        CacheBustReason::CalibrationPressure => 5,
+        CacheBustReason::Pressure => 6,
+        CacheBustReason::Delta => 7,
+        CacheBustReason::Other => 8,
+    }
+}
+
+/// The log label for one reason, matching its ledger slot.
+#[must_use]
+pub(crate) fn bust_reason_label(reason: CacheBustReason) -> &'static str {
+    BUST_REASON_LABELS[bust_reason_index(reason)]
+}
 
 /// Full mctx cache error type: `thiserror` plumbing (see `McCacheError`).
 #[derive(Debug, thiserror::Error)]
@@ -65,6 +121,9 @@ pub struct Signals {
     /// Only the delta (`m1`) differs from the frozen bytes: new coverage
     /// arrived and the frozen baseline is still valid.
     pub delta_changed: bool,
+    /// Why this pass busted, or a placeholder on a defer. Set by the caller
+    /// from its own predicates; classification and the core never infer it.
+    pub bust_reason: CacheBustReason,
     pub completed_compaction: Option<CompactionIdentity>,
 }
 
@@ -227,6 +286,11 @@ pub enum PassOutcome {
     BustApplied {
         /// The cached prefix after the pass.
         prefix: String,
+        /// Whether the whole baseline was rebuilt (Hard) rather than only the
+        /// volatile delta (Soft).
+        hard: bool,
+        /// The caller's reason for this bust, for diagnostics and the ledger.
+        reason: CacheBustReason,
     },
 }
 
@@ -235,9 +299,12 @@ impl PassOutcome {
     #[must_use]
     pub fn prefix(&self) -> Option<&str> {
         match self {
-            PassOutcome::DeferReplayed { prefix } | PassOutcome::BustApplied { prefix } => {
-                Some(prefix)
-            }
+            PassOutcome::DeferReplayed { prefix }
+            | PassOutcome::BustApplied {
+                prefix,
+                hard: _,
+                reason: _,
+            } => Some(prefix),
         }
     }
 }
@@ -449,7 +516,43 @@ pub(crate) fn transition(
     let prefix = state.cached_prefix_bytes();
     let outcome = match result.action {
         Action::SoftPlus => PassOutcome::DeferReplayed { prefix },
-        Action::Soft | Action::Hard => PassOutcome::BustApplied { prefix },
+        Action::Soft | Action::Hard => PassOutcome::BustApplied {
+            prefix,
+            hard: result.action == Action::Hard,
+            reason: signals.bust_reason,
+        },
     };
     (state, outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BUST_REASON_COUNT, BUST_REASON_LABELS, CacheBustReason, bust_reason_index,
+        bust_reason_label,
+    };
+
+    #[test]
+    fn bust_reasons_have_distinct_slots_and_labels() {
+        let reasons = [
+            CacheBustReason::FirstPass,
+            CacheBustReason::Forced,
+            CacheBustReason::Reconcile,
+            CacheBustReason::Checkpoint,
+            CacheBustReason::Identity,
+            CacheBustReason::CalibrationPressure,
+            CacheBustReason::Pressure,
+            CacheBustReason::Delta,
+            CacheBustReason::Other,
+        ];
+        assert_eq!(reasons.len(), BUST_REASON_COUNT);
+        for (index, reason) in reasons.into_iter().enumerate() {
+            assert_eq!(
+                bust_reason_index(reason),
+                index,
+                "{reason:?} has its own slot"
+            );
+            assert_eq!(bust_reason_label(reason), BUST_REASON_LABELS[index]);
+        }
+    }
 }

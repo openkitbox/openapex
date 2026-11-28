@@ -13,6 +13,8 @@ use std::sync::{Mutex, MutexGuard};
 use ox_llm::chat_completions::wire::{ChatRequest, Usage};
 use ox_schema::support::{TokenCache, TokenUsage};
 
+use crate::mctx::cache::{BUST_REASON_COUNT, CacheBustReason, bust_reason_index};
+
 use super::super::drain::DrainCtx;
 
 /// The prompt split the provider reported: `(cache read, uncached input)`,
@@ -35,19 +37,21 @@ fn prompt_split(usage: &Usage) -> (i64, i64) {
 /// How one session's prompts were served, accumulated over its settled
 /// attempts.
 ///
-/// A `folds` counter is deliberately absent. A fold reaches a pass as
-/// `Action::Hard`, and `PassOutcome` collapses that together with
-/// `Action::Soft` into one `BustApplied` (`crate::mctx::cache`), while the
-/// runner's only pass call site (`mctx_head`) keeps just the head halves and
-/// the floor and never reads `PassResult::outcome`. Counting folds would need a
-/// `PassOutcome` that tells a hard rebuild from a soft delta, or a fold mark
-/// carried on the pass request.
+/// Bust counters are recorded by the commit pass from `PassOutcome` (which now
+/// carries both the hard/soft distinction and the reason), not from provider
+/// usage: a cache miss does not imply a local bust and vice versa.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SessionCache {
     /// Prompt tokens the provider served from its prefix cache.
     pub read: i64,
     /// Input tokens the provider had to prefill (`prompt_tokens - cached`).
     pub uncached: i64,
+    /// Bust passes committed for this session.
+    pub busts: u64,
+    /// Bust passes that rebuilt the whole baseline (`Action::Hard`).
+    pub hard_busts: u64,
+    /// Busts per reason, indexed by [`bust_reason_index`].
+    pub bust_reasons: [u32; BUST_REASON_COUNT],
 }
 
 /// Process-wide prompt-cache accounting, per session.
@@ -70,6 +74,19 @@ impl CacheLedger {
         let entry = sessions.entry(session.to_owned()).or_default();
         entry.read = entry.read.saturating_add(read);
         entry.uncached = entry.uncached.saturating_add(uncached);
+    }
+
+    /// Record one committed bust. Previews never call this; `attempt_tokens`
+    /// remains the only writer of the provider-reported token counters.
+    pub(crate) fn record_bust(&self, session: &str, reason: CacheBustReason, hard: bool) {
+        let mut sessions = lock(&self.sessions);
+        let entry = sessions.entry(session.to_owned()).or_default();
+        entry.busts = entry.busts.saturating_add(1);
+        if hard {
+            entry.hard_busts = entry.hard_busts.saturating_add(1);
+        }
+        let index = bust_reason_index(reason);
+        entry.bust_reasons[index] = entry.bust_reasons[index].saturating_add(1);
     }
 
     /// Every session `keep` accepts, sorted by session id so a periodic log

@@ -33,15 +33,17 @@
 //! placeholder rides the head at the next bust, and the bust applies the drops.
 //! The tail half is [`crate::mctx::tagger::apply_overlay`], which runs at
 //! request assembly and replaces an applied drop's content in the live
-//! transcript. A queued drop is itself a bust signal ([`Signals::head_changed`]),
-//! so a stamp takes effect on the next pass and the signal then converges (the
-//! bust empties the queue). A row below the floor is covered by the head alone;
-//! a row above it is covered by the overlay — exactly one placeholder either
-//! way.
+//! transcript. A queued drop is NOT itself a bust signal: on a defer the
+//! frozen bytes replay verbatim, so its placeholder waits until some real bust
+//! rebuilds the prefix and applies the drop. A row below the floor is covered
+//! by the head alone; a row above it is covered by the overlay — exactly one
+//! placeholder either way.
 //!
 //! Freeze/replay discipline is NOT re-implemented here: on a defer the kernel
 //! replays the frozen bytes verbatim and this module only plans (it never
 //! re-derives what it will not freeze away).
+
+use std::sync::Arc;
 
 use super::cache_core::{
     CompactionIdentity, CoreState, DurabilityClass, FrozenUnit, M0RenderIdentity,
@@ -50,7 +52,8 @@ use anyhow::{Context as _, Result};
 
 use crate::mctx::budget::{Budget, memory_budget, user_profile_budget};
 use crate::mctx::cache::{
-    HeadRenderer, McCache, McCacheError, PassOutcome, RenderedPass, Signals, run_snapshot,
+    CacheBustReason, HeadRenderer, McCache, McCacheError, PassOutcome, RenderedPass, Signals,
+    run_snapshot,
 };
 use crate::mctx::compartments::{self, Compartment};
 use crate::mctx::memory::{
@@ -65,6 +68,7 @@ use crate::mctx::tagger::{mark_drops_applied, peek_queued_drops};
 use crate::mctx::tokens;
 use ox_db::{Db, optional};
 use ox_schema::id::now_millis;
+use ox_schema::wire::ToolDef;
 
 /// What one pass produced for the request builder.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +112,9 @@ pub struct PassRequest<'a> {
     /// Provider/model identity for the frozen history render.
     pub provider_id: &'a str,
     pub model_id: &'a str,
+    /// The advertised tool definitions: their names and descriptions are part
+    /// of the frozen prompt identity, their schemas are not copied here.
+    pub tools: &'a Arc<Vec<ToolDef>>,
 }
 
 /// Run one transform pass for a session.
@@ -174,6 +181,7 @@ async fn execute_once(
         calibration,
         provider_id,
         model_id,
+        tools,
     } = request;
     // One counter resolution per pass: the session's measured ratio scales every
     // local count into the budget's units for every walk below.
@@ -280,6 +288,7 @@ async fn execute_once(
         budget.window(),
         budget.history,
         calibration,
+        tools_identity_bits(tools),
     );
     let mut plan = plan_units_with_m0_identity(
         &compartments,
@@ -308,9 +317,14 @@ async fn execute_once(
     let identity_changed = state.as_ref().is_some_and(|state| {
         m0_identity_changed_without_calibration(state.m0_identity.as_ref(), &current_identity)
     });
-    let legacy_identity = state
-        .as_ref()
-        .is_some_and(|state| state.m0_identity.is_none());
+    // State persisted before tool identity existed reads back as zero bits:
+    // treat it the same as no identity and rebuild once.
+    let legacy_identity = state.as_ref().is_some_and(|state| {
+        state
+            .m0_identity
+            .as_ref()
+            .is_none_or(|identity| identity.tools_identity_bits == 0)
+    });
     let missing_m0 = state
         .as_ref()
         .is_some_and(|state| frozen_half(Some(state), "m0").is_none());
@@ -331,17 +345,19 @@ async fn execute_once(
                     .is_some_and(|m0| count_tokens(m0) > budget.history as usize)
         })
     });
-    let hard_rebuild = state.is_none()
-        || calibration_pressure
-        || forced
-        || checkpoint_changed
-        || stale
-        || reconcile_pending
-        || !drops.is_empty()
-        || identity_changed
-        || legacy_identity
-        || missing_m0
-        || pressure;
+    let hard_rebuild = needs_hard_rebuild(&RebuildInputs {
+        first: state.is_none(),
+        calibration_pressure,
+        forced,
+        checkpoint: checkpoint_changed,
+        stale,
+        reconcile_pending,
+        identity: identity_changed,
+        legacy_identity,
+        missing_m0,
+        pressure,
+        drops_pending: !drops.is_empty(),
+    });
     if hard_rebuild {
         plan = plan_units_with_m0_identity(
             &compartments,
@@ -357,6 +373,19 @@ async fn execute_once(
             Some(&current_identity),
         );
     }
+    let head_changed = hard_rebuild || forced || stale || identity_changed;
+    let delta_changed = Some(plan.m1.as_str()) != frozen_m1;
+    let reason = bust_reason(&BustSignals {
+        first: state.is_none(),
+        forced,
+        stale_or_reconcile: stale || reconcile_pending,
+        checkpoint: checkpoint_changed,
+        identity: identity_changed || legacy_identity || missing_m0,
+        calibration_pressure,
+        pressure,
+        head_changed,
+        delta_changed,
+    });
     let boundary_present = if forward_boundary {
         state.as_ref().map(|state| state.boundary_id.clone())
     } else {
@@ -366,13 +395,9 @@ async fn execute_once(
         boundary_present,
         forced,
         run_started,
-        // A queued drop makes the head itself stale (its placeholder has to
-        // appear beside the frozen history), and it must be a bust: a defer
-        // would replay the frozen bytes and the mark would never take effect.
-        // The signal converges — the bust applies the drops, so the next pass
-        // sees an empty queue.
-        head_changed: hard_rebuild || forced || stale || !drops.is_empty() || identity_changed,
-        delta_changed: Some(plan.m1.as_str()) != frozen_m1,
+        head_changed,
+        delta_changed,
+        bust_reason: reason,
         completed_compaction,
     };
 
@@ -429,6 +454,7 @@ async fn execute_once(
             legacy_identity,
             missing_m0,
             queued_drop = !drops.is_empty(),
+            bust_reason = crate::mctx::cache::bust_reason_label(reason),
             delta_changed = signals.delta_changed,
             delta_source = delta_diagnostic(signals.delta_changed, coverage > previous_coverage),
             coverage_advanced = coverage > previous_coverage,
@@ -454,7 +480,11 @@ async fn execute_once(
                 },
             )
         }
-        PassOutcome::BustApplied { prefix } => {
+        PassOutcome::BustApplied {
+            prefix,
+            hard,
+            reason,
+        } => {
             // The bust froze these bytes, so the queued drops they carry are
             // now reflected in the prefix: mark them applied.
             applied = drops.iter().map(|(tag, _)| *tag).collect();
@@ -472,6 +502,8 @@ async fn execute_once(
                 coverage,
                 PassOutcome::BustApplied {
                     prefix: String::new(),
+                    hard,
+                    reason,
                 },
             )
         }
@@ -658,6 +690,44 @@ fn requires_hard_rebuild(
         && (usage_pct.is_some_and(|usage| usage >= budget.hard_pct) || count_tokens(m1) > m1_budget)
 }
 
+/// The predicates that decide whether the frozen baseline must be rebuilt.
+///
+/// `drops_pending` is carried so the decision can be tested against the real
+/// pass inputs, but it is deliberately NOT a reason to rebuild: a queued drop
+/// only rides along with the next real bust, never causes one.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct RebuildInputs {
+    first: bool,
+    calibration_pressure: bool,
+    forced: bool,
+    checkpoint: bool,
+    stale: bool,
+    reconcile_pending: bool,
+    identity: bool,
+    legacy_identity: bool,
+    missing_m0: bool,
+    pressure: bool,
+    drops_pending: bool,
+}
+
+/// Pure hard-rebuild decision: no I/O, and queued drops never contribute.
+#[must_use]
+pub(crate) fn needs_hard_rebuild(inputs: &RebuildInputs) -> bool {
+    // Read, but never used as a predicate: drops are passengers on the next
+    // real bust, so their presence must not decide this function.
+    let _drops_pending = inputs.drops_pending;
+    inputs.first
+        || inputs.calibration_pressure
+        || inputs.forced
+        || inputs.checkpoint
+        || inputs.stale
+        || inputs.reconcile_pending
+        || inputs.identity
+        || inputs.legacy_identity
+        || inputs.missing_m0
+        || inputs.pressure
+}
+
 fn m0_identity_changed_without_calibration(
     frozen: Option<&M0RenderIdentity>,
     current: &M0RenderIdentity,
@@ -667,8 +737,79 @@ fn m0_identity_changed_without_calibration(
             || identity.model_id != current.model_id
             || identity.window != current.window
             || identity.history_budget != current.history_budget
+            || identity.tools_identity_bits != current.tools_identity_bits
             || identity.render_version != current.render_version
     })
+}
+
+/// The predicates a bust reason is derived from, kept together so the pure
+/// decision function has one input and the priority is visible at one site.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct BustSignals {
+    first: bool,
+    forced: bool,
+    stale_or_reconcile: bool,
+    checkpoint: bool,
+    identity: bool,
+    calibration_pressure: bool,
+    pressure: bool,
+    head_changed: bool,
+    delta_changed: bool,
+}
+
+/// First matching cause wins. The head signal has no dedicated enum variant:
+/// once every named cause is ruled out, a head-only bust is reported as
+/// `Other`; a delta-only bust is `Delta`.
+#[must_use]
+pub(crate) fn bust_reason(signals: &BustSignals) -> CacheBustReason {
+    if signals.first {
+        CacheBustReason::FirstPass
+    } else if signals.forced {
+        CacheBustReason::Forced
+    } else if signals.stale_or_reconcile {
+        CacheBustReason::Reconcile
+    } else if signals.checkpoint {
+        CacheBustReason::Checkpoint
+    } else if signals.identity {
+        CacheBustReason::Identity
+    } else if signals.calibration_pressure {
+        CacheBustReason::CalibrationPressure
+    } else if signals.pressure {
+        CacheBustReason::Pressure
+    } else if signals.head_changed {
+        CacheBustReason::Other
+    } else if signals.delta_changed {
+        CacheBustReason::Delta
+    } else {
+        CacheBustReason::Other
+    }
+}
+
+/// A deterministic identity for the names and descriptions the model sees.
+/// Sorting by name makes the hash independent of registry iteration order;
+/// parameters are deliberately not hashed (this pins the prompt text, not the
+/// JSON schema). No description bytes are copied.
+#[must_use]
+fn tools_identity_bits(tools: &[ToolDef]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash as _, Hasher as _};
+
+    let mut pairs: Vec<(&str, &str)> = tools
+        .iter()
+        .map(|tool| {
+            (
+                tool.function.name.as_str(),
+                tool.function.description.as_str(),
+            )
+        })
+        .collect();
+    pairs.sort_unstable_by_key(|pair| pair.0);
+    let mut hasher = DefaultHasher::new();
+    for (name, description) in pairs {
+        name.hash(&mut hasher);
+        description.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// The frozen `(m0, m1)` payload halves, if the state carries them.
@@ -911,5 +1052,119 @@ fn delta_diagnostic(changed: bool, coverage_advanced: bool) -> &'static str {
         (false, _) => "none",
         (true, true) => "coverage_and_other_or_unknown",
         (true, false) => "other_or_unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BustSignals, CacheBustReason, RebuildInputs, bust_reason, needs_hard_rebuild,
+        tools_identity_bits,
+    };
+    use ox_schema::wire::ToolDef;
+    use serde_json::Value;
+
+    #[test]
+    fn tool_identity_is_order_independent_and_description_sensitive() {
+        let first = ToolDef::function("b", "beta", Value::Null);
+        let second = ToolDef::function("a", "alpha", Value::Null);
+        let ordered = tools_identity_bits(&[second.clone(), first.clone()]);
+        assert_eq!(
+            tools_identity_bits(&[first.clone(), second.clone()]),
+            ordered,
+            "registry order must not churn the frozen prompt identity"
+        );
+
+        let mut changed_first = first;
+        changed_first.function.description = "renamed beta".to_owned();
+        assert_ne!(
+            tools_identity_bits(&[second, changed_first]),
+            ordered,
+            "a changed tool description must bust the prompt identity"
+        );
+    }
+
+    #[test]
+    fn bust_reason_uses_the_fixed_priority() {
+        let reason =
+            |first, forced, stale, checkpoint, identity, calibration, pressure, head, delta| {
+                bust_reason(&BustSignals {
+                    first,
+                    forced,
+                    stale_or_reconcile: stale,
+                    checkpoint,
+                    identity,
+                    calibration_pressure: calibration,
+                    pressure,
+                    head_changed: head,
+                    delta_changed: delta,
+                })
+            };
+        assert_eq!(
+            reason(true, true, true, true, true, true, true, true, true),
+            CacheBustReason::FirstPass
+        );
+        assert_eq!(
+            reason(false, true, true, true, true, true, true, true, true),
+            CacheBustReason::Forced
+        );
+        assert_eq!(
+            reason(false, false, true, true, true, true, true, true, true),
+            CacheBustReason::Reconcile
+        );
+        assert_eq!(
+            reason(false, false, false, true, true, true, true, true, true),
+            CacheBustReason::Checkpoint
+        );
+        assert_eq!(
+            reason(false, false, false, false, true, true, true, true, true),
+            CacheBustReason::Identity
+        );
+        assert_eq!(
+            reason(false, false, false, false, false, true, true, true, true),
+            CacheBustReason::CalibrationPressure
+        );
+        assert_eq!(
+            reason(false, false, false, false, false, false, true, true, true),
+            CacheBustReason::Pressure
+        );
+        assert_eq!(
+            reason(false, false, false, false, false, false, false, true, true),
+            CacheBustReason::Other
+        );
+        assert_eq!(
+            reason(false, false, false, false, false, false, false, false, true),
+            CacheBustReason::Delta
+        );
+        assert_eq!(
+            reason(
+                false, false, false, false, false, false, false, false, false
+            ),
+            CacheBustReason::Other
+        );
+    }
+
+    #[test]
+    fn queued_drops_alone_do_not_force_a_hard_rebuild() {
+        let inputs = RebuildInputs {
+            drops_pending: true,
+            ..RebuildInputs::default()
+        };
+        assert!(
+            !needs_hard_rebuild(&inputs),
+            "drops ride the next real bust; a queue alone must stay a defer"
+        );
+    }
+
+    #[test]
+    fn identity_change_forces_a_hard_rebuild() {
+        let inputs = RebuildInputs {
+            identity: true,
+            ..RebuildInputs::default()
+        };
+        assert!(
+            needs_hard_rebuild(&inputs),
+            "a changed m0 identity invalidates the frozen baseline"
+        );
     }
 }

@@ -80,7 +80,8 @@ pub struct FrozenUnit {
 
 /// The inputs that produced the frozen history unit. This is deliberately
 /// separate from the provider/model identity: it records the complete m[0]
-/// render decision, including the budget and calibrated counter.
+/// render decision, including the budget, the calibrated counter, and the
+/// names and descriptions of the tools the model could call.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct M0RenderIdentity {
     pub provider_id: String,
@@ -88,6 +89,11 @@ pub struct M0RenderIdentity {
     pub window: Option<u32>,
     pub history_budget: u32,
     pub calibration_bits: u64,
+    /// Order-independent hash of the advertised tools' names and descriptions.
+    /// Zero on state written before this field existed, which makes that state
+    /// a legacy identity and forces one rebuild.
+    #[serde(default)]
+    pub tools_identity_bits: u64,
     pub render_version: u8,
 }
 
@@ -99,6 +105,7 @@ impl M0RenderIdentity {
         window: Option<u32>,
         history_budget: u32,
         calibration: f64,
+        tools_identity_bits: u64,
     ) -> Self {
         Self {
             provider_id: provider_id.into(),
@@ -106,6 +113,7 @@ impl M0RenderIdentity {
             window,
             history_budget,
             calibration_bits: calibration.to_bits(),
+            tools_identity_bits,
             render_version: 1,
         }
     }

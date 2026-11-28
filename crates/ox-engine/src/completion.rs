@@ -112,6 +112,21 @@ fn observe_error(error: ox_llm::error::ChatError) -> ox_llm::error::ChatError {
     error
 }
 
+/// Log one hidden completion's provider usage, including cache writes, so the
+/// hidden path and the session path report the same fields.
+pub(crate) fn log_hidden_usage(purpose: &'static str, usage: &Usage) {
+    let read = usage.cached_tokens.unwrap_or(0);
+    tracing::info!(
+        purpose,
+        prompt_tokens = usage.prompt_tokens,
+        cache_read = read,
+        cache_uncached = usage.prompt_tokens.saturating_sub(read),
+        cache_write = usage.cache_write_tokens.unwrap_or(0),
+        cache_scope = "hidden",
+        "OX_COMPLETION_USAGE"
+    );
+}
+
 /// Hidden callers without a session usage ledger keep their cache-usage log at
 /// this boundary; compaction uses its own delta/publication owner instead.
 pub(crate) async fn collect_text(
@@ -134,15 +149,8 @@ pub(crate) async fn collect_text_with_limit(
         std::future::ready(Ok(()))
     })
     .await?;
-    if let Some(usage) = completion.usage {
-        let read = usage.cached_tokens.unwrap_or(0);
-        tracing::info!(
-            purpose,
-            prompt_tokens = usage.prompt_tokens,
-            cache_read = read,
-            cache_uncached = usage.prompt_tokens.saturating_sub(read),
-            "OX_COMPLETION_USAGE"
-        );
+    if let Some(usage) = &completion.usage {
+        log_hidden_usage(purpose, usage);
     }
     tracing::debug!(purpose, finish = ?completion.finish, "hidden completion finished");
     Ok(completion.text)

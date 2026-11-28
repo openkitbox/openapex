@@ -779,18 +779,34 @@ fn spawn_runner_memory_stats(
 /// Diagnostic-only: no request path reads this, and nothing is persisted. When
 /// no session has reported usage yet, `read + uncached` is zero and `hit_ratio`
 /// is logged as `None` rather than a `0.0` that would read as a total miss.
+/// Bust counts come from committed passes; they can be non-zero even when no
+/// provider usage has been reported for a session.
 fn log_cache_stats(runner: &Runner) {
     let ledger = runner.diagnostic_cache_ledger();
     let mut read = 0i64;
     let mut uncached = 0i64;
+    let mut busts = 0u64;
+    let mut hard_busts = 0u64;
+    let mut bust_reasons = ox_engine::mctx::cache::BUST_REASON_LABELS.map(|_| 0u32);
     for (session, cache) in &ledger {
-        read += cache.read;
-        uncached += cache.uncached;
+        read = read.saturating_add(cache.read);
+        uncached = uncached.saturating_add(cache.uncached);
+        busts = busts.saturating_add(cache.busts);
+        hard_busts = hard_busts.saturating_add(cache.hard_busts);
+        for (total, count) in bust_reasons.iter_mut().zip(cache.bust_reasons) {
+            *total = total.saturating_add(count);
+        }
         tracing::debug!(
             session = %session,
+            cache_scope = "live",
             cache_usage_source = "provider_reported",
+            bust_source = "local_pass",
             cache_read = cache.read,
             cache_uncached = cache.uncached,
+            cache_busts = cache.busts,
+            cache_hard_busts = cache.hard_busts,
+            cache_bust_reasons = ?cache.bust_reasons,
+            cache_bust_reason_labels = ?ox_engine::mctx::cache::BUST_REASON_LABELS,
             "OX_CACHE_STATS"
         );
     }
@@ -800,9 +816,15 @@ fn log_cache_stats(runner: &Runner) {
     };
     tracing::info!(
         sessions = ledger.len(),
+        cache_scope = "live",
         cache_usage_source = "provider_reported",
+        bust_source = "local_pass",
         cache_read = read,
         cache_uncached = uncached,
+        cache_busts = busts,
+        cache_hard_busts = hard_busts,
+        cache_bust_reasons = ?bust_reasons,
+        cache_bust_reason_labels = ?ox_engine::mctx::cache::BUST_REASON_LABELS,
         hit_ratio = ?hit_ratio,
         "OX_CACHE_STATS"
     );

@@ -15,9 +15,9 @@ use ox_schema::message::{Compaction, Message};
 
 use super::chunk::Chunk;
 use super::prompt::{
-    CompartmentPromptInputs, HISTORIAN_SYSTEM_PROMPT, build_compartment_agent_prompt,
-    build_historian_repair_prompt, build_prefixed_instruction, historian_request_with_prompt,
-    prefixed_request,
+    CompartmentPromptInputs, HISTORIAN_SYSTEM_PROMPT, PrefixRequest,
+    build_compartment_agent_prompt, build_historian_repair_prompt, build_prefixed_instruction,
+    historian_request_with_prompt, prefixed_request,
 };
 
 /// Lifecycle of one `mc_historian_run` row (the `state` column).
@@ -379,17 +379,17 @@ pub async fn run(ctx: &RunCtx<'_, '_>, plan: &RunPlan<'_>) -> Result<Option<RunO
         // attempt sends the same prefix with a different tail, which is still a
         // cache hit on everything before the instruction.
         let request = match &plan.prefix {
-            Some(prefix) => prefixed_request(
+            Some(prefix) => prefixed_request(PrefixRequest {
                 model,
-                prefix.system_static,
-                prefix.instructions,
-                &prefix.head,
-                prefix.region,
-                prefix.tools,
-                HISTORIAN_SYSTEM_PROMPT,
-                &user_prompt,
-                ctx.reasoning_effort,
-            ),
+                system_static: prefix.system_static,
+                instructions: prefix.instructions,
+                head: &prefix.head,
+                region: prefix.region,
+                tools: prefix.tools,
+                role_prompt: HISTORIAN_SYSTEM_PROMPT,
+                instruction: &user_prompt,
+                reasoning_effort: ctx.reasoning_effort,
+            }),
             None => historian_request_with_prompt(model, &user_prompt, ctx.reasoning_effort),
         };
 

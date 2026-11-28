@@ -78,6 +78,11 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
         mctx_m0_hash = diagnostic.m0_hash,
         mctx_m1_hash = diagnostic.m1_hash,
         mctx_head_only_hash = diagnostic.mctx_head_hash,
+        mctx_bust_reason = diagnostic
+            .bust_reason
+            .map(crate::mctx::cache::bust_reason_label)
+            .unwrap_or("none"),
+        mctx_bust_hard = diagnostic.bust_hard,
         "mctx request prefix diagnostic"
     );
     let rows = if ctx.config.magic_context.enabled {
