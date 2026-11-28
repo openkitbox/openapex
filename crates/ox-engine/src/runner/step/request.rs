@@ -16,7 +16,6 @@ use ox_schema::message::Message;
 
 use super::super::drain::DrainCtx;
 use super::super::instructions;
-use super::super::output_budget::bound_aggregate_tool_outputs;
 use super::attempt::StepParams;
 use super::context::{
     assistant_tokens, build_chat_messages, mctx_head, responses_compacted, responses_replay_state,
@@ -122,9 +121,6 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
         &[head_m0.as_deref(), head_m1.as_deref()],
         &rows,
     );
-    // Only the live request is bounded: the historian prefix and the fold's
-    // 4 KiB tier keep their own bytes (and the m[0] cache anchor).
-    bound_aggregate_tool_outputs(&mut chat_messages);
     let mut layers = super::super::request_budget::Layers {
         system_static: system_static.len(),
         frozen: instructions_initial.len(),
