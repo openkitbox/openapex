@@ -73,6 +73,13 @@ pub(crate) fn measure(request: &ChatRequest, ratio: f64) -> Result<RequestBill, 
             }
         }
     }
+    // Responses replay rides the request instead of an assistant message, but
+    // the writer emits those raw items on the wire. Count them once so
+    // admission sees every byte the endpoint will receive.
+    replay_bytes += request.responses_replay_state.as_deref().map_or(
+        0,
+        ox_llm::responses::replay::ResponsesReplayState::extra_wire_bytes,
+    );
     // serde skips the native state but the Messages writer emits its blocks.
     // Count them once in content bytes and mirror them into the serialized
     // total, leaving the framing remainder unchanged.
@@ -190,6 +197,7 @@ mod tests {
     use std::sync::Arc;
 
     use ox_llm::messages::replay::{MessagesReplayState, ReplayBlock};
+    use ox_llm::responses::replay::{ResponsesOrigin, ResponsesReplayInput, ResponsesReplayState};
 
     use super::{ChatMessage, ChatRequest, measure};
 
@@ -221,6 +229,29 @@ mod tests {
             1.0,
         )
         .expect("native request measures");
+        assert_eq!(native.content_bytes - plain.content_bytes, extra);
+        assert_eq!(native.serialized_bytes - plain.serialized_bytes, extra);
+    }
+
+    #[test]
+    fn responses_replay_bytes_are_budgeted() {
+        let state = ResponsesReplayState::new(
+            ResponsesOrigin::new(
+                "provider",
+                "https://responses.example/v1/responses",
+                "responses/v1",
+            ),
+            ResponsesReplayInput {
+                model: "model".to_owned(),
+                items: vec![serde_json::json!({"id": "raw-item"})],
+                ..ResponsesReplayInput::default()
+            },
+        );
+        let extra = state.extra_wire_bytes();
+        let plain = measure(&ChatRequest::new("model", vec![]), 1.0).expect("plain measures");
+        let mut request = ChatRequest::new("model", vec![]);
+        request.responses_replay_state = Some(Arc::new(state));
+        let native = measure(&request, 1.0).expect("native measures");
         assert_eq!(native.content_bytes - plain.content_bytes, extra);
         assert_eq!(native.serialized_bytes - plain.serialized_bytes, extra);
     }

@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -7,6 +8,9 @@ use ox_llm::chat_completions::wire::{
     ChatMessage, FunctionCall, FunctionType, ImageUrl, ToolCall, UserPart,
 };
 use ox_llm::messages::replay::from_provider_state;
+use ox_llm::responses::replay::{
+    ResponsesReplayState, from_provider_state as responses_from_provider_state,
+};
 use ox_schema::message::{
     AssistantContent, Compaction, CompactionCompleted, CompactionMessage, Message, ToolState,
 };
@@ -29,6 +33,116 @@ pub(crate) struct MctxDiagnostic {
     pub m0_hash: u64,
     pub m1_hash: u64,
     pub mctx_head_hash: u64,
+}
+
+#[cfg(test)]
+mod responses_replay_tests {
+    use ox_llm::responses::replay::{ResponsesOrigin, ResponsesReplayInput, ResponsesReplayState};
+    use ox_schema::message::{
+        AssistantContent, AssistantMessage, AssistantTime, Compaction, CompactionCompleted,
+        CompactionMessage, CompactionReason, Message, TimeCreated,
+    };
+    use ox_schema::support::ModelRef;
+    use serde_json::json;
+
+    use super::{responses_compacted, responses_replay_state};
+
+    fn assistant(id: &str, replay: Option<ResponsesReplayState>) -> Message {
+        Message::Assistant(Box::new(AssistantMessage {
+            id: id.to_owned(),
+            metadata: None,
+            time: AssistantTime {
+                created: 1,
+                streamed: None,
+                completed: Some(2),
+            },
+            agent: "apex".to_owned(),
+            model: ModelRef {
+                id: "gpt-5".to_owned(),
+                provider_id: "responses".to_owned(),
+                variant: None,
+            },
+            content: vec![AssistantContent::Text {
+                text: "answer".to_owned(),
+                state: None,
+            }],
+            snapshot: None,
+            finish: None,
+            raw_finish: None,
+            provider_state: replay
+                .map(|state| state.into_provider_state().expect("state serializes")),
+            cost: None,
+            tokens: None,
+            error: None,
+            retry: None,
+        }))
+    }
+
+    fn replay() -> ResponsesReplayState {
+        ResponsesReplayState::new(
+            ResponsesOrigin::new(
+                "responses",
+                "https://api.example/v1/responses",
+                "responses/v1",
+            ),
+            ResponsesReplayInput {
+                model: "gpt-5".to_owned(),
+                items: vec![json!({"id": "raw-item"})],
+                ..ResponsesReplayInput::default()
+            },
+        )
+    }
+
+    fn checkpoint(marked: bool) -> Message {
+        let mut provider_state = ox_schema::support::Record::new();
+        if marked {
+            provider_state.insert(
+                super::super::super::compaction::RESPONSES_COMPACTED_KEY.to_owned(),
+                json!(true),
+            );
+        }
+        Message::Compaction(CompactionMessage {
+            id: "compaction-1".to_owned(),
+            metadata: None,
+            time: TimeCreated { created: 3 },
+            compaction: Compaction::Completed(Box::new(CompactionCompleted {
+                reason: CompactionReason::Manual,
+                model: None,
+                provider_state: Some(provider_state),
+                summary: "summary".to_owned(),
+                recent: String::new(),
+                provider_context: None,
+                cost: None,
+                tokens: None,
+            })),
+        })
+    }
+
+    #[test]
+    fn checkpoint_hides_replay_state_from_before_the_boundary() {
+        let rows = [assistant("before", Some(replay())), checkpoint(true)];
+        assert!(responses_compacted(&rows));
+        assert!(
+            responses_replay_state(&rows).is_none(),
+            "a checkpoint must not carry pre-compaction raw items forward"
+        );
+    }
+
+    #[test]
+    fn replay_state_from_after_the_checkpoint_is_kept() {
+        let rows = [
+            assistant("before", Some(replay())),
+            checkpoint(true),
+            assistant("after", Some(replay())),
+        ];
+        assert!(responses_replay_state(&rows).is_some());
+    }
+
+    #[test]
+    fn an_unmarked_checkpoint_is_not_treated_as_a_responses_compaction() {
+        let rows = [checkpoint(false)];
+        assert!(!responses_compacted(&rows));
+    }
 }
 
 #[derive(Debug)]
@@ -278,6 +392,36 @@ pub(crate) fn compaction_boundary<'row>(
             )
         })
         .map_or(0, |from_end| len - 1 - from_end)
+}
+
+/// The newest Responses replay state inside the current history window.
+///
+/// A completed checkpoint is a hard boundary: state from before it would put
+/// raw items back into a request whose readable history was compacted away.
+pub(super) fn responses_replay_state(messages: &[Message]) -> Option<Arc<ResponsesReplayState>> {
+    messages[compaction_boundary(messages.iter())..]
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            Message::Assistant(assistant) => {
+                responses_from_provider_state(assistant.provider_state.as_ref())
+            }
+            _ => None,
+        })
+}
+
+/// Whether the latest checkpoint explicitly dropped Responses raw items.
+pub(super) fn responses_compacted(messages: &[Message]) -> bool {
+    messages
+        .get(compaction_boundary(messages.iter()))
+        .and_then(|message| match message {
+            Message::Compaction(CompactionMessage {
+                compaction: Compaction::Completed(completed),
+                ..
+            }) => completed.provider_state.as_ref(),
+            _ => None,
+        })
+        .is_some_and(|state| state.contains_key(super::super::compaction::RESPONSES_COMPACTED_KEY))
 }
 
 /// The provider-reported context cost of one decoded row: the decoded twin

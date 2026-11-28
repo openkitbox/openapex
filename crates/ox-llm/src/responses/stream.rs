@@ -1,44 +1,79 @@
 //! Responses SSE decoding: typed Responses events become the engine's
 //! [`StreamEvent`] vocabulary.
 //!
-//! Function calls are announced by `response.output_item.added` with an item
-//! id, while argument deltas refer to that item id rather than a call ordinal.
-//! The decoder keeps only a small item-id → (ordinal, call id, name) map for
-//! the life of one stream; it never rebuilds or copies the transcript.
+//! Function and custom tool calls are announced by `response.output_item.added`
+//! with an item id, while input deltas refer to that item id rather than a call
+//! ordinal. The decoder keeps only a small item-id → (ordinal, call id, name)
+//! map for the life of one stream. Raw output items are kept once per item
+//! (`added` / `done`, or the terminal response's `output` array) and moved into
+//! a single [`StreamEvent::ProviderState`] at the terminal event; no transcript
+//! is rebuilt from deltas.
+//!
+//! Text, refusal and reasoning deltas use the existing stream vocabulary.
+//! Content-part lifecycle events, citations/annotations and server-side tool
+//! events carry no engine-side event; a new upstream event type is ignored so
+//! it cannot break a turn. Refusal is surfaced as text, as in Chat Completions.
 //!
 //! Terminal contract: `response.completed` emits usage (when reported),
 //! `Finish { reason: "stop" }` and `Done`; `response.incomplete` emits the same
 //! shape with `Finish { reason: "length" }`. These reasons are the engine's
 //! `map_finish` vocabulary — the upstream event names are not recognized
-//! there. `response.failed`, `response.cancelled` and `error` fail the stream.
-//! Unknown event types are ignored so a new upstream event cannot break a turn.
+//! there. `response.failed`, `response.cancelled` and `error` fail the stream
+//! without emitting text, tool, usage or terminal events.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde_json::Value;
 
 use crate::chat_completions::stream::StreamEvent;
 use crate::chat_completions::wire::Usage;
 use crate::error::ChatError;
+use crate::responses::replay::{ResponsesOrigin, ResponsesReplayInput, ResponsesReplayState};
 use crate::sse::SseDecoder;
+
+/// Wire marker recorded with replayed items; Chat Completions and Messages use
+/// different markers and must never consume a Responses state.
+const PROTOCOL_MARKER: &str = "responses/v1";
+
+/// Endpoint identity needed to build a replayable state.
+#[derive(Debug)]
+struct ReplayIdentity {
+    provider: String,
+    endpoint: String,
+    model: String,
+}
 
 /// Decodes one Responses stream.
 #[derive(Debug, Default)]
 pub struct ResponsesDecoder {
-    /// Announced function-call items: item id → the engine's view of the call.
+    /// Announced tool items: item id → the engine's view of the call.
     tools: HashMap<String, ToolIdentity>,
     /// How many tool calls this stream has seen.
     next_tool: u32,
+    /// Raw output items in wire order, keyed by `output_index`.
+    output_items: BTreeMap<u64, Value>,
+    /// Item id → `output_index`, for `done` events without an explicit index.
+    item_slots: HashMap<String, u64>,
+    /// Endpoint identity for the terminal replay record, when requested.
+    replay: Option<ReplayIdentity>,
+    /// Fingerprint of the request input that produced this stream.
+    fingerprint: Option<(String, usize)>,
+    /// Highest `sequence_number` seen, used for background resume.
+    sequence_number: Option<u64>,
+    /// Response id seen on any event, used for chained state modes.
+    response_id: Option<String>,
+    /// Whether the terminal replay record has already been emitted.
+    state_emitted: bool,
 }
 
-/// What the engine needs to know about one function-call item.
+/// What the engine needs to know about one tool-call item.
 #[derive(Debug)]
 struct ToolIdentity {
     /// Dense ordinal in this response.
     index: u32,
     /// Call id echoed by the matching result.
     call_id: Option<String>,
-    /// Function name.
+    /// Tool name.
     name: Option<String>,
 }
 
@@ -49,19 +84,153 @@ impl ResponsesDecoder {
         Self::default()
     }
 
+    /// Bind the endpoint that produced this stream so the terminal event can
+    /// carry its raw items in a replayable [`StreamEvent::ProviderState`].
+    #[must_use]
+    pub fn with_replay(
+        mut self,
+        provider: impl Into<String>,
+        endpoint: impl Into<String>,
+        model: impl Into<String>,
+    ) -> Self {
+        self.replay = Some(ReplayIdentity {
+            provider: provider.into(),
+            endpoint: endpoint.into(),
+            model: model.into(),
+        });
+        self
+    }
+
+    /// Bind the input fingerprint so the next chained turn can verify that the
+    /// prefix it drops is byte-identical to the one this response saw.
+    #[must_use]
+    pub fn with_fingerprint(mut self, hash: &str, len: usize) -> Self {
+        self.fingerprint = Some((hash.to_owned(), len));
+        self
+    }
+
+    /// Highest `sequence_number` seen so far, for background resume.
+    #[must_use]
+    pub fn last_sequence_number(&self) -> Option<u64> {
+        self.sequence_number
+    }
+
+    /// Response id seen so far, for chained state modes.
+    #[must_use]
+    pub fn response_id(&self) -> Option<&str> {
+        self.response_id.as_deref()
+    }
+
     /// The identity for `item_id`, allocating a dense ordinal if the item was
     /// never announced (a forward-compatible fallback for new event orders).
     fn identity(&mut self, item_id: &str) -> &mut ToolIdentity {
-        let next = &mut self.next_tool;
-        self.tools.entry(item_id.to_owned()).or_insert_with(|| {
-            let index = *next;
-            *next += 1;
-            ToolIdentity {
-                index,
-                call_id: None,
-                name: None,
+        if !self.tools.contains_key(item_id) {
+            let index = self.next_tool;
+            self.next_tool += 1;
+            self.tools.insert(
+                item_id.to_owned(),
+                ToolIdentity {
+                    index,
+                    call_id: None,
+                    name: None,
+                },
+            );
+        }
+        self.tools
+            .get_mut(item_id)
+            .expect("identity was inserted above")
+    }
+
+    /// Slot for one raw item: the wire's `output_index`, a previously announced
+    /// item's slot, or the next position when an endpoint supplies neither.
+    fn slot(&self, value: &Value, item_id: Option<&str>) -> u64 {
+        if let Some(index) = value.get("output_index").and_then(Value::as_u64) {
+            return index;
+        }
+        if let Some(slot) = item_id.and_then(|id| self.item_slots.get(id)) {
+            return *slot;
+        }
+        self.output_items
+            .keys()
+            .next_back()
+            .map_or(0, |last| last + 1)
+    }
+
+    /// Keep the announced item once; its `done` event replaces it with the
+    /// complete item.
+    fn on_output_item_added(&mut self, value: &mut Value) {
+        let Some(item) = value
+            .get_mut("item")
+            .map(std::mem::take)
+            .filter(Value::is_object)
+        else {
+            return;
+        };
+        let id = item.get("id").and_then(Value::as_str);
+        let slot = self.slot(value, id);
+        if let Some(id) = id {
+            self.item_slots.insert(id.to_owned(), slot);
+            if matches!(
+                item.get("type").and_then(Value::as_str),
+                Some("function_call" | "custom_tool_call")
+            ) {
+                let identity = self.identity(id);
+                identity.call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                identity.name = item.get("name").and_then(Value::as_str).map(str::to_owned);
             }
-        })
+        }
+        self.output_items.insert(slot, item);
+    }
+
+    fn on_output_item_done(&mut self, value: &mut Value) {
+        let Some(item) = value
+            .get_mut("item")
+            .map(std::mem::take)
+            .filter(Value::is_object)
+        else {
+            return;
+        };
+        let id = item.get("id").and_then(Value::as_str);
+        let slot = self.slot(value, id);
+        if let Some(id) = id
+            && !self.item_slots.contains_key(id)
+        {
+            self.item_slots.insert(id.to_owned(), slot);
+        }
+        self.output_items.insert(slot, item);
+    }
+
+    /// Emit the replay record before usage/finish/done, exactly once per
+    /// stream. The terminal `output` array wins over the accumulated items;
+    /// endpoints that omit it still replay the items seen in the stream.
+    fn record_state(&mut self, value: &mut Value, out: &mut Vec<StreamEvent>) {
+        let Some(identity) = &self.replay else {
+            return;
+        };
+        let items =
+            terminal_output(value).unwrap_or_else(|| self.output_items.values().cloned().collect());
+        let state = ResponsesReplayState::new(
+            ResponsesOrigin::new(&identity.provider, &identity.endpoint, PROTOCOL_MARKER),
+            ResponsesReplayInput {
+                model: identity.model.clone(),
+                response_id: self.response_id.clone(),
+                conversation_id: response_conversation_id(value),
+                sequence_number: self.sequence_number,
+                items,
+                input_fingerprint: self
+                    .fingerprint
+                    .as_ref()
+                    .map_or_else(String::new, |(hash, _)| hash.clone()),
+                input_len: self.fingerprint.as_ref().map_or(0, |(_, len)| *len),
+            },
+        );
+        match state.into_provider_state() {
+            Ok(record) => out.push(StreamEvent::ProviderState(record)),
+            Err(error) => tracing::warn!(%error, "could not serialize Responses replay state"),
+        }
     }
 }
 
@@ -75,62 +244,32 @@ impl SseDecoder for ResponsesDecoder {
             out.push(StreamEvent::Done);
             return Ok(());
         }
-        let value: Value = serde_json::from_str(payload)
+        let mut value: Value = serde_json::from_str(payload)
             .map_err(|error| ChatError::Sse(format!("invalid JSON payload: {error}")))?;
-        let Some(kind) = value.get("type").and_then(Value::as_str) else {
+        let Some(kind) = value.get("type").and_then(Value::as_str).map(str::to_owned) else {
             return Ok(());
         };
-        match kind {
-            "response.output_text.delta" => {
-                if let Some(delta) = value.get("delta").and_then(Value::as_str)
-                    && !delta.is_empty()
-                {
-                    out.push(StreamEvent::TextDelta(delta.to_owned()));
-                }
+        if let Some(sequence) = value.get("sequence_number").and_then(Value::as_u64) {
+            self.sequence_number = Some(sequence);
+        }
+        if let Some(id) = response_id_of(&value) {
+            self.response_id = Some(id.to_owned());
+        }
+        match kind.as_str() {
+            "response.output_text.delta" | "response.refusal.delta" => text_delta(&value, out),
+            "response.reasoning_summary_text.delta" | "response.reasoning.delta" => {
+                reasoning_delta(&value, out);
             }
-            "response.reasoning_summary_text.delta" => {
-                if let Some(delta) = value.get("delta").and_then(Value::as_str)
-                    && !delta.is_empty()
-                {
-                    out.push(StreamEvent::ReasoningDelta(delta.to_owned()));
-                }
-            }
-            "response.output_item.added" => {
-                let Some(item) = value.get("item") else {
-                    return Ok(());
-                };
-                if item.get("type").and_then(Value::as_str) != Some("function_call") {
-                    return Ok(());
-                }
-                let Some(id) = item.get("id").and_then(Value::as_str) else {
-                    return Ok(());
-                };
-                let identity = self.identity(id);
-                identity.call_id = item
-                    .get("call_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                identity.name = item.get("name").and_then(Value::as_str).map(str::to_owned);
-            }
-            "response.function_call_arguments.delta" => {
-                let (Some(item_id), Some(delta)) = (
-                    value.get("item_id").and_then(Value::as_str),
-                    value.get("delta").and_then(Value::as_str),
-                ) else {
-                    return Ok(());
-                };
-                if delta.is_empty() {
-                    return Ok(());
-                }
-                let identity = self.identity(item_id);
-                out.push(StreamEvent::ToolCallDelta {
-                    index: identity.index,
-                    id: identity.call_id.clone(),
-                    name: identity.name.clone(),
-                    arguments: delta.to_owned(),
-                });
+            "response.output_item.added" => self.on_output_item_added(&mut value),
+            "response.output_item.done" => self.on_output_item_done(&mut value),
+            "response.function_call_arguments.delta" | "response.custom_tool_call_input.delta" => {
+                self.tool_delta(&value, out);
             }
             "response.completed" | "response.incomplete" => {
+                if !self.state_emitted {
+                    self.record_state(&mut value, out);
+                    self.state_emitted = true;
+                }
                 if let Some(usage) = usage_from(&value) {
                     out.push(StreamEvent::Usage(usage));
                 }
@@ -144,20 +283,82 @@ impl SseDecoder for ResponsesDecoder {
                 });
                 out.push(StreamEvent::Done);
             }
-            "response.failed" => {
-                return Err(upstream_error(&value, "response failed"));
-            }
-            "response.cancelled" => {
-                return Err(upstream_error(&value, "response cancelled"));
-            }
-            "error" => {
-                return Err(upstream_error(&value, "upstream error"));
-            }
-            // Forward compatibility: a new event type must not fail the turn.
+            "response.failed" => return Err(upstream_error(&value, "response failed")),
+            "response.cancelled" => return Err(upstream_error(&value, "response cancelled")),
+            "error" => return Err(upstream_error(&value, "upstream error")),
+            // Forward compatibility: lifecycle, annotation, server-side tool
+            // and unknown events must not fail the turn or duplicate deltas.
             _ => {}
         }
         Ok(())
     }
+}
+
+impl ResponsesDecoder {
+    /// One tool-input delta, keyed by the announced item id.
+    fn tool_delta(&mut self, value: &Value, out: &mut Vec<StreamEvent>) {
+        let (Some(item_id), Some(delta)) = (
+            value.get("item_id").and_then(Value::as_str),
+            value.get("delta").and_then(Value::as_str),
+        ) else {
+            return;
+        };
+        if delta.is_empty() {
+            return;
+        }
+        let identity = self.identity(item_id);
+        out.push(StreamEvent::ToolCallDelta {
+            index: identity.index,
+            id: identity.call_id.clone(),
+            name: identity.name.clone(),
+            arguments: delta.to_owned(),
+        });
+    }
+}
+
+/// Text and refusal deltas share the engine's text event.
+fn text_delta(value: &Value, out: &mut Vec<StreamEvent>) {
+    if let Some(delta) = value.get("delta").and_then(Value::as_str)
+        && !delta.is_empty()
+    {
+        out.push(StreamEvent::TextDelta(delta.to_owned()));
+    }
+}
+
+fn reasoning_delta(value: &Value, out: &mut Vec<StreamEvent>) {
+    if let Some(delta) = value.get("delta").and_then(Value::as_str)
+        && !delta.is_empty()
+    {
+        out.push(StreamEvent::ReasoningDelta(delta.to_owned()));
+    }
+}
+
+/// Response id on any event (`response.id` or `response_id`).
+fn response_id_of(value: &Value) -> Option<&str> {
+    value
+        .get("response")
+        .and_then(|response| response.get("id"))
+        .and_then(Value::as_str)
+        .or_else(|| value.get("response_id").and_then(Value::as_str))
+}
+
+/// Conversation id carried by a terminal response, when present.
+fn response_conversation_id(value: &Value) -> Option<String> {
+    value
+        .get("response")
+        .and_then(|response| response.get("conversation"))
+        .and_then(|conversation| conversation.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// Take the complete `output` array out of a terminal event without cloning it.
+fn terminal_output(value: &mut Value) -> Option<Vec<Value>> {
+    let output = value
+        .get_mut("response")?
+        .get_mut("output")?
+        .as_array_mut()?;
+    Some(std::mem::take(output))
 }
 
 /// The usage object of a terminal response event, when present.
@@ -350,5 +551,51 @@ mod tests {
             .decode(r#"{"type":"error","message":"plain"}"#, &mut events)
             .expect_err("plain error still fails");
         assert!(matches!(error, ChatError::Upstream(message) if message.contains("plain")));
+    }
+
+    #[test]
+    fn failed_cancelled_and_error_never_emit_text_events() {
+        let payloads = [
+            r#"{"type":"response.failed","response":{"id":"resp-1","output":[{"type":"message","content":[{"type":"output_text","text":"partial"}]}],"error":{"code":"server_error","message":"boom"}}}"#,
+            r#"{"type":"response.cancelled","response":{"id":"resp-2","output":[{"type":"message","content":[{"type":"output_text","text":"cancelled text"}]}]}}"#,
+            r#"{"type":"error","code":"rate_limit","message":"slow down"}"#,
+        ];
+
+        for payload in payloads {
+            let mut decoder = ResponsesDecoder::new();
+            let mut events = Vec::new();
+            let error = decoder
+                .decode(payload, &mut events)
+                .expect_err("terminal failure is an upstream error");
+            assert!(
+                matches!(error, ChatError::Upstream(_)),
+                "failure must be an upstream error, got {error:?}"
+            );
+            assert!(
+                events.is_empty(),
+                "failed streams must not emit text, tool or terminal events: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sequence_and_response_id_are_tracked_from_any_event() {
+        let mut decoder = ResponsesDecoder::new();
+        let mut events = Vec::new();
+        decoder
+            .decode(
+                r#"{"type":"response.created","sequence_number":3,"response":{"id":"resp-3"}}"#,
+                &mut events,
+            )
+            .expect("created event decodes");
+        decoder
+            .decode(
+                r#"{"type":"response.output_text.delta","sequence_number":5,"delta":"x"}"#,
+                &mut events,
+            )
+            .expect("delta decodes");
+
+        assert_eq!(decoder.last_sequence_number(), Some(5));
+        assert_eq!(decoder.response_id(), Some("resp-3"));
     }
 }

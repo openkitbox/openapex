@@ -39,6 +39,7 @@ mod mcp;
 pub(crate) mod mcp_events;
 mod media;
 pub(crate) mod permission;
+pub(crate) mod responses;
 pub mod session;
 pub mod shell;
 pub mod skill;
@@ -122,6 +123,11 @@ async fn authenticate_service(
         ctrl.skip_rest();
         return;
     };
+    // External providers cannot send the managed Basic credential; this route
+    // authenticates each delivery with its own HMAC instead.
+    if webhook_path_is_public(req.uri().path()) {
+        return;
+    }
     let password = state.service_password.as_deref();
     if !service_authentication_required(req.local_addr(), password) {
         return;
@@ -139,6 +145,11 @@ async fn authenticate_service(
         "message": "Authentication required",
     })));
     ctrl.skip_rest();
+}
+
+/// Only the HMAC-authenticated Responses webhook bypasses managed Basic auth.
+fn webhook_path_is_public(path: &str) -> bool {
+    path == "/ox/responses/webhook"
 }
 
 /// Return whether managed service authentication applies to this transport.
@@ -997,7 +1008,8 @@ pub fn build_router(state: AppState) -> Router {
                 .push(Router::with_path("directories").get(directories))
                 .push(Router::with_path("lease").get(lease::lease))
                 .push(Router::with_path("session/{id}/family").get(family::family))
-                .push(Router::with_path("session/{sessionID}/media/{messageID}").get(media::media)),
+                .push(Router::with_path("session/{sessionID}/media/{messageID}").get(media::media))
+                .push(Router::with_path("responses/webhook").post(responses::webhook)),
         )
         .push(
             Router::with_path("api")
@@ -1171,4 +1183,17 @@ async fn unmatched(req: &mut Request, res: &mut Response) {
         "_tag": "NotFoundError",
         "message": format!("No route for {} {}", req.method(), req.uri().path()),
     })));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::webhook_path_is_public;
+
+    #[test]
+    fn only_the_responses_webhook_bypasses_managed_basic_auth() {
+        assert!(webhook_path_is_public("/ox/responses/webhook"));
+        assert!(!webhook_path_is_public("/ox/responses/webhook/other"));
+        assert!(!webhook_path_is_public("/api/agent"));
+        assert!(!webhook_path_is_public("/ox/location"));
+    }
 }

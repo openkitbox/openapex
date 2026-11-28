@@ -25,7 +25,7 @@
 //! - **effort** becomes `thinking` + `output_config`, per the endpoint's
 //!   capability policy (see [`MessagesPolicy`]).
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::replay::{MessagesOrigin, ReplayBlock};
@@ -37,11 +37,13 @@ use crate::error::ChatError;
 /// The protocol is one shape; providers differ in which optional knobs they
 /// accept and how they want reasoning replayed. Everything a provider can
 /// disagree about is here, so the translation has no provider `match` in it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum MessagesDialect {
     /// Anthropic's own endpoints: portable thinking budgets, unsigned
     /// reasoning blocks are invalid and therefore dropped on replay, mid-flow
     /// system prompts become user turns.
+    #[default]
     Anthropic,
     /// DeepSeek's Anthropic-compatible endpoint
     /// (`https://api.deepseek.com/anthropic`): `thinking` is always sent
@@ -86,13 +88,13 @@ impl MessagesPolicy {
         }
     }
 
-    /// The dialect a configured provider speaks. Unknown providers get the
-    /// portable form; a provider that needs more opts in here.
+    /// The policy for an endpoint's explicitly declared dialect. The endpoint
+    /// configuration owns this choice; no provider name is consulted here.
     #[must_use]
-    pub fn for_provider(provider: &str) -> Self {
-        match provider {
-            crate::config::DEEPSEEK => Self::deepseek(),
-            _ => Self::anthropic(),
+    pub fn for_dialect(dialect: MessagesDialect) -> Self {
+        Self {
+            dialect,
+            default_max_tokens: 8192,
         }
     }
 

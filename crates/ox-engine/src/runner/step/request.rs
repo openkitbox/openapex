@@ -7,6 +7,10 @@ use crate::mctx::search;
 use crate::prompt;
 use ox_core::copied_tags::strip_copied_tag_notation;
 use ox_llm::chat_completions::wire::{ChatMessage, ChatRequest, ToolChoice, UserContent};
+use ox_llm::config::Protocol;
+use ox_llm::responses::client::responses_url;
+use ox_llm::responses::options::{ResponsesStateMode, merge_options};
+use ox_llm::responses::replay::{ResponsesOrigin, ResponsesReplayState};
 use ox_schema::event::SessionEventData;
 use ox_schema::message::Message;
 
@@ -14,7 +18,9 @@ use super::super::drain::DrainCtx;
 use super::super::instructions;
 use super::super::output_budget::bound_aggregate_tool_outputs;
 use super::attempt::StepParams;
-use super::context::{assistant_tokens, build_chat_messages, mctx_head};
+use super::context::{
+    assistant_tokens, build_chat_messages, mctx_head, responses_compacted, responses_replay_state,
+};
 use super::history::load_history_after;
 use super::load_overlaid_tail;
 /// Candidates fetched for one turn's recall: the renderer still caps the hint
@@ -228,6 +234,7 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
         params.model.id.clone(),
         chat_messages,
     );
+    request.responses_replay_state = responses_replay_for(ctx, params, &rows)?;
     request.tools = ctx.tools.definitions_shared();
     // The session's selected reasoning level (model variant) rides every
     // chat turn; no selection leaves the field off the wire.
@@ -239,6 +246,93 @@ pub(super) async fn build_request(ctx: &DrainCtx, params: &StepParams<'_>) -> Re
     let _bill =
         super::super::request_budget::apply(ctx, &mut request, &params.model.provider_id, layers)?;
     Ok(request)
+}
+
+/// Replay state is attached only when the current route still points at the
+/// endpoint that produced it. The wire rechecks the model and protocol marker;
+/// this gate owns provider and endpoint identity.
+fn responses_replay_for(
+    ctx: &DrainCtx,
+    params: &StepParams,
+    messages: &[Message],
+) -> Result<Option<Arc<ResponsesReplayState>>> {
+    let Some(provider) = ctx.config.llm.provider(&params.model.provider_id) else {
+        return Ok(None);
+    };
+    if provider.protocol != Some(Protocol::Responses) {
+        return Ok(None);
+    }
+    let Some(state) = responses_replay_state(messages) else {
+        check_responses_after_compaction(
+            false,
+            responses_compacted(messages),
+            responses_state_mode(ctx, params)?,
+        )?;
+        return Ok(None);
+    };
+    let endpoint = responses_url(&provider.base_url);
+    let origin = ResponsesOrigin::new(&params.model.provider_id, &endpoint, &state.protocol_marker);
+    let wire_model = ctx
+        .config
+        .llm
+        .models
+        .get(&params.model.id)
+        .and_then(|route| {
+            route
+                .candidates
+                .iter()
+                .find(|candidate| candidate.provider == params.model.provider_id)
+        })
+        .map_or(params.model.id.as_str(), |candidate| {
+            candidate.model.as_str()
+        });
+    Ok(state.matches(&origin, wire_model).then_some(state))
+}
+
+/// A chained Responses session cannot continue across a checkpoint: the raw
+/// items it needs were intentionally dropped. Manual mode simply falls back to
+/// the readable history.
+fn check_responses_after_compaction(
+    has_replay_state: bool,
+    compacted: bool,
+    mode: ResponsesStateMode,
+) -> Result<()> {
+    if !has_replay_state && compacted && mode != ResponsesStateMode::Manual {
+        anyhow::bail!(
+            "Responses: checkpoint dropped native replay state; reset the state or use manual mode"
+        );
+    }
+    Ok(())
+}
+
+/// Effective Responses state mode for the selected route, using the same
+/// provider/candidate layering as the transport (without parsing overrides).
+fn responses_state_mode(ctx: &DrainCtx, params: &StepParams) -> Result<ResponsesStateMode> {
+    let provider = ctx
+        .config
+        .llm
+        .responses_options_providers
+        .get(&params.model.provider_id);
+    let candidate = ctx
+        .config
+        .llm
+        .models
+        .get(&params.model.id)
+        .and_then(|route| {
+            route
+                .candidates
+                .iter()
+                .position(|candidate| candidate.provider == params.model.provider_id)
+        })
+        .and_then(|index| {
+            ctx.config
+                .llm
+                .responses_options_candidates
+                .get(&(params.model.id.clone(), index))
+        });
+    merge_options(provider, candidate, None)
+        .map(|options| options.state_mode())
+        .map_err(|error| anyhow::anyhow!("Responses options: {error}"))
 }
 
 /// Final-step request shape (upstream llm.ts): keep `tools` so the provider
@@ -403,4 +497,27 @@ async fn sync_instructions(
         instructions::apply(deltas, baseline);
     }
     Ok((initial, Some(text)))
+}
+
+#[cfg(test)]
+mod responses_gate_tests {
+    use ox_llm::responses::options::ResponsesStateMode;
+
+    use super::check_responses_after_compaction;
+
+    #[test]
+    fn chained_mode_fails_closed_after_compaction() {
+        let error =
+            check_responses_after_compaction(false, true, ResponsesStateMode::PreviousResponse)
+                .expect_err("a chained request must not continue without its raw items");
+        assert!(error.to_string().contains("checkpoint"));
+    }
+
+    #[test]
+    fn manual_mode_and_fresh_replay_state_are_allowed() {
+        check_responses_after_compaction(false, true, ResponsesStateMode::Manual)
+            .expect("manual mode uses readable history");
+        check_responses_after_compaction(true, true, ResponsesStateMode::Conversation)
+            .expect("state created after the checkpoint is usable");
+    }
 }

@@ -33,7 +33,7 @@ use ox_llm::chat_completions::wire::{ChatMessage, ChatRequest};
 use ox_schema::event::SessionEventData;
 use ox_schema::id::now_millis;
 use ox_schema::message::CompactionReason;
-use ox_schema::support::{ModelRef, SessionError};
+use ox_schema::support::{ModelRef, Record, SessionError};
 use tokio_util::sync::CancellationToken;
 
 use super::drain::DrainCtx;
@@ -46,6 +46,22 @@ use super::unknown_error;
 /// through a dedicated `compaction` agent whose system prompt is exactly
 /// this scoping: summarize, don't continue.
 pub(crate) const COMPACTION_SYSTEM: &str = "You summarize conversations so another agent can resume the work. Summarize only; do not continue the task.";
+
+/// Marker a completed checkpoint carries so a Responses chain can tell that
+/// its raw items were deliberately dropped instead of merely lost.
+pub const RESPONSES_COMPACTED_KEY: &str = "ox.responses.compacted.v1";
+
+/// Provider state for a completed compaction. It is not replay state: the
+/// explicit marker tells the next request that native chaining is broken.
+#[must_use]
+pub fn responses_compaction_marker() -> Record {
+    let mut marker = Record::new();
+    marker.insert(
+        RESPONSES_COMPACTED_KEY.to_owned(),
+        serde_json::Value::Bool(true),
+    );
+    marker
+}
 
 /// Upstream `buildPrompt(false)` (compaction.ts:145) verbatim: the
 /// first-time summary instruction appended as the final user message.
@@ -812,7 +828,7 @@ pub(crate) async fn publish_outcome(
                     session_id: ctx.session_id.clone(),
                     reason,
                     model: Some(model),
-                    provider_state: None,
+                    provider_state: Some(responses_compaction_marker()),
                     provider_context: None,
                     text: summary.clone(),
                     recent,
@@ -1651,7 +1667,7 @@ async fn settle_quiet_outcome(
                         session_id: ctx.session_id.clone(),
                         reason: CompactionReason::Idle,
                         model: Some(model),
-                        provider_state: None,
+                        provider_state: Some(responses_compaction_marker()),
                         provider_context: None,
                         text: summary,
                         recent,

@@ -10,8 +10,11 @@ use std::time::Duration;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::credentials::Credentials;
+use crate::messages::wire::MessagesDialect;
+use crate::responses::options::ResponsesOptions;
 
 /// Environment variable overrides.
 pub const ENV_DEFAULT_MODEL: &str = "OX_DEFAULT_MODEL";
@@ -197,6 +200,9 @@ pub struct BuiltinProvider {
     pub models_base_url: &'static str,
     /// The protocol used when the operator has not chosen one.
     pub protocol: Protocol,
+    /// The Messages dialect this builtin's endpoint speaks. Installed into the
+    /// resolved configuration so routing never has to match on a provider id.
+    pub messages_dialect: MessagesDialect,
     /// Environment variable that can supply the key
     /// (`DEEPSEEK_API_KEY`).
     pub env_key: &'static str,
@@ -241,6 +247,7 @@ pub static BUILTINS: &[BuiltinProvider] = &[BuiltinProvider {
     messages_base_url: "https://api.deepseek.com/anthropic",
     models_base_url: "https://api.deepseek.com",
     protocol: Protocol::Messages,
+    messages_dialect: MessagesDialect::DeepSeek,
     env_key: ENV_DEEPSEEK_KEY,
     models: &[
         SeedModel {
@@ -375,23 +382,39 @@ impl Routes {
     }
 }
 
+/// The wire shape of the LLM slice of `ox.toml`.
+///
+/// The raw provider and model tables are kept alongside the typed structs only
+/// during deserialization: `[providers.<id>] responses_options`,
+/// `[models.<id>] candidates[].responses_options` and `messages_dialect` need
+/// to be captured without adding fields to `ProviderConfig`/`CandidateConfig`
+/// (those types are constructed by other crates).
+#[derive(Deserialize)]
+struct RawLlmConfig {
+    #[serde(default)]
+    providers: BTreeMap<String, Value>,
+    #[serde(default)]
+    models: BTreeMap<String, Value>,
+    #[serde(default)]
+    context_caps: BTreeMap<String, u32>,
+    #[serde(default)]
+    default_model: Option<String>,
+}
+
 /// The LLM-endpoint slice of `ox.toml`.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default)]
 pub struct LlmConfig {
     /// Outbound endpoints (`[providers.<name>]`) and credential-resolved
     /// builtins. With none, every request fails closed with
     /// [`crate::error::ChatError::NoRoute`].
-    #[serde(default)]
     pub providers: BTreeMap<String, ProviderConfig>,
     /// Builtin providers whose credentials resolved at load time (see
     /// [`BuiltinProvider`]). Never read from `ox.toml`: a section there is a
     /// normal `[providers]` entry and wins outright.
-    #[serde(skip)]
     pub builtins: BTreeMap<String, ResolvedBuiltin>,
     /// ox's logical model surface with ordered candidate routes
     /// (`[models.<id>]`). Explicit candidates win over direct endpoint
     /// requests; an unrouted model needs an explicitly selected provider.
-    #[serde(default)]
     pub models: BTreeMap<String, ModelRouteConfig>,
     /// Per-model context-window caps (`[context_caps]`, `model id = tokens`).
     /// A cap never *raises* a window: the compaction geometry runs on
@@ -399,14 +422,67 @@ pub struct LlmConfig {
     /// earlier, never overflow the model. A cap for a model the catalogue
     /// reports no context for does nothing (the unknown-window fallback
     /// stands); inert or unknown caps warn at catalogue refresh.
-    #[serde(default)]
     pub context_caps: BTreeMap<String, u32>,
     /// Model backing sessions without an explicit selection: either a
     /// qualified reference (`provider/id`) or a bare id that names a catalogue
     /// entry. An unknown name has no default rather than inventing an endpoint.
     /// When unset the first chat-capable catalogue entry is the default.
-    #[serde(default)]
     pub default_model: Option<String>,
+    /// Responses options declared on `[providers.<id>]`, by provider id.
+    pub responses_options_providers: BTreeMap<String, ResponsesOptions>,
+    /// Responses options declared on `[models.<id>] candidates[]`, keyed by
+    /// (model id, candidate index). The index is a wire-stable position: the
+    /// candidate list must never be reordered after options are captured, or
+    /// an option would attach to the wrong endpoint.
+    pub responses_options_candidates: BTreeMap<(String, usize), ResponsesOptions>,
+    /// Explicit Messages dialects by endpoint name. Builtins add their
+    /// compatibility dialect during [`Self::apply_credentials`].
+    pub messages_dialects: BTreeMap<String, MessagesDialect>,
+}
+
+impl<'de> Deserialize<'de> for LlmConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = RawLlmConfig::deserialize(deserializer)?;
+        let mut config = LlmConfig {
+            context_caps: raw.context_caps,
+            default_model: raw.default_model,
+            ..Default::default()
+        };
+        for (name, table) in raw.providers {
+            if let Some(options) = table.get("responses_options") {
+                let parsed =
+                    ResponsesOptions::deserialize(options).map_err(serde::de::Error::custom)?;
+                config
+                    .responses_options_providers
+                    .insert(name.clone(), parsed);
+            }
+            if let Some(dialect) = table.get("messages_dialect") {
+                let parsed =
+                    MessagesDialect::deserialize(dialect).map_err(serde::de::Error::custom)?;
+                config.messages_dialects.insert(name.clone(), parsed);
+            }
+            let provider: ProviderConfig =
+                serde_json::from_value(table).map_err(serde::de::Error::custom)?;
+            config.providers.insert(name, provider);
+        }
+        for (id, table) in raw.models {
+            if let Some(candidates) = table.get("candidates").and_then(Value::as_array) {
+                for (index, candidate) in candidates.iter().enumerate() {
+                    if let Some(options) = candidate.get("responses_options") {
+                        let parsed = ResponsesOptions::deserialize(options)
+                            .map_err(serde::de::Error::custom)?;
+                        config
+                            .responses_options_candidates
+                            .insert((id.clone(), index), parsed);
+                    }
+                }
+            }
+            let route: ModelRouteConfig =
+                serde_json::from_value(table).map_err(serde::de::Error::custom)?;
+            config.models.insert(id, route);
+        }
+        Ok(config)
+    }
 }
 
 impl LlmConfig {
@@ -422,6 +498,7 @@ impl LlmConfig {
     /// `[providers.deepseek] base_url = "…"` alone still works with
     /// `DEEPSEEK_API_KEY` set.
     pub fn apply_credentials(&mut self, credentials: &Credentials) {
+        let mut builtin_dialects: Vec<(String, MessagesDialect)> = Vec::new();
         for builtin in BUILTINS {
             if let Some(provider) = self.providers.get_mut(builtin.id) {
                 // `[providers.deepseek]` without a `base_url` is the one-line
@@ -433,6 +510,7 @@ impl LlmConfig {
                     let protocol = provider.protocol.unwrap_or(builtin.protocol);
                     provider.protocol = Some(protocol);
                     provider.base_url = builtin.base_url(protocol).to_owned();
+                    builtin_dialects.push((builtin.id.to_owned(), builtin.messages_dialect));
                 }
                 if provider.api_key.as_deref().is_none_or(str::is_empty) {
                     provider.api_key = stored_key(credentials, builtin);
@@ -443,6 +521,7 @@ impl LlmConfig {
                 continue;
             };
             let protocol = builtin.protocol;
+            builtin_dialects.push((builtin.id.to_owned(), builtin.messages_dialect));
             self.builtins.insert(
                 builtin.id.to_owned(),
                 ResolvedBuiltin {
@@ -456,6 +535,19 @@ impl LlmConfig {
                 },
             );
         }
+        for (name, dialect) in builtin_dialects {
+            self.messages_dialects.entry(name).or_insert(dialect);
+        }
+    }
+
+    /// The Messages dialect an endpoint declared, or the portable default.
+    /// Builtin compatibility dialects are installed by [`Self::apply_credentials`].
+    #[must_use]
+    pub fn messages_dialect_for(&self, name: &str) -> MessagesDialect {
+        self.messages_dialects
+            .get(name)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// The endpoint configuration for `name`, whether the operator wrote it

@@ -15,6 +15,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::messages::replay::MessagesReplayState;
+use crate::responses::options::ResponsesOptions;
+use crate::responses::replay::ResponsesReplayState;
 use ox_schema::support::Finite;
 
 /// Tool schema types live in the contract crate; the chat request re-exports
@@ -55,6 +57,14 @@ pub struct ChatRequest {
     /// Always `{"include_usage": true}` so the final chunk carries usage.
     #[serde(default)]
     pub stream_options: IncludeUsage,
+    /// Internal Responses option layer. Serde skips it in both directions:
+    /// the Chat Completions body is byte-identical with or without it.
+    #[serde(default, skip)]
+    pub responses_options: Option<serde_json::Value>,
+    /// Opaque Responses replay state restored from the durable row. Internal
+    /// only: never serialized onto any Chat wire.
+    #[serde(default, skip)]
+    pub responses_replay_state: Option<std::sync::Arc<ResponsesReplayState>>,
 }
 
 impl ChatRequest {
@@ -70,6 +80,8 @@ impl ChatRequest {
             reasoning_effort: None,
             stream: StreamEnabled,
             stream_options: IncludeUsage,
+            responses_options: None,
+            responses_replay_state: None,
         }
     }
 
@@ -79,6 +91,15 @@ impl ChatRequest {
     /// shared compatibility mapping at the request boundary.
     pub fn apply_reasoning_effort(&mut self, variant: Option<&str>) {
         self.reasoning_effort = reasoning_effort_of(variant);
+    }
+
+    /// Attach a per-request Responses option layer without touching the wire.
+    pub fn set_responses_options(
+        &mut self,
+        options: &ResponsesOptions,
+    ) -> Result<(), serde_json::Error> {
+        self.responses_options = Some(serde_json::to_value(options)?);
+        Ok(())
     }
 }
 
@@ -534,4 +555,56 @@ pub(crate) fn pair_tool_results(messages: Vec<ChatMessage>) -> Vec<ChatMessage> 
         }
     }
     spliced
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::responses::replay::{ResponsesOrigin, ResponsesReplayInput};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[test]
+    fn internal_responses_fields_are_absent_from_chat_bytes() {
+        let baseline = ChatRequest::new("m", vec![ChatMessage::user("hello")]);
+        let golden = r#"{"model":"m","messages":[{"role":"user","content":"hello"}],"stream":true,"stream_options":{"include_usage":true}}"#;
+        assert_eq!(
+            serde_json::to_string(&baseline).expect("baseline serializes"),
+            golden
+        );
+
+        let mut changed = baseline.clone();
+        changed.responses_options = Some(json!({"state_mode": "conversation"}));
+        changed.responses_replay_state = Some(Arc::new(ResponsesReplayState::new(
+            ResponsesOrigin::new(
+                "vendor",
+                "https://vendor.example/v1/responses",
+                "responses/v1",
+            ),
+            ResponsesReplayInput {
+                model: "m".to_owned(),
+                items: vec![json!({"type": "message"})],
+                input_fingerprint: "fingerprint".to_owned(),
+                input_len: 8,
+                ..Default::default()
+            },
+        )));
+        assert_eq!(
+            serde_json::to_string(&changed).expect("internal fields are skipped"),
+            golden
+        );
+        assert_eq!(
+            serialized_len(&changed).expect("counting writer agrees with to_string"),
+            golden.len()
+        );
+    }
+
+    #[test]
+    fn internal_fields_are_not_deserialized_from_chat_bytes() {
+        let with_unknown = r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"responses_options":{"user":"ignored"},"responses_replay_state":{}}"#;
+        let request: ChatRequest = serde_json::from_str(with_unknown)
+            .expect("unknown internal keys stay harmless on the Chat wire");
+        assert!(request.responses_options.is_none());
+        assert!(request.responses_replay_state.is_none());
+    }
 }

@@ -21,8 +21,9 @@ use super::client::ChatCompletionsClient;
 use super::limit::LimitedChat;
 use super::wire::ChatRequest;
 use crate::messages::client::MessagesClient;
-use crate::messages::wire::MessagesPolicy;
+use crate::messages::wire::{MessagesDialect, MessagesPolicy};
 use crate::responses::client::ResponsesClient;
+use crate::responses::options::{ResponsesOptions, merge_options};
 
 /// One resolved fallback target: a chat transport plus the wire model to
 /// request on it.
@@ -52,17 +53,28 @@ impl EndpointRouter {
     pub fn from_config(config: &LlmConfig) -> Result<Self, ChatError> {
         let mut clients: BTreeMap<String, Arc<dyn Chat>> = BTreeMap::new();
         for (name, provider) in &config.providers {
+            let options = config.responses_options_providers.get(name);
             clients.insert(
                 name.clone(),
-                gated(client_for(name, provider)?, &provider.limits, name),
+                gated(
+                    client_for(provider, config.messages_dialect_for(name), name, options)?,
+                    &provider.limits,
+                    name,
+                ),
             );
         }
         // A builtin is an endpoint like any other once its credential resolved.
         for (name, resolved) in &config.builtins {
+            let options = config.responses_options_providers.get(name);
             clients.insert(
                 name.clone(),
                 gated(
-                    client_for(name, &resolved.config)?,
+                    client_for(
+                        &resolved.config,
+                        config.messages_dialect_for(name),
+                        name,
+                        options,
+                    )?,
                     &resolved.config.limits,
                     name,
                 ),
@@ -81,23 +93,54 @@ impl EndpointRouter {
                 )
             })
             .collect();
-        let resolve = |provider: &str, model: &str| -> Candidate {
-            let chat = clients.get(provider).unwrap_or_else(|| {
-                panic!("candidate provider `{provider}` missing despite LlmConfig::validate")
-            });
-            Candidate {
-                chat: Arc::clone(chat),
+        let resolve = |provider: &str, model: &str, index: usize| -> Result<Candidate, ChatError> {
+            let chat = match config
+                .responses_options_candidates
+                .get(&(model.to_owned(), index))
+            {
+                Some(candidate_options) => {
+                    let endpoint = config_for(config, provider).ok_or_else(|| {
+                        ChatError::Upstream(format!(
+                            "no configuration for Responses candidate `{provider}`"
+                        ))
+                    })?;
+                    if endpoint.protocol() != Protocol::Responses {
+                        return Err(ChatError::Upstream(format!(
+                            "Responses options configured for non-Responses provider `{provider}`"
+                        )));
+                    }
+                    let merged = merge_options(
+                        config.responses_options_providers.get(provider),
+                        Some(candidate_options),
+                        None,
+                    )
+                    .map_err(|error| {
+                        ChatError::Upstream(format!("invalid Responses options: {error}"))
+                    })?;
+                    Arc::new(ResponsesClient::with_options(
+                        endpoint.base_url.clone(),
+                        endpoint.api_key.clone(),
+                        endpoint.limits.stall_timeout(),
+                        provider.to_owned(),
+                        merged,
+                    )?) as Arc<dyn Chat>
+                }
+                None => Arc::clone(clients.get(provider).ok_or_else(|| {
+                    ChatError::Upstream(format!("no configured client for provider `{provider}`"))
+                })?),
+            };
+            Ok(Candidate {
+                chat,
                 model: Some(model.to_owned()),
                 provider: provider.to_owned(),
-            }
+            })
         };
         let mut routes = BTreeMap::new();
         for (id, route) in &config.models {
-            let candidates = route
-                .candidates
-                .iter()
-                .map(|candidate| resolve(&candidate.provider, &candidate.model))
-                .collect();
+            let mut candidates = Vec::with_capacity(route.candidates.len());
+            for (index, candidate) in route.candidates.iter().enumerate() {
+                candidates.push(resolve(&candidate.provider, &candidate.model, index)?);
+            }
             routes.insert(id.clone(), candidates);
         }
         Ok(Self {
@@ -192,10 +235,23 @@ impl Chat for EndpointRouter {
 /// cannot disagree with the path ox appends to its base URL: chat completions
 /// and Messages each own their request builder, decoder and URL.
 ///
-/// A Messages endpoint also picks the dialect its `provider` name implies
-/// ([`MessagesPolicy::for_provider`]): `deepseek` states its thinking switch and
-/// replays unsigned reasoning, anything else takes the portable Anthropic form.
-fn client_for(name: &str, provider: &ProviderConfig) -> Result<Arc<dyn Chat>, ChatError> {
+/// A Messages endpoint uses the dialect its configuration declares. Builtins
+/// install their compatibility dialect during credential resolution; an
+/// operator-named endpoint gets the portable Anthropic form unless it declares
+/// `messages_dialect` explicitly. No provider name is matched here.
+fn config_for<'a>(config: &'a LlmConfig, name: &str) -> Option<&'a ProviderConfig> {
+    if let Some(provider) = config.providers.get(name) {
+        return Some(provider);
+    }
+    config.builtins.get(name).map(|resolved| &resolved.config)
+}
+
+fn client_for(
+    provider: &ProviderConfig,
+    dialect: MessagesDialect,
+    provider_id: &str,
+    options: Option<&ResponsesOptions>,
+) -> Result<Arc<dyn Chat>, ChatError> {
     let stall = provider.limits.stall_timeout();
     Ok(match provider.protocol() {
         Protocol::ChatCompletions => Arc::new(ChatCompletionsClient::with_stall_timeout(
@@ -206,13 +262,15 @@ fn client_for(name: &str, provider: &ProviderConfig) -> Result<Arc<dyn Chat>, Ch
         Protocol::Messages => Arc::new(MessagesClient::new(
             provider.base_url.clone(),
             provider.api_key.clone(),
-            MessagesPolicy::for_provider(name),
+            MessagesPolicy::for_dialect(dialect),
             stall,
         )?),
-        Protocol::Responses => Arc::new(ResponsesClient::new(
+        Protocol::Responses => Arc::new(ResponsesClient::with_options(
             provider.base_url.clone(),
             provider.api_key.clone(),
             stall,
+            provider_id.to_owned(),
+            options.cloned().unwrap_or_default(),
         )?),
     })
 }
@@ -266,6 +324,7 @@ pub(crate) fn should_failover(error: &ChatError) -> bool {
 mod tests {
     use super::client_for;
     use crate::config::{EndpointLimits, LlmConfig, Protocol, ProviderConfig};
+    use crate::messages::wire::MessagesDialect;
 
     fn provider(protocol: Protocol) -> ProviderConfig {
         ProviderConfig {
@@ -276,11 +335,21 @@ mod tests {
         }
     }
 
+    fn call(protocol: Protocol) -> bool {
+        client_for(
+            &provider(protocol),
+            MessagesDialect::Anthropic,
+            "test",
+            None,
+        )
+        .is_ok()
+    }
+
     #[test]
     fn protocol_responses_selects_client() {
-        assert!(client_for("responses", &provider(Protocol::Responses)).is_ok());
-        assert!(client_for("chat", &provider(Protocol::ChatCompletions)).is_ok());
-        assert!(client_for("messages", &provider(Protocol::Messages)).is_ok());
+        assert!(call(Protocol::Responses));
+        assert!(call(Protocol::ChatCompletions));
+        assert!(call(Protocol::Messages));
 
         // Existing config validation rejects an empty Responses base URL.
         let mut config = LlmConfig::default();
